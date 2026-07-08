@@ -1,0 +1,2908 @@
+//! Tool families and the registry (§4.5). A `Tool` is a schema-bearing,
+//! blast-radius-tagged capability; the `ToolRegistry` implements the kernel's
+//! `Executor`, exposing specs (K2) and dispatching validated intents to the
+//! right tool. Phase 0 ships fs + shell over the workspace sandbox.
+
+use async_trait::async_trait;
+use ignore::WalkBuilder;
+use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
+use regex::{Regex, RegexBuilder};
+use sandbox::WorkspaceSandbox;
+use scraper::{Html, Selector};
+use serde_json::{json, Value};
+use similar::{ChangeTag, TextDiff};
+use std::collections::HashMap;
+use std::net::{IpAddr, ToSocketAddrs};
+use std::sync::Arc;
+
+/// Build a compact unified-style diff (with a few lines of context) for display.
+fn make_diff(path: &str, before: &str, after: &str) -> String {
+    let diff = TextDiff::from_lines(before, after);
+    let mut out = format!("--- {path}\n+++ {path}\n");
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal => " ",
+        };
+        out.push_str(sign);
+        out.push_str(change.value());
+        if !change.value().ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Hard ceiling on any single tool call (defense against stuck tools).
+const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ToolError {
+    #[error("missing or invalid argument: {0}")]
+    Args(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn blast_radius(&self) -> BlastRadius;
+    /// JSON Schema for the parameters (what the model is told it can pass).
+    fn schema(&self) -> Value;
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError>;
+
+    /// Presentation category surfaces map to a glyph/verb (§4.13). Defaults from
+    /// the blast radius; tools override for a finer class (Search/Web/Vcs/…).
+    /// Declared here so surfaces read it, never re-deriving from the tool name.
+    fn category(&self) -> ToolCategory {
+        match self.blast_radius() {
+            BlastRadius::Read => ToolCategory::Read,
+            _ => ToolCategory::Write,
+        }
+    }
+
+    /// The tool's display glyph (one grapheme). Defaults per category; a tool
+    /// overrides it to keep a distinct icon. Declared here so surfaces render the
+    /// tool's own glyph without holding a name→glyph table.
+    fn icon(&self) -> &'static str {
+        match self.category() {
+            ToolCategory::Read => "◇",
+            ToolCategory::Write => "✎",
+            ToolCategory::Search => "⌕",
+            ToolCategory::Web => "◍",
+            ToolCategory::Shell => "❯",
+            ToolCategory::Vcs => "⎇",
+            ToolCategory::Diagnostic => "⚑",
+            ToolCategory::Plan => "☑",
+            ToolCategory::Other => "•",
+        }
+    }
+
+    /// A side-effect-free preview of what this call would do (e.g. a diff or the
+    /// command), shown at the human gate. Async so a preview can read the file's
+    /// current contents to render a real before→after diff. Default: none.
+    async fn preview(&self, _args: &Value) -> Option<String> {
+        None
+    }
+}
+
+/// Cap a rendered diff so a huge change doesn't flood the approval card.
+fn cap_preview(s: &str) -> String {
+    const MAX_LINES: usize = 60;
+    let total = s.lines().count();
+    let mut out: Vec<&str> = s.lines().take(MAX_LINES).collect();
+    if total > MAX_LINES {
+        out.push("…");
+        return format!("{}\n(+{} more lines)", out.join("\n"), total - MAX_LINES);
+    }
+    out.join("\n")
+}
+
+/// Helper: required string argument.
+fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| ToolError::Args(format!("expected string '{key}'")))
+}
+
+pub struct ToolRegistry {
+    tools: HashMap<String, Arc<dyn Tool>>,
+    /// The workspace sandbox, kept so the executor can report its containment
+    /// level (§4.8) to the kernel's trust-flow escalation. `None` for a bare
+    /// registry built via [`ToolRegistry::new`].
+    sandbox: Option<Arc<WorkspaceSandbox>>,
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self { tools: HashMap::new(), sandbox: None }
+    }
+
+    pub fn register(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
+        self.tools.insert(tool.name().to_string(), tool);
+        self
+    }
+
+    /// Convenience: a registry with the default fs + shell + search/edit tools,
+    /// plus `read_artifact` over the given artifact store.
+    pub fn with_workspace(
+        sandbox: Arc<WorkspaceSandbox>,
+        artifacts: Arc<dyn kernel::ArtifactStore>,
+    ) -> Self {
+        let mut r = Self::new();
+        r.sandbox = Some(sandbox.clone());
+        r.register(Arc::new(FsRead { sbx: sandbox.clone() }));
+        r.register(Arc::new(FsWrite { sbx: sandbox.clone() }));
+        r.register(Arc::new(FsList { sbx: sandbox.clone() }));
+        r.register(Arc::new(FsEdit { sbx: sandbox.clone() }));
+        r.register(Arc::new(WordCount { sbx: sandbox.clone() }));
+        r.register(Arc::new(Grep { sbx: sandbox.clone() }));
+        r.register(Arc::new(Glob { sbx: sandbox.clone() }));
+        r.register(Arc::new(CodeOutline { sbx: sandbox.clone() }));
+        r.register(Arc::new(References { sbx: sandbox.clone() }));
+        r.register(Arc::new(Tree { sbx: sandbox.clone() }));
+        r.register(Arc::new(MultiEdit { sbx: sandbox.clone() }));
+        r.register(Arc::new(Git { sbx: sandbox.clone() }));
+        r.register(Arc::new(Diagnostics { sbx: sandbox.clone() }));
+        r.register(Arc::new(ShellExec { sbx: sandbox }));
+        r.register(Arc::new(ReadArtifact { store: artifacts }));
+        r.register(Arc::new(WebSearch));
+        r.register(Arc::new(WebFetch));
+        r.register(Arc::new(WebCrawl));
+        r.register(Arc::new(UpdatePlan));
+        r
+    }
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Executor for ToolRegistry {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs: Vec<ToolSpec> = self
+            .tools
+            .values()
+            .map(|t| ToolSpec {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                schema: t.schema(),
+                blast_radius: t.blast_radius(),
+                category: t.category(),
+                icon: t.icon().to_string(),
+            })
+            .collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name)); // stable exposure order
+        specs
+    }
+
+    fn blast_radius(&self, tool: &str) -> Option<BlastRadius> {
+        self.tools.get(tool).map(|t| t.blast_radius())
+    }
+
+    fn category(&self, tool: &str) -> Option<ToolCategory> {
+        self.tools.get(tool).map(|t| t.category())
+    }
+
+    fn containment(&self) -> kernel::Containment {
+        self.sandbox
+            .as_ref()
+            .map(|s| s.containment())
+            .unwrap_or(kernel::Containment::None)
+    }
+
+    async fn execute(&self, intent: &ToolIntent) -> Observation {
+        let Some(tool) = self.tools.get(&intent.tool) else {
+            return Observation::denial(&intent.id, format!("unknown tool '{}'", intent.tool));
+        };
+        // Per-tool timeout so a stuck tool (e.g. a hung fetch) never hangs the
+        // session — it returns a structured timeout observation instead (P10).
+        match tokio::time::timeout(TOOL_TIMEOUT, tool.execute(&intent.args)).await {
+            Ok(Ok(payload)) => Observation::ok(&intent.id, payload),
+            Ok(Err(e)) => Observation::error(&intent.id, e.to_string()),
+            Err(_) => Observation::error(
+                &intent.id,
+                format!("tool '{}' timed out after {}s", intent.tool, TOOL_TIMEOUT.as_secs()),
+            ),
+        }
+    }
+
+    async fn preview(&self, intent: &ToolIntent) -> Option<String> {
+        match self.tools.get(&intent.tool) {
+            Some(t) => t.preview(&intent.args).await,
+            None => None,
+        }
+    }
+}
+
+// ── fs family ──────────────────────────────────────────────────────────────
+
+struct FsRead {
+    sbx: Arc<WorkspaceSandbox>,
+}
+#[async_trait]
+impl Tool for FsRead {
+    fn name(&self) -> &str {
+        "fs.read"
+    }
+    fn description(&self) -> &str {
+        "Read a UTF-8 text file (workspace, or outside with permission). Reads the \
+         whole file by default; for large files pass `offset` (1-based start line) \
+         and/or `limit` (line count) to read just a slice and save context. Typical \
+         flow: `glob`/`grep` to locate the file and line, then read the range around \
+         it rather than the whole file."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative or absolute path" },
+                "offset": { "type": "integer", "description": "1-based line to start at (optional; default whole file)" },
+                "limit": { "type": "integer", "description": "Max lines to return from offset (optional)" }
+            },
+            "required": ["path"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
+        let offset = args.get("offset").and_then(Value::as_u64);
+        let limit = args.get("limit").and_then(Value::as_u64);
+        // Whole-file read (default) — unchanged behavior.
+        if offset.is_none() && limit.is_none() {
+            return Ok(json!({ "path": path, "content": content }));
+        }
+        // Line-range read: return just the requested slice plus positioning info.
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        let start = (offset.unwrap_or(1).max(1) as usize - 1).min(total);
+        let end = limit.map(|l| start + l as usize).unwrap_or(total).min(total);
+        let slice = lines.get(start..end).unwrap_or(&[]).join("\n");
+        Ok(json!({
+            "path": path,
+            "content": slice,
+            "start_line": start + 1,
+            "end_line": end,
+            "total_lines": total,
+        }))
+    }
+}
+
+struct FsWrite {
+    sbx: Arc<WorkspaceSandbox>,
+}
+#[async_trait]
+impl Tool for FsWrite {
+    fn name(&self) -> &str {
+        "fs.write"
+    }
+    fn description(&self) -> &str {
+        "Write a whole UTF-8 text file (creates parent dirs; snapshots any prior \
+         version; returns a diff). Use this for NEW files or full rewrites; prefer \
+         `fs.edit` to change part of an existing file (smaller, reviewable diff). \
+         Supports paths outside workspace with permission."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::ReversibleLocal
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative or absolute path" },
+                "content": { "type": "string", "description": "File contents" }
+            },
+            "required": ["path", "content"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let content = arg_str(args, "content")?;
+        // Capture the prior contents (empty for a new file) so surfaces can render
+        // a proper diff: a new file shows as all-additions (empty left column),
+        // an overwrite shows the real before/after — same view as fs.edit.
+        let old = self.sbx.read(&path).await.unwrap_or_default();
+        let snapshot = self.sbx.write(&path, &content).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        Ok(json!({ "path": path, "written": true, "snapshot": snapshot, "old": old, "new": content }))
+    }
+
+    /// The gate preview for a write is a diff against the file's current state
+    /// (all additions for a brand-new file, or a real change diff when it
+    /// already exists), so the approval card shows exactly what will land —
+    /// capped so a large file doesn't flood the prompt.
+    async fn preview(&self, args: &Value) -> Option<String> {
+        let path = args.get("path")?.as_str()?;
+        let content = args.get("content")?.as_str()?;
+        // Diff against the file's current state: a brand-new file shows as all
+        // additions; an overwrite shows the real before→after change.
+        let old = self.sbx.read(path).await.unwrap_or_default();
+        Some(cap_preview(&make_diff(path, &old, content)))
+    }
+}
+
+struct FsList {
+    sbx: Arc<WorkspaceSandbox>,
+}
+#[async_trait]
+impl Tool for FsList {
+    fn name(&self) -> &str {
+        "fs.list"
+    }
+    fn icon(&self) -> &'static str { "▸" }
+    fn description(&self) -> &str {
+        "List the immediate entries of a directory (directories suffixed with '/'). \
+         For recursive discovery by name use `glob`; to search file contents use \
+         `grep`. Supports paths outside workspace with permission."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "path": { "type": "string", "description": "Workspace-relative or absolute dir (default '.')" } }
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let entries = self.sbx.list(path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        Ok(json!({ "path": path, "entries": entries }))
+    }
+}
+
+struct FsEdit {
+    sbx: Arc<WorkspaceSandbox>,
+}
+#[async_trait]
+impl Tool for FsEdit {
+    fn name(&self) -> &str {
+        "fs.edit"
+    }
+    fn description(&self) -> &str {
+        "Edit a file by replacing an exact substring. `old_string` must match uniquely unless `replace_all` is true. Returns a unified diff. Supports paths outside workspace with permission."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::ReversibleLocal
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative or absolute path" },
+                "old_string": { "type": "string", "description": "Exact text to replace" },
+                "new_string": { "type": "string", "description": "Replacement text" },
+                "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false)" }
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let old_s = arg_str(args, "old_string")?;
+        let new_s = arg_str(args, "new_string")?;
+        let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+
+        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let count = content.matches(&old_s).count();
+        if count == 0 {
+            return Err(ToolError::Failed(format!("old_string not found in {path}")));
+        }
+        if count > 1 && !replace_all {
+            return Err(ToolError::Failed(format!(
+                "old_string appears {count} times in {path}; pass replace_all or use a more specific string"
+            )));
+        }
+        let updated = if replace_all {
+            content.replace(&old_s, &new_s)
+        } else {
+            content.replacen(&old_s, &new_s, 1)
+        };
+        let snapshot = self.sbx.write(&path, &updated).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let diff = make_diff(&path, &content, &updated);
+        Ok(json!({
+            "path": path,
+            "diff": diff,
+            // Raw before/after content too, so a richer surface (e.g. a TUI)
+            // can build its own view (side-by-side) instead of re-parsing the
+            // pre-rendered unified diff string.
+            "old": content,
+            "new": updated,
+            "replacements": if replace_all { count } else { 1 },
+            "snapshot": snapshot
+        }))
+    }
+
+    /// Compute the diff without writing — the real preview for the gate. Mirrors
+    /// `execute`'s match logic so the card reflects what will actually happen
+    /// (including the "not found" / "ambiguous match" cases that would fail).
+    async fn preview(&self, args: &Value) -> Option<String> {
+        let path = args.get("path")?.as_str()?;
+        let old_s = args.get("old_string")?.as_str()?;
+        let new_s = args.get("new_string")?.as_str()?;
+        let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+        let content = self.sbx.read(path).await.ok()?;
+        let count = content.matches(old_s).count();
+        if count == 0 {
+            return Some(format!("(old_string not found in {path} — this edit would fail)"));
+        }
+        if count > 1 && !replace_all {
+            return Some(format!(
+                "(old_string appears {count}× in {path}; needs replace_all or a more specific match)"
+            ));
+        }
+        let updated = if replace_all {
+            content.replace(old_s, new_s)
+        } else {
+            content.replacen(old_s, new_s, 1)
+        };
+        Some(cap_preview(&make_diff(path, &content, &updated)))
+    }
+}
+
+// ── word_count ───────────────────────────────────────────────────────────────
+//
+// A simple read-only tool that counts words, lines, and characters in a workspace
+// file. Useful for the model to get a quick sense of file size without reading
+// the full content.
+
+struct WordCount {
+    sbx: Arc<WorkspaceSandbox>,
+}
+
+#[async_trait]
+impl Tool for WordCount {
+    fn name(&self) -> &str {
+        "word_count"
+    }
+    fn icon(&self) -> &'static str { "#" }
+    fn description(&self) -> &str {
+        "Count words, lines, and characters in a workspace file. Supports paths outside workspace with permission."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative or absolute path to the file" }
+            },
+            "required": ["path"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
+        let lines: Vec<&str> = content.lines().collect();
+        let line_count = lines.len();
+        let char_count = content.chars().count();
+        // Word count: split on whitespace
+        let word_count = content.split_whitespace().count();
+        Ok(json!({
+            "path": path,
+            "lines": line_count,
+            "words": word_count,
+            "chars": char_count,
+        }))
+    }
+}
+
+// ── search family ────────────────────────────────────────────────────────────
+
+struct Grep {
+    sbx: Arc<WorkspaceSandbox>,
+}
+#[async_trait]
+impl Tool for Grep {
+    fn name(&self) -> &str {
+        "grep"
+    }
+    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn description(&self) -> &str {
+        "Search file contents by regular expression across the workspace, \
+         gitignore-aware (skips ignored/hidden files, target/, node_modules, binaries). \
+         Returns matching {path, line, text}. Use `context` to include surrounding \
+         lines, `case_insensitive` for loose matching, `path` to scope to a subtree."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax)" },
+                "path": { "type": "string", "description": "Workspace-relative dir to scope the search (default '.')" },
+                "case_insensitive": { "type": "boolean", "description": "Match ignoring case (default false)" },
+                "context": { "type": "integer", "description": "Lines of context to include around each match (default 0)" },
+                "max_results": { "type": "integer", "description": "Cap on matches returned (default 200)" }
+            },
+            "required": ["pattern"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let pattern = arg_str(args, "pattern")?;
+        let ci = args.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false);
+        let context = args.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(200) as usize;
+        let rel_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+
+        let re = RegexBuilder::new(&pattern)
+            .case_insensitive(ci)
+            .build()
+            .map_err(|e| ToolError::Args(format!("bad regex: {e}")))?;
+        let start = self.sbx.resolve(rel_path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let root = self.sbx.root().to_path_buf();
+
+        // gitignore-aware, parallel-capable walk (ripgrep's engine). Standard
+        // filters skip .git, hidden files (incl .medha), and gitignored paths;
+        // we additionally skip build dirs that may not be gitignored.
+        let mut matches: Vec<Value> = Vec::new();
+        let mut truncated = false;
+        let walk = WalkBuilder::new(&start)
+            .standard_filters(true)
+            .filter_entry(|e| !skip_dir(e))
+            .build();
+
+        'outer: for dent in walk.flatten() {
+            if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if dent.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000 {
+                continue; // skip oversized files
+            }
+            let Ok(content) = std::fs::read_to_string(dent.path()) else {
+                continue; // skip binaries (non-UTF-8)
+            };
+            let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
+            let lines: Vec<&str> = content.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if re.is_match(line) {
+                    if matches.len() >= max {
+                        truncated = true;
+                        break 'outer;
+                    }
+                    let mut m = json!({
+                        "path": rel,
+                        "line": i + 1,
+                        "text": line.chars().take(200).collect::<String>()
+                    });
+                    if context > 0 {
+                        let lo = i.saturating_sub(context);
+                        let hi = (i + context + 1).min(lines.len());
+                        let ctx: Vec<String> =
+                            (lo..hi).map(|j| format!("{}: {}", j + 1, lines[j])).collect();
+                        m["context"] = json!(ctx);
+                    }
+                    matches.push(m);
+                }
+            }
+        }
+        let count = matches.len();
+        Ok(json!({ "matches": matches, "count": count, "truncated": truncated }))
+    }
+}
+
+/// Skip build dirs that may not be gitignored (`.git`/hidden/.medha are already
+/// excluded by `standard_filters`).
+fn skip_dir(e: &ignore::DirEntry) -> bool {
+    e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+        && matches!(e.file_name().to_str(), Some("target" | "node_modules"))
+}
+
+struct Glob {
+    sbx: Arc<WorkspaceSandbox>,
+}
+#[async_trait]
+impl Tool for Glob {
+    fn name(&self) -> &str {
+        "glob"
+    }
+    fn icon(&self) -> &'static str { "✦" }
+    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn description(&self) -> &str {
+        "Find files by name pattern across the whole workspace (recursive, \
+         gitignore-aware), e.g. '**/*.rs' or 'src/**/test_*.py'. Faster and more \
+         reliable than `find` via shell.exec for locating files by name; use \
+         `grep` instead when searching by file *content*."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Glob pattern, e.g. '**/*.rs'" },
+                "max_results": { "type": "integer", "description": "Cap on matches (default 500)" }
+            },
+            "required": ["pattern"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let pattern = arg_str(args, "pattern")?;
+        let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(500) as usize;
+        let matcher = glob::Pattern::new(&pattern).map_err(|e| ToolError::Args(e.to_string()))?;
+        let root = self.sbx.root().to_path_buf();
+
+        let mut matches: Vec<String> = Vec::new();
+        let mut truncated = false;
+        let walk = WalkBuilder::new(&root).standard_filters(true).filter_entry(|e| !skip_dir(e)).build();
+        for dent in walk.flatten() {
+            if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
+            if matcher.matches(&rel) {
+                if matches.len() >= max {
+                    truncated = true;
+                    break;
+                }
+                matches.push(rel);
+            }
+        }
+        matches.sort();
+        let count = matches.len();
+        Ok(json!({ "pattern": pattern, "matches": matches, "count": count, "truncated": truncated }))
+    }
+}
+
+// ── code intelligence ─────────────────────────────────────────────────────────
+
+struct CodeOutline {
+    sbx: Arc<WorkspaceSandbox>,
+}
+
+/// Language-aware, line-based symbol patterns. Each rule has a `kind` label and a
+/// regex with a named `name` capture. Deliberately heuristic (no full parse): a
+/// fast, dependency-light table of contents, not a compiler front-end.
+fn outline_rules(path: &str) -> Vec<(&'static str, Regex)> {
+    let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+    let r = |p: &str| Regex::new(p).unwrap();
+    match ext.as_str() {
+        "rs" => vec![
+            ("fn", r(r"^\s*(?:pub\s+)?(?:pub\([^)]*\)\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?(?:extern\s+\S+\s+)?fn\s+(?P<name>\w+)")),
+            ("struct", r(r"^\s*(?:pub\s+)?(?:pub\([^)]*\)\s+)?struct\s+(?P<name>\w+)")),
+            ("enum", r(r"^\s*(?:pub\s+)?enum\s+(?P<name>\w+)")),
+            ("trait", r(r"^\s*(?:pub\s+)?(?:unsafe\s+)?trait\s+(?P<name>\w+)")),
+            ("impl", r(r"^\s*impl(?:<[^>]*>)?\s+(?P<name>[\w:]+)")),
+            ("mod", r(r"^\s*(?:pub\s+)?mod\s+(?P<name>\w+)")),
+            ("type", r(r"^\s*(?:pub\s+)?type\s+(?P<name>\w+)")),
+            ("macro", r(r"^\s*macro_rules!\s*(?P<name>\w+)")),
+        ],
+        "py" => vec![
+            ("class", r(r"^\s*class\s+(?P<name>\w+)")),
+            ("def", r(r"^\s*(?:async\s+)?def\s+(?P<name>\w+)")),
+        ],
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => vec![
+            ("class", r(r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(?P<name>\w+)")),
+            ("function", r(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\*?\s+(?P<name>\w+)")),
+            ("const", r(r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>\w+)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|\w+\s*=>)")),
+            ("interface", r(r"^\s*(?:export\s+)?interface\s+(?P<name>\w+)")),
+            ("type", r(r"^\s*(?:export\s+)?type\s+(?P<name>\w+)")),
+            ("enum", r(r"^\s*(?:export\s+)?(?:const\s+)?enum\s+(?P<name>\w+)")),
+        ],
+        "go" => vec![
+            ("func", r(r"^\s*func\s+(?:\([^)]*\)\s*)?(?P<name>\w+)")),
+            ("type", r(r"^\s*type\s+(?P<name>\w+)\s+(?:struct|interface)")),
+        ],
+        "rb" => vec![
+            ("class", r(r"^\s*class\s+(?P<name>\w+)")),
+            ("module", r(r"^\s*module\s+(?P<name>\w+)")),
+            ("def", r(r"^\s*def\s+(?P<name>[\w.?!]+)")),
+        ],
+        "java" | "kt" | "scala" => vec![
+            ("type", r(r"^\s*(?:public|private|protected|abstract|final|static|sealed|open|data|\s)*\s*(?:class|interface|enum|object)\s+(?P<name>\w+)")),
+            ("method", r(r"^\s*(?:public|private|protected|static|final|abstract|synchronized|override|fun|def|\s)+[\w<>\[\],.\s]+?\s+(?P<name>\w+)\s*\([^;{]*\)\s*\{?\s*$")),
+        ],
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" => vec![
+            ("type", r(r"^\s*(?:class|struct)\s+(?P<name>\w+)")),
+            ("fn", r(r"^\s*(?:[\w:<>\*&]+\s+)+(?P<name>\w+)\s*\([^;]*\)\s*\{?\s*$")),
+        ],
+        _ => vec![],
+    }
+}
+
+#[async_trait]
+impl Tool for CodeOutline {
+    fn name(&self) -> &str {
+        "code_outline"
+    }
+    fn icon(&self) -> &'static str { "⌗" }
+    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn description(&self) -> &str {
+        "Extract a symbol map — functions, classes, structs, traits, methods, etc., \
+         each with its line number — from a source file. A fast table of contents so \
+         you can jump straight to a symbol with `fs.read` (offset/limit) instead of \
+         reading the whole file. Supports Rust, Python, JS/TS, Go, Ruby, Java/Kotlin, \
+         C/C++. Heuristic (line-based), so it's cheap but not a full parse."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "path": { "type": "string", "description": "Workspace-relative or absolute path to a source file" } },
+            "required": ["path"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(format!("read failed: {e}")))?;
+        let rules = outline_rules(&path);
+        if rules.is_empty() {
+            return Ok(json!({ "path": path, "symbols": [], "count": 0, "note": "unsupported file type for outline" }));
+        }
+        let mut symbols: Vec<Value> = Vec::new();
+        for (i, line) in content.lines().enumerate() {
+            for (kind, re) in &rules {
+                if let Some(caps) = re.captures(line) {
+                    if let Some(name) = caps.name("name") {
+                        symbols.push(json!({ "kind": kind, "name": name.as_str(), "line": i + 1 }));
+                        break; // one symbol per line
+                    }
+                }
+            }
+        }
+        let count = symbols.len();
+        Ok(json!({ "path": path, "symbols": symbols, "count": count }))
+    }
+}
+
+struct References {
+    sbx: Arc<WorkspaceSandbox>,
+}
+
+#[async_trait]
+impl Tool for References {
+    fn name(&self) -> &str {
+        "references"
+    }
+    fn icon(&self) -> &'static str { "↗" }
+    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn description(&self) -> &str {
+        "Find every place a symbol (function/type/variable name) appears — WHOLE-WORD \
+         matches only, so 'run' won't match 'running'. Returns {path, line, text} for \
+         each occurrence (you judge from the text which is the definition vs a use). \
+         Use after `code_outline` to see a symbol's call sites before changing or \
+         renaming it. More precise than `grep` for identifiers; use `grep` for free-form \
+         regex/text."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "symbol": { "type": "string", "description": "Identifier to locate (matched as a whole word)" },
+                "path": { "type": "string", "description": "Workspace-relative dir to scope the search (default '.')" },
+                "max_results": { "type": "integer", "description": "Cap on references returned (default 200)" }
+            },
+            "required": ["symbol"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let symbol = arg_str(args, "symbol")?;
+        let rel_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(200) as usize;
+
+        // Deterministic whole-word match — the reason to use this over `grep`. We do
+        // NOT classify definition-vs-use here: the caller sees the line text and can
+        // judge that far more reliably than a language-specific keyword heuristic could.
+        let esc = regex::escape(&symbol);
+        let word = Regex::new(&format!(r"\b{esc}\b")).map_err(|e| ToolError::Args(format!("bad symbol: {e}")))?;
+
+        let start = self.sbx.resolve(rel_path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let root = self.sbx.root().to_path_buf();
+
+        let mut refs: Vec<Value> = Vec::new();
+        let mut files = std::collections::HashSet::new();
+        let mut truncated = false;
+        let walk = WalkBuilder::new(&start).standard_filters(true).filter_entry(|e| !skip_dir(e)).build();
+        'outer: for dent in walk.flatten() {
+            if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if dent.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000 {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(dent.path()) else { continue };
+            let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
+            for (i, line) in content.lines().enumerate() {
+                if word.is_match(line) {
+                    if refs.len() >= max {
+                        truncated = true;
+                        break 'outer;
+                    }
+                    files.insert(rel.clone());
+                    refs.push(json!({
+                        "path": rel,
+                        "line": i + 1,
+                        "text": line.trim().chars().take(200).collect::<String>(),
+                    }));
+                }
+            }
+        }
+        let count = refs.len();
+        let file_count = files.len();
+        Ok(json!({ "symbol": symbol, "references": refs, "count": count, "files": file_count, "truncated": truncated }))
+    }
+}
+
+struct Tree {
+    sbx: Arc<WorkspaceSandbox>,
+}
+
+#[async_trait]
+impl Tool for Tree {
+    fn name(&self) -> &str {
+        "tree"
+    }
+    fn icon(&self) -> &'static str { "├" }
+    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn description(&self) -> &str {
+        "Show a directory as an indented, depth-limited tree (gitignore-aware, skips \
+         .git/target/node_modules) — the fastest way to orient in an unfamiliar \
+         project. Use `glob` to match files by pattern, `fs.list` for one directory."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative dir to root the tree (default '.')" },
+                "depth": { "type": "integer", "description": "Max levels deep (default 2)" },
+                "max_entries": { "type": "integer", "description": "Cap on entries listed (default 300)" }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let rel_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let depth = args.get("depth").and_then(Value::as_u64).unwrap_or(2).max(1) as usize;
+        let max = args.get("max_entries").and_then(Value::as_u64).unwrap_or(300) as usize;
+        let start = self.sbx.resolve(rel_path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+
+        let mut out = String::new();
+        let mut count = 0usize;
+        let mut truncated = false;
+        let walk = WalkBuilder::new(&start)
+            .max_depth(Some(depth))
+            .standard_filters(true)
+            .filter_entry(|e| !skip_dir(e))
+            .sort_by_file_name(std::cmp::Ord::cmp)
+            .build();
+        for dent in walk.flatten() {
+            let d = dent.depth();
+            if d == 0 {
+                continue; // skip the root itself
+            }
+            if count >= max {
+                truncated = true;
+                break;
+            }
+            let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let name = dent.file_name().to_string_lossy();
+            out.push_str(&"  ".repeat(d - 1));
+            out.push_str(&name);
+            if is_dir {
+                out.push('/');
+            }
+            out.push('\n');
+            count += 1;
+        }
+        Ok(json!({ "path": rel_path, "tree": out, "entries": count, "truncated": truncated }))
+    }
+}
+
+// ── artifact recovery ────────────────────────────────────────────────────────
+
+struct ReadArtifact {
+    store: Arc<dyn kernel::ArtifactStore>,
+}
+#[async_trait]
+impl Tool for ReadArtifact {
+    fn name(&self) -> &str {
+        "read_artifact"
+    }
+    fn icon(&self) -> &'static str { "⎘" }
+    fn description(&self) -> &str {
+        "Read a byte range of a large/earlier output that was spilled to the \
+         artifact store (referenced by a hash in a truncated tool result). Use \
+         `offset` and `length` to page through it."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "hash": { "type": "string", "description": "Artifact content hash" },
+                "offset": { "type": "integer", "description": "Start byte (default 0)" },
+                "length": { "type": "integer", "description": "Bytes to read (default: to end)" }
+            },
+            "required": ["hash"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let hash = arg_str(args, "hash")?;
+        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let length = args.get("length").and_then(Value::as_u64).map(|l| l as usize);
+        let total = self.store.size(&hash).map_err(ToolError::Failed)?;
+        let bytes = self.store.get(&hash, offset, length).map_err(ToolError::Failed)?;
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        Ok(json!({
+            "hash": hash,
+            "offset": offset,
+            "length": bytes.len(),
+            "total_size": total,
+            "content": content
+        }))
+    }
+}
+
+// ── web family (free: DuckDuckGo search, no key) ─────────────────────────────
+//
+// NOTE: web output is *untrusted* content (P7, `TrustLabel::Web`). The full
+// trust-flow escalation (taint: a tool whose params derive from web content is
+// escalated) lands with the governance layer; for now these are read-only.
+
+/// A realistic desktop-browser User-Agent. Search engines (DuckDuckGo especially)
+/// and many sites return empty/blocked responses to non-browser agents, so a
+/// browser UA is the single biggest reliability win for both search and fetch.
+const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+
+fn http_client() -> Result<reqwest::Client, ToolError> {
+    reqwest::Client::builder()
+        .user_agent(BROWSER_UA)
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| ToolError::Failed(e.to_string()))
+}
+
+/// True if `ip` is a non-public address that an agent-supplied fetch must never
+/// reach — loopback, RFC1918 private, link-local (incl. the 169.254.169.254
+/// cloud-metadata endpoint), CGNAT, unspecified/broadcast/multicast, and the
+/// IPv6 equivalents (including IPv4-mapped forms). This is the SSRF blocklist.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.octets()[0] == 0
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40) // 100.64.0.0/10 CGNAT
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg0 & 0xffc0) == 0xfe80 // link-local  fe80::/10
+                || (seg0 & 0xfe00) == 0xfc00 // unique-local fc00::/7
+        }
+    }
+}
+
+/// SSRF guard: require http/https and confirm the host does not resolve to any
+/// non-public address. Called before the initial request AND re-checked on
+/// every redirect hop (a redirect to `http://169.254.169.254/…` is the classic
+/// bypass). DNS is resolved here so a hostname pointing at an internal IP is
+/// caught; the per-hop re-check is the pragmatic defense against rebinding.
+fn validate_public_url(url: &reqwest::Url) -> Result<(), String> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("blocked URL scheme '{other}' (only http/https allowed)")),
+    }
+    let host = url.host_str().ok_or_else(|| "URL has no host".to_string())?;
+
+    // IP literal: check directly, no DNS.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_blocked_ip(ip) {
+            Err(format!("blocked non-public address: {ip}"))
+        } else {
+            Ok(())
+        };
+    }
+
+    // Hostname: reject if ANY resolved address is non-public.
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed for '{host}': {e}"))?;
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        if is_blocked_ip(addr.ip()) {
+            return Err(format!("blocked non-public address {} for host '{host}'", addr.ip()));
+        }
+    }
+    if !saw_any {
+        return Err(format!("no addresses resolved for host '{host}'"));
+    }
+    Ok(())
+}
+
+/// Read a response body into memory, but abort as soon as it exceeds `max`
+/// bytes — streaming rather than buffering the whole (possibly unbounded,
+/// chunked) body first. A declared oversized `Content-Length` is rejected up
+/// front. This is the cap the PDF/HTML size limits used to apply only *after*
+/// the entire body was already in memory.
+async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>, ToolError> {
+    use futures::StreamExt;
+    if let Some(len) = resp.content_length() {
+        if len as usize > max {
+            return Err(ToolError::Failed(format!(
+                "response too large: Content-Length {len} exceeds {max}-byte cap"
+            )));
+        }
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ToolError::Failed(e.to_string()))?;
+        if buf.len() + chunk.len() > max {
+            return Err(ToolError::Failed(format!("response exceeded {max}-byte cap")));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Like [`http_client`], but for agent-supplied `web.fetch` targets: redirects
+/// are followed only to URLs that pass [`validate_public_url`], so a public URL
+/// can't 30x-bounce the fetch into the internal network.
+fn fetch_client() -> Result<reqwest::Client, ToolError> {
+    reqwest::Client::builder()
+        .user_agent(BROWSER_UA)
+        .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many redirects");
+            }
+            match validate_public_url(attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(msg) => attempt.error(format!("blocked redirect: {msg}")),
+            }
+        }))
+        .build()
+        .map_err(|e| ToolError::Failed(e.to_string()))
+}
+
+struct WebSearch;
+#[async_trait]
+impl Tool for WebSearch {
+    fn name(&self) -> &str {
+        "web.search"
+    }
+    fn category(&self) -> ToolCategory { ToolCategory::Web }
+    fn description(&self) -> &str {
+        "Search the web. Returns {title, url, snippet}. Backends tried in order: \
+         Tavily (if TAVILY_API_KEY is set), Brave (BRAVE_API_KEY), a configured \
+         SearXNG (MEDHA_SEARXNG_URL), then DuckDuckGo best-effort. Follow up with \
+         web.fetch on a result url."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Search query" },
+                "max_results": { "type": "integer", "description": "Max results (default 8)" }
+            },
+            "required": ["query"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let query = arg_str(args, "query")?;
+        let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(8) as usize;
+        let client = http_client()?;
+
+        // Reliable free backends first: Brave (free-tier key), then a self-hosted
+        // SearXNG (no key), then DuckDuckGo best-effort (often anti-botted).
+        // Each tier falls through to the next on ANY failure — not just an
+        // absent key, but an invalid/placeholder key, an expired key, or a
+        // network error — so one misconfigured backend never breaks search.
+        let mut errors = Vec::new();
+
+        // Tavily first: purpose-built for LLM agents, no scraping, most reliable.
+        if let Ok(key) = std::env::var("TAVILY_API_KEY") {
+            if !key.trim().is_empty() {
+                match tavily_search(&client, &query, max, key.trim()).await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => errors.push(format!("tavily: {e}")),
+                }
+            }
+        }
+        if let Ok(key) = std::env::var("BRAVE_API_KEY") {
+            if !key.trim().is_empty() {
+                match brave_search(&client, &query, max, key.trim()).await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => errors.push(format!("brave: {e}")),
+                }
+            }
+        }
+        if let Ok(base) = std::env::var("MEDHA_SEARXNG_URL") {
+            if !base.trim().is_empty() {
+                match searxng_search(&client, &query, max, base.trim()).await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => errors.push(format!("searxng: {e}")),
+                }
+            }
+        }
+
+        match duckduckgo_search(&client, &query, max).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                errors.push(format!("duckduckgo: {e}"));
+                // All configured tiers failed: surface every attempt's error so
+                // the model (and the user) can see exactly what went wrong,
+                // rather than only the last backend's message.
+                Err(ToolError::Failed(errors.join("; ")))
+            }
+        }
+    }
+}
+
+/// Parses a DuckDuckGo results page (`html` string, `max` cap) into result values.
+type DdgParser = fn(&str, usize) -> Vec<Value>;
+
+async fn duckduckgo_search(
+    client: &reqwest::Client,
+    query: &str,
+    max: usize,
+) -> Result<Value, ToolError> {
+    // Try the scraper-friendly `lite` endpoint first, then the heavier `html` one.
+    // `lite` returns simple table markup and is far less aggressively bot-blocked.
+    let endpoints: [(&str, DdgParser); 2] = [
+        ("https://lite.duckduckgo.com/lite/", parse_ddg_lite),
+        ("https://html.duckduckgo.com/html/", parse_ddg),
+    ];
+    let mut last_err = String::from("no results parsed (DuckDuckGo may be anti-botting)");
+    for (url, parse) in endpoints {
+        let resp = client
+            .post(url)
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .header(reqwest::header::REFERER, "https://duckduckgo.com/")
+            .form(&[("q", query)])
+            .send()
+            .await;
+        let html = match resp {
+            Ok(r) => match r.text().await {
+                Ok(t) => t,
+                Err(e) => { last_err = e.to_string(); continue; }
+            },
+            Err(e) => { last_err = e.to_string(); continue; }
+        };
+        let results = parse(&html, max); // sync: scraper DOM never crosses an await
+        if !results.is_empty() {
+            let count = results.len();
+            return Ok(json!({ "query": query, "results": results, "count": count, "backend": "duckduckgo" }));
+        }
+    }
+    Err(ToolError::Failed(last_err))
+}
+
+/// Brave Search API (free tier; reliable). Header auth, JSON results.
+/// Tavily Search (https://api.tavily.com/search) — a search API built for LLM
+/// agents: clean, ranked results with an NLP summary per source in `content`.
+/// Bearer-authenticated; no scraping, so it's the most reliable backend.
+async fn tavily_search(
+    client: &reqwest::Client,
+    query: &str,
+    max: usize,
+    key: &str,
+) -> Result<Value, ToolError> {
+    let body = json!({
+        "query": query,
+        "search_depth": "basic",
+        "topic": "general",
+        "max_results": max.clamp(1, 20),
+    });
+    let resp = client
+        .post("https://api.tavily.com/search")
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let brief: String = body.chars().take(200).collect();
+        return Err(ToolError::Failed(format!("tavily {status}: {brief}")));
+    }
+    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("results").and_then(Value::as_array) {
+        for r in arr.iter().take(max) {
+            out.push(json!({
+                "title": r.get("title").and_then(Value::as_str).unwrap_or(""),
+                "url": r.get("url").and_then(Value::as_str).unwrap_or(""),
+                "snippet": r.get("content").and_then(Value::as_str).unwrap_or(""),
+            }));
+        }
+    }
+    if out.is_empty() {
+        return Err(ToolError::Failed("tavily: no results".into()));
+    }
+    let count = out.len();
+    Ok(json!({ "query": query, "results": out, "count": count, "backend": "tavily" }))
+}
+
+/// Tavily Extract (https://api.tavily.com/extract) — LLM-optimized page reader.
+/// Handles JS-heavy/anti-bot pages that a plain fetch can't; returns markdown.
+async fn tavily_extract(client: &reqwest::Client, url: &str, key: &str) -> Result<Value, ToolError> {
+    let body = json!({ "urls": url, "extract_depth": "basic", "format": "markdown" });
+    let resp = client
+        .post("https://api.tavily.com/extract")
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let brief: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
+        return Err(ToolError::Failed(format!("tavily extract {status}: {brief}")));
+    }
+    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
+    let content = v
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("raw_content"))
+        .and_then(Value::as_str);
+    match content {
+        Some(c) if !c.trim().is_empty() => {
+            Ok(json!({ "url": url, "status": 200, "title": "", "content": c, "backend": "tavily" }))
+        }
+        _ => Err(ToolError::Failed("tavily extract: no content returned".into())),
+    }
+}
+
+/// Tavily Crawl (https://api.tavily.com/crawl) — graph-based multi-page traversal
+/// from a root URL, with optional natural-language `instructions` to focus it.
+async fn tavily_crawl(
+    client: &reqwest::Client,
+    url: &str,
+    instructions: Option<&str>,
+    max_depth: u64,
+    limit: u64,
+    key: &str,
+) -> Result<Value, ToolError> {
+    let mut body = json!({
+        "url": url,
+        "max_depth": max_depth.clamp(1, 5),
+        "limit": limit.clamp(1, 100),
+        "extract_depth": "basic",
+        "format": "markdown",
+    });
+    if let Some(i) = instructions {
+        if !i.trim().is_empty() {
+            body["instructions"] = json!(i.trim());
+        }
+    }
+    let resp = client
+        .post("https://api.tavily.com/crawl")
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let brief: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
+        return Err(ToolError::Failed(format!("tavily crawl {status}: {brief}")));
+    }
+    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
+    let base = v.get("base_url").and_then(Value::as_str).unwrap_or(url).to_string();
+    let mut pages = Vec::new();
+    if let Some(arr) = v.get("results").and_then(Value::as_array) {
+        for r in arr {
+            let purl = r.get("url").and_then(Value::as_str).unwrap_or("");
+            // Cap per-page content so a big crawl can't blow the model's context.
+            let content: String = r
+                .get("raw_content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(4000)
+                .collect();
+            if !purl.is_empty() {
+                pages.push(json!({ "url": purl, "content": content }));
+            }
+        }
+    }
+    if pages.is_empty() {
+        return Err(ToolError::Failed(
+            "no pages returned — the site is likely JavaScript-rendered or has few \
+             crawlable links; use web.fetch on specific page URLs instead"
+                .into(),
+        ));
+    }
+    let count = pages.len();
+    Ok(json!({ "base_url": base, "pages": pages, "count": count, "backend": "tavily" }))
+}
+
+async fn brave_search(
+    client: &reqwest::Client,
+    query: &str,
+    max: usize,
+    key: &str,
+) -> Result<Value, ToolError> {
+    let count = max.to_string();
+    let resp = client
+        .get("https://api.search.brave.com/res/v1/web/search")
+        .header("X-Subscription-Token", key)
+        .header("Accept", "application/json")
+        .query(&[("q", query), ("count", count.as_str())])
+        .send()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ToolError::Failed(format!("brave search {status}: {body}")));
+    }
+    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
+    let mut out = Vec::new();
+    if let Some(arr) = v.pointer("/web/results").and_then(Value::as_array) {
+        for r in arr.iter().take(max) {
+            out.push(json!({
+                "title": r.get("title").and_then(Value::as_str).unwrap_or(""),
+                "url": r.get("url").and_then(Value::as_str).unwrap_or(""),
+                "snippet": r.get("description").and_then(Value::as_str).unwrap_or(""),
+            }));
+        }
+    }
+    let count = out.len();
+    Ok(json!({ "query": query, "results": out, "count": count, "backend": "brave" }))
+}
+
+/// Self-hosted SearXNG JSON API (free, no key) — the user points MEDHA_SEARXNG_URL
+/// at an instance they trust.
+async fn searxng_search(
+    client: &reqwest::Client,
+    query: &str,
+    max: usize,
+    base: &str,
+) -> Result<Value, ToolError> {
+    let url = format!("{}/search", base.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .query(&[("q", query), ("format", "json")])
+        .send()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(ToolError::Failed(format!("searxng {}", resp.status())));
+    }
+    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("results").and_then(Value::as_array) {
+        for r in arr.iter().take(max) {
+            out.push(json!({
+                "title": r.get("title").and_then(Value::as_str).unwrap_or(""),
+                "url": r.get("url").and_then(Value::as_str).unwrap_or(""),
+                "snippet": r.get("content").and_then(Value::as_str).unwrap_or(""),
+            }));
+        }
+    }
+    let count = out.len();
+    Ok(json!({ "query": query, "results": out, "count": count, "backend": "searxng" }))
+}
+
+/// Parse the `lite.duckduckgo.com/lite/` results table: result links carry
+/// `class="result-link"`, snippets are in `td.result-snippet` (in document order).
+fn parse_ddg_lite(html: &str, max: usize) -> Vec<Value> {
+    let doc = Html::parse_document(html);
+    let link_sel = Selector::parse("a.result-link").unwrap();
+    let snip_sel = Selector::parse("td.result-snippet, .result-snippet").unwrap();
+    let snippets: Vec<String> = doc
+        .select(&snip_sel)
+        .map(|s| s.text().collect::<String>().trim().to_string())
+        .collect();
+    let mut out = Vec::new();
+    for (i, a) in doc.select(&link_sel).enumerate() {
+        if out.len() >= max {
+            break;
+        }
+        let title = a.text().collect::<String>().trim().to_string();
+        let url = decode_ddg_url(a.value().attr("href").unwrap_or_default());
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        let snippet = snippets.get(i).cloned().unwrap_or_default();
+        out.push(json!({ "title": title, "url": url, "snippet": snippet }));
+    }
+    out
+}
+
+fn parse_ddg(html: &str, max: usize) -> Vec<Value> {
+    let doc = Html::parse_document(html);
+    // DuckDuckGo static HTML uses #links .result as container (any tag with class=result)
+    let res_sel = Selector::parse("#links .result").unwrap();
+    let title_sel = Selector::parse("a.result__a").unwrap();
+    let snip_sel = Selector::parse(".result__snippet").unwrap();
+
+    // Primary: structured result containers (title + snippet).
+    let mut out = Vec::new();
+    for el in doc.select(&res_sel) {
+        if out.len() >= max {
+            break;
+        }
+        let Some(a) = el.select(&title_sel).next() else { continue };
+        let title = a.text().collect::<String>().trim().to_string();
+        let url = decode_ddg_url(a.value().attr("href").unwrap_or_default());
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        let snippet = el
+            .select(&snip_sel)
+            .next()
+            .map(|s| s.text().collect::<String>().trim().to_string())
+            .unwrap_or_default();
+        out.push(json!({ "title": title, "url": url, "snippet": snippet }));
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    // Fallback: any anchor that is a DuckDuckGo result redirect (layout-robust).
+    let any = Selector::parse("a").unwrap();
+    for a in doc.select(&any) {
+        if out.len() >= max {
+            break;
+        }
+        let href = a.value().attr("href").unwrap_or_default();
+        if !href.contains("uddg=") {
+            continue;
+        }
+        let url = decode_ddg_url(href);
+        let title = a.text().collect::<String>().trim().to_string();
+        if !url.is_empty() && !title.is_empty() {
+            out.push(json!({ "title": title, "url": url, "snippet": "" }));
+        }
+    }
+    out
+}
+
+/// DuckDuckGo wraps result links as `//duckduckgo.com/l/?uddg=<encoded-url>`.
+fn decode_ddg_url(href: &str) -> String {
+    if let Some(i) = href.find("uddg=") {
+        let enc = href[i + 5..].split('&').next().unwrap_or("");
+        return urlencoding::decode(enc).map(|c| c.into_owned()).unwrap_or_default();
+    }
+    if href.starts_with("http") {
+        href.to_string()
+    } else if href.starts_with("//") {
+        format!("https:{href}")
+    } else {
+        String::new()
+    }
+}
+
+struct WebFetch;
+#[async_trait]
+impl Tool for WebFetch {
+    fn name(&self) -> &str {
+        "web.fetch"
+    }
+    fn icon(&self) -> &'static str { "↓" }
+    fn category(&self) -> ToolCategory { ToolCategory::Web }
+    fn description(&self) -> &str {
+        "Fetch a web page and return its readable content as Markdown (free plain \
+         fetch; falls back to Tavily Extract if TAVILY_API_KEY is set and the page \
+         blocks scrapers or errors). For crawling a whole site, use web.crawl."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "url": { "type": "string", "description": "Absolute URL to fetch" } },
+            "required": ["url"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let url = arg_str(args, "url")?;
+        match fetch_plain(&url).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // Plain fetch failed or the page blocked us — fall back to Tavily's
+                // LLM-optimized extractor when a key is configured.
+                if let Ok(key) = std::env::var("TAVILY_API_KEY") {
+                    if !key.trim().is_empty() {
+                        return tavily_extract(&http_client()?, &url, key.trim()).await.map_err(|te| {
+                            ToolError::Failed(format!("plain fetch failed ({e}); {te}"))
+                        });
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Free plain HTTP fetch → Markdown. Returns Err on network failure or a non-2xx
+/// status (so the caller can fall back to Tavily Extract on blocked/erroring pages).
+async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| ToolError::Failed(format!("invalid URL: {e}")))?;
+
+    // SSRF guard: reject internal/non-public targets before connecting. DNS is
+    // blocking, so resolve off the async workers.
+    {
+        let parsed = parsed.clone();
+        tokio::task::spawn_blocking(move || validate_public_url(&parsed))
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?
+            .map_err(ToolError::Failed)?;
+    }
+
+    let resp = fetch_client()?
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    let status = resp.status();
+    let code = status.as_u16();
+    let ctype = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // PDFs need the raw bytes (decoding to text would corrupt them), so
+    // branch before `.text()`. arXiv & friends serve `application/pdf`; also
+    // catch a `.pdf` URL in case the type header is generic.
+    if status.is_success() && (ctype.contains("pdf") || url.split('?').next().unwrap_or(url).ends_with(".pdf")) {
+        let bytes = read_body_capped(resp, 25 * 1024 * 1024).await?;
+        // Panic-isolated on the blocking pool: a malformed PDF that makes the
+        // extractor panic degrades to a message, it never takes down the run.
+        let text = tokio::task::spawn_blocking(move || extract_pdf_text(&bytes))
+            .await
+            .unwrap_or_else(|_| "[web.fetch: PDF extraction failed]".to_string());
+        return Ok(json!({ "url": url, "status": code, "title": "", "content": text }));
+    }
+
+    // A blocked/erroring page (403/404/5xx) → error so we can try Tavily Extract.
+    if !status.is_success() {
+        return Err(ToolError::Failed(format!("HTTP {code}")));
+    }
+
+    let raw = read_body_capped(resp, 16 * 1024 * 1024).await?;
+    let body = String::from_utf8_lossy(&raw).into_owned();
+    let title = extract_title(&body);
+
+    // Only HTML/text is converted. Binary content (PDF, images, …) must NOT
+    // be fed to the recursive HTML parser: on non-HTML bytes it can recurse
+    // until the worker stack overflows, which aborts the whole process
+    // (uncatchable). Report the type plainly instead.
+    let texty = ctype.contains("html")
+        || ctype.contains("xml")
+        || ctype.starts_with("text/")
+        || (ctype.is_empty() && body.trim_start().starts_with('<'));
+    if !texty {
+        let kind = if ctype.is_empty() { "binary content".to_string() } else { ctype };
+        return Ok(json!({
+            "url": url, "status": code, "title": title,
+            "content": format!(
+                "[web.fetch: {kind} ({} bytes) is not an HTML/text page — cannot convert to Markdown]",
+                body.len()
+            )
+        }));
+    }
+
+    // Conversion is CPU-bound and recursive → off the async workers and onto
+    // a large-stack thread (inside `html_to_markdown`) so it can't abort us.
+    let markdown = tokio::task::spawn_blocking(move || html_to_markdown(&body))
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    Ok(json!({ "url": url, "status": code, "title": title, "content": markdown }))
+}
+
+struct WebCrawl;
+#[async_trait]
+impl Tool for WebCrawl {
+    fn name(&self) -> &str {
+        "web.crawl"
+    }
+    fn icon(&self) -> &'static str { "⇊" }
+    fn category(&self) -> ToolCategory { ToolCategory::Web }
+    fn description(&self) -> &str {
+        "Fetch content from MANY pages under ONE site/root in a single call (Tavily; \
+         requires TAVILY_API_KEY). Use this — instead of calling web.fetch page by \
+         page — when the task needs multiple pages of the SAME site, e.g. 'read all \
+         the docs under this URL', 'every posting on this careers page', 'summarize \
+         this whole section'. Give natural-language `instructions` to focus it (e.g. \
+         'pages about pricing'). NOT for: a single known page (use web.fetch) or \
+         finding pages across different sites (use web.search)."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Root URL to start crawling" },
+                "instructions": { "type": "string", "description": "Optional: what to look for, in natural language" },
+                "max_depth": { "type": "integer", "description": "How far from the root to follow links (1-5, default 1)" },
+                "limit": { "type": "integer", "description": "Max pages to process (default 20)" }
+            },
+            "required": ["url"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let url = arg_str(args, "url")?;
+        let instructions = args.get("instructions").and_then(Value::as_str);
+        let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(1);
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
+        let key = std::env::var("TAVILY_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| ToolError::Failed("web.crawl requires TAVILY_API_KEY (set it in .env)".into()))?;
+        tavily_crawl(&http_client()?, &url, instructions, max_depth, limit, key.trim()).await
+    }
+}
+
+fn extract_title(html: &str) -> String {
+    Regex::new(r"(?is)<title[^>]*>(.*?)</title>")
+        .ok()
+        .and_then(|re| re.captures(html))
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Strip script/style noise, then convert to Markdown (free, no headless
+/// browser). `html2md` is a recursive descent over the DOM, so two guards keep
+/// it from overflowing the stack and aborting the process: the input is capped,
+/// and the parse runs on a thread with a large stack (deeply nested but valid
+/// HTML would otherwise blow the default 2 MB worker stack).
+fn html_to_markdown(html: &str) -> String {
+    const MAX_INPUT: usize = 4 * 1024 * 1024;
+    let truncated = if html.len() > MAX_INPUT {
+        let mut end = MAX_INPUT;
+        while !html.is_char_boundary(end) {
+            end -= 1;
+        }
+        &html[..end]
+    } else {
+        html
+    };
+    let no_script = Regex::new(r"(?is)<script.*?</script>").unwrap().replace_all(truncated, "");
+    let cleaned =
+        Regex::new(r"(?is)<style.*?</style>").unwrap().replace_all(&no_script, "").into_owned();
+
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || html2md::parse_html(&cleaned))
+        .ok()
+        .and_then(|h| h.join().ok())
+        .unwrap_or_else(|| "[web.fetch: page too complex to convert to Markdown]".to_string())
+}
+
+/// Extract the text of a PDF (e.g. an arXiv paper) so `web.fetch` returns
+/// something useful instead of refusing binary. Size-capped; empty output means
+/// a scanned/image PDF with no embedded text layer (we don't OCR).
+fn extract_pdf_text(bytes: &[u8]) -> String {
+    const MAX_PDF: usize = 25 * 1024 * 1024;
+    const MAX_OUT: usize = 400 * 1024;
+    if bytes.len() > MAX_PDF {
+        return format!("[web.fetch: PDF too large to extract ({} bytes)]", bytes.len());
+    }
+    match pdf_extract::extract_text_from_mem(bytes) {
+        Ok(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                "[web.fetch: PDF has no extractable text layer (likely scanned images)]".to_string()
+            } else if text.len() > MAX_OUT {
+                let mut end = MAX_OUT;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}\n\n[…truncated; {} total chars]", &text[..end], text.len())
+            } else {
+                text.to_string()
+            }
+        }
+        Err(e) => format!("[web.fetch: could not extract PDF text: {e}]"),
+    }
+}
+
+// ── shell family ─────────────────────────────────────────────────────────────
+
+/// The environment handed to `shell.exec` children: the current process env
+/// filtered down to a non-secret allowlist. Everything else (provider/API keys
+/// like TAVILY_API_KEY/BRAVE_API_KEY and any other injected secrets) is dropped,
+/// so an arbitrary shell command can't read them out of the environment.
+fn shell_env() -> Vec<(String, String)> {
+    const ALLOW: &[&str] = &[
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD",
+        "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE", "TERM", "TERMINFO",
+        "TZ", "COLUMNS", "LINES",
+        // Toolchain locators (paths, not secrets) so builds/tests still work.
+        "CARGO_HOME", "RUSTUP_HOME", "GOPATH", "GOROOT", "GOCACHE",
+        "JAVA_HOME", "NODE_PATH", "NVM_DIR", "PYENV_ROOT", "VIRTUAL_ENV",
+        "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    ];
+    std::env::vars()
+        .filter(|(k, _)| ALLOW.contains(&k.as_str()) || k.starts_with("LC_"))
+        .collect()
+}
+
+/// True if `program` resolves on the current PATH (or is an existing absolute
+/// path). Used to report "not installed" before invoking a checker, since under
+/// a sandbox wrapper a missing target no longer surfaces as a spawn error.
+fn program_on_path(program: &str) -> bool {
+    let p = std::path::Path::new(program);
+    if p.is_absolute() {
+        return p.exists();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).exists()))
+        .unwrap_or(false)
+}
+
+struct ShellExec {
+    sbx: Arc<WorkspaceSandbox>,
+}
+#[async_trait]
+impl Tool for ShellExec {
+    fn name(&self) -> &str {
+        "shell.exec"
+    }
+    fn category(&self) -> ToolCategory { ToolCategory::Shell }
+    fn description(&self) -> &str {
+        "Run any shell command in the workspace root and capture stdout/stderr/exit \
+         code — sed, awk, cat, diff, git, curl, build/test commands, pipelines, \
+         anything the shell provides. Prefer fs.edit for exact string-replace edits \
+         (it produces a reviewable diff) and glob/grep for finding files — use this \
+         for everything else, including multi-step shell pipelines."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        // Phase 0 runs locally in the workspace; the container backend and the
+        // pre-execution scanner (§4.6) harden this in Phase 1.
+        BlastRadius::IrreversibleLocal
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string", "description": "Command line to run via the shell" } },
+            "required": ["command"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let command = arg_str(args, "command")?;
+        // Run through the sandbox's execution backend (host or the OS-native
+        // jail), rooted at the workspace. `clear_env` + the allowlist keep
+        // injected API keys out of the child so a command can't exfiltrate them
+        // via `printenv` / `echo $TAVILY_API_KEY`; the backend also sets
+        // kill_on_drop so a timeout/cancel never leaks an orphaned process.
+        let output = self
+            .sbx
+            .exec("sh", &["-c".to_string(), command.clone()], shell_env(), true)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        Ok(json!({
+            "command": command,
+            "exit_code": output.status,
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        }))
+    }
+
+    async fn preview(&self, args: &Value) -> Option<String> {
+        args.get("command").and_then(|v| v.as_str()).map(|c| format!("$ {c}"))
+    }
+}
+
+// ── multi_edit ─────────────────────────────────────────────────────────────
+
+struct MultiEdit {
+    sbx: Arc<WorkspaceSandbox>,
+}
+
+/// Apply a sequence of exact-substring replacements to `content`, in order (each
+/// edit sees the previous one's result). All-or-nothing: if any edit's
+/// `old_string` is missing — or ambiguous without `replace_all` — the whole
+/// batch fails and nothing is returned, so a partial edit can never land.
+fn apply_edits(content: &str, edits: &[Value]) -> Result<String, ToolError> {
+    let mut cur = content.to_string();
+    for (i, e) in edits.iter().enumerate() {
+        let n = i + 1;
+        let old = e
+            .get("old_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Args(format!("edit #{n}: missing 'old_string'")))?;
+        let new = e
+            .get("new_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Args(format!("edit #{n}: missing 'new_string'")))?;
+        let replace_all = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+        let count = cur.matches(old).count();
+        if count == 0 {
+            return Err(ToolError::Failed(format!("edit #{n}: old_string not found")));
+        }
+        if count > 1 && !replace_all {
+            return Err(ToolError::Failed(format!(
+                "edit #{n}: old_string appears {count} times; pass replace_all or use a more specific string"
+            )));
+        }
+        cur = if replace_all { cur.replace(old, new) } else { cur.replacen(old, new, 1) };
+    }
+    Ok(cur)
+}
+
+#[async_trait]
+impl Tool for MultiEdit {
+    fn name(&self) -> &str {
+        "multi_edit"
+    }
+    fn icon(&self) -> &'static str { "❏" }
+    fn description(&self) -> &str {
+        "Apply several exact-substring edits to ONE file atomically, in order — one \
+         snapshot, one write, one combined diff. All-or-nothing: if any edit's \
+         `old_string` isn't found (or is ambiguous without `replace_all`), NOTHING is \
+         written. Prefer this over multiple `fs.edit` calls when changing several places \
+         in the same file — it's cheaper and can't leave the file half-edited. Each edit \
+         sees the result of the previous one."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::ReversibleLocal
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative or absolute path" },
+                "edits": {
+                    "type": "array",
+                    "description": "Edits applied in order; each sees the previous edit's result",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": { "type": "string", "description": "Exact text to replace" },
+                            "new_string": { "type": "string", "description": "Replacement text" },
+                            "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false)" }
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
+                }
+            },
+            "required": ["path", "edits"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let edits = args
+            .get("edits")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ToolError::Args("expected array 'edits'".into()))?;
+        if edits.is_empty() {
+            return Err(ToolError::Args("'edits' is empty".into()));
+        }
+        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let updated = apply_edits(&content, edits)?;
+        let snapshot =
+            self.sbx.write(&path, &updated).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let diff = make_diff(&path, &content, &updated);
+        Ok(json!({
+            "path": path,
+            "edits_applied": edits.len(),
+            "diff": diff,
+            "old": content,
+            "new": updated,
+            "snapshot": snapshot
+        }))
+    }
+
+    async fn preview(&self, args: &Value) -> Option<String> {
+        let path = args.get("path")?.as_str()?;
+        let edits = args.get("edits")?.as_array()?;
+        let content = self.sbx.read(path).await.ok()?;
+        match apply_edits(&content, edits) {
+            Ok(updated) => Some(cap_preview(&make_diff(path, &content, &updated))),
+            Err(e) => Some(format!("({e} — this multi_edit would fail)")),
+        }
+    }
+}
+
+// ── git (read-only) ──────────────────────────────────────────────────────────
+
+struct Git {
+    sbx: Arc<WorkspaceSandbox>,
+}
+
+/// Reject an argument that could be mistaken for a git flag (leading `-`).
+/// User-supplied revs/paths are passed as plain argv (no shell), and paths go
+/// after `--`, so this closes the only remaining flag-injection gap.
+fn safe_git_arg(s: &str) -> Result<&str, ToolError> {
+    if s.starts_with('-') {
+        return Err(ToolError::Args(format!(
+            "invalid git argument '{s}' (must not start with '-')"
+        )));
+    }
+    Ok(s)
+}
+
+#[async_trait]
+impl Tool for Git {
+    fn name(&self) -> &str {
+        "git"
+    }
+    fn category(&self) -> ToolCategory { ToolCategory::Vcs }
+    fn description(&self) -> &str {
+        "Git as a structured tool. Read-only inspection — `status`, `diff`, `log`, \
+         `blame`, `show` — plus `add` and `commit` (which are approval-gated). Use this \
+         instead of `shell.exec` for git: reads never mutate the repo, and writes go \
+         through the human gate. Branches/pushes/rebases are intentionally out of scope \
+         — use `shell.exec` for those."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        // Mixed: reads are READ, commit/add stage/record changes. Report the max
+        // (a commit is reversible via git). Policy gates the mutating subcommands.
+        BlastRadius::ReversibleLocal
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "subcommand": { "type": "string", "enum": ["status","diff","log","blame","show","add","commit"], "description": "Which git command (add/commit are approval-gated)" },
+                "path": { "type": "string", "description": "Limit to this file/dir (diff/log/blame); what to stage (add, default '.')" },
+                "rev": { "type": "string", "description": "Revision/ref for diff/show/log (e.g. HEAD, a branch, a SHA)" },
+                "staged": { "type": "boolean", "description": "diff: show staged changes (--staged)" },
+                "max_count": { "type": "integer", "description": "log: number of commits (default 20)" },
+                "message": { "type": "string", "description": "commit: the commit message (required for commit)" },
+                "all": { "type": "boolean", "description": "commit: stage all tracked changes first (-a)" }
+            },
+            "required": ["subcommand"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let sub = arg_str(args, "subcommand")?;
+        let path = args.get("path").and_then(Value::as_str);
+        let rev = args.get("rev").and_then(Value::as_str);
+        let mut ga: Vec<String> = Vec::new();
+        match sub.as_str() {
+            "status" => ga.extend(["status".into(), "--short".into(), "--branch".into()]),
+            "diff" => {
+                ga.push("diff".into());
+                if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
+                    ga.push("--staged".into());
+                }
+                if let Some(r) = rev {
+                    ga.push(safe_git_arg(r)?.into());
+                }
+            }
+            "log" => {
+                let n = args.get("max_count").and_then(Value::as_u64).unwrap_or(20);
+                ga.extend(["log".into(), "--oneline".into(), "-n".into(), n.to_string()]);
+                if let Some(r) = rev {
+                    ga.push(safe_git_arg(r)?.into());
+                }
+            }
+            "blame" => {
+                path.ok_or_else(|| ToolError::Args("blame requires 'path'".into()))?;
+                ga.push("blame".into());
+            }
+            "show" => {
+                ga.extend(["show".into(), "--stat".into(), safe_git_arg(rev.unwrap_or("HEAD"))?.into()]);
+            }
+            "add" => ga.push("add".into()),
+            "commit" => {
+                let msg = arg_str(args, "message")
+                    .map_err(|_| ToolError::Args("commit requires 'message'".into()))?;
+                ga.push("commit".into());
+                if args.get("all").and_then(Value::as_bool).unwrap_or(false) {
+                    ga.push("-a".into());
+                }
+                // `-m <msg>` — msg is the value consumed by -m, so a leading '-' is
+                // harmless; passed as its own argv element (no shell).
+                ga.push("-m".into());
+                ga.push(msg);
+            }
+            other => return Err(ToolError::Args(format!("unknown git subcommand '{other}'"))),
+        }
+        // User paths go after `--` so they can never be read as flags.
+        if matches!(sub.as_str(), "diff" | "log" | "blame") {
+            if let Some(p) = path {
+                ga.push("--".into());
+                ga.push(safe_git_arg(p)?.into());
+            }
+        }
+        if sub == "add" {
+            ga.push("--".into());
+            ga.push(safe_git_arg(path.unwrap_or("."))?.into());
+        }
+        // Fixed git subcommand, run through the sandbox backend (inherits env —
+        // git needs $HOME/$PATH; it's not an arbitrary-command surface).
+        let output = self
+            .sbx
+            .exec("git", &ga, vec![], false)
+            .await
+            .map_err(|e| ToolError::Failed(format!("failed to run git: {e}")))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Cap large output (a long log/diff) so it doesn't flood context.
+        let capped: String = stdout.lines().take(400).collect::<Vec<_>>().join("\n");
+        Ok(json!({
+            "subcommand": sub,
+            "exit_code": output.status,
+            "stdout": capped,
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        }))
+    }
+
+    async fn preview(&self, args: &Value) -> Option<String> {
+        // Only the mutating subcommands reach the gate; show what will run.
+        match args.get("subcommand").and_then(Value::as_str)? {
+            "commit" => {
+                let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
+                let all = if args.get("all").and_then(Value::as_bool).unwrap_or(false) { " -a" } else { "" };
+                Some(format!("git commit{all} -m {msg:?}"))
+            }
+            "add" => {
+                Some(format!("git add -- {}", args.get("path").and_then(Value::as_str).unwrap_or(".")))
+            }
+            _ => None,
+        }
+    }
+}
+
+// ── diagnostics ──────────────────────────────────────────────────────────────
+
+struct Diagnostics {
+    sbx: Arc<WorkspaceSandbox>,
+}
+
+/// Parse `cargo check --message-format=json` stdout into structured diagnostics.
+/// Each stdout line is one JSON object; we keep `compiler-message` errors and
+/// warnings, pulling the primary span for file/line/column.
+fn cargo_diagnostics(stdout: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v.get("reason").and_then(Value::as_str) != Some("compiler-message") {
+            continue;
+        }
+        let Some(msg) = v.get("message") else { continue };
+        let level = msg.get("level").and_then(Value::as_str).unwrap_or("");
+        if !matches!(level, "error" | "warning") {
+            continue;
+        }
+        let text = msg.get("message").and_then(Value::as_str).unwrap_or("").to_string();
+        let code =
+            msg.get("code").and_then(|c| c.get("code")).and_then(Value::as_str).map(str::to_string);
+        let (file, line_no, col) = msg
+            .get("spans")
+            .and_then(Value::as_array)
+            .and_then(|spans| {
+                spans
+                    .iter()
+                    .find(|s| s.get("is_primary").and_then(Value::as_bool) == Some(true))
+                    .or_else(|| spans.first())
+            })
+            .map(|s| {
+                (
+                    s.get("file_name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    s.get("line_start").and_then(Value::as_u64).unwrap_or(0),
+                    s.get("column_start").and_then(Value::as_u64).unwrap_or(0),
+                )
+            })
+            .unwrap_or_default();
+        out.push(json!({
+            "severity": level, "file": file, "line": line_no, "column": col,
+            "code": code, "message": text
+        }));
+    }
+    out
+}
+
+/// The toolchains `diagnostics` knows how to check. Each maps to ONE fixed,
+/// argument-free command — no user-supplied command string ever runs (that would
+/// be an ungated `shell.exec` bypass).
+#[derive(Clone, Copy, PartialEq)]
+enum DiagLang {
+    Rust,
+    TypeScript,
+    Python,
+}
+
+/// Detect the toolchain from marker files at the workspace root. First match wins.
+fn detect_lang(root: &std::path::Path) -> Option<DiagLang> {
+    if root.join("Cargo.toml").exists() {
+        Some(DiagLang::Rust)
+    } else if root.join("tsconfig.json").exists() {
+        Some(DiagLang::TypeScript)
+    } else if root.join("pyproject.toml").exists()
+        || root.join("ruff.toml").exists()
+        || root.join(".ruff.toml").exists()
+    {
+        Some(DiagLang::Python)
+    } else {
+        None
+    }
+}
+
+/// Parse `tsc --noEmit --pretty false` output lines:
+/// `src/x.ts(12,5): error TS2322: Type '...' is not assignable ...`
+fn tsc_diagnostics(stdout: &str) -> Vec<Value> {
+    let re = Regex::new(r"^(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(TS\d+):\s*(.*)$").unwrap();
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let c = re.captures(l.trim())?;
+            Some(json!({
+                "severity": &c[4],
+                "file": &c[1],
+                "line": c[2].parse::<u64>().unwrap_or(0),
+                "column": c[3].parse::<u64>().unwrap_or(0),
+                "code": &c[5],
+                "message": &c[6],
+            }))
+        })
+        .collect()
+}
+
+/// Parse `ruff check --output-format=json`: an array of
+/// `{filename, location:{row,column}, code, message}`. Ruff emits lint findings
+/// (no per-item severity), so all are reported as `warning`.
+fn ruff_diagnostics(stdout: &str) -> Vec<Value> {
+    let Ok(items) = serde_json::from_str::<Vec<Value>>(stdout) else { return vec![] };
+    items
+        .iter()
+        .map(|it| {
+            let loc = it.get("location");
+            json!({
+                "severity": "warning",
+                "file": it.get("filename").and_then(Value::as_str).unwrap_or(""),
+                "line": loc.and_then(|l| l.get("row")).and_then(Value::as_u64).unwrap_or(0),
+                "column": loc.and_then(|l| l.get("column")).and_then(Value::as_u64).unwrap_or(0),
+                "code": it.get("code").and_then(Value::as_str),
+                "message": it.get("message").and_then(Value::as_str).unwrap_or(""),
+            })
+        })
+        .collect()
+}
+
+#[async_trait]
+impl Tool for Diagnostics {
+    fn name(&self) -> &str {
+        "diagnostics"
+    }
+    fn category(&self) -> ToolCategory { ToolCategory::Diagnostic }
+    fn description(&self) -> &str {
+        "Get STRUCTURED compiler/linter diagnostics — {file, line, column, severity, \
+         code, message} — for the workspace, instead of scraping raw build output. \
+         Auto-detects the toolchain (Rust→`cargo check`, TypeScript→`tsc --noEmit`, \
+         Python→`ruff check`) or pass `language` to force one. Use after edits to find \
+         exactly what broke and where."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        // Analysis only: it inspects the code and reports problems; it doesn't
+        // touch source (build artifacts aside), like the verifier.
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "language": { "type": "string", "enum": ["rust","typescript","python"], "description": "Force a toolchain; omit to auto-detect from the workspace" }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let root = self.sbx.root();
+        // Language is an ENUM, never a free command string — no shell.exec bypass.
+        let lang = match args.get("language").and_then(Value::as_str) {
+            Some("rust") => Some(DiagLang::Rust),
+            Some("typescript") | Some("ts") => Some(DiagLang::TypeScript),
+            Some("python") | Some("py") => Some(DiagLang::Python),
+            Some(other) => {
+                return Err(ToolError::Args(format!(
+                    "unknown language '{other}' (rust|typescript|python)"
+                )))
+            }
+            None => detect_lang(root),
+        };
+        let Some(lang) = lang else {
+            return Ok(json!({
+                "supported": false,
+                "note": "no supported project detected (looked for Cargo.toml, tsconfig.json, pyproject.toml/ruff.toml). Pass `language`, or use shell.exec for another checker."
+            }));
+        };
+        // Each language → ONE fixed command with fixed args.
+        let (program, cmd_args, checker): (&str, &[&str], &str) = match lang {
+            DiagLang::Rust => ("cargo", &["check", "--message-format=json", "--quiet"], "cargo check"),
+            DiagLang::TypeScript => ("npx", &["--no-install", "tsc", "--noEmit", "--pretty", "false"], "tsc"),
+            DiagLang::Python => ("ruff", &["check", "--output-format=json", "."], "ruff"),
+        };
+        // Under a sandbox wrapper a missing checker no longer surfaces as a
+        // spawn error on our side (the wrapper spawns fine, then fails to exec
+        // the target), so check PATH up front to keep the honest "not installed"
+        // report instead of a confusing non-zero exit.
+        if !program_on_path(program) {
+            return Ok(json!({
+                "supported": false,
+                "checker": checker,
+                "note": format!("could not run {checker}: '{program}' not found on PATH. Is it installed?")
+            }));
+        }
+        let cmd_args_owned: Vec<String> = cmd_args.iter().map(|s| s.to_string()).collect();
+        let output = match self.sbx.exec(program, &cmd_args_owned, vec![], false).await {
+            Ok(o) => o,
+            Err(e) => {
+                return Ok(json!({
+                    "supported": false,
+                    "checker": checker,
+                    "note": format!("could not run {checker}: {e}. Is it installed and on PATH?")
+                }))
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let diags = match lang {
+            DiagLang::Rust => cargo_diagnostics(&stdout),
+            DiagLang::TypeScript => tsc_diagnostics(&stdout),
+            DiagLang::Python => ruff_diagnostics(&stdout),
+        };
+        let errors = diags.iter().filter(|d| d["severity"] == "error").count();
+        let warnings = diags.iter().filter(|d| d["severity"] == "warning").count();
+        let mut result = json!({
+            "supported": true,
+            "checker": checker,
+            "errors": errors,
+            "warnings": warnings,
+            "diagnostics": diags,
+        });
+        // If the checker itself failed (config error, missing sub-tool via npx)
+        // and produced no parseable diagnostics, surface stderr rather than
+        // silently reporting a clean run.
+        if errors == 0 && warnings == 0 && output.status != Some(0) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            result["note"] = json!(format!(
+                "{checker} exited non-zero with no parsed diagnostics — stderr: {}",
+                tail.join(" | ")
+            ));
+        }
+        Ok(result)
+    }
+}
+
+// ── planning ─────────────────────────────────────────────────────────────────
+
+/// A cognitive tool (no side effects): the model maintains a live checklist for
+/// a multi-step task. It passes the *full* list each call, so the latest call
+/// is the current plan; the surface renders it and the event log captures the
+/// agent's intent + progress over time (P3). This is what lets the agent lay
+/// out a plan for complex work and tick it off as it goes.
+struct UpdatePlan;
+
+#[async_trait]
+impl Tool for UpdatePlan {
+    fn name(&self) -> &str {
+        "update_plan"
+    }
+    fn category(&self) -> ToolCategory { ToolCategory::Plan }
+    fn description(&self) -> &str {
+        "Create and maintain your TODO list for the current task — this is your planning \
+         tool and the user's live progress view. Call it PROACTIVELY: the moment a task \
+         needs 3 or more steps, before doing anything else, call it with the full ordered \
+         list of steps (first step `in_progress`, the rest `pending`). Then call it again \
+         after each step to mark that step `completed` and set the next to `in_progress`. \
+         ALWAYS pass the COMPLETE list every time (it replaces the previous one). Exactly \
+         ONE step is `in_progress`. Skipping this on a multi-step task is a mistake — the \
+         user relies on it to see what you're doing. Optional `explanation`: a one-line \
+         note about the update (shown above the list)."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "explanation": { "type": "string", "description": "Optional one-line note about this plan update (what changed / why)." },
+                "steps": {
+                    "type": "array",
+                    "description": "The full ordered list of steps.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string", "description": "Short imperative step description." },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                        },
+                        "required": ["title", "status"]
+                    }
+                }
+            },
+            "required": ["steps"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let steps = args
+            .get("steps")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ToolError::Args("expected array 'steps'".into()))?;
+        let mut out = Vec::with_capacity(steps.len());
+        // Enforce the invariant the model is asked to keep: at most ONE step
+        // `in_progress`. If it slips and marks several, keep the first and demote the
+        // rest to `pending` — so the rendered plan is always unambiguous.
+        let mut seen_active = false;
+        for s in steps {
+            let title = s
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::Args("each step needs a 'title'".into()))?;
+            // compatible enum is `completed`; accept the legacy `done` too and
+            // normalize, so a model that emits either works.
+            let mut status = match s.get("status").and_then(Value::as_str) {
+                Some("in_progress") => "in_progress",
+                Some("completed" | "done") => "completed",
+                _ => "pending",
+            };
+            if status == "in_progress" {
+                if seen_active { status = "pending"; } else { seen_active = true; }
+            }
+            out.push(json!({ "title": title, "status": status }));
+        }
+        let done = out.iter().filter(|s| s["status"] == "completed").count();
+        let mut result = json!({ "steps": out, "total": out.len(), "done": done });
+        if let Some(exp) = args.get("explanation").and_then(Value::as_str) {
+            if !exp.trim().is_empty() {
+                result["explanation"] = json!(exp.trim());
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scan source with the outline rules the same way the tool does.
+    fn scan_outline(path: &str, src: &str) -> Vec<(String, String, usize)> {
+        let rules = outline_rules(path);
+        let mut out = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            for (kind, re) in &rules {
+                if let Some(c) = re.captures(line) {
+                    if let Some(n) = c.name("name") {
+                        out.push((kind.to_string(), n.as_str().to_string(), i + 1));
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn code_outline_rust() {
+        let src = "pub fn foo() {}\nstruct Bar;\n    async fn baz() {}\nimpl Bar {}\npub trait T {}\n";
+        let s = scan_outline("x.rs", src);
+        assert!(s.iter().any(|(k, n, _)| k == "fn" && n == "foo"));
+        assert!(s.iter().any(|(k, n, _)| k == "struct" && n == "Bar"));
+        assert!(s.iter().any(|(k, n, _)| k == "fn" && n == "baz"));
+        assert!(s.iter().any(|(k, n, _)| k == "impl" && n == "Bar"));
+        assert!(s.iter().any(|(k, n, _)| k == "trait" && n == "T"));
+    }
+
+    #[test]
+    fn code_outline_python() {
+        let src = "class A:\n    def m(self):\n        pass\nasync def h():\n    pass\n";
+        let s = scan_outline("x.py", src);
+        assert!(s.iter().any(|(k, n, l)| k == "class" && n == "A" && *l == 1));
+        assert!(s.iter().any(|(k, n, _)| k == "def" && n == "m"));
+        assert!(s.iter().any(|(k, n, _)| k == "def" && n == "h"));
+    }
+
+    #[test]
+    fn code_outline_unknown_ext_is_empty() {
+        assert!(outline_rules("notes.txt").is_empty());
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_internal_and_bad_schemes() {
+        // IP literals and a non-http scheme need no DNS, so this is hermetic.
+        for bad in [
+            "http://127.0.0.1/x",
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "http://10.0.0.5/",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://[::1]/",
+            "http://0.0.0.0/",
+            "http://100.64.0.1/",           // CGNAT
+            "ftp://example.com/passwd",     // disallowed scheme
+            "file:///etc/passwd",           // disallowed scheme
+        ] {
+            let u = reqwest::Url::parse(bad).unwrap();
+            assert!(validate_public_url(&u).is_err(), "should block {bad}");
+        }
+        // A public IP literal passes the guard.
+        let ok = reqwest::Url::parse("http://1.1.1.1/").unwrap();
+        assert!(validate_public_url(&ok).is_ok(), "public address should pass");
+    }
+
+    #[tokio::test]
+    async fn references_whole_word_and_definition_flag() {
+        let dir = std::env::temp_dir().join(format!("medha-refs-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `helper` is defined once and called once; `helperx` must NOT match.
+        std::fs::write(dir.join("a.rs"), "fn helper() {}\nfn main() {\n    helper();\n    let helperx = 1;\n}\n").unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let tool = References { sbx };
+        let out = tool.execute(&json!({ "symbol": "helper" })).await.unwrap();
+        // Whole-word: matches the def line and the call, but NOT `helperx`.
+        assert_eq!(out["count"].as_u64().unwrap(), 2, "should match the def line and the call, not helperx");
+        let refs = out["references"].as_array().unwrap();
+        assert!(refs.iter().all(|r| r["text"].as_str().unwrap().contains("helper")));
+    }
+
+    #[tokio::test]
+    async fn tree_lists_nested_structure() {
+        let dir = std::env::temp_dir().join(format!("medha-tree-{}", ulid_like()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src").join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("README.md"), "# hi").unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let tool = Tree { sbx };
+        let out = tool.execute(&json!({ "depth": 2 })).await.unwrap();
+        let tree = out["tree"].as_str().unwrap();
+        assert!(tree.contains("src/"), "tree: {tree}");
+        assert!(tree.contains("main.rs"));
+        assert!(tree.contains("README.md"));
+    }
+
+    #[tokio::test]
+    async fn registry_executes_fs_write_then_read() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+
+        // specs are exposed and sorted
+        let names: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"fs.write".to_string()));
+
+        let write = ToolIntent {
+            id: "1".into(),
+            tool: "fs.write".into(),
+            args: json!({ "path": "x.txt", "content": "hi" }),
+        };
+        let obs = reg.execute(&write).await;
+        assert_eq!(obs.status, kernel::ObsStatus::Ok);
+
+        let read = ToolIntent {
+            id: "2".into(),
+            tool: "fs.read".into(),
+            args: json!({ "path": "x.txt" }),
+        };
+        let obs = reg.execute(&read).await;
+        assert_eq!(obs.payload["content"], "hi");
+    }
+
+    /// End-to-end proof that `shell.exec`, routed through a native-backed
+    /// workspace, is actually confined: an in-workspace write succeeds, a write
+    /// to $HOME is blocked by the OS jail.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn shell_exec_is_jailed_under_native_backend() {
+        let dir = std::env::temp_dir().join(format!("medha-shelljail-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = sandbox::select_backend(
+            &sandbox::SandboxConfig {
+                backend: sandbox::BackendKind::Native,
+                net: sandbox::NetPolicy::Allow,
+                ..Default::default()
+            },
+            vec![],
+        );
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap().with_exec_backend(backend));
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+
+        let inside = reg
+            .execute(&ToolIntent {
+                id: "1".into(),
+                tool: "shell.exec".into(),
+                args: json!({ "command": "touch inside.txt" }),
+            })
+            .await;
+        assert_eq!(inside.payload["exit_code"].as_i64(), Some(0), "in-workspace write should succeed");
+        assert!(dir.join("inside.txt").exists());
+
+        let marker = format!(".medha-shelljail-escape-{}", ulid_like());
+        let outside = reg
+            .execute(&ToolIntent {
+                id: "2".into(),
+                tool: "shell.exec".into(),
+                args: json!({ "command": format!("touch \"$HOME/{marker}\"") }),
+            })
+            .await;
+        assert_ne!(outside.payload["exit_code"].as_i64(), Some(0), "shell write to HOME must be blocked");
+        let home = std::env::var("HOME").unwrap();
+        assert!(!std::path::Path::new(&home).join(&marker).exists(), "escape file must not exist");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn update_plan_echoes_steps_and_counts_done() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+        let obs = reg
+            .execute(&ToolIntent {
+                id: "p".into(),
+                tool: "update_plan".into(),
+                args: json!({ "steps": [
+                    { "title": "read files", "status": "done" },
+                    { "title": "write page", "status": "in_progress" },
+                    { "title": "verify", "status": "pending" }
+                ] }),
+            })
+            .await;
+        assert_eq!(obs.status, kernel::ObsStatus::Ok);
+        assert_eq!(obs.payload["total"], 3);
+        assert_eq!(obs.payload["done"], 1);
+        assert_eq!(obs.payload["steps"][1]["status"], "in_progress");
+    }
+
+    #[tokio::test]
+    async fn update_plan_enforces_single_active_and_keeps_explanation() {
+        let dir = std::env::temp_dir().join(format!("medha-plan-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+        let obs = reg
+            .execute(&ToolIntent {
+                id: "p".into(),
+                tool: "update_plan".into(),
+                args: json!({ "explanation": "starting the write", "steps": [
+                    { "title": "a", "status": "in_progress" },
+                    { "title": "b", "status": "in_progress" },
+                    { "title": "c", "status": "pending" }
+                ] }),
+            })
+            .await;
+        assert_eq!(obs.payload["steps"][0]["status"], "in_progress");
+        assert_eq!(obs.payload["steps"][1]["status"], "pending", "a second active step is demoted");
+        assert_eq!(obs.payload["explanation"], "starting the write");
+    }
+
+    #[test]
+    fn extract_pdf_text_smoke() {
+        // Set MEDHA_TEST_PDF=/path/to.pdf to exercise against a real file.
+        let Ok(path) = std::env::var("MEDHA_TEST_PDF") else { return };
+        let bytes = std::fs::read(path).unwrap();
+        let out = extract_pdf_text(&bytes);
+        assert!(!out.is_empty());
+        assert!(!out.starts_with("[web.fetch: could not"), "extraction errored: {out}");
+        eprintln!("extracted {} chars; head: {:?}", out.len(), &out[..out.len().min(120)]);
+    }
+
+    #[test]
+    fn html_to_markdown_converts_and_caps_large_input() {
+        let md = html_to_markdown("<h1>Title</h1><p>Hello <b>world</b></p>");
+        assert!(md.contains("Title"), "converts basic HTML");
+        // Oversized input is truncated before the recursive parser sees it.
+        let big = format!("<p>{}</p>", "x".repeat(6 * 1024 * 1024));
+        let out = html_to_markdown(&big);
+        assert!(out.len() <= 5 * 1024 * 1024, "large input is capped");
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_is_denied() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+        let obs = reg
+            .execute(&ToolIntent { id: "9".into(), tool: "nope".into(), args: json!({}) })
+            .await;
+        assert_eq!(obs.status, kernel::ObsStatus::Denied);
+    }
+
+    #[tokio::test]
+    async fn fs_edit_diffs_and_grep_finds() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+
+        reg.execute(&ToolIntent {
+            id: "1".into(),
+            tool: "fs.write".into(),
+            args: json!({ "path": "f.txt", "content": "alpha\nbeta\ngamma\n" }),
+        })
+        .await;
+
+        // edit: replace a unique line, expect a diff with -/+ lines
+        let edit = reg
+            .execute(&ToolIntent {
+                id: "2".into(),
+                tool: "fs.edit".into(),
+                args: json!({ "path": "f.txt", "old_string": "beta", "new_string": "BETA" }),
+            })
+            .await;
+        assert_eq!(edit.status, kernel::ObsStatus::Ok);
+        let diff = edit.payload["diff"].as_str().unwrap();
+        assert!(diff.contains("-beta"), "diff shows removal");
+        assert!(diff.contains("+BETA"), "diff shows insertion");
+
+        // grep finds the edited content
+        let g = reg
+            .execute(&ToolIntent {
+                id: "3".into(),
+                tool: "grep".into(),
+                args: json!({ "pattern": "BETA", "path": "." }),
+            })
+            .await;
+        assert_eq!(g.status, kernel::ObsStatus::Ok);
+        assert!(g.payload["count"].as_u64().unwrap() >= 1);
+
+        // edit with a non-unique match is rejected (no replace_all)
+        let bad = reg
+            .execute(&ToolIntent {
+                id: "4".into(),
+                tool: "fs.edit".into(),
+                args: json!({ "path": "f.txt", "old_string": "a", "new_string": "x" }),
+            })
+            .await;
+        assert_eq!(bad.status, kernel::ObsStatus::Error);
+    }
+
+    #[test]
+    fn multi_edit_applies_in_order_and_is_atomic() {
+        let src = "one two three\n";
+        // Sequential edits, each seeing the previous result.
+        let ok = apply_edits(
+            src,
+            &[
+                json!({ "old_string": "one", "new_string": "1" }),
+                json!({ "old_string": "1 two", "new_string": "1-2" }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(ok, "1-2 three\n");
+        // A missing old_string aborts the WHOLE batch (nothing applied).
+        let err = apply_edits(
+            src,
+            &[
+                json!({ "old_string": "one", "new_string": "1" }),
+                json!({ "old_string": "nope", "new_string": "x" }),
+            ],
+        );
+        assert!(err.is_err(), "batch must fail atomically on a missing match");
+        // Ambiguous match without replace_all is rejected.
+        assert!(apply_edits("a a a", &[json!({ "old_string": "a", "new_string": "b" })]).is_err());
+        assert_eq!(
+            apply_edits("a a a", &[json!({ "old_string": "a", "new_string": "b", "replace_all": true })]).unwrap(),
+            "b b b"
+        );
+    }
+
+    #[test]
+    fn safe_git_arg_rejects_flag_like_values() {
+        assert!(safe_git_arg("HEAD~3").is_ok());
+        assert!(safe_git_arg("src/main.rs").is_ok());
+        assert!(safe_git_arg("--upload-pack=evil").is_err());
+        assert!(safe_git_arg("-x").is_err());
+    }
+
+    #[test]
+    fn cargo_diagnostics_parses_compiler_messages() {
+        // One compiler-message line + one unrelated line (build-script/artifact).
+        let stdout = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"x"}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"error","message":"mismatched types","code":{"code":"E0308"},"spans":[{"is_primary":true,"file_name":"src/lib.rs","line_start":42,"column_start":9}]}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"note","message":"just a note","spans":[]}}"#,
+        );
+        let diags = cargo_diagnostics(stdout);
+        assert_eq!(diags.len(), 1, "keeps errors/warnings, drops notes and artifacts");
+        assert_eq!(diags[0]["severity"], "error");
+        assert_eq!(diags[0]["file"], "src/lib.rs");
+        assert_eq!(diags[0]["line"], 42);
+        assert_eq!(diags[0]["code"], "E0308");
+    }
+
+    #[test]
+    fn tsc_and_ruff_parsers_extract_structured_diagnostics() {
+        // tsc --pretty false
+        let tsc = "src/app.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'.\nnot a diagnostic line";
+        let d = tsc_diagnostics(tsc);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0]["file"], "src/app.ts");
+        assert_eq!(d[0]["line"], 12);
+        assert_eq!(d[0]["column"], 5);
+        assert_eq!(d[0]["code"], "TS2322");
+        assert_eq!(d[0]["severity"], "error");
+
+        // ruff --output-format=json
+        let ruff = r#"[{"filename":"m.py","location":{"row":3,"column":1},"code":"F401","message":"unused import"}]"#;
+        let r = ruff_diagnostics(ruff);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["file"], "m.py");
+        assert_eq!(r[0]["line"], 3);
+        assert_eq!(r[0]["code"], "F401");
+        assert_eq!(r[0]["severity"], "warning");
+        // Non-JSON (e.g. ruff not installed / crashed) → no diagnostics, no panic.
+        assert!(ruff_diagnostics("error: ruff not found").is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_edit_writes_once_or_not_at_all() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+        reg.execute(&ToolIntent {
+            id: "1".into(),
+            tool: "fs.write".into(),
+            args: json!({ "path": "f.txt", "content": "alpha\nbeta\n" }),
+        })
+        .await;
+        // A batch where the second edit can't match must leave the file untouched.
+        let bad = reg
+            .execute(&ToolIntent {
+                id: "2".into(),
+                tool: "multi_edit".into(),
+                args: json!({ "path": "f.txt", "edits": [
+                    { "old_string": "alpha", "new_string": "ALPHA" },
+                    { "old_string": "nonexistent", "new_string": "x" }
+                ] }),
+            })
+            .await;
+        assert_eq!(bad.status, kernel::ObsStatus::Error);
+        let after = reg
+            .execute(&ToolIntent { id: "3".into(), tool: "fs.read".into(), args: json!({ "path": "f.txt" }) })
+            .await;
+        assert!(after.payload["content"].as_str().unwrap().contains("alpha"), "must not be partially edited");
+    }
+
+    #[tokio::test]
+    async fn preview_renders_a_real_diff_without_writing() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+
+        reg.execute(&ToolIntent {
+            id: "1".into(),
+            tool: "fs.write".into(),
+            args: json!({ "path": "f.txt", "content": "alpha\nbeta\ngamma\n" }),
+        })
+        .await;
+
+        // fs.edit preview shows the change and does NOT modify the file.
+        let prev = reg
+            .preview(&ToolIntent {
+                id: "2".into(),
+                tool: "fs.edit".into(),
+                args: json!({ "path": "f.txt", "old_string": "beta", "new_string": "BETA" }),
+            })
+            .await
+            .expect("edit preview should render a diff");
+        assert!(prev.contains("-beta") && prev.contains("+BETA"), "preview is a real diff: {prev}");
+        // The file is untouched (preview is side-effect-free).
+        let after = reg
+            .execute(&ToolIntent { id: "3".into(), tool: "fs.read".into(), args: json!({ "path": "f.txt" }) })
+            .await;
+        assert!(after.payload["content"].as_str().unwrap().contains("beta"));
+
+        // A brand-new file previews as all-additions.
+        let np = reg
+            .preview(&ToolIntent {
+                id: "4".into(),
+                tool: "fs.write".into(),
+                args: json!({ "path": "new.txt", "content": "hello\n" }),
+            })
+            .await
+            .expect("write preview should render additions");
+        assert!(np.contains("+hello"), "new-file preview shows additions: {np}");
+
+        // An edit whose old_string is absent previews the failure, not a diff.
+        let miss = reg
+            .preview(&ToolIntent {
+                id: "5".into(),
+                tool: "fs.edit".into(),
+                args: json!({ "path": "f.txt", "old_string": "nope", "new_string": "x" }),
+            })
+            .await
+            .expect("should explain the miss");
+        assert!(miss.contains("not found"), "preview flags the miss: {miss}");
+    }
+
+    #[tokio::test]
+    async fn word_count_counts_lines_words_chars() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+
+        // Write a test file
+        reg.execute(&ToolIntent {
+            id: "1".into(),
+            tool: "fs.write".into(),
+            args: json!({ "path": "test.txt", "content": "hello world\nthis is a test\nthree lines here" }),
+        })
+        .await;
+
+        // word_count should return correct counts
+        let wc = reg
+            .execute(&ToolIntent {
+                id: "2".into(),
+                tool: "word_count".into(),
+                args: json!({ "path": "test.txt" }),
+            })
+            .await;
+        assert_eq!(wc.status, kernel::ObsStatus::Ok);
+        assert_eq!(wc.payload["lines"], 3);
+        assert_eq!(wc.payload["words"], 9); // "hello", "world", "this", "is", "a", "test", "three", "lines", "here"
+        assert_eq!(wc.payload["chars"], 43); // exact char count including newlines
+        assert_eq!(wc.payload["path"], "test.txt");
+    }
+
+    // tiny unique-ish suffix without pulling ulid into dev-deps
+    fn ulid_like() -> u128 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    }
+
+    // Minimal in-memory artifact store for tests (read_artifact isn't exercised).
+    #[derive(Default)]
+    struct MemArtifacts(std::sync::Mutex<HashMap<String, Vec<u8>>>);
+    impl kernel::ArtifactStore for MemArtifacts {
+        fn put(&self, bytes: &[u8]) -> Result<String, String> {
+            let key = format!("{}", bytes.len());
+            self.0.lock().unwrap().insert(key.clone(), bytes.to_vec());
+            Ok(key)
+        }
+        fn get(&self, hash: &str, offset: usize, len: Option<usize>) -> Result<Vec<u8>, String> {
+            let map = self.0.lock().unwrap();
+            let data = map.get(hash).ok_or("not found")?;
+            let start = offset.min(data.len());
+            let end = len.map(|l| (start + l).min(data.len())).unwrap_or(data.len());
+            Ok(data[start..end].to_vec())
+        }
+        fn size(&self, hash: &str) -> Result<usize, String> {
+            Ok(self.0.lock().unwrap().get(hash).map(|d| d.len()).unwrap_or(0))
+        }
+    }
+    fn mem_artifacts() -> Arc<dyn kernel::ArtifactStore> {
+        Arc::new(MemArtifacts::default())
+    }
+}

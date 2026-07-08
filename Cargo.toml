@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kernel",
+    "crates/providers",
+    "crates/medha-cli", "crates/context", "crates/sandbox", "crates/tools", "crates/store", "crates/policy", "crates/lockfile", "crates/permissions",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.1"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+async-trait = "0.1"
+# rustls (not native-tls/OpenSSL) so the binary is self-contained and portable:
+# no system OpenSSL dependency, cross-compiles cleanly, works for static builds
+# — matching the "single static binary, curl|sh" packaging goal (§7).
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "rustls-tls"] }
+ulid = "1"
+thiserror = "2"
+anyhow = "1"
+
+# Local crates
+kernel = { path = "crates/kernel" }
+providers = { path = "crates/providers" }
+context = { path = "crates/context" }

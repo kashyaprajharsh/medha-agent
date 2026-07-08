@@ -1,0 +1,84 @@
+# medha.lock — the harness artifact (§6). Copy to `medha.lock` in your project
+# root to version and share these settings. Absent file = every value below
+# stays at its built-in default (nothing changes for a bare checkout).
+# Env vars (MEDHA_MAX_TURNS, MEDHA_APPROVE, MEDHA_VERIFY, ...) still work as
+# quick session-level overrides on top of whatever this file specifies.
+
+[routing]
+# Seat for the provider router (§4.4) once a second model is wired for
+# cross-vendor adversarial verification. Not yet consulted by the kernel.
+# executor = "openai-compat://localhost:8000/qwen3-coder"
+# verifier = "openai-compat://together/llama-3.3-70b"
+
+[budget]
+# Per-task ceilings (§4.1/§18.5). Omit any field to leave it unbounded/default.
+max_turns = 200
+# max_tokens = 5000000
+# max_cost_usd = 5.0
+# max_wall_s = 7200
+
+[context]
+# Compaction tuning (§4.3). These are the built-in defaults — override only if
+# you know what you're changing; get eval-gated once the Gate exists (§4.11).
+trigger_ratio = 0.85
+microcompact_ratio = 0.60
+tail_ratio = 0.20
+protect_first_n = 3
+protect_last_n = 20
+prune_min_tool_tokens = 8000
+emergency_ratio = 0.95
+
+[policy]
+# Tool classes requiring human approval before execution (§4.7). File writes
+# need a nod by default; shell is instead gated by the deterministic
+# dangerous-pattern scanner (blocks rm -rf/, sudo, credential reads, etc.) so
+# ordinary commands like `open` or `ls` don't need approval. Add "shell.exec"
+# here too if you want every shell command to ask first. [] = fully autonomous.
+approve = ["fs.write", "fs.edit"]
+
+[sandbox]
+# Execution isolation for shell/build/VCS commands (§4.8). Makes the containment
+# posture part of the portable harness artifact. Zero external dependencies —
+# uses the OS-native sandbox (macOS Seatbelt; Linux Landlock later), not Docker.
+#   backend = "native"  (default) → OS jail: writes confined to the workspace,
+#             temp, and dev caches; anything else (e.g. ~/.ssh) is blocked.
+#           = "host"              → no OS isolation (scanner + approval only).
+#           = "container"         → run each command in a throwaway docker/podman
+#             container (opt-in heavy tier; shells out, no daemon linked in).
+#             Requires `image`. Host env is NOT forwarded, so API keys stay put.
+#           = "ssh"               → run each command on a remote `host` (remote
+#             exec, not local isolation; assumes the workspace exists there).
+# Override per-session with `--no-sandbox` or MEDHA_SANDBOX=host|native.
+# Misconfigured container/ssh falls back to the native jail with a warning.
+backend = "native"
+# Container tier (only used when backend = "container"):
+# image = "rust:1"          # must contain the toolchain your commands need
+# runtime = "docker"        # or "podman"; auto-detected if unset
+# memory = "2g"             # optional resource caps
+# pids = 512
+# SSH tier (only used when backend = "ssh"):
+# host = "user@devbox"
+# remote_dir = "/home/user/project"
+# network: "allow" (default — cargo/npm/etc. can fetch) or "deny" (block all
+# network from confined commands — stronger containment for untrusted work).
+network = "allow"
+# Extra absolute paths the jail may write to, beyond workspace + temp + the
+# built-in dev caches (~/.cargo, ~/.rustup, ~/.npm, ~/.cache, ...).
+# extra_writable = ["/path/to/shared/build/dir"]
+
+[ui]
+# TUI presentation defaults (toggle live with /thinking and /detail in-session).
+show_thinking = false
+full_transparency = false
+
+[verify]
+# Deterministic check run after file-modifying turns (§4.7). Empty = none.
+# command = "cargo check"
+
+[reasoning]
+# Request-side thinking control for reasoning-capable models (§4.4) — sent as
+# chat_template_kwargs (vLLM/SGLang-style servers). Both fields optional; a
+# server/model without a matching knob just ignores what it doesn't support.
+# Live override: /think on|off|medium|status in a session.
+# enabled = true
+# effort = "medium"   # "low" | "medium" | "high" — not every server has all three

@@ -1,0 +1,19 @@
+[package]
+name = "permissions"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+tokio = { workspace = true }
+kernel = { path = "../kernel" }
+dirs = "5"
+toml = "0.8"
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

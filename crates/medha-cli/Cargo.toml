@@ -1,0 +1,43 @@
+[package]
+name = "medha-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "medha"
+path = "src/main.rs"
+
+[dependencies]
+kernel.workspace = true
+providers.workspace = true
+context.workspace = true
+tools = { path = "../tools" }
+sandbox = { path = "../sandbox" }
+store = { path = "../store" }
+ulid.workspace = true
+policy = { path = "../policy" }
+lockfile = { path = "../lockfile" }
+tokio = { workspace = true, features = ["process", "io-std", "io-util"] }
+tokio-util = { version = "0.7" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+dotenvy = "0.15"
+rustyline = "14"
+# Keep crossterm pinned to the same version ratatui re-exports (PART 7) — a mismatch
+# means two crossterm versions in the tree and event types that don't unify.
+ratatui = "0.30"
+similar = "2"
+crossterm = { version = "0.29", features = ["event-stream"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

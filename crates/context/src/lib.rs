@@ -1,0 +1,20 @@
+//! Context compiler & compaction (§4.3). Phase 1 ships the budget-aware,
+//! two-phase compactor; the full five-sheath compiler and the six-stage
+//! pipeline build on these primitives. `ContextEngine` is the swap point (P8).
+
+pub mod budget;
+pub mod compactor;
+pub mod engine;
+pub mod identity;
+pub mod policy;
+pub mod prompts;
+pub mod tokens;
+
+pub use budget::ContextBudget;
+pub use engine::PipelineEngine;
+pub use compactor::{
+    compact, decide, total_tokens, CompactionResult, ExtractiveSummarizer, HistoryItem, ItemKind,
+    Summarizer, SummarizeError,
+};
+pub use policy::{CompactionAction, CompactionPolicy};
+pub use tokens::{BpeCounter, HeuristicCounter, TokenCounter};

@@ -1,0 +1,16 @@
+[package]
+name = "lockfile"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kernel.workspace = true
+context.workspace = true
+sandbox = { path = "../sandbox" }
+serde.workspace = true
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

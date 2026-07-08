@@ -1,0 +1,10 @@
+# Rust build output
+/target
+
+# Secrets / local config — never commit
+.env
+.env.*
+!.env.example
+
+# Local runtime state (event-log DB, snapshots)
+.medha/

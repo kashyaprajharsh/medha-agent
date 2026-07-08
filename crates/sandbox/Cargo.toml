@@ -1,0 +1,21 @@
+[package]
+name = "sandbox"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ulid.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["process"] }
+permissions = { path = "../permissions" }
+kernel = { path = "../kernel" }
+
+# Linux OS-native sandbox: Landlock LSM (kernel ≥5.13), no external binary.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }

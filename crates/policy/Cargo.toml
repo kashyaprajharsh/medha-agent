@@ -1,0 +1,13 @@
+[package]
+name = "policy"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kernel.workspace = true
+regex = "1"
+
+[dev-dependencies]
+serde_json.workspace = true

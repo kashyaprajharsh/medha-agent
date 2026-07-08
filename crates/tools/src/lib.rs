@@ -920,9 +920,11 @@ impl Tool for ReadArtifact {
     }
     fn icon(&self) -> &'static str { "⎘" }
     fn description(&self) -> &str {
-        "Read a byte range of a large/earlier output that was spilled to the \
-         artifact store (referenced by a hash in a truncated tool result). Use \
-         `offset` and `length` to page through it."
+        "Continue reading a large output that was spilled to the artifact store — \
+         whenever a tool result shows a hash and says only the first N chars are \
+         shown, use this to read the rest. Page through with `offset`/`length` \
+         until you have what you need. Never tell the user an output was truncated \
+         or that you can't see it: the full content is here, so fetch it."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read

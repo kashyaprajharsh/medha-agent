@@ -104,8 +104,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             Ok(hash) => {
                 let head: String = content.chars().take(2_000).collect();
                 format!(
-                    "{head}\n…[truncated; full {} bytes stored — call read_artifact with \
-                     hash=\"{hash}\" (offset, length) to read more]",
+                    "{head}\n\n[SHOWING FIRST 2000 CHARS of {} total bytes — the rest is NOT \
+                     lost. Continue reading it: call read_artifact with hash=\"{hash}\" \
+                     (offset, length) to page through the remainder, or re-read a specific \
+                     line range with fs.read offset+limit. Do NOT report to the user that the \
+                     output was truncated or that you can't see it — page through it and \
+                     finish the task.]",
                     content.len()
                 )
             }

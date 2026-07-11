@@ -83,23 +83,23 @@ impl Default for PipelineEngine {
     }
 }
 
-/// Estimate tokens for the message-selection budget walks (head/tail). Counts
-/// the full tool-call envelope (name + args + id), not just text content —
-/// otherwise tool-heavy turns are badly undercounted.
+/// One message's estimate for the budget walks: the full tool-call envelope
+/// (name + args + id), not just text content — otherwise tool-heavy turns are
+/// badly undercounted (P1-9).
+fn count_msg(m: &Message, counter: &dyn TokenCounter) -> u32 {
+    let mut t = counter.count(&m.content);
+    for tc in &m.tool_calls {
+        t += counter.count(&tc.tool) + counter.count(&tc.args.to_string()) + 4;
+    }
+    if let Some(id) = &m.tool_call_id {
+        t += counter.count(id);
+    }
+    t
+}
+
+/// Estimate tokens for the message-selection budget walks (head/tail).
 fn count_all(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
-    messages
-        .iter()
-        .map(|m| {
-            let mut t = counter.count(&m.content);
-            for tc in &m.tool_calls {
-                t += counter.count(&tc.tool) + counter.count(&tc.args.to_string()) + 4;
-            }
-            if let Some(id) = &m.tool_call_id {
-                t += counter.count(id);
-            }
-            t
-        })
-        .sum()
+    messages.iter().map(|m| count_msg(m, counter)).sum()
 }
 
 fn passthrough(messages: &[Message], tokens: u32, overflow: bool) -> CompileResult {
@@ -357,12 +357,18 @@ fn tail_start_index(
     let mut start = messages.len();
     while start > head_end {
         let candidate = start - 1;
-        acc += counter.count(&messages[candidate].content);
+        // Full envelope incl. tool-call args (P1-9): an assistant message whose
+        // args carry a whole file must count as such, or the "protected tail"
+        // walks far deeper than the budget it claims to respect.
+        acc += count_msg(&messages[candidate], counter);
+        // The candidate joins the tail before the threshold check — `kept` and
+        // `acc` include it, so excluding it protected one message fewer than
+        // `protect_last_n` promises.
+        start = candidate;
         let kept = messages.len() - candidate;
         if kept >= policy.protect_last_n && acc >= tail_budget {
             break;
         }
-        start = candidate;
     }
     start.max(head_end)
 }
@@ -408,6 +414,29 @@ mod tests {
     }
     fn full_policy() -> CompactionPolicy {
         CompactionPolicy { protect_first_n: 1, protect_last_n: 2, tail_ratio: 0.1, ..Default::default() }
+    }
+
+    #[test]
+    fn tail_walk_counts_tool_call_args_not_just_text() {
+        // P1-9 (tail half): an assistant message whose tool-call args carry a
+        // big payload must weigh its full size in the tail-budget walk. With
+        // args counted, the tail budget is filled by the last message alone;
+        // uncounted (content is empty), the walk would run past it.
+        let counter = HeuristicCounter;
+        let budget = ContextBudget::from_max_ctx(10_000);
+        let policy = CompactionPolicy { protect_last_n: 1, tail_ratio: 0.1, ..Default::default() };
+        let mut msgs: Vec<Message> = (0..6).map(|i| user(&format!("m{i}"))).collect();
+        let big_args = serde_json::json!({ "content": "z".repeat(40_000) });
+        msgs.push(Message::assistant_calls(
+            String::new(),
+            vec![ToolIntent { id: "1".into(), tool: "fs.write".into(), args: big_args }],
+        ));
+        let start = tail_start_index(&msgs, 0, &budget, &policy, &counter);
+        assert_eq!(
+            start,
+            msgs.len() - 1,
+            "the args-heavy final message alone exceeds the tail budget"
+        );
     }
 
     #[tokio::test]

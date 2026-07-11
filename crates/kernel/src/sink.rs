@@ -22,6 +22,10 @@ pub trait StreamSink: Send + Sync {
     fn tool_result(&self, _tool: &str, _ok: bool, _payload: &Value) {}
     /// Real token usage for the turn, reported by the provider (authoritative).
     fn usage(&self, _prompt_tokens: u32, _total_tokens: u32) {}
+    /// Session cost so far, when pricing is known (P1-12). `indicative` = the
+    /// figure comes from a list price (models.dev) rather than the operator's
+    /// own configured rate — surfaces show it as "~$0.42 est.".
+    fn cost(&self, _total_usd: f64, _indicative: bool) {}
     /// A deterministic verifier result after file-modifying edits.
     fn verify(&self, _ok: bool, _summary: &str) {}
     /// Compaction is running (`true`) or finished (`false`) — lets a surface show

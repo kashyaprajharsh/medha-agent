@@ -124,7 +124,6 @@ impl Event {
         let (verdict, reason) = match decision {
             Decision::Allow => ("allow", String::new()),
             Decision::Deny { reason } => ("deny", reason.clone()),
-            Decision::Verify => ("verify", String::new()),
             Decision::Human => ("human", String::new()),
         };
         Self::new(
@@ -186,11 +185,18 @@ pub trait EventLog: Send + Sync {
         let idx = cut_index(&events, at_event)
             .ok_or_else(|| KernelError::Log(format!("event {at_event} not in session {session}")))?;
         let new_id = Ulid::new();
-        for e in &events[..idx] {
+        // Stamp clones with fork time, not the original timestamps (K17):
+        // the /resume picker sorts sessions by newest event, and a branch
+        // carrying old timestamps sinks to the bottom the moment it's made.
+        // A tiny monotonic increment preserves intra-fork order for any
+        // consumer that sorts by ts (storage order itself is by rowid).
+        let forked_at = now_ts();
+        for (i, e) in events[..idx].iter().enumerate() {
             let mut clone = e.clone();
             clone.id = Ulid::new();
             clone.session_id = new_id;
             clone.parent_id = None;
+            clone.ts = forked_at + i as f64 * 1e-6;
             clone.provenance = Provenance { source: "fork".into() };
             self.append(clone).await?;
         }
@@ -345,7 +351,16 @@ pub fn project_messages(events: &[Event]) -> Vec<Message> {
             EventKind::UserMessage => {
                 flush(&mut out, &mut text, &mut intents, &mut assistant_open);
                 let t = e.payload.get("text").and_then(Value::as_str).unwrap_or_default();
-                out.push(Message::user(t));
+                // An Esc-interrupted turn logs the prompt, then the re-send logs
+                // it again with no assistant turn in between (K20) — collapse
+                // consecutive identical user turns so resume shows one.
+                let duplicate = matches!(
+                    out.last(),
+                    Some(m) if matches!(m.role, crate::types::Role::User) && m.content == t
+                );
+                if !duplicate {
+                    out.push(Message::user(t));
+                }
             }
             EventKind::ModelText => {
                 text = e.payload.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -565,6 +580,24 @@ mod tests {
     }
 
     #[test]
+    fn projection_collapses_the_duplicate_prompt_an_interrupt_leaves_behind() {
+        use crate::types::Role;
+        let s = Session::new();
+        // Esc mid-turn: the prompt was logged before the turn, then re-sent —
+        // logged again with nothing in between (K20).
+        let events = vec![
+            Event::user_message(&s, "build the feature"),
+            Event::user_message(&s, "build the feature"),
+            Event::model_text(&s, "on it"),
+            // A *later* identical prompt after an assistant turn is legitimate.
+            Event::user_message(&s, "build the feature"),
+        ];
+        let msgs = project_messages(&events);
+        let users: Vec<_> = msgs.iter().filter(|m| m.role == Role::User).collect();
+        assert_eq!(users.len(), 2, "consecutive duplicate collapsed, later repeat kept: {msgs:?}");
+    }
+
+    #[test]
     fn verify_chain_accepts_intact_and_rejects_tampered() {
         use futures::executor::block_on;
         let log = InMemoryLog::new();
@@ -659,6 +692,16 @@ mod tests {
         let msgs = project_messages(&branch);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "one");
+
+        // K17: fork clones are stamped with fork time, not the originals' —
+        // so the fresh branch sorts to the TOP of a newest-first session list.
+        let original = block_on(log.events(s.id));
+        assert!(
+            branch[0].ts >= original[0].ts,
+            "fork event ts ({}) must be >= the original's ({})",
+            branch[0].ts,
+            original[0].ts
+        );
     }
 
     #[test]

@@ -43,11 +43,17 @@ enum CountRoute {
 enum ProbeState {
     /// Not yet probed.
     Unknown,
-    /// Probed — no exact-count route on this host (fall back to a local estimate).
-    Unavailable,
+    /// Probed — no exact-count route on this host (fall back to a local
+    /// estimate). Carries the calls since the failed probe: after
+    /// `REPROBE_AFTER` we probe again (K16 — a transient startup failure must
+    /// not disable exact counting for the whole process).
+    Unavailable(u32),
     /// Probed — this route works.
     Route(CountRoute),
 }
+
+/// Re-try a failed count-tokens probe after this many skipped calls (K16).
+const REPROBE_AFTER: u32 = 20;
 
 impl OpenAiCompat {
     pub fn new(
@@ -313,11 +319,27 @@ fn sniff_target(args: &str) -> Option<String> {
             let Some(rest) = rest.strip_prefix(':') else { continue };
             let rest = rest.trim_start();
             let Some(rest) = rest.strip_prefix('"') else { continue };
-            if let Some(end) = rest.find('"') {
-                let val = &rest[..end];
-                if !val.is_empty() {
-                    return Some(val.to_string());
+            // Scan to the first UNESCAPED quote (K19): a command like
+            // `echo \"hi\"` must not be cut at its inner escaped quote.
+            let mut val = String::new();
+            let mut chars = rest.chars();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => match chars.next() {
+                        Some('n') | Some('t') => val.push(' '),
+                        Some(e) => val.push(e),
+                        None => break, // escape straddles a chunk boundary — incomplete
+                    },
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    c => val.push(c),
                 }
+            }
+            if closed && !val.is_empty() {
+                return Some(val);
             }
         }
     }
@@ -536,16 +558,20 @@ impl Provider for OpenAiCompat {
         }
         let state = *self.count_probe.lock().unwrap();
         match state {
-            ProbeState::Unavailable => None,
+            ProbeState::Unavailable(n) if n < REPROBE_AFTER => {
+                *self.count_probe.lock().unwrap() = ProbeState::Unavailable(n + 1);
+                None
+            }
             ProbeState::Route(route) => self.count_via(route, messages).await,
-            ProbeState::Unknown => {
+            // Unknown, or Unavailable long enough that it's worth re-probing.
+            ProbeState::Unknown | ProbeState::Unavailable(_) => {
                 for route in [CountRoute::VllmTokenize, CountRoute::Anthropic] {
                     if let Some(n) = self.count_via(route, messages).await {
                         *self.count_probe.lock().unwrap() = ProbeState::Route(route);
                         return Some(n);
                     }
                 }
-                *self.count_probe.lock().unwrap() = ProbeState::Unavailable;
+                *self.count_probe.lock().unwrap() = ProbeState::Unavailable(0);
                 None
             }
         }
@@ -844,6 +870,22 @@ mod sniff_tests {
     fn command_and_unknown_keys() {
         assert_eq!(sniff_target(r#"{"command":"cargo build"}"#), Some("cargo build".to_string()));
         assert_eq!(sniff_target(r#"{"pattern":"foo"}"#), None);
+    }
+
+    #[test]
+    fn escaped_quotes_do_not_cut_the_value_short() {
+        // K19: an escaped quote inside the value is content, not the closer.
+        assert_eq!(
+            sniff_target(r#"{"command":"echo \"hello world\" > f.txt"}"#),
+            Some(r#"echo "hello world" > f.txt"#.to_string())
+        );
+        // Escaped backslash before the real closing quote still closes correctly.
+        assert_eq!(
+            sniff_target(r#"{"path":"dir\\file.rs"}"#),
+            Some(r"dir\file.rs".to_string())
+        );
+        // Still-open value ending mid-escape is incomplete, not a hit.
+        assert_eq!(sniff_target(r#"{"command":"echo \"unfinished"#), None);
     }
 }
 

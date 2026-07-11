@@ -290,41 +290,61 @@ impl WorkspaceSandbox {
     /// Read a file - supports paths outside workspace via permission system
     pub async fn read(&self, path: &str) -> Result<String, SandboxError> {
         let resolved = self.resolve(path).await?;
-        std::fs::read_to_string(&resolved).map_err(|e| SandboxError::Io(e.to_string()))
+        tokio::task::spawn_blocking(move || {
+            std::fs::read_to_string(&resolved).map_err(|e| SandboxError::Io(e.to_string()))
+        })
+        .await
+        .map_err(|e| SandboxError::Io(e.to_string()))?
     }
 
     /// Write a file - supports paths outside workspace via permission system
     pub async fn write(&self, path: &str, contents: &str) -> Result<Option<String>, SandboxError> {
         let resolved = self.resolve_for_write(path).await?;
-        let snapshot_id = self.snapshot_if_exists(&resolved)?;
-        if let Some(parent) = resolved.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| SandboxError::Io(e.to_string()))?;
-        }
-        std::fs::write(&resolved, contents).map_err(|e| SandboxError::Io(e.to_string()))?;
-        Ok(snapshot_id)
+        let snapshots = self.snapshots.clone();
+        let contents = contents.to_string();
+        tokio::task::spawn_blocking(move || {
+            let snapshot_id = Self::snapshot_if_exists_at(&snapshots, &resolved)?;
+            if let Some(parent) = resolved.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| SandboxError::Io(e.to_string()))?;
+            }
+            // Crash-atomic: write a sibling temp file, then rename over the target.
+            let tmp = resolved.with_extension(format!("medha-tmp-{}", ulid::Ulid::new()));
+            std::fs::write(&tmp, &contents).map_err(|e| SandboxError::Io(e.to_string()))?;
+            std::fs::rename(&tmp, &resolved).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                SandboxError::Io(e.to_string())
+            })?;
+            Ok(snapshot_id)
+        })
+        .await
+        .map_err(|e| SandboxError::Io(e.to_string()))?
     }
 
     /// List a directory - supports paths outside workspace via permission system
     pub async fn list(&self, path: &str) -> Result<Vec<String>, SandboxError> {
         let resolved = self.resolve(path).await?;
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(&resolved).map_err(|e| SandboxError::Io(e.to_string()))? {
-            let entry = entry.map_err(|e| SandboxError::Io(e.to_string()))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let suffix = if entry.path().is_dir() { "/" } else { "" };
-            entries.push(format!("{name}{suffix}"));
-        }
-        entries.sort();
-        Ok(entries)
+        tokio::task::spawn_blocking(move || {
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(&resolved).map_err(|e| SandboxError::Io(e.to_string()))? {
+                let entry = entry.map_err(|e| SandboxError::Io(e.to_string()))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let suffix = if entry.path().is_dir() { "/" } else { "" };
+                entries.push(format!("{name}{suffix}"));
+            }
+            entries.sort();
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| SandboxError::Io(e.to_string()))?
     }
 
-    fn snapshot_if_exists(&self, path: &Path) -> Result<Option<String>, SandboxError> {
+    fn snapshot_if_exists_at(snapshots: &Path, path: &Path) -> Result<Option<String>, SandboxError> {
         if !path.exists() {
             return Ok(None);
         }
-        std::fs::create_dir_all(&self.snapshots).map_err(|e| SandboxError::Io(e.to_string()))?;
+        std::fs::create_dir_all(snapshots).map_err(|e| SandboxError::Io(e.to_string()))?;
         let id = ulid::Ulid::new().to_string();
-        let dest = self.snapshots.join(&id);
+        let dest = snapshots.join(&id);
         std::fs::copy(path, &dest).map_err(|e| SandboxError::Io(e.to_string()))?;
         Ok(Some(id))
     }
@@ -391,6 +411,25 @@ mod tests {
         // Read it back
         let content = sbx.read("test.txt").await.unwrap();
         assert_eq!(content, "hello");
+    }
+
+    #[tokio::test]
+    async fn write_is_atomic_and_leaves_no_temp_files() {
+        let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = WorkspaceSandbox::new_jailed(&dir).unwrap();
+        sbx.write("a.txt", "v1").await.unwrap();
+        sbx.write("a.txt", "v2").await.unwrap();
+        assert_eq!(sbx.read("a.txt").await.unwrap(), "v2");
+        // No sibling temp files survive a successful write.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("medha-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

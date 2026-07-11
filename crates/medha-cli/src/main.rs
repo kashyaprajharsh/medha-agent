@@ -370,9 +370,42 @@ async fn main() -> Result<()> {
 
     let base_budget = lock.budget.to_budget();
     let ui_config = lock.ui.clone();
+
+    // Cost meter (P1-12): the operator's configured rate wins; else the model's
+    // models.dev list price as an *indicative* figure (self-hosted routes don't
+    // bill list price); else the meter stays off — never a silent $0.00.
+    let pricing = match (lock.pricing.input_per_mtok, lock.pricing.output_per_mtok) {
+        (Some(i), Some(o)) => {
+            Some(kernel::Pricing { input_per_mtok: i, output_per_mtok: o, indicative: false })
+        }
+        _ => providers::models_dev::pricing(&model_name).await.map(|(i, o)| kernel::Pricing {
+            input_per_mtok: i,
+            output_per_mtok: o,
+            indicative: true,
+        }),
+    };
+    match &pricing {
+        Some(p) if p.indicative => eprintln!(
+            "cost meter: {model_name} list price from models.dev (${:.2}/M in, ${:.2}/M out) — \
+             indicative only; set [pricing] in medha.lock for your real rate",
+            p.input_per_mtok, p.output_per_mtok
+        ),
+        Some(_) => {}
+        None => {
+            if base_budget.max_cost_usd.is_some() {
+                eprintln!(
+                    "warning: max_cost_usd is set but no pricing is known for '{model_name}' — \
+                     the cost budget cannot be enforced. Set [pricing] input_per_mtok / \
+                     output_per_mtok in medha.lock."
+                );
+            }
+        }
+    }
+
     let kernel = Kernel::new(
         provider, log.clone(), executor, context_engine, artifacts, policy, gate, verifier,
-    );
+    )
+    .with_pricing(pricing);
 
     // K1 Identity sheath is assembled by the context compiler, not hardcoded
     // here; config may override the persona (§4.3).

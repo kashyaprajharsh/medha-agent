@@ -104,6 +104,8 @@ pub(crate) enum TuiEvent {
     /// Compaction is running (true) / finished (false) — drives the live indicator.
     Compacting(bool),
     Usage(u32, u32),
+    /// Session cost so far in USD; `true` = indicative list price (shown "est.").
+    Cost(f64, bool),
     Verify(bool, String),
     Approval(String, Option<String>, bool, oneshot::Sender<kernel::Approval>),
     Done(Vec<Message>, StopReason),
@@ -174,7 +176,9 @@ impl RewindPoint {
     /// The two code options are omitted when no files were edited from here on
     /// (nothing to roll back). `None` action = cancel.
     fn scope_options(&self) -> Vec<(String, Option<RewindScope>)> {
-        let plural = if self.files == 1 { "file" } else { "files" };
+        // "tracked" (K18): rollback reverts only snapshot-carrying writes —
+        // shell-side mutations (`sed -i`, `git checkout`) are not undone.
+        let plural = if self.files == 1 { "tracked file" } else { "tracked files" };
         let mut opts = Vec::new();
         if self.files > 0 {
             opts.push((
@@ -219,11 +223,22 @@ struct Entry {
     item: Item,
     lines: Option<Vec<Line<'static>>>,
     height: usize,
+    /// K15: streaming-assistant cache — the rendered+wrapped rows of the text
+    /// prefix up to the last '\n', which per-line rendering guarantees can
+    /// never change as more deltas append. Only the tail line re-renders per
+    /// frame (previously the whole message did: quadratic over the stream).
+    stream_cache: Option<StreamCache>,
+}
+
+struct StreamCache {
+    prefix_bytes: usize,
+    width: u16,
+    rows: Vec<Line<'static>>,
 }
 
 impl Entry {
     fn new(item: Item) -> Self {
-        Self { item, lines: None, height: 0 }
+        Self { item, lines: None, height: 0, stream_cache: None }
     }
     fn invalidate(&mut self) {
         self.lines = None;
@@ -233,14 +248,39 @@ impl Entry {
     /// is the exact row count — no separate wrap measurement, so scroll math and
     /// the rendered slice can never drift.
     fn ensure(&mut self, cx: &RenderCtx<'_>, width: u16) {
-        if self.lines.is_none() {
-            let mut rows: Vec<Line<'static>> = Vec::new();
-            for logical in render_item(&self.item, cx) {
+        if self.lines.is_some() {
+            return;
+        }
+        // Incremental path for streaming assistant text (K15): render_assistant
+        // is strictly per-line (no cross-line state), so rows for the prefix up
+        // to the last newline are stable and cached; only the tail re-renders.
+        if let Item::Assistant(s) = &self.item {
+            let split = s.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let reuse = self
+                .stream_cache
+                .as_ref()
+                .is_some_and(|c| c.prefix_bytes == split && c.width == width);
+            if !reuse {
+                let mut rows: Vec<Line<'static>> = Vec::new();
+                for logical in view::render_assistant(&s[..split]) {
+                    rows.extend(wrap_line(&logical, width as usize));
+                }
+                self.stream_cache = Some(StreamCache { prefix_bytes: split, width, rows });
+            }
+            let mut rows = self.stream_cache.as_ref().unwrap().rows.clone();
+            for logical in view::render_assistant(&s[split..]) {
                 rows.extend(wrap_line(&logical, width as usize));
             }
             self.height = rows.len();
             self.lines = Some(rows);
+            return;
         }
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        for logical in render_item(&self.item, cx) {
+            rows.extend(wrap_line(&logical, width as usize));
+        }
+        self.height = rows.len();
+        self.lines = Some(rows);
     }
 }
 
@@ -249,8 +289,11 @@ impl Entry {
 /// of truth for layout — the renderer draws these rows directly (no ratatui wrap),
 /// so measured height always equals rendered rows (essential for virtualization).
 fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
-    // Flatten to (char, style); fast-path lines that already fit.
+    // Flatten to (char, style); measure in terminal CELLS, not chars — CJK and
+    // emoji occupy 2 columns (K14), so char counting clips and mis-cursors.
+    let cell_w = |c: char| c.width().unwrap_or(0);
     let mut chars: Vec<(char, Style)> = Vec::new();
     for span in &line.spans {
         let st = span.style;
@@ -258,16 +301,29 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
             chars.push((c, st));
         }
     }
-    if chars.len() <= width {
+    // Fast-path lines that already fit.
+    if chars.iter().map(|&(c, _)| cell_w(c)).sum::<usize>() <= width {
         return vec![line.clone()];
     }
 
-    // Greedy word wrap: fill up to `width`, breaking at the last space when possible.
+    // Greedy word wrap: fill up to `width` cells, breaking at the last space
+    // when possible.
     let n = chars.len();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < n {
-        let hard_end = (i + width).min(n);
+        // Extend while the row's cell width fits (always take ≥1 char so a
+        // double-width char on a width-1 row can't loop forever).
+        let mut used = 0usize;
+        let mut hard_end = i;
+        while hard_end < n {
+            let cw = cell_w(chars[hard_end].0);
+            if used + cw > width && hard_end > i {
+                break;
+            }
+            used += cw;
+            hard_end += 1;
+        }
         if hard_end < n {
             if let Some(sp) = (i..hard_end).rev().find(|&k| chars[k].0 == ' ') {
                 if sp > i {
@@ -438,6 +494,8 @@ struct Model {
     approval_ready: bool,
     /// Context percentage
     ctx_pct: Option<u32>,
+    /// Session cost so far (USD, `true` = indicative "est." figure), when known.
+    cost_usd: Option<(f64, bool)>,
     /// Model name
     model: String,
     /// Max context
@@ -531,6 +589,7 @@ impl Model {
             cached_width: 0,
             approval_ready: false,
             ctx_pct: None,
+            cost_usd: None,
             model,
             max_ctx,
             running: false,
@@ -894,10 +953,11 @@ mod tests {
         let opts = p.scope_options();
         assert_eq!(opts.len(), 4);
         assert_eq!(opts[0].1, Some(RewindScope::ConversationAndCode));
-        assert!(opts[0].0.contains("3 files"), "count shown: {}", opts[0].0);
+        // "tracked" is deliberate (K18): only snapshot-tracked writes revert.
+        assert!(opts[0].0.contains("3 tracked files"), "count shown: {}", opts[0].0);
         assert_eq!(opts[1].1, Some(RewindScope::Conversation));
         assert_eq!(opts[2].1, Some(RewindScope::Code));
-        assert!(opts[2].0.contains("3 files"), "count shown: {}", opts[2].0);
+        assert!(opts[2].0.contains("3 tracked files"), "count shown: {}", opts[2].0);
         assert_eq!(opts[3].1, None, "last row is cancel");
     }
 
@@ -1007,6 +1067,50 @@ mod tests {
     fn wrap_line_fast_path_when_it_fits() {
         assert_eq!(wrap_line(&Line::from("short"), 80).len(), 1);
         assert_eq!(wrap_line(&Line::from(""), 80).len(), 1);
+    }
+
+    #[test]
+    fn streaming_incremental_render_matches_full_render() {
+        // K15: the prefix-cache path must produce byte-identical rows to a
+        // from-scratch render at every step of a simulated stream.
+        let cats = HashMap::new();
+        let cx = RenderCtx { width: 12, full_transparency: false, show_thinking: true, show_summary: false, viz: &cats };
+        let mut streamed = Entry::new(Item::Assistant(String::new()));
+        let mut acc = String::new();
+        for delta in ["- [x] do", "ne\nnow a long", " line that wraps\n", "tail"] {
+            acc.push_str(delta);
+            if let Item::Assistant(buf) = &mut streamed.item { buf.push_str(delta); }
+            streamed.invalidate();
+            streamed.ensure(&cx, 12);
+            let mut fresh = Entry::new(Item::Assistant(acc.clone()));
+            fresh.ensure(&cx, 12);
+            let flat = |e: &Entry| -> Vec<String> {
+                e.lines.as_ref().unwrap().iter().map(text).collect()
+            };
+            assert_eq!(flat(&streamed), flat(&fresh), "diverged after {acc:?}");
+            assert_eq!(streamed.height, fresh.height);
+        }
+        // A width change invalidates the cached prefix (no stale-width rows).
+        streamed.invalidate();
+        streamed.ensure(&cx, 7);
+        let mut fresh = Entry::new(Item::Assistant(acc.clone()));
+        fresh.ensure(&cx, 7);
+        assert_eq!(streamed.height, fresh.height, "cache must not survive a width change");
+    }
+
+    #[test]
+    fn wrap_line_measures_terminal_cells_not_chars() {
+        use unicode_width::UnicodeWidthStr;
+        // K14: 4 CJK chars = 8 cells. At width 4 that's 2 rows of 2 chars each —
+        // char-counting would cram all 4 into one row and clip the terminal.
+        let rows = wrap_line(&Line::from("你好世界"), 4);
+        let texts: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(texts, vec!["你好", "世界"]);
+        assert!(texts.iter().all(|t| UnicodeWidthStr::width(t.as_str()) <= 4));
+        // Cursor/layout side: emoji before the cursor offsets it by 2 cells.
+        let (rows, crow, ccol) = view::layout_input("🙂ab", 3, 80);
+        assert_eq!(rows, vec!["🙂ab".to_string()]);
+        assert_eq!((crow, ccol), (0, 4), "cursor lands after 2-cell emoji + 2 chars");
     }
 
     #[test]

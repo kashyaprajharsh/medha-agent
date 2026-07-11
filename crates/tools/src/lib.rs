@@ -151,14 +151,14 @@ impl ToolRegistry {
         r.register(Arc::new(FsRead { sbx: sandbox.clone() }));
         r.register(Arc::new(FsWrite { sbx: sandbox.clone() }));
         r.register(Arc::new(FsList { sbx: sandbox.clone() }));
-        r.register(Arc::new(FsEdit { sbx: sandbox.clone() }));
+        r.register(Arc::new(FsEdit { sbx: sandbox.clone(), pins: Default::default() }));
         r.register(Arc::new(WordCount { sbx: sandbox.clone() }));
         r.register(Arc::new(Grep { sbx: sandbox.clone() }));
         r.register(Arc::new(Glob { sbx: sandbox.clone() }));
         r.register(Arc::new(CodeOutline { sbx: sandbox.clone() }));
         r.register(Arc::new(References { sbx: sandbox.clone() }));
         r.register(Arc::new(Tree { sbx: sandbox.clone() }));
-        r.register(Arc::new(MultiEdit { sbx: sandbox.clone() }));
+        r.register(Arc::new(MultiEdit { sbx: sandbox.clone(), pins: Default::default() }));
         r.register(Arc::new(Git { sbx: sandbox.clone() }));
         r.register(Arc::new(Diagnostics { sbx: sandbox.clone() }));
         // Background-task facility (§2): a slow `shell.exec` promotes to a task in
@@ -366,9 +366,13 @@ impl Tool for FsWrite {
         // Capture the prior contents (empty for a new file) so surfaces can render
         // a proper diff: a new file shows as all-additions (empty left column),
         // an overwrite shows the real before/after — same view as fs.edit.
-        let old = self.sbx.read(&path).await.unwrap_or_default();
+        let (old, unreadable) = read_or_flag_unreadable(&self.sbx, &path).await;
         let snapshot = self.sbx.write(&path, &content).await.map_err(|e| ToolError::Failed(e.to_string()))?;
-        Ok(json!({ "path": path, "written": true, "snapshot": snapshot, "old": old, "new": content }))
+        let mut out = json!({ "path": path, "written": true, "snapshot": snapshot, "old": old, "new": content });
+        if unreadable {
+            out["note"] = json!("prior file existed but was unreadable (non-UTF-8 or permission denied); diff shows it as empty");
+        }
+        Ok(out)
     }
 
     /// The gate preview for a write is a diff against the file's current state
@@ -379,9 +383,34 @@ impl Tool for FsWrite {
         let path = args.get("path")?.as_str()?;
         let content = args.get("content")?.as_str()?;
         // Diff against the file's current state: a brand-new file shows as all
-        // additions; an overwrite shows the real before→after change.
-        let old = self.sbx.read(path).await.unwrap_or_default();
-        Some(cap_preview(&make_diff(path, &old, content)))
+        // additions; an overwrite shows the real before→after change. An existing
+        // but unreadable file must NOT masquerade as "new file" — that hides a
+        // destructive overwrite from the approval card.
+        let (old, unreadable) = read_or_flag_unreadable(&self.sbx, path).await;
+        let diff = cap_preview(&make_diff(path, &old, content));
+        if unreadable {
+            Some(format!(
+                "⚠ OVERWRITES an existing file whose contents can't be read (non-UTF-8 or permission denied) — this is not a new file.\n{diff}"
+            ))
+        } else {
+            Some(diff)
+        }
+    }
+}
+
+/// Read a file's contents for diffing; distinguish "doesn't exist" (empty, false)
+/// from "exists but unreadable" (empty, true) so previews can't call a
+/// destructive overwrite a new file.
+async fn read_or_flag_unreadable(sbx: &WorkspaceSandbox, path: &str) -> (String, bool) {
+    match sbx.read(path).await {
+        Ok(s) => (s, false),
+        Err(_) => {
+            let exists = match sbx.resolve(path).await {
+                Ok(p) => p.exists(),
+                Err(_) => false,
+            };
+            (String::new(), exists)
+        }
     }
 }
 
@@ -415,8 +444,43 @@ impl Tool for FsList {
     }
 }
 
+/// Preview→execute content pins (P1-1). `preview` records a hash of the file
+/// content the approval card was rendered from, keyed by the exact tool args;
+/// `execute` takes the pin and refuses if the file changed in between — the
+/// approved diff and the applied diff must be the same diff.
+#[derive(Default)]
+struct PreviewPins(std::sync::Mutex<std::collections::HashMap<u64, u64>>);
+
+impl PreviewPins {
+    fn pin(&self, args: &Value, content: &str) {
+        let mut map = self.0.lock().unwrap();
+        if map.len() > 64 {
+            map.clear(); // bound stale pins from denied/abandoned previews
+        }
+        map.insert(content_hash(&args.to_string()), content_hash(content));
+    }
+    /// Take the pin for these args (if any) and verify the content still matches.
+    fn check(&self, args: &Value, path: &str, content: &str) -> Result<(), ToolError> {
+        let pinned = self.0.lock().unwrap().remove(&content_hash(&args.to_string()));
+        match pinned {
+            Some(h) if h != content_hash(content) => Err(ToolError::Failed(format!(
+                "{path} changed after the approved preview; re-run the edit to preview the current content"
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn content_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 struct FsEdit {
     sbx: Arc<WorkspaceSandbox>,
+    pins: PreviewPins,
 }
 #[async_trait]
 impl Tool for FsEdit {
@@ -452,6 +516,8 @@ impl Tool for FsEdit {
         // the same original and clobber this one (P0-4).
         let _guard = self.sbx.path_guard(&path).await;
         let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        // Refuse if the file changed since the approved preview (P1-1).
+        self.pins.check(args, &path, &content)?;
         // CRLF-tolerant byte-exact match (see `resolve_edit`).
         let (old_s, new_s) = resolve_edit(&content, &old_s, &new_s)
             .ok_or_else(|| ToolError::Failed(format!("old_string not found in {path}")))?;
@@ -490,6 +556,8 @@ impl Tool for FsEdit {
         let new_s = args.get("new_string")?.as_str()?;
         let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
         let content = self.sbx.read(path).await.ok()?;
+        // Pin what the approval card will show (P1-1).
+        self.pins.pin(args, &content);
         let count = content.matches(old_s).count();
         if count == 0 {
             return Some(format!("(old_string not found in {path} — this edit would fail)"));
@@ -606,50 +674,73 @@ impl Tool for Grep {
         // gitignore-aware, parallel-capable walk (ripgrep's engine). Standard
         // filters skip .git, hidden files (incl .medha), and gitignored paths;
         // we additionally skip build dirs that may not be gitignored.
-        let mut matches: Vec<Value> = Vec::new();
-        let mut truncated = false;
-        let walk = WalkBuilder::new(&start)
-            .standard_filters(true)
-            .filter_entry(|e| !skip_dir(e))
-            .build();
+        // Full walk + reads are blocking work — off the async runtime.
+        tokio::task::spawn_blocking(move || {
+            let mut matches: Vec<Value> = Vec::new();
+            let mut truncated = false;
+            let mut skipped_large = 0usize;
+            let walk = WalkBuilder::new(&start)
+                .standard_filters(true)
+                .filter_entry(|e| !skip_dir(e))
+                .build();
 
-        'outer: for dent in walk.flatten() {
-            if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            if dent.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000 {
-                continue; // skip oversized files
-            }
-            let Ok(content) = std::fs::read_to_string(dent.path()) else {
-                continue; // skip binaries (non-UTF-8)
-            };
-            let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
-            let lines: Vec<&str> = content.lines().collect();
-            for (i, line) in lines.iter().enumerate() {
-                if re.is_match(line) {
-                    if matches.len() >= max {
-                        truncated = true;
-                        break 'outer;
+            'outer: for dent in walk.flatten() {
+                if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                if dent.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000 {
+                    skipped_large += 1;
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(dent.path()) else {
+                    continue; // skip binaries (non-UTF-8)
+                };
+                let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
+                let lines: Vec<&str> = content.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    if re.is_match(line) {
+                        if matches.len() >= max {
+                            truncated = true;
+                            break 'outer;
+                        }
+                        let mut m = json!({
+                            "path": rel,
+                            "line": i + 1,
+                            "text": clip_marked(line, 200)
+                        });
+                        if context > 0 {
+                            let lo = i.saturating_sub(context);
+                            let hi = (i + context + 1).min(lines.len());
+                            let ctx: Vec<String> =
+                                (lo..hi).map(|j| format!("{}: {}", j + 1, lines[j])).collect();
+                            m["context"] = json!(ctx);
+                        }
+                        matches.push(m);
                     }
-                    let mut m = json!({
-                        "path": rel,
-                        "line": i + 1,
-                        "text": line.chars().take(200).collect::<String>()
-                    });
-                    if context > 0 {
-                        let lo = i.saturating_sub(context);
-                        let hi = (i + context + 1).min(lines.len());
-                        let ctx: Vec<String> =
-                            (lo..hi).map(|j| format!("{}: {}", j + 1, lines[j])).collect();
-                        m["context"] = json!(ctx);
-                    }
-                    matches.push(m);
                 }
             }
-        }
-        let count = matches.len();
-        Ok(json!({ "matches": matches, "count": count, "truncated": truncated }))
+            let count = matches.len();
+            let mut out = json!({ "matches": matches, "count": count, "truncated": truncated });
+            if skipped_large > 0 {
+                out["note"] = json!(format!(
+                    "[skipped {skipped_large} file(s) >1MB — not searched; use shell.exec grep for those]"
+                ));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?
     }
+}
+
+/// Clip a line to `max` chars with an explicit marker (never silently truncate).
+fn clip_marked(line: &str, max: usize) -> String {
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let mut s: String = line.chars().take(max).collect();
+    s.push_str(" …[line truncated]");
+    s
 }
 
 /// Skip build dirs that may not be gitignored (`.git`/hidden/.medha are already
@@ -694,32 +785,37 @@ impl Tool for Glob {
         let matcher = glob::Pattern::new(&pattern).map_err(|e| ToolError::Args(e.to_string()))?;
         let root = self.sbx.root().to_path_buf();
 
-        let mut matches: Vec<String> = Vec::new();
-        let mut truncated = false;
-        let walk = WalkBuilder::new(&root).standard_filters(true).filter_entry(|e| !skip_dir(e)).build();
-        for dent in walk.flatten() {
-            if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
-            // `require_literal_separator` so `*` and `?` do NOT cross `/`:
-            // `*.rs` matches `main.rs` but not `src/main.rs`, and `src/*.rs`
-            // doesn't reach `src/a/b.rs`. Use `**` to span directories. Without
-            // this, plain `*` spans path separators and over-matches wildly.
-            if matcher.matches_with(&rel, glob::MatchOptions {
-                require_literal_separator: true,
-                ..Default::default()
-            }) {
-                if matches.len() >= max {
-                    truncated = true;
-                    break;
+        // Full workspace walk is blocking work — off the async runtime.
+        tokio::task::spawn_blocking(move || {
+            let mut matches: Vec<String> = Vec::new();
+            let mut truncated = false;
+            let walk = WalkBuilder::new(&root).standard_filters(true).filter_entry(|e| !skip_dir(e)).build();
+            for dent in walk.flatten() {
+                if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
                 }
-                matches.push(rel);
+                let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
+                // `require_literal_separator` so `*` and `?` do NOT cross `/`:
+                // `*.rs` matches `main.rs` but not `src/main.rs`, and `src/*.rs`
+                // doesn't reach `src/a/b.rs`. Use `**` to span directories. Without
+                // this, plain `*` spans path separators and over-matches wildly.
+                if matcher.matches_with(&rel, glob::MatchOptions {
+                    require_literal_separator: true,
+                    ..Default::default()
+                }) {
+                    if matches.len() >= max {
+                        truncated = true;
+                        break;
+                    }
+                    matches.push(rel);
+                }
             }
-        }
-        matches.sort();
-        let count = matches.len();
-        Ok(json!({ "pattern": pattern, "matches": matches, "count": count, "truncated": truncated }))
+            matches.sort();
+            let count = matches.len();
+            Ok(json!({ "pattern": pattern, "matches": matches, "count": count, "truncated": truncated }))
+        })
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?
     }
 }
 
@@ -873,37 +969,50 @@ impl Tool for References {
         let start = self.sbx.resolve(rel_path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
         let root = self.sbx.root().to_path_buf();
 
-        let mut refs: Vec<Value> = Vec::new();
-        let mut files = std::collections::HashSet::new();
-        let mut truncated = false;
-        let walk = WalkBuilder::new(&start).standard_filters(true).filter_entry(|e| !skip_dir(e)).build();
-        'outer: for dent in walk.flatten() {
-            if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            if dent.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000 {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(dent.path()) else { continue };
-            let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
-            for (i, line) in content.lines().enumerate() {
-                if word.is_match(line) {
-                    if refs.len() >= max {
-                        truncated = true;
-                        break 'outer;
+        // Full walk + reads are blocking work — off the async runtime.
+        tokio::task::spawn_blocking(move || {
+            let mut refs: Vec<Value> = Vec::new();
+            let mut files = std::collections::HashSet::new();
+            let mut truncated = false;
+            let mut skipped_large = 0usize;
+            let walk = WalkBuilder::new(&start).standard_filters(true).filter_entry(|e| !skip_dir(e)).build();
+            'outer: for dent in walk.flatten() {
+                if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                if dent.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000 {
+                    skipped_large += 1;
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(dent.path()) else { continue };
+                let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
+                for (i, line) in content.lines().enumerate() {
+                    if word.is_match(line) {
+                        if refs.len() >= max {
+                            truncated = true;
+                            break 'outer;
+                        }
+                        files.insert(rel.clone());
+                        refs.push(json!({
+                            "path": rel,
+                            "line": i + 1,
+                            "text": clip_marked(line.trim(), 200),
+                        }));
                     }
-                    files.insert(rel.clone());
-                    refs.push(json!({
-                        "path": rel,
-                        "line": i + 1,
-                        "text": line.trim().chars().take(200).collect::<String>(),
-                    }));
                 }
             }
-        }
-        let count = refs.len();
-        let file_count = files.len();
-        Ok(json!({ "symbol": symbol, "references": refs, "count": count, "files": file_count, "truncated": truncated }))
+            let count = refs.len();
+            let file_count = files.len();
+            let mut out = json!({ "symbol": symbol, "references": refs, "count": count, "files": file_count, "truncated": truncated });
+            if skipped_large > 0 {
+                out["note"] = json!(format!(
+                    "[skipped {skipped_large} file(s) >1MB — not searched; use shell.exec grep for those]"
+                ));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?
     }
 }
 
@@ -941,36 +1050,45 @@ impl Tool for Tree {
         let depth = args.get("depth").and_then(Value::as_u64).unwrap_or(2).max(1) as usize;
         let max = args.get("max_entries").and_then(Value::as_u64).unwrap_or(300) as usize;
         let start = self.sbx.resolve(rel_path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let rel_path = rel_path.to_string();
 
-        let mut out = String::new();
-        let mut count = 0usize;
-        let mut truncated = false;
-        let walk = WalkBuilder::new(&start)
-            .max_depth(Some(depth))
-            .standard_filters(true)
-            .filter_entry(|e| !skip_dir(e))
-            .sort_by_file_name(std::cmp::Ord::cmp)
-            .build();
-        for dent in walk.flatten() {
-            let d = dent.depth();
-            if d == 0 {
-                continue; // skip the root itself
+        // Directory walk is blocking work — off the async runtime.
+        tokio::task::spawn_blocking(move || {
+            let mut out = String::new();
+            let mut count = 0usize;
+            let mut truncated = false;
+            let walk = WalkBuilder::new(&start)
+                .max_depth(Some(depth))
+                .standard_filters(true)
+                .filter_entry(|e| !skip_dir(e))
+                .sort_by_file_name(std::cmp::Ord::cmp)
+                .build();
+            for dent in walk.flatten() {
+                let d = dent.depth();
+                if d == 0 {
+                    continue; // skip the root itself
+                }
+                if count >= max {
+                    truncated = true;
+                    break;
+                }
+                let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let name = dent.file_name().to_string_lossy();
+                out.push_str(&"  ".repeat(d - 1));
+                out.push_str(&name);
+                if is_dir {
+                    out.push('/');
+                }
+                out.push('\n');
+                count += 1;
             }
-            if count >= max {
-                truncated = true;
-                break;
+            if truncated {
+                out.push_str(&format!("[truncated: first {max} entries shown — raise max_entries or narrow path]\n"));
             }
-            let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            let name = dent.file_name().to_string_lossy();
-            out.push_str(&"  ".repeat(d - 1));
-            out.push_str(&name);
-            if is_dir {
-                out.push('/');
-            }
-            out.push('\n');
-            count += 1;
-        }
-        Ok(json!({ "path": rel_path, "tree": out, "entries": count, "truncated": truncated }))
+            Ok(json!({ "path": rel_path, "tree": out, "entries": count, "truncated": truncated }))
+        })
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?
     }
 }
 
@@ -2189,6 +2307,7 @@ impl Tool for TaskList {
 
 struct MultiEdit {
     sbx: Arc<WorkspaceSandbox>,
+    pins: PreviewPins,
 }
 
 /// Apply a sequence of exact-substring replacements to `content`, in order (each
@@ -2314,6 +2433,8 @@ impl Tool for MultiEdit {
         // Serialize same-file edits within a turn (P0-4).
         let _guard = self.sbx.path_guard(&path).await;
         let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        // Refuse if the file changed since the approved preview (P1-1).
+        self.pins.check(args, &path, &content)?;
         let updated = apply_edits(&content, edits)?;
         let snapshot =
             self.sbx.write(&path, &updated).await.map_err(|e| ToolError::Failed(e.to_string()))?;
@@ -2332,6 +2453,8 @@ impl Tool for MultiEdit {
         let path = args.get("path")?.as_str()?;
         let edits = args.get("edits")?.as_array()?;
         let content = self.sbx.read(path).await.ok()?;
+        // Pin what the approval card will show (P1-1).
+        self.pins.pin(args, &content);
         match apply_edits(&content, edits) {
             Ok(updated) => Some(cap_preview(&make_diff(path, &content, &updated))),
             Err(e) => Some(format!("({e} — this multi_edit would fail)")),
@@ -2454,12 +2577,20 @@ impl Tool for Git {
             .await
             .map_err(|e| ToolError::Failed(format!("failed to run git: {e}")))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Cap large output (a long log/diff) so it doesn't flood context.
-        let capped: String = stdout.lines().take(400).collect::<Vec<_>>().join("\n");
+        // Cap large output (a long log/diff) so it doesn't flood context — with
+        // an explicit marker so a capped diff is never mistaken for a complete one.
+        let total_lines = stdout.lines().count();
+        let mut capped: String = stdout.lines().take(400).collect::<Vec<_>>().join("\n");
+        if total_lines > 400 {
+            capped.push_str(&format!(
+                "\n[truncated: showing first 400 of {total_lines} lines — scope with `path` or use shell.exec git for full output]"
+            ));
+        }
         Ok(json!({
             "subcommand": sub,
             "exit_code": output.status,
             "stdout": capped,
+            "truncated": total_lines > 400,
             "stderr": String::from_utf8_lossy(&output.stderr),
         }))
     }
@@ -3040,6 +3171,45 @@ mod tests {
             .execute(&ToolIntent { id: "9".into(), tool: "nope".into(), args: json!({}) })
             .await;
         assert_eq!(obs.status, kernel::ObsStatus::Denied);
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_when_file_changed_after_preview() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx.clone(), mem_artifacts());
+
+        sbx.write("p.txt", "alpha\nbeta\n").await.unwrap();
+        let intent = ToolIntent {
+            id: "1".into(),
+            tool: "fs.edit".into(),
+            args: json!({ "path": "p.txt", "old_string": "beta", "new_string": "BETA" }),
+        };
+        // Gate flow: preview pins the content, then the file changes underneath.
+        assert!(reg.preview(&intent).await.is_some());
+        sbx.write("p.txt", "alpha\nbeta\nnew line sneaked in\n").await.unwrap();
+        let obs = reg.execute(&intent).await;
+        assert_eq!(obs.status, kernel::ObsStatus::Error, "stale preview must refuse");
+        assert!(obs.payload.to_string().contains("changed after the approved preview"));
+
+        // Re-running (fresh preview against current content) succeeds.
+        let intent2 = ToolIntent { id: "2".into(), ..intent.clone() };
+        assert!(reg.preview(&intent2).await.is_some());
+        let obs2 = reg.execute(&intent2).await;
+        assert_eq!(obs2.status, kernel::ObsStatus::Ok);
+
+        // multi_edit gets the same guard.
+        let mintent = ToolIntent {
+            id: "3".into(),
+            tool: "multi_edit".into(),
+            args: json!({ "path": "p.txt", "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }] }),
+        };
+        assert!(reg.preview(&mintent).await.is_some());
+        sbx.write("p.txt", "changed\nalpha\n").await.unwrap();
+        let mobs = reg.execute(&mintent).await;
+        assert_eq!(mobs.status, kernel::ObsStatus::Error, "stale multi_edit preview must refuse");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

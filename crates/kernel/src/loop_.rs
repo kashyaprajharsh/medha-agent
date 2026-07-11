@@ -76,6 +76,8 @@ pub struct Kernel<P: Provider, L: EventLog> {
     pub gate: Arc<dyn crate::gate::HumanGate>,
     pub verifier: Arc<dyn crate::verify::Verifier>,
     max_parallel_tools: usize,
+    /// Resolved model pricing (P1-12); `None` = cost unknown, meter stays off.
+    pricing: Option<crate::types::Pricing>,
 }
 
 /// Tool-result payloads larger than this spill to the artifact store and are
@@ -113,7 +115,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             gate,
             verifier,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
+            pricing: None,
         }
+    }
+
+    /// Set resolved model pricing so the governor meters real dollars (P1-12).
+    pub fn with_pricing(mut self, pricing: Option<crate::types::Pricing>) -> Self {
+        self.pricing = pricing;
+        self
     }
 
     /// Spill an oversized tool-result payload to the artifact store, returning a
@@ -279,11 +288,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             };
             // Feed real token usage back: the context engine uses it for accurate
-            // compaction decisions, and the governor meters spend (cost = 0.0
-            // until a per-model price table is wired).
+            // compaction decisions, and the governor meters spend — real dollars
+            // when pricing resolved, 0.0 (meter off) otherwise (P1-12).
             if let Some(u) = usage {
                 self.context.update_usage(u.prompt_tokens, u.total_tokens);
-                gov.record_tokens(u.total_tokens as u64, 0.0);
+                let cost = self
+                    .pricing
+                    .map(|p| p.cost(u.prompt_tokens, u.completion_tokens))
+                    .unwrap_or(0.0);
+                gov.record_tokens(u.total_tokens as u64, cost);
+                if let Some(p) = self.pricing {
+                    sink.cost(gov.cost_usd(), p.indicative);
+                }
             }
             messages.push(assistant);
 
@@ -460,10 +476,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         Ok((text, reasoning, intents, usage))
     }
 
-    /// validate (P1) → police (§4.6) → verify (§4.7) → execute (§4.8).
-    /// The policy authorizes deny-first; the verifier layer (§4.7) will gate
-    /// `Verify`/`Human` once it exists — until then they fall through to
-    /// execution (Verify) or a denial (Human, no gate yet).
+    /// validate (P1) → police (§4.6) → gate (P5) → execute (§4.8).
+    /// The policy authorizes deny-first; `Human` routes through the approval
+    /// gate with a real preview. A pre-execution verifier chain (§4.7) will
+    /// slot in here when it exists.
     async fn dispatch_one(
         &self,
         session: &Session,
@@ -474,7 +490,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let raw = self.policy.authorize(intent, radius);
         // Did trust-flow turn a permissive verdict into a gate? Such an escalated
         // gate must never be auto-approved (K9) — capture it before `raw` moves.
-        let raw_permissive = matches!(raw, crate::types::Decision::Allow | crate::types::Decision::Verify);
+        let raw_permissive = matches!(raw, crate::types::Decision::Allow);
         let decision =
             escalate_for_trust_flow(raw, radius, web_tainted, self.executor.containment());
         let escalated = raw_permissive && matches!(decision, crate::types::Decision::Human);
@@ -498,7 +514,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     Observation::denial(&intent.id, "rejected by human".to_string())
                 }
             }
-            crate::types::Decision::Allow | crate::types::Decision::Verify => {
+            crate::types::Decision::Allow => {
                 self.executor.execute(intent).await
             }
         }

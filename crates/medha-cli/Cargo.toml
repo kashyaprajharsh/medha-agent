@@ -41,3 +41,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Terminal cells, not chars: CJK/emoji are 2 columns (K14). Same crate ratatui uses.
+unicode-width = "0.2"

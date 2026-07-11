@@ -173,6 +173,25 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+/// Resolved per-token pricing for the session's model, USD per million tokens
+/// (P1-12). `indicative` marks a list price (e.g. models.dev) applied to a
+/// route that may not actually bill it — a self-hosted deployment — so
+/// surfaces label the figure "est." instead of presenting it as an invoice.
+#[derive(Debug, Clone, Copy)]
+pub struct Pricing {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    pub indicative: bool,
+}
+
+impl Pricing {
+    pub fn cost(&self, prompt_tokens: u32, completion_tokens: u32) -> f64 {
+        (prompt_tokens as f64 * self.input_per_mtok
+            + completion_tokens as f64 * self.output_per_mtok)
+            / 1_000_000.0
+    }
+}
+
 /// The canonical streaming unit emitted by any provider (§4.4).
 #[derive(Debug, Clone)]
 pub enum Block {
@@ -232,11 +251,13 @@ impl Observation {
 }
 
 /// Authorization outcome from the Policy engine (§4.6). Deny-first by default.
+/// A `Verify` variant (pre-execution verifier chain, §4.7) is deliberately
+/// absent until it actually routes through a verifier — a variant that silently
+/// behaves like `Allow` is worse than no variant.
 #[derive(Debug, Clone)]
 pub enum Decision {
     Allow,
     Deny { reason: String },
-    Verify,
     Human,
 }
 

@@ -138,6 +138,25 @@ mod tests {
     }
 
     #[test]
+    fn cost_budget_trips_with_real_pricing() {
+        // P1-12: with pricing resolved, recorded cost accrues and the cost
+        // ceiling actually trips (it could never trip while cost was 0.0).
+        let p = crate::types::Pricing { input_per_mtok: 3.0, output_per_mtok: 15.0, indicative: false };
+        let per_turn = p.cost(100_000, 20_000); // 0.3 + 0.3 = $0.60
+        assert!((per_turn - 0.6).abs() < 1e-9);
+        let mut g = Governor::new(Budget {
+            max_turns: None,
+            max_tokens: None,
+            max_cost_usd: Some(1.0),
+            max_wall_s: None,
+        });
+        g.record_tokens(120_000, per_turn);
+        assert_eq!(g.check(), None);
+        g.record_tokens(120_000, per_turn);
+        assert_eq!(g.check(), Some(BudgetStop::Cost));
+    }
+
+    #[test]
     fn unbounded_never_trips() {
         let g = Governor::new(Budget {
             max_turns: None,

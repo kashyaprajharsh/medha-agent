@@ -77,6 +77,20 @@ pub struct MedhaLock {
     pub sandbox: SandboxLockConfig,
     #[serde(default)]
     pub permissions: PermissionsConfig,
+    #[serde(default)]
+    pub pricing: PricingConfig,
+}
+
+/// Operator-declared per-token pricing for the executor model (P1-12), USD per
+/// million tokens. Set this on self-hosted/custom routes where a vendor list
+/// price doesn't apply (or to your negotiated rate). When unset, the models.dev
+/// list price is used as an *indicative* figure (shown "est."); if that's
+/// unknown too, the cost meter stays off — never a silent $0.00.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PricingConfig {
+    pub input_per_mtok: Option<f64>,
+    pub output_per_mtok: Option<f64>,
 }
 
 /// Execution sandbox for shell/build/VCS commands (§4.8). This makes the

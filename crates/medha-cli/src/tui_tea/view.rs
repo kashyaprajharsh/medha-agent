@@ -2,6 +2,7 @@
 //! pickers, autocomplete). Pure functions of Model. Split out of tui_tea.rs.
 #![allow(clippy::too_many_arguments)]
 use super::*;
+use unicode_width::UnicodeWidthStr;
 
 pub(super) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub(super) fn spinner_frame(frame: u64) -> &'static str { SPINNER[(frame as usize) % SPINNER.len()] }
@@ -673,31 +674,57 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         ));
     }
     let ctx = match model.ctx_pct { Some(pct) => format!("ctx {pct}%"), None => "ctx —".to_string() };
+    // Cost so far, when pricing resolved (P1-12); "~…est." marks an indicative
+    // list price (self-hosted routes aren't billed it). No pricing → no line.
+    let cost = match model.cost_usd {
+        Some((usd, true)) => format!(" · ~${usd:.2} est."),
+        Some((usd, false)) => format!(" · ${usd:.2}"),
+        None => String::new(),
+    };
     let think = match model.reasoning.enabled {
         Some(true) => format!("think {}", crate::effort_label(model.reasoning.effort)),
         Some(false) => "think off".to_string(),
         None => "think —".to_string(),
     };
     let hints = if model.running { "esc interrupt" } else { "/thinking · /detail · /help" };
-    let right = format!("{ctx} · {think}   {hints}");
-    let left_w: usize = left.iter().map(|s| s.content.chars().count()).sum();
-    let pad = (area.width as usize).saturating_sub(left_w + right.chars().count());
+    let right = format!("{ctx}{cost} · {think}   {hints}");
+    // Pad in terminal cells (K14) so the right block stays right-aligned even
+    // with wide glyphs in the left block.
+    let left_w: usize = left.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+    let pad = (area.width as usize).saturating_sub(left_w + UnicodeWidthStr::width(right.as_str()));
     let mut spans = left; spans.push(Span::raw(" ".repeat(pad))); spans.push(Span::styled(right, Style::default().fg(theme::FAINT)));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Lay the input box out in terminal CELLS (K14): rows wrap on display width
+/// (CJK/emoji = 2 columns) and the returned cursor column is a cell offset, so
+/// the terminal cursor lands on the right glyph, not two cells short.
 pub(super) fn layout_input(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
+    use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
+    let cell_w = |c: char| c.width().unwrap_or(0);
     let chars: Vec<char> = text.chars().collect();
     let cur = cursor.min(chars.len());
     let mut rows: Vec<String> = vec![String::new()];
+    let mut row_w = 0usize; // cell width of the row being built
     let (mut crow, mut ccol) = (0usize, 0usize);
     for (i, &ch) in chars.iter().enumerate() {
-        if i == cur { crow = rows.len() - 1; ccol = rows.last().unwrap().chars().count(); }
-        if ch == '\n' { rows.push(String::new()); }
-        else { if rows.last().unwrap().chars().count() >= width { rows.push(String::new()); } rows.last_mut().unwrap().push(ch); }
+        if i == cur { crow = rows.len() - 1; ccol = row_w; }
+        if ch == '\n' {
+            rows.push(String::new());
+            row_w = 0;
+        } else {
+            let cw = cell_w(ch);
+            if row_w + cw > width && row_w > 0 {
+                rows.push(String::new());
+                row_w = 0;
+                if i == cur { crow = rows.len() - 1; ccol = 0; }
+            }
+            rows.last_mut().unwrap().push(ch);
+            row_w += cw;
+        }
     }
-    if cur >= chars.len() { crow = rows.len() - 1; ccol = rows.last().unwrap().chars().count(); }
+    if cur >= chars.len() { crow = rows.len() - 1; ccol = row_w; }
     (rows, crow, ccol)
 }
 

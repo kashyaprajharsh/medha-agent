@@ -1,10 +1,12 @@
-//! Model context-window lookup via models.dev (§4.4) — a real, externally
+//! Model metadata lookup via models.dev (§4.4) — a real, externally
 //! maintained metadata database (the same source opencode uses), not a
 //! hardcoded table baked into the binary. Fetched once, cached to disk, and
 //! matched by model id. If a model genuinely isn't in it, we say so and leave
-//! the window unknown (P2: never fabricate a number) — the caller then either
-//! asks the user to set one explicitly or disables compaction, matching how
-//! opencode behaves when metadata can't be resolved for a local/custom model.
+//! the value unknown (P2: never fabricate a number) — the caller then either
+//! asks the user to set one explicitly or disables the dependent feature,
+//! matching how opencode behaves when metadata can't be resolved for a
+//! local/custom model. Carries both context windows and per-MTok list prices
+//! (the latter feed the cost meter, P1-12 — indicative for self-hosted routes).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,11 +18,22 @@ const API_URL: &str = "https://models.dev/api.json";
 /// not every second, so a cached copy is fine to reuse for a while.
 const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// Everything we retain per model. Old cache files (context-only format) fail
+/// to deserialize into this and are simply re-fetched.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ModelMeta {
+    pub context: Option<u32>,
+    /// USD per million input tokens (models.dev list price).
+    pub input_per_mtok: Option<f64>,
+    /// USD per million output tokens (models.dev list price).
+    pub output_per_mtok: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Cache {
     fetched_at_unix: u64,
-    /// lowercased model id → context window (tokens)
-    entries: HashMap<String, u32>,
+    /// lowercased model id → metadata
+    entries: HashMap<String, ModelMeta>,
 }
 
 #[derive(Deserialize)]
@@ -33,12 +46,22 @@ struct Provider {
 struct ModelEntry {
     #[serde(default)]
     limit: Option<Limit>,
+    #[serde(default)]
+    cost: Option<Cost>,
 }
 
 #[derive(Deserialize)]
 struct Limit {
     #[serde(default)]
     context: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct Cost {
+    #[serde(default)]
+    input: Option<f64>,
+    #[serde(default)]
+    output: Option<f64>,
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -68,7 +91,7 @@ fn save_disk_cache(cache: &Cache) {
     }
 }
 
-async fn fetch_and_flatten(client: &reqwest::Client) -> Result<HashMap<String, u32>, String> {
+async fn fetch_and_flatten(client: &reqwest::Client) -> Result<HashMap<String, ModelMeta>, String> {
     let resp = client.get(API_URL).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("models.dev returned {}", resp.status()));
@@ -77,41 +100,54 @@ async fn fetch_and_flatten(client: &reqwest::Client) -> Result<HashMap<String, u
     let mut flat = HashMap::new();
     for provider in providers.into_values() {
         for (id, model) in provider.models {
-            if let Some(ctx) = model.limit.and_then(|l| l.context) {
-                flat.insert(id.to_lowercase(), ctx);
+            let meta = ModelMeta {
+                context: model.limit.and_then(|l| l.context),
+                input_per_mtok: model.cost.as_ref().and_then(|c| c.input),
+                output_per_mtok: model.cost.as_ref().and_then(|c| c.output),
+            };
+            if meta.context.is_some() || meta.input_per_mtok.is_some() {
+                flat.insert(id.to_lowercase(), meta);
             }
         }
     }
     Ok(flat)
 }
 
-/// Look up `model_id`'s context window from models.dev. Uses a fresh disk
-/// cache if present; otherwise fetches live and re-caches. Returns `None` on
-/// network failure or if the model genuinely isn't listed — never a guess.
-pub async fn context_window(model_id: &str) -> Option<u32> {
-    let entries = if let Some(cache) = load_disk_cache() {
-        cache.entries
-    } else {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .ok()?;
-        let entries = fetch_and_flatten(&client).await.ok()?;
-        save_disk_cache(&Cache { fetched_at_unix: now_unix(), entries: entries.clone() });
-        entries
-    };
-    lookup(model_id, &entries)
+/// Load the metadata table: fresh disk cache if present, else fetch + re-cache.
+async fn entries() -> Option<HashMap<String, ModelMeta>> {
+    if let Some(cache) = load_disk_cache() {
+        return Some(cache.entries);
+    }
+    let client =
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok()?;
+    let fetched = fetch_and_flatten(&client).await.ok()?;
+    save_disk_cache(&Cache { fetched_at_unix: now_unix(), entries: fetched.clone() });
+    Some(fetched)
 }
 
-fn lookup(model_id: &str, entries: &HashMap<String, u32>) -> Option<u32> {
+/// Look up `model_id`'s context window from models.dev. Returns `None` on
+/// network failure or if the model genuinely isn't listed — never a guess.
+pub async fn context_window(model_id: &str) -> Option<u32> {
+    lookup(model_id, &entries().await?).and_then(|m| m.context)
+}
+
+/// Look up `model_id`'s list price (USD per MTok input, output). This is the
+/// vendor's list price — for a self-hosted route it's an *indicative* figure
+/// only; callers must label it as such. `None` = not listed, never a guess.
+pub async fn pricing(model_id: &str) -> Option<(f64, f64)> {
+    let meta = lookup(model_id, &entries().await?)?;
+    Some((meta.input_per_mtok?, meta.output_per_mtok?))
+}
+
+fn lookup(model_id: &str, entries: &HashMap<String, ModelMeta>) -> Option<ModelMeta> {
     let needle = model_id.to_lowercase();
     // Exact match on the full id (as given, and stripped of a provider prefix).
-    if let Some(&ctx) = entries.get(&needle) {
-        return Some(ctx);
+    if let Some(&meta) = entries.get(&needle) {
+        return Some(meta);
     }
     let tail = needle.rsplit('/').next().unwrap_or(&needle);
-    if let Some(&ctx) = entries.get(tail) {
-        return Some(ctx);
+    if let Some(&meta) = entries.get(tail) {
+        return Some(meta);
     }
     // Fuzzy: the known id is a substring of ours, or ours is a substring of it
     // (handles version/quantization suffixes like "-bf16", "-instruct").
@@ -128,11 +164,28 @@ mod tests {
     #[test]
     fn exact_and_fuzzy_match() {
         let mut m = HashMap::new();
-        m.insert("qwen3-32b".to_string(), 131_072u32);
-        m.insert("claude-opus-4".to_string(), 200_000u32);
+        m.insert(
+            "qwen3-32b".to_string(),
+            ModelMeta { context: Some(131_072), input_per_mtok: None, output_per_mtok: None },
+        );
+        m.insert(
+            "claude-opus-4".to_string(),
+            ModelMeta {
+                context: Some(200_000),
+                input_per_mtok: Some(15.0),
+                output_per_mtok: Some(75.0),
+            },
+        );
 
-        assert_eq!(lookup("qwen3-32b", &m), Some(131_072));
-        assert_eq!(lookup("nvidia/qwen3-32b-instruct", &m), Some(131_072));
-        assert_eq!(lookup("totally-unknown-model", &m), None);
+        assert_eq!(lookup("qwen3-32b", &m).and_then(|x| x.context), Some(131_072));
+        assert_eq!(
+            lookup("nvidia/qwen3-32b-instruct", &m).and_then(|x| x.context),
+            Some(131_072)
+        );
+        assert!(lookup("totally-unknown-model", &m).is_none());
+        // Pricing present only when models.dev lists both sides.
+        let opus = lookup("claude-opus-4", &m).unwrap();
+        assert_eq!(opus.input_per_mtok, Some(15.0));
+        assert_eq!(opus.output_per_mtok, Some(75.0));
     }
 }

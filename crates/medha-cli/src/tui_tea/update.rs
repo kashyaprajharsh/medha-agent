@@ -403,6 +403,7 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
                 model.ctx_pct = Some((prompt_tokens as f32 / usable as f32 * 100.0).round() as u32);
             }
         }
+        TuiEvent::Cost(usd, indicative) => model.cost_usd = Some((usd, indicative)),
         TuiEvent::Verify(ok, summary) => model.push_item(Item::Verify { ok, summary }),
         TuiEvent::Approval(action, detail, escalated, responder) => {
             // Auto-approve only a previously "always"-ed action, and NEVER a
@@ -490,7 +491,11 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
         // (non-destructive). Code-only (`new_id == None`) leaves the conversation
         // untouched and just reports the files reverted.
         TuiEvent::Rewound { new_id, msgs, rolled, scope, prefill } => {
-            let files = |n: usize| if n == 1 { "1 file".to_string() } else { format!("{n} files") };
+            // "tracked" is honest (K18): only snapshot-carrying writes revert —
+            // files mutated via shell (`sed -i`, `git checkout`) are not rolled back.
+            let files = |n: usize| {
+                if n == 1 { "1 tracked file".to_string() } else { format!("{n} tracked files") }
+            };
             if let Some(id) = new_id {
                 session.id = id;
                 let system = transcript.first().cloned().unwrap_or_else(|| Message::system(""));
@@ -748,6 +753,7 @@ impl kernel::StreamSink for TuiSink {
     fn compacting(&self, active: bool) { self.emit("compacting", TuiEvent::Compacting(active)); }
     fn compaction(&self, before: u32, after: u32, summarized: bool, summary: Option<&str>) { self.emit("compaction", TuiEvent::Compaction(before, after, summarized, summary.map(str::to_string))); }
     fn usage(&self, prompt_tokens: u32, total_tokens: u32) { self.emit("usage", TuiEvent::Usage(prompt_tokens, total_tokens)); }
+    fn cost(&self, total_usd: f64, indicative: bool) { self.emit("cost", TuiEvent::Cost(total_usd, indicative)); }
     fn verify(&self, ok: bool, summary: &str) { self.emit("verify", TuiEvent::Verify(ok, summary.to_string())); }
 }
 

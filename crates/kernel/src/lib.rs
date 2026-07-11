@@ -36,5 +36,5 @@ pub use provider::{
 };
 pub use types::{
     BlastRadius, Block, CompiledContext, Containment, Decision, Message, ObsStatus, Observation,
-    Role, Session, ToolCategory, ToolIntent, ToolSpec, TrustLabel, TurnResult, Usage,
+    Pricing, Role, Session, ToolCategory, ToolIntent, ToolSpec, TrustLabel, TurnResult, Usage,
 };

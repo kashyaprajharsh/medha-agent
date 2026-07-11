@@ -27,6 +27,11 @@ pub struct PipelineEngine {
     /// Consecutive compactions that barely helped; backs off to avoid the
     /// "compact every turn" thrash.
     ineffective: AtomicU32,
+    /// Context size when the anti-thrash backoff latched. Growth past this
+    /// releases the latch: new material means compaction can find new cuts —
+    /// without this, a latched session sat at >100% of usable with compaction
+    /// refusing to run until the 95%-of-true-window emergency line.
+    latched_at: AtomicU32,
     /// Summarizer for Full compaction. Defaults to the deterministic extractive
     /// fallback; the CLI injects an `LlmSummarizer` for real summaries.
     summarizer: Arc<dyn Summarizer>,
@@ -56,6 +61,7 @@ impl PipelineEngine {
             counter,
             last_prompt_tokens: AtomicU32::new(0),
             ineffective: AtomicU32::new(0),
+            latched_at: AtomicU32::new(0),
             summarizer: Arc::new(ExtractiveSummarizer),
             last_summary: std::sync::Mutex::new(None),
             artifacts: None,
@@ -176,11 +182,17 @@ impl ContextEngine for PipelineEngine {
         let near_hard_ceiling = is_overflow(basis, mc, &self.policy);
 
         // Anti-thrash: if the last couple of compactions barely helped, stop —
-        // UNLESS we're at the hard safety ceiling, in which case we must keep
-        // trying rather than silently send an overflowing turn (the second,
-        // independent safety layer above the soft trigger).
+        // UNLESS we're at the hard safety ceiling (must keep trying rather than
+        // silently send an overflowing turn), or the context has since GROWN
+        // ≥10% past where the backoff latched (new material = new cuts to make;
+        // holding the latch there left sessions stuck over 100% of usable).
         if self.ineffective.load(Ordering::Relaxed) >= 2 && !near_hard_ceiling {
-            return passthrough(messages, before, false);
+            let latched = self.latched_at.load(Ordering::Relaxed);
+            if basis as u32 > latched.saturating_add(latched / 10) {
+                self.ineffective.store(0, Ordering::Relaxed);
+            } else {
+                return passthrough(messages, before, false);
+            }
         }
 
         let action = if basis >= usable * self.policy.trigger_ratio || near_hard_ceiling {
@@ -298,8 +310,10 @@ impl ContextEngine for PipelineEngine {
 
         // Track effectiveness: a compaction that frees <10% counts as
         // ineffective; two in a row trips the anti-thrash backoff above.
+        // Remember the size we latched at so growth can release the backoff.
         if before.saturating_sub(after) < before / 10 {
             self.ineffective.fetch_add(1, Ordering::Relaxed);
+            self.latched_at.store(after, Ordering::Relaxed);
         } else {
             self.ineffective.store(0, Ordering::Relaxed);
         }
@@ -532,6 +546,45 @@ mod tests {
         fn size(&self, _h: &str) -> Result<usize, String> {
             Ok(0)
         }
+    }
+
+    #[tokio::test]
+    async fn anti_thrash_latch_releases_when_context_grows() {
+        // Two compactions that free nothing latch the backoff. The latch must
+        // RELEASE once the context grows ≥10% past the latch point — holding
+        // it left sessions stuck >100% of usable with compaction refusing to
+        // run until the 95%-of-true-window emergency line.
+        let eng = engine(CompactionPolicy {
+            protect_first_n: 1,
+            protect_last_n: 2,
+            tail_ratio: 0.05,
+            ..Default::default()
+        });
+        // Prune band (~3120..4420 of usable 5200 @8k), but the middle holds no
+        // tool results — pruning frees nothing → "ineffective" twice → latch.
+        let mut msgs = vec![Message::system("S")];
+        for i in 0..8 {
+            msgs.push(user(&format!("ask {i} {}", "y".repeat(1_600))));
+        }
+        let r1 = eng.compile(&msgs, Some(8_000)).await;
+        assert!(r1.compacted && r1.before_tokens == r1.after_tokens, "nothing prunable");
+        let r2 = eng.compile(&msgs, Some(8_000)).await;
+        assert!(r2.compacted);
+        let r3 = eng.compile(&msgs, Some(8_000)).await;
+        assert!(!r3.compacted, "latched after two ineffective passes");
+
+        // Same size again → still latched.
+        let r4 = eng.compile(&msgs, Some(8_000)).await;
+        assert!(!r4.compacted, "latch holds while nothing changed");
+
+        // Growth past 10% of the latch point → released, compaction runs again
+        // (now in the Full band, which CAN shrink this content).
+        for i in 0..3 {
+            msgs.push(user(&format!("more {i} {}", "z".repeat(1_600))));
+        }
+        let r5 = eng.compile(&msgs, Some(8_000)).await;
+        assert!(r5.compacted, "grown context must release the anti-thrash latch");
+        assert!(r5.after_tokens < r5.before_tokens, "and this pass actually shrinks");
     }
 
     #[tokio::test]

@@ -836,8 +836,12 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     draw_input(f, model, pad_h(chunks[2]));
     draw_status(f, model, pad_h(chunks[3]));
     
-    if model.input.starts_with('/') { draw_autocomplete(f, model, pad_h(chunks[2])); }
-    if let Some(picker) = &model.picker { draw_picker(f, picker, pad_h(chunks[2])); }
+    // While an approval card is pending it owns the keyboard — drawing the
+    // autocomplete/picker under it would show interactive-looking menus that
+    // don't respond ("stuck menu"). They come back once the card is answered.
+    let gate_open = model.pending_approval().is_some();
+    if !gate_open && model.input.starts_with('/') { draw_autocomplete(f, model, pad_h(chunks[2])); }
+    if !gate_open { if let Some(picker) = &model.picker { draw_picker(f, picker, pad_h(chunks[2])); } }
     // Approval is now inline in transcript (PART 3) — no modal
 }
 

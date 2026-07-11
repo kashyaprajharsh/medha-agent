@@ -834,8 +834,8 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
             model.push_notice(if model.full_transparency { "detail: full tool input/output" } else { "detail: summarized" });
         }
         "tasks" => {
-            if model.bg_tasks.is_empty() {
-                model.push_notice("no background tasks");
+            let text = if model.bg_tasks.is_empty() {
+                "background tasks: none".to_string()
             } else {
                 let mut lines = String::from("background tasks:");
                 for t in &model.bg_tasks {
@@ -843,8 +843,11 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
                     lines.push_str(&format!("\n  {} [{state}]  {}", t.id, t.command));
                 }
                 lines.push_str("\n\n(the agent polls with task.output and stops with task.kill)");
-                model.push_notice(lines);
-            }
+                lines
+            };
+            // Live status: refresh the previous /tasks block instead of
+            // stacking identical copies.
+            model.upsert_notice("background tasks", text);
         }
         "help" => {
             let mut text = COMMANDS.iter().map(|(c, d)| format!("{c}  {d}")).collect::<Vec<_>>().join("\n");

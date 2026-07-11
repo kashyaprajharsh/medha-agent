@@ -681,6 +681,24 @@ impl Model {
         self.push_item(Item::Notice(s.into()));
     }
 
+    /// Live-status notices (/tasks): when the most recent item is already a
+    /// notice with this `prefix`, update it in place — re-running the command
+    /// must refresh one block, not stack identical copies in the scrollback.
+    fn upsert_notice(&mut self, prefix: &str, text: String) {
+        if let Some(e) = self.items.back_mut() {
+            if matches!(&e.item, Item::Notice(n) if n.starts_with(prefix)) {
+                e.item = Item::Notice(text);
+                e.invalidate();
+                self.dirty = true;
+                if self.auto_scroll {
+                    self.scroll_to_bottom();
+                }
+                return;
+            }
+        }
+        self.push_item(Item::Notice(text));
+    }
+
     fn push_item(&mut self, item: Item) {
         self.items.push_back(Entry::new(item));
         // Cap scrollback
@@ -1067,6 +1085,21 @@ mod tests {
     fn wrap_line_fast_path_when_it_fits() {
         assert_eq!(wrap_line(&Line::from("short"), 80).len(), 1);
         assert_eq!(wrap_line(&Line::from(""), 80).len(), 1);
+    }
+
+    #[test]
+    fn upsert_notice_replaces_the_previous_matching_block() {
+        let ui = lockfile::UiConfig::default();
+        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        m.upsert_notice("background tasks", "background tasks:\n  t1 [running] find".into());
+        m.upsert_notice("background tasks", "background tasks:\n  t1 [done] find".into());
+        let notices: Vec<&Item> = m.items.iter().map(|e| &e.item).collect();
+        assert_eq!(notices.len(), 1, "re-running /tasks must refresh, not stack");
+        assert!(matches!(notices[0], Item::Notice(n) if n.contains("[done]")));
+        // A different item in between → a fresh block is appended, not merged.
+        m.push_item(Item::User("hi".into()));
+        m.upsert_notice("background tasks", "background tasks: none".into());
+        assert_eq!(m.items.len(), 3);
     }
 
     #[test]

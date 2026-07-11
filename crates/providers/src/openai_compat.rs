@@ -351,58 +351,118 @@ fn sniff_target(args: &str) -> Option<String> {
 /// models (Ollama, llama.cpp, DeepSeek-R1 without a server-side reasoning
 /// parser) emit thinking this way instead of a separate `reasoning_content`
 /// field — both conventions are real and this handles the inline-tag one.
-/// Stateful because a tag can straddle two SSE chunks.
+/// A tag counts only at the start of a line (see `line_has_content`); this is
+/// a fallback for servers running without a reasoning parser — when the
+/// server provides `reasoning_content`, that path is preferred and this
+/// filter never fires. Stateful because a tag can straddle two SSE chunks.
 #[derive(Default)]
 struct ThinkTagFilter {
     buf: String,
     in_think: bool,
+    /// The current visible output line already carries non-whitespace text.
+    /// Thinking blocks are template-structural: every inline-thinking chat
+    /// template emits `<think>` at the start of its own line (stream start,
+    /// or right after a newline). A tag surfacing MID-line is therefore the
+    /// model *writing about* the tag — docs, code samples — and must stay
+    /// literal. Matching it anywhere used to reroute the rest of a reply
+    /// into hidden reasoning the moment the answer mentioned the tag.
+    line_has_content: bool,
 }
 
 const OPEN_TAG: &str = "<think>";
 const CLOSE_TAG: &str = "</think>";
 
 impl ThinkTagFilter {
+    /// Track whether the visible line still open after emitting `s` has any
+    /// non-whitespace on it (drives the line-start rule for later chunks).
+    fn note_emitted(&mut self, s: &str) {
+        match s.rfind('\n') {
+            Some(i) => self.line_has_content = !s[i + 1..].trim().is_empty(),
+            None => self.line_has_content = self.line_has_content || !s.trim().is_empty(),
+        }
+    }
+
+    /// True when a tag found right after `prefix` sits at a line start —
+    /// everything on its line so far (buffered here or already emitted) is
+    /// whitespace.
+    fn at_line_start(&self, prefix: &str) -> bool {
+        match prefix.rfind('\n') {
+            Some(i) => prefix[i + 1..].trim().is_empty(),
+            None => !self.line_has_content && prefix.trim().is_empty(),
+        }
+    }
+
     /// Feed newly-arrived content text; returns the blocks safe to emit now.
-    /// Anything that might still be a partial tag is held back in `buf`.
+    /// A tail that might still be a partial tag is held back in `buf`.
     fn feed(&mut self, chunk: &str) -> Vec<Block> {
         self.buf.push_str(chunk);
         let mut out = Vec::new();
         loop {
-            let found = if self.in_think { self.buf.find(CLOSE_TAG) } else { self.buf.find(OPEN_TAG) };
-            match found {
-                Some(pos) => {
-                    let head = self.buf[..pos].to_string();
-                    let rest_start = pos + if self.in_think { CLOSE_TAG.len() } else { OPEN_TAG.len() };
-                    self.buf = self.buf[rest_start..].to_string();
-                    if !head.is_empty() {
-                        out.push(if self.in_think { Block::Reasoning(head) } else { Block::Text(head) });
-                    }
-                    self.in_think = !self.in_think;
-                }
-                None => {
-                    // Hold back a tail long enough to contain a partial tag
-                    // start, so "<thi" arriving now and "nk>" next chunk still
-                    // matches. Emit everything before that as safe.
-                    let margin = CLOSE_TAG.len().max(OPEN_TAG.len()) - 1;
-                    if self.buf.len() > margin {
-                        let split = self.buf.len() - margin;
-                        // Split on a char boundary at or before `split`.
-                        let split = (0..=split).rev().find(|&i| self.buf.is_char_boundary(i)).unwrap_or(0);
-                        let emit = self.buf[..split].to_string();
-                        self.buf = self.buf[split..].to_string();
-                        if !emit.is_empty() {
-                            out.push(if self.in_think {
-                                Block::Reasoning(emit)
-                            } else {
-                                Block::Text(emit)
-                            });
+            if self.in_think {
+                match self.buf.find(CLOSE_TAG) {
+                    Some(pos) => {
+                        let head = self.buf[..pos].to_string();
+                        self.buf = self.buf[pos + CLOSE_TAG.len()..].to_string();
+                        if !head.is_empty() {
+                            out.push(Block::Reasoning(head));
                         }
+                        self.in_think = false;
+                        // A stripped block leaves its line visibly empty, so a
+                        // back-to-back follow-up block still opens at a line start.
+                        self.line_has_content = false;
                     }
-                    break;
+                    None => {
+                        self.hold_margin(&mut out);
+                        break;
+                    }
+                }
+            } else {
+                // Open only at a line start; mid-line occurrences are literal
+                // content and are skipped (a later line-start one still opens).
+                let opener = self
+                    .buf
+                    .match_indices(OPEN_TAG)
+                    .map(|(pos, _)| pos)
+                    .find(|&pos| self.at_line_start(&self.buf[..pos]));
+                match opener {
+                    Some(pos) => {
+                        let head = self.buf[..pos].to_string();
+                        self.buf = self.buf[pos + OPEN_TAG.len()..].to_string();
+                        if !head.is_empty() {
+                            self.note_emitted(&head);
+                            out.push(Block::Text(head));
+                        }
+                        self.in_think = true;
+                    }
+                    None => {
+                        self.hold_margin(&mut out);
+                        break;
+                    }
                 }
             }
         }
         out
+    }
+
+    /// Emit everything except a tail long enough to hide a partial tag —
+    /// "<thi" arriving now and "nk>" next chunk must still match. The split
+    /// lands on a char boundary.
+    fn hold_margin(&mut self, out: &mut Vec<Block>) {
+        let margin = CLOSE_TAG.len().max(OPEN_TAG.len()) - 1;
+        if self.buf.len() > margin {
+            let split = self.buf.len() - margin;
+            let split = (0..=split).rev().find(|&i| self.buf.is_char_boundary(i)).unwrap_or(0);
+            let emit = self.buf[..split].to_string();
+            self.buf = self.buf[split..].to_string();
+            if !emit.is_empty() {
+                if self.in_think {
+                    out.push(Block::Reasoning(emit));
+                } else {
+                    self.note_emitted(&emit);
+                    out.push(Block::Text(emit));
+                }
+            }
+        }
     }
 
     /// Flush any remaining buffered text at end of stream.
@@ -672,6 +732,11 @@ impl Provider for OpenAiCompat {
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Err(e) => {
+                        // Surface what the filter is still holding before the
+                        // error — otherwise the reply's tail silently vanishes.
+                        if let Some(b) = think_filter.flush() {
+                            yield Ok(b);
+                        }
                         yield Err(ProviderError::Transport(e.to_string()));
                         return;
                     }
@@ -970,29 +1035,90 @@ mod think_tag_tests {
     }
 
     #[test]
-    fn strips_think_tags_in_one_chunk() {
+    fn strips_a_leading_think_block() {
         let mut f = ThinkTagFilter::default();
-        let blocks = f.feed("before <think>hmm let me consider</think> after");
-        let flushed = f.flush();
-        let mut all = blocks;
-        all.extend(flushed);
+        let mut all = f.feed("<think>hmm let me consider</think> after");
+        all.extend(f.flush());
         let (text, reasoning) = collect(&all);
-        assert_eq!(text, "before  after");
+        assert_eq!(text, " after");
         assert_eq!(reasoning, "hmm let me consider");
     }
 
     #[test]
-    fn handles_tag_split_across_chunks() {
+    fn leading_tag_split_across_chunks_still_matches() {
         let mut f = ThinkTagFilter::default();
         let mut all = Vec::new();
-        // "<think>" itself split mid-tag, and "</think>" split mid-tag too.
-        all.extend(f.feed("start <thi"));
+        // Whitespace before the tag is fine; "<think>"/"</think>" split mid-tag.
+        all.extend(f.feed("  <thi"));
         all.extend(f.feed("nk>reasoning here</th"));
         all.extend(f.feed("ink> end"));
         all.extend(f.flush());
         let (text, reasoning) = collect(&all);
-        assert_eq!(text, "start  end");
+        assert_eq!(text, "   end");
         assert_eq!(reasoning, "reasoning here");
+    }
+
+    #[test]
+    fn literal_think_mid_answer_is_content_not_a_tag() {
+        // The reported bug: the model writes documentation ABOUT `<think>`
+        // tags mid-answer — everything after got hidden as collapsed
+        // reasoning and the user saw their reply "cut off".
+        let mut f = ThinkTagFilter::default();
+        let mut all = Vec::new();
+        all.extend(f.feed("Reasoning support (Shape 2: `<think>"));
+        all.extend(f.feed("` tags). The rest of the answer must stay visible."));
+        all.extend(f.flush());
+        let (text, reasoning) = collect(&all);
+        assert_eq!(reasoning, "", "mid-answer literal must not open a think block");
+        assert_eq!(
+            text,
+            "Reasoning support (Shape 2: `<think>` tags). The rest of the answer must stay visible."
+        );
+    }
+
+    #[test]
+    fn unclosed_literal_tag_at_answer_end_is_not_swallowed() {
+        let mut f = ThinkTagFilter::default();
+        let mut all = f.feed("use <think");
+        all.extend(f.flush());
+        let (text, reasoning) = collect(&all);
+        assert_eq!(text, "use <think");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn mid_response_block_at_line_start_is_reasoning() {
+        // Chat templates emit think blocks on their own line — one arriving
+        // mid-response after a newline is real thinking, not content.
+        let mut f = ThinkTagFilter::default();
+        let mut all = Vec::new();
+        all.extend(f.feed("para one\n\n<think>plan the "));
+        all.extend(f.feed("next step</think>\npara two"));
+        all.extend(f.flush());
+        let (text, reasoning) = collect(&all);
+        assert_eq!(text, "para one\n\n\npara two");
+        assert_eq!(reasoning, "plan the next step");
+    }
+
+    #[test]
+    fn literal_tag_pair_mid_line_stays_content() {
+        // Both tags mentioned inline (docs/code sample) — nothing is stripped.
+        let mut f = ThinkTagFilter::default();
+        let mut all = f.feed("wrap reasoning in `<think>` and `</think>` in templates");
+        all.extend(f.flush());
+        let (text, reasoning) = collect(&all);
+        assert_eq!(text, "wrap reasoning in `<think>` and `</think>` in templates");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn back_to_back_leading_blocks_both_strip() {
+        let mut f = ThinkTagFilter::default();
+        let mut all = f.feed("<think>a</think><think>b</think>hello");
+        all.extend(f.flush());
+        let (text, reasoning) = collect(&all);
+        assert_eq!(text, "hello");
+        assert_eq!(reasoning, "ab");
     }
 
     #[test]

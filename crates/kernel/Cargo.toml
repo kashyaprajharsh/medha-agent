@@ -12,5 +12,12 @@ ulid = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 async-trait.workspace = true
 futures.workspace = true
-futures-timer = "3"
+# The kernel commits to tokio (like every other crate here): the tool/sandbox
+# futures it awaits already require a tokio runtime, so runtime-agnosticism
+# bought nothing — and interrupts.rs needs select!/sync/time first-class.
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+tokio-util = "0.7"
 sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

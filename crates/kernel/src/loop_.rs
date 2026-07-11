@@ -410,7 +410,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                     if e.is_retryable() && !emitted && attempt < MAX_TURN_RETRIES {
                         attempt += 1;
-                        futures_timer::Delay::new(retry_backoff(attempt)).await;
+                        tokio::time::sleep(retry_backoff(attempt)).await;
                         continue;
                     }
                     return Err(KernelError::Provider(e.to_string()));

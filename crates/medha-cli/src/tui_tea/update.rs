@@ -361,8 +361,10 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
                 _ => kernel::Approval::Deny,
             };
             // "Always" for a tool means don't re-ask this session; for a path the
-            // permission layer persists it to medha.lock (PART 1).
-            if choice == 1 {
+            // permission layer persists it to medha.lock (PART 1). A trust-flow
+            // escalated action is NEVER remembered — each web-tainted action is
+            // reviewed afresh (K9), so treat its "always" as a one-time approve.
+            if choice == 1 && !pending.escalated {
                 model.auto_approve.insert(pending.action.clone());
             }
             let _ = pending.responder.send(decision);
@@ -392,18 +394,22 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
             }
         }
         TuiEvent::Verify(ok, summary) => model.push_item(Item::Verify { ok, summary }),
-        TuiEvent::Approval(action, detail, responder) => {
-            if model.auto_approve.contains(&action) {
+        TuiEvent::Approval(action, detail, escalated, responder) => {
+            // Auto-approve only a previously "always"-ed action, and NEVER a
+            // trust-flow-escalated one (a web-tainted action is always reviewed
+            // afresh — approving one shell command must not wave through a later
+            // web-derived one, K9).
+            if !escalated && model.auto_approve.contains(&action) {
                 let _ = responder.send(kernel::Approval::Once);
             } else {
-                tracing::debug!(action = %action, "approval created");
+                tracing::debug!(action = %action, escalated, "approval created");
                 // Queue, don't clobber: the kernel runs tool calls concurrently
                 // (buffered up to `max_parallel_tools`), so several `confirm()`
                 // requests can arrive in the same turn. Replacing a pending one
                 // would drop its `oneshot::Sender` and the kernel would read that
                 // as `Approval::Deny` (the spurious "rejected by human").
                 let was_empty = model.pending_approvals.is_empty();
-                model.pending_approvals.push_back(PendingApproval { action, detail, responder });
+                model.pending_approvals.push_back(PendingApproval { action, detail, escalated, responder });
                 if was_empty {
                     model.approval_sel = 0;
                     model.approval_ready = false;
@@ -914,6 +920,7 @@ mod fix_tests {
         m.pending_approvals.push_back(PendingApproval {
             action: "shell.exec".into(),
             detail: None,
+            escalated: false,
             responder: tx,
         });
         m.deny_pending_approvals();

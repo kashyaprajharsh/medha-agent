@@ -41,6 +41,20 @@ fn approval_detail(intent: &ToolIntent) -> String {
     }
 }
 
+/// The auto-approve scope key for the human gate (K9): the tool plus its most
+/// salient argument, so "always allow" is scoped to *this* action — approving
+/// `rm -rf build/` doesn't then auto-approve every future `shell.exec`. Falls
+/// back to the bare tool name for tools with no obvious identifying arg.
+fn approval_key(intent: &ToolIntent) -> String {
+    let arg = ["command", "path", "url"]
+        .iter()
+        .find_map(|k| intent.args.get(*k).and_then(|v| v.as_str()));
+    match arg {
+        Some(a) => format!("{}: {a}", intent.tool),
+        None => intent.tool.clone(),
+    }
+}
+
 /// Why a session loop stopped — so the surface can tell the user (e.g. which
 /// budget ceiling was hit, and that it can be resumed) instead of returning
 /// silently.
@@ -67,6 +81,15 @@ pub struct Kernel<P: Provider, L: EventLog> {
 /// Tool-result payloads larger than this spill to the artifact store and are
 /// replaced in-context by a head + a `read_artifact` reference (§4.5).
 const SPILL_THRESHOLD: usize = 16_000;
+
+/// How many times a turn's model stream is retried on a transient provider
+/// failure (429 / 5xx / network drop) before giving up (K3).
+const MAX_TURN_RETRIES: u32 = 3;
+
+/// Capped exponential backoff between stream retries: 250ms, 500ms, 1s, …
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(250u64.saturating_mul(1 << attempt.saturating_sub(1).min(4)))
+}
 
 impl<P: Provider, L: EventLog> Kernel<P, L> {
     #[allow(clippy::too_many_arguments)]
@@ -139,6 +162,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let specs = self.executor.specs();
         let max_ctx = self.provider.capabilities().max_ctx;
         let mut gov = crate::budgets::Governor::new(budget);
+        // Spill oversized tool results already in the working set (K11). The live
+        // path spills at execute time (below), but messages rebuilt from the log
+        // on resume carry the FULL payloads — a resumed context could be
+        // megabytes larger than the live one ever was. Re-applying the spill here
+        // is idempotent (already-spilled results are under the threshold) and
+        // covers every resume entry point (headless / REPL / TUI).
+        for m in messages.iter_mut() {
+            if m.role == crate::types::Role::Tool && m.content.len() > SPILL_THRESHOLD {
+                m.content = self.maybe_spill(std::mem::take(&mut m.content));
+            }
+        }
         // Record this turn's new user message so the session is fully
         // reconstructable from the log (resume/replay). Callers append the user
         // message then call run_session, so the tail is the new prompt; earlier
@@ -190,9 +224,38 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 // so this is lossless — better than discarding them.
                 messages = view.clone();
             }
-            let ctx = CompiledContext { model: String::new(), messages: view, tools: specs.clone() };
+            let mut ctx = CompiledContext { model: String::new(), messages: view, tools: specs.clone() };
 
-            let (assistant, intents, usage) = self.run_turn(session, &ctx, sink).await?;
+            // Run the turn; if the provider rejects it as too long despite our
+            // pre-flight budgeting (P0-6 — the local estimate undercounted), do
+            // one emergency compaction with a halved window (forces the engine's
+            // hard path) and retry once, rather than dying with a fatal error.
+            let mut overflow_retried = false;
+            let (assistant, intents, usage) = loop {
+                match self.run_turn(session, &ctx, sink).await {
+                    Ok(t) => break t,
+                    Err(KernelError::ContextOverflow) if !overflow_retried => {
+                        overflow_retried = true;
+                        let emergency = max_ctx.map(|m| (m / 2).max(1));
+                        let recompiled = self.context.compile(&messages, emergency).await;
+                        sink.compaction(recompiled.before_tokens, recompiled.after_tokens, recompiled.summarized);
+                        self.log
+                            .append(Event::compaction(session, recompiled.before_tokens, recompiled.after_tokens))
+                            .await?;
+                        messages = recompiled.messages.clone();
+                        ctx = CompiledContext {
+                            model: String::new(),
+                            messages: recompiled.messages,
+                            tools: specs.clone(),
+                        };
+                    }
+                    Err(KernelError::ContextOverflow) => {
+                        // Already retried once and still over — stop gracefully.
+                        return Ok((messages, StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow)));
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
             // Feed real token usage back: the context engine uses it for accurate
             // compaction decisions, and the governor meters spend (cost = 0.0
             // until a per-model price table is wired).
@@ -269,54 +332,51 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         rep.summary,
                         tail.join("\n")
                     );
+                    // Log it as a user message so a resumed session sees the same
+                    // verifier feedback the model reasoned about (K12) — otherwise
+                    // replay diverges (the model self-corrected against text that
+                    // no longer exists in the reconstructed history).
+                    self.log.append(Event::user_message(session, &feedback)).await.ok();
                     messages.push(Message::user(feedback));
                 }
             }
         }
     }
 
-    /// One turn: stream the model, log every block, collect text + intents into
-    /// a single assistant message.
+    /// One turn: stream the model (retrying transient failures), log every
+    /// block, and collect text + intents into a single assistant message.
+    ///
+    /// Retry policy (K3): a transient provider failure — network drop, 429, 5xx,
+    /// mid-stream cutoff — is retried with capped exponential backoff, but ONLY
+    /// while nothing has been streamed to the surface yet (re-running after
+    /// partial output would duplicate it). A context-length rejection is surfaced
+    /// as [`KernelError::ContextOverflow`] so `run_session` can compact and retry
+    /// (P0-6); other errors are fatal for the turn.
     async fn run_turn(
         &self,
         session: &Session,
         ctx: &CompiledContext,
         sink: &dyn StreamSink,
     ) -> Result<(Message, Vec<ToolIntent>, Option<crate::types::Usage>), KernelError> {
-        let mut stream = self
-            .provider
-            .stream(ctx)
-            .await
-            .map_err(|e| KernelError::Provider(e.to_string()))?;
-
-        // Stream text/reasoning deltas to the surface as they arrive; accumulate
-        // and log each once per turn (one event, not one per token). Reasoning
-        // is logged for full transparency/audit (P3/P7) but excluded from the
-        // Message that re-enters conversation history — it's scratch content,
-        // not something to echo back per the reasoning-model providers' own
-        // convention.
-        let mut text = String::new();
-        let mut reasoning = String::new();
-        let mut intents: Vec<ToolIntent> = Vec::new();
-        let mut usage: Option<crate::types::Usage> = None;
-        while let Some(block) = stream.next().await {
-            match block.map_err(|e| KernelError::Provider(e.to_string()))? {
-                Block::Text(t) => {
-                    sink.text(&t);
-                    text.push_str(&t);
-                }
-                Block::Reasoning(r) => {
-                    sink.reasoning(&r);
-                    reasoning.push_str(&r);
-                }
-                Block::ToolStarted { name, target } => sink.tool_started(&name, target.as_deref()),
-                Block::ToolIntent(it) => intents.push(it),
-                Block::Usage(u) => {
-                    sink.usage(u.prompt_tokens, u.total_tokens);
-                    usage = Some(u);
+        let mut attempt = 0u32;
+        let (text, reasoning, intents, usage) = loop {
+            match self.stream_turn(ctx, sink).await {
+                Ok(data) => break data,
+                Err((e, emitted)) => {
+                    if e.is_context_overflow() {
+                        return Err(KernelError::ContextOverflow);
+                    }
+                    if e.is_retryable() && !emitted && attempt < MAX_TURN_RETRIES {
+                        attempt += 1;
+                        futures_timer::Delay::new(retry_backoff(attempt)).await;
+                        continue;
+                    }
+                    return Err(KernelError::Provider(e.to_string()));
                 }
             }
-        }
+        };
+        // Log (P3/P7) after a successful stream. Reasoning is logged for
+        // transparency but excluded from the Message that re-enters history.
         if !reasoning.is_empty() {
             self.log.append(Event::model_reasoning(session, &reasoning)).await?;
         }
@@ -327,6 +387,55 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             self.log.append(Event::model_intent(session, it)).await?;
         }
         Ok((Message::assistant_calls(text, intents.clone()), intents, usage))
+    }
+
+    /// Establish and consume one model stream, emitting deltas to the sink as
+    /// they arrive. Returns the accumulated (text, reasoning, intents, usage) on
+    /// success, or `(error, already_emitted)` — the flag tells the caller whether
+    /// retrying is safe (retrying after content was streamed would duplicate it).
+    #[allow(clippy::type_complexity)]
+    async fn stream_turn(
+        &self,
+        ctx: &CompiledContext,
+        sink: &dyn StreamSink,
+    ) -> Result<
+        (String, String, Vec<ToolIntent>, Option<crate::types::Usage>),
+        (crate::provider::ProviderError, bool),
+    > {
+        let mut stream = self.provider.stream(ctx).await.map_err(|e| (e, false))?;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut intents: Vec<ToolIntent> = Vec::new();
+        let mut usage: Option<crate::types::Usage> = None;
+        let mut emitted = false;
+        while let Some(block) = stream.next().await {
+            match block {
+                Ok(Block::Text(t)) => {
+                    emitted = true;
+                    sink.text(&t);
+                    text.push_str(&t);
+                }
+                Ok(Block::Reasoning(r)) => {
+                    emitted = true;
+                    sink.reasoning(&r);
+                    reasoning.push_str(&r);
+                }
+                Ok(Block::ToolStarted { name, target }) => {
+                    emitted = true;
+                    sink.tool_started(&name, target.as_deref());
+                }
+                Ok(Block::ToolIntent(it)) => {
+                    emitted = true;
+                    intents.push(it);
+                }
+                Ok(Block::Usage(u)) => {
+                    sink.usage(u.prompt_tokens, u.total_tokens);
+                    usage = Some(u);
+                }
+                Err(e) => return Err((e, emitted)),
+            }
+        }
+        Ok((text, reasoning, intents, usage))
     }
 
     /// validate (P1) → police (§4.6) → verify (§4.7) → execute (§4.8).
@@ -340,12 +449,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         web_tainted: bool,
     ) -> Observation {
         let radius = self.executor.blast_radius(&intent.tool);
-        let decision = escalate_for_trust_flow(
-            self.policy.authorize(intent, radius),
-            radius,
-            web_tainted,
-            self.executor.containment(),
-        );
+        let raw = self.policy.authorize(intent, radius);
+        // Did trust-flow turn a permissive verdict into a gate? Such an escalated
+        // gate must never be auto-approved (K9) — capture it before `raw` moves.
+        let raw_permissive = matches!(raw, crate::types::Decision::Allow | crate::types::Decision::Verify);
+        let decision =
+            escalate_for_trust_flow(raw, radius, web_tainted, self.executor.containment());
+        let escalated = raw_permissive && matches!(decision, crate::types::Decision::Human);
         self.log.append(Event::policy(session, intent, &decision)).await.ok();
         match decision {
             crate::types::Decision::Deny { reason } => Observation::denial(&intent.id, reason),
@@ -357,7 +467,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     .preview(intent)
                     .await
                     .unwrap_or_else(|| approval_detail(intent));
-                if self.gate.confirm(&intent.tool, Some(&detail)).await.approved() {
+                // Scope the approval to this specific action (tool + salient arg),
+                // so "always allow" doesn't blanket every call of the tool (K9).
+                let action = approval_key(intent);
+                if self.gate.confirm(&action, Some(&detail), escalated).await.approved() {
                     self.executor.execute(intent).await
                 } else {
                     Observation::denial(&intent.id, "rejected by human".to_string())
@@ -391,6 +504,30 @@ fn escalate_for_trust_flow(
         Decision::Human
     } else {
         decision
+    }
+}
+
+#[cfg(test)]
+mod approval_key_tests {
+    use super::approval_key;
+    use crate::types::ToolIntent;
+    use serde_json::json;
+
+    fn intent(tool: &str, args: serde_json::Value) -> ToolIntent {
+        ToolIntent { id: "1".into(), tool: tool.into(), args }
+    }
+
+    #[test]
+    fn approval_key_scopes_to_the_salient_arg_not_just_the_tool() {
+        // Two different shell commands must produce DIFFERENT keys, so approving
+        // one with "always" doesn't blanket-approve the other (K9).
+        let a = approval_key(&intent("shell.exec", json!({ "command": "cargo build" })));
+        let b = approval_key(&intent("shell.exec", json!({ "command": "rm -rf build" })));
+        assert_eq!(a, "shell.exec: cargo build");
+        assert_ne!(a, b, "distinct commands must not share an auto-approve key");
+        // Path-based tools key on the path; arg-less tools fall back to the tool.
+        assert_eq!(approval_key(&intent("fs.write", json!({ "path": "x.rs" }))), "fs.write: x.rs");
+        assert_eq!(approval_key(&intent("update_plan", json!({}))), "update_plan");
     }
 }
 

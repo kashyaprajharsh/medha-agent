@@ -361,6 +361,8 @@ impl Tool for FsWrite {
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
         let content = arg_str(args, "content")?;
+        // Serialize same-file writes within a turn (P0-4).
+        let _guard = self.sbx.path_guard(&path).await;
         // Capture the prior contents (empty for a new file) so surfaces can render
         // a proper diff: a new file shows as all-additions (empty left column),
         // an overwrite shows the real before/after — same view as fs.edit.
@@ -446,6 +448,9 @@ impl Tool for FsEdit {
         let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
         validate_edit(&old_s, &new_s)?;
 
+        // Serialize same-file edits within a turn so a concurrent edit can't read
+        // the same original and clobber this one (P0-4).
+        let _guard = self.sbx.path_guard(&path).await;
         let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
         // CRLF-tolerant byte-exact match (see `resolve_edit`).
         let (old_s, new_s) = resolve_edit(&content, &old_s, &new_s)
@@ -1917,6 +1922,38 @@ impl TaskTable {
         out.sort_by(|a, b| a["task_id"].as_str().cmp(&b["task_id"].as_str()));
         out
     }
+    /// Await a registered task up to `dur` (without holding the table lock across
+    /// the await — clone the completion receiver out first). Returns true if it
+    /// finished in time. Unknown id → false.
+    async fn wait_until(&self, id: &str, dur: std::time::Duration) -> bool {
+        let rx = {
+            let Ok(m) = self.inner.lock() else { return false };
+            match m.get(id) {
+                Some(t) => t.proc.done_receiver(),
+                None => return false,
+            }
+        };
+        sandbox::exec::wait_done(rx, dur).await
+    }
+
+    /// Remove a finished task and return its `(exit_code, stdout, stderr)` — used
+    /// when a promoted command actually completed inside the foreground window,
+    /// so it doesn't linger in the table.
+    fn take_finished(&self, id: &str) -> Option<(Option<i32>, String, String)> {
+        let mut m = self.inner.lock().ok()?;
+        let entry = m.remove(id)?;
+        let (o, e) = entry.proc.snapshot();
+        Some((entry.proc.exit_code(), o, e))
+    }
+
+    /// `(pid, stdout_so_far, stderr_so_far)` for a still-running task.
+    fn running_view(&self, id: &str) -> Option<(Option<u32>, String, String)> {
+        let m = self.inner.lock().ok()?;
+        let t = m.get(id)?;
+        let (o, e) = t.proc.snapshot();
+        Some((t.proc.pid, o, e))
+    }
+
     /// Structured task list for surfaces (the TUI status line / `/tasks`).
     fn info(&self) -> Vec<kernel::BackgroundTask> {
         let Ok(m) = self.inner.lock() else { return Vec::new() };
@@ -1997,24 +2034,30 @@ impl Tool for ShellExec {
             .exec_background("sh", &["-c".to_string(), command.clone()], shell_env(), true)
             .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-        // Immediate backgrounding (servers/watchers) → return a task id now.
-        if !background {
-            // Otherwise give it up to `promote_after` to finish in the foreground.
-            if bg.wait_until(promote_after).await {
-                let (stdout, stderr) = bg.snapshot();
+        // Register in the table BEFORE waiting. If the caller cancels (Esc) during
+        // the foreground window, this future is dropped mid-wait — and because the
+        // task is already tracked, it stays pollable/listable and is reaped by the
+        // table's session-end `kill_all`, instead of leaking an untracked process
+        // group (the timeout path was fixed by GroupReaper; this closes the cancel
+        // path).
+        let task_id = self.tasks.register(command.clone(), bg);
+
+        // Foreground window (skipped for explicit background): if it finishes in
+        // time, unregister and return the full output like an ordinary command.
+        if !background && self.tasks.wait_until(&task_id, promote_after).await {
+            if let Some((exit_code, stdout, stderr)) = self.tasks.take_finished(&task_id) {
                 return Ok(json!({
                     "command": command,
-                    "exit_code": bg.exit_code(),
+                    "exit_code": exit_code,
                     "stdout": stdout,
                     "stderr": stderr,
                 }));
             }
         }
 
-        // Still running past the deadline (or explicitly backgrounded): promote.
-        let (stdout, stderr) = bg.snapshot();
-        let pid = bg.pid;
-        let task_id = self.tasks.register(command.clone(), bg);
+        // Still running past the deadline (or explicitly backgrounded): leave it
+        // tracked and hand back the task id + partial output.
+        let (pid, stdout, stderr) = self.tasks.running_view(&task_id).unwrap_or((None, String::new(), String::new()));
         Ok(json!({
             "command": command,
             "status": "running",
@@ -2268,6 +2311,8 @@ impl Tool for MultiEdit {
         if edits.is_empty() {
             return Err(ToolError::Args("'edits' is empty".into()));
         }
+        // Serialize same-file edits within a turn (P0-4).
+        let _guard = self.sbx.path_guard(&path).await;
         let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
         let updated = apply_edits(&content, edits)?;
         let snapshot =
@@ -3434,6 +3479,29 @@ mod tests {
     // above; a real-clock variant flakes under heavy parallel test load, so it's
     // intentionally not a separate test.)
 
+    #[tokio::test]
+    async fn cancelling_shell_exec_mid_wait_still_tracks_the_task() {
+        // If the caller cancels (Esc) during the foreground window, the shell.exec
+        // future is dropped mid-wait. Because the task is registered BEFORE the
+        // wait, it must remain tracked (pollable/killable/reaped) — not leak an
+        // invisible process group.
+        let dir = std::env::temp_dir().join(format!("medha-sh-cancel-{}", ulid_like()));
+        let reg = Arc::new(reg_in(&dir));
+        // Long foreground window so the call is definitely mid-wait when dropped.
+        let fut = run(&reg, "shell.exec", json!({ "command": "sleep 30", "timeout_s": 30 }));
+        // Drop the future partway through the wait — this is what a cancel does.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+
+        // The task is still tracked (register-before-wait), not leaked.
+        let list = run(&reg, "task.list", json!({})).await;
+        let tasks = list.payload["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1, "cancelled shell.exec must stay tracked: {:?}", list.payload);
+        let id = tasks[0]["task_id"].as_str().unwrap().to_string();
+        // And it's reapable via the table (also what session-end kill_all does).
+        assert_eq!(run(&reg, "task.kill", json!({ "task_id": id })).await.payload["killed"], true);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── K7 / P1-10: long-running tools get a wider ceiling than the 60s default ──
     #[test]
     fn per_tool_timeouts_exceed_the_default_for_long_runners() {
@@ -3450,6 +3518,33 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-to-{}", ulid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap())
+    }
+
+    // ── P0-4: concurrent same-file edits must not clobber each other ──────────
+    #[tokio::test]
+    async fn concurrent_edits_to_one_file_both_apply() {
+        let dir = std::env::temp_dir().join(format!("medha-p04-{}", ulid_like()));
+        let reg = Arc::new(reg_in(&dir));
+        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "alpha beta" })).await;
+
+        // Fire two edits to the SAME file at once. Without per-path serialization
+        // both read "alpha beta" and last-write-wins drops one; the lock forces
+        // the second to see the first's result, so both land.
+        let (a, b) = (reg.clone(), reg.clone());
+        let e1 = tokio::spawn(async move {
+            run(&a, "fs.edit", json!({ "path": "f.txt", "old_string": "alpha", "new_string": "A" })).await
+        });
+        let e2 = tokio::spawn(async move {
+            run(&b, "fs.edit", json!({ "path": "f.txt", "old_string": "beta", "new_string": "B" })).await
+        });
+        let (r1, r2) = (e1.await.unwrap(), e2.await.unwrap());
+        assert_eq!(r1.status, kernel::ObsStatus::Ok);
+        assert_eq!(r2.status, kernel::ObsStatus::Ok);
+
+        // Final file reflects BOTH edits (order-independent).
+        let out = run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"].as_str().unwrap().to_string();
+        assert_eq!(out, "A B", "both edits applied, neither lost: {out:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── P1-7: `*` must not cross `/` ──────────────────────────────────────────

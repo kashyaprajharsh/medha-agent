@@ -6,8 +6,9 @@
 //! The new permission system allows legitimate access to files outside the
 //! workspace via a live ask-then-persist flow (see issues.txt).
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kernel::HumanGate;
 use permissions::PermissionManager;
@@ -37,6 +38,11 @@ pub struct WorkspaceSandbox {
     permission_manager: Arc<PermissionManager>,
     /// Backend that runs shell/build/VCS commands (host or OS-native jail).
     exec: Arc<dyn ExecBackend>,
+    /// Per-path write locks (P0-4): serialize concurrent read-modify-write on the
+    /// same file so two same-turn edits can't both read the original and clobber
+    /// each other (last-write-wins, silent loss, corrupted snapshot chain).
+    /// Different paths never contend.
+    write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl WorkspaceSandbox {
@@ -63,6 +69,7 @@ impl WorkspaceSandbox {
             snapshots,
             permission_manager: Arc::new(permission_manager),
             exec: Arc::new(HostBackend),
+            write_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -82,7 +89,22 @@ impl WorkspaceSandbox {
             snapshots,
             permission_manager: Arc::new(permission_manager),
             exec: Arc::new(HostBackend),
+            write_locks: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Acquire the write lock for `path` (P0-4). Hold the returned guard across a
+    /// read-modify-write (as `fs.edit` / `multi_edit` / `fs.write` do) so two
+    /// concurrent edits to the *same* file serialize instead of clobbering each
+    /// other. Keyed on the raw path string — the model uses a consistent spelling
+    /// for a file within a turn, so same-file calls share the lock; distinct
+    /// files get distinct locks and run in parallel.
+    pub async fn path_guard(&self, path: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.write_locks.lock().expect("write_locks poisoned");
+            locks.entry(path.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        };
+        lock.lock_owned().await
     }
 
     /// Install the execution backend used by shell/build/VCS tools. Defaults to

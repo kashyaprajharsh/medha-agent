@@ -78,13 +78,13 @@ impl AcpGate {
 
 #[async_trait::async_trait]
 impl kernel::HumanGate for AcpGate {
-    async fn confirm(&self, action: &str, detail: Option<&str>) -> kernel::Approval {
+    async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> kernel::Approval {
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(gate_id, tx);
         self.writer.notify(
             "approval",
-            json!({ "gate_id": gate_id, "action": action, "detail": detail }),
+            json!({ "gate_id": gate_id, "action": action, "detail": detail, "escalated": escalated }),
         );
         // Editor disconnected or never answered → treat as a rejection (P5:
         // never commit an unapproved action). An editor approval is "allow once":

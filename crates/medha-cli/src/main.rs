@@ -528,8 +528,11 @@ struct TerminalGate;
 
 #[async_trait::async_trait]
 impl kernel::HumanGate for TerminalGate {
-    async fn confirm(&self, action: &str, detail: Option<&str>) -> kernel::Approval {
+    async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> kernel::Approval {
         println!("\n\x1b[33m⚠ approve {action}?\x1b[0m");
+        if escalated {
+            println!("\x1b[31m  ⚠ web-tainted action — reviewed every time; 'always' is not offered\x1b[0m");
+        }
         if let Some(d) = detail {
             for line in d.lines() {
                 if line.starts_with('+') && !line.starts_with("+++") {
@@ -541,13 +544,18 @@ impl kernel::HumanGate for TerminalGate {
                 }
             }
         }
-        print!("  [1] once  [2] always  [3] no (default): ");
+        // A trust-flow-escalated action is never remembered: offer only once/no.
+        if escalated {
+            print!("  [1] once  [3] no (default): ");
+        } else {
+            print!("  [1] once  [2] always  [3] no (default): ");
+        }
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
         match line.trim().to_lowercase().as_str() {
             "1" | "y" | "yes" | "once" => kernel::Approval::Once,
-            "2" | "a" | "always" => kernel::Approval::Always,
+            "2" | "a" | "always" if !escalated => kernel::Approval::Always,
             _ => kernel::Approval::Deny,
         }
     }

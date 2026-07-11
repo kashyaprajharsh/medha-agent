@@ -410,6 +410,7 @@ impl PermissionManager {
             .confirm(
                 &format!("{permission:?} access to {}", resolved.display()),
                 Some(&prompt),
+                false, // an out-of-workspace path prompt is not a trust-flow escalation
             )
             .await;
 
@@ -452,7 +453,7 @@ mod tests {
     struct FixedGate(Approval);
     #[async_trait::async_trait]
     impl HumanGate for FixedGate {
-        async fn confirm(&self, _action: &str, _detail: Option<&str>) -> Approval {
+        async fn confirm(&self, _action: &str, _detail: Option<&str>, _escalated: bool) -> Approval {
             self.0
         }
     }

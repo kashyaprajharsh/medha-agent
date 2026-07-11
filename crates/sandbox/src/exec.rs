@@ -291,18 +291,14 @@ impl BgProc {
     pub fn exit_code(&self) -> Option<i32> {
         self.code.lock().ok().and_then(|c| *c)
     }
+    /// A clone of the completion signal, so a holder (e.g. the task table) can
+    /// await this task WITHOUT keeping the table lock held across the await.
+    pub fn done_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.done_rx.clone()
+    }
     /// Wait up to `dur` for completion. Returns true if it finished in time.
     pub async fn wait_until(&self, dur: std::time::Duration) -> bool {
-        let mut rx = self.done_rx.clone();
-        tokio::time::timeout(dur, async {
-            while !*rx.borrow_and_update() {
-                if rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        })
-        .await
-        .is_ok()
+        wait_done(self.done_rx.clone(), dur).await
     }
     /// SIGKILL the whole process group.
     pub fn kill(&self) {
@@ -310,6 +306,21 @@ impl BgProc {
             kill_group(pid);
         }
     }
+}
+
+/// Wait up to `dur` for a task's done-signal to flip to `true`; returns true if
+/// it completed in time. Free-standing so a caller holding a task table can
+/// clone the receiver out (cheap) and await here without keeping the lock.
+pub async fn wait_done(mut rx: tokio::sync::watch::Receiver<bool>, dur: std::time::Duration) -> bool {
+    tokio::time::timeout(dur, async {
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok()
 }
 
 /// Spawn a command as a background task: it keeps running after this returns,

@@ -12,4 +12,5 @@ ulid = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+futures-timer = "3"
 sha2 = "0.10"

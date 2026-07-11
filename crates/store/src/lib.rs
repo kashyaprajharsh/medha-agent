@@ -72,8 +72,6 @@ pub enum StoreError {
 
 pub struct SqliteLog {
     conn: Mutex<Connection>,
-    /// Running chain hash (hash of the most recent event). Resumed on open.
-    last_hash: Mutex<[u8; 32]>,
 }
 
 impl SqliteLog {
@@ -102,18 +100,10 @@ impl SqliteLog {
         )
         .map_err(|e| StoreError::Db(e.to_string()))?;
 
-        // Resume the chain from the latest event so appends continue, not reset.
-        let last: Option<Vec<u8>> = conn
-            .query_row("SELECT hash FROM events ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0))
-            .ok();
-        let mut last_hash = [0u8; 32];
-        if let Some(h) = last {
-            if h.len() == 32 {
-                last_hash.copy_from_slice(&h);
-            }
-        }
-
-        Ok(Self { conn: Mutex::new(conn), last_hash: Mutex::new(last_hash) })
+        // The chain head is read from the DB inside each append's transaction
+        // (see `append`), not cached — so a second MEDHA process on the same
+        // workspace can't append against a stale head and corrupt the chain (K10).
+        Ok(Self { conn: Mutex::new(conn) })
     }
 
     /// Verify the tamper-evident hash chain over the ENTIRE log (all sessions,
@@ -226,12 +216,31 @@ impl SqliteLog {
 #[async_trait]
 impl EventLog for SqliteLog {
     async fn append(&self, mut e: Event) -> Result<Event, KernelError> {
-        let mut last = self.last_hash.lock().map_err(|_| KernelError::Log("poisoned".into()))?;
-        e.prev_hash = *last;
+        use rusqlite::OptionalExtension;
+        let mut conn = self.conn.lock().map_err(|_| KernelError::Log("poisoned".into()))?;
+        // Read the chain head and insert inside ONE `IMMEDIATE` transaction, so
+        // the read-then-append is atomic against any other writer — including a
+        // second MEDHA process on the same DB. Trusting an in-memory cached head
+        // (the old design) let two processes both link off the same hash and
+        // fail `verify()` as "tampering" (K10). SQLite's write lock serializes.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|err| KernelError::Log(err.to_string()))?;
+
+        let head: Option<Vec<u8>> = tx
+            .query_row("SELECT hash FROM events ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0))
+            .optional()
+            .map_err(|err| KernelError::Log(err.to_string()))?;
+        let mut prev = [0u8; 32];
+        if let Some(h) = head {
+            if h.len() == 32 {
+                prev.copy_from_slice(&h);
+            }
+        }
+        e.prev_hash = prev;
         let hash = chain_hash(&e.prev_hash, &e);
 
-        let conn = self.conn.lock().map_err(|_| KernelError::Log("poisoned".into()))?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO events
                 (id, session_id, parent_id, kind, payload, trust, provenance, prev_hash, hash, ts)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -249,8 +258,7 @@ impl EventLog for SqliteLog {
             ],
         )
         .map_err(|err| KernelError::Log(err.to_string()))?;
-
-        *last = hash;
+        tx.commit().map_err(|err| KernelError::Log(err.to_string()))?;
         Ok(e)
     }
 
@@ -413,6 +421,30 @@ mod tests {
         let h1 = chain_hash(&events[0].prev_hash, &events[0]);
         assert_eq!(events[1].prev_hash, h1, "chain is linked");
         assert_ne!(events[0].prev_hash, [0u8; 32].map(|_| 1u8)); // sanity
+    }
+
+    #[tokio::test]
+    async fn two_instances_on_one_db_keep_the_chain_intact() {
+        // Simulates two MEDHA processes sharing a workspace: each opens its own
+        // SqliteLog (own connection, no shared cache) and appends interleaved.
+        // The head is read inside each append's IMMEDIATE txn (K10), so the chain
+        // stays linked and verify() passes — the old cached-head design corrupted
+        // it here.
+        let dir = std::env::temp_dir().join(format!("medha-k10-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let a = SqliteLog::open(&db).unwrap();
+        let b = SqliteLog::open(&db).unwrap();
+        let s = kernel::Session { id: Ulid::new(), done: false };
+
+        for i in 0..6 {
+            let log = if i % 2 == 0 { &a } else { &b };
+            log.append(Event::model_text(&s, &format!("event {i}"))).await.unwrap();
+        }
+
+        // Either handle sees all six, and the global chain verifies clean.
+        assert_eq!(a.events(s.id).await.len(), 6);
+        SqliteLog::open(&db).unwrap().verify().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

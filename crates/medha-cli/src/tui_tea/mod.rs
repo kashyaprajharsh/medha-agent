@@ -82,9 +82,9 @@ pub(crate) struct TuiGate {
 
 #[async_trait::async_trait]
 impl kernel::HumanGate for TuiGate {
-    async fn confirm(&self, action: &str, detail: Option<&str>) -> kernel::Approval {
+    async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> kernel::Approval {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let req = TuiEvent::Approval(action.to_string(), detail.map(str::to_string), resp_tx);
+        let req = TuiEvent::Approval(action.to_string(), detail.map(str::to_string), escalated, resp_tx);
         if self.tx.send(req).is_err() {
             return kernel::Approval::Deny;
         }
@@ -103,7 +103,7 @@ pub(crate) enum TuiEvent {
     Compaction(u32, u32, bool),
     Usage(u32, u32),
     Verify(bool, String),
-    Approval(String, Option<String>, oneshot::Sender<kernel::Approval>),
+    Approval(String, Option<String>, bool, oneshot::Sender<kernel::Approval>),
     Done(Vec<Message>, StopReason),
     Error(String),
     Interrupted,
@@ -307,6 +307,9 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 struct PendingApproval {
     action: String,
     detail: Option<String>,
+    /// True for a trust-flow-escalated (web-tainted) action — never auto-approved
+    /// and never remembered via "always" (K9).
+    escalated: bool,
     responder: oneshot::Sender<kernel::Approval>,
 }
 
@@ -1092,16 +1095,20 @@ mod tests {
     // "rejected by human". The queue must hold all of them.
 
     fn push_approval(model: &mut Model, action: &str) -> oneshot::Receiver<kernel::Approval> {
+        push_approval_ex(model, action, false)
+    }
+
+    fn push_approval_ex(model: &mut Model, action: &str, escalated: bool) -> oneshot::Receiver<kernel::Approval> {
         let (tx, rx) = oneshot::channel();
-        let ev = TuiEvent::Approval(action.to_string(), None, tx);
+        let ev = TuiEvent::Approval(action.to_string(), None, escalated, tx);
         // Drive the same path handle_agent_event uses, minus the generic plumbing.
         match ev {
-            TuiEvent::Approval(action, detail, responder) => {
-                if model.auto_approve.contains(&action) {
+            TuiEvent::Approval(action, detail, escalated, responder) => {
+                if !escalated && model.auto_approve.contains(&action) {
                     let _ = responder.send(kernel::Approval::Once);
                 } else {
                     let was_empty = model.pending_approvals.is_empty();
-                    model.pending_approvals.push_back(PendingApproval { action, detail, responder });
+                    model.pending_approvals.push_back(PendingApproval { action, detail, escalated, responder });
                     if was_empty {
                         model.approval_sel = 0;
                         model.approval_ready = false;
@@ -1112,6 +1119,24 @@ mod tests {
             _ => unreachable!(),
         }
         rx
+    }
+
+    #[test]
+    fn escalated_approval_is_never_auto_approved() {
+        let ui = lockfile::UiConfig::default();
+        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        // The user previously chose "always" for this exact action.
+        m.auto_approve.insert("shell.exec: curl example.com".to_string());
+
+        // A normal request for it auto-approves (no card queued).
+        let mut rx = push_approval_ex(&mut m, "shell.exec: curl example.com", false);
+        assert!(m.pending_approvals.is_empty(), "remembered action auto-approves");
+        assert_eq!(rx.try_recv(), Ok(kernel::Approval::Once));
+
+        // The SAME action, but trust-flow ESCALATED (web-tainted), must NOT be
+        // auto-approved — it queues a fresh card for review (K9).
+        let _rx2 = push_approval_ex(&mut m, "shell.exec: curl example.com", true);
+        assert_eq!(m.pending_approvals.len(), 1, "escalated action is always re-asked, never waved through");
     }
 
     #[test]

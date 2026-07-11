@@ -46,6 +46,80 @@ pub enum ProviderError {
     Stream(String),
 }
 
+impl ProviderError {
+    /// Transient failures worth retrying with backoff: network/transport drops,
+    /// rate limits (429), and server errors (5xx). A context-length 400 is NOT
+    /// retryable as-is (retrying sends the same over-long request) — it's handled
+    /// separately by compaction; see [`is_context_overflow`](Self::is_context_overflow).
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            ProviderError::Transport(_) => true,
+            ProviderError::Status(code, _) => *code == 429 || (500..600).contains(code),
+            // A mid-stream cutoff often shows up here; treat as transient too.
+            ProviderError::Stream(_) => true,
+            ProviderError::Decode(_) => false,
+        }
+    }
+
+    /// The provider rejected the request for exceeding the model's context
+    /// window (usually a 400/413 whose message mentions context/token length).
+    /// The fix is to compact and retry, not to back off — so this is classified
+    /// apart from [`is_retryable`](Self::is_retryable).
+    pub fn is_context_overflow(&self) -> bool {
+        let msg = match self {
+            ProviderError::Status(code, m) if *code == 400 || *code == 413 => m,
+            _ => return false,
+        };
+        let m = msg.to_lowercase();
+        (m.contains("context") && (m.contains("length") || m.contains("window")))
+            || m.contains("context_length_exceeded")
+            || m.contains("maximum context")
+            || m.contains("too many tokens")
+            || (m.contains("token") && m.contains("exceed"))
+    }
+}
+
+#[cfg(test)]
+mod error_class_tests {
+    use super::ProviderError;
+
+    #[test]
+    fn transient_failures_are_retryable() {
+        assert!(ProviderError::Transport("connection reset".into()).is_retryable());
+        assert!(ProviderError::Status(429, "rate limited".into()).is_retryable());
+        assert!(ProviderError::Status(500, "internal".into()).is_retryable());
+        assert!(ProviderError::Status(503, "unavailable".into()).is_retryable());
+        assert!(ProviderError::Stream("mid-stream cutoff".into()).is_retryable());
+    }
+
+    #[test]
+    fn client_errors_and_decode_are_not_retryable() {
+        assert!(!ProviderError::Status(400, "bad request".into()).is_retryable());
+        assert!(!ProviderError::Status(401, "unauthorized".into()).is_retryable());
+        assert!(!ProviderError::Status(404, "not found".into()).is_retryable());
+        assert!(!ProviderError::Decode("bad json".into()).is_retryable());
+    }
+
+    #[test]
+    fn context_overflow_is_detected_and_kept_separate_from_retry() {
+        for msg in [
+            "This model's maximum context length is 128000 tokens",
+            "context_length_exceeded",
+            "requested tokens exceed the context window",
+            "too many tokens in the prompt",
+        ] {
+            let e = ProviderError::Status(400, msg.into());
+            assert!(e.is_context_overflow(), "should flag: {msg}");
+            assert!(!e.is_retryable(), "overflow is NOT a plain retry: {msg}");
+        }
+        // A generic 400 is neither.
+        let generic = ProviderError::Status(400, "invalid parameter 'foo'".into());
+        assert!(!generic.is_context_overflow());
+        // A 429 is retryable but not an overflow.
+        assert!(!ProviderError::Status(429, "slow down".into()).is_context_overflow());
+    }
+}
+
 /// How hard the model should think before answering. Maps onto whatever knob
 /// the adapter's server actually exposes (e.g. vLLM/SGLang's `medium_effort`
 /// flag) — canonical here so the kernel/surfaces never see vendor JSON shapes.

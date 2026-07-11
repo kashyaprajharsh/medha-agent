@@ -29,8 +29,13 @@ impl Approval {
 #[async_trait]
 pub trait HumanGate: Send + Sync {
     /// Ask the human to approve `action`; `detail` is a preview (command/diff).
-    /// Returns the human's decision (allow once / always / deny).
-    async fn confirm(&self, action: &str, detail: Option<&str>) -> Approval;
+    /// `action` doubles as the auto-approve scope key, so it should identify the
+    /// *specific* action (e.g. "shell.exec: cargo build"), not just the tool —
+    /// otherwise "always allow" blanket-approves every call of that tool (K9).
+    /// `escalated` is true when this gate exists only because of a trust-flow
+    /// escalation (a web-tainted consequential action, §4.6); such prompts must
+    /// NEVER be remembered/auto-approved — each one is asked afresh.
+    async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> Approval;
 }
 
 /// No human available (headless / non-interactive): reject anything that needs
@@ -39,7 +44,7 @@ pub struct AutoDeny;
 
 #[async_trait]
 impl HumanGate for AutoDeny {
-    async fn confirm(&self, _action: &str, _detail: Option<&str>) -> Approval {
+    async fn confirm(&self, _action: &str, _detail: Option<&str>, _escalated: bool) -> Approval {
         Approval::Deny
     }
 }

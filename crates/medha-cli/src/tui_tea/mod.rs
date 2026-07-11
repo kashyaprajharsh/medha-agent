@@ -69,6 +69,16 @@ fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
     COMMANDS.iter().filter(|(c, _)| c.starts_with(input)).copied().collect()
 }
 
+/// A line is a slash command only when its FIRST TOKEN is a known command.
+/// Anything else starting with `/` — a pasted absolute path, "/Users/… open
+/// this" — is chat for the model, not an "unknown command" error.
+fn is_slash_command(line: &str) -> bool {
+    match line.split_whitespace().next() {
+        Some(tok) => COMMANDS.iter().any(|(c, _)| *c == tok),
+        None => false,
+    }
+}
+
 /// Channel shared by sink (agent → UI events) and human gate (agent → UI approval requests)
 pub(crate) fn channel() -> (mpsc::UnboundedSender<TuiEvent>, mpsc::UnboundedReceiver<TuiEvent>) {
     mpsc::unbounded_channel()
@@ -1099,6 +1109,20 @@ mod tests {
     fn wrap_line_fast_path_when_it_fits() {
         assert_eq!(wrap_line(&Line::from("short"), 80).len(), 1);
         assert_eq!(wrap_line(&Line::from(""), 80).len(), 1);
+    }
+
+    #[test]
+    fn slash_parsing_only_fires_on_known_commands() {
+        // Known commands, with and without args.
+        assert!(is_slash_command("/help"));
+        assert!(is_slash_command("/think on"));
+        assert!(is_slash_command("/effort high"));
+        // A pasted absolute path is CHAT, not an unknown-command error.
+        assert!(!is_slash_command("/Users/x/medha/learn.html open this in browser"));
+        assert!(!is_slash_command("/tmp/foo.txt"));
+        // Near-miss typo goes to the model too (autocomplete guides while typing).
+        assert!(!is_slash_command("/claer"));
+        assert!(!is_slash_command("/"));
     }
 
     #[test]

@@ -264,8 +264,9 @@ pub(super) fn handle_key<P, L>(
                 model.input.insert(model.cursor - 1, '\n');
                 return;
             }
-            // Slash commands
-            if model.input.starts_with('/') {
+            // Slash commands — only when the first token IS a known command;
+            // a pasted path ("/Users/… do X") goes to the model as chat.
+            if is_slash_command(&model.input) {
                 let line = std::mem::take(&mut model.input);
                 model.cursor = 0;
                 model.ac_sel = 0;

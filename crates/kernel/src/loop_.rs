@@ -216,7 +216,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             if compiled.compacted {
                 sink.compaction(compiled.before_tokens, compiled.after_tokens, compiled.summarized);
                 self.log
-                    .append(Event::compaction(session, compiled.before_tokens, compiled.after_tokens))
+                    .append(Event::compaction(
+                        session,
+                        compiled.before_tokens,
+                        compiled.after_tokens,
+                        compiled.summary.as_deref(),
+                    ))
                     .await?;
                 // Carry-forward: the compacted view becomes the working set, so
                 // history stays bounded and we don't recompact it every turn.
@@ -240,7 +245,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         let recompiled = self.context.compile(&messages, emergency).await;
                         sink.compaction(recompiled.before_tokens, recompiled.after_tokens, recompiled.summarized);
                         self.log
-                            .append(Event::compaction(session, recompiled.before_tokens, recompiled.after_tokens))
+                            .append(Event::compaction(
+                                session,
+                                recompiled.before_tokens,
+                                recompiled.after_tokens,
+                                recompiled.summary.as_deref(),
+                            ))
                             .await?;
                         messages = recompiled.messages.clone();
                         ctx = CompiledContext {

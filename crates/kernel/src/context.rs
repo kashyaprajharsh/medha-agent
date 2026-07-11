@@ -22,6 +22,10 @@ pub struct CompileResult {
     /// The kernel must not send this turn — send would risk a provider
     /// context-length-exceeded error rather than a controlled, graceful stop.
     pub overflow: bool,
+    /// Summary text produced by a Full compaction, for the kernel to persist in
+    /// the `context.compaction` event so resume/replay reconstructs the working
+    /// set. `None` for prune-only or no-op passes.
+    pub summary: Option<String>,
 }
 
 #[async_trait]

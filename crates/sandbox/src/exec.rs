@@ -353,18 +353,28 @@ pub fn spawn_background(mut cmd: tokio::process::Command) -> Result<BgProc, Exec
             }
         }
     }
-    if let Some(o) = out_pipe {
-        tokio::spawn(pump(o, stdout.clone()));
-    }
-    if let Some(e) = err_pipe {
-        tokio::spawn(pump(e, stderr.clone()));
-    }
+    let out_handle = out_pipe.map(|o| tokio::spawn(pump(o, stdout.clone())));
+    let err_handle = err_pipe.map(|e| tokio::spawn(pump(e, stderr.clone())));
     let code2 = code.clone();
     tokio::spawn(async move {
         let status = child.wait().await.ok().and_then(|s| s.code());
         if let Ok(mut c) = code2.lock() {
             *c = status;
         }
+        // Let the pumps drain the final chunk before signalling done — otherwise
+        // a command that prints then exits immediately can be snapshotted before
+        // the last read lands, losing the output tail (K21). Bounded by a short
+        // grace: a grandchild holding the pipe open must NOT block `done` forever
+        // (the very hang the process-group design avoids), so we cap the wait.
+        let drain = async {
+            if let Some(h) = out_handle {
+                let _ = h.await;
+            }
+            if let Some(h) = err_handle {
+                let _ = h.await;
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), drain).await;
         let _ = done_tx.send(true);
     });
 

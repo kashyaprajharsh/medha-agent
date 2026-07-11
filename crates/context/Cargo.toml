@@ -10,6 +10,7 @@ kernel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 thiserror.workspace = true
 tiktoken-rs = "0.12.0"
 

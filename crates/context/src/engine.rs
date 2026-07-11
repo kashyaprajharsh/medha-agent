@@ -27,6 +27,9 @@ pub struct PipelineEngine {
     /// Consecutive compactions that barely helped; backs off to avoid the
     /// "compact every turn" thrash.
     ineffective: AtomicU32,
+    /// Summarizer for Full compaction. Defaults to the deterministic extractive
+    /// fallback; the CLI injects an `LlmSummarizer` for real summaries.
+    summarizer: Arc<dyn Summarizer>,
 }
 
 impl PipelineEngine {
@@ -43,7 +46,14 @@ impl PipelineEngine {
             counter,
             last_prompt_tokens: AtomicU32::new(0),
             ineffective: AtomicU32::new(0),
+            summarizer: Arc::new(ExtractiveSummarizer),
         }
+    }
+
+    /// Inject the summarizer used for Full compaction (e.g. an LLM summarizer).
+    pub fn with_summarizer(mut self, summarizer: Arc<dyn Summarizer>) -> Self {
+        self.summarizer = summarizer;
+        self
     }
 }
 
@@ -80,6 +90,7 @@ fn passthrough(messages: &[Message], tokens: u32, overflow: bool) -> CompileResu
         before_tokens: tokens,
         after_tokens: tokens,
         overflow,
+        summary: None,
     }
 }
 
@@ -167,6 +178,7 @@ impl ContextEngine for PipelineEngine {
         }
 
         let summarized = matches!(action, CompactionAction::Full);
+        let mut summary_text: Option<String> = None;
         let mut out: Vec<Message> = Vec::with_capacity(n);
         out.extend_from_slice(&messages[..head_end]);
         let middle = &messages[head_end..tail_start];
@@ -179,7 +191,11 @@ impl ContextEngine for PipelineEngine {
                     if m.role == Role::Tool {
                         let toks = counter.count(&m.content);
                         let mut pm = m.clone();
-                        pm.content = format!("[pruned tool output: {toks} tokens — recoverable from log]");
+                        // Honest placeholder: don't claim log-recoverability the
+                        // model can't act on (P1-3 lossless-prune-with-artifact is
+                        // the follow-up). If the content already carried a
+                        // read_artifact pointer, re-fetching is still possible.
+                        pm.content = format!("[earlier tool output pruned to save context — {toks} tokens]");
                         out.push(pm);
                     } else {
                         out.push(m.clone());
@@ -188,14 +204,20 @@ impl ContextEngine for PipelineEngine {
             }
             CompactionAction::Full => {
                 // Replace the whole middle with one summary system message. The
-                // full history is retained by the kernel/log (P3); this only
-                // shrinks the model's view.
+                // full history is retained by the kernel/log (P3).
                 let items: Vec<HistoryItem> = middle.iter().map(msg_to_item).collect();
-                let summary = ExtractiveSummarizer
-                    .summarize(None, &items)
-                    .await
-                    .unwrap_or_else(|_| "[summary unavailable]".to_string());
-                out.push(Message::system(summary));
+                // Injected summarizer (LLM), then extractive fallback — never the
+                // useless "[summary unavailable]" placeholder that produced
+                // hallucination-inducing empty context.
+                let text = match self.summarizer.summarize(None, &items).await {
+                    Ok(s) => s,
+                    Err(_) => ExtractiveSummarizer
+                        .summarize(None, &items)
+                        .await
+                        .unwrap_or_else(|_| extractive_stub(&items)),
+                };
+                summary_text = Some(text.clone());
+                out.push(Message::system(text));
             }
             CompactionAction::None => unreachable!(),
         }
@@ -222,8 +244,15 @@ impl ContextEngine for PipelineEngine {
             before_tokens: before,
             after_tokens: after,
             overflow,
+            summary: summary_text,
         }
     }
+}
+
+/// Last-resort summary if even the extractive fallback errors (it doesn't today,
+/// but keep the promise: never emit an empty/"unavailable" summary).
+fn extractive_stub(items: &[HistoryItem]) -> String {
+    format!("[compacted {} earlier messages; full history in the event log]", items.len())
 }
 
 fn msg_to_item(m: &Message) -> HistoryItem {
@@ -277,6 +306,52 @@ mod tests {
     /// strings), so they pin the heuristic counter rather than the BPE default.
     fn engine(policy: CompactionPolicy) -> PipelineEngine {
         PipelineEngine::with_counter(policy, Arc::new(HeuristicCounter))
+    }
+
+    struct OkSummarizer(&'static str);
+    #[async_trait]
+    impl Summarizer for OkSummarizer {
+        async fn summarize(&self, _p: Option<&str>, _i: &[HistoryItem]) -> Result<String, crate::compactor::SummarizeError> {
+            Ok(self.0.to_string())
+        }
+    }
+    struct ErrSummarizer;
+    #[async_trait]
+    impl Summarizer for ErrSummarizer {
+        async fn summarize(&self, _p: Option<&str>, _i: &[HistoryItem]) -> Result<String, crate::compactor::SummarizeError> {
+            Err(crate::compactor::SummarizeError::Unavailable("no model".into()))
+        }
+    }
+
+    fn full_compaction_history() -> Vec<Message> {
+        let mut msgs = vec![Message::system("SYSTEM")];
+        for i in 0..12 {
+            msgs.push(user(&format!("ask {i} {}", "y".repeat(400))));
+        }
+        msgs.push(user("FINAL"));
+        msgs
+    }
+    fn full_policy() -> CompactionPolicy {
+        CompactionPolicy { protect_first_n: 1, protect_last_n: 2, tail_ratio: 0.1, ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn full_compaction_uses_injected_summarizer_and_persists_it() {
+        let eng = engine(full_policy()).with_summarizer(Arc::new(OkSummarizer("HANDOFF")));
+        let r = eng.compile(&full_compaction_history(), Some(2_000)).await;
+        assert!(r.compacted && r.summarized);
+        assert_eq!(r.summary.as_deref(), Some("HANDOFF"), "summary text carried out for K12 persistence");
+        assert!(r.messages.iter().any(|m| m.content == "HANDOFF"), "summary is in the compacted view");
+    }
+
+    #[tokio::test]
+    async fn full_compaction_falls_back_to_extractive_never_unavailable() {
+        let eng = engine(full_policy()).with_summarizer(Arc::new(ErrSummarizer));
+        let r = eng.compile(&full_compaction_history(), Some(2_000)).await;
+        assert!(r.summarized);
+        let s = r.summary.expect("a summary is always produced");
+        assert!(!s.contains("[summary unavailable]"), "must not emit the empty placeholder");
+        assert!(!s.trim().is_empty());
     }
 
     #[tokio::test]

@@ -76,7 +76,8 @@ mod tests {
     fn embedded_default_resolves_and_has_sections() {
         let p = compaction_summary();
         assert!(p.contains("Goal"));
-        assert!(p.contains("Next Steps"));
+        assert!(p.contains("Next steps"));
+        assert!(p.contains("User instructions"));
         assert!(p.contains("verbatim"));
     }
 

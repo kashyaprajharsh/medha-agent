@@ -420,6 +420,7 @@ name = "context"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "futures",
  "kernel",
  "serde",
  "serde_json",

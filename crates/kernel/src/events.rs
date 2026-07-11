@@ -135,11 +135,13 @@ impl Event {
         )
     }
 
-    pub fn compaction(s: &Session, before_tokens: u32, after_tokens: u32) -> Self {
+    pub fn compaction(s: &Session, before_tokens: u32, after_tokens: u32, summary: Option<&str>) -> Self {
+        // Persist the summary text so a resumed session reconstructs the exact
+        // working set the model saw (K12), not a re-derived one.
         Self::new(
             s,
             EventKind::Compaction,
-            json!({ "before_tokens": before_tokens, "after_tokens": after_tokens }),
+            json!({ "before_tokens": before_tokens, "after_tokens": after_tokens, "summary": summary }),
             TrustLabel::System,
         )
     }

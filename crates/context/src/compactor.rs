@@ -240,6 +240,78 @@ fn tail_start_index(
     start.max(head_end)
 }
 
+/// LLM summarizer: routes the middle through a model using the versioned
+/// `compaction_summary` template. On any failure it returns
+/// `SummarizeError::Unavailable`, so the engine falls back to the extractive
+/// summarizer — a keyword scrape is far better than an empty summary that
+/// invites hallucination.
+pub struct LlmSummarizer<P: kernel::Provider> {
+    provider: std::sync::Arc<P>,
+}
+
+impl<P: kernel::Provider> LlmSummarizer<P> {
+    pub fn new(provider: std::sync::Arc<P>) -> Self {
+        Self { provider }
+    }
+}
+
+fn role_label(role: &Role) -> &'static str {
+    match role {
+        Role::User => "USER",
+        Role::Assistant => "ASSISTANT",
+        Role::Tool => "TOOL",
+        Role::System => "SYSTEM",
+    }
+}
+
+#[async_trait]
+impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
+    async fn summarize(
+        &self,
+        previous: Option<&str>,
+        items: &[HistoryItem],
+    ) -> Result<String, SummarizeError> {
+        use futures::StreamExt;
+        use kernel::{Block, CompiledContext, Message};
+
+        let mut body = String::new();
+        if let Some(prev) = previous {
+            body.push_str("=== previous summary (update it) ===\n");
+            body.push_str(prev);
+            body.push_str("\n=== conversation to fold in ===\n");
+        }
+        for it in items {
+            body.push_str(role_label(&it.role));
+            body.push_str(": ");
+            body.push_str(&it.content);
+            body.push('\n');
+        }
+
+        let ctx = CompiledContext {
+            model: String::new(),
+            messages: vec![Message::system(crate::prompts::compaction_summary()), Message::user(body)],
+            tools: Vec::new(),
+        };
+        let mut stream = self
+            .provider
+            .stream(&ctx)
+            .await
+            .map_err(|e| SummarizeError::Unavailable(e.to_string()))?;
+        let mut text = String::new();
+        while let Some(block) = stream.next().await {
+            match block {
+                Ok(Block::Text(t)) => text.push_str(&t),
+                Ok(_) => {} // ignore reasoning/tool/usage blocks
+                Err(e) => return Err(SummarizeError::Unavailable(e.to_string())),
+            }
+        }
+        if text.trim().is_empty() {
+            return Err(SummarizeError::Unavailable("model returned empty summary".into()));
+        }
+        Ok(text)
+    }
+}
+
 /// Deterministic, no-LLM fallback. Lossy but honest and offline-capable; the
 /// full detail remains recoverable via each item's `source_events`/`artifact`.
 pub struct ExtractiveSummarizer;

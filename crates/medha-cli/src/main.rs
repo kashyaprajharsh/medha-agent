@@ -344,7 +344,13 @@ async fn main() -> Result<()> {
 
     // Context engine: budget-aware two-phase compaction (§4.3), tuned from
     // medha.lock's [context] section (or its built-in-matching default).
-    let context_engine = Arc::new(context::PipelineEngine::new(lock.context.to_policy()));
+    // LLM summarizer for Full compaction (falls back to extractive on failure),
+    // so a compacted session keeps a real handoff summary instead of a keyword
+    // scrape that invites hallucination.
+    let context_engine = Arc::new(
+        context::PipelineEngine::new(lock.context.to_policy())
+            .with_summarizer(Arc::new(context::LlmSummarizer::new(provider.clone()))),
+    );
 
     // Deny-first policy + shell command scanner (§4.6). Approval set comes from
     // medha.lock's [policy] approve list, extended by MEDHA_APPROVE (e.g.

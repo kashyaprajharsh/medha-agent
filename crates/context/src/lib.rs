@@ -14,7 +14,7 @@ pub use budget::ContextBudget;
 pub use engine::PipelineEngine;
 pub use compactor::{
     compact, decide, total_tokens, CompactionResult, ExtractiveSummarizer, HistoryItem, ItemKind,
-    Summarizer, SummarizeError,
+    LlmSummarizer, Summarizer, SummarizeError,
 };
 pub use policy::{CompactionAction, CompactionPolicy};
 pub use tokens::{BpeCounter, HeuristicCounter, TokenCounter};

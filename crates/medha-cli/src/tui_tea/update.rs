@@ -226,6 +226,12 @@ pub(super) fn handle_key<P, L>(
                 model.cursor = 0;
             }
         }
+        // ^E expands/collapses the compaction summary cards.
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.show_summary = !model.show_summary;
+            model.invalidate_all_renders();
+            model.push_notice(if model.show_summary { "summaries: expanded (^E)" } else { "summaries: collapsed (^E)" });
+        }
         KeyCode::Esc if model.running => {
             if let Some(token) = model.cancel_token.take() {
                 token.cancel();
@@ -386,7 +392,11 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
         TuiEvent::Reasoning(delta) => model.push_thinking_delta(&delta),
         TuiEvent::ToolCall(tool, args) => { model.current_tool = None; model.push_item(Item::ToolCall { tool, args }); }
         TuiEvent::ToolResult(tool, ok, payload) => { model.current_tool = None; model.push_item(Item::ToolResult { tool, ok, payload }); }
-        TuiEvent::Compaction(before, after, summarized) => model.push_item(Item::Compaction { before, after, summarized }),
+        TuiEvent::Compaction(before, after, summarized, summary) => {
+            model.compacting = false;
+            model.push_item(Item::Compaction { before, after, summarized, summary });
+        }
+        TuiEvent::Compacting(active) => model.compacting = active,
         TuiEvent::Usage(prompt_tokens, _total) => {
             if let Some(mc) = model.max_ctx {
                 let usable = context::ContextBudget::from_max_ctx(mc).usable().max(1);
@@ -735,7 +745,8 @@ impl kernel::StreamSink for TuiSink {
     fn reasoning(&self, delta: &str) { self.emit("reasoning", TuiEvent::Reasoning(delta.to_string())); }
     fn tool_call(&self, tool: &str, args: &serde_json::Value) { self.emit("tool_call", TuiEvent::ToolCall(tool.to_string(), args.clone())); }
     fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) { self.emit("tool_result", TuiEvent::ToolResult(tool.to_string(), ok, payload.clone())); }
-    fn compaction(&self, before: u32, after: u32, summarized: bool) { self.emit("compaction", TuiEvent::Compaction(before, after, summarized)); }
+    fn compacting(&self, active: bool) { self.emit("compacting", TuiEvent::Compacting(active)); }
+    fn compaction(&self, before: u32, after: u32, summarized: bool, summary: Option<&str>) { self.emit("compaction", TuiEvent::Compaction(before, after, summarized, summary.map(str::to_string))); }
     fn usage(&self, prompt_tokens: u32, total_tokens: u32) { self.emit("usage", TuiEvent::Usage(prompt_tokens, total_tokens)); }
     fn verify(&self, ok: bool, summary: &str) { self.emit("verify", TuiEvent::Verify(ok, summary.to_string())); }
 }

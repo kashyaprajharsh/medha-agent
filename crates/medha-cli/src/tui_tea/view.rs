@@ -296,6 +296,8 @@ pub(super) struct RenderCtx<'a> {
     pub(super) width: u16,
     pub(super) full_transparency: bool,
     pub(super) show_thinking: bool,
+    /// Expand compaction cards to show the full summary (toggled by ^E).
+    pub(super) show_summary: bool,
     /// Tool name → its declared presentation, so rendering uses each tool's own
     /// glyph + category colour (static per session; borrowed).
     pub(super) viz: &'a HashMap<String, ToolViz>,
@@ -351,9 +353,25 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
             if cx.full_transparency { lines.extend(json_block(payload, "out")); }
             lines
         }
-        Item::Compaction { before, after, summarized } => {
+        Item::Compaction { before, after, summarized, summary } => {
             let how = if *summarized { "summarized" } else { "pruned" };
-            vec![Line::from(Span::styled(format!("  ↯ {how} context · {before} → {after} tokens"), Style::default().fg(theme::WARN)))]
+            let hint = match summary {
+                Some(_) if cx.show_summary => "  (^E to collapse)",
+                Some(_) => "  (^E to expand summary)",
+                None => "",
+            };
+            let mut lines = vec![Line::from(Span::styled(
+                format!("  ↯ {how} context · {before} → {after} tokens{hint}"),
+                Style::default().fg(theme::WARN),
+            ))];
+            if cx.show_summary {
+                if let Some(s) = summary {
+                    for l in s.lines() {
+                        lines.push(Line::from(Span::styled(format!("    {l}"), Style::default().fg(theme::DIM))));
+                    }
+                }
+            }
+            lines
         }
         Item::Verify { ok, summary } => {
             let (mark, color) = if *ok { ("✔", theme::OK) } else { ("✗", theme::ERR) };
@@ -634,6 +652,13 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
             Style::default().fg(theme::WARN),
         ));
     }
+    // Live "compacting…" indicator while a summarize pass calls the model.
+    if model.compacting {
+        left.push(Span::styled(
+            format!("  {} compacting context…", spinner_frame(model.anim_frame)),
+            Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
+        ));
+    }
     // Live background-task indicator: an animated glyph + count, so the user sees
     // what's still running (a promoted `shell.exec`) even when no turn is active.
     // `/tasks` lists them; `task.kill` (or the model) stops them.
@@ -809,7 +834,7 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
     // Each item is wrapped ONCE and memoized; a big diff is never re-laid-out per
     // frame. (This block is the only O(items) work, and only on change.)
     if model.dirty {
-        let cx = RenderCtx { width: area.width, full_transparency: model.full_transparency, show_thinking: model.show_thinking, viz: &model.tool_viz };
+        let cx = RenderCtx { width: area.width, full_transparency: model.full_transparency, show_thinking: model.show_thinking, show_summary: model.show_summary, viz: &model.tool_viz };
         let mut total = 0usize;
         for e in model.items.iter_mut() {
             e.ensure(&cx, vw);

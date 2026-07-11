@@ -160,6 +160,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink: &dyn StreamSink,
     ) -> Result<(Vec<Message>, StopReason), KernelError> {
         let specs = self.executor.specs();
+        // Size the tool-def overhead once so token estimates match the real
+        // request (tool defs are sent every turn) (P1-9).
+        self.context.note_tools(&specs);
         let max_ctx = self.provider.capabilities().max_ctx;
         let mut gov = crate::budgets::Governor::new(budget);
         // Spill oversized tool results already in the working set (K11). The live
@@ -200,12 +203,19 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // authoritative-count channel the post-turn `usage` uses.
             if max_ctx.is_some() {
                 if let Some(exact) = self.provider.count_tokens(&messages).await {
-                    self.context.update_usage(exact, exact);
+                    // Pre-flight count is tool-blind → estimate channel adds the
+                    // tool-def overhead (P1-9); real usage still uses update_usage.
+                    self.context.update_estimate(exact);
                 }
             }
 
-            // Compile a budget-fitted view of the working history (§4.3).
+            // Compile a budget-fitted view of the working history (§4.3). Bracket
+            // it with compacting(true/false) so a surface can show a live
+            // "compacting…" indicator while a summarize pass calls the model
+            // (instant for a no-op/prune pass, so no visible flicker).
+            sink.compacting(true);
             let compiled = self.context.compile(&messages, max_ctx).await;
+            sink.compacting(false);
             // Hard safety ceiling (independent of the soft trigger): if even the
             // engine's best effort still overflows, refuse to send this turn
             // rather than risk a provider context-length error (I4).
@@ -214,7 +224,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             }
             let view = compiled.messages;
             if compiled.compacted {
-                sink.compaction(compiled.before_tokens, compiled.after_tokens, compiled.summarized);
+                sink.compaction(compiled.before_tokens, compiled.after_tokens, compiled.summarized, compiled.summary.as_deref());
                 self.log
                     .append(Event::compaction(
                         session,
@@ -242,8 +252,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     Err(KernelError::ContextOverflow) if !overflow_retried => {
                         overflow_retried = true;
                         let emergency = max_ctx.map(|m| (m / 2).max(1));
+                        sink.compacting(true);
                         let recompiled = self.context.compile(&messages, emergency).await;
-                        sink.compaction(recompiled.before_tokens, recompiled.after_tokens, recompiled.summarized);
+                        sink.compacting(false);
+                        sink.compaction(recompiled.before_tokens, recompiled.after_tokens, recompiled.summarized, recompiled.summary.as_deref());
                         self.log
                             .append(Event::compaction(
                                 session,

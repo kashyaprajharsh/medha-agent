@@ -5,7 +5,7 @@
 //! history is retained by the kernel/log — compaction shrinks the *view sent to
 //! the model*, never the truth (P3).
 
-use crate::types::Message;
+use crate::types::{Message, ToolSpec};
 use async_trait::async_trait;
 
 pub struct CompileResult {
@@ -30,10 +30,15 @@ pub struct CompileResult {
 
 #[async_trait]
 pub trait ContextEngine: Send + Sync {
-    /// Record real token usage from the provider's last response. This is the
-    /// authoritative token count (never an estimate); the engine uses it to
-    /// drive compaction decisions instead of guessing.
+    /// Real usage from the last response — authoritative; includes tool defs.
     fn update_usage(&self, _prompt_tokens: u32, _total_tokens: u32) {}
+
+    /// Pre-flight server count (messages only) — engine adds tool-def overhead
+    /// here, unlike `update_usage`. Separate channel by design (P1-9).
+    fn update_estimate(&self, _count: u32) {}
+
+    /// Note the session's tool set so tool-def overhead is sized once (P1-9).
+    fn note_tools(&self, _tools: &[ToolSpec]) {}
 
     /// Compile outbound context from the working history. `max_ctx` is the
     /// model's window (`None` = unknown → no compaction; never guess a window).

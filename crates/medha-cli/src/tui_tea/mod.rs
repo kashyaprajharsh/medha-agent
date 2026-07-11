@@ -100,7 +100,9 @@ pub(crate) enum TuiEvent {
     ToolStarted(String, Option<String>),
     ToolCall(String, serde_json::Value),
     ToolResult(String, bool, serde_json::Value),
-    Compaction(u32, u32, bool),
+    Compaction(u32, u32, bool, Option<String>),
+    /// Compaction is running (true) / finished (false) — drives the live indicator.
+    Compacting(bool),
     Usage(u32, u32),
     Verify(bool, String),
     Approval(String, Option<String>, bool, oneshot::Sender<kernel::Approval>),
@@ -202,7 +204,7 @@ enum Item {
     Assistant(String),
     ToolCall { tool: String, args: serde_json::Value },
     ToolResult { tool: String, ok: bool, payload: serde_json::Value },
-    Compaction { before: u32, after: u32, summarized: bool },
+    Compaction { before: u32, after: u32, summarized: bool, summary: Option<String> },
     Verify { ok: bool, summary: String },
     Notice(String),
     Thinking(String),
@@ -496,6 +498,11 @@ struct Model {
     /// Running-task count last reflected on screen, so the status line only
     /// forces an idle redraw when the number actually changes.
     bg_shown_running: usize,
+    /// A compaction (summarize pass) is currently running — shows a live
+    /// "compacting…" indicator.
+    compacting: bool,
+    /// Expand compaction cards to show their full summary text (toggled by ^E).
+    show_summary: bool,
 }
 
 impl Model {
@@ -548,6 +555,8 @@ impl Model {
             restore,
             bg_tasks: Vec::new(),
             bg_shown_running: 0,
+            compacting: false,
+            show_summary: false,
         }
     }
 
@@ -1005,7 +1014,7 @@ mod tests {
         // The virtualization invariant: an item's reported height is exactly the
         // number of physical rows it renders (so scroll math can't drift).
         let cats = HashMap::new();
-        let cx = RenderCtx { width: 20, full_transparency: false, show_thinking: true, viz: &cats };
+        let cx = RenderCtx { width: 20, full_transparency: false, show_thinking: true, show_summary: false, viz: &cats };
         let mut e = Entry::new(Item::Assistant("a fairly long line that must wrap across several rows here".into()));
         e.ensure(&cx, 20);
         assert_eq!(e.height, e.lines.as_ref().unwrap().len());
@@ -1043,7 +1052,7 @@ mod tests {
     #[test]
     fn entry_memoizes_render() {
         let cats = HashMap::new();
-        let cx = RenderCtx { width: 80, full_transparency: false, show_thinking: true, viz: &cats };
+        let cx = RenderCtx { width: 80, full_transparency: false, show_thinking: true, show_summary: false, viz: &cats };
         let mut e = Entry::new(Item::User("hi".into()));
         assert!(e.lines.is_none());
         e.ensure(&cx, 80);

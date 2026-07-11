@@ -123,9 +123,14 @@ impl kernel::StreamSink for AcpSink {
     fn verify(&self, ok: bool, summary: &str) {
         self.writer.event("verify", json!({ "ok": ok, "summary": summary }));
     }
-    fn compaction(&self, before: u32, after: u32, summarized: bool) {
-        self.writer
-            .event("compaction", json!({ "before": before, "after": after, "summarized": summarized }));
+    fn compacting(&self, active: bool) {
+        self.writer.event("compacting", json!({ "active": active }));
+    }
+    fn compaction(&self, before: u32, after: u32, summarized: bool, summary: Option<&str>) {
+        self.writer.event(
+            "compaction",
+            json!({ "before": before, "after": after, "summarized": summarized, "summary": summary }),
+        );
     }
 }
 

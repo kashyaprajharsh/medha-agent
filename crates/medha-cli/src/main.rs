@@ -349,7 +349,8 @@ async fn main() -> Result<()> {
     // scrape that invites hallucination.
     let context_engine = Arc::new(
         context::PipelineEngine::new(lock.context.to_policy())
-            .with_summarizer(Arc::new(context::LlmSummarizer::new(provider.clone()))),
+            .with_summarizer(Arc::new(context::LlmSummarizer::new(provider.clone())))
+            .with_artifacts(artifacts.clone()),
     );
 
     // Deny-first policy + shell command scanner (§4.6). Approval set comes from
@@ -619,7 +620,7 @@ impl kernel::StreamSink for PrintSink {
             println!("  ⎿ {}", result_summary(tool, payload));
         }
     }
-    fn compaction(&self, before: u32, after: u32, summarized: bool) {
+    fn compaction(&self, before: u32, after: u32, summarized: bool, _summary: Option<&str>) {
         let how = if summarized { "summarized" } else { "pruned" };
         println!("\n↯ {how} context {before}→{after} tokens");
     }

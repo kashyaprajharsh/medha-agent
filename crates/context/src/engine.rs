@@ -30,6 +30,16 @@ pub struct PipelineEngine {
     /// Summarizer for Full compaction. Defaults to the deterministic extractive
     /// fallback; the CLI injects an `LlmSummarizer` for real summaries.
     summarizer: Arc<dyn Summarizer>,
+    /// Last summary produced, fed back as `previous` so re-compaction UPDATES it
+    /// (iterative re-summary) instead of summarizing a gist-of-a-gist.
+    last_summary: std::sync::Mutex<Option<String>>,
+    /// Artifact store for lossless prune: pruned tool output is spilled here and
+    /// referenced by hash, so the model can `read_artifact` it back (P1-3). When
+    /// absent (tests), prune falls back to an honest non-recoverable placeholder.
+    artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
+    /// Fixed per-request tool-definition token overhead, sized once by
+    /// `note_tools` and added to every estimate (P1-9).
+    tool_overhead: AtomicU32,
 }
 
 impl PipelineEngine {
@@ -47,12 +57,22 @@ impl PipelineEngine {
             last_prompt_tokens: AtomicU32::new(0),
             ineffective: AtomicU32::new(0),
             summarizer: Arc::new(ExtractiveSummarizer),
+            last_summary: std::sync::Mutex::new(None),
+            artifacts: None,
+            tool_overhead: AtomicU32::new(0),
         }
     }
 
     /// Inject the summarizer used for Full compaction (e.g. an LLM summarizer).
     pub fn with_summarizer(mut self, summarizer: Arc<dyn Summarizer>) -> Self {
         self.summarizer = summarizer;
+        self
+    }
+
+    /// Inject the artifact store so pruned tool output is spilled + re-fetchable
+    /// (lossless prune, P1-3).
+    pub fn with_artifacts(mut self, artifacts: Arc<dyn kernel::ArtifactStore>) -> Self {
+        self.artifacts = Some(artifacts);
         self
     }
 }
@@ -100,15 +120,43 @@ fn is_overflow(tokens: f32, true_max_ctx: u32, policy: &CompactionPolicy) -> boo
     tokens >= true_max_ctx as f32 * policy.emergency_ratio
 }
 
+/// Extra tokens per tool for chat-template scaffolding (headers/instructions the
+/// serialized schema doesn't capture). Biased safe-high — undercount is the risk.
+const PER_TOOL_SCAFFOLD_TOKENS: u32 = 18;
+
 #[async_trait]
 impl ContextEngine for PipelineEngine {
     fn update_usage(&self, prompt_tokens: u32, _total_tokens: u32) {
+        // Real usage already counts tool defs — store verbatim.
         self.last_prompt_tokens.store(prompt_tokens, Ordering::Relaxed);
+    }
+
+    fn update_estimate(&self, count: u32) {
+        // Server count omits tool defs — add the overhead so the basis matches
+        // what's actually sent (P1-9).
+        self.last_prompt_tokens
+            .store(count + self.tool_overhead.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    fn note_tools(&self, tools: &[kernel::ToolSpec]) {
+        let n: u32 = tools
+            .iter()
+            .map(|t| {
+                self.counter.count(&t.name)
+                    + self.counter.count(&t.description)
+                    + self.counter.count(&t.schema.to_string())
+                    + PER_TOOL_SCAFFOLD_TOKENS
+            })
+            .sum();
+        self.tool_overhead.store(n, Ordering::Relaxed);
     }
 
     async fn compile(&self, messages: &[Message], max_ctx: Option<u32>) -> CompileResult {
         let counter: &dyn TokenCounter = self.counter.as_ref();
-        let before = count_all(messages, counter);
+        // Include the fixed tool-def overhead so the estimate matches the real
+        // request size (tool defs are sent every turn but not in `count_all`).
+        let overhead = self.tool_overhead.load(Ordering::Relaxed);
+        let before = count_all(messages, counter) + overhead;
 
         // Unknown window → never guess; send as-is (the budget cannot be sized;
         // overflow is unknowable too, so we can't claim it — false).
@@ -191,11 +239,15 @@ impl ContextEngine for PipelineEngine {
                     if m.role == Role::Tool {
                         let toks = counter.count(&m.content);
                         let mut pm = m.clone();
-                        // Honest placeholder: don't claim log-recoverability the
-                        // model can't act on (P1-3 lossless-prune-with-artifact is
-                        // the follow-up). If the content already carried a
-                        // read_artifact pointer, re-fetching is still possible.
-                        pm.content = format!("[earlier tool output pruned to save context — {toks} tokens]");
+                        // Lossless prune: spill the full output and reference it so
+                        // the model can re-read it (P1-3). No store → honest
+                        // non-recoverable placeholder.
+                        pm.content = match self.artifacts.as_ref().and_then(|s| s.put(m.content.as_bytes()).ok()) {
+                            Some(hash) => format!(
+                                "[tool output pruned to save context — {toks} tokens. Re-read with read_artifact hash=\"{hash}\"]"
+                            ),
+                            None => format!("[earlier tool output pruned to save context — {toks} tokens]"),
+                        };
                         out.push(pm);
                     } else {
                         out.push(m.clone());
@@ -209,13 +261,22 @@ impl ContextEngine for PipelineEngine {
                 // Injected summarizer (LLM), then extractive fallback — never the
                 // useless "[summary unavailable]" placeholder that produced
                 // hallucination-inducing empty context.
-                let text = match self.summarizer.summarize(None, &items).await {
+                // Feed the last summary back so the model UPDATES it (iterative).
+                let previous = self.last_summary.lock().ok().and_then(|g| g.clone());
+                let text = match self.summarizer.summarize(previous.as_deref(), &items).await {
                     Ok(s) => s,
                     Err(_) => ExtractiveSummarizer
-                        .summarize(None, &items)
+                        .summarize(previous.as_deref(), &items)
                         .await
                         .unwrap_or_else(|_| extractive_stub(&items)),
                 };
+                // Cap the summary so a runaway one can't itself blow the budget
+                // (~15% of usable). Truncate on a char boundary with a marker.
+                let cap = (usable * 0.15) as u32;
+                let text = cap_summary(text, cap, counter);
+                if let Ok(mut g) = self.last_summary.lock() {
+                    *g = Some(text.clone());
+                }
                 summary_text = Some(text.clone());
                 out.push(Message::system(text));
             }
@@ -223,7 +284,7 @@ impl ContextEngine for PipelineEngine {
         }
 
         out.extend_from_slice(&messages[tail_start..]);
-        let after = count_all(&out, counter);
+        let after = count_all(&out, counter) + overhead;
 
         // Track effectiveness: a compaction that frees <10% counts as
         // ineffective; two in a row trips the anti-thrash backoff above.
@@ -253,6 +314,20 @@ impl ContextEngine for PipelineEngine {
 /// but keep the promise: never emit an empty/"unavailable" summary).
 fn extractive_stub(items: &[HistoryItem]) -> String {
     format!("[compacted {} earlier messages; full history in the event log]", items.len())
+}
+
+/// Cap a summary to `max_tokens`; truncate on a char boundary + a marker if over.
+fn cap_summary(text: String, max_tokens: u32, counter: &dyn TokenCounter) -> String {
+    if max_tokens == 0 || counter.count(&text) <= max_tokens {
+        return text;
+    }
+    // ~4 chars/token heuristic for the cut point; leave room for the marker.
+    let keep = (max_tokens as usize).saturating_mul(4);
+    let mut cut = keep.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n…[summary truncated to fit context]", &text[..cut])
 }
 
 fn msg_to_item(m: &Message) -> HistoryItem {
@@ -352,6 +427,97 @@ mod tests {
         let s = r.summary.expect("a summary is always produced");
         assert!(!s.contains("[summary unavailable]"), "must not emit the empty placeholder");
         assert!(!s.trim().is_empty());
+    }
+
+    struct RecordingSummarizer(std::sync::Mutex<Vec<Option<String>>>);
+    #[async_trait]
+    impl Summarizer for RecordingSummarizer {
+        async fn summarize(&self, previous: Option<&str>, _i: &[HistoryItem]) -> Result<String, crate::compactor::SummarizeError> {
+            self.0.lock().unwrap().push(previous.map(str::to_string));
+            Ok("SUMMARY-vN".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_def_overhead_lifts_the_preflight_basis_over_the_trigger() {
+        use kernel::{BlastRadius, ContextEngine, ToolCategory, ToolSpec};
+        // A big tool set → sizable fixed overhead a tool-blind count ignores.
+        let tools: Vec<ToolSpec> = (0..20)
+            .map(|i| ToolSpec {
+                name: format!("tool_{i}"),
+                description: "x".repeat(400),
+                schema: serde_json::json!({ "p": "q".repeat(400) }),
+                blast_radius: BlastRadius::Read,
+                category: ToolCategory::Read,
+                icon: "•".into(),
+            })
+            .collect();
+        let history = full_compaction_history();
+        let msg_tokens = count_all(&history, &HeuristicCounter);
+
+        // Tool-blind pre-flight basis alone stays under the trigger → no compaction.
+        let plain = engine(full_policy());
+        plain.update_estimate(msg_tokens);
+        assert!(!plain.compile(&history, Some(8_000)).await.compacted, "messages alone stay under trigger");
+
+        // Same basis + the noted tool-def overhead crosses the trigger → compaction.
+        let withtools = engine(full_policy());
+        withtools.note_tools(&tools);
+        withtools.update_estimate(msg_tokens);
+        assert!(withtools.compile(&history, Some(8_000)).await.compacted, "tool-def overhead pushes it over");
+    }
+
+    #[tokio::test]
+    async fn re_compaction_threads_the_previous_summary() {
+        let rec = Arc::new(RecordingSummarizer(std::sync::Mutex::new(Vec::new())));
+        let eng = engine(full_policy()).with_summarizer(rec.clone());
+        eng.compile(&full_compaction_history(), Some(2_000)).await; // first Full
+        eng.compile(&full_compaction_history(), Some(2_000)).await; // second Full
+        let seen = rec.0.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].is_none(), "first compaction has no previous summary");
+        assert_eq!(seen[1].as_deref(), Some("SUMMARY-vN"), "second UPDATES the previous summary");
+    }
+
+    #[derive(Default)]
+    struct MemStore(std::sync::Mutex<usize>);
+    impl kernel::ArtifactStore for MemStore {
+        fn put(&self, _b: &[u8]) -> Result<String, String> {
+            let mut n = self.0.lock().unwrap();
+            *n += 1;
+            Ok(format!("h{n}"))
+        }
+        fn get(&self, _h: &str, _o: usize, _l: Option<usize>) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn size(&self, _h: &str) -> Result<usize, String> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_spills_tool_output_to_artifacts_when_available() {
+        let eng = engine(CompactionPolicy {
+            protect_first_n: 1,
+            protect_last_n: 2,
+            tail_ratio: 0.05,
+            prune_min_tool_tokens: 1,
+            ..Default::default()
+        })
+        .with_artifacts(Arc::new(MemStore::default()));
+        // Sized into the Prune band (>=60%, <85% of usable ~5200 for an 8k window).
+        let mut msgs = vec![Message::system("S")];
+        for i in 0..8 {
+            msgs.push(user(&format!("ask {i}")));
+            msgs.push(Message::tool_result(format!("c{i}"), "z".repeat(1600)));
+        }
+        msgs.push(user("LAST"));
+        let r = eng.compile(&msgs, Some(8_000)).await;
+        assert!(r.compacted && !r.summarized, "expected a Prune pass (summarized={})", r.summarized);
+        assert!(
+            r.messages.iter().any(|m| m.content.contains("read_artifact hash=")),
+            "pruned tool output must be spilled + re-fetchable"
+        );
     }
 
     #[tokio::test]

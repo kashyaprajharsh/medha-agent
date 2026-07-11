@@ -24,9 +24,12 @@ pub trait StreamSink: Send + Sync {
     fn usage(&self, _prompt_tokens: u32, _total_tokens: u32) {}
     /// A deterministic verifier result after file-modifying edits.
     fn verify(&self, _ok: bool, _summary: &str) {}
-    /// Compaction just fired. `summarized` = true for a summarize pass, false
-    /// for a cheap prune-only pass.
-    fn compaction(&self, _before: u32, _after: u32, _summarized: bool) {}
+    /// Compaction is running (`true`) or finished (`false`) — lets a surface show
+    /// a live "compacting…" indicator while a summarize pass calls the model.
+    fn compacting(&self, _active: bool) {}
+    /// Compaction just fired. `summarized` = true for a summarize pass, false for
+    /// a cheap prune-only pass; `summary` is the handoff text (Full only).
+    fn compaction(&self, _before: u32, _after: u32, _summarized: bool, _summary: Option<&str>) {}
 }
 
 /// Discards every update — the headless default.

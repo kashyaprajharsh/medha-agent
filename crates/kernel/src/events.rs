@@ -372,7 +372,23 @@ pub fn project_messages(events: &[Event]) -> Vec<Message> {
                 let content = e.payload.get("payload").map(|p| p.to_string()).unwrap_or_default();
                 out.push(Message::tool_result(id, content));
             }
-            _ => {} // reasoning / policy / compaction / session — not conversation
+            EventKind::Compaction => {
+                // A Full compaction carries a summary: replay the compacted view
+                // the live session actually saw — collapse everything so far into
+                // the summary — instead of re-inflating the full pre-compaction
+                // history (completes K12). Prune-only compactions carry no summary
+                // and are skipped (their messages replay verbatim, spill-bounded).
+                if let Some(summary) = e.payload.get("summary").and_then(Value::as_str) {
+                    if !summary.trim().is_empty() {
+                        out.clear();
+                        text.clear();
+                        intents.clear();
+                        assistant_open = false;
+                        out.push(Message::system(summary));
+                    }
+                }
+            }
+            _ => {} // reasoning / policy / session — not conversation
         }
     }
     flush(&mut out, &mut text, &mut intents, &mut assistant_open);
@@ -479,6 +495,37 @@ mod tests {
         assert!(matches!(msgs[2].role, Role::Tool) && msgs[2].tool_call_id.as_deref() == Some("1"));
         assert!(msgs[2].content.contains("a.rs"));
         assert!(matches!(msgs[3].role, Role::Assistant) && msgs[3].content.contains("a.rs"));
+    }
+
+    #[test]
+    fn resume_consumes_compaction_summary_instead_of_full_history() {
+        let s = Session::new();
+        let events = vec![
+            Event::user_message(&s, "first task"),
+            Event::model_text(&s, "did the first thing"),
+            Event::user_message(&s, "second task"),
+            // A Full compaction fired here, summarizing everything above.
+            Event::compaction(&s, 1000, 200, Some("HANDOFF: goal + progress")),
+            Event::user_message(&s, "third task"),
+        ];
+        let msgs = project_messages(&events);
+        // Pre-compaction history collapses into the summary; post-compaction stays.
+        assert!(msgs[0].content.contains("HANDOFF: goal + progress"), "summary is the head: {msgs:?}");
+        assert!(!msgs.iter().any(|m| m.content == "first task"), "pre-compaction history collapsed");
+        assert!(msgs.iter().any(|m| m.content == "third task"), "post-compaction turn kept");
+    }
+
+    #[test]
+    fn prune_compaction_without_summary_keeps_history() {
+        let s = Session::new();
+        let events = vec![
+            Event::user_message(&s, "keep me"),
+            Event::compaction(&s, 1000, 800, None), // prune-only: no summary
+            Event::user_message(&s, "and me"),
+        ];
+        let msgs = project_messages(&events);
+        assert!(msgs.iter().any(|m| m.content == "keep me"), "prune must not collapse history");
+        assert!(msgs.iter().any(|m| m.content == "and me"));
     }
 
     #[test]

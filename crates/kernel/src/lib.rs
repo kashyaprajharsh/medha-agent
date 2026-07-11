@@ -8,6 +8,7 @@ pub mod errors;
 pub mod events;
 pub mod executor;
 pub mod gate;
+pub mod interrupts;
 pub mod policy;
 pub mod provider;
 pub mod sink;
@@ -27,6 +28,7 @@ pub use events::{
 };
 pub use executor::{BackgroundTask, Executor};
 pub use gate::{Approval, AutoDeny, HumanGate};
+pub use interrupts::{Interrupt, InterruptHandle, InterruptQueue};
 pub use policy::{AllowAll, Policy};
 pub use sink::{NullSink, StreamSink};
 pub use verify::{NoVerify, VerifyReport, Verifier};

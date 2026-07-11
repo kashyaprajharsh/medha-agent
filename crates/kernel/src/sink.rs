@@ -34,6 +34,11 @@ pub trait StreamSink: Send + Sync {
     /// Compaction just fired. `summarized` = true for a summarize pass, false for
     /// a cheap prune-only pass; `summary` is the handoff text (Full only).
     fn compaction(&self, _before: u32, _after: u32, _summarized: bool, _summary: Option<&str>) {}
+    /// A queued steer message was applied at a turn boundary.
+    fn steered(&self, _text: &str) {}
+    /// The session was cancelled with steers still queued — they were NOT
+    /// applied; the surface should give them back to the user (input box).
+    fn steers_returned(&self, _texts: &[String]) {}
 }
 
 /// Discards every update — the headless default.

@@ -21,6 +21,10 @@ pub enum EventKind {
     /// transparency/audit (P3/P7), even though it's excluded from the
     /// conversation history sent back to the model.
     ModelReasoning,
+    /// A processed interrupt (steer applied / turn cancelled) — audit trail
+    /// (Vol 3's Interrupt kind). Steer text ALSO logs as `user.message`, so
+    /// projection ignores this kind entirely.
+    Interrupt,
 }
 
 impl EventKind {
@@ -35,6 +39,7 @@ impl EventKind {
             EventKind::Compaction => "context.compaction",
             EventKind::Session => "session",
             EventKind::ModelReasoning => "model.reasoning",
+            EventKind::Interrupt => "interrupt",
         }
     }
 
@@ -48,6 +53,7 @@ impl EventKind {
             "context.compaction" => EventKind::Compaction,
             "session" => EventKind::Session,
             "model.reasoning" => EventKind::ModelReasoning,
+            "interrupt" => EventKind::Interrupt,
             _ => return None,
         })
     }
@@ -130,6 +136,16 @@ impl Event {
             s,
             EventKind::PolicyDecision,
             json!({ "tool": intent.tool, "intent_id": intent.id, "decision": verdict, "reason": reason }),
+            TrustLabel::System,
+        )
+    }
+
+    /// A processed interrupt: `kind` = "steer" | "cancel", `text` for steers.
+    pub fn interrupt(s: &Session, kind: &str, text: Option<&str>) -> Self {
+        Self::new(
+            s,
+            EventKind::Interrupt,
+            json!({ "kind": kind, "text": text }),
             TrustLabel::System,
         )
     }

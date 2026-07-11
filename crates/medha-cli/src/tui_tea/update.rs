@@ -715,7 +715,7 @@ pub(super) fn spawn_turn<P, L>(
     tokio::spawn(async move {
         let sink = TuiSink { tx: tx.clone() };
         tokio::select! {
-            result = kernel.run_session(&session, messages, budget, &sink) => {
+            result = kernel.run_session(&session, messages, budget, &sink, None) => {
                 match result {
                     Ok((updated, reason)) => { let _ = tx.send(TuiEvent::Done(updated, reason)); }
                     Err(e) => { let _ = tx.send(TuiEvent::Error(e.to_string())); }

@@ -487,7 +487,7 @@ async fn main() -> Result<()> {
     messages.extend(resumed);
     messages.push(Message::user(prompt));
     let sink = PrintSink::plain();
-    match kernel.run_session(&session, messages, apply_budget_env(base_budget), &sink).await {
+    match kernel.run_session(&session, messages, apply_budget_env(base_budget), &sink, None).await {
         Ok((_t, kernel::StopReason::Budget(stop))) => {
             eprintln!("\n(stopped: {} reached — raise the limit to continue)", stop.label());
         }
@@ -847,7 +847,7 @@ where
                 // through the sink, which also records real token usage.
                 let sink = PrintSink::tracking(usage.clone());
                 // Each user message is a fresh task → fresh budget contract.
-                match kernel.run_session(session, transcript.clone(), budget.clone(), &sink).await {
+                match kernel.run_session(session, transcript.clone(), budget.clone(), &sink, None).await {
                     Ok((updated, kernel::StopReason::Budget(stop))) => {
                         transcript = updated;
                         println!(

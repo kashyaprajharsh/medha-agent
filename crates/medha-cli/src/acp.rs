@@ -215,7 +215,7 @@ where
                         tokio::spawn(async move {
                             let sink = AcpSink { writer };
                             tokio::select! {
-                                result = kernel.run_session(&session, messages, budget, &sink) => {
+                                result = kernel.run_session(&session, messages, budget, &sink, None) => {
                                     let _ = done_tx.send(match result {
                                         Ok((updated, reason)) => TurnDone::Ok(updated, reason),
                                         Err(e) => TurnDone::Err(e.to_string()),

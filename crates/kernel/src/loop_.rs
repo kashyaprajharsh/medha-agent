@@ -64,6 +64,9 @@ pub enum StopReason {
     Finished,
     /// A budget ceiling was reached (the continuation policy can resume).
     Budget(crate::budgets::BudgetStop),
+    /// The surface cancelled the turn; in-flight work settled gracefully and
+    /// the returned history is consistent (every intent has an observation).
+    Interrupted,
 }
 
 pub struct Kernel<P: Provider, L: EventLog> {
@@ -81,6 +84,8 @@ pub struct Kernel<P: Provider, L: EventLog> {
     /// Serializes human-gate prompts: parallel tool dispatch must not pop
     /// several approval cards at once (P2 gate race).
     gate_serial: futures::lock::Mutex<()>,
+    /// Post-cancel settle window for in-flight tools (tunable in tests).
+    settle_grace: std::time::Duration,
 }
 
 /// Tool-result payloads larger than this spill to the artifact store and are
@@ -90,6 +95,12 @@ const SPILL_THRESHOLD: usize = 16_000;
 /// How many times a turn's model stream is retried on a transient provider
 /// failure (429 / 5xx / network drop) before giving up (K3).
 const MAX_TURN_RETRIES: u32 = 3;
+
+/// After a cancel, how long an in-flight tool gets to settle before its future
+/// is dropped and an `[interrupted]` observation is synthesized. Dropping is
+/// safe here: process trees die with the future (group reaper), and the
+/// synthesized observation keeps the intent→observation invariant intact.
+const TOOL_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Capped exponential backoff between stream retries: 250ms, 500ms, 1s, …
 fn retry_backoff(attempt: u32) -> std::time::Duration {
@@ -120,6 +131,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             pricing: None,
             gate_serial: futures::lock::Mutex::new(()),
+            settle_grace: TOOL_SETTLE_GRACE,
         }
     }
 
@@ -127,6 +139,30 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     pub fn with_pricing(mut self, pricing: Option<crate::types::Pricing>) -> Self {
         self.pricing = pricing;
         self
+    }
+
+    /// Override the post-cancel tool settle window (tests use a short one).
+    pub fn with_settle_grace(mut self, grace: std::time::Duration) -> Self {
+        self.settle_grace = grace;
+        self
+    }
+
+    /// Common tail for a graceful cancel: hand back steers that never reached
+    /// a turn boundary (typed text must not vanish), log the interrupt, and
+    /// return the settled history.
+    async fn finish_interrupted(
+        &self,
+        session: &Session,
+        messages: Vec<Message>,
+        q: &mut crate::interrupts::InterruptQueue,
+        sink: &dyn StreamSink,
+    ) -> Result<(Vec<Message>, StopReason), KernelError> {
+        let leftover = q.drain_steers();
+        if !leftover.is_empty() {
+            sink.steers_returned(&leftover);
+        }
+        self.log.append(Event::interrupt(session, "cancel", None)).await.ok();
+        Ok((messages, StopReason::Interrupted))
     }
 
     /// Spill an oversized tool-result payload to the artifact store, returning a
@@ -171,7 +207,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         mut messages: Vec<Message>,
         budget: crate::budgets::Budget,
         sink: &dyn StreamSink,
+        mut interrupts: Option<crate::interrupts::InterruptQueue>,
     ) -> Result<(Vec<Message>, StopReason), KernelError> {
+        // `None` (headless) → a token that never trips; every cancel path is dead.
+        let cancel = interrupts.as_ref().map(|q| q.token()).unwrap_or_default();
         let specs = self.executor.specs();
         // Size the tool-def overhead once so token estimates match the real
         // request (tool defs are sent every turn) (P1-9).
@@ -203,6 +242,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // can be escalated. Scoped to the request (one run_session).
         let mut web_tainted = false;
         loop {
+            // Turn boundary: honor a pending cancel first (queued steers go
+            // BACK to the surface, not into a turn that won't run), then
+            // inject queued steers as user messages.
+            if let Some(q) = interrupts.as_mut() {
+                if q.cancel_requested() {
+                    return self.finish_interrupted(session, messages, q, sink).await;
+                }
+                for s in q.drain_steers() {
+                    self.log.append(Event::user_message(session, &s)).await?;
+                    self.log.append(Event::interrupt(session, "steer", Some(&s))).await.ok();
+                    sink.steered(&s);
+                    messages.push(Message::user(s));
+                }
+            }
+
             // Budget gate: stop gracefully before a turn if any ceiling is hit (I4).
             if let Some(stop) = gov.check() {
                 return Ok((messages, StopReason::Budget(stop)));
@@ -259,8 +313,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // one emergency compaction with a halved window (forces the engine's
             // hard path) and retry once, rather than dying with a fatal error.
             let mut overflow_retried = false;
-            let (assistant, intents, usage) = loop {
-                match self.run_turn(session, &ctx, sink).await {
+            let (assistant, intents, usage, turn_interrupted) = loop {
+                match self.run_turn(session, &ctx, sink, &cancel).await {
                     Ok(t) => break t,
                     Err(KernelError::ContextOverflow) if !overflow_retried => {
                         overflow_retried = true;
@@ -305,12 +359,30 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     sink.cost(gov.cost_usd(), p.indicative);
                 }
             }
+            // Interrupted mid-stream, or cancelled between the stream ending
+            // and dispatch: keep the partial/complete TEXT (already logged) but
+            // drop un-admitted intents — an intent enters the log and the live
+            // history only once its observation is guaranteed to follow.
+            if turn_interrupted || cancel.is_cancelled() {
+                messages.push(Message::assistant_calls(assistant.content, Vec::new()));
+                if let Some(q) = interrupts.as_mut() {
+                    return self.finish_interrupted(session, messages, q, sink).await;
+                }
+                return Ok((messages, StopReason::Interrupted));
+            }
             messages.push(assistant);
 
             if intents.is_empty() {
                 return Ok((messages, StopReason::Finished)); // text-only finish
             }
 
+            // Dispatch admission: intents are logged HERE — after the cancel
+            // check, immediately before execution — so a logged intent always
+            // gets an observation (real or synthesized). Replay order per id is
+            // intent → policy.decision → observation.
+            for it in &intents {
+                self.log.append(Event::model_intent(session, it)).await?;
+            }
             // Notify the surface of the calls before they run (live feedback).
             for it in &intents {
                 sink.tool_call(&it.tool, &it.args);
@@ -331,10 +403,35 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // Full dependency-aware DAG with write-path serialization is the next
             // refinement (parallel.rs); for now tools are sandbox-jailed and
             // conflicting same-turn writes are rare.
+            let dispatch_cancel = cancel.clone();
             let results: Vec<(String, String, Observation)> = stream::iter(intents)
-                .map(|intent| async move {
-                    let obs = self.dispatch_one(session, &intent, web_tainted).await;
-                    (intent.id, intent.tool, obs)
+                .map(|intent| {
+                    let cancel = dispatch_cancel.clone();
+                    async move {
+                        // The dispatch future is never dropped by the cancel
+                        // itself: on cancel the tool gets TOOL_SETTLE_GRACE to
+                        // finish (its real observation is kept); only past the
+                        // grace is it dropped — deliberately — and an
+                        // `[interrupted]` observation synthesized, so the
+                        // admitted intent still gets its observation.
+                        let obs = {
+                            let fut = self.dispatch_one(session, &intent, web_tainted);
+                            tokio::pin!(fut);
+                            tokio::select! {
+                                obs = &mut fut => obs,
+                                _ = cancel.cancelled() => {
+                                    match tokio::time::timeout(self.settle_grace, &mut fut).await {
+                                        Ok(obs) => obs,
+                                        Err(_) => Observation::error(
+                                            &intent.id,
+                                            "[interrupted] cancelled by user; tool did not settle within the grace window",
+                                        ),
+                                    }
+                                }
+                            }
+                        };
+                        (intent.id, intent.tool, obs)
+                    }
                 })
                 .buffered(self.max_parallel_tools)
                 .collect()
@@ -359,6 +456,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 sink.tool_result(&tool, ok, &obs.payload);
                 let content = serde_json::to_string(&obs.payload).unwrap_or_default();
                 messages.push(Message::tool_result(&id, self.maybe_spill(content)));
+            }
+
+            // Cancelled during dispatch: every admitted intent has settled
+            // (real or synthesized observation, logged above) — stop here.
+            // The verifier is skipped deliberately: the user asked to stop,
+            // and a build/test run can be long.
+            if cancel.is_cancelled() {
+                if let Some(q) = interrupts.as_mut() {
+                    return self.finish_interrupted(session, messages, q, sink).await;
+                }
+                return Ok((messages, StopReason::Interrupted));
             }
 
             // Deterministic verification after edits (§4.7): run the configured
@@ -399,10 +507,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         session: &Session,
         ctx: &CompiledContext,
         sink: &dyn StreamSink,
-    ) -> Result<(Message, Vec<ToolIntent>, Option<crate::types::Usage>), KernelError> {
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(Message, Vec<ToolIntent>, Option<crate::types::Usage>, bool), KernelError> {
         let mut attempt = 0u32;
-        let (text, reasoning, intents, usage) = loop {
-            match self.stream_turn(ctx, sink).await {
+        let (text, reasoning, intents, usage, interrupted) = loop {
+            match self.stream_turn(ctx, sink, cancel).await {
                 Ok(data) => break data,
                 Err((e, emitted)) => {
                     if e.is_context_overflow() {
@@ -417,18 +526,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             }
         };
-        // Log (P3/P7) after a successful stream. Reasoning is logged for
-        // transparency but excluded from the Message that re-enters history.
+        // Log (P3/P7) after the stream — including a cancelled one: what
+        // streamed is what the user saw and must survive resume. Intents are
+        // NOT logged here — they're logged at dispatch admission, so a logged
+        // intent always gets an observation (interrupts invariant).
         if !reasoning.is_empty() {
             self.log.append(Event::model_reasoning(session, &reasoning)).await?;
         }
         if !text.is_empty() {
             self.log.append(Event::model_text(session, &text)).await?;
         }
-        for it in &intents {
-            self.log.append(Event::model_intent(session, it)).await?;
-        }
-        Ok((Message::assistant_calls(text, intents.clone()), intents, usage))
+        Ok((Message::assistant_calls(text, intents.clone()), intents, usage, interrupted))
     }
 
     /// Establish and consume one model stream, emitting deltas to the sink as
@@ -440,8 +548,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         &self,
         ctx: &CompiledContext,
         sink: &dyn StreamSink,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<
-        (String, String, Vec<ToolIntent>, Option<crate::types::Usage>),
+        (String, String, Vec<ToolIntent>, Option<crate::types::Usage>, bool),
         (crate::provider::ProviderError, bool),
     > {
         let mut stream = self.provider.stream(ctx).await.map_err(|e| (e, false))?;
@@ -450,7 +559,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut intents: Vec<ToolIntent> = Vec::new();
         let mut usage: Option<crate::types::Usage> = None;
         let mut emitted = false;
-        while let Some(block) = stream.next().await {
+        loop {
+            let block = tokio::select! {
+                block = stream.next() => block,
+                _ = cancel.cancelled() => {
+                    // Cancelled mid-stream: keep what streamed (the user saw
+                    // it), drop un-dispatched intents — they were never
+                    // admitted, so nothing in the log dangles.
+                    return Ok((text, reasoning, Vec::new(), usage, true));
+                }
+            };
+            let Some(block) = block else { break };
             match block {
                 Ok(Block::Text(t)) => {
                     emitted = true;
@@ -477,7 +596,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 Err(e) => return Err((e, emitted)),
             }
         }
-        Ok((text, reasoning, intents, usage))
+        Ok((text, reasoning, intents, usage, false))
     }
 
     /// validate (P1) → police (§4.6) → gate (P5) → execute (§4.8).

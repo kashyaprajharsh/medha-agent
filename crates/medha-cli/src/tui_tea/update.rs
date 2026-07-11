@@ -103,15 +103,23 @@ pub(super) fn handle_key<P, L>(
         return;
     }
 
-    // Esc is reserved for stopping a running turn (cancel token), not for
-    // answering an approval. Intercept it before the approval branch so Esc
-    // always does what the user expects — interrupt — instead of silently
-    // denying whichever prompt happens to be on screen (which the kernel would
-    // then read as "rejected by human").
+    // Esc is reserved for stopping a running turn, not for answering an
+    // approval. Intercept it before the approval branch so Esc always does
+    // what the user expects — interrupt — instead of silently denying
+    // whichever prompt happens to be on screen. The cancel is GRACEFUL: the
+    // kernel lets in-flight tools settle (bounded) and returns Done with
+    // StopReason::Interrupted — the handle stays until then.
     if key.code == KeyCode::Esc && model.running {
-        if let Some(token) = model.cancel_token.take() {
-            token.cancel();
+        if let Some(h) = &model.interrupt {
+            h.cancel_turn();
+            if !model.cancelling {
+                model.cancelling = true;
+                model.push_notice("⏹ stopping — letting in-flight tools settle…");
+            }
         }
+        // Answering the pending approvals unblocks any gate the kernel is
+        // waiting on, so the cancel settles immediately (K8, by design).
+        model.deny_pending_approvals();
         return;
     }
 
@@ -233,8 +241,10 @@ pub(super) fn handle_key<P, L>(
             model.push_notice(if model.show_summary { "summaries: expanded (^E)" } else { "summaries: collapsed (^E)" });
         }
         KeyCode::Esc if model.running => {
-            if let Some(token) = model.cancel_token.take() {
-                token.cancel();
+            // Unreachable in practice (the top-of-handler intercept fires
+            // first) — kept as a safety arm with the same graceful path.
+            if let Some(h) = &model.interrupt {
+                h.cancel_turn();
             }
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -282,9 +292,17 @@ pub(super) fn handle_key<P, L>(
             let line = model.resolve_pastes(&raw);
 
             if model.running {
-                let preview: String = raw.chars().take(60).collect();
-                model.queued.push(line);
-                model.push_notice(format!("⏳ queued (sends after current turn): {preview}"));
+                // Mid-turn steer: the kernel injects it at the next turn
+                // boundary (same session, model sees it immediately after the
+                // current tools settle). Never reaches here with an approval
+                // card open — the approval branch owns Enter above.
+                if let Some(h) = &model.interrupt {
+                    h.steer(line.clone());
+                    let preview: String = raw.chars().take(60).collect();
+                    model.push_notice(format!("↳ queued for this task: {preview}"));
+                } else {
+                    model.push_notice("(turn is finishing — try again in a moment)");
+                }
             } else {
                 spawn_turn(model, kernel, session, transcript, budget, tx, line);
             }
@@ -434,10 +452,19 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
             model.running = false;
             model.current_tool = None;
             model.turn_started = None;
-            model.cancel_token = None;
+            model.interrupt = None;
+            model.cancelling = false;
             model.deny_pending_approvals();
-            if let StopReason::Budget(stop) = reason {
-                model.push_notice(format!("(stopped: {} reached)", stop.label()));
+            match reason {
+                StopReason::Budget(stop) => {
+                    model.push_notice(format!("(stopped: {} reached)", stop.label()));
+                }
+                StopReason::Interrupted => {
+                    // The kernel settled in-flight tools before returning —
+                    // the transcript above is the consistent, resumable truth.
+                    model.push_notice("⏹ stopped — in-flight work settled");
+                }
+                StopReason::Finished => {}
             }
         }
         TuiEvent::Error(e) => {
@@ -445,16 +472,27 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
             model.running = false;
             model.current_tool = None;
             model.turn_started = None;
-            model.cancel_token = None;
+            model.interrupt = None;
+            model.cancelling = false;
             model.deny_pending_approvals();
         }
-        TuiEvent::Interrupted => {
-            model.push_notice("⏹ stopped (Esc)");
-            model.running = false;
-            model.current_tool = None;
-            model.turn_started = None;
-            model.cancel_token = None;
-            model.deny_pending_approvals();
+        // A queued steer reached its turn boundary: promote the "queued"
+        // notice to a real user line (that's what the model now sees).
+        TuiEvent::Steered(text) => {
+            model.remove_last_notice("↳ queued for this task:");
+            model.push_item(Item::User(text));
+        }
+        // Steers the session never applied (cancel/finish raced them): give
+        // the text back to the input box — typed text must never vanish.
+        TuiEvent::SteersReturned(texts) => {
+            model.remove_last_notice("↳ queued for this task:");
+            let restored = texts.join("\n");
+            if !model.input.is_empty() {
+                model.input.push('\n');
+            }
+            model.input.push_str(&restored);
+            model.cursor = model.input.len();
+            model.push_notice("(queued message returned to the input box — not sent)");
         }
         // `/resume` list arrived from the log — open the session picker.
         TuiEvent::SessionsLoaded(sessions) => {
@@ -703,27 +741,24 @@ pub(super) fn spawn_turn<P, L>(
     model.turn_started = Some(Instant::now());
     transcript.push(Message::user(line));
 
-    let cancel_token = CancellationToken::new();
-    model.cancel_token = Some(cancel_token.clone());
-    
+    // Graceful interruption: the kernel owns cancellation now. Esc trips the
+    // handle; run_session ALWAYS returns (settled history + StopReason), so
+    // there is no select! race dropping the session future mid-tool anymore.
+    let (handle, queue) = kernel::InterruptQueue::pair();
+    model.interrupt = Some(handle);
+    model.cancelling = false;
+
     let kernel = kernel.clone();
     let session = session.clone();
     let messages = transcript.clone();
     let budget = budget.clone();
     let tx = tx.clone();
-    
+
     tokio::spawn(async move {
         let sink = TuiSink { tx: tx.clone() };
-        tokio::select! {
-            result = kernel.run_session(&session, messages, budget, &sink, None) => {
-                match result {
-                    Ok((updated, reason)) => { let _ = tx.send(TuiEvent::Done(updated, reason)); }
-                    Err(e) => { let _ = tx.send(TuiEvent::Error(e.to_string())); }
-                }
-            }
-            _ = cancel_token.cancelled() => {
-                let _ = tx.send(TuiEvent::Interrupted);
-            }
+        match kernel.run_session(&session, messages, budget, &sink, Some(queue)).await {
+            Ok((updated, reason)) => { let _ = tx.send(TuiEvent::Done(updated, reason)); }
+            Err(e) => { let _ = tx.send(TuiEvent::Error(e.to_string())); }
         }
     });
 }
@@ -755,6 +790,8 @@ impl kernel::StreamSink for TuiSink {
     fn usage(&self, prompt_tokens: u32, total_tokens: u32) { self.emit("usage", TuiEvent::Usage(prompt_tokens, total_tokens)); }
     fn cost(&self, total_usd: f64, indicative: bool) { self.emit("cost", TuiEvent::Cost(total_usd, indicative)); }
     fn verify(&self, ok: bool, summary: &str) { self.emit("verify", TuiEvent::Verify(ok, summary.to_string())); }
+    fn steered(&self, text: &str) { self.emit("steered", TuiEvent::Steered(text.to_string())); }
+    fn steers_returned(&self, texts: &[String]) { self.emit("steers_returned", TuiEvent::SteersReturned(texts.to_vec())); }
 }
 
 /// Run slash command

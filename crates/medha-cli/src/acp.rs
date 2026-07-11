@@ -132,18 +132,24 @@ impl kernel::StreamSink for AcpSink {
             json!({ "before": before, "after": after, "summarized": summarized, "summary": summary }),
         );
     }
+    fn steered(&self, text: &str) {
+        self.writer.event("message.steered", json!({ "content": text }));
+    }
+    fn steers_returned(&self, texts: &[String]) {
+        self.writer.event("message.returned", json!({ "contents": texts }));
+    }
 }
 
 /// Result of a spawned turn, delivered back to the main loop.
 enum TurnDone {
     Ok(Vec<Message>, StopReason),
     Err(String),
-    Cancelled,
 }
 
 /// Run the bridge until stdin closes. Single session, one turn at a time — a
-/// `message.send` arriving mid-turn is rejected with an `error` event rather
-/// than silently queued (the editor decides what to do).
+/// `message.send` arriving mid-turn becomes a STEER (injected at the next
+/// turn boundary); `cancel`/`interrupt` stops gracefully via the kernel's
+/// interrupt handle (in-flight tools settle; never a mid-tool kill).
 pub async fn run<P, L>(
     kernel: Arc<Kernel<P, L>>,
     session: Session,
@@ -168,7 +174,7 @@ where
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<TurnDone>();
     let mut running = false;
-    let mut cancel: Option<oneshot::Sender<()>> = None;
+    let mut interrupt: Option<kernel::InterruptHandle> = None;
 
     loop {
         tokio::select! {
@@ -199,13 +205,20 @@ where
                             continue;
                         }
                         if running {
-                            writer.event("error", json!({ "message": "a turn is already running" }));
+                            // Mid-turn message = steer: the kernel injects it
+                            // at the next turn boundary of the SAME session.
+                            if let Some(h) = &interrupt {
+                                h.steer(content);
+                                writer.event("message.queued", json!({}));
+                            } else {
+                                writer.event("error", json!({ "message": "a turn is already running" }));
+                            }
                             continue;
                         }
                         transcript.push(Message::user(content));
                         running = true;
-                        let (cancel_tx, cancel_rx) = oneshot::channel();
-                        cancel = Some(cancel_tx);
+                        let (handle, queue) = kernel::InterruptQueue::pair();
+                        interrupt = Some(handle);
                         let kernel = kernel.clone();
                         let session = session.clone();
                         let messages = transcript.clone();
@@ -214,15 +227,13 @@ where
                         let done_tx = done_tx.clone();
                         tokio::spawn(async move {
                             let sink = AcpSink { writer };
-                            tokio::select! {
-                                result = kernel.run_session(&session, messages, budget, &sink, None) => {
-                                    let _ = done_tx.send(match result {
-                                        Ok((updated, reason)) => TurnDone::Ok(updated, reason),
-                                        Err(e) => TurnDone::Err(e.to_string()),
-                                    });
-                                }
-                                _ = cancel_rx => { let _ = done_tx.send(TurnDone::Cancelled); }
-                            }
+                            let result = kernel
+                                .run_session(&session, messages, budget, &sink, Some(queue))
+                                .await;
+                            let _ = done_tx.send(match result {
+                                Ok((updated, reason)) => TurnDone::Ok(updated, reason),
+                                Err(e) => TurnDone::Err(e.to_string()),
+                            });
                         });
                     }
                     "approval.respond" => {
@@ -236,8 +247,10 @@ where
                         }
                     }
                     "cancel" | "interrupt" => {
-                        if let Some(tx) = cancel.take() {
-                            let _ = tx.send(());
+                        // Graceful: in-flight tools settle, the turn returns
+                        // Done(Interrupted) with a consistent transcript.
+                        if let Some(h) = &interrupt {
+                            h.cancel_turn();
                         }
                     }
                     "shutdown" | "exit" => break,
@@ -248,18 +261,17 @@ where
             }
             Some(done) = done_rx.recv() => {
                 running = false;
-                cancel = None;
+                interrupt = None;
                 match done {
                     TurnDone::Ok(updated, reason) => {
                         transcript = updated;
-                        let stop = match reason {
-                            StopReason::Budget(s) => Some(s.label().to_string()),
-                            _ => None,
-                        };
-                        writer.event("turn.done", json!({ "stopped": stop }));
+                        match reason {
+                            StopReason::Interrupted => writer.event("turn.cancelled", json!({})),
+                            StopReason::Budget(s) => writer.event("turn.done", json!({ "stopped": s.label() })),
+                            StopReason::Finished => writer.event("turn.done", json!({ "stopped": Value::Null })),
+                        }
                     }
                     TurnDone::Err(e) => writer.event("turn.error", json!({ "message": e })),
-                    TurnDone::Cancelled => writer.event("turn.cancelled", json!({})),
                 }
             }
         }

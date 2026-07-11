@@ -157,12 +157,19 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         q: &mut crate::interrupts::InterruptQueue,
         sink: &dyn StreamSink,
     ) -> Result<(Vec<Message>, StopReason), KernelError> {
+        Self::return_unapplied_steers(q, sink);
+        self.log.append(Event::interrupt(session, "cancel", None)).await.ok();
+        Ok((messages, StopReason::Interrupted))
+    }
+
+    /// Hand back any steers still queued at a session exit (Finished / budget
+    /// stop / cancel) — a steer that raced the final turn must reach the
+    /// surface, never evaporate.
+    fn return_unapplied_steers(q: &mut crate::interrupts::InterruptQueue, sink: &dyn StreamSink) {
         let leftover = q.drain_steers();
         if !leftover.is_empty() {
             sink.steers_returned(&leftover);
         }
-        self.log.append(Event::interrupt(session, "cancel", None)).await.ok();
-        Ok((messages, StopReason::Interrupted))
     }
 
     /// Spill an oversized tool-result payload to the artifact store, returning a
@@ -259,6 +266,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
             // Budget gate: stop gracefully before a turn if any ceiling is hit (I4).
             if let Some(stop) = gov.check() {
+                if let Some(q) = interrupts.as_mut() {
+                    Self::return_unapplied_steers(q, sink);
+                }
                 return Ok((messages, StopReason::Budget(stop)));
             }
             gov.record_turn();
@@ -287,6 +297,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // engine's best effort still overflows, refuse to send this turn
             // rather than risk a provider context-length error (I4).
             if compiled.overflow {
+                if let Some(q) = interrupts.as_mut() {
+                    Self::return_unapplied_steers(q, sink);
+                }
                 return Ok((messages, StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow)));
             }
             let view = compiled.messages;
@@ -340,6 +353,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                     Err(KernelError::ContextOverflow) => {
                         // Already retried once and still over — stop gracefully.
+                        if let Some(q) = interrupts.as_mut() {
+                            Self::return_unapplied_steers(q, sink);
+                        }
                         return Ok((messages, StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow)));
                     }
                     Err(e) => return Err(e),
@@ -373,6 +389,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             messages.push(assistant);
 
             if intents.is_empty() {
+                // A steer that raced this final turn goes back to the surface.
+                if let Some(q) = interrupts.as_mut() {
+                    Self::return_unapplied_steers(q, sink);
+                }
                 return Ok((messages, StopReason::Finished)); // text-only finish
             }
 

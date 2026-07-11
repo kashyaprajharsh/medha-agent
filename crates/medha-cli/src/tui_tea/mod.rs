@@ -17,7 +17,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 
 mod update;
 mod view;
@@ -110,7 +109,12 @@ pub(crate) enum TuiEvent {
     Approval(String, Option<String>, bool, oneshot::Sender<kernel::Approval>),
     Done(Vec<Message>, StopReason),
     Error(String),
-    Interrupted,
+    /// A queued steer was applied at a turn boundary — promote its "queued"
+    /// notice to a real user line.
+    Steered(String),
+    /// The session ended with steers never applied (cancel / finish raced
+    /// them) — give the text back to the input box, never lose it.
+    SteersReturned(Vec<String>),
     /// `/resume` completed loading the session list from the log.
     SessionsLoaded(Vec<kernel::SessionMeta>),
     /// A past session's events were replayed into a transcript; swap to it.
@@ -507,10 +511,12 @@ struct Model {
     current_tool: Option<(String, Option<String>)>,
     /// When the current turn started — for the elapsed-time counter in the status.
     turn_started: Option<Instant>,
-    /// Queued messages (sent during agent turn)
-    queued: Vec<String>,
-    /// Cancel token for current turn
-    cancel_token: Option<CancellationToken>,
+    /// Interrupt handle for the running turn: Esc → graceful cancel_turn,
+    /// Enter mid-turn → steer (applied at the next turn boundary).
+    interrupt: Option<kernel::InterruptHandle>,
+    /// An Esc was sent and the kernel is settling in-flight tools — used to
+    /// show one "stopping…" notice instead of one per Esc press.
+    cancelling: bool,
     /// Pending inline approval queue (PART 3). The kernel may emit several
     /// tool calls concurrently (buffered up to `max_parallel_tools`), and each
     /// out-of-workspace path or Human-gated tool spawns a separate `confirm()`
@@ -595,8 +601,8 @@ impl Model {
             running: false,
             current_tool: None,
             turn_started: None,
-            queued: Vec::new(),
-            cancel_token: None,
+            interrupt: None,
+            cancelling: false,
             pending_approvals: VecDeque::new(),
             approval_sel: 0,
             auto_approve: std::collections::HashSet::new(),
@@ -679,6 +685,19 @@ impl Model {
 
     fn push_notice(&mut self, s: impl Into<String>) {
         self.push_item(Item::Notice(s.into()));
+    }
+
+    /// Remove the most recent notice starting with `prefix` — e.g. a "queued"
+    /// steer marker being promoted to a real user line once it applies.
+    fn remove_last_notice(&mut self, prefix: &str) {
+        if let Some(idx) = self
+            .items
+            .iter()
+            .rposition(|e| matches!(&e.item, Item::Notice(n) if n.starts_with(prefix)))
+        {
+            self.items.remove(idx);
+            self.dirty = true;
+        }
     }
 
     /// Live-status notices (/tasks): when the most recent item is already a
@@ -916,11 +935,6 @@ where
             redraw_needed = false;
         }
 
-        // Drain queued messages after turn completes
-        if !model.running && !model.queued.is_empty() {
-            let line = model.queued.remove(0);
-            spawn_turn(&mut model, &kernel, &session, &mut transcript, &budget, &tx, line);
-        }
     }
 
     // Restore terminal on exit (PART 2).
@@ -1085,6 +1099,28 @@ mod tests {
     fn wrap_line_fast_path_when_it_fits() {
         assert_eq!(wrap_line(&Line::from("short"), 80).len(), 1);
         assert_eq!(wrap_line(&Line::from(""), 80).len(), 1);
+    }
+
+    #[test]
+    fn steer_events_promote_queued_notice_and_return_unsent_text() {
+        let ui = lockfile::UiConfig::default();
+        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        let mut session = kernel::Session::new();
+        let mut transcript: Vec<Message> = Vec::new();
+
+        // Steer queued in the TUI → notice; kernel applies it → Steered
+        // promotes the notice to a real user line (exactly one).
+        m.push_notice("↳ queued for this task: check the tests");
+        update::handle_agent_event(&mut m, TuiEvent::Steered("check the tests".into()), &mut session, &mut transcript);
+        assert!(!m.items.iter().any(|e| matches!(&e.item, Item::Notice(n) if n.starts_with("↳ queued"))));
+        assert!(m.items.iter().any(|e| matches!(&e.item, Item::User(s) if s == "check the tests")));
+
+        // Cancel raced a steer → the text lands back in the input box.
+        m.push_notice("↳ queued for this task: do Y instead");
+        update::handle_agent_event(&mut m, TuiEvent::SteersReturned(vec!["do Y instead".into()]), &mut session, &mut transcript);
+        assert_eq!(m.input, "do Y instead", "returned steer must be editable, not lost");
+        assert_eq!(m.cursor, m.input.len());
+        assert!(!m.items.iter().any(|e| matches!(&e.item, Item::Notice(n) if n.starts_with("↳ queued"))));
     }
 
     #[test]

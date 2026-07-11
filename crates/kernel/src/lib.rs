@@ -21,8 +21,11 @@ pub use artifacts::ArtifactStore;
 pub use budgets::{Budget, BudgetStop, Governor, DEFAULT_MAX_TURNS};
 pub use context::{CompileResult, ContextEngine};
 pub use errors::KernelError;
-pub use events::{project_messages, Event, EventKind, EventLog, InMemoryLog, Provenance, SessionMeta};
-pub use executor::Executor;
+pub use events::{
+    cut_index, project_messages, rollback_plan, Event, EventKind, EventLog, FileRollback,
+    InMemoryLog, Provenance, SessionMeta,
+};
+pub use executor::{BackgroundTask, Executor};
 pub use gate::{Approval, AutoDeny, HumanGate};
 pub use policy::{AllowAll, Policy};
 pub use sink::{NullSink, StreamSink};

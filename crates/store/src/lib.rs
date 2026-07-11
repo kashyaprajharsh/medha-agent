@@ -368,6 +368,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_persists_a_branch_and_leaves_the_original_intact() {
+        let dir = std::env::temp_dir().join(format!("medha-fork-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let log = SqliteLog::open(&db).unwrap();
+        let s = kernel::Session { id: Ulid::new(), done: false };
+
+        log.append(Event::user_message(&s, "one")).await.unwrap();
+        let cut = log.append(Event::user_message(&s, "two")).await.unwrap();
+        log.append(Event::model_text(&s, "answer")).await.unwrap();
+
+        // Fork before "two": the branch keeps only "one".
+        let branch_id = log.fork(s.id, cut.id).await.unwrap();
+        let branch = log.events(branch_id).await;
+        assert_eq!(branch.len(), 1);
+        assert_eq!(branch[0].payload.get("text").and_then(|v| v.as_str()), Some("one"));
+        assert_eq!(branch[0].session_id, branch_id);
+
+        // Original session untouched; whole log still verifies (fork appended a
+        // valid continuation of the global chain, tamper-evidence intact).
+        assert_eq!(log.events(s.id).await.len(), 3);
+        log.verify().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn persists_and_chains() {
         let dir = std::env::temp_dir().join(format!("medha-store-{}", Ulid::new()));
         let db = dir.join("events.db");

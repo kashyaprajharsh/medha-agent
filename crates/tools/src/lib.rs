@@ -87,6 +87,16 @@ pub trait Tool: Send + Sync {
     async fn preview(&self, _args: &Value) -> Option<String> {
         None
     }
+
+    /// Hard wall-clock ceiling for one call. Default `Some(60s)` protects against
+    /// a stuck tool. Tools that legitimately run long or self-manage their own
+    /// bound return a larger value or `None` (no cap): `shell.exec` promotes a
+    /// slow command to a background task instead of being killed, and
+    /// `diagnostics`/`web.crawl` can exceed 60s on a big workspace/site. A `None`
+    /// here means the tool is trusted to bound itself.
+    fn timeout(&self) -> Option<std::time::Duration> {
+        Some(TOOL_TIMEOUT)
+    }
 }
 
 /// Cap a rendered diff so a huge change doesn't flood the approval card.
@@ -115,11 +125,14 @@ pub struct ToolRegistry {
     /// level (§4.8) to the kernel's trust-flow escalation. `None` for a bare
     /// registry built via [`ToolRegistry::new`].
     sandbox: Option<Arc<WorkspaceSandbox>>,
+    /// Shared background-task table (promoted `shell.exec` runs), kept so the
+    /// executor can report live tasks to a surface. `None` for a bare registry.
+    tasks: Option<Arc<TaskTable>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: HashMap::new(), sandbox: None }
+        Self { tools: HashMap::new(), sandbox: None, tasks: None }
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
@@ -148,7 +161,15 @@ impl ToolRegistry {
         r.register(Arc::new(MultiEdit { sbx: sandbox.clone() }));
         r.register(Arc::new(Git { sbx: sandbox.clone() }));
         r.register(Arc::new(Diagnostics { sbx: sandbox.clone() }));
-        r.register(Arc::new(ShellExec { sbx: sandbox }));
+        // Background-task facility (§2): a slow `shell.exec` promotes to a task in
+        // this shared table; `task.output`/`task.kill`/`task.list` operate on it,
+        // and the executor exposes it to surfaces via `background_tasks()`.
+        let tasks = Arc::new(TaskTable::default());
+        r.tasks = Some(tasks.clone());
+        r.register(Arc::new(ShellExec { sbx: sandbox, tasks: tasks.clone() }));
+        r.register(Arc::new(TaskOutput { tasks: tasks.clone() }));
+        r.register(Arc::new(TaskKill { tasks: tasks.clone() }));
+        r.register(Arc::new(TaskList { tasks }));
         r.register(Arc::new(ReadArtifact { store: artifacts }));
         r.register(Arc::new(WebSearch));
         r.register(Arc::new(WebFetch));
@@ -198,19 +219,36 @@ impl Executor for ToolRegistry {
             .unwrap_or(kernel::Containment::None)
     }
 
+    fn background_tasks(&self) -> Vec<kernel::BackgroundTask> {
+        self.tasks.as_ref().map(|t| t.info()).unwrap_or_default()
+    }
+
     async fn execute(&self, intent: &ToolIntent) -> Observation {
         let Some(tool) = self.tools.get(&intent.tool) else {
             return Observation::denial(&intent.id, format!("unknown tool '{}'", intent.tool));
         };
-        // Per-tool timeout so a stuck tool (e.g. a hung fetch) never hangs the
-        // session — it returns a structured timeout observation instead (P10).
-        match tokio::time::timeout(TOOL_TIMEOUT, tool.execute(&intent.args)).await {
-            Ok(Ok(payload)) => Observation::ok(&intent.id, payload),
-            Ok(Err(e)) => Observation::error(&intent.id, e.to_string()),
-            Err(_) => Observation::error(
-                &intent.id,
-                format!("tool '{}' timed out after {}s", intent.tool, TOOL_TIMEOUT.as_secs()),
-            ),
+        // Per-tool timeout so a stuck tool never hangs the session. The ceiling
+        // is the tool's own (default 60s); tools that self-manage a longer run
+        // (shell.exec promotes to background; diagnostics/web.crawl) return a
+        // larger value or `None` for no cap. On timeout the run future is dropped
+        // — and for exec-backed tools that drop tears down the whole process
+        // group (see `GroupReaper`), so nothing is orphaned.
+        let run = tool.execute(&intent.args);
+        let result = match tool.timeout() {
+            Some(limit) => match tokio::time::timeout(limit, run).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return Observation::error(
+                        &intent.id,
+                        format!("tool '{}' timed out after {}s", intent.tool, limit.as_secs()),
+                    );
+                }
+            },
+            None => run.await,
+        };
+        match result {
+            Ok(payload) => Observation::ok(&intent.id, payload),
+            Err(e) => Observation::error(&intent.id, e.to_string()),
         }
     }
 
@@ -263,17 +301,32 @@ impl Tool for FsRead {
             return Ok(json!({ "path": path, "content": content }));
         }
         // Line-range read: return just the requested slice plus positioning info.
-        let lines: Vec<&str> = content.lines().collect();
+        // Split with `split_inclusive` so each line KEEPS its terminator — CRLF
+        // stays CRLF and the final line keeps (or lacks) its trailing newline.
+        // `content.lines()` used to strip `\r` and the last `\n`, so the model
+        // copied LF-only text that then failed byte-exact against a CRLF file in
+        // `fs.edit`/`multi_edit` ("old_string not found"). Raw slices fix that.
+        let lines: Vec<&str> = content.split_inclusive('\n').collect();
         let total = lines.len();
         let start = (offset.unwrap_or(1).max(1) as usize - 1).min(total);
-        let end = limit.map(|l| start + l as usize).unwrap_or(total).min(total);
-        let slice = lines.get(start..end).unwrap_or(&[]).join("\n");
+        // `saturating_add` so `start + limit` can't wrap in release and silently
+        // return empty content for a large `limit`.
+        let end = limit.map(|l| start.saturating_add(l as usize).min(total)).unwrap_or(total);
+        let slice = lines.get(start..end).unwrap_or(&[]).concat();
+        // Flag an offset that lands past EOF, so an empty slice isn't read as
+        // "the file ends here" when really the offset overshot.
+        let beyond_eof = offset.is_some() && start >= total && total > 0;
         Ok(json!({
             "path": path,
             "content": slice,
             "start_line": start + 1,
             "end_line": end,
             "total_lines": total,
+            "note": if beyond_eof {
+                Some(format!("offset {} is past end of file ({total} lines)", offset.unwrap_or(0)))
+            } else {
+                None
+            },
         }))
     }
 }
@@ -391,12 +444,13 @@ impl Tool for FsEdit {
         let old_s = arg_str(args, "old_string")?;
         let new_s = arg_str(args, "new_string")?;
         let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+        validate_edit(&old_s, &new_s)?;
 
         let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        // CRLF-tolerant byte-exact match (see `resolve_edit`).
+        let (old_s, new_s) = resolve_edit(&content, &old_s, &new_s)
+            .ok_or_else(|| ToolError::Failed(format!("old_string not found in {path}")))?;
         let count = content.matches(&old_s).count();
-        if count == 0 {
-            return Err(ToolError::Failed(format!("old_string not found in {path}")));
-        }
         if count > 1 && !replace_all {
             return Err(ToolError::Failed(format!(
                 "old_string appears {count} times in {path}; pass replace_all or use a more specific string"
@@ -643,7 +697,14 @@ impl Tool for Glob {
                 continue;
             }
             let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
-            if matcher.matches(&rel) {
+            // `require_literal_separator` so `*` and `?` do NOT cross `/`:
+            // `*.rs` matches `main.rs` but not `src/main.rs`, and `src/*.rs`
+            // doesn't reach `src/a/b.rs`. Use `**` to span directories. Without
+            // this, plain `*` spans path separators and over-matches wildly.
+            if matcher.matches_with(&rel, glob::MatchOptions {
+                require_literal_separator: true,
+                ..Default::default()
+            }) {
                 if matches.len() >= max {
                     truncated = true;
                     break;
@@ -1649,6 +1710,11 @@ impl Tool for WebCrawl {
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
     }
+    fn timeout(&self) -> Option<std::time::Duration> {
+        // A multi-page crawl (`limit` up to 100) is one long request and can't
+        // finish inside 60s; give it a wider ceiling.
+        Some(std::time::Duration::from_secs(300)) // 5 min
+    }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
@@ -1775,6 +1841,108 @@ fn program_on_path(program: &str) -> bool {
 
 struct ShellExec {
     sbx: Arc<WorkspaceSandbox>,
+    tasks: Arc<TaskTable>,
+}
+
+/// Seconds a `shell.exec` runs in the foreground before it's promoted to a
+/// background task (returns partial output + a task id, keeps running). Chosen
+/// below the default tool ceiling so promotion — not a kill — is what happens to
+/// a slow command.
+const PROMOTE_AFTER_SECS: u64 = 50;
+
+/// Shared registry of promoted background commands (§2). One per session,
+/// created in [`ToolRegistry::with_workspace`] and shared by `shell.exec` and
+/// the `task.*` tools.
+#[derive(Default)]
+struct TaskTable {
+    inner: std::sync::Mutex<HashMap<String, TaskEntry>>,
+    seq: std::sync::atomic::AtomicU64,
+}
+
+struct TaskEntry {
+    proc: sandbox::exec::BgProc,
+    command: String,
+}
+
+impl TaskTable {
+    fn register(&self, command: String, proc: sandbox::exec::BgProc) -> String {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let id = format!("t{n}");
+        if let Ok(mut m) = self.inner.lock() {
+            m.insert(id.clone(), TaskEntry { proc, command });
+        }
+        id
+    }
+    /// A JSON snapshot of one task (status + current output), or `None` if the id
+    /// is unknown.
+    fn snapshot(&self, id: &str) -> Option<Value> {
+        let m = self.inner.lock().ok()?;
+        let t = m.get(id)?;
+        let (stdout, stderr) = t.proc.snapshot();
+        let running = t.proc.is_running();
+        Some(json!({
+            "task_id": id,
+            "command": t.command,
+            "status": if running { "running" } else { "exited" },
+            "exit_code": t.proc.exit_code(),
+            "stdout": stdout,
+            "stderr": stderr,
+        }))
+    }
+    /// Kill a task's process group; returns false if the id is unknown.
+    fn kill(&self, id: &str) -> bool {
+        let Ok(m) = self.inner.lock() else { return false };
+        match m.get(id) {
+            Some(t) => {
+                t.proc.kill();
+                true
+            }
+            None => false,
+        }
+    }
+    /// One-line summaries of every task (for `task.list` / status).
+    fn list(&self) -> Vec<Value> {
+        let Ok(m) = self.inner.lock() else { return Vec::new() };
+        let mut out: Vec<Value> = m
+            .iter()
+            .map(|(id, t)| {
+                json!({
+                    "task_id": id,
+                    "command": t.command,
+                    "status": if t.proc.is_running() { "running" } else { "exited" },
+                    "exit_code": t.proc.exit_code(),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a["task_id"].as_str().cmp(&b["task_id"].as_str()));
+        out
+    }
+    /// Structured task list for surfaces (the TUI status line / `/tasks`).
+    fn info(&self) -> Vec<kernel::BackgroundTask> {
+        let Ok(m) = self.inner.lock() else { return Vec::new() };
+        let mut out: Vec<kernel::BackgroundTask> = m
+            .iter()
+            .map(|(id, t)| kernel::BackgroundTask {
+                id: id.clone(),
+                command: t.command.clone(),
+                running: t.proc.is_running(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// Kill every still-running task — called at session end so nothing is left
+    /// running detached.
+    fn kill_all(&self) {
+        if let Ok(m) = self.inner.lock() {
+            for t in m.values() {
+                if t.proc.is_running() {
+                    t.proc.kill();
+                }
+            }
+        }
+    }
 }
 #[async_trait]
 impl Tool for ShellExec {
@@ -1794,35 +1962,183 @@ impl Tool for ShellExec {
         // pre-execution scanner (§4.6) harden this in Phase 1.
         BlastRadius::IrreversibleLocal
     }
+    fn timeout(&self) -> Option<std::time::Duration> {
+        // Self-managed: `execute` runs the command in the foreground only up to
+        // `promote_after` (default 50s, or the caller's `timeout_s`), then
+        // promotes it to a background task — so the call always returns promptly
+        // and never needs the registry's wall-clock kill. `None` = no outer cap.
+        None
+    }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "command": { "type": "string", "description": "Command line to run via the shell" } },
+            "properties": {
+                "command": { "type": "string", "description": "Command line to run via the shell" },
+                "background": { "type": "boolean", "description": "Start detached immediately and return a task_id (for servers/watchers). Poll with task.output, stop with task.kill." },
+                "timeout_s": { "type": "integer", "description": "Seconds to wait before promoting a slow command to a background task (default 50)." }
+            },
             "required": ["command"]
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let command = arg_str(args, "command")?;
-        // Run through the sandbox's execution backend (host or the OS-native
-        // jail), rooted at the workspace. `clear_env` + the allowlist keep
-        // injected API keys out of the child so a command can't exfiltrate them
-        // via `printenv` / `echo $TAVILY_API_KEY`; the backend also sets
-        // kill_on_drop so a timeout/cancel never leaks an orphaned process.
-        let output = self
+        let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
+        let promote_after = std::time::Duration::from_secs(
+            args.get("timeout_s").and_then(Value::as_u64).unwrap_or(PROMOTE_AFTER_SECS),
+        );
+        // Spawn through the sandbox's execution backend (host or OS-native jail),
+        // rooted at the workspace, as a background task from the start. `clear_env`
+        // + the allowlist keep injected API keys out of the child so a command
+        // can't exfiltrate them via `printenv`. The process is its own group
+        // leader, so `task.kill` (or session-end cleanup) tears down the whole
+        // tree — no orphans.
+        let bg = self
             .sbx
-            .exec("sh", &["-c".to_string(), command.clone()], shell_env(), true)
-            .await
+            .exec_background("sh", &["-c".to_string(), command.clone()], shell_env(), true)
             .map_err(|e| ToolError::Failed(e.to_string()))?;
+
+        // Immediate backgrounding (servers/watchers) → return a task id now.
+        if !background {
+            // Otherwise give it up to `promote_after` to finish in the foreground.
+            if bg.wait_until(promote_after).await {
+                let (stdout, stderr) = bg.snapshot();
+                return Ok(json!({
+                    "command": command,
+                    "exit_code": bg.exit_code(),
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }));
+            }
+        }
+
+        // Still running past the deadline (or explicitly backgrounded): promote.
+        let (stdout, stderr) = bg.snapshot();
+        let pid = bg.pid;
+        let task_id = self.tasks.register(command.clone(), bg);
         Ok(json!({
             "command": command,
-            "exit_code": output.status,
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
+            "status": "running",
+            "task_id": task_id,
+            "pid": pid,
+            "stdout_so_far": stdout,
+            "stderr_so_far": stderr,
+            "hint": "still running — poll with task.output {task_id}, stop with task.kill {task_id}",
         }))
     }
 
     async fn preview(&self, args: &Value) -> Option<String> {
         args.get("command").and_then(|v| v.as_str()).map(|c| format!("$ {c}"))
+    }
+}
+
+// ── background tasks: task.output / task.kill / task.list ────────────────────
+
+/// Kill every still-running task when the table (and thus the session's tool
+/// registry) is dropped — no detached command outlives the session.
+impl Drop for TaskTable {
+    fn drop(&mut self) {
+        self.kill_all();
+    }
+}
+
+struct TaskOutput {
+    tasks: Arc<TaskTable>,
+}
+
+#[async_trait]
+impl Tool for TaskOutput {
+    fn name(&self) -> &str {
+        "task.output"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Shell
+    }
+    fn description(&self) -> &str {
+        "Check a background shell task — one that a slow `shell.exec` was promoted \
+         into, or that you started with `background: true`. Returns its current \
+         stdout/stderr, whether it's still running, and the exit code once it \
+         finishes. Omit `task_id` to list every task."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "task_id": { "type": "string", "description": "Task id from shell.exec (omit to list all tasks)" } }
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        match args.get("task_id").and_then(Value::as_str) {
+            Some(id) => self
+                .tasks
+                .snapshot(id)
+                .ok_or_else(|| ToolError::Failed(format!("no such task '{id}'"))),
+            None => Ok(json!({ "tasks": self.tasks.list() })),
+        }
+    }
+}
+
+struct TaskKill {
+    tasks: Arc<TaskTable>,
+}
+
+#[async_trait]
+impl Tool for TaskKill {
+    fn name(&self) -> &str {
+        "task.kill"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Shell
+    }
+    fn description(&self) -> &str {
+        "Stop a background shell task — SIGKILLs its whole process group (so any \
+         child processes, e.g. a dev server's workers, die too)."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        // A local, expected action on a task this agent started — no approval nag.
+        BlastRadius::ReversibleLocal
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "task_id": { "type": "string", "description": "Task id to kill" } },
+            "required": ["task_id"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let id = arg_str(args, "task_id")?;
+        if self.tasks.kill(&id) {
+            Ok(json!({ "task_id": id, "killed": true }))
+        } else {
+            Err(ToolError::Failed(format!("no such task '{id}'")))
+        }
+    }
+}
+
+struct TaskList {
+    tasks: Arc<TaskTable>,
+}
+
+#[async_trait]
+impl Tool for TaskList {
+    fn name(&self) -> &str {
+        "task.list"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Shell
+    }
+    fn description(&self) -> &str {
+        "List all background shell tasks with their status and exit codes."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: &Value) -> Result<Value, ToolError> {
+        Ok(json!({ "tasks": self.tasks.list() }))
     }
 }
 
@@ -1836,6 +2152,47 @@ struct MultiEdit {
 /// edit sees the previous one's result). All-or-nothing: if any edit's
 /// `old_string` is missing — or ambiguous without `replace_all` — the whole
 /// batch fails and nothing is returned, so a partial edit can never land.
+/// Reject `old_string` values that corrupt files rather than edit them: an
+/// empty needle matches *between every character* (so `replace` splices
+/// `new_string` throughout), and `old == new` is a no-op that still writes and
+/// burns a snapshot. Both must fail loudly, not "succeed".
+fn validate_edit(old: &str, new: &str) -> Result<(), ToolError> {
+    if old.is_empty() {
+        return Err(ToolError::Failed(
+            "old_string must not be empty (an empty match would insert new_string between every character)".into(),
+        ));
+    }
+    if old == new {
+        return Err(ToolError::Failed(
+            "old_string and new_string are identical — nothing to change".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the (old, new) pair to use for a byte-exact edit, tolerating a
+/// line-ending mismatch. On a CRLF file `new` is always normalized to CRLF so a
+/// replacement never leaves mixed endings — this matters even when `old` matched
+/// exactly (the model can supply a CRLF `old` but an LF-only `new`). If `old`
+/// isn't found verbatim, retries with `old`'s endings normalized to CRLF (the
+/// model may hold LF-only text from an earlier read). `None` if neither form is
+/// present. `to_crlf` is idempotent, so an already-CRLF `new` is unchanged.
+fn resolve_edit(content: &str, old: &str, new: &str) -> Option<(String, String)> {
+    let file_is_crlf = content.contains("\r\n");
+    let to_crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+    if content.contains(old) {
+        let new = if file_is_crlf { to_crlf(new) } else { new.to_string() };
+        return Some((old.to_string(), new));
+    }
+    if file_is_crlf {
+        let crlf_old = to_crlf(old);
+        if content.contains(&crlf_old) {
+            return Some((crlf_old, to_crlf(new)));
+        }
+    }
+    None
+}
+
 fn apply_edits(content: &str, edits: &[Value]) -> Result<String, ToolError> {
     let mut cur = content.to_string();
     for (i, e) in edits.iter().enumerate() {
@@ -1848,17 +2205,17 @@ fn apply_edits(content: &str, edits: &[Value]) -> Result<String, ToolError> {
             .get("new_string")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::Args(format!("edit #{n}: missing 'new_string'")))?;
+        validate_edit(old, new).map_err(|err| ToolError::Failed(format!("edit #{n}: {err}")))?;
         let replace_all = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
-        let count = cur.matches(old).count();
-        if count == 0 {
-            return Err(ToolError::Failed(format!("edit #{n}: old_string not found")));
-        }
+        let (old, new) = resolve_edit(&cur, old, new)
+            .ok_or_else(|| ToolError::Failed(format!("edit #{n}: old_string not found")))?;
+        let count = cur.matches(&old).count();
         if count > 1 && !replace_all {
             return Err(ToolError::Failed(format!(
                 "edit #{n}: old_string appears {count} times; pass replace_all or use a more specific string"
             )));
         }
-        cur = if replace_all { cur.replace(old, new) } else { cur.replacen(old, new, 1) };
+        cur = if replace_all { cur.replace(&old, &new) } else { cur.replacen(&old, &new, 1) };
     }
     Ok(cur)
 }
@@ -2211,6 +2568,10 @@ impl Tool for Diagnostics {
         // Analysis only: it inspects the code and reports problems; it doesn't
         // touch source (build artifacts aside), like the verifier.
         BlastRadius::Read
+    }
+    fn timeout(&self) -> Option<std::time::Duration> {
+        // A cold `cargo check`/`tsc` on a large workspace easily exceeds 60s.
+        Some(std::time::Duration::from_secs(600)) // 10 min
     }
     fn schema(&self) -> Value {
         json!({
@@ -2906,5 +3267,207 @@ mod tests {
     }
     fn mem_artifacts() -> Arc<dyn kernel::ArtifactStore> {
         Arc::new(MemArtifacts::default())
+    }
+
+    /// A registry over a fresh jailed workspace, for exercising tools end-to-end.
+    fn reg_in(dir: &std::path::Path) -> ToolRegistry {
+        std::fs::create_dir_all(dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(dir).unwrap());
+        ToolRegistry::with_workspace(sbx, mem_artifacts())
+    }
+    async fn run(reg: &ToolRegistry, tool: &str, args: Value) -> kernel::Observation {
+        reg.execute(&ToolIntent { id: "t".into(), tool: tool.into(), args }).await
+    }
+
+    // ── P0-1: ranged reads keep raw bytes (CRLF + trailing newline) so an edit
+    //         built from a ranged read matches byte-for-byte ───────────────────
+    #[tokio::test]
+    async fn ranged_read_preserves_crlf_then_edit_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("medha-crlf-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "one\r\ntwo\r\nthree\r\n" })).await;
+
+        // A ranged read returns the slice with its CRLF terminator intact.
+        let r = run(&reg, "fs.read", json!({ "path": "f.txt", "offset": 2, "limit": 1 })).await;
+        assert_eq!(r.status, kernel::ObsStatus::Ok);
+        assert_eq!(r.payload["content"], "two\r\n", "CRLF preserved (was LF-normalized)");
+
+        // The model copies that exact slice into an edit — it must match.
+        let e = run(&reg, "fs.edit", json!({
+            "path": "f.txt", "old_string": "two\r\n", "new_string": "TWO\r\n"
+        })).await;
+        assert_eq!(e.status, kernel::ObsStatus::Ok, "edit failed: {:?}", e.payload);
+        assert_eq!(run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"],
+                   "one\r\nTWO\r\nthree\r\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_keeps_crlf_when_new_string_is_lf_only() {
+        // Exact-match path: old_string matches the CRLF file verbatim, but the
+        // model supplied an LF-only new_string. The write must not leave mixed
+        // endings — new is normalized to the file's CRLF.
+        let dir = std::env::temp_dir().join(format!("medha-crlf3-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "a\r\nb\r\nc\r\n" })).await;
+        let e = run(&reg, "fs.edit", json!({
+            "path": "f.txt", "old_string": "b\r\n", "new_string": "X\nY\n"
+        })).await;
+        assert_eq!(e.status, kernel::ObsStatus::Ok, "{:?}", e.payload);
+        let out = run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"].as_str().unwrap().to_string();
+        assert!(!out.contains("X\nY") || out.contains("X\r\nY"), "no bare LF introduced: {out:?}");
+        assert_eq!(out, "a\r\nX\r\nY\r\nc\r\n", "new_string normalized to CRLF");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_is_crlf_tolerant_for_lf_only_needle() {
+        let dir = std::env::temp_dir().join(format!("medha-crlf2-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "one\r\ntwo\r\n" })).await;
+        // Needle uses LF though the file is CRLF — resolve_edit should still match.
+        let e = run(&reg, "fs.edit", json!({
+            "path": "f.txt", "old_string": "one\ntwo", "new_string": "1\n2"
+        })).await;
+        assert_eq!(e.status, kernel::ObsStatus::Ok, "CRLF-tolerant match failed: {:?}", e.payload);
+        assert_eq!(run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"], "1\r\n2\r\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── P2: a huge limit must not overflow into an empty slice ────────────────
+    #[tokio::test]
+    async fn ranged_read_huge_limit_does_not_overflow() {
+        let dir = std::env::temp_dir().join(format!("medha-ovf-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "a\nb\nc\n" })).await;
+        let r = run(&reg, "fs.read", json!({ "path": "f.txt", "offset": 2, "limit": u64::MAX })).await;
+        assert_eq!(r.payload["content"], "b\nc\n", "saturating end, not wrapped-empty");
+        // Offset past EOF is flagged, not silently empty.
+        let past = run(&reg, "fs.read", json!({ "path": "f.txt", "offset": 99, "limit": 1 })).await;
+        assert_eq!(past.payload["content"], "");
+        assert!(past.payload["note"].as_str().unwrap_or("").contains("past end"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── P0-5: empty / no-op old_string must fail, not corrupt the file ────────
+    #[tokio::test]
+    async fn edit_rejects_empty_and_noop_old_string() {
+        let dir = std::env::temp_dir().join(format!("medha-empty-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "abc" })).await;
+
+        let empty = run(&reg, "fs.edit", json!({
+            "path": "f.txt", "old_string": "", "new_string": "X", "replace_all": true
+        })).await;
+        assert_eq!(empty.status, kernel::ObsStatus::Error, "empty old_string must be rejected");
+        // File untouched.
+        assert_eq!(run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"], "abc");
+
+        let noop = run(&reg, "fs.edit", json!({
+            "path": "f.txt", "old_string": "abc", "new_string": "abc"
+        })).await;
+        assert_eq!(noop.status, kernel::ObsStatus::Error, "old==new must be rejected");
+
+        // multi_edit guards the same way.
+        let me = run(&reg, "multi_edit", json!({
+            "path": "f.txt", "edits": [{ "old_string": "", "new_string": "Y" }]
+        })).await;
+        assert_eq!(me.status, kernel::ObsStatus::Error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── P0-3 / §2: background-task facility ───────────────────────────────────
+    #[tokio::test]
+    async fn shell_fast_command_completes_inline() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-fast-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        let obs = run(&reg, "shell.exec", json!({ "command": "printf hi" })).await;
+        assert_eq!(obs.status, kernel::ObsStatus::Ok);
+        assert_eq!(obs.payload["exit_code"].as_i64(), Some(0));
+        assert_eq!(obs.payload["stdout"], "hi");
+        assert!(obs.payload.get("task_id").is_none(), "fast command should not promote");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_background_promotes_and_is_pollable_and_killable() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-bg-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        // background:true → returns a task id immediately, keeps running.
+        let started = run(&reg, "shell.exec", json!({
+            "command": "sleep 30; echo done", "background": true
+        })).await;
+        assert_eq!(started.payload["status"], "running");
+        let id = started.payload["task_id"].as_str().expect("task id").to_string();
+
+        // task.output reports it running.
+        let poll = run(&reg, "task.output", json!({ "task_id": id })).await;
+        assert_eq!(poll.payload["status"], "running", "{:?}", poll.payload);
+
+        // task.list shows it.
+        let list = run(&reg, "task.list", json!({})).await;
+        assert!(list.payload["tasks"].as_array().unwrap().iter().any(|t| t["task_id"] == id.as_str()));
+
+        // The executor exposes it to surfaces (what the TUI status line polls).
+        {
+            use kernel::Executor;
+            let live = reg.background_tasks();
+            assert!(live.iter().any(|t| t.id == id && t.running), "executor should report the running task");
+        }
+
+        // task.kill stops it.
+        let killed = run(&reg, "task.kill", json!({ "task_id": id })).await;
+        assert_eq!(killed.payload["killed"], true);
+
+        // Give the reaper a moment; the task is no longer running.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let after = run(&reg, "task.output", json!({ "task_id": id })).await;
+        assert_eq!(after.payload["status"], "exited", "killed task should no longer run");
+
+        // Unknown task ids are errors, not silent success.
+        assert_eq!(run(&reg, "task.kill", json!({ "task_id": "nope" })).await.status, kernel::ObsStatus::Error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // (The wait-based promote path — `wait_until` timing out then registering —
+    // is the same registration code as the deterministic `background: true` case
+    // above; a real-clock variant flakes under heavy parallel test load, so it's
+    // intentionally not a separate test.)
+
+    // ── K7 / P1-10: long-running tools get a wider ceiling than the 60s default ──
+    #[test]
+    fn per_tool_timeouts_exceed_the_default_for_long_runners() {
+        let default = TOOL_TIMEOUT;
+        // A quick local tool keeps the default 60s.
+        assert_eq!(WordCount { sbx: mk_sbx() }.timeout(), Some(default));
+        // shell.exec self-manages (promotes to background) → no outer cap.
+        assert_eq!(ShellExec { sbx: mk_sbx(), tasks: Arc::new(TaskTable::default()) }.timeout(), None);
+        // A long-running fixed tool widens its ceiling past the default.
+        assert!(Diagnostics { sbx: mk_sbx() }.timeout().unwrap() > default, "diagnostics must exceed 60s");
+    }
+
+    fn mk_sbx() -> Arc<WorkspaceSandbox> {
+        let dir = std::env::temp_dir().join(format!("medha-to-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap())
+    }
+
+    // ── P1-7: `*` must not cross `/` ──────────────────────────────────────────
+    #[tokio::test]
+    async fn glob_star_does_not_cross_slash() {
+        let dir = std::env::temp_dir().join(format!("medha-glob-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        run(&reg, "fs.write", json!({ "path": "top.rs", "content": "" })).await;
+        run(&reg, "fs.write", json!({ "path": "src/main.rs", "content": "" })).await;
+
+        let shallow = run(&reg, "glob", json!({ "pattern": "*.rs" })).await;
+        let m = shallow.payload["matches"].as_array().unwrap();
+        assert!(m.iter().any(|v| v == "top.rs"), "matches top-level");
+        assert!(!m.iter().any(|v| v == "src/main.rs"), "* must not descend into src/");
+
+        let deep = run(&reg, "glob", json!({ "pattern": "**/*.rs" })).await;
+        let m = deep.payload["matches"].as_array().unwrap();
+        assert!(m.iter().any(|v| v == "src/main.rs"), "** spans directories");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

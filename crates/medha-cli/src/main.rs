@@ -340,7 +340,7 @@ async fn main() -> Result<()> {
         WorkspaceSandbox::new(cwd.clone(), trust_path, audit_path, Some(gate.clone()))?
             .with_exec_backend(exec_backend),
     );
-    let executor = Arc::new(ToolRegistry::with_workspace(workspace, artifacts.clone()));
+    let executor = Arc::new(ToolRegistry::with_workspace(workspace.clone(), artifacts.clone()));
 
     // Context engine: budget-aware two-phase compaction (§4.3), tuned from
     // medha.lock's [context] section (or its built-in-matching default).
@@ -428,6 +428,7 @@ async fn main() -> Result<()> {
                 apply_budget_env(base_budget),
                 ui_config,
                 resumed,
+                workspace.clone(),
                 tx,
                 rx,
             )

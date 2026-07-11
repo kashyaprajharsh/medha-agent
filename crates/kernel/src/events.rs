@@ -167,6 +167,88 @@ pub trait EventLog: Send + Sync {
     async fn sessions(&self) -> Vec<SessionMeta> {
         Vec::new()
     }
+
+    /// Fork a session into a new branch that shares its history *before*
+    /// `at_event` (§18.4 time-travel). The prefix events are re-appended under a
+    /// fresh session id — a new, independently hash-valid chain — so the original
+    /// session is never mutated (append-only holds) and the fork can be continued
+    /// on its own. Returns the new session id. This is what makes rewind
+    /// non-destructive: you branch off a past point instead of erasing the future.
+    ///
+    /// `at_event` is a *cut before*: the new session contains every event that
+    /// preceded it, and none from `at_event` onward. The default impl reconstructs
+    /// the prefix via [`Self::events`] + [`Self::append`], so any backend gets a
+    /// correct fork for free; a store may override for efficiency.
+    async fn fork(&self, session: Ulid, at_event: Ulid) -> Result<Ulid, KernelError> {
+        let events = self.events(session).await;
+        let idx = cut_index(&events, at_event)
+            .ok_or_else(|| KernelError::Log(format!("event {at_event} not in session {session}")))?;
+        let new_id = Ulid::new();
+        for e in &events[..idx] {
+            let mut clone = e.clone();
+            clone.id = Ulid::new();
+            clone.session_id = new_id;
+            clone.parent_id = None;
+            clone.provenance = Provenance { source: "fork".into() };
+            self.append(clone).await?;
+        }
+        Ok(new_id)
+    }
+}
+
+/// Position of `at_event` within an ordered event slice — the cut point for
+/// rewind/fork. Everything at index `< cut_index` is the retained prefix;
+/// everything from the returned index onward is the discarded (or rolled-back)
+/// future. `None` if the event isn't in the slice.
+pub fn cut_index(events: &[Event], at_event: Ulid) -> Option<usize> {
+    events.iter().position(|e| e.id == at_event)
+}
+
+/// A file to roll back during a code rewind: restore `snapshot` (the pre-write
+/// copy the sandbox took) to `path`, or *delete* `path` when `snapshot` is
+/// `None` (the write that follows the cut is the one that created the file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRollback {
+    pub path: String,
+    pub snapshot: Option<String>,
+}
+
+/// Compute the file-level rollback that returns the workspace to its state at
+/// the cut point — i.e. undo every file write logged from `at_event` onward
+/// (§18.4). Walks the write-family tool observations (those carrying a `path`
+/// plus a `snapshot` field) that occur at/after the cut and, for each path,
+/// keeps the EARLIEST one: its `snapshot` is that file's content *before* the
+/// first post-cut write, which is exactly its state at the cut. `None` snapshot
+/// ⇒ the file didn't exist yet, so rewinding deletes it. One entry per path, so
+/// the result is order-independent to apply.
+///
+/// The event log holds the full tool result (P3), including the snapshot id the
+/// sandbox returns on every write — so this reads purely from the log, no
+/// separate write journal. If `at_event` isn't found, returns an empty plan
+/// (nothing to undo) rather than erroring.
+pub fn rollback_plan(events: &[Event], at_event: Ulid) -> Vec<FileRollback> {
+    let Some(idx) = cut_index(events, at_event) else { return Vec::new() };
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut plan = Vec::new();
+    for e in &events[idx..] {
+        if e.kind != EventKind::ToolObs {
+            continue;
+        }
+        // Observation payload is { intent_id, ok, payload: <tool result json> }.
+        let Some(result) = e.payload.get("payload").and_then(Value::as_object) else { continue };
+        // Write-family results (fs.write / fs.edit / fs.multi_edit) are exactly
+        // those carrying both a `path` and a `snapshot` key (id or null).
+        if !result.contains_key("snapshot") {
+            continue;
+        }
+        let Some(path) = result.get("path").and_then(Value::as_str) else { continue };
+        if !seen.insert(path) {
+            continue; // keep the earliest write per path — that's the cut state
+        }
+        let snapshot = result.get("snapshot").and_then(Value::as_str).map(str::to_owned);
+        plan.push(FileRollback { path: path.to_string(), snapshot });
+    }
+    plan
 }
 
 /// In-memory log for Phase 0. The SQLite WAL + FTS5 backend (Vol 3 §3) is a
@@ -292,6 +374,47 @@ pub fn project_messages(events: &[Event]) -> Vec<Message> {
         }
     }
     flush(&mut out, &mut text, &mut intents, &mut assistant_open);
+    close_dangling_tool_calls(out)
+}
+
+/// Close any tool call left unanswered — the case where a session was
+/// interrupted (Esc/crash) *between* logging a `model.tool_intent` and its
+/// `tool.observation`. The projected assistant message then carries a
+/// `tool_calls` entry with no matching tool result, and every subsequent turn of
+/// the resumed session is rejected by the provider (400: an assistant tool_call
+/// must be followed by a tool result) — resume is permanently bricked. We
+/// synthesize a `[interrupted]` tool result for each dangling call so the
+/// history is a valid request again. Placed right after the assistant's real
+/// results, before the next message.
+fn close_dangling_tool_calls(msgs: Vec<Message>) -> Vec<Message> {
+    use crate::types::Role;
+    let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
+    let mut iter = msgs.into_iter().peekable();
+    while let Some(m) = iter.next() {
+        let calls: Vec<String> = if m.role == Role::Assistant {
+            m.tool_calls.iter().map(|c| c.id.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        out.push(m);
+        if calls.is_empty() {
+            continue;
+        }
+        // Consume this assistant's run of tool results, tracking which ids were answered.
+        let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while iter.peek().map(|n| n.role == Role::Tool).unwrap_or(false) {
+            let tool = iter.next().unwrap();
+            if let Some(id) = &tool.tool_call_id {
+                answered.insert(id.clone());
+            }
+            out.push(tool);
+        }
+        for id in calls {
+            if !answered.contains(&id) {
+                out.push(Message::tool_result(id, "[interrupted]"));
+            }
+        }
+    }
     out
 }
 
@@ -357,6 +480,42 @@ mod tests {
     }
 
     #[test]
+    fn projection_closes_a_tool_call_interrupted_before_its_observation() {
+        use crate::types::Role;
+        let s = Session::new();
+        // A turn cut short: the model asked for a tool (intent logged) but the
+        // observation was never logged (Esc/crash mid-tool), and then the user
+        // sent another message on resume.
+        let events = vec![
+            Event::user_message(&s, "read the file"),
+            Event::model_text(&s, ""),
+            Event::model_intent(
+                &s,
+                &ToolIntent { id: "x1".into(), tool: "fs.read".into(), args: json!({}) },
+            ),
+            // no tool.observation for x1 — interrupted here
+            Event::user_message(&s, "actually never mind, do this instead"),
+        ];
+        let msgs = project_messages(&events);
+
+        // Every assistant tool_call must be answered by a following tool result,
+        // else the provider 400s and resume is bricked.
+        for (i, m) in msgs.iter().enumerate() {
+            for call in &m.tool_calls {
+                let answered = msgs[i + 1..].iter().any(|later| {
+                    later.role == Role::Tool && later.tool_call_id.as_deref() == Some(&call.id)
+                });
+                assert!(answered, "dangling tool_call `{}` after interrupt", call.id);
+            }
+        }
+        // The synthesized result carries the interrupted marker.
+        assert!(
+            msgs.iter().any(|m| m.role == Role::Tool && m.content.contains("[interrupted]")),
+            "expected a synthesized [interrupted] tool result: {msgs:?}"
+        );
+    }
+
+    #[test]
     fn verify_chain_accepts_intact_and_rejects_tampered() {
         use futures::executor::block_on;
         let log = InMemoryLog::new();
@@ -393,6 +552,64 @@ mod tests {
         let mut altered = base.clone();
         altered.payload = json!({ "text": "HELLO" });
         assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
+    }
+
+    #[test]
+    fn rollback_plan_undoes_post_cut_writes_keeping_earliest_per_path() {
+        let s = Session::new();
+        // Helper: a write observation carrying path + snapshot, as the kernel logs it.
+        let write = |intent: &str, path: &str, snap: Option<&str>| {
+            let payload = json!({ "path": path, "written": true, "snapshot": snap });
+            Event::tool_obs(&s, &Observation::ok(intent, payload), TrustLabel::Tool)
+        };
+        let cut = Event::user_message(&s, "second request");
+        let cut_id = cut.id;
+        let events = vec![
+            Event::user_message(&s, "first request"),
+            write("a", "src/lib.rs", None), // created before the cut — not undone
+            cut,
+            write("b", "src/lib.rs", Some("SNAP1")), // first post-cut write to lib.rs
+            write("c", "src/main.rs", None),          // main.rs created after cut → delete
+            write("d", "src/lib.rs", Some("SNAP2")),  // later write to lib.rs → ignored
+        ];
+        let plan = rollback_plan(&events, cut_id);
+        assert_eq!(
+            plan,
+            vec![
+                FileRollback { path: "src/lib.rs".into(), snapshot: Some("SNAP1".into()) },
+                FileRollback { path: "src/main.rs".into(), snapshot: None },
+            ],
+            "earliest post-cut write per path; pre-cut writes untouched"
+        );
+        // Cut not found → nothing to roll back.
+        assert!(rollback_plan(&events, Ulid::new()).is_empty());
+    }
+
+    #[test]
+    fn fork_branches_a_prefix_into_a_new_independent_session() {
+        use futures::executor::block_on;
+        let log = InMemoryLog::new();
+        let s = Session::new();
+        block_on(log.append(Event::user_message(&s, "one"))).unwrap();
+        let cut = block_on(log.append(Event::user_message(&s, "two"))).unwrap();
+        block_on(log.append(Event::model_text(&s, "answer to two"))).unwrap();
+
+        // Fork *before* the second user message: the branch keeps only "one".
+        let new_id = block_on(log.fork(s.id, cut.id)).unwrap();
+        assert_ne!(new_id, s.id, "fork is a new session");
+
+        let branch = block_on(log.events(new_id));
+        assert_eq!(branch.len(), 1, "prefix before the cut event only");
+        assert_eq!(branch[0].payload.get("text").and_then(Value::as_str), Some("one"));
+        assert_eq!(branch[0].session_id, new_id, "events re-homed onto the branch");
+
+        // The original session is untouched (append-only preserved).
+        assert_eq!(block_on(log.events(s.id)).len(), 3);
+
+        // Projecting the branch yields the single retained user turn.
+        let msgs = project_messages(&branch);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "one");
     }
 
     #[test]

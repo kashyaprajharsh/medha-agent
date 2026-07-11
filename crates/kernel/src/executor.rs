@@ -6,6 +6,16 @@
 use crate::types::{BlastRadius, Containment, Observation, ToolCategory, ToolIntent, ToolSpec};
 use async_trait::async_trait;
 
+/// A background command the executor is tracking (a promoted `shell.exec`), for
+/// surfaces to display — so the *user* can see what's running, not just the
+/// model (§2 / §4.13).
+#[derive(Debug, Clone)]
+pub struct BackgroundTask {
+    pub id: String,
+    pub command: String,
+    pub running: bool,
+}
+
 #[async_trait]
 pub trait Executor: Send + Sync {
     /// Tool specs to expose into the K2 capability sheath for this session
@@ -41,5 +51,11 @@ pub trait Executor: Send + Sync {
     /// current contents through the (async) sandbox.
     async fn preview(&self, _intent: &ToolIntent) -> Option<String> {
         None
+    }
+
+    /// Background commands currently tracked (promoted `shell.exec` tasks), for a
+    /// surface to show the user. Default: none (executors without a task table).
+    fn background_tasks(&self) -> Vec<BackgroundTask> {
+        Vec::new()
     }
 }

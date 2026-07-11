@@ -9,7 +9,8 @@ Roadmap items are in [`../PROGRESS.md`](../PROGRESS.md), not here.
 ## 1. Tool families
 
 All tools live in [`crates/tools/src/lib.rs`](../crates/tools/src/lib.rs), behind
-the `Tool` trait, registered by `ToolRegistry::with_workspace` (19 tools total).
+the `Tool` trait, registered by `ToolRegistry::with_workspace` (22 tools total,
+including the background-task `task.output` / `task.kill` / `task.list`).
 The registry implements the kernel's `Executor` trait, so the kernel never knows
 an individual tool exists — only the `specs()` it exposes and the
 `blast_radius()` / `category()` each declares.

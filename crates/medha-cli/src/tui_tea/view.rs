@@ -634,6 +634,19 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
             Style::default().fg(theme::WARN),
         ));
     }
+    // Live background-task indicator: an animated glyph + count, so the user sees
+    // what's still running (a promoted `shell.exec`) even when no turn is active.
+    // `/tasks` lists them; `task.kill` (or the model) stops them.
+    let running_bg = model.bg_running();
+    if running_bg > 0 {
+        const SPIN: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+        let g = SPIN[(model.anim_frame as usize / 4) % SPIN.len()];
+        let word = if running_bg == 1 { "task" } else { "tasks" };
+        left.push(Span::styled(
+            format!("  {g} {running_bg} bg {word}"),
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
     let ctx = match model.ctx_pct { Some(pct) => format!("ctx {pct}%"), None => "ctx —".to_string() };
     let think = match model.reasoning.enabled {
         Some(true) => format!("think {}", crate::effort_label(model.reasoning.effort)),
@@ -713,15 +726,43 @@ pub(super) fn draw_autocomplete(f: &mut Frame, model: &Model, input_area: Rect) 
 }
 
 pub(super) fn draw_picker(f: &mut Frame, picker: &Picker, input_area: Rect) {
-    let options = picker.kind.options();
-    let height = options.len() as u16 + 1;
+    let labels = picker.kind.labels();
+    let n = labels.len();
+    // Fit the picker into the space actually available above the input box —
+    // no magic row count. `input_area.y` is how many rows sit above the input;
+    // reserve one for the title, keep one as a top margin. A long session list
+    // then windows around the selection instead of overflowing the screen.
+    let capacity = (input_area.y as usize).saturating_sub(2).max(1);
+    let visible = n.min(capacity).max(1);
+    let start = if n <= visible {
+        0
+    } else {
+        picker.selected.saturating_sub(visible / 2).min(n - visible)
+    };
+    let end = (start + visible).min(n);
+
+    let height = visible as u16 + 1; // + title row
     let y = input_area.y.saturating_sub(height);
     let area = Rect::new(input_area.x, y, input_area.width, height);
     f.render_widget(ratatui::widgets::Clear, area);
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(format!("  {}", picker.kind.title().trim()), Style::default().fg(theme::FAINT)))];
-    for (i, label) in options.iter().enumerate() {
-        if i == picker.selected { lines.push(Line::from(vec![Span::styled("▌ ", Style::default().fg(theme::ACCENT)), Span::styled(label.to_string(), Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))])); }
-        else { lines.push(Line::from(Span::styled(format!("  {label}"), Style::default().fg(theme::TEXT)))); }
+
+    // Title shows position (e.g. "3/27") when the list is windowed off-screen.
+    let mut title = picker.kind.title().trim().to_string();
+    if n > visible {
+        title = format!("{title}  ({}/{n})", picker.selected + 1);
+    }
+    let mut lines: Vec<Line> =
+        vec![Line::from(Span::styled(format!("  {title}"), Style::default().fg(theme::FAINT)))];
+    for (offset, label) in labels[start..end].iter().enumerate() {
+        let i = start + offset;
+        if i == picker.selected {
+            lines.push(Line::from(vec![
+                Span::styled("▌ ", Style::default().fg(theme::ACCENT)),
+                Span::styled(label.clone(), Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(format!("  {label}"), Style::default().fg(theme::TEXT))));
+        }
     }
     f.render_widget(Paragraph::new(lines), area);
 }

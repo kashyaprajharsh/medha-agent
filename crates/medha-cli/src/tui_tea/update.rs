@@ -2,8 +2,9 @@
 //! StreamSink→TuiEvent bridge. Split out of the old monolithic tui_tea.rs.
 #![allow(clippy::too_many_arguments)]
 use super::*;
+use sandbox::WorkspaceSandbox;
 
-pub(super) fn update<P, L>(model: &mut Model, msg: Msg, kernel: &Arc<Kernel<P, L>>, session: &Session, transcript: &mut Vec<Message>, budget: &Budget, tx: &mpsc::UnboundedSender<TuiEvent>) 
+pub(super) fn update<P, L>(model: &mut Model, msg: Msg, kernel: &Arc<Kernel<P, L>>, session: &mut Session, transcript: &mut Vec<Message>, budget: &Budget, tx: &mpsc::UnboundedSender<TuiEvent>) 
 where
     P: Provider + 'static,
     L: EventLog + 'static,
@@ -16,11 +17,16 @@ where
             model.viewport_height = height as usize;
             model.auto_scroll = model.scroll_offset >= model.max_scroll();
         }
-        Msg::AgentEvent(ev) => handle_agent_event(model, ev, transcript),
+        Msg::AgentEvent(ev) => handle_agent_event(model, ev, session, transcript),
         Msg::Tick => {
             model.anim_frame = model.anim_frame.wrapping_add(1);
             if let Some(f) = model.intro_frame {
                 model.intro_frame = if f >= 40 { None } else { Some(f + 1) };
+            }
+            // Refresh the live background-task list a few times a second (cheap
+            // mutex read) so the status-line indicator tracks reality.
+            if model.anim_frame % 16 == 0 {
+                model.bg_tasks = kernel.executor.background_tasks();
             }
         }
     }
@@ -85,7 +91,7 @@ pub(super) fn handle_key<P, L>(
     model: &mut Model,
     key: KeyEvent,
     kernel: &Arc<Kernel<P, L>>,
-    session: &Session,
+    session: &mut Session,
     transcript: &mut Vec<Message>,
     budget: &Budget,
     tx: &mpsc::UnboundedSender<TuiEvent>,
@@ -117,13 +123,55 @@ pub(super) fn handle_key<P, L>(
 
     // Picker handling
     if let Some(picker) = model.picker.as_mut() {
-        let opts = picker.kind.options();
+        let labels = picker.kind.labels();
         match key.code {
-            KeyCode::Up => picker.selected = picker.selected.checked_sub(1).unwrap_or(opts.len() - 1),
-            KeyCode::Down => picker.selected = (picker.selected + 1) % opts.len(),
+            KeyCode::Up => picker.selected = picker.selected.checked_sub(1).unwrap_or(labels.len().saturating_sub(1)),
+            KeyCode::Down => picker.selected = (picker.selected + 1) % labels.len().max(1),
             KeyCode::Enter => {
-                let choice = opts[picker.selected];
-                let msg = picker.kind.apply(kernel.provider.as_ref(), choice);
+                // Session picker: fetch the selected session's events and replay
+                // them into the transcript. Think/Effort pickers apply in-place.
+                if let PickerKind::Session(sessions) = &picker.kind {
+                    if let Some(meta) = sessions.get(picker.selected) {
+                        let id = meta.id;
+                        let log = kernel.log.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let events = log.events(id).await;
+                            let msgs = kernel::project_messages(&events);
+                            let _ = tx.send(TuiEvent::Resumed(id, msgs));
+                        });
+                        model.picker = None;
+                        model.push_notice(format!("(loading session {id} …)"));
+                        return;
+                    }
+                }
+                // Rewind step 1: a cut point was chosen → open the scope menu
+                // (conversation only · + code · cancel). No async work yet.
+                if let PickerKind::Rewind(points) = &picker.kind {
+                    if let Some(point) = points.get(picker.selected).cloned() {
+                        model.picker = Some(Picker::new(PickerKind::RewindMode(point)));
+                        return;
+                    }
+                }
+                // Rewind step 2: a scope was chosen → branch the session and,
+                // for the "+ code" scope, roll the workspace back. `None` = cancel
+                // (return to no picker; the user can re-open with /rewind).
+                if let PickerKind::RewindMode(point) = &picker.kind {
+                    let scope = point.scope_options().get(picker.selected).and_then(|(_, s)| *s);
+                    let at_event = point.at_event; // Copy — ends the picker borrow
+                    match scope {
+                        Some(scope) => {
+                            let restore = model.restore.clone();
+                            model.picker = None;
+                            spawn_rewind(kernel, restore, session.id, at_event, scope, tx);
+                            model.push_notice("(rewinding …)");
+                        }
+                        None => model.picker = None,
+                    }
+                    return;
+                }
+                let choice = labels[picker.selected].clone();
+                let msg = picker.kind.apply(kernel.provider.as_ref(), &choice);
                 model.reasoning = kernel.provider.reasoning();
                 model.picker = None;
                 model.push_notice(msg);
@@ -158,7 +206,12 @@ pub(super) fn handle_key<P, L>(
                     model.input.clear();
                     model.cursor = 0;
                     model.ac_sel = 0;
-                    run_slash(model, &cmd, transcript, kernel.provider.as_ref());
+                    match cmd.as_str() {
+                        "resume" => start_resume(model, kernel, tx),
+                        "rewind" => start_rewind(model, kernel, session, tx),
+                        "clear" => do_clear(model, session, transcript),
+                        _ => run_slash(model, &cmd, transcript, kernel.provider.as_ref()),
+                    }
                     return;
                 }
                 _ => {}
@@ -202,7 +255,13 @@ pub(super) fn handle_key<P, L>(
                 model.ac_sel = 0;
                 model.history.push(line.clone());
                 model.history_idx = None;
-                run_slash(model, line.trim_start_matches('/').trim(), transcript, kernel.provider.as_ref());
+                let cmd = line.trim_start_matches('/').trim();
+                match cmd {
+                    "resume" => start_resume(model, kernel, tx),
+                    "rewind" => start_rewind(model, kernel, session, tx),
+                    "clear" => do_clear(model, session, transcript),
+                    _ => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
+                }
                 return;
             }
             if model.input.trim().is_empty() {
@@ -317,8 +376,8 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
     }
 }
 
-/// Handle agent events
-pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, transcript: &mut Vec<Message>) {
+/// Handle agent events. `session` is swapped when a `/resume` completes.
+pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut Session, transcript: &mut Vec<Message>) {
     match ev {
         TuiEvent::ToolStarted(tool, target) => model.current_tool = Some((tool, target)),
         TuiEvent::Text(delta) => { model.current_tool = None; model.push_text_delta(&delta); }
@@ -359,6 +418,7 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, transcript: &m
             model.current_tool = None;
             model.turn_started = None;
             model.cancel_token = None;
+            model.deny_pending_approvals();
             if let StopReason::Budget(stop) = reason {
                 model.push_notice(format!("(stopped: {} reached)", stop.label()));
             }
@@ -369,6 +429,7 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, transcript: &m
             model.current_tool = None;
             model.turn_started = None;
             model.cancel_token = None;
+            model.deny_pending_approvals();
         }
         TuiEvent::Interrupted => {
             model.push_notice("⏹ stopped (Esc)");
@@ -376,8 +437,229 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, transcript: &m
             model.current_tool = None;
             model.turn_started = None;
             model.cancel_token = None;
+            model.deny_pending_approvals();
+        }
+        // `/resume` list arrived from the log — open the session picker.
+        TuiEvent::SessionsLoaded(sessions) => {
+            if sessions.is_empty() {
+                model.push_notice("(no saved sessions in this workspace)");
+            } else {
+                model.picker = Some(Picker::new(PickerKind::Session(sessions)));
+            }
+        }
+        // A past session's events were replayed — swap session id, rebuild the
+        // transcript (keeping the system message at [0]), and repaint the items.
+        TuiEvent::Resumed(id, msgs) => {
+            session.id = id;
+            // Preserve transcript[0] (the system prompt); replace the rest.
+            let system = transcript.first().cloned().unwrap_or_else(|| Message::system(""));
+            transcript.clear();
+            transcript.push(system);
+            transcript.extend(msgs.clone());
+            repaint_history(model, &msgs);
+            model.push_notice(format!("(resumed session {id})"));
+        }
+        // `/rewind` cut points arrived from the log — open the rewind picker.
+        TuiEvent::RewindPointsLoaded(points) => {
+            if points.is_empty() {
+                model.push_notice("(nothing to rewind to — no earlier turns in this session)");
+            } else {
+                model.picker = Some(Picker::new(PickerKind::Rewind(points)));
+            }
+        }
+        // A rewind finished. For conversation scopes `new_id` is the forked
+        // branch: swap to it, rebuild the transcript (keeping the system message
+        // at [0]), and drop the chosen prompt back into the input box to edit or
+        // re-send (edit-and-resubmit). The original session stays in the log
+        // (non-destructive). Code-only (`new_id == None`) leaves the conversation
+        // untouched and just reports the files reverted.
+        TuiEvent::Rewound { new_id, msgs, rolled, scope, prefill } => {
+            let files = |n: usize| if n == 1 { "1 file".to_string() } else { format!("{n} files") };
+            if let Some(id) = new_id {
+                session.id = id;
+                let system = transcript.first().cloned().unwrap_or_else(|| Message::system(""));
+                transcript.clear();
+                transcript.push(system);
+                transcript.extend(msgs.clone());
+                repaint_history(model, &msgs);
+                // Prefill the prompt so the user can tweak it and re-send.
+                if let Some(text) = prefill {
+                    model.input = text;
+                    model.cursor = model.input.len();
+                }
+            }
+            let note = match scope {
+                RewindScope::ConversationAndCode => format!(
+                    "(rewound · {} rolled back · prompt ready to edit · new branch, original kept)",
+                    files(rolled)
+                ),
+                RewindScope::Conversation => {
+                    "(rewound · code kept · prompt ready to edit · new branch, original kept)".to_string()
+                }
+                RewindScope::Code => {
+                    format!("({} rolled back · conversation kept)", files(rolled))
+                }
+            };
+            model.push_notice(note);
         }
     }
+}
+
+/// Rebuild the visible transcript items from a projected message list.
+/// Used when resuming a past session: the replayed conversation replaces the
+/// on-screen items. User text → `Item::User`; assistant text → `Item::Assistant`,
+/// and each of that turn's tool calls → an `Item::ToolCall` card so the resumed
+/// history shows *what the agent did*, not just what it said. Raw tool results
+/// are skipped (verbose JSON; the model still has them in the transcript).
+pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
+    model.items.clear();
+    for m in msgs {
+        match m.role {
+            kernel::Role::User => model.push_item(Item::User(m.content.clone())),
+            kernel::Role::Assistant => {
+                if !m.content.trim().is_empty() {
+                    model.push_item(Item::Assistant(m.content.clone()));
+                }
+                for tc in &m.tool_calls {
+                    model.push_item(Item::ToolCall { tool: tc.tool.clone(), args: tc.args.clone() });
+                }
+            }
+            // system/tool messages are not shown as transcript rows.
+            _ => {}
+        }
+    }
+    model.welcome = false;
+    model.invalidate_all_renders();
+    model.scroll_to_bottom();
+}
+
+/// Open the resume picker — but refuse while a turn is mid-flight: resuming then
+/// would let the finishing turn's `Done` event overwrite the freshly-loaded
+/// transcript. The user must finish or Esc the current turn first.
+fn start_resume<L: EventLog + 'static>(
+    model: &mut Model,
+    kernel: &Arc<Kernel<impl Provider + 'static, L>>,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    if model.running {
+        model.push_notice("finish or Esc the current turn before resuming a session");
+        return;
+    }
+    spawn_sessions_fetch(kernel, tx);
+}
+
+/// Open the rewind (time-travel) picker for the CURRENT session. Like resume, it
+/// refuses mid-turn. Reads the session's events off the main loop and derives one
+/// cut point per past user turn — branching before turn *k* keeps turns 1..k-1 and
+/// rolls the workspace back to that moment. Sends `RewindPointsLoaded` back.
+fn start_rewind<L: EventLog + 'static>(
+    model: &mut Model,
+    kernel: &Arc<Kernel<impl Provider + 'static, L>>,
+    session: &Session,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    if model.running {
+        model.push_notice("finish or Esc the current turn before rewinding");
+        return;
+    }
+    let log = kernel.log.clone();
+    let session_id = session.id;
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let events = log.events(session_id).await;
+        // Rewind points are your past prompts: rewinding *to* a message goes
+        // back to just BEFORE it ran — the message + everything
+        // after leave the conversation, code reverts to before that turn's edits,
+        // and the prompt is prefilled to edit/re-send. So the cut is the
+        // user-message event itself, and every prompt (incl. the latest — "redo
+        // my last") is a valid point.
+        let points: Vec<RewindPoint> = events
+            .iter()
+            .filter(|e| e.kind == kernel::EventKind::UserMessage)
+            .map(|e| {
+                let text = e
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(empty)")
+                    .trim()
+                    .replace('\n', " ");
+                let label = if text.chars().count() > 60 {
+                    format!("{}…", text.chars().take(59).collect::<String>())
+                } else {
+                    text
+                };
+                // Files a code rollback from this prompt onward would revert —
+                // shown in the picker; hides the code options when zero.
+                let files = kernel::rollback_plan(&events, e.id).len();
+                RewindPoint { at_event: e.id, label, files }
+            })
+            .collect();
+        let _ = tx.send(TuiEvent::RewindPointsLoaded(points));
+    });
+}
+
+/// Perform a rewind back to just before `at_event` (a past user prompt).
+/// Reads the session history once. When `scope` touches code, it rolls files
+/// back to before that turn's edits. When `scope` touches the conversation, it
+/// forks the session before the prompt (a new branch — the original is
+/// preserved), projects the conversation up to the cut, and lifts the prompt
+/// text out to prefill the input box. Code-only leaves the conversation as-is
+/// (no fork, `new_id = None`). Sends `Rewound` back with whatever it changed.
+fn spawn_rewind<L: EventLog + 'static>(
+    kernel: &Arc<Kernel<impl Provider + 'static, L>>,
+    restore: Arc<WorkspaceSandbox>,
+    session_id: ulid::Ulid,
+    at_event: ulid::Ulid,
+    scope: RewindScope,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    let log = kernel.log.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let events = log.events(session_id).await;
+        let Some(idx) = kernel::cut_index(&events, at_event) else { return };
+
+        // Code rollback: revert every file written from this prompt onward,
+        // returning the workspace to its state before the turn ran.
+        let mut rolled = 0usize;
+        if scope.touches_code() {
+            for fr in kernel::rollback_plan(&events, at_event) {
+                if restore.restore(&fr.path, fr.snapshot.as_deref()).await.is_ok() {
+                    rolled += 1;
+                }
+            }
+        }
+
+        // Conversation rewind: fork before the prompt (non-destructive), replay
+        // the kept history, and prefill the prompt for editing/re-sending.
+        let (new_id, msgs, prefill) = if scope.touches_conversation() {
+            let new_id = match log.fork(session_id, at_event).await {
+                Ok(id) => id,
+                Err(_) => return,
+            };
+            let prefill = events
+                .get(idx)
+                .and_then(|e| e.payload.get("text"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            (Some(new_id), kernel::project_messages(&events[..idx]), prefill)
+        } else {
+            (None, Vec::new(), None)
+        };
+        let _ = tx.send(TuiEvent::Rewound { new_id, msgs, rolled, scope, prefill });
+    });
+}
+
+/// Spawn the async session-list fetch for `/resume`. Reads `log.sessions()`
+/// off the main loop and sends `SessionsLoaded` back through the channel.
+fn spawn_sessions_fetch<L: EventLog + 'static>(kernel: &Arc<Kernel<impl Provider + 'static, L>>, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let log = kernel.log.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let sessions = log.sessions().await;
+        let _ = tx.send(TuiEvent::SessionsLoaded(sessions));
+    });
 }
 
 /// Spawn agent turn as background task
@@ -453,8 +735,39 @@ impl kernel::StreamSink for TuiSink {
 }
 
 /// Run slash command
+/// True when a stripped command prefix ends at a word boundary — i.e. the rest
+/// is empty or starts with whitespace (an argument). Distinguishes `/think` and
+/// `/think high` from `/thinking`.
+fn is_cmd_boundary(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with(char::is_whitespace)
+}
+
+/// `/clear`: reset the conversation for real. Clearing only the rendered items
+/// (as `run_slash` used to) left the full prior history in `transcript`, so the
+/// very next turn re-shipped everything to the model. Truncate the transcript to
+/// the system prompt AND start a fresh session id so new events don't append to
+/// the old thread. Refused mid-turn (the running turn would rewrite transcript
+/// on `Done`).
+fn do_clear(model: &mut Model, session: &mut Session, transcript: &mut Vec<Message>) {
+    if model.running {
+        model.push_notice("finish or Esc the current turn before clearing");
+        return;
+    }
+    let system = transcript.first().cloned().unwrap_or_else(|| Message::system(""));
+    transcript.clear();
+    transcript.push(system);
+    *session = Session::new();
+    model.items.clear();
+    model.invalidate_all_renders();
+    model.push_notice("(conversation cleared — fresh session)");
+}
+
 pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, transcript: &[Message], provider: &P) {
-    if let Some(rest) = cmd.strip_prefix("think") {
+    // Only treat `think`/`effort` as those commands when the prefix ends at a
+    // word boundary (end-of-string or a space). Otherwise a greedy
+    // `strip_prefix("think")` also swallows `/thinking` → routes it here with a
+    // garbage arg ("ing"), and the real `"thinking"` arm below is dead code.
+    if let Some(rest) = cmd.strip_prefix("think").filter(|r| is_cmd_boundary(r)) {
         let rest = rest.trim();
         if rest.is_empty() {
             model.picker = Some(Picker::new(PickerKind::Think));
@@ -464,7 +777,7 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
         }
         return;
     }
-    if let Some(rest) = cmd.strip_prefix("effort") {
+    if let Some(rest) = cmd.strip_prefix("effort").filter(|r| is_cmd_boundary(r)) {
         let rest = rest.trim();
         if rest.is_empty() {
             model.picker = Some(Picker::new(PickerKind::Effort));
@@ -476,6 +789,17 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
     }
     match cmd {
         "exit" | "quit" => model.should_quit = true,
+        "resume" => {
+            // The actual session fetch is async (reads the event log); the caller
+            // (handle_key) has the kernel handle and the tx channel, but run_slash
+            // only gets the provider. So we set a flag the caller checks after
+            // run_slash returns — it then spawns the log query.
+            //
+            // This is handled inline in handle_key's Enter path for /resume so we
+            // have access to kernel.log. Here we just show a notice if somehow
+            // reached directly.
+            model.push_notice("(use /resume to pick a session — or type it and press Enter)");
+        }
         "thinking" => {
             model.show_thinking = !model.show_thinking;
             model.invalidate_all_renders();
@@ -486,15 +810,27 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
             model.invalidate_all_renders();
             model.push_notice(if model.full_transparency { "detail: full tool input/output" } else { "detail: summarized" });
         }
+        "tasks" => {
+            if model.bg_tasks.is_empty() {
+                model.push_notice("no background tasks");
+            } else {
+                let mut lines = String::from("background tasks:");
+                for t in &model.bg_tasks {
+                    let state = if t.running { "running" } else { "done" };
+                    lines.push_str(&format!("\n  {} [{state}]  {}", t.id, t.command));
+                }
+                lines.push_str("\n\n(the agent polls with task.output and stops with task.kill)");
+                model.push_notice(lines);
+            }
+        }
         "help" => {
             let mut text = COMMANDS.iter().map(|(c, d)| format!("{c}  {d}")).collect::<Vec<_>>().join("\n");
             text.push_str("\n\nshortcuts:\n\n  Esc     interrupt a running turn\n  Ctrl-D  quit\n  ↑/↓     scroll (empty input) · history (while typing)");
             model.push_notice(text);
         }
-        "clear" => {
-            model.items.clear();
-            model.push_notice("(conversation cleared)");
-        }
+        // `/clear` is handled in `handle_key` (via `do_clear`) where the
+        // transcript and session are mutable; this arm is only a fallback.
+        "clear" => model.push_notice("(use /clear to reset the conversation)"),
         "status" => {
             let toks: usize = transcript.iter().map(|m| m.content.len() / 4).sum();
             let ctx = match model.max_ctx {
@@ -509,3 +845,79 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
 }
 
 
+
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn model() -> Model {
+        let dir = std::env::temp_dir().join(format!("medha-upd-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        Model::new("m".into(), None, kernel::ReasoningConfig::default(),
+                   lockfile::UiConfig::default(), HashMap::new(), sbx)
+    }
+
+    // ── K6: `/think` must not capture `/thinking` ─────────────────────────────
+    #[test]
+    fn cmd_boundary_distinguishes_think_from_thinking() {
+        // `strip_prefix("think")` on "thinking" leaves "ing" (no boundary) → not
+        // the think command; on "think"/"think high" it leaves ""/" high".
+        assert!(is_cmd_boundary(""));            // /think
+        assert!(is_cmd_boundary(" high"));       // /think high
+        assert!(!is_cmd_boundary("ing"));        // /thinking → must fall through
+    }
+
+    // ── K5: `/clear` truncates the transcript and starts a fresh session ──────
+    #[test]
+    fn clear_truncates_transcript_and_starts_fresh_session() {
+        let mut m = model();
+        let mut session = Session::new();
+        let old_id = session.id;
+        let mut transcript = vec![
+            Message::system("SYS"),
+            Message::user("hello"),
+            Message::assistant_calls("hi", vec![]),
+        ];
+        m.items.push_back(Entry::new(Item::User("hello".into())));
+
+        do_clear(&mut m, &mut session, &mut transcript);
+
+        assert_eq!(transcript.len(), 1, "only the system prompt survives");
+        assert_eq!(transcript[0].content, "SYS");
+        // Conversation items are gone (only the "(cleared)" notice remains).
+        assert!(
+            !m.items.iter().any(|e| matches!(&e.item, Item::User(t) if t == "hello")),
+            "prior conversation items cleared"
+        );
+        assert_ne!(session.id, old_id, "a fresh session id is minted");
+    }
+
+    #[test]
+    fn clear_is_refused_mid_turn() {
+        let mut m = model();
+        m.running = true;
+        let mut session = Session::new();
+        let id = session.id;
+        let mut transcript = vec![Message::system("SYS"), Message::user("x")];
+        do_clear(&mut m, &mut session, &mut transcript);
+        assert_eq!(transcript.len(), 2, "transcript untouched while a turn runs");
+        assert_eq!(session.id, id);
+    }
+
+    // ── K8: ending a turn denies queued approvals so the card can't freeze input ──
+    #[tokio::test]
+    async fn deny_pending_approvals_answers_and_clears_the_queue() {
+        let mut m = model();
+        let (tx, rx) = oneshot::channel();
+        m.pending_approvals.push_back(PendingApproval {
+            action: "shell.exec".into(),
+            detail: None,
+            responder: tx,
+        });
+        m.deny_pending_approvals();
+        assert!(m.pending_approvals.is_empty(), "queue drained");
+        assert!(matches!(rx.await, Ok(kernel::Approval::Deny)), "dangling responder got Deny");
+    }
+}

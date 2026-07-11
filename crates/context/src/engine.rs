@@ -133,7 +133,22 @@ impl ContextEngine for PipelineEngine {
         }
 
         let n = messages.len();
-        let head_end = self.policy.protect_first_n.min(n);
+        let mut head_end = self.policy.protect_first_n.min(n);
+        // Head-boundary pairing guard (mirror of the tail guard below): the head
+        // must not *end* on an assistant message that carries tool_calls — its
+        // tool results live in the middle, and Full compaction would summarize
+        // them away, leaving a dangling tool_calls message the provider rejects
+        // with a 400. Extend the head forward to swallow the whole tool-result
+        // group so the call and its results stay together.
+        if head_end > 0
+            && head_end < n
+            && messages[head_end - 1].role == Role::Assistant
+            && !messages[head_end - 1].tool_calls.is_empty()
+        {
+            while head_end < n && messages[head_end].role == Role::Tool {
+                head_end += 1;
+            }
+        }
         let mut tail_start = tail_start_index(messages, head_end, &budget, &self.policy, counter);
 
         // Tool-call pairing guard: the tail must not *begin* on a tool result,
@@ -335,6 +350,49 @@ mod tests {
                 let prev = &r.messages[i - 1];
                 assert_eq!(prev.role, Role::Assistant);
                 assert!(prev.tool_calls.iter().any(|c| c.id == id), "dangling tool result");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_compaction_does_not_leave_a_dangling_tool_call_at_the_head() {
+        // Regression for P0-2: with protect_first_n=3, the last kept head
+        // message (index 2) is an assistant WITH tool_calls whose result sits in
+        // the middle. Full compaction must not summarize that result away and
+        // leave a dangling tool_calls message (provider 400) — the head guard
+        // should extend the head to keep the call and its result together.
+        let eng = engine(CompactionPolicy {
+            protect_first_n: 3,
+            protect_last_n: 2,
+            tail_ratio: 0.1,
+            ..Default::default()
+        });
+        let mut msgs = vec![Message::system("SYSTEM"), user("first ask")];
+        // Index 2: assistant with a tool call whose result is the next message.
+        let head_call = ToolIntent { id: "head".into(), tool: "fs.read".into(), args: serde_json::json!({}) };
+        msgs.push(Message::assistant_calls("", vec![head_call]));
+        msgs.push(Message::tool_result("head", "z".repeat(400)));
+        // Enough middle turns to force a Full compaction under a tiny window.
+        for i in 0..12 {
+            msgs.push(user(&format!("ask {i} {}", "y".repeat(400))));
+            let call = ToolIntent { id: format!("c{i}"), tool: "fs.read".into(), args: serde_json::json!({}) };
+            msgs.push(Message::assistant_calls("", vec![call]));
+            msgs.push(Message::tool_result(format!("c{i}"), "z".repeat(400)));
+        }
+        msgs.push(user("FINAL"));
+
+        let r = eng.compile(&msgs, Some(2_000)).await;
+        assert!(r.compacted && r.summarized, "expected a Full compaction");
+
+        // Forward pairing invariant (the one P0-2 breaks): every tool_call id in
+        // any assistant message must have a matching tool_result later in the
+        // request — no dangling call.
+        for (i, m) in r.messages.iter().enumerate() {
+            for call in &m.tool_calls {
+                let paired = r.messages[i + 1..]
+                    .iter()
+                    .any(|later| later.role == Role::Tool && later.tool_call_id.as_deref() == Some(&call.id));
+                assert!(paired, "dangling tool_call `{}` at head boundary (index {i})", call.id);
             }
         }
     }

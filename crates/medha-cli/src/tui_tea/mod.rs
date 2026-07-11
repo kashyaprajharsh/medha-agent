@@ -12,6 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame};
+use sandbox::WorkspaceSandbox;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,6 +59,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/effort", "set reasoning depth (bare = arrow-key picker)"),
     ("/thinking", "show/hide the model's live reasoning"),
     ("/detail", "expand/collapse full tool input & output"),
+    ("/resume", "switch to a past session"),
+    ("/rewind", "time-travel: branch from an earlier turn (undoes later edits)"),
+    ("/tasks", "list background shell tasks (running/finished)"),
     ("/clear", "reset the conversation"),
     ("/exit", "quit (also Ctrl-D)"),
 ];
@@ -103,6 +107,92 @@ pub(crate) enum TuiEvent {
     Done(Vec<Message>, StopReason),
     Error(String),
     Interrupted,
+    /// `/resume` completed loading the session list from the log.
+    SessionsLoaded(Vec<kernel::SessionMeta>),
+    /// A past session's events were replayed into a transcript; swap to it.
+    Resumed(ulid::Ulid, Vec<Message>),
+    /// `/rewind` completed loading this session's rewind points from the log.
+    RewindPointsLoaded(Vec<RewindPoint>),
+    /// A rewind finished. `new_id` is `Some` for conversation scopes (swap to
+    /// the forked branch); `None` for code-only (conversation untouched). `msgs`
+    /// is the branch's replayed conversation, `rolled` the files reverted,
+    /// `prefill` the chosen prompt to drop back into the input box.
+    Rewound {
+        new_id: Option<ulid::Ulid>,
+        msgs: Vec<Message>,
+        rolled: usize,
+        scope: RewindScope,
+        prefill: Option<String>,
+    },
+}
+
+/// One rewind point offered by `/rewind` — a past user prompt. Rewinding *to* a
+/// message goes back to the state right BEFORE that message ran: the message and
+/// everything after it leave the conversation, the code reverts to before that
+/// turn's edits, and the message text is put back in the input box to edit and
+/// re-send (an edit-and-resubmit affordance). `label` is the prompt (truncated) for the
+/// picker; `at_event` is that user-message event (the cut is before it); `files`
+/// is how many files a code rollback from here would revert, so the scope menu
+/// can show the count and hide the code options when it's zero.
+#[derive(Clone, Debug)]
+pub(crate) struct RewindPoint {
+    pub at_event: ulid::Ulid,
+    pub label: String,
+    pub files: usize,
+}
+
+/// What a `/rewind` restores once the user picks a scope — three independent
+/// restore actions. Conversation-touching scopes fork the session (the original
+/// is preserved) and prefill the chosen prompt; `Code` alone is a pure file
+/// revert that leaves the conversation as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RewindScope {
+    /// Rewind the conversation only; leave the working files as they are now.
+    Conversation,
+    /// Rewind the conversation *and* roll the files back to before the turn.
+    ConversationAndCode,
+    /// Roll the files back only; keep the conversation intact (no fork/prefill).
+    Code,
+}
+
+impl RewindScope {
+    /// True for scopes that rewind the conversation (fork + prefill + swap).
+    fn touches_conversation(self) -> bool {
+        matches!(self, RewindScope::Conversation | RewindScope::ConversationAndCode)
+    }
+    /// True for scopes that roll files back.
+    fn touches_code(self) -> bool {
+        matches!(self, RewindScope::Code | RewindScope::ConversationAndCode)
+    }
+}
+
+impl RewindPoint {
+    /// The scope menu shown after this point is chosen (step 2 of `/rewind`),
+    /// ordered most-destructive first: code+conversation, conversation, code.
+    /// The two code options are omitted when no files were edited from here on
+    /// (nothing to roll back). `None` action = cancel.
+    fn scope_options(&self) -> Vec<(String, Option<RewindScope>)> {
+        let plural = if self.files == 1 { "file" } else { "files" };
+        let mut opts = Vec::new();
+        if self.files > 0 {
+            opts.push((
+                format!("⏪ restore code + conversation — roll back {} {plural}", self.files),
+                Some(RewindScope::ConversationAndCode),
+            ));
+        }
+        opts.push((
+            "↩ restore conversation only — keep current files".to_string(),
+            Some(RewindScope::Conversation),
+        ));
+        if self.files > 0 {
+            opts.push((
+                format!("⟲ restore code only — keep conversation, roll back {} {plural}", self.files),
+                Some(RewindScope::Code),
+            ));
+        }
+        opts.push(("✕ cancel".to_string(), None));
+        opts
+    }
 }
 
 /// One rendered line-group in the transcript
@@ -220,30 +310,75 @@ struct PendingApproval {
     responder: oneshot::Sender<kernel::Approval>,
 }
 
-/// Reasoning control picker kind
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Reasoning control / session picker kind. Not `Copy` — `Session` owns a `Vec`.
+#[derive(Clone)]
 enum PickerKind {
     Think,
     Effort,
+    /// Browse past sessions to resume. Holds the list from `log.sessions()`.
+    Session(Vec<kernel::SessionMeta>),
+    /// Time-travel cut points in the current session. Holds the list from
+    /// `log.events()`, one entry per past user turn.
+    Rewind(Vec<RewindPoint>),
+    /// Step 2 of `/rewind`: having chosen a cut point, pick the scope
+    /// (conversation only · conversation + code · cancel).
+    RewindMode(RewindPoint),
 }
 
 impl PickerKind {
-    fn title(&self) -> &'static str {
+    fn title(&self) -> String {
         match self {
-            PickerKind::Think => " thinking — ↑↓ select, Enter apply, Esc cancel ",
-            PickerKind::Effort => " effort — ↑↓ select, Enter apply, Esc cancel ",
+            PickerKind::Think => " thinking — ↑↓ select, Enter apply, Esc cancel ".into(),
+            PickerKind::Effort => " effort — ↑↓ select, Enter apply, Esc cancel ".into(),
+            PickerKind::Session(_) => " resume a session — ↑↓ select, Enter open, Esc cancel ".into(),
+            PickerKind::Rewind(_) => " rewind to a turn — ↑↓ select, Enter choose, Esc cancel ".into(),
+            PickerKind::RewindMode(p) => {
+                format!(" rewind → “{}” — ↑↓ select, Enter apply, Esc back ", p.label)
+            }
         }
     }
-    fn options(&self) -> &'static [&'static str] {
+    /// Dynamic labels for each row. For `Session`, each row is a one-line
+    /// summary (date · events · title) matching the `--sessions` headless format.
+    fn labels(&self) -> Vec<String> {
         match self {
-            PickerKind::Think => &["on", "off"],
-            PickerKind::Effort => &["low", "medium", "high"],
+            PickerKind::Think => vec!["on".into(), "off".into()],
+            PickerKind::Effort => vec!["low".into(), "medium".into(), "high".into()],
+            PickerKind::Session(sessions) => sessions
+                .iter()
+                .map(|s| {
+                    let when = chrono::DateTime::from_timestamp(s.last_ts as i64, 0)
+                        .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "?".into());
+                    let title = if s.title.is_empty() { "(no messages)" } else { &s.title };
+                    format!("{when} · {} events · {title}", s.events)
+                })
+                .collect(),
+            PickerKind::Rewind(points) => points
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let edits = if p.files == 0 {
+                        String::new()
+                    } else if p.files == 1 {
+                        "  · 1 edit since".to_string()
+                    } else {
+                        format!("  · {} edits since", p.files)
+                    };
+                    format!("{}. {}{edits}", i + 1, p.label)
+                })
+                .collect(),
+            PickerKind::RewindMode(p) => p.scope_options().into_iter().map(|(l, _)| l).collect(),
         }
     }
     fn apply<P: kernel::Provider>(&self, provider: &P, choice: &str) -> String {
         match self {
             PickerKind::Think => crate::apply_think_command(provider, choice),
             PickerKind::Effort => crate::apply_effort_command(provider, choice),
+            // Session/Rewind kinds are handled by Enter in handle_key (they spawn
+            // async log work or open a sub-picker), not via apply — unreachable.
+            PickerKind::Session(_) | PickerKind::Rewind(_) | PickerKind::RewindMode(_) => {
+                String::new()
+            }
         }
     }
 }
@@ -348,6 +483,16 @@ struct Model {
     /// Full content of large pastes, kept out of the rendered input box (PART 2).
     /// The input holds a compact placeholder token that indexes into this vec.
     pastes: Vec<String>,
+    /// Workspace sandbox handle, used only to roll files back on `/rewind`
+    /// (code time-travel). File ops still go through the executor for turns;
+    /// this is the out-of-band restore path.
+    restore: Arc<WorkspaceSandbox>,
+    /// Live background shell tasks (promoted `shell.exec` runs), polled from the
+    /// executor so the *user* sees what's running — not just the model.
+    bg_tasks: Vec<kernel::BackgroundTask>,
+    /// Running-task count last reflected on screen, so the status line only
+    /// forces an idle redraw when the number actually changes.
+    bg_shown_running: usize,
 }
 
 impl Model {
@@ -357,6 +502,7 @@ impl Model {
         reasoning: kernel::ReasoningConfig,
         ui: lockfile::UiConfig,
         tool_viz: HashMap<String, ToolViz>,
+        restore: Arc<WorkspaceSandbox>,
     ) -> Self {
         Self {
             items: VecDeque::with_capacity(MAX_SCROLLBACK_LINES),
@@ -396,7 +542,15 @@ impl Model {
             intro_frame: Some(0),
             last_redraw: Instant::now(),
             pastes: Vec::new(),
+            restore,
+            bg_tasks: Vec::new(),
+            bg_shown_running: 0,
         }
+    }
+
+    /// How many background tasks are still running.
+    fn bg_running(&self) -> usize {
+        self.bg_tasks.iter().filter(|t| t.running).count()
     }
 
     /// The front of the approval queue (the one currently rendered/answerable),
@@ -404,6 +558,19 @@ impl Model {
     /// `pending_approval` field go through here so the queue is transparent.
     fn pending_approval(&self) -> Option<&PendingApproval> {
         self.pending_approvals.front()
+    }
+
+    /// Deny and clear every queued approval — called whenever a turn ends
+    /// (Done/Error/Interrupted). An Esc-cancel drops the gate's receiver but the
+    /// card stayed on screen, and because it intercepts all keys, every keystroke
+    /// then routed to a prompt whose responder is dead — the UI froze. Denying is
+    /// safe: the turn is already over, so the decisions no longer matter.
+    fn deny_pending_approvals(&mut self) {
+        while let Some(p) = self.pending_approvals.pop_front() {
+            let _ = p.responder.send(kernel::Approval::Deny);
+        }
+        self.approval_sel = 0;
+        self.approval_ready = false;
     }
 
     /// The declared category of a tool (from the executor specs), or `Other` if
@@ -554,13 +721,14 @@ enum Msg {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tea<P, L>(
     kernel: Arc<Kernel<P, L>>,
-    session: Session,
+    mut session: Session,
     system: String,
     model_name: String,
     max_ctx: Option<u32>,
     budget: Budget,
     ui: lockfile::UiConfig,
     resumed: Vec<Message>,
+    restore: Arc<WorkspaceSandbox>,
     tx: mpsc::UnboundedSender<TuiEvent>,
     mut rx: mpsc::UnboundedReceiver<TuiEvent>,
 ) -> anyhow::Result<()>
@@ -582,7 +750,7 @@ where
         .into_iter()
         .map(|s| (s.name, ToolViz { icon: s.icon, category: s.category }))
         .collect();
-    let mut model = Model::new(model_name, max_ctx, kernel.provider.reasoning(), ui, tool_viz);
+    let mut model = Model::new(model_name, max_ctx, kernel.provider.reasoning(), ui, tool_viz, restore);
     let mut transcript = vec![Message::system(system)];
     transcript.extend(resumed); // prior conversation when resuming (else empty)
     let mut events = EventStream::new();
@@ -606,14 +774,14 @@ where
             // Terminal events (input, resize, paste)
             maybe_ev = events.next() => {
                 match maybe_ev {
-                    Some(Ok(CtEvent::Key(key))) => { update(&mut model, Msg::KeyPress(key), &kernel, &session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
+                    Some(Ok(CtEvent::Key(key))) => { update(&mut model, Msg::KeyPress(key), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
                     Some(Ok(CtEvent::Mouse(m))) => match m.kind {
-                        MouseEventKind::ScrollUp => { update(&mut model, Msg::MouseScroll(-2), &kernel, &session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
-                        MouseEventKind::ScrollDown => { update(&mut model, Msg::MouseScroll(2), &kernel, &session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
+                        MouseEventKind::ScrollUp => { update(&mut model, Msg::MouseScroll(-2), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
+                        MouseEventKind::ScrollDown => { update(&mut model, Msg::MouseScroll(2), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
                         _ => {}
                     },
-                    Some(Ok(CtEvent::Paste(data))) => { update(&mut model, Msg::Paste(data), &kernel, &session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
-                    Some(Ok(CtEvent::Resize(_, h))) => { update(&mut model, Msg::Resize(h), &kernel, &session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
+                    Some(Ok(CtEvent::Paste(data))) => { update(&mut model, Msg::Paste(data), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
+                    Some(Ok(CtEvent::Resize(_, h))) => { update(&mut model, Msg::Resize(h), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
                     _ => {}
                 }
             }
@@ -621,10 +789,10 @@ where
             // wake so a burst of streaming tokens can't pile up and dump "3 at once".
             // Consecutive text deltas coalesce naturally (appended to one buffer).
             Some(ev) = rx.recv() => {
-                update(&mut model, Msg::AgentEvent(ev), &kernel, &session, &mut transcript, &budget, &tx);
+                update(&mut model, Msg::AgentEvent(ev), &kernel, &mut session, &mut transcript, &budget, &tx);
                 let mut drained = 0u32;
                 while let Ok(ev) = rx.try_recv() {
-                    update(&mut model, Msg::AgentEvent(ev), &kernel, &session, &mut transcript, &budget, &tx);
+                    update(&mut model, Msg::AgentEvent(ev), &kernel, &mut session, &mut transcript, &budget, &tx);
                     drained += 1;
                     if drained >= 10_000 { break; } // safety bound per wake
                 }
@@ -634,12 +802,18 @@ where
             // Tick for animations — only forces a redraw when something is actually
             // moving (spinner/intro) or content changed; idle ticks cost nothing.
             _ = ticker.tick() => {
-                update(&mut model, Msg::Tick, &kernel, &session, &mut transcript, &budget, &tx);
+                update(&mut model, Msg::Tick, &kernel, &mut session, &mut transcript, &budget, &tx);
                 // The welcome splash breathes/resonates continuously; a live turn
-                // has a spinner; otherwise idle ticks cost nothing.
-                if model.running || model.welcome || model.intro_frame.is_some() || model.dirty {
+                // has a spinner; a running background task animates its indicator;
+                // otherwise idle ticks cost nothing.
+                let running = model.bg_running();
+                if model.running || model.welcome || model.intro_frame.is_some() || model.dirty
+                    || running > 0
+                    || running != model.bg_shown_running
+                {
                     redraw_needed = true;
                 }
+                model.bg_shown_running = running;
             }
         }
 
@@ -679,6 +853,41 @@ mod tests {
     fn block(lines: &[Line]) -> String {
         lines.iter().map(text).collect::<Vec<_>>().join("\n")
     }
+    /// A throwaway jailed sandbox for constructing a `Model` in tests (the
+    /// rewind restore handle; unused by the assertions here).
+    fn test_sbx() -> Arc<WorkspaceSandbox> {
+        let dir = std::env::temp_dir().join(format!("medha-tui-test-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap())
+    }
+
+    // ---- /rewind scope menu (step 2) ----
+
+    #[test]
+    fn rewind_scope_menu_hides_code_options_when_nothing_to_undo() {
+        // No file edits from this point on → only "restore conversation" + cancel;
+        // offering a code rollback that reverts nothing would be misleading.
+        let p = RewindPoint { at_event: ulid::Ulid::new(), label: "hi".into(), files: 0 };
+        let opts = p.scope_options();
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].1, Some(RewindScope::Conversation));
+        assert_eq!(opts[1].1, None, "last row is cancel");
+        assert!(!opts.iter().any(|(_, s)| matches!(s, Some(RewindScope::ConversationAndCode | RewindScope::Code))));
+    }
+
+    #[test]
+    fn rewind_scope_menu_offers_all_three_with_count_when_edits_exist() {
+        // Order: code+conversation, conversation, code, then cancel.
+        let p = RewindPoint { at_event: ulid::Ulid::new(), label: "hi".into(), files: 3 };
+        let opts = p.scope_options();
+        assert_eq!(opts.len(), 4);
+        assert_eq!(opts[0].1, Some(RewindScope::ConversationAndCode));
+        assert!(opts[0].0.contains("3 files"), "count shown: {}", opts[0].0);
+        assert_eq!(opts[1].1, Some(RewindScope::Conversation));
+        assert_eq!(opts[2].1, Some(RewindScope::Code));
+        assert!(opts[2].0.contains("3 files"), "count shown: {}", opts[2].0);
+        assert_eq!(opts[3].1, None, "last row is cancel");
+    }
 
     // ---- PART 3: inline approval card ----
 
@@ -712,7 +921,7 @@ mod tests {
     #[test]
     fn typing_and_editing_multibyte_does_not_panic() {
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new());
+        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
         // Type "café" then a trailing char — the classic char-vs-byte panic case.
         for c in "café".chars() { m.insert_char(c); }
         m.insert_char('!');
@@ -810,7 +1019,7 @@ mod tests {
             ("fs.read".to_string(), viz("◇", ToolCategory::Read)),
             ("shell.exec".to_string(), viz("❯", ToolCategory::Shell)),
         ]);
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, cats);
+        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, cats, test_sbx());
         // A streaming write shows the file basename — "writing medha.html", not "thinking".
         m.current_tool = Some(("fs.write".into(), Some("/Users/x/medha/medha.html".into())));
         assert_eq!(activity_label(&m), "writing medha.html");
@@ -908,7 +1117,7 @@ mod tests {
     #[test]
     fn concurrent_approvals_queue_without_dropping_responders() {
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new());
+        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
 
         // Two approvals arrive back-to-back (the concurrent-dispatch case).
         let mut rx1 = push_approval(&mut m, "Read access to /outside/a");
@@ -947,7 +1156,7 @@ mod tests {
         // And at the queue level: routing Esc through handle_approval_key must not
         // pop or answer anything (Esc is handled by the caller, not here).
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new());
+        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
         let _rx = push_approval(&mut m, "Read access to /outside/a");
         m.approval_ready = true;
         handle_approval_key(&mut m, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

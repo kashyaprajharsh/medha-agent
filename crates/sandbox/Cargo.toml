@@ -9,7 +9,7 @@ rust-version.workspace = true
 thiserror.workspace = true
 ulid.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "io-util", "sync", "time", "rt"] }
 permissions = { path = "../permissions" }
 kernel = { path = "../kernel" }
 
@@ -17,5 +17,9 @@ kernel = { path = "../kernel" }
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 
+# Unix: SIGKILL a command's whole process group on timeout/cancel (no orphans).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time"] }

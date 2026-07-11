@@ -124,6 +124,27 @@ impl WorkspaceSandbox {
             .await
     }
 
+    /// Spawn a command as a background task through the active backend (same
+    /// jail as [`exec`]). Returns immediately with a [`BgProc`] handle whose
+    /// output streams into a rolling buffer; the process keeps running until it
+    /// exits or is killed. Backs `shell.exec`'s promote-to-background behavior.
+    pub fn exec_background(
+        &self,
+        program: &str,
+        args: &[String],
+        env: Vec<(String, String)>,
+        clear_env: bool,
+    ) -> Result<crate::exec::BgProc, ExecError> {
+        let cmd = self.exec.build_command(&ExecRequest {
+            program: program.to_string(),
+            args: args.to_vec(),
+            cwd: self.root.clone(),
+            env,
+            clear_env,
+        })?;
+        crate::exec::spawn_background(cmd)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -285,6 +306,42 @@ impl WorkspaceSandbox {
         std::fs::copy(path, &dest).map_err(|e| SandboxError::Io(e.to_string()))?;
         Ok(Some(id))
     }
+
+    /// Restore a single file to a snapshot taken before an earlier write —
+    /// the primitive behind code rewind (§18.4). `snapshot = Some(id)` copies
+    /// that pre-write snapshot back over `path`; `snapshot = None` means the
+    /// write being undone had *created* the file, so rewinding removes it. The
+    /// target path goes through the same write-jail resolution as a normal write
+    /// (so a rewind can never escape the workspace), and the snapshot id is
+    /// validated as a bare ULID so it can't reach outside the snapshots dir.
+    pub async fn restore(&self, path: &str, snapshot: Option<&str>) -> Result<(), SandboxError> {
+        let resolved = self.resolve_for_write(path).await?;
+        match snapshot {
+            Some(id) => {
+                let src = self.snapshot_path(id)?;
+                if let Some(parent) = resolved.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| SandboxError::Io(e.to_string()))?;
+                }
+                std::fs::copy(&src, &resolved).map_err(|e| SandboxError::Io(e.to_string()))?;
+            }
+            None => {
+                // Undo a creation: remove the file if it's still there.
+                if resolved.exists() {
+                    std::fs::remove_file(&resolved).map_err(|e| SandboxError::Io(e.to_string()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot ids are ULIDs (Crockford base32); reject anything else so a
+    /// restore can never read a path outside the snapshots directory.
+    fn snapshot_path(&self, id: &str) -> Result<PathBuf, SandboxError> {
+        if id.len() != 26 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(SandboxError::Escape(format!("invalid snapshot id: {id}")));
+        }
+        Ok(self.snapshots.join(id))
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +369,31 @@ mod tests {
         // Read it back
         let content = sbx.read("test.txt").await.unwrap();
         assert_eq!(content, "hello");
+    }
+
+    #[tokio::test]
+    async fn restore_rolls_a_file_back_and_deletes_created_files() {
+        let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = WorkspaceSandbox::new_jailed(&dir).unwrap();
+
+        // v1 exists, then a second write snapshots v1 and stores v2.
+        sbx.write("f.txt", "v1").await.unwrap();
+        let snap = sbx.write("f.txt", "v2").await.unwrap().expect("snapshot of v1");
+        assert_eq!(sbx.read("f.txt").await.unwrap(), "v2");
+
+        // Restoring the snapshot rolls the file back to v1.
+        sbx.restore("f.txt", Some(&snap)).await.unwrap();
+        assert_eq!(sbx.read("f.txt").await.unwrap(), "v1");
+
+        // A newly-created file (no prior snapshot) is removed on rewind.
+        sbx.write("new.txt", "born").await.unwrap();
+        sbx.restore("new.txt", None).await.unwrap();
+        assert!(sbx.read("new.txt").await.is_err(), "created file removed");
+
+        // A bogus (non-ULID) snapshot id can't escape the snapshots dir.
+        assert!(sbx.restore("f.txt", Some("../../etc/passwd")).await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

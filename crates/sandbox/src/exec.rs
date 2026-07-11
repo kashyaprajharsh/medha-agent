@@ -7,8 +7,8 @@
 //! - [`SeatbeltBackend`] (macOS) confines the command with the OS-native
 //!   sandbox (`/usr/bin/sandbox-exec`) — filesystem writes jailed to the
 //!   workspace + temp, network optionally denied — with **zero external
-//!   dependencies** (no Docker, no daemon). This is what Claude Code / codex /
-//!   gemini-cli use on macOS.
+//!   dependencies** (no Docker, no daemon) — the standard OS-native isolation
+//!   approach for local coding agents on macOS.
 //!
 //! Container / microVM / ssh backends slot in here later behind the same trait
 //! (the opt-in "heavy" isolation tier); a Linux Landlock backend is the next
@@ -122,7 +122,18 @@ impl Default for SandboxConfig {
 
 #[async_trait]
 pub trait ExecBackend: Send + Sync {
-    async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError>;
+    /// Build the fully jail-configured command (program/args/env + any wrapping:
+    /// `sandbox-exec`, Landlock `pre_exec`, `docker run`, `ssh`) — but do NOT
+    /// spawn it. `run` and the background-task facility both spawn through
+    /// [`spawn_and_wait`] / [`spawn_background`], so isolation is applied in one
+    /// place and the same jailed command can run in the foreground or background.
+    fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError>;
+
+    /// Run a command to completion (foreground). Default: build + supervise, so a
+    /// timeout/cancel tears down the whole process group (see [`GroupReaper`]).
+    async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError> {
+        spawn_and_wait(self.build_command(&req)?).await
+    }
     /// Short human-readable label for logs / UX (`"host"`, `"native"`, …).
     fn label(&self) -> &str;
     /// How strongly this backend confines commands — read by the kernel's
@@ -132,11 +143,11 @@ pub trait ExecBackend: Send + Sync {
     }
 }
 
-/// Build a `tokio` command applying cwd, environment policy, and `kill_on_drop`
-/// (so a timed-out / cancelled tool never leaks an orphaned child process).
+/// Build a `tokio` command applying cwd and environment policy. Isolation into
+/// a process group and teardown are handled by [`spawn_and_wait`].
 fn base_command(program: &str, args: &[String], req: &ExecRequest) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args).current_dir(&req.cwd).kill_on_drop(true);
+    cmd.args(args).current_dir(&req.cwd);
     if req.clear_env {
         cmd.env_clear();
     }
@@ -148,17 +159,214 @@ fn to_output(o: std::process::Output) -> ExecOutput {
     ExecOutput { status: o.status.code(), stdout: o.stdout, stderr: o.stderr }
 }
 
+/// Fires a `SIGKILL` at a whole process group when dropped while still *armed*.
+/// This is the fix for the compounding-timeout bug: `kill_on_drop` only kills
+/// the direct child, so a timed-out `sh -c "cargo build"` orphaned its
+/// grandchildren (rustc jobs, a dev server) — which kept holding locks/ports,
+/// so the next attempt hung to the timeout too, forever. Because the child is
+/// spawned as its own group leader (`process_group(0)`), signalling the negative
+/// pid reaches the entire tree. When [`spawn_and_wait`] completes normally it
+/// disarms the reaper, so only an abnormal exit (the run future being dropped by
+/// an outer timeout/cancel) triggers the group kill.
+struct GroupReaper {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl GroupReaper {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupReaper {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.armed {
+            if let Some(pid) = self.pid {
+                // Negative pid = the process GROUP led by `pid`.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+/// Put a command in its own process group (unix) and pipe stdout/stderr, so a
+/// spawned child can be supervised and group-killed. `kill_on_drop` is a
+/// per-caller choice: foreground runs set it (backstop for the leader);
+/// background tasks clear it (they must survive the handle being dropped).
+fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool) {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(kill_on_drop);
+}
+
+/// SIGKILL an entire process group by its leader pid (unix). No-op elsewhere.
+#[allow(unused_variables)]
+fn kill_group(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+/// Spawn a command in its own process group, capture stdout/stderr, and wait for
+/// it. If the returned future is dropped before completion — which is exactly
+/// what an outer `tokio::time::timeout` or a cancellation does — the
+/// [`GroupReaper`] SIGKILLs the whole process tree, so nothing is orphaned.
+async fn spawn_and_wait(mut cmd: tokio::process::Command) -> Result<ExecOutput, ExecError> {
+    configure_for_spawn(&mut cmd, true); // reaper backstops the group; kill_on_drop the leader
+    let child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
+    let mut reaper = GroupReaper::new(child.id());
+    let out = child.wait_with_output().await.map_err(|e| ExecError::Spawn(e.to_string()))?;
+    reaper.disarm(); // finished on its own — nothing to tear down
+    Ok(to_output(out))
+}
+
+/// A cap on each retained stream of a background task; once exceeded, oldest
+/// bytes are dropped from the front (the tail is what matters for "what's it
+/// doing now"). Overflow is marked so a poll can't be mistaken for complete.
+const BG_BUF_CAP: usize = 1_000_000;
+
+/// A rolling capture of one output stream: keeps at most `BG_BUF_CAP` recent
+/// bytes and remembers whether anything older was dropped.
+#[derive(Default)]
+struct BgBuf {
+    data: Vec<u8>,
+    truncated: bool,
+}
+
+impl BgBuf {
+    fn push(&mut self, bytes: &[u8]) {
+        self.data.extend_from_slice(bytes);
+        if self.data.len() > BG_BUF_CAP {
+            let drop = self.data.len() - BG_BUF_CAP;
+            self.data.drain(..drop);
+            self.truncated = true;
+        }
+    }
+    fn text(&self) -> String {
+        let body = String::from_utf8_lossy(&self.data);
+        if self.truncated {
+            format!("[…earlier output dropped…]\n{body}")
+        } else {
+            body.into_owned()
+        }
+    }
+}
+
+type SharedBuf = std::sync::Arc<std::sync::Mutex<BgBuf>>;
+
+/// A backgrounded command: stdout/stderr stream into rolling buffers while it
+/// runs, and it can be polled, awaited briefly, or killed (whole group). This is
+/// what `shell.exec` promotes a slow command into, so the model gets partial
+/// output + a task id immediately instead of blocking (§2).
+pub struct BgProc {
+    pub pid: Option<u32>,
+    stdout: SharedBuf,
+    stderr: SharedBuf,
+    done_rx: tokio::sync::watch::Receiver<bool>,
+    code: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
+}
+
+impl BgProc {
+    /// Current buffered stdout / stderr (tails, with a marker if truncated).
+    pub fn snapshot(&self) -> (String, String) {
+        let o = self.stdout.lock().map(|b| b.text()).unwrap_or_default();
+        let e = self.stderr.lock().map(|b| b.text()).unwrap_or_default();
+        (o, e)
+    }
+    /// Still running?
+    pub fn is_running(&self) -> bool {
+        !*self.done_rx.borrow()
+    }
+    /// Exit code once exited (`None` while running or if killed by signal).
+    pub fn exit_code(&self) -> Option<i32> {
+        self.code.lock().ok().and_then(|c| *c)
+    }
+    /// Wait up to `dur` for completion. Returns true if it finished in time.
+    pub async fn wait_until(&self, dur: std::time::Duration) -> bool {
+        let mut rx = self.done_rx.clone();
+        tokio::time::timeout(dur, async {
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+    /// SIGKILL the whole process group.
+    pub fn kill(&self) {
+        if let Some(pid) = self.pid {
+            kill_group(pid);
+        }
+    }
+}
+
+/// Spawn a command as a background task: it keeps running after this returns,
+/// with stdout/stderr pumped into rolling buffers and its exit status recorded.
+/// `kill_on_drop` is off — the process must outlive the spawn call — so callers
+/// are responsible for `kill()` (or session-end cleanup).
+pub fn spawn_background(mut cmd: tokio::process::Command) -> Result<BgProc, ExecError> {
+    use std::sync::{Arc, Mutex};
+    configure_for_spawn(&mut cmd, false);
+    let mut child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
+    let pid = child.id();
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let stdout: SharedBuf = Arc::new(Mutex::new(BgBuf::default()));
+    let stderr: SharedBuf = Arc::new(Mutex::new(BgBuf::default()));
+    let code = Arc::new(Mutex::new(None));
+    let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+
+    async fn pump<R: tokio::io::AsyncRead + Unpin>(mut r: R, buf: SharedBuf) {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match r.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut b) = buf.lock() {
+                        b.push(&chunk[..n]);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(o) = out_pipe {
+        tokio::spawn(pump(o, stdout.clone()));
+    }
+    if let Some(e) = err_pipe {
+        tokio::spawn(pump(e, stderr.clone()));
+    }
+    let code2 = code.clone();
+    tokio::spawn(async move {
+        let status = child.wait().await.ok().and_then(|s| s.code());
+        if let Ok(mut c) = code2.lock() {
+            *c = status;
+        }
+        let _ = done_tx.send(true);
+    });
+
+    Ok(BgProc { pid, stdout, stderr, done_rx, code })
+}
+
 /// Runs commands directly on the host with no OS isolation.
 pub struct HostBackend;
 
 #[async_trait]
 impl ExecBackend for HostBackend {
-    async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError> {
-        let out = base_command(&req.program, &req.args, &req)
-            .output()
-            .await
-            .map_err(|e| ExecError::Spawn(e.to_string()))?;
-        Ok(to_output(out))
+    fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
+        Ok(base_command(&req.program, &req.args, req))
     }
     fn label(&self) -> &str {
         "host"
@@ -223,7 +431,7 @@ impl SeatbeltBackend {
 #[cfg(target_os = "macos")]
 #[async_trait]
 impl ExecBackend for SeatbeltBackend {
-    async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError> {
+    fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
         let profile = self.profile(&req.cwd);
         // sandbox-exec -p <profile> <program> <args...>
         let mut wrapped = Vec::with_capacity(req.args.len() + 3);
@@ -231,11 +439,7 @@ impl ExecBackend for SeatbeltBackend {
         wrapped.push(profile);
         wrapped.push(req.program.clone());
         wrapped.extend(req.args.iter().cloned());
-        let out = base_command("/usr/bin/sandbox-exec", &wrapped, &req)
-            .output()
-            .await
-            .map_err(|e| ExecError::Spawn(e.to_string()))?;
-        Ok(to_output(out))
+        Ok(base_command("/usr/bin/sandbox-exec", &wrapped, req))
     }
     fn label(&self) -> &str {
         "native"
@@ -324,7 +528,7 @@ fn build_landlock_ruleset(writable: &[PathBuf], net: NetPolicy) -> Option<landlo
 #[cfg(target_os = "linux")]
 #[async_trait]
 impl ExecBackend for LandlockBackend {
-    async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError> {
+    fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
         use std::os::unix::process::CommandExt;
 
         let ruleset = build_landlock_ruleset(&self.writable_paths(&req.cwd), self.net);
@@ -351,10 +555,7 @@ impl ExecBackend for LandlockBackend {
             }
         }
 
-        let mut tokio_cmd = tokio::process::Command::from(cmd);
-        tokio_cmd.kill_on_drop(true);
-        let out = tokio_cmd.output().await.map_err(|e| ExecError::Spawn(e.to_string()))?;
-        Ok(to_output(out))
+        Ok(tokio::process::Command::from(cmd))
     }
     fn label(&self) -> &str {
         "native"
@@ -460,17 +661,13 @@ impl ContainerBackend {
 
 #[async_trait]
 impl ExecBackend for ContainerBackend {
-    async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError> {
-        let argv = self.build_argv(&req);
+    fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
+        let argv = self.build_argv(req);
         // The runtime CLIENT runs with our host env (it needs PATH/DOCKER_HOST);
         // the containerized command gets none of it (see build_argv).
-        let out = tokio::process::Command::new(&self.runtime)
-            .args(&argv)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| ExecError::Spawn(e.to_string()))?;
-        Ok(to_output(out))
+        let mut cmd = tokio::process::Command::new(&self.runtime);
+        cmd.args(&argv);
+        Ok(cmd)
     }
     fn label(&self) -> &str {
         "container"
@@ -519,15 +716,11 @@ impl SshBackend {
 
 #[async_trait]
 impl ExecBackend for SshBackend {
-    async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError> {
-        let argv = self.build_argv(&req);
-        let out = tokio::process::Command::new("ssh")
-            .args(&argv)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| ExecError::Spawn(e.to_string()))?;
-        Ok(to_output(out))
+    fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
+        let argv = self.build_argv(req);
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&argv);
+        Ok(cmd)
     }
     fn label(&self) -> &str {
         "ssh"
@@ -624,6 +817,31 @@ mod tests {
             env: std::env::vars().collect(),
             clear_env: false,
         }
+    }
+
+    /// K1: a timed-out command must take its whole process *tree* down, not just
+    /// the direct child. We spawn `sh -c 'sh -c "sleep 30" ...'` where a
+    /// grandchild writes a sentinel file only if it survives, wrap the run in a
+    /// short timeout (dropping the future, as the tool layer does), then confirm
+    /// the grandchild was killed before it could write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group() {
+        let dir = std::env::temp_dir().join(format!("medha-killpg-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("survived.txt");
+        // Grandchild sleeps briefly then writes the marker; if the group is
+        // killed on timeout it never gets there.
+        let script = format!("(sleep 1; touch {}) & wait", marker.display());
+        let fut = HostBackend.run(req("/bin/sh", &["-c", &script], dir.clone()));
+        // Drop the run future well before the grandchild's 1s write — this is
+        // exactly what an outer `tokio::time::timeout` does on expiry.
+        let r = tokio::time::timeout(std::time::Duration::from_millis(150), fut).await;
+        assert!(r.is_err(), "outer timeout should elapse");
+        // Give the reaper + any stray write a moment, then confirm no marker.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(!marker.exists(), "grandchild survived the group kill (orphaned tree)");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

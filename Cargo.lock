@@ -2912,6 +2912,7 @@ dependencies = [
  "async-trait",
  "kernel",
  "landlock",
+ "libc",
  "permissions",
  "thiserror 2.0.18",
  "tokio",

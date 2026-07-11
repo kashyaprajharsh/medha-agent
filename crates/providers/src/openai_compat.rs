@@ -652,88 +652,29 @@ impl Provider for OpenAiCompat {
                     Ok(bytes) => buf.extend_from_slice(&bytes),
                 }
 
-                // Drain complete SSE records (separated by a blank line).
-                while let Some(pos) = find_subslice(&buf, b"\n\n") {
-                    let record: Vec<u8> = buf.drain(..pos + 2).collect();
+                // Drain complete SSE records. A record ends at a blank line —
+                // "\n\n" (LF) or the spec-legal "\r\n\r\n" (CRLF). Handling CRLF
+                // is essential: without it a CRLF server's records never match,
+                // the buffer grows unbounded, and the whole response is silently
+                // dropped.
+                while let Some((pos, sep_len)) = find_record_boundary(&buf) {
+                    let record: Vec<u8> = buf.drain(..pos + sep_len).collect();
                     let record = String::from_utf8_lossy(&record);
-                    for line in record.lines() {
-                        let Some(data) = line.trim_start().strip_prefix("data:") else {
-                            continue;
-                        };
-                        let data = data.trim();
-                        if data.is_empty() || data == "[DONE]" {
-                            continue;
-                        }
-                        let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
-                            continue; // tolerate keep-alives / non-JSON frames
-                        };
-                        // A mid-stream error frame ends the turn with a real
-                        // error instead of a silent truncation.
-                        if let Some(err) = chunk.error {
-                            let msg = match (err.message, err.kind) {
-                                (Some(m), Some(k)) => format!("{m} ({k})"),
-                                (Some(m), None) => m,
-                                (None, Some(k)) => k,
-                                (None, None) => "provider returned an error frame".to_string(),
-                            };
-                            yield Err(ProviderError::Stream(msg));
-                            return;
-                        }
-                        if let Some(u) = chunk.usage {
-                            yield Ok(Block::Usage(Usage {
-                                prompt_tokens: u.prompt_tokens,
-                                completion_tokens: u.completion_tokens,
-                                total_tokens: u.total_tokens,
-                            }));
-                        }
-                        if let Some(choice) = chunk.choices.into_iter().next() {
-                            if let Some(r) = choice.delta.reasoning_content {
-                                if !r.is_empty() {
-                                    yield Ok(Block::Reasoning(r));
-                                }
-                            }
-                            if let Some(c) = choice.delta.content {
-                                if !c.is_empty() {
-                                    for block in think_filter.feed(&c) {
-                                        yield Ok(block);
-                                    }
-                                }
-                            }
-                            for tc in choice.delta.tool_calls {
-                                let idx = tc.index;
-                                let e = accum.entry(idx).or_default();
-                                if let Some(id) = tc.id {
-                                    if !id.is_empty() { e.0 = id; }
-                                }
-                                if let Some(f) = tc.function {
-                                    if let Some(n) = f.name {
-                                        if !n.is_empty() {
-                                            let first = e.1.is_empty();
-                                            e.1 = n.clone();
-                                            // Surface the tool name the moment it's known so the UI
-                                            // can show "writing…/reading…" while the (possibly huge)
-                                            // arguments are still streaming in.
-                                            if first {
-                                                yield Ok(Block::ToolStarted { name: n, target: None });
-                                            }
-                                        }
-                                    }
-                                    if let Some(a) = f.arguments {
-                                        e.2.push_str(&a);
-                                        // The path/command usually appears at the START of the args
-                                        // JSON (before a huge `content` field), so we can surface
-                                        // "writing medha.html…" long before the write finishes.
-                                        if !e.1.is_empty() && !target_announced.contains(&idx) {
-                                            if let Some(t) = sniff_target(&e.2) {
-                                                target_announced.insert(idx);
-                                                yield Ok(Block::ToolStarted { name: e.1.clone(), target: Some(t) });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    match process_sse_record(&record, &mut accum, &mut think_filter, &mut target_announced) {
+                        Ok(blocks) => for b in blocks { yield Ok(b); },
+                        Err(e) => { yield Err(e); return; }
                     }
+                }
+            }
+
+            // Drain any trailing partial record the server never terminated with
+            // a blank line — otherwise its final frame (often the one carrying
+            // the last tool-call args or usage) is thrown away at EOF.
+            if !buf.is_empty() {
+                let record = String::from_utf8_lossy(&buf);
+                match process_sse_record(&record, &mut accum, &mut think_filter, &mut target_announced) {
+                    Ok(blocks) => for b in blocks { yield Ok(b); },
+                    Err(e) => { yield Err(e); return; }
                 }
             }
 
@@ -742,20 +683,142 @@ impl Provider for OpenAiCompat {
             }
 
             // Emit fully-assembled tool calls, in the order the model issued them.
-            for (_idx, (id, name, args)) in accum {
-                if name.is_empty() { continue; }
-                let parsed = if args.trim().is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str(&args)
-                        .unwrap_or_else(|_| serde_json::json!({ "_raw": args }))
-                };
-                yield Ok(Block::ToolIntent(ToolIntent { id, tool: name, args: parsed }));
+            for intent in finalize_tool_calls(accum) {
+                yield Ok(Block::ToolIntent(intent));
             }
         };
 
         Ok(s.boxed())
     }
+}
+
+/// The end of the first complete SSE record in `buf`: a blank-line separator,
+/// which is `"\n\n"` on LF servers or `"\r\n\r\n"` on spec-legal CRLF servers.
+/// Returns `(offset of the separator, its length)`, whichever variant appears
+/// earliest. Without the CRLF case a CRLF server's records never drain.
+fn find_record_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_subslice(buf, b"\n\n").map(|p| (p, 2usize));
+    let crlf = find_subslice(buf, b"\r\n\r\n").map(|p| (p, 4usize));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Turn accumulated tool-call fragments into final intents, in issue order.
+/// Synthesizes `call_{idx}` for any call the stream never gave an id — some
+/// gateways (llama.cpp and others) omit it, and an empty `tool_call_id` 400s on
+/// strict backends when the result is sent back.
+fn finalize_tool_calls(
+    accum: std::collections::BTreeMap<u32, (String, String, String)>,
+) -> Vec<ToolIntent> {
+    let mut out = Vec::new();
+    for (idx, (id, name, args)) in accum {
+        if name.is_empty() {
+            continue;
+        }
+        let id = if id.is_empty() { format!("call_{idx}") } else { id };
+        let parsed = if args.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&args).unwrap_or_else(|_| serde_json::json!({ "_raw": args }))
+        };
+        out.push(ToolIntent { id, tool: name, args: parsed });
+    }
+    out
+}
+
+/// Parse one SSE record's `data:` lines into the blocks to yield, folding
+/// tool-call deltas into `accum`. Shared by the mid-stream drain loop and the
+/// end-of-stream residual drain so both paths behave identically. Returns
+/// `Err` for a mid-stream error frame (ends the turn with a real error rather
+/// than a silent truncation). `str::lines()` already tolerates `\r\n`, so only
+/// the record *delimiter* needed CRLF handling (see `find_record_boundary`).
+fn process_sse_record(
+    record: &str,
+    accum: &mut std::collections::BTreeMap<u32, (String, String, String)>,
+    think_filter: &mut ThinkTagFilter,
+    target_announced: &mut std::collections::HashSet<u32>,
+) -> Result<Vec<Block>, ProviderError> {
+    let mut out = Vec::new();
+    for line in record.lines() {
+        let Some(data) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
+            continue; // tolerate keep-alives / non-JSON frames
+        };
+        if let Some(err) = chunk.error {
+            let msg = match (err.message, err.kind) {
+                (Some(m), Some(k)) => format!("{m} ({k})"),
+                (Some(m), None) => m,
+                (None, Some(k)) => k,
+                (None, None) => "provider returned an error frame".to_string(),
+            };
+            return Err(ProviderError::Stream(msg));
+        }
+        if let Some(u) = chunk.usage {
+            out.push(Block::Usage(Usage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            }));
+        }
+        if let Some(choice) = chunk.choices.into_iter().next() {
+            if let Some(r) = choice.delta.reasoning_content {
+                if !r.is_empty() {
+                    out.push(Block::Reasoning(r));
+                }
+            }
+            if let Some(c) = choice.delta.content {
+                if !c.is_empty() {
+                    out.extend(think_filter.feed(&c));
+                }
+            }
+            for tc in choice.delta.tool_calls {
+                let idx = tc.index;
+                let e = accum.entry(idx).or_default();
+                if let Some(id) = tc.id {
+                    if !id.is_empty() {
+                        e.0 = id;
+                    }
+                }
+                if let Some(f) = tc.function {
+                    if let Some(n) = f.name {
+                        if !n.is_empty() {
+                            let first = e.1.is_empty();
+                            e.1 = n.clone();
+                            // Surface the tool name the moment it's known so the UI
+                            // can show "writing…/reading…" while the (possibly huge)
+                            // arguments are still streaming in.
+                            if first {
+                                out.push(Block::ToolStarted { name: n, target: None });
+                            }
+                        }
+                    }
+                    if let Some(a) = f.arguments {
+                        e.2.push_str(&a);
+                        // The path/command usually appears at the START of the args
+                        // JSON (before a huge `content` field), so we can surface
+                        // "writing medha.html…" long before the write finishes.
+                        if !e.1.is_empty() && !target_announced.contains(&idx) {
+                            if let Some(t) = sniff_target(&e.2) {
+                                target_announced.insert(idx);
+                                out.push(Block::ToolStarted { name: e.1.clone(), target: Some(t) });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -781,6 +844,69 @@ mod sniff_tests {
     fn command_and_unknown_keys() {
         assert_eq!(sniff_target(r#"{"command":"cargo build"}"#), Some("cargo build".to_string()));
         assert_eq!(sniff_target(r#"{"pattern":"foo"}"#), None);
+    }
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::*;
+    use std::collections::{BTreeMap, HashSet};
+
+    // ── K4: record boundary must accept BOTH LF and CRLF blank-line separators ──
+    #[test]
+    fn record_boundary_handles_lf_and_crlf() {
+        assert_eq!(find_record_boundary(b"data: x\n\ndata: y"), Some((7, 2)));
+        // CRLF: "data: x\r\n\r\n..." — the LF-only search would never match here.
+        assert_eq!(find_record_boundary(b"data: x\r\n\r\nrest"), Some((7, 4)));
+        // No blank line yet → no complete record.
+        assert_eq!(find_record_boundary(b"data: partial\r\n"), None);
+    }
+
+    fn drive(record: &str) -> Vec<Block> {
+        let mut accum = BTreeMap::new();
+        let mut tf = ThinkTagFilter::default();
+        let mut announced = HashSet::new();
+        let mut blocks = process_sse_record(record, &mut accum, &mut tf, &mut announced).unwrap();
+        // The think-tag filter holds a tail back pending a possible `<think>`;
+        // flush at end-of-stream (as the real driver does) to emit it.
+        if let Some(b) = tf.flush() {
+            blocks.push(b);
+        }
+        blocks
+    }
+
+    #[test]
+    fn crlf_record_is_parsed_not_dropped() {
+        // A CRLF-delimited content frame must yield its text (previously the
+        // whole response was silently dropped on CRLF servers).
+        let blocks = drive("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\r\n");
+        let text: String = blocks.iter().filter_map(|b| match b {
+            Block::Text(t) => Some(t.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(text, "hello", "CRLF record must be parsed, not dropped: {blocks:?}");
+    }
+
+    // ── K13: a tool call the server never gave an id gets a synthesized one ─────
+    #[test]
+    fn missing_tool_call_id_is_synthesized() {
+        let mut accum = BTreeMap::new();
+        // index 0, a name, no id (empty) — as a lax gateway streams it.
+        accum.insert(0u32, (String::new(), "fs.read".to_string(), r#"{"path":"a"}"#.to_string()));
+        let intents = finalize_tool_calls(accum);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].id, "call_0", "empty id must be synthesized, not left blank");
+        assert_eq!(intents[0].tool, "fs.read");
+        assert_eq!(intents[0].args["path"], "a");
+    }
+
+    #[test]
+    fn present_tool_call_id_is_preserved() {
+        let mut accum = BTreeMap::new();
+        accum.insert(0u32, ("real-id".to_string(), "fs.read".to_string(), String::new()));
+        let intents = finalize_tool_calls(accum);
+        assert_eq!(intents[0].id, "real-id");
+        assert_eq!(intents[0].args, serde_json::json!({}), "empty args → empty object");
     }
 }
 

@@ -228,7 +228,9 @@ pub struct ContextConfig {
     pub tail_ratio: f32,
     pub protect_first_n: usize,
     pub protect_last_n: usize,
-    pub prune_min_tool_tokens: u32,
+    /// Absent (default) = auto: scales with the context window (~1% of usable,
+    /// min 200). Set an explicit token count to override.
+    pub prune_min_tool_tokens: Option<u32>,
     pub emergency_ratio: f32,
 }
 

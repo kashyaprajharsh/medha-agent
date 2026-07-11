@@ -78,6 +78,9 @@ pub struct Kernel<P: Provider, L: EventLog> {
     max_parallel_tools: usize,
     /// Resolved model pricing (P1-12); `None` = cost unknown, meter stays off.
     pricing: Option<crate::types::Pricing>,
+    /// Serializes human-gate prompts: parallel tool dispatch must not pop
+    /// several approval cards at once (P2 gate race).
+    gate_serial: futures::lock::Mutex<()>,
 }
 
 /// Tool-result payloads larger than this spill to the artifact store and are
@@ -116,6 +119,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             verifier,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             pricing: None,
+            gate_serial: futures::lock::Mutex::new(()),
         }
     }
 
@@ -498,17 +502,25 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         match decision {
             crate::types::Decision::Deny { reason } => Observation::denial(&intent.id, reason),
             crate::types::Decision::Human => {
-                // Draft → approve → commit (P5): show a real preview (rendered
-                // diff via dry-run when available) and ask before executing.
-                let detail = self
-                    .executor
-                    .preview(intent)
-                    .await
-                    .unwrap_or_else(|| approval_detail(intent));
-                // Scope the approval to this specific action (tool + salient arg),
-                // so "always allow" doesn't blanket every call of the tool (K9).
-                let action = approval_key(intent);
-                if self.gate.confirm(&action, Some(&detail), escalated).await.approved() {
+                // One approval card at a time (P2 gate race): the lock spans
+                // preview → answer so parallel dispatch can't pop several
+                // prompts at once, but is dropped BEFORE execution so an
+                // approved slow tool doesn't block the next card.
+                let approved = {
+                    let _one_gate = self.gate_serial.lock().await;
+                    // Draft → approve → commit (P5): show a real preview (rendered
+                    // diff via dry-run when available) and ask before executing.
+                    let detail = self
+                        .executor
+                        .preview(intent)
+                        .await
+                        .unwrap_or_else(|| approval_detail(intent));
+                    // Scope the approval to this specific action (tool + salient arg),
+                    // so "always allow" doesn't blanket every call of the tool (K9).
+                    let action = approval_key(intent);
+                    self.gate.confirm(&action, Some(&detail), escalated).await.approved()
+                };
+                if approved {
                     self.executor.execute(intent).await
                 } else {
                     Observation::denial(&intent.id, "rejected by human".to_string())

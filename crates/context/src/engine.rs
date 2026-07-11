@@ -166,10 +166,13 @@ impl ContextEngine for PipelineEngine {
         let budget = ContextBudget::from_max_ctx(mc);
         let usable = budget.usable().max(1) as f32;
 
-        // Decide on the *real* last-reported prompt tokens when we have them;
-        // fall back to the estimate only before the first response.
+        // Decision basis: the max of the last reported/counted figure and the
+        // local count of the CURRENT messages. On hosts with no count route the
+        // stored figure is last turn's usage, which excludes this turn's tool
+        // results — trusting it alone triggered compaction one turn late (P2).
+        // max() biases toward compacting earlier, the safe direction.
         let actual = self.last_prompt_tokens.load(Ordering::Relaxed);
-        let basis = if actual > 0 { actual as f32 } else { before as f32 };
+        let basis = (actual as f32).max(before as f32);
         let near_hard_ceiling = is_overflow(basis, mc, &self.policy);
 
         // Anti-thrash: if the last couple of compactions barely helped, stop —
@@ -234,10 +237,16 @@ impl ContextEngine for PipelineEngine {
         match action {
             CompactionAction::Prune => {
                 // Cheap, lossless: shrink tool-result bodies, keep structure
-                // (and tool_call_id) so pairing is untouched.
+                // (and tool_call_id) so pairing is untouched. Oldest-first,
+                // honoring the prune floor, and STOP once pressure is back
+                // under the prune trigger — wiping the whole middle at 60%
+                // threw away recent context the model was still using (P2).
+                let floor = self.policy.prune_floor(budget.usable()).max(1);
+                let target = usable * self.policy.microcompact_ratio;
+                let mut est = basis;
                 for m in middle {
-                    if m.role == Role::Tool {
-                        let toks = counter.count(&m.content);
+                    let toks = if m.role == Role::Tool { counter.count(&m.content) } else { 0 };
+                    if m.role == Role::Tool && toks >= floor && est >= target {
                         let mut pm = m.clone();
                         // Lossless prune: spill the full output and reference it so
                         // the model can re-read it (P1-3). No store → honest
@@ -248,6 +257,7 @@ impl ContextEngine for PipelineEngine {
                             ),
                             None => format!("[earlier tool output pruned to save context — {toks} tokens]"),
                         };
+                        est -= (toks.saturating_sub(counter.count(&pm.content))) as f32;
                         out.push(pm);
                     } else {
                         out.push(m.clone());
@@ -525,12 +535,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prune_is_oldest_first_respects_floor_and_stops_at_target() {
+        // P2: the prune tier must (a) skip outputs under the floor, (b) prune
+        // oldest-first, (c) STOP once pressure is back under the prune trigger
+        // — not wipe every middle tool result at 60%.
+        let eng = engine(CompactionPolicy {
+            protect_first_n: 1,
+            protect_last_n: 2,
+            tail_ratio: 0.05,
+            prune_min_tool_tokens: Some(100),
+            ..Default::default()
+        });
+        // usable(8k) ≈ 5200; band [3120, 4420). Three 1100-token outputs + one
+        // 50-token one ≈ 3360 → Prune. Pruning the OLDEST (-~1075) lands under
+        // target 3120, so the rest must survive.
+        let msgs = vec![
+            Message::system("S"),
+            user("ask 0"),
+            Message::tool_result("c0", "a".repeat(4_400)),
+            user("ask 1"),
+            Message::tool_result("c1", "b".repeat(4_400)),
+            user("ask 2"),
+            Message::tool_result("c2", "c".repeat(200)),
+            user("ask 3"),
+            Message::tool_result("c3", "d".repeat(4_400)),
+            user("LAST"),
+        ];
+        let r = eng.compile(&msgs, Some(8_000)).await;
+        assert!(r.compacted && !r.summarized, "expected a Prune pass (compacted={} summarized={} before={} after={})", r.compacted, r.summarized, r.before_tokens, r.after_tokens);
+        let pruned: Vec<&Message> =
+            r.messages.iter().filter(|m| m.content.contains("pruned to save context")).collect();
+        assert_eq!(pruned.len(), 1, "stop at target: only the oldest is pruned: {:?}",
+            r.messages.iter().map(|m| m.content.chars().take(30).collect::<String>()).collect::<Vec<_>>());
+        assert_eq!(pruned[0].tool_call_id.as_deref(), Some("c0"), "oldest-first");
+        assert!(
+            r.messages.iter().any(|m| m.tool_call_id.as_deref() == Some("c1") && m.content.starts_with("bbb")),
+            "newer big output survives once under target"
+        );
+        assert!(
+            r.messages.iter().any(|m| m.tool_call_id.as_deref() == Some("c2") && m.content.starts_with("ccc")),
+            "small output under the floor is never pruned"
+        );
+    }
+
+    #[tokio::test]
     async fn prune_spills_tool_output_to_artifacts_when_available() {
         let eng = engine(CompactionPolicy {
             protect_first_n: 1,
             protect_last_n: 2,
             tail_ratio: 0.05,
-            prune_min_tool_tokens: 1,
+            prune_min_tool_tokens: Some(1),
             ..Default::default()
         })
         .with_artifacts(Arc::new(MemStore::default()));

@@ -293,9 +293,27 @@ impl Tool for FsRead {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
-        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
         let offset = args.get("offset").and_then(Value::as_u64);
         let limit = args.get("limit").and_then(Value::as_u64);
+        // Size guard (P2): refuse a whole-file read of a huge file BEFORE
+        // loading it — otherwise it lands in memory and the event log intact
+        // (only model context was protected by the 16KB spill). Ranged reads
+        // stay allowed; point the model at them.
+        const MAX_WHOLE_READ: u64 = 2_000_000;
+        if offset.is_none() && limit.is_none() {
+            if let Ok(p) = self.sbx.resolve(&path).await {
+                if let Ok(md) = std::fs::metadata(&p) {
+                    if md.len() > MAX_WHOLE_READ {
+                        return Err(ToolError::Failed(format!(
+                            "{path} is {} bytes — too large for a whole-file read (cap {MAX_WHOLE_READ}). \
+                             Read a range with offset/limit, or grep it.",
+                            md.len()
+                        )));
+                    }
+                }
+            }
+        }
+        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
         // Whole-file read (default) — unchanged behavior.
         if offset.is_none() && limit.is_none() {
             return Ok(json!({ "path": path, "content": content }));
@@ -1130,14 +1148,39 @@ impl Tool for ReadArtifact {
         let length = args.get("length").and_then(Value::as_u64).map(|l| l as usize);
         let total = self.store.size(&hash).map_err(ToolError::Failed)?;
         let bytes = self.store.get(&hash, offset, length).map_err(ToolError::Failed)?;
-        let content = String::from_utf8_lossy(&bytes).into_owned();
-        Ok(json!({
+        // Snap page edges to char boundaries (P2): a byte offset can land
+        // mid-UTF-8-sequence; lossy decoding put U+FFFD at the edges and made
+        // stitched pages corrupt exact strings. Skip leading continuation
+        // bytes, drop an incomplete trailing char, and report `next_offset`
+        // so the dropped tail bytes re-appear at the start of the next page.
+        let lead = if offset > 0 {
+            bytes.iter().take_while(|b| (**b & 0xC0) == 0x80).count()
+        } else {
+            0
+        };
+        let slice = &bytes[lead.min(bytes.len())..];
+        let (content, consumed) = match std::str::from_utf8(slice) {
+            Ok(s) => (s.to_string(), slice.len()),
+            Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => {
+                // Clean text cut mid-char at the page end — keep the valid prefix.
+                let v = e.valid_up_to();
+                (String::from_utf8_lossy(&slice[..v]).into_owned(), v)
+            }
+            // Genuinely non-UTF-8 (binary artifact) — lossy as before.
+            Err(_) => (String::from_utf8_lossy(slice).into_owned(), slice.len()),
+        };
+        let next_offset = offset + lead + consumed;
+        let mut out = json!({
             "hash": hash,
             "offset": offset,
-            "length": bytes.len(),
+            "length": lead + consumed,
             "total_size": total,
             "content": content
-        }))
+        });
+        if next_offset < total as usize {
+            out["next_offset"] = json!(next_offset);
+        }
+        Ok(out)
     }
 }
 
@@ -1256,23 +1299,26 @@ async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>
 }
 
 /// Like [`http_client`], but for agent-supplied `web.fetch` targets: redirects
-/// are followed only to URLs that pass [`validate_public_url`], so a public URL
-/// can't 30x-bounce the fetch into the internal network.
+/// are NOT auto-followed — `fetch_plain` follows them manually so each hop's
+/// target passes [`validate_public_url`] with DNS resolved off the async
+/// workers (a redirect policy closure is sync, which forced blocking DNS onto
+/// the runtime, P2). A public URL still can't 30x-bounce into the internal net.
 fn fetch_client() -> Result<reqwest::Client, ToolError> {
     reqwest::Client::builder()
         .user_agent(BROWSER_UA)
         .timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
-                return attempt.error("too many redirects");
-            }
-            match validate_public_url(attempt.url()) {
-                Ok(()) => attempt.follow(),
-                Err(msg) => attempt.error(format!("blocked redirect: {msg}")),
-            }
-        }))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ToolError::Failed(e.to_string()))
+}
+
+/// Validate a URL as public with DNS resolution on the blocking pool.
+async fn validate_public_url_async(url: &reqwest::Url) -> Result<(), ToolError> {
+    let u = url.clone();
+    tokio::task::spawn_blocking(move || validate_public_url(&u))
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?
+        .map_err(ToolError::Failed)
 }
 
 struct WebSearch;
@@ -1605,24 +1651,38 @@ async fn searxng_search(
 /// `class="result-link"`, snippets are in `td.result-snippet` (in document order).
 fn parse_ddg_lite(html: &str, max: usize) -> Vec<Value> {
     let doc = Html::parse_document(html);
+    let row_sel = Selector::parse("tr").unwrap();
     let link_sel = Selector::parse("a.result-link").unwrap();
     let snip_sel = Selector::parse("td.result-snippet, .result-snippet").unwrap();
-    let snippets: Vec<String> = doc
-        .select(&snip_sel)
-        .map(|s| s.text().collect::<String>().trim().to_string())
-        .collect();
-    let mut out = Vec::new();
-    for (i, a) in doc.select(&link_sel).enumerate() {
+    // Pair structurally, not by index (P2): a snippet belongs to the link row
+    // immediately before it. Index-zipping the two node lists meant one ad or
+    // snippet-less row shifted EVERY later snippet onto the wrong result.
+    let mut out: Vec<Value> = Vec::new();
+    let mut pending: Option<(String, String)> = None;
+    let flush = |pending: &mut Option<(String, String)>, snippet: String, out: &mut Vec<Value>| {
+        if let Some((title, url)) = pending.take() {
+            out.push(json!({ "title": title, "url": url, "snippet": snippet }));
+        }
+    };
+    for row in doc.select(&row_sel) {
         if out.len() >= max {
-            break;
+            return out;
         }
-        let title = a.text().collect::<String>().trim().to_string();
-        let url = decode_ddg_url(a.value().attr("href").unwrap_or_default());
-        if title.is_empty() || url.is_empty() {
-            continue;
+        if let Some(a) = row.select(&link_sel).next() {
+            // New result row: emit any prior result that never got a snippet.
+            flush(&mut pending, String::new(), &mut out);
+            let title = a.text().collect::<String>().trim().to_string();
+            let url = decode_ddg_url(a.value().attr("href").unwrap_or_default());
+            if !title.is_empty() && !url.is_empty() {
+                pending = Some((title, url));
+            }
+        } else if let Some(s) = row.select(&snip_sel).next() {
+            let snippet = s.text().collect::<String>().trim().to_string();
+            flush(&mut pending, snippet, &mut out);
         }
-        let snippet = snippets.get(i).cloned().unwrap_or_default();
-        out.push(json!({ "title": title, "url": url, "snippet": snippet }));
+    }
+    if out.len() < max {
+        flush(&mut pending, String::new(), &mut out);
     }
     out
 }
@@ -1742,19 +1802,40 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
 
     // SSRF guard: reject internal/non-public targets before connecting. DNS is
     // blocking, so resolve off the async workers.
-    {
-        let parsed = parsed.clone();
-        tokio::task::spawn_blocking(move || validate_public_url(&parsed))
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))?
-            .map_err(ToolError::Failed)?;
-    }
+    validate_public_url_async(&parsed).await?;
 
-    let resp = fetch_client()?
-        .get(parsed)
-        .send()
-        .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    // Follow redirects manually (max 5) so EVERY hop is validated the same way
+    // — the classic bypass is a public URL that 30x-redirects to
+    // http://169.254.169.254/… — with per-hop DNS off the async workers (P2).
+    let client = fetch_client()?;
+    let mut current = parsed;
+    let mut hops = 0u8;
+    let resp = loop {
+        let r = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        if !r.status().is_redirection() {
+            break r;
+        }
+        hops += 1;
+        if hops > 5 {
+            return Err(ToolError::Failed("too many redirects".into()));
+        }
+        let loc = r
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| ToolError::Failed("redirect without a Location header".into()))?;
+        let next = current
+            .join(loc)
+            .map_err(|e| ToolError::Failed(format!("bad redirect target: {e}")))?;
+        validate_public_url_async(&next)
+            .await
+            .map_err(|e| ToolError::Failed(format!("blocked redirect: {e}")))?;
+        current = next;
+    };
     let status = resp.status();
     let code = status.as_u16();
     let ctype = resp
@@ -3171,6 +3252,86 @@ mod tests {
             .execute(&ToolIntent { id: "9".into(), tool: "nope".into(), args: json!({}) })
             .await;
         assert_eq!(obs.status, kernel::ObsStatus::Denied);
+    }
+
+    #[test]
+    fn ddg_lite_snippets_pair_structurally_not_by_index() {
+        // Result 1 has NO snippet row — its absence must not shift result 2's
+        // snippet onto it (the old index-zip did exactly that).
+        let html = r#"<table>
+            <tr><td><a class="result-link" href="https://one.example/">One</a></td></tr>
+            <tr><td><a class="result-link" href="https://two.example/">Two</a></td></tr>
+            <tr><td class="result-snippet">snippet for two</td></tr>
+        </table>"#;
+        let out = parse_ddg_lite(html, 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["title"], "One");
+        assert_eq!(out[0]["snippet"], "", "missing snippet must stay missing");
+        assert_eq!(out[1]["title"], "Two");
+        assert_eq!(out[1]["snippet"], "snippet for two", "snippet stays with ITS result");
+    }
+
+    #[tokio::test]
+    async fn read_artifact_pages_snap_to_char_boundaries() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let store = mem_artifacts();
+        let reg = ToolRegistry::with_workspace(sbx, store.clone());
+        // "héllo wörld" repeated — page length 5 cuts mid-'é' (2 bytes).
+        let text = "héllo wörld ".repeat(10);
+        let hash = store.put(text.as_bytes()).unwrap();
+
+        let page1 = reg
+            .execute(&ToolIntent {
+                id: "1".into(),
+                tool: "read_artifact".into(),
+                args: json!({ "hash": hash, "offset": 0, "length": 2 }),
+            })
+            .await;
+        let c1 = page1.payload["content"].as_str().unwrap();
+        assert!(!c1.contains('\u{FFFD}'), "no replacement char at a cut page edge: {c1:?}");
+        assert_eq!(c1, "h", "the split 'é' is dropped, not mangled");
+        // Continue from next_offset: the dropped bytes re-appear.
+        let next = page1.payload["next_offset"].as_u64().unwrap();
+        assert_eq!(next, 1, "resume where the complete chars ended");
+        let page2 = reg
+            .execute(&ToolIntent {
+                id: "2".into(),
+                tool: "read_artifact".into(),
+                args: json!({ "hash": hash, "offset": next, "length": 4 }),
+            })
+            .await;
+        let c2 = page2.payload["content"].as_str().unwrap();
+        assert!(!c2.contains('\u{FFFD}'), "leading continuation bytes snapped: {c2:?}");
+        assert_eq!(c2, "éll");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_read_refuses_whole_read_of_a_huge_file_but_allows_ranges() {
+        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+        // 3MB file, over the 2MB whole-read cap.
+        std::fs::write(dir.join("big.txt"), "line\n".repeat(600_000)).unwrap();
+
+        let whole = reg
+            .execute(&ToolIntent { id: "1".into(), tool: "fs.read".into(), args: json!({ "path": "big.txt" }) })
+            .await;
+        assert_eq!(whole.status, kernel::ObsStatus::Error, "whole read must refuse");
+        assert!(whole.payload.to_string().contains("offset"), "error points at ranged reads");
+
+        let ranged = reg
+            .execute(&ToolIntent {
+                id: "2".into(),
+                tool: "fs.read".into(),
+                args: json!({ "path": "big.txt", "offset": 1, "limit": 3 }),
+            })
+            .await;
+        assert_eq!(ranged.status, kernel::ObsStatus::Ok, "ranged read still works");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

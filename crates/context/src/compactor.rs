@@ -169,7 +169,7 @@ pub async fn compact(
         .filter(|i| i.kind == ItemKind::ToolOutput && !i.pruned)
         .map(|i| counter.count(&i.content))
         .sum();
-    if tool_tokens >= policy.prune_min_tool_tokens {
+    if tool_tokens >= policy.prune_floor(budget.usable()) {
         for item in compactable.iter_mut() {
             if item.kind == ItemKind::ToolOutput && !item.pruned {
                 let toks = counter.count(&item.content);
@@ -387,7 +387,7 @@ mod tests {
             protect_first_n: 1,
             protect_last_n: 1,
             tail_ratio: 0.1,
-            prune_min_tool_tokens: 10,
+            prune_min_tool_tokens: Some(10),
             ..Default::default()
         };
         let counter = HeuristicCounter;

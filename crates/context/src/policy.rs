@@ -19,7 +19,10 @@ pub struct CompactionPolicy {
     /// Floor on the number of most-recent messages kept verbatim.
     pub protect_last_n: usize,
     /// Only bother pruning tool outputs if they exceed this many tokens.
-    pub prune_min_tool_tokens: u32,
+    /// `None` (default) scales with the window — see [`Self::prune_floor`]:
+    /// an absolute constant can't fit both an 8k local model and a 200k
+    /// hosted one (every other threshold here is a ratio for the same reason).
+    pub prune_min_tool_tokens: Option<u32>,
     /// Hard safety ceiling, as a fraction of the *true* model window (not the
     /// reduced usable budget). A second, independent layer above the normal
     /// trigger — the pattern real harnesses use two thresholds for: a soft
@@ -39,9 +42,20 @@ impl Default for CompactionPolicy {
             tail_ratio: 0.20,
             protect_first_n: 3,
             protect_last_n: 20,
-            prune_min_tool_tokens: 8_000,
+            prune_min_tool_tokens: None,
             emergency_ratio: 0.95,
         }
+    }
+}
+
+impl CompactionPolicy {
+    /// Effective prune floor for a given usable window. Configured value wins
+    /// verbatim; the auto default is 1% of usable, clamped to ≥200 tokens so
+    /// tiny windows don't churn outputs barely bigger than the ~30-token
+    /// placeholder that replaces them. (~1,000 on a 128k model, 200 on 8k.)
+    pub fn prune_floor(&self, usable: u32) -> u32 {
+        self.prune_min_tool_tokens
+            .unwrap_or_else(|| ((usable as f32 * 0.01) as u32).max(200))
     }
 }
 

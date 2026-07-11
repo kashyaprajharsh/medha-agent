@@ -8,3 +8,7 @@
 
 # Local runtime state (event-log DB, snapshots)
 .medha/
+
+# personal research/notes at repo root — never commit
+learn-self-evolving-agents.html
+SELF_EVOLVING_AGENTS_RESEARCH.md

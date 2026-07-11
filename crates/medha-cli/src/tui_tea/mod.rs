@@ -1088,6 +1088,34 @@ mod tests {
     }
 
     #[test]
+    fn text_and_reasoning_stream_into_separate_transcript_items() {
+        // The display side of the "answer hidden behind thinking" bug: text
+        // deltas must build ONE visible Assistant item; only Reasoning deltas
+        // may create a (collapsible) Thinking item.
+        let ui = lockfile::UiConfig::default();
+        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        let mut session = kernel::Session::new();
+        let mut transcript: Vec<Message> = Vec::new();
+
+        // A pure-text answer that mentions think tags — streamed in deltas.
+        for d in ["Shape 2: `<think>", "` tags) and the rest ", "of the answer"] {
+            update::handle_agent_event(&mut m, TuiEvent::Text(d.to_string()), &mut session, &mut transcript);
+        }
+        let thinking = m.items.iter().filter(|e| matches!(e.item, Item::Thinking(_))).count();
+        assert_eq!(thinking, 0, "no Thinking item for a text-only answer");
+        assert!(
+            m.items.iter().any(|e| matches!(&e.item, Item::Assistant(s) if s == "Shape 2: `<think>` tags) and the rest of the answer")),
+            "the full answer is one visible Assistant item"
+        );
+
+        // Genuine reasoning deltas DO make a Thinking item, answer separate.
+        update::handle_agent_event(&mut m, TuiEvent::Reasoning("planning".into()), &mut session, &mut transcript);
+        update::handle_agent_event(&mut m, TuiEvent::Text("done.".into()), &mut session, &mut transcript);
+        assert!(m.items.iter().any(|e| matches!(&e.item, Item::Thinking(s) if s == "planning")));
+        assert!(m.items.iter().any(|e| matches!(&e.item, Item::Assistant(s) if s == "done.")));
+    }
+
+    #[test]
     fn upsert_notice_replaces_the_previous_matching_block() {
         let ui = lockfile::UiConfig::default();
         let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());

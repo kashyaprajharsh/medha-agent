@@ -982,6 +982,67 @@ mod sse_tests {
         blocks
     }
 
+    /// Drive several SSE content records through the real parsing path (record
+    /// → delta → think filter), flushing at end-of-stream like the driver does.
+    fn drive_many(deltas: &[&str]) -> Vec<Block> {
+        let mut accum = BTreeMap::new();
+        let mut tf = ThinkTagFilter::default();
+        let mut announced = HashSet::new();
+        let mut blocks = Vec::new();
+        for d in deltas {
+            let record = format!(
+                "data: {}\n",
+                serde_json::json!({"choices":[{"delta":{"content": d}}]})
+            );
+            blocks.extend(process_sse_record(&record, &mut accum, &mut tf, &mut announced).unwrap());
+        }
+        if let Some(b) = tf.flush() {
+            blocks.push(b);
+        }
+        blocks
+    }
+
+    fn join(blocks: &[Block]) -> (String, String) {
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        for b in blocks {
+            match b {
+                Block::Text(t) => text.push_str(t),
+                Block::Reasoning(r) => reasoning.push_str(r),
+                _ => {}
+            }
+        }
+        (text, reasoning)
+    }
+
+    #[test]
+    fn answer_mentioning_think_tags_streams_fully_visible() {
+        // End-to-end regression for the reported bug: the model streams an
+        // answer that DOCUMENTS think tags ("Shape 2: `<think>` tags"), with
+        // the tag split across SSE deltas exactly as a real stream does. The
+        // whole reply must arrive as visible text; nothing may be rerouted
+        // into hidden reasoning.
+        let full = "Reasoning support (Shape 1: `reasoning_content` field; Shape 2: `<think>` tags)\n- Tool call strategies: `Native`, `Guided` (planned)\n- `models.dev` integration for pricing";
+        let deltas = [
+            "Reasoning support (Shape 1: `reasoning_content` field; Shape 2: `<th",
+            "ink>` tags)\n- Tool call strategies: `Nati",
+            "ve`, `Guided` (planned)\n- `models.dev` integration for pricing",
+        ];
+        let (text, reasoning) = join(&drive_many(&deltas));
+        assert_eq!(reasoning, "", "no part of the answer may become hidden reasoning");
+        assert_eq!(text, full, "the full answer must stay visible");
+    }
+
+    #[test]
+    fn genuine_leading_thinking_still_separates_from_answer() {
+        // The same path with REAL inline thinking: block stripped into the
+        // reasoning lane, answer intact.
+        let deltas = ["<think>weigh the", " options</think>", "The answer is 42."];
+        let (text, reasoning) = join(&drive_many(&deltas));
+        assert_eq!(reasoning, "weigh the options");
+        assert_eq!(text, "The answer is 42.");
+    }
+
     #[test]
     fn crlf_record_is_parsed_not_dropped() {
         // A CRLF-delimited content frame must yield its text (previously the

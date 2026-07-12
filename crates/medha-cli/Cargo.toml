@@ -43,3 +43,8 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Terminal cells, not chars: CJK/emoji are 2 columns (K14). Same crate ratatui uses.
 unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# TUI stdout-corruption fix: dup/dup2 the real tty so the terminal draws on a
+# private handle while a dependency's stray println! is redirected to a log.
+libc = "0.2"

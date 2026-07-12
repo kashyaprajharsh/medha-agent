@@ -67,7 +67,7 @@ network = "allow"
 # extra_writable = ["/path/to/shared/build/dir"]
 
 [ui]
-# TUI presentation defaults (toggle live with /thinking and /detail in-session).
+# TUI presentation defaults (configure reasoning live with /reasoning).
 show_thinking = false
 full_transparency = false
 
@@ -79,6 +79,6 @@ full_transparency = false
 # Request-side thinking control for reasoning-capable models (§4.4) — sent as
 # chat_template_kwargs (vLLM/SGLang-style servers). Both fields optional; a
 # server/model without a matching knob just ignores what it doesn't support.
-# Live override: /think on|off|medium|status in a session.
+# Live override: /reasoning in a TUI session.
 # enabled = true
 # effort = "medium"   # "low" | "medium" | "high" — not every server has all three

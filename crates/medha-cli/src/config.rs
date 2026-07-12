@@ -68,9 +68,47 @@ pub struct Resolved {
     pub max_ctx: Option<u32>,
 }
 
-pub fn config_path() -> Result<PathBuf> {
+/// The MEDHA home directory — `$MEDHA_HOME` if set, else `~/.medha`. Holds
+/// user-global config (`config.toml`), user skills, and all per-workspace
+/// runtime state under `projects/` (see [`state_dir`]).
+pub fn medha_home() -> Result<PathBuf> {
+    if let Some(h) = std::env::var_os("MEDHA_HOME") {
+        return Ok(PathBuf::from(h));
+    }
     let home = dirs::home_dir().context("could not determine home directory")?;
-    Ok(home.join(".medha").join("config.toml"))
+    Ok(home.join(".medha"))
+}
+
+pub fn config_path() -> Result<PathBuf> {
+    Ok(medha_home()?.join("config.toml"))
+}
+
+/// Per-workspace runtime state directory: `~/.medha/projects/<encoded-cwd>/`
+/// (Claude Code style). Runtime state — the event log, artifacts, snapshots,
+/// logs — lives HERE, out of the working tree, so it never clutters or gets
+/// committed to the user's repos. Only committed config (`.medha/skills`,
+/// `medha.lock`) stays in the workspace. Creates the dir. `workspace` should be
+/// the canonicalized cwd so the same project always maps to the same dir.
+pub fn state_dir(workspace: &std::path::Path) -> Result<PathBuf> {
+    let dir = state_dir_in(&medha_home()?, workspace);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Pure path computation behind [`state_dir`] (no I/O) — testable without env.
+fn state_dir_in(home: &std::path::Path, workspace: &std::path::Path) -> PathBuf {
+    home.join("projects").join(encode_workspace(workspace))
+}
+
+/// Encode an absolute workspace path into one readable directory name, the way
+/// Claude Code does: every path separator becomes `-`, so
+/// `/Users/x/proj` → `-Users-x-proj`. Existing hyphens are left as-is; a
+/// Windows drive colon becomes `-`.
+fn encode_workspace(p: &std::path::Path) -> String {
+    p.to_string_lossy()
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | ':') { '-' } else { c })
+        .collect()
 }
 
 pub fn load() -> Result<Option<Config>> {
@@ -276,4 +314,31 @@ fn prompt(label: &str) -> Result<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).context("reading input")?;
     Ok(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn encodes_workspace_path_claude_code_style() {
+        // Leading separator and every '/' become '-'; existing hyphens survive.
+        assert_eq!(encode_workspace(Path::new("/Users/x/proj")), "-Users-x-proj");
+        assert_eq!(
+            encode_workspace(Path::new("/Users/reeturajharsh/Personal/files/medha")),
+            "-Users-reeturajharsh-Personal-files-medha"
+        );
+        assert_eq!(encode_workspace(Path::new("/a/my-repo")), "-a-my-repo");
+    }
+
+    #[test]
+    fn state_dir_is_per_workspace_under_home_projects() {
+        let home = Path::new("/home/u/.medha");
+        let a = state_dir_in(home, Path::new("/w/one"));
+        let b = state_dir_in(home, Path::new("/w/two"));
+        assert_eq!(a, Path::new("/home/u/.medha/projects/-w-one"));
+        assert_ne!(a, b, "different workspaces get different state dirs");
+        assert!(a.starts_with(home), "state stays under MEDHA home, not the workspace");
+    }
 }

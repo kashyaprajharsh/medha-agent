@@ -272,7 +272,9 @@ impl ContextConfig {
 /// `sudo`, credential reads, etc. are hard-blocked regardless of this list.
 /// Set to `[]` for full autonomy, or add "shell.exec" to also gate shell.
 fn default_approve() -> Vec<String> {
-    vec!["fs.write".into(), "fs.edit".into(), "multi_edit".into()]
+    // skill.save always shows an approval card so the user sees the full SKILL.md
+    // being written before it lands (Phase A skills).
+    vec!["fs.write".into(), "fs.edit".into(), "multi_edit".into(), "skill.save".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,7 +304,7 @@ pub struct VerifyConfig {
 pub struct UiConfig {
     /// Show the model's live reasoning/thinking stream, when the endpoint
     /// sends one. Off by default — reasoning is scratch content and can be
-    /// verbose; toggle live with the `/thinking` command.
+    /// verbose; configure live with the unified `/reasoning` command.
     pub show_thinking: bool,
     /// Show full, untruncated tool inputs/outputs instead of the summarized
     /// one-line view. Off by default for a readable stream; toggle live with
@@ -312,7 +314,7 @@ pub struct UiConfig {
 
 
 /// Reasoning/thinking request-side control (§4.4), config-file counterpart to
-/// the live `/think` slash command. `enabled`/`effort` both `None` = don't
+/// the live `/reasoning` slash command. `enabled`/`effort` both `None` = don't
 /// touch the server's own default. Not every model/server has a "medium" tier
 /// (some only expose on/off) — an effort the adapter can't map is silently
 /// unused rather than faked; see `kernel::ReasoningConfig`.
@@ -451,7 +453,7 @@ mod tests {
             context::CompactionPolicy::default().trigger_ratio
         );
         // File-write default (§4.6): writes need approval; shell is scanner-gated.
-        assert_eq!(lock.policy.approve, vec!["fs.write", "fs.edit", "multi_edit"]);
+        assert_eq!(lock.policy.approve, vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]);
         assert!(lock.verify.command.is_none());
     }
 
@@ -497,7 +499,7 @@ mod tests {
         assert!(loaded.is_none()); // load() is explicit Option; load_default() covers the fallback
         let default_used = MedhaLock::load("/nonexistent/path/medha.lock").unwrap_or_default();
         // Deny-first default applies even when no file exists at all.
-        assert_eq!(default_used.policy.approve, vec!["fs.write", "fs.edit", "multi_edit"]);
+        assert_eq!(default_used.policy.approve, vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]);
     }
 
     #[test]

@@ -1897,6 +1897,7 @@ dependencies = [
  "futures",
  "kernel",
  "keyring",
+ "libc",
  "lockfile",
  "policy",
  "providers",
@@ -3646,6 +3647,8 @@ dependencies = [
  "similar",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
+ "ulid",
  "urlencoding",
 ]
 

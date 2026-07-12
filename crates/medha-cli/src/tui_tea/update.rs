@@ -129,6 +129,10 @@ pub(super) fn handle_key<P, L>(
         return;
     }
 
+    if handle_reasoning_picker_key(model, key, kernel.provider.as_ref()) {
+        return;
+    }
+
     // Picker handling
     if let Some(picker) = model.picker.as_mut() {
         let labels = picker.kind.labels();
@@ -137,7 +141,7 @@ pub(super) fn handle_key<P, L>(
             KeyCode::Down => picker.selected = (picker.selected + 1) % labels.len().max(1),
             KeyCode::Enter => {
                 // Session picker: fetch the selected session's events and replay
-                // them into the transcript. Think/Effort pickers apply in-place.
+                // them into the transcript.
                 if let PickerKind::Session(sessions) = &picker.kind {
                     if let Some(meta) = sessions.get(picker.selected) {
                         let id = meta.id;
@@ -178,11 +182,18 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                let choice = labels[picker.selected].clone();
-                let msg = picker.kind.apply(kernel.provider.as_ref(), &choice);
-                model.reasoning = kernel.provider.reasoning();
-                model.picker = None;
-                model.push_notice(msg);
+                // Skill picker: a name was chosen → force-load its procedure into
+                // the transcript (same as `/skill <name>`).
+                if let PickerKind::Skill(skills) = &picker.kind {
+                    let name = skills.get(picker.selected).map(|(n, _)| n.clone());
+                    if let Some(name) = name {
+                        model.picker = None;
+                        load_skill_by_name(model, &name, transcript);
+                    } else {
+                        model.picker = None;
+                    }
+                    return;
+                }
             }
             KeyCode::Esc => model.picker = None,
             _ => {}
@@ -214,12 +225,7 @@ pub(super) fn handle_key<P, L>(
                     model.input.clear();
                     model.cursor = 0;
                     model.ac_sel = 0;
-                    match cmd.as_str() {
-                        "resume" => start_resume(model, kernel, tx),
-                        "rewind" => start_rewind(model, kernel, session, tx),
-                        "clear" => do_clear(model, session, transcript),
-                        _ => run_slash(model, &cmd, transcript, kernel.provider.as_ref()),
-                    }
+                    dispatch_slash(model, &cmd, kernel, session, transcript, tx);
                     return;
                 }
                 _ => {}
@@ -273,12 +279,7 @@ pub(super) fn handle_key<P, L>(
                 model.history.push(line.clone());
                 model.history_idx = None;
                 let cmd = line.trim_start_matches('/').trim();
-                match cmd {
-                    "resume" => start_resume(model, kernel, tx),
-                    "rewind" => start_rewind(model, kernel, session, tx),
-                    "clear" => do_clear(model, session, transcript),
-                    _ => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
-                }
+                dispatch_slash(model, cmd, kernel, session, transcript, tx);
                 return;
             }
             if model.input.trim().is_empty() {
@@ -450,6 +451,7 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
         }
         TuiEvent::Done(updated, reason) => {
             *transcript = updated;
+            model.last_turn_reasoning_received = Some(model.reasoning_received_this_turn);
             model.running = false;
             model.current_tool = None;
             model.turn_started = None;
@@ -469,6 +471,7 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
             }
         }
         TuiEvent::Error(e) => {
+            model.last_turn_reasoning_received = Some(model.reasoning_received_this_turn);
             model.push_notice(format!("error: {e}"));
             model.running = false;
             model.current_tool = None;
@@ -513,6 +516,8 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
             transcript.push(system);
             transcript.extend(msgs.clone());
             repaint_history(model, &msgs);
+            model.reasoning_received_this_turn = false;
+            model.last_turn_reasoning_received = None;
             model.push_notice(format!("(resumed session {id})"));
         }
         // `/rewind` cut points arrived from the log — open the rewind picker.
@@ -596,6 +601,63 @@ pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
 /// Open the resume picker — but refuse while a turn is mid-flight: resuming then
 /// would let the finishing turn's `Done` event overwrite the freshly-loaded
 /// transcript. The user must finish or Esc the current turn first.
+/// What a slash command routes to. Pure — no kernel, no side effects — so the
+/// routing itself is unit-testable (a `/skill` regression once slipped through
+/// because only the *handler* was tested, not that the command reached it).
+#[derive(Debug, PartialEq, Eq)]
+enum SlashAction {
+    Resume,
+    Rewind,
+    Clear,
+    SkillPicker,
+    LoadSkill(String),
+    /// Everything else — handled by `run_slash` (help, status, skills, think…).
+    Other,
+}
+
+/// Map a slash command (leading `/` already stripped) to its action. This is the
+/// single source of truth for routing; both Enter paths go through it.
+fn classify_slash(cmd: &str) -> SlashAction {
+    match cmd {
+        "resume" => SlashAction::Resume,
+        "rewind" => SlashAction::Rewind,
+        "clear" => SlashAction::Clear,
+        "skill" => SlashAction::SkillPicker,
+        c if c.starts_with("skill ") => {
+            SlashAction::LoadSkill(c.strip_prefix("skill ").unwrap_or("").trim().to_string())
+        }
+        _ => SlashAction::Other,
+    }
+}
+
+/// Route a slash command to its handler. The ONE dispatch point — both Enter
+/// paths (autocomplete-accept and plain typed) call this, so they can never
+/// diverge (a bug we hit when the two were duplicated).
+fn dispatch_slash<P, L>(
+    model: &mut Model,
+    cmd: &str,
+    kernel: &Arc<Kernel<P, L>>,
+    session: &mut Session,
+    transcript: &mut Vec<Message>,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) where
+    P: Provider + 'static,
+    L: EventLog + 'static,
+{
+    // Clear the welcome splash: the view draws it INSTEAD of the transcript, so
+    // a command run as the very first action would otherwise push a notice that
+    // stays hidden behind the splash — looks like nothing happened.
+    model.welcome = false;
+    match classify_slash(cmd) {
+        SlashAction::Resume => start_resume(model, kernel, tx),
+        SlashAction::Rewind => start_rewind(model, kernel, session, tx),
+        SlashAction::Clear => do_clear(model, session, transcript),
+        SlashAction::SkillPicker => open_skill_picker(model),
+        SlashAction::LoadSkill(name) => load_skill_by_name(model, &name, transcript),
+        SlashAction::Other => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
+    }
+}
+
 fn start_resume<L: EventLog + 'static>(
     model: &mut Model,
     kernel: &Arc<Kernel<impl Provider + 'static, L>>,
@@ -739,7 +801,11 @@ pub(super) fn spawn_turn<P, L>(
     model.push_item(Item::User(line.clone()));
     model.auto_scroll = true;
     model.running = true;
+    model.reasoning_received_this_turn = false;
     model.turn_started = Some(Instant::now());
+    // Pick up any skill saved/edited since startup so the model's manifest is
+    // current this turn (not just next session).
+    model.refresh_skill_manifest(transcript);
     transcript.push(Message::user(line));
 
     // Graceful interruption: the kernel owns cancellation now. Esc trips the
@@ -803,6 +869,72 @@ fn is_cmd_boundary(rest: &str) -> bool {
     rest.is_empty() || rest.starts_with(char::is_whitespace)
 }
 
+/// The unified reasoning panel has three editable rows. The fourth row reports
+/// delivery for the previous turn and is deliberately not selectable.
+fn handle_reasoning_picker_key<P: kernel::Provider>(
+    model: &mut Model,
+    key: KeyEvent,
+    provider: &P,
+) -> bool {
+    let selected = match model.picker.as_ref() {
+        Some(Picker { kind: PickerKind::Reasoning(_), selected }) => *selected,
+        _ => return false,
+    };
+
+    match key.code {
+        KeyCode::Up => {
+            if let Some(picker) = model.picker.as_mut() {
+                picker.selected = picker.selected.checked_sub(1).unwrap_or(2);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(picker) = model.picker.as_mut() {
+                picker.selected = (picker.selected + 1) % 3;
+            }
+        }
+        KeyCode::Enter => {
+            match selected {
+                0 => {
+                    let cfg = provider.reasoning();
+                    let enabled = cfg.enabled != Some(true);
+                    provider.set_reasoning(kernel::ReasoningConfig {
+                        enabled: Some(enabled),
+                        effort: if enabled { cfg.effort } else { None },
+                    });
+                    model.reasoning = provider.reasoning();
+                }
+                1 => {
+                    model.show_thinking = !model.show_thinking;
+                    model.invalidate_all_renders();
+                }
+                2 => {
+                    let cfg = provider.reasoning();
+                    let effort = match cfg.effort {
+                        None => Some(kernel::ReasoningEffort::Low),
+                        Some(kernel::ReasoningEffort::Low) => Some(kernel::ReasoningEffort::Medium),
+                        Some(kernel::ReasoningEffort::Medium) => Some(kernel::ReasoningEffort::High),
+                        Some(kernel::ReasoningEffort::High) => None,
+                    };
+                    provider.set_reasoning(kernel::ReasoningConfig {
+                        enabled: Some(true),
+                        effort,
+                    });
+                    model.reasoning = provider.reasoning();
+                }
+                _ => {}
+            }
+            let state = ReasoningPanelState::from_model(model);
+            if let Some(picker) = model.picker.as_mut() {
+                picker.kind = PickerKind::Reasoning(state);
+            }
+            model.dirty = true;
+        }
+        KeyCode::Esc => model.picker = None,
+        _ => {}
+    }
+    true
+}
+
 /// `/clear`: reset the conversation for real. Clearing only the rendered items
 /// (as `run_slash` used to) left the full prior history in `transcript`, so the
 /// very next turn re-shipped everything to the model. Truncate the transcript to
@@ -819,32 +951,87 @@ fn do_clear(model: &mut Model, session: &mut Session, transcript: &mut Vec<Messa
     transcript.push(system);
     *session = Session::new();
     model.items.clear();
+    model.reasoning_received_this_turn = false;
+    model.last_turn_reasoning_received = None;
     model.invalidate_all_renders();
     model.push_notice("(conversation cleared — fresh session)");
 }
 
+/// `/skill` with no name: open a selectable picker of installed skills (↑↓ +
+/// Enter), so the user never has to remember or type an exact name.
+fn open_skill_picker(model: &mut Model) {
+    let Some(store) = model.skills.clone() else {
+        model.push_notice("skills unavailable in this session");
+        return;
+    };
+    let disc = store.discover(&model.known_tools);
+    let list: Vec<(String, String)> = disc
+        .effective()
+        .map(|l| (l.skill.name.clone(), l.skill.description.clone()))
+        .collect();
+    if list.is_empty() {
+        model.push_notice("no skills installed — add one under ~/.medha/skills/<name>/SKILL.md");
+        return;
+    }
+    model.picker = Some(Picker::new(PickerKind::Skill(list)));
+}
+
+/// Force-load a skill's full procedure into the conversation, deterministically
+/// (no reliance on the model choosing to call `skill.load`). This is the
+/// model-independent trigger Hermes exposes via `/skill-name`: the procedure
+/// lands in the transcript, so the next turn the model *has* it. Empty name →
+/// open the picker instead. Reached from `/skill <name>` and the skill picker.
+fn load_skill_by_name(model: &mut Model, name: &str, transcript: &mut Vec<Message>) {
+    if name.is_empty() {
+        open_skill_picker(model);
+        return;
+    }
+    let Some(store) = model.skills.clone() else {
+        model.push_notice("skills unavailable in this session");
+        return;
+    };
+    match store.load(name, &model.known_tools) {
+        Ok(v) => {
+            let body = v.get("procedure").and_then(|s| s.as_str()).unwrap_or("");
+            let desc = v.get("description").and_then(|s| s.as_str()).unwrap_or("");
+            // Inject as a user-role message so the model is guaranteed to see the
+            // procedure on the next turn — same content `skill.load` would return.
+            transcript.push(Message::user(format!(
+                "[Loaded skill: {name}] Follow this procedure for the current and related work:\n\n{body}"
+            )));
+            model.push_notice(format!(
+                "✔ loaded skill '{name}' — {desc}\n  It's in context now; tell me what to do and I'll follow it."
+            ));
+        }
+        Err(e) => model.push_notice(format!("skill '{name}': {e}")),
+    }
+}
+
 pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, transcript: &[Message], provider: &P) {
-    // Only treat `think`/`effort` as those commands when the prefix ends at a
-    // word boundary (end-of-string or a space). Otherwise a greedy
-    // `strip_prefix("think")` also swallows `/thinking` → routes it here with a
-    // garbage arg ("ing"), and the real `"thinking"` arm below is dead code.
+    if let Some(rest) = cmd.strip_prefix("reasoning").filter(|r| is_cmd_boundary(r)) {
+        apply_reasoning_command(model, provider, rest.trim());
+        return;
+    }
+
+    // Compatibility aliases. They are accepted but hidden from autocomplete
+    // and help so the product presents one clear reasoning surface.
     if let Some(rest) = cmd.strip_prefix("think").filter(|r| is_cmd_boundary(r)) {
         let rest = rest.trim();
         if rest.is_empty() {
-            model.picker = Some(Picker::new(PickerKind::Think));
+            open_reasoning_panel(model);
+        } else if rest == "status" {
+            model.push_notice(model.reasoning_status_block());
         } else {
-            model.push_notice(crate::apply_think_command(provider, rest));
-            model.reasoning = provider.reasoning();
+            apply_reasoning_command(model, provider, rest);
         }
         return;
     }
     if let Some(rest) = cmd.strip_prefix("effort").filter(|r| is_cmd_boundary(r)) {
         let rest = rest.trim();
         if rest.is_empty() {
-            model.picker = Some(Picker::new(PickerKind::Effort));
+            open_reasoning_panel(model);
         } else {
-            model.push_notice(crate::apply_effort_command(provider, rest));
-            model.reasoning = provider.reasoning();
+            apply_reasoning_command(model, provider, &format!("effort {rest}"));
         }
         return;
     }
@@ -862,9 +1049,8 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
             model.push_notice("(use /resume to pick a session — or type it and press Enter)");
         }
         "thinking" => {
-            model.show_thinking = !model.show_thinking;
-            model.invalidate_all_renders();
-            model.push_notice(if model.show_thinking { "reasoning: shown" } else { "reasoning: hidden" });
+            let visibility = if model.show_thinking { "hide" } else { "show" };
+            apply_reasoning_command(model, provider, visibility);
         }
         "detail" => {
             model.full_transparency = !model.full_transparency;
@@ -887,6 +1073,12 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
             // stacking identical copies.
             model.upsert_notice("background tasks", text);
         }
+        "skills" => {
+            // Re-scan live so a skill saved this session shows up; refresh the
+            // previous /skills block instead of stacking copies.
+            let text = model.skills_notice();
+            model.upsert_notice("skills", text);
+        }
         "help" => {
             let mut text = COMMANDS.iter().map(|(c, d)| format!("{c}  {d}")).collect::<Vec<_>>().join("\n");
             text.push_str("\n\nshortcuts:\n\n  Esc     interrupt a running turn\n  Ctrl-D  quit\n  ↑/↓     scroll (empty input) · history (while typing)");
@@ -901,10 +1093,69 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
                 Some(mc) => format!("{mc} window"),
                 None => "unknown window".to_string(),
             };
-            let think = crate::apply_think_command(provider, "status");
-            model.push_notice(format!("model: {}  |  {ctx}  |  ~{toks} est. tokens  |  {think}", model.model));
+            model.push_notice(format!(
+                "model: {}  |  {ctx}  |  ~{toks} est. tokens\n\n{}",
+                model.model,
+                model.reasoning_status_block()
+            ));
         }
         other => model.push_notice(format!("unknown command: /{other}")),
+    }
+}
+
+fn open_reasoning_panel(model: &mut Model) {
+    let state = ReasoningPanelState::from_model(model);
+    model.picker = Some(Picker::new(PickerKind::Reasoning(state)));
+}
+
+fn apply_reasoning_command<P: kernel::Provider>(model: &mut Model, provider: &P, args: &str) {
+    let result = match args {
+        "" => {
+            open_reasoning_panel(model);
+            return;
+        }
+        "status" => Ok(()),
+        "on" => {
+            let effort = provider.reasoning().effort;
+            provider.set_reasoning(kernel::ReasoningConfig { enabled: Some(true), effort });
+            model.reasoning = provider.reasoning();
+            Ok(())
+        }
+        "off" => {
+            provider.set_reasoning(kernel::ReasoningConfig { enabled: Some(false), effort: None });
+            model.reasoning = provider.reasoning();
+            Ok(())
+        }
+        "show" | "hide" => {
+            model.show_thinking = args == "show";
+            model.invalidate_all_renders();
+            Ok(())
+        }
+        "effort auto" => {
+            let enabled = provider.reasoning().enabled;
+            provider.set_reasoning(kernel::ReasoningConfig { enabled, effort: None });
+            model.reasoning = provider.reasoning();
+            Ok(())
+        }
+        "effort low" | "effort medium" | "effort high" => {
+            let effort = match args.strip_prefix("effort ").unwrap_or("") {
+                "low" => kernel::ReasoningEffort::Low,
+                "medium" => kernel::ReasoningEffort::Medium,
+                _ => kernel::ReasoningEffort::High,
+            };
+            provider.set_reasoning(kernel::ReasoningConfig {
+                enabled: Some(true),
+                effort: Some(effort),
+            });
+            model.reasoning = provider.reasoning();
+            Ok(())
+        }
+        _ => Err("usage: /reasoning [on|off|show|hide|status|effort auto|low|medium|high]"),
+    };
+
+    match result {
+        Ok(()) => model.push_notice(model.reasoning_status_block()),
+        Err(usage) => model.push_notice(usage),
     }
 }
 
@@ -923,6 +1174,54 @@ mod fix_tests {
                    lockfile::UiConfig::default(), HashMap::new(), sbx)
     }
 
+    // ── slash ROUTING (the bug that shipped: `/skill` reached only one of the
+    //    two Enter paths and fell through to "unknown command"). Both paths now
+    //    route through classify_slash; this pins that routing. ──────────────────
+    #[test]
+    fn classify_slash_routes_skill_commands() {
+        assert_eq!(classify_slash("skill"), SlashAction::SkillPicker);
+        assert_eq!(
+            classify_slash("skill frontend-ui-design"),
+            SlashAction::LoadSkill("frontend-ui-design".into())
+        );
+        // `/skills` (list) must NOT be mistaken for `/skill` (load).
+        assert_eq!(classify_slash("skills"), SlashAction::Other);
+        assert_eq!(classify_slash("resume"), SlashAction::Resume);
+        assert_eq!(classify_slash("clear"), SlashAction::Clear);
+        assert_eq!(classify_slash("help"), SlashAction::Other);
+    }
+
+    // ── /skill <name> force-loads the procedure into the transcript ───────────
+    #[test]
+    fn load_skill_injects_procedure_into_transcript() {
+        let dir = std::env::temp_dir().join(format!("medha-loadskill-{}", ulid::Ulid::new()));
+        let user = dir.join("skills");
+        std::fs::create_dir_all(user.join("greet")).unwrap();
+        std::fs::write(
+            user.join("greet").join("SKILL.md"),
+            "---\nname = \"greet\"\ndescription = \"say hi\"\n---\n\nStep 1: say hello",
+        )
+        .unwrap();
+        let store = Arc::new(tools::SkillStore::new(dir.join("noproj"), Some(user)));
+        let mut m = model().with_skills(store, std::collections::HashSet::new());
+        let mut transcript = vec![Message::system("S")];
+
+        load_skill_by_name(&mut m, "greet", &mut transcript);
+        let injected = &transcript.last().unwrap().content;
+        assert!(injected.contains("say hello"), "procedure body must be injected");
+        assert!(injected.contains("Loaded skill: greet"));
+
+        // Unknown skill → no injection, a clear notice instead.
+        let n = transcript.len();
+        load_skill_by_name(&mut m, "nope", &mut transcript);
+        assert_eq!(transcript.len(), n, "unknown skill must not inject anything");
+
+        // Empty name → opens the picker (no injection), listing the one skill.
+        load_skill_by_name(&mut m, "", &mut transcript);
+        assert!(matches!(&m.picker, Some(p) if matches!(p.kind, PickerKind::Skill(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── K6: `/think` must not capture `/thinking` ─────────────────────────────
     #[test]
     fn cmd_boundary_distinguishes_think_from_thinking() {
@@ -931,6 +1230,72 @@ mod fix_tests {
         assert!(is_cmd_boundary(""));            // /think
         assert!(is_cmd_boundary(" high"));       // /think high
         assert!(!is_cmd_boundary("ing"));        // /thinking → must fall through
+    }
+
+    #[test]
+    fn unified_reasoning_command_controls_every_setting() {
+        let provider = providers::OpenAiCompat::new("http://localhost/v1", "", "m");
+        let mut m = model();
+        let transcript = vec![Message::system("S")];
+
+        run_slash(&mut m, "reasoning on", &transcript, &provider);
+        assert_eq!(m.reasoning.enabled, Some(true));
+
+        run_slash(&mut m, "reasoning show", &transcript, &provider);
+        assert!(m.show_thinking);
+
+        run_slash(&mut m, "reasoning effort high", &transcript, &provider);
+        assert_eq!(m.reasoning.effort, Some(kernel::ReasoningEffort::High));
+
+        run_slash(&mut m, "reasoning effort auto", &transcript, &provider);
+        assert_eq!(m.reasoning.effort, None);
+
+        run_slash(&mut m, "reasoning", &transcript, &provider);
+        assert!(matches!(
+            &m.picker,
+            Some(Picker { kind: PickerKind::Reasoning(_), .. })
+        ));
+        let labels = m.picker.as_ref().unwrap().kind.labels();
+        assert_eq!(labels[0], "Mode:       On");
+        assert_eq!(labels[1], "Visibility: Shown");
+        assert_eq!(labels[2], "Effort:     Auto");
+        assert_eq!(labels[3], "Last turn:  No completed turn yet");
+    }
+
+    #[test]
+    fn reasoning_delivery_is_recorded_when_turn_finishes() {
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+
+        m.running = true;
+        m.reasoning_received_this_turn = false;
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Done(transcript.clone(), StopReason::Finished),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(m.last_turn_reasoning_received, Some(false));
+        assert_eq!(m.reasoning_trace_label(), "no trace");
+
+        m.running = true;
+        m.reasoning_received_this_turn = false;
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Reasoning("planning".into()),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(m.reasoning_trace_label(), "receiving");
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Done(transcript.clone(), StopReason::Finished),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(m.last_turn_reasoning_received, Some(true));
+        assert_eq!(m.reasoning_trace_label(), "received");
     }
 
     // ── K5: `/clear` truncates the transcript and starts a fresh session ──────

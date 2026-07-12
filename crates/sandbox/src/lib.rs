@@ -114,6 +114,15 @@ impl WorkspaceSandbox {
         self
     }
 
+    /// Relocate the undo-snapshot directory out of the workspace. By default
+    /// snapshots live at `<root>/.medha/snapshots`; the CLI points this at the
+    /// per-workspace state dir (`~/.medha/projects/<enc>/snapshots`) so runtime
+    /// state never lands in the working tree. The jail `root` is unchanged.
+    pub fn with_snapshots_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.snapshots = dir.into();
+        self
+    }
+
     /// The label of the active execution backend (`"host"` / `"native"`).
     pub fn exec_backend_label(&self) -> &str {
         self.exec.label()

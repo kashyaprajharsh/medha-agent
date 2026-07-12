@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+mod tty;
 mod update;
 mod view;
 use update::*;
@@ -54,16 +55,20 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
     ("/status", "model, context window, current pressure"),
-    ("/think", "enable/disable reasoning: on|off|status"),
-    ("/effort", "set reasoning depth (bare = arrow-key picker)"),
-    ("/thinking", "show/hide the model's live reasoning"),
+    ("/reasoning", "configure mode, visibility, effort, and inspect delivery"),
     ("/detail", "expand/collapse full tool input & output"),
     ("/resume", "switch to a past session"),
     ("/rewind", "time-travel: branch from an earlier turn (undoes later edits)"),
     ("/tasks", "list background shell tasks (running/finished)"),
+    ("/skills", "list installed skills (scope, availability, shadowing)"),
+    ("/skill", "pick a skill to load into context (or /skill <name>)"),
     ("/clear", "reset the conversation"),
     ("/exit", "quit (also Ctrl-D)"),
 ];
+
+/// Accepted for compatibility, but intentionally omitted from autocomplete and
+/// `/help`: one visible `/reasoning` surface replaces these overlapping names.
+const LEGACY_REASONING_COMMANDS: &[&str] = &["/think", "/thinking", "/effort"];
 
 fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
     COMMANDS.iter().filter(|(c, _)| c.starts_with(input)).copied().collect()
@@ -74,7 +79,10 @@ fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
 /// this" — is chat for the model, not an "unknown command" error.
 fn is_slash_command(line: &str) -> bool {
     match line.split_whitespace().next() {
-        Some(tok) => COMMANDS.iter().any(|(c, _)| *c == tok),
+        Some(tok) => {
+            COMMANDS.iter().any(|(c, _)| *c == tok)
+                || LEGACY_REASONING_COMMANDS.contains(&tok)
+        }
         None => false,
     }
 }
@@ -385,11 +393,77 @@ struct PendingApproval {
     responder: oneshot::Sender<kernel::Approval>,
 }
 
-/// Reasoning control / session picker kind. Not `Copy` — `Session` owns a `Vec`.
+#[derive(Clone)]
+struct ReasoningPanelState {
+    enabled: Option<bool>,
+    show: bool,
+    effort: Option<kernel::ReasoningEffort>,
+    last_turn_received: Option<bool>,
+}
+
+impl ReasoningPanelState {
+    fn from_model(model: &Model) -> Self {
+        Self {
+            enabled: model.reasoning.enabled,
+            show: model.show_thinking,
+            effort: model.reasoning.effort,
+            last_turn_received: model.last_turn_reasoning_received,
+        }
+    }
+
+    fn mode_label(&self) -> &'static str {
+        match self.enabled {
+            Some(true) => "On",
+            Some(false) => "Off",
+            None => "Server default",
+        }
+    }
+
+    fn visibility_label(&self) -> &'static str {
+        if self.show { "Shown" } else { "Hidden" }
+    }
+
+    fn effort_label(&self) -> &'static str {
+        match self.effort {
+            Some(kernel::ReasoningEffort::Low) => "Low",
+            Some(kernel::ReasoningEffort::Medium) => "Medium",
+            Some(kernel::ReasoningEffort::High) => "High",
+            None => "Auto",
+        }
+    }
+
+    fn last_turn_label(&self) -> &'static str {
+        match self.last_turn_received {
+            Some(true) => "Reasoning received",
+            Some(false) => "No reasoning received",
+            None => "No completed turn yet",
+        }
+    }
+
+    fn labels(&self) -> Vec<String> {
+        vec![
+            format!("Mode:       {}", self.mode_label()),
+            format!("Visibility: {}", self.visibility_label()),
+            format!("Effort:     {}", self.effort_label()),
+            format!("Last turn:  {}", self.last_turn_label()),
+        ]
+    }
+
+    fn status_block(&self) -> String {
+        format!(
+            "reasoning\n  Mode:       {}\n  Visibility: {}\n  Effort:     {}\n  Last turn:  {}",
+            self.mode_label(),
+            self.visibility_label(),
+            self.effort_label(),
+            self.last_turn_label()
+        )
+    }
+}
+
+/// Reasoning control / session picker kind. Not `Copy` — some variants own data.
 #[derive(Clone)]
 enum PickerKind {
-    Think,
-    Effort,
+    Reasoning(ReasoningPanelState),
     /// Browse past sessions to resume. Holds the list from `log.sessions()`.
     Session(Vec<kernel::SessionMeta>),
     /// Time-travel cut points in the current session. Holds the list from
@@ -398,26 +472,30 @@ enum PickerKind {
     /// Step 2 of `/rewind`: having chosen a cut point, pick the scope
     /// (conversation only · conversation + code · cancel).
     RewindMode(RewindPoint),
+    /// `/skill` with no name: pick an installed skill to force-load. Holds
+    /// (name, description) for each effective skill.
+    Skill(Vec<(String, String)>),
 }
 
 impl PickerKind {
     fn title(&self) -> String {
         match self {
-            PickerKind::Think => " thinking — ↑↓ select, Enter apply, Esc cancel ".into(),
-            PickerKind::Effort => " effort — ↑↓ select, Enter apply, Esc cancel ".into(),
+            PickerKind::Reasoning(_) => {
+                " reasoning — ↑↓ select, Enter change, Esc done ".into()
+            }
             PickerKind::Session(_) => " resume a session — ↑↓ select, Enter open, Esc cancel ".into(),
             PickerKind::Rewind(_) => " rewind to a turn — ↑↓ select, Enter choose, Esc cancel ".into(),
             PickerKind::RewindMode(p) => {
                 format!(" rewind → “{}” — ↑↓ select, Enter apply, Esc back ", p.label)
             }
+            PickerKind::Skill(_) => " load a skill — ↑↓ select, Enter load, Esc cancel ".into(),
         }
     }
     /// Dynamic labels for each row. For `Session`, each row is a one-line
     /// summary (date · events · title) matching the `--sessions` headless format.
     fn labels(&self) -> Vec<String> {
         match self {
-            PickerKind::Think => vec!["on".into(), "off".into()],
-            PickerKind::Effort => vec!["low".into(), "medium".into(), "high".into()],
+            PickerKind::Reasoning(state) => state.labels(),
             PickerKind::Session(sessions) => sessions
                 .iter()
                 .map(|s| {
@@ -443,16 +521,8 @@ impl PickerKind {
                 })
                 .collect(),
             PickerKind::RewindMode(p) => p.scope_options().into_iter().map(|(l, _)| l).collect(),
-        }
-    }
-    fn apply<P: kernel::Provider>(&self, provider: &P, choice: &str) -> String {
-        match self {
-            PickerKind::Think => crate::apply_think_command(provider, choice),
-            PickerKind::Effort => crate::apply_effort_command(provider, choice),
-            // Session/Rewind kinds are handled by Enter in handle_key (they spawn
-            // async log work or open a sub-picker), not via apply — unreachable.
-            PickerKind::Session(_) | PickerKind::Rewind(_) | PickerKind::RewindMode(_) => {
-                String::new()
+            PickerKind::Skill(skills) => {
+                skills.iter().map(|(n, d)| format!("{n} — {d}")).collect()
             }
         }
     }
@@ -541,6 +611,11 @@ struct Model {
     auto_approve: std::collections::HashSet<String>,
     /// Current reasoning config
     reasoning: kernel::ReasoningConfig,
+    /// Whether any reasoning delta arrived during the active turn.
+    reasoning_received_this_turn: bool,
+    /// Delivery result for the most recently completed turn. `None` means this
+    /// TUI has not completed a turn yet (resumed history does not retain it).
+    last_turn_reasoning_received: Option<bool>,
     /// Active picker
     picker: Option<Picker>,
     /// Autocomplete selection
@@ -577,6 +652,10 @@ struct Model {
     compacting: bool,
     /// Expand compaction cards to show their full summary text (toggled by ^E).
     show_summary: bool,
+    /// Skill store + the session's registered tool names, so `/skills` can
+    /// re-scan live. `None` in tests / when skills aren't wired.
+    skills: Option<Arc<tools::SkillStore>>,
+    known_tools: Arc<std::collections::HashSet<String>>,
 }
 
 impl Model {
@@ -617,6 +696,8 @@ impl Model {
             approval_sel: 0,
             auto_approve: std::collections::HashSet::new(),
             reasoning,
+            reasoning_received_this_turn: false,
+            last_turn_reasoning_received: None,
             picker: None,
             ac_sel: 0,
             welcome: true,
@@ -632,7 +713,75 @@ impl Model {
             bg_shown_running: 0,
             compacting: false,
             show_summary: false,
+            skills: None,
+            known_tools: Arc::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Wire the skill store (project + user dirs) and the session's tool names so
+    /// `/skills` can list them. Set once in `run_tea`.
+    fn with_skills(mut self, store: Arc<tools::SkillStore>, known_tools: std::collections::HashSet<String>) -> Self {
+        self.skills = Some(store);
+        self.known_tools = Arc::new(known_tools);
+        self
+    }
+
+    /// Refresh the skills manifest inside the system message (transcript[0]) so a
+    /// skill saved or edited mid-session shows up in the model's list on the very
+    /// next turn — the manifest is otherwise built once at startup. Strips the
+    /// old "## Skills available" section (stable marker) and re-appends a fresh
+    /// one; no-op when skills aren't wired or transcript[0] isn't the system msg.
+    fn refresh_skill_manifest(&self, transcript: &mut [Message]) {
+        let Some(store) = &self.skills else { return };
+        let Some(sys) = transcript.first_mut() else { return };
+        if sys.role != kernel::Role::System {
+            return;
+        }
+        const MARKER: &str = "## Skills available";
+        if let Some(idx) = sys.content.find(MARKER) {
+            let head = sys.content[..idx].trim_end().to_string();
+            sys.content = head;
+        }
+        let fresh = store.manifest(&self.known_tools, None);
+        if !fresh.is_empty() {
+            sys.content.push_str("\n\n");
+            sys.content.push_str(&fresh);
+        }
+    }
+
+    /// Render the `/skills` notice: effective skills (scope, availability),
+    /// shadowed ones, and parse errors. Mirrors `/tasks`' upsert-in-place block.
+    fn skills_notice(&self) -> String {
+        let Some(store) = &self.skills else {
+            return "skills: unavailable".to_string();
+        };
+        let disc = store.discover(&self.known_tools);
+        if disc.listings.is_empty() && disc.errors.is_empty() {
+            return "skills: none installed\n\n(add one under .medha/skills/<name>/SKILL.md, \
+                    or ask me to save a procedure as a skill)"
+                .to_string();
+        }
+        let mut out = String::from("skills:");
+        for l in disc.effective() {
+            let s = &l.skill;
+            let avail = if l.available() {
+                String::new()
+            } else {
+                format!("  (unavailable: needs {})", l.missing_tools.join(", "))
+            };
+            out.push_str(&format!("\n  {} [{}]  {}{}", s.name, s.scope.as_str(), s.description, avail));
+        }
+        for l in disc.listings.iter().filter(|l| l.shadowed) {
+            out.push_str(&format!(
+                "\n  {} [{}]  — shadowed by project",
+                l.skill.name,
+                l.skill.scope.as_str()
+            ));
+        }
+        for (path, reason) in &disc.errors {
+            out.push_str(&format!("\n  ⚠ {} — {reason}", path.display()));
+        }
+        out
     }
 
     /// How many background tasks are still running.
@@ -758,6 +907,7 @@ impl Model {
     }
 
     fn push_thinking_delta(&mut self, delta: &str) {
+        self.reasoning_received_this_turn = true;
         let appended = matches!(self.items.back().map(|e| &e.item), Some(Item::Thinking(_)));
         if appended {
             let e = self.items.back_mut().unwrap();
@@ -771,6 +921,22 @@ impl Model {
             }
         } else {
             self.push_item(Item::Thinking(delta.to_string()));
+        }
+    }
+
+    fn reasoning_status_block(&self) -> String {
+        ReasoningPanelState::from_model(self).status_block()
+    }
+
+    fn reasoning_trace_label(&self) -> &'static str {
+        if self.running {
+            if self.reasoning_received_this_turn { "receiving" } else { "waiting" }
+        } else {
+            match self.last_turn_reasoning_received {
+                Some(true) => "received",
+                Some(false) => "no trace",
+                None => "no turn",
+            }
         }
     }
 
@@ -847,6 +1013,9 @@ pub async fn run_tea<P, L>(
     ui: lockfile::UiConfig,
     resumed: Vec<Message>,
     restore: Arc<WorkspaceSandbox>,
+    stray_log: std::path::PathBuf,
+    skill_store: Arc<tools::SkillStore>,
+    known_tools: std::collections::HashSet<String>,
     tx: mpsc::UnboundedSender<TuiEvent>,
     mut rx: mpsc::UnboundedReceiver<TuiEvent>,
 ) -> anyhow::Result<()>
@@ -854,11 +1023,10 @@ where
     P: Provider + 'static,
     L: EventLog + 'static,
 {
-    use crossterm::event::{EnableBracketedPaste, DisableBracketedPaste};
-
-    // Terminal setup with panic-safe restore hook (PART 0/2).
-    let mut terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // Terminal setup with panic-safe restore hook (PART 0/2). Draws on a private
+    // tty handle; a dependency's stray stdout is redirected to `stray_log` so it
+    // can't corrupt the alternate screen. See tty.rs.
+    let (mut terminal, mut redirect) = tty::init(&stray_log)?;
 
     // Presentation flows from the tools' declared metadata (glyph + category) —
     // the single source of truth — so adding a tool needs no TUI edit.
@@ -868,7 +1036,8 @@ where
         .into_iter()
         .map(|s| (s.name, ToolViz { icon: s.icon, category: s.category }))
         .collect();
-    let mut model = Model::new(model_name, max_ctx, kernel.provider.reasoning(), ui, tool_viz, restore);
+    let mut model = Model::new(model_name, max_ctx, kernel.provider.reasoning(), ui, tool_viz, restore)
+        .with_skills(skill_store, known_tools);
     let mut transcript = vec![Message::system(system)];
     transcript.extend(resumed); // prior conversation when resuming (else empty)
     let mut events = EventStream::new();
@@ -947,13 +1116,11 @@ where
 
     }
 
-    // Restore terminal on exit (PART 2).
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
-    ratatui::restore();
+    // Restore terminal on exit (PART 2): leave the alternate screen on the
+    // private handle, then undo the fd 1/2 redirection.
+    tty::restore(&mut terminal, &mut redirect);
     Ok(())
 }
-
-use crossterm::execute;
 
 #[cfg(test)]
 mod tests {
@@ -972,6 +1139,39 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-tui-test-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap())
+    }
+
+    // ---- mid-session skill manifest refresh ----
+
+    #[test]
+    fn refresh_skill_manifest_injects_saved_skill_same_session() {
+        let dir = std::env::temp_dir().join(format!("medha-skref-{}", ulid::Ulid::new()));
+        let proj = dir.join(".medha").join("skills");
+        std::fs::create_dir_all(proj.join("note-taker")).unwrap();
+        std::fs::write(
+            proj.join("note-taker").join("SKILL.md"),
+            "---\nname = \"note-taker\"\ndescription = \"Capture a decision\"\n---\n\nsteps",
+        )
+        .unwrap();
+        let store = Arc::new(tools::SkillStore::new(proj, None));
+        let mut known = std::collections::HashSet::new();
+        known.insert("fs.write".to_string());
+        let model = Model::new(
+            "m".into(), None, kernel::ReasoningConfig::default(),
+            lockfile::UiConfig::default(), HashMap::new(), test_sbx(),
+        )
+        .with_skills(store, known);
+
+        // A system message with no skills section yet (as at startup with none).
+        let mut transcript = vec![Message::system("BASE PROMPT")];
+        model.refresh_skill_manifest(&mut transcript);
+        assert!(transcript[0].content.contains("## Skills available"));
+        assert!(transcript[0].content.contains("note-taker"));
+        // Idempotent: a second refresh must not stack a duplicate section.
+        model.refresh_skill_manifest(&mut transcript);
+        assert_eq!(transcript[0].content.matches("## Skills available").count(), 1);
+        assert!(transcript[0].content.starts_with("BASE PROMPT"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- /rewind scope menu (step 2) ----
@@ -1115,6 +1315,10 @@ mod tests {
     fn slash_parsing_only_fires_on_known_commands() {
         // Known commands, with and without args.
         assert!(is_slash_command("/help"));
+        assert!(is_slash_command("/reasoning"));
+        assert!(is_slash_command("/reasoning effort high"));
+        // Legacy names remain accepted even though autocomplete presents only
+        // the unified command.
         assert!(is_slash_command("/think on"));
         assert!(is_slash_command("/effort high"));
         // A pasted absolute path is CHAT, not an unknown-command error.

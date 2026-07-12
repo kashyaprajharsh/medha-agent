@@ -126,8 +126,11 @@ async fn main() -> Result<()> {
     // provider is resolved, so listing sessions never touches the API key /
     // keychain (it shouldn't need to prompt for a read-only list).
     if cli.sessions {
-        let db = std::env::current_dir()?.join(".medha").join("events.db");
-        print_sessions(&store::SqliteLog::open(&db)?)?;
+        let cwd = std::env::current_dir()?;
+        let cwd = cwd.canonicalize().unwrap_or(cwd);
+        let state = config::state_dir(&cwd)?;
+        migrate_legacy_state(&cwd, &state);
+        print_sessions(&store::SqliteLog::open(state.join("events.db"))?)?;
         return Ok(());
     }
 
@@ -209,12 +212,19 @@ async fn main() -> Result<()> {
     // further adjustable live via /think.
     provider.set_reasoning(lock.reasoning.to_config());
 
-    // Persistent, hash-chained event log at <workspace>/.medha/events.db (§4.2).
+    // Runtime state lives OUT of the working tree, under
+    // ~/.medha/projects/<encoded-cwd>/ (Claude Code style) — event log,
+    // artifacts, snapshots, logs. Only committed config (.medha/skills,
+    // medha.lock) stays in the workspace. See config::state_dir.
     let cwd = std::env::current_dir()?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let state = config::state_dir(&cwd)?;
+    // One-time move of any pre-relocation state from <workspace>/.medha.
+    migrate_legacy_state(&cwd, &state);
 
     // Structured logging to a file, never stdout — a TUI owns the screen (spec §7).
-    // <workspace>/.medha/logs/medha.log; level via RUST_LOG (default info).
-    let logs_dir = cwd.join(".medha").join("logs");
+    // state/logs/medha.log; level via RUST_LOG (default info).
+    let logs_dir = state.join("logs");
     std::fs::create_dir_all(&logs_dir).ok();
     let (log_writer, _log_guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::never(&logs_dir, "medha.log"));
@@ -227,7 +237,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let db_path = cwd.join(".medha").join("events.db");
+    let db_path = state.join("events.db");
     let log = Arc::new(store::SqliteLog::open(&db_path)?);
 
     // Verify the tamper-evident hash chain on resume. A break means the log was
@@ -237,8 +247,8 @@ async fn main() -> Result<()> {
         eprintln!("warning: event log integrity check failed: {e}");
     }
 
-    // Content-addressed artifact store at <workspace>/.medha/artifacts (§4.5).
-    let artifacts = Arc::new(store::FileArtifactStore::open(cwd.join(".medha").join("artifacts"))?);
+    // Content-addressed artifact store at state/artifacts (§4.5).
+    let artifacts = Arc::new(store::FileArtifactStore::open(state.join("artifacts"))?);
 
     // Human gate (§4.7): the editor's approval card in ACP mode, the TUI's modal
     // in TUI mode, a y/N prompt in the terminal REPL/one-shot, auto-deny headless.
@@ -262,21 +272,18 @@ async fn main() -> Result<()> {
     };
 
     // Workspace = current directory; fs/shell tools use permission system for out-of-workspace access (§4.8).
-    // Logs live under <workspace>/.medha/logs/ (created above, alongside events.db/
-    // artifacts); the trust lockfile stays at the project root for the user to edit.
+    // medha.lock stays at the project root (committed, user-editable); runtime
+    // state (logs/db/artifacts/trust) lives in the per-workspace state dir.
     let lock_path = cwd.join("medha.lock");
-    // Machine-local permission grants live here, NOT in the portable medha.lock
-    // (§13.3): absolute per-machine paths must not travel with the harness
-    // artifact. One-time migration moves any legacy [permissions] block out.
-    let trust_path = cwd.join(".medha").join("trust.lock");
+    // Machine-local permission grants live in the per-workspace state dir, NOT in
+    // the portable medha.lock (§13.3): absolute per-machine paths must not travel
+    // with the harness artifact. One-time migration moves any legacy
+    // [permissions] block out.
+    let trust_path = state.join("trust.lock");
     lockfile::migrate_permissions_to_trust_file(&lock_path, &trust_path).ok();
-    // Keep the whole .medha state dir (trust grants, audit log, snapshots, db)
-    // out of version control — write a gitignore once if absent.
-    let medha_dir = cwd.join(".medha");
-    let gitignore = medha_dir.join(".gitignore");
-    if medha_dir.exists() && !gitignore.exists() {
-        std::fs::write(&gitignore, "# MEDHA local state — never commit\n*\n").ok();
-    }
+    // No workspace .gitignore is written any more: runtime state now lives under
+    // ~/.medha/projects/, so the only thing left in <workspace>/.medha is
+    // committed config (skills), which the user *wants* in version control.
     let audit_path = logs_dir.join("audit.log");
     // Migrate an audit log written by an older build at the project root.
     let legacy_audit = cwd.join("medha_audit.log");
@@ -338,9 +345,21 @@ async fn main() -> Result<()> {
 
     let workspace = Arc::new(
         WorkspaceSandbox::new(cwd.clone(), trust_path, audit_path, Some(gate.clone()))?
-            .with_exec_backend(exec_backend),
+            .with_exec_backend(exec_backend)
+            .with_snapshots_dir(state.join("snapshots")),
     );
-    let executor = Arc::new(ToolRegistry::with_workspace(workspace.clone(), artifacts.clone()));
+    // Skills (Phase A, §4.11 consumption side): discover project + user skills
+    // and register `skill.load`/`skill.save`. The store reads the harness's own
+    // `.medha/skills` config dirs directly (not via the sandbox), so scanning
+    // never prompts for permission.
+    let skill_store = Arc::new(tools::SkillStore::new(
+        workspace.root().join(".medha").join("skills"),
+        dirs::home_dir().map(|h| h.join(".medha").join("skills")),
+    ));
+    let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
+    registry.register_skills(skill_store.clone());
+    let known_tools = registry.tool_names();
+    let executor = Arc::new(registry);
 
     // Context engine: budget-aware two-phase compaction (§4.3), tuned from
     // medha.lock's [context] section (or its built-in-matching default).
@@ -420,6 +439,16 @@ async fn main() -> Result<()> {
          date above — do not assume an older year in your searches or answers.",
         cwd.display()
     ));
+    // K2 skills manifest: one compact line per installed skill so the model knows
+    // what it can `skill.load`. Empty (no section) when no skills exist — zero
+    // behaviour change for workspaces without skills. In headless mode the task
+    // narrows the list when there are many; the interactive session lists all.
+    let skills_manifest =
+        skill_store.manifest(&known_tools, if has_task { Some(prompt.as_str()) } else { None });
+    if !skills_manifest.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&skills_manifest);
+    }
 
     // Resume (--continue / --resume <id>): rebuild the prior conversation from
     // the event log and continue the SAME session (new events append onward).
@@ -469,6 +498,9 @@ async fn main() -> Result<()> {
                 ui_config,
                 resumed,
                 workspace.clone(),
+                logs_dir.join("stray-stdout.log"),
+                skill_store.clone(),
+                known_tools.clone(),
                 tx,
                 rx,
             )
@@ -733,7 +765,95 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
     }
 }
 
-/// Interactive session (Vol 7 Stage 2): persistent multi-turn conversation with
+/// One-time move of pre-relocation runtime state from `<workspace>/.medha` into
+/// the new per-workspace state dir (`~/.medha/projects/<enc>`). Non-destructive:
+/// each item moves only if the destination does not already exist, so a fresh
+/// state dir wins and re-running never clobbers. Committed config (`skills`,
+/// `agents`, …) is deliberately NOT moved — it belongs in the workspace.
+fn migrate_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
+    let legacy = cwd.join(".medha");
+    if !legacy.exists() {
+        return;
+    }
+    // events.db carries WAL/SHM sidecars — move them together or the log breaks.
+    for name in [
+        "events.db", "events.db-wal", "events.db-shm",
+        "artifacts", "snapshots", "logs", "trust.lock",
+    ] {
+        let (from, to) = (legacy.join(name), state.join(name));
+        if from.exists() && !to.exists() {
+            if let Err(e) = move_path(&from, &to) {
+                // Don't silently swallow — surface it so a failed move never
+                // looks like lost history (the source is left in place).
+                eprintln!(
+                    "warning: could not migrate {} → {} ({e}). Move it manually to keep the old history.",
+                    from.display(),
+                    to.display()
+                );
+            }
+        }
+    }
+    // Remove the blanket ".medha/.gitignore" older builds wrote (content "*"): it
+    // would now wrongly ignore committed project skills. Only delete our own file.
+    let gi = legacy.join(".gitignore");
+    if let Ok(text) = std::fs::read_to_string(&gi) {
+        if text.contains("MEDHA local state") {
+            std::fs::remove_file(&gi).ok();
+        }
+    }
+    // If nothing committed is left (no skills/agents/etc.), remove the empty dir
+    // so a migrated workspace carries no stray .medha at all.
+    if std::fs::read_dir(&legacy).map(|mut d| d.next().is_none()).unwrap_or(false) {
+        std::fs::remove_dir(&legacy).ok();
+    }
+}
+
+/// Move a file or directory, bulletproof across filesystems: try the atomic
+/// `rename` first (same volume), and on ANY failure — cross-device `EXDEV` is the
+/// common one when `~/.medha` and the workspace sit on different drives — fall
+/// back to a recursive copy-then-delete so the migration never gives up silently.
+fn move_path(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    move_by_copy(from, to)
+}
+
+/// The cross-device fallback for [`move_path`]: copy the tree, then delete the
+/// source. Only leaves the source behind if the *delete* fails (data is already
+/// safe at `to` by then). Factored out so this branch is unit-testable without
+/// actually needing two filesystems.
+fn move_by_copy(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        copy_dir_all(from, to)?;
+        std::fs::remove_dir_all(from)?;
+    } else {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(from, to)?;
+        std::fs::remove_file(from)?;
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory tree (regular files + nested dirs). Symlinks are
+/// followed (their target content is copied) — MEDHA's state dirs hold regular
+/// files, so this is safe and keeps the copy self-contained on the destination.
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 /// Print the workspace's past sessions (newest first) for `--sessions`.
 fn print_sessions(log: &store::SqliteLog) -> Result<()> {
     let sessions = log.list_sessions()?;
@@ -985,5 +1105,98 @@ fn print_status(model: &str, max_ctx: Option<u32>, actual_tokens: u32) {
             );
         }
         None => println!("context: window unknown — compaction off (set MEDHA_MAX_CTX)"),
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("medha-mig-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Legacy <workspace>/.medha state moves to the new state dir, the stale
+    /// blanket gitignore is dropped, and an emptied legacy dir is removed —
+    /// while committed config (skills) is left untouched.
+    #[test]
+    fn migrates_state_out_of_workspace_and_keeps_committed_config() {
+        let root = tmp();
+        let (cwd, state) = (root.join("ws"), root.join("state"));
+        let legacy = cwd.join(".medha");
+        std::fs::create_dir_all(legacy.join("logs")).unwrap();
+        std::fs::create_dir_all(legacy.join("skills").join("mine")).unwrap();
+        std::fs::write(legacy.join("events.db"), b"DB").unwrap();
+        std::fs::write(legacy.join("logs").join("medha.log"), b"log").unwrap();
+        std::fs::write(legacy.join(".gitignore"), "# MEDHA local state — never commit\n*\n").unwrap();
+        std::fs::write(legacy.join("skills").join("mine").join("SKILL.md"), "x").unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        migrate_legacy_state(&cwd, &state);
+
+        // State moved out.
+        assert_eq!(std::fs::read(state.join("events.db")).unwrap(), b"DB");
+        assert!(state.join("logs").join("medha.log").exists());
+        assert!(!legacy.join("events.db").exists());
+        // Stale auto-gitignore dropped; committed skills kept in the workspace.
+        assert!(!legacy.join(".gitignore").exists());
+        assert!(legacy.join("skills").join("mine").join("SKILL.md").exists(), "committed config must stay");
+        // Legacy dir NOT removed because skills/ remains.
+        assert!(legacy.exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Non-destructive: a file already present in the new state dir is never
+    /// clobbered by an older legacy copy.
+    #[test]
+    fn does_not_clobber_existing_state() {
+        let root = tmp();
+        let (cwd, state) = (root.join("ws"), root.join("state"));
+        std::fs::create_dir_all(cwd.join(".medha")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(cwd.join(".medha").join("events.db"), b"OLD").unwrap();
+        std::fs::write(state.join("events.db"), b"NEW").unwrap();
+
+        migrate_legacy_state(&cwd, &state);
+
+        assert_eq!(std::fs::read(state.join("events.db")).unwrap(), b"NEW", "existing state wins");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The cross-device fallback (used when rename hits EXDEV) must faithfully
+    /// copy a nested directory tree and then remove the source. We call it
+    /// directly so the branch is covered without needing two real filesystems.
+    #[test]
+    fn move_by_copy_relocates_nested_tree_and_removes_source() {
+        let root = tmp();
+        let (from, to) = (root.join("from"), root.join("to"));
+        std::fs::create_dir_all(from.join("sub")).unwrap();
+        std::fs::write(from.join("a.txt"), b"A").unwrap();
+        std::fs::write(from.join("sub").join("b.txt"), b"B").unwrap();
+
+        move_by_copy(&from, &to).unwrap();
+
+        assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"A");
+        assert_eq!(std::fs::read(to.join("sub").join("b.txt")).unwrap(), b"B");
+        assert!(!from.exists(), "source is removed after a successful copy-move");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A single file goes through the same fallback (creating the parent).
+    #[test]
+    fn move_by_copy_relocates_single_file() {
+        let root = tmp();
+        let from = root.join("db");
+        std::fs::write(&from, b"DB").unwrap();
+        let to = root.join("nested").join("db");
+
+        move_by_copy(&from, &to).unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"DB");
+        assert!(!from.exists());
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -2,7 +2,7 @@
 
 Research note behind MEDHA's reasoning support. Grounds the parsing in
 `crates/providers/src/openai_compat.rs` and the request-side controls in
-`crates/lockfile` / the `/think` and `/effort` commands. Written so the next
+`crates/lockfile` / the unified `/reasoning` command. Written so the next
 person doesn't have to re-derive which field a given server uses.
 
 ## TL;DR
@@ -106,7 +106,7 @@ is no single knob:
 
 MEDHA models this as a `ReasoningConfig { enabled, effort }`
 (`kernel::ReasoningConfig`), seeded from `medha.lock`'s `[reasoning]` section
-and adjustable live with `/think` and `/effort`. The adapter maps it to
+and adjustable live with `/reasoning`. The adapter maps it to
 whatever the endpoint understands and **silently omits** knobs a given server
 can't map (an effort tier it doesn't support is not faked). This matches the
 project's rule: never fabricate a capability the backend doesn't actually have.

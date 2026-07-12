@@ -6,6 +6,9 @@
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
+
+pub mod skills;
+pub use skills::{SkillScope, SkillStore};
 use regex::{Regex, RegexBuilder};
 use sandbox::WorkspaceSandbox;
 use scraper::{Html, Selector};
@@ -137,6 +140,23 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
         self.tools.insert(tool.name().to_string(), tool);
+        self
+    }
+
+    /// The names of every registered tool — used to validate a skill's
+    /// `required_tools` against what this session can actually call.
+    pub fn tool_names(&self) -> std::collections::HashSet<String> {
+        self.tools.keys().cloned().collect()
+    }
+
+    /// Register the Phase-A skill tools (`skill.load`, `skill.save`) over the
+    /// given store. Call *after* the capability tools are registered so the
+    /// captured `known_tools` set (frozen for the session) reflects them — it is
+    /// what `required_tools` is validated against.
+    pub fn register_skills(&mut self, store: Arc<SkillStore>) -> &mut Self {
+        let known = Arc::new(self.tool_names());
+        self.register(Arc::new(skills::SkillLoad { store: store.clone(), known_tools: known.clone() }));
+        self.register(Arc::new(skills::SkillSave { store, known_tools: known }));
         self
     }
 

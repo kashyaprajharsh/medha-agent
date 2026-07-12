@@ -385,9 +385,9 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
         Item::Thinking(s) => {
             let style = Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC);
             if !cx.show_thinking {
-                return vec![Line::from(Span::styled("  · thinking (hidden — /thinking)", Style::default().fg(theme::FAINT).add_modifier(Modifier::ITALIC)))];
+                return vec![Line::from(Span::styled("  · reasoning (hidden — /reasoning show)", Style::default().fg(theme::FAINT).add_modifier(Modifier::ITALIC)))];
             }
-            let mut lines = vec![Line::from(Span::styled("  · thinking", style))];
+            let mut lines = vec![Line::from(Span::styled("  · reasoning", style))];
             lines.extend(s.lines().map(|l| Line::from(Span::styled(format!("  {l}"), style))));
             lines
         }
@@ -681,13 +681,17 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         Some((usd, false)) => format!(" · ${usd:.2}"),
         None => String::new(),
     };
-    let think = match model.reasoning.enabled {
-        Some(true) => format!("think {}", crate::effort_label(model.reasoning.effort)),
-        Some(false) => "think off".to_string(),
-        None => "think —".to_string(),
+    let mode = match model.reasoning.enabled {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "default",
     };
-    let hints = if model.running { "esc interrupt" } else { "/thinking · /detail · /help" };
-    let right = format!("{ctx}{cost} · {think}   {hints}");
+    let visibility = if model.show_thinking { "shown" } else { "hidden" };
+    let effort = crate::effort_label(model.reasoning.effort);
+    let trace = model.reasoning_trace_label();
+    let reasoning = format!("reasoning {mode} · {visibility} · {effort} · {trace}");
+    let hints = if model.running { "esc interrupt" } else { "/reasoning · /detail · /help" };
+    let right = format!("{ctx}{cost} · {reasoning}   {hints}");
     // Pad in terminal cells (K14) so the right block stays right-aligned even
     // with wide glyphs in the left block.
     let left_w: usize = left.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
@@ -850,7 +854,10 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
     // (set in view()), or the last lines — e.g. the approval options — get clipped
     // off the bottom even when auto-scrolled.
     model.viewport_height = area.height as usize;
-    if model.welcome {
+    // Show the welcome splash only while the transcript is truly empty. Guarding
+    // on `items.is_empty()` too means any pushed content (e.g. a `/skills` notice
+    // run as the first action) always wins — the splash can never hide it.
+    if model.welcome && model.items.is_empty() {
         model.content_height = area.height as usize;
         draw_welcome(f, model, area);
         return;

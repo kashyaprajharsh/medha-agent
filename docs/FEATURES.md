@@ -256,10 +256,11 @@ Four run modes, chosen automatically:
 |---------|:---:|:---:|--------|
 | `/help` | ✅ | ✅ | Show commands |
 | `/status` | ✅ | ✅ | Model, context window, pressure, thinking state |
-| `/think [on\|off\|status]` | ✅ | ✅ | Enable/disable reasoning |
-| `/effort [low\|medium\|high]` | ✅ | ✅ | Set reasoning depth (bare = arrow-key picker in TUI) |
+| `/reasoning` | — | ✅ | Unified mode, visibility, effort, and delivery-status panel |
+| `/reasoning on\|off\|show\|hide\|status` | — | ✅ | Configure reasoning explicitly |
+| `/reasoning effort auto\|low\|medium\|high` | — | ✅ | Set reasoning depth (`low`/`medium`/`high` also enable it) |
+| `/think`, `/effort`, `/thinking` | ✅ | ✅ | Compatibility aliases (hidden from TUI help/autocomplete) |
 | `/clear` | ✅ | — | Reset conversation (keep system prompt) |
-| `/thinking` | — | ✅ | Show/hide the model's live reasoning |
 | `/detail` | — | ✅ | Expand/collapse full tool input & output |
 | `/exit` `/quit` | ✅ | ✅ | Quit (also `Ctrl`+`D`) |
 
@@ -283,7 +284,7 @@ Groq, OpenAI). Uses `rustls` (no OpenSSL) so the binary is self-contained.
 - **Request-side reasoning control** — `ReasoningConfig {enabled, effort}` maps
   to `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`) and is
   silently omitted for servers that don't support a given knob. Set via
-  `[reasoning]` in `medha.lock` or `/think` `/effort` live.
+  `[reasoning]` in `medha.lock` or the unified `/reasoning` panel live.
 - **Exact token counting** — discovers the host's tokenization route on first
   use (vLLM `/tokenize` or Anthropic-style `/messages/count_tokens`), caches it,
   and returns `None` when none exists (falls back to a local estimate). The

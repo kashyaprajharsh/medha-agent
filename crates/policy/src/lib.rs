@@ -11,6 +11,8 @@
 //! compiler; that's the next increment. The command scanner already blocks the
 //! concrete damage path regardless of where the command originated.
 
+pub mod guard;
+
 use kernel::{AutonomyLevel, BlastRadius, Decision, Policy, ToolIntent};
 use regex::Regex;
 use std::collections::HashSet;
@@ -288,7 +290,7 @@ fn is_system_path(p: &str) -> bool {
 /// Patterns that are refused outright. This is intentionally best-effort — the
 /// real guarantee comes from `needs_review` escalating everything ambiguous, so
 /// this list only needs to catch the clearly-destructive shapes.
-fn hard_dangerous(c: &str, workspace: Option<&str>) -> Option<String> {
+pub(crate) fn hard_dangerous(c: &str, workspace: Option<&str>) -> Option<String> {
     const SUBSTRINGS: &[(&str, &str)] = &[
         (":(){", "fork bomb"),
         ("mkfs", "filesystem format"),
@@ -359,7 +361,7 @@ fn hard_dangerous(c: &str, workspace: Option<&str>) -> Option<String> {
 /// legitimate uses) but must never be silently allowed — they route to the
 /// human gate, so under a no-human policy (`MEDHA_APPROVE=none`, `AutoDeny`)
 /// they fail closed rather than open.
-fn needs_review(c: &str) -> Option<&'static str> {
+pub(crate) fn needs_review(c: &str) -> Option<&'static str> {
     // Command/process substitution and backtick subshells: their output can be
     // an arbitrary command the scan never inspected.
     if c.contains("$(") || c.contains('`') || c.contains("<(") || c.contains(">(") {

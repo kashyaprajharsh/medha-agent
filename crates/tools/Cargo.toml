@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 kernel.workspace = true
 sandbox = { path = "../sandbox" }
+policy = { path = "../policy" }
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

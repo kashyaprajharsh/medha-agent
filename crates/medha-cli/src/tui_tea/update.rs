@@ -1618,8 +1618,19 @@ pub(super) fn handle_agent_event(
                 } else {
                     ""
                 };
+                // A caution verdict installs but must be shown — the package
+                // carried dual-use content the user should know about.
+                let caution = if report.scan_verdict == "caution" {
+                    let mut w = String::from("\n  ⚠ guard flagged (review before use):");
+                    for f in &report.scan_findings {
+                        w.push_str(&format!("\n    · {f}"));
+                    }
+                    w
+                } else {
+                    String::new()
+                };
                 model.push_notice(format!(
-                    "✔ {verb} skill '{}' — {} files · {}{}\n  Load: /skill {} · Inspect: /skill info {}{shadowing}",
+                    "✔ {verb} skill '{}' — {} files · {}{}\n  Load: /skill {} · Inspect: /skill info {}{shadowing}{caution}",
                     report.name,
                     report.files,
                     human_bytes(report.bytes),

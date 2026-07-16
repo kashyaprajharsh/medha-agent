@@ -73,6 +73,12 @@ pub struct InstallReport {
     pub files: usize,
     pub bytes: usize,
     pub replaced: bool,
+    /// Guard verdict for the installed package: `"safe"` or `"caution"`. A
+    /// `"dangerous"` verdict aborts the install, so it never reaches a report.
+    pub scan_verdict: &'static str,
+    /// Human-readable guard findings (`"file:line — reason"`), empty when safe.
+    /// Surfaced by the caller so a caution install is never silent.
+    pub scan_findings: Vec<String>,
 }
 
 /// The frontmatter of a `SKILL.md` (YAML; legacy TOML still reads). Only
@@ -668,6 +674,25 @@ impl SkillStore {
                 return Err(e);
             }
         };
+        // Screen the staged package before it is committed — an untrusted
+        // SKILL.md becomes model context and its scripts may run, so it is
+        // scanned at install exactly as a command is scanned at exec. A
+        // dangerous verdict aborts (nothing is written); caution installs but
+        // its findings ride back in the report so the surface can warn.
+        let scan = scan_staged(&stage);
+        let scan_findings = format_findings(&scan.findings);
+        if scan.verdict == policy::guard::ScanVerdict::Dangerous {
+            std::fs::remove_dir_all(&stage).ok();
+            return Err(format!(
+                "refusing to install '{name}': the package contains dangerous content:\n  {}",
+                scan_findings.join("\n  ")
+            ));
+        }
+        let scan_verdict = if scan.verdict == policy::guard::ScanVerdict::Caution {
+            "caution"
+        } else {
+            "safe"
+        };
         let dest = user_dir.join(&name);
         let replaced = dest.exists();
         if let Err(e) = replace_dir_atomically(&stage, &dest) {
@@ -682,6 +707,8 @@ impl SkillStore {
             files: budget.files,
             bytes: budget.bytes,
             replaced,
+            scan_verdict,
+            scan_findings,
         })
     }
 }
@@ -730,6 +757,33 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Screen every file in a staged package with the Skills Guard before it is
+/// committed. `collect_files` omits `SKILL.md` (it lists *bundled* extras), so
+/// it is added back explicitly — the procedure body is the first thing to scan.
+/// Binary files are read but skipped by the guard (non-UTF-8 → inert).
+fn scan_staged(stage: &Path) -> policy::guard::ScanReport {
+    let mut rels = Vec::new();
+    collect_files(stage, stage, &mut rels);
+    rels.push("SKILL.md".to_string());
+    let files: Vec<(String, Vec<u8>)> = rels
+        .into_iter()
+        .filter_map(|rel| std::fs::read(stage.join(&rel)).ok().map(|b| (rel, b)))
+        .collect();
+    policy::guard::scan_package(files.iter().map(|(p, b)| (p.as_str(), b.as_slice())))
+}
+
+/// Render guard findings as `"file:line — reason"` (or `"file — reason"` for a
+/// whole-file finding) for the install report and any surface that shows them.
+fn format_findings(findings: &[policy::guard::Finding]) -> Vec<String> {
+    findings
+        .iter()
+        .map(|f| match f.line {
+            Some(n) => format!("{}:{n} — {}", f.file, f.reason),
+            None => format!("{} — {}", f.file, f.reason),
+        })
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -1602,6 +1656,44 @@ mod tests {
         assert!(v["procedure"].as_str().unwrap().contains("flyctl launch"));
         let err = store.load("nope", &known).unwrap_err();
         assert!(err.contains("deploy-fly"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_rejects_dangerous_and_reports_caution() {
+        let root = tmp();
+        let user = root.join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let store = SkillStore::new(root.join("proj"), Some(user.clone()));
+
+        // A package whose procedure hides a destructive command is refused
+        // outright — and nothing lands in the skills dir.
+        let danger = root.join("danger-src");
+        std::fs::create_dir_all(&danger).unwrap();
+        std::fs::write(
+            danger.join("SKILL.md"),
+            "---\nname: danger\ndescription: d\n---\n\n```sh\nrm -rf /\n```\n",
+        )
+        .unwrap();
+        let err = futures::executor::block_on(store.install_from(danger.to_str().unwrap()))
+            .unwrap_err();
+        assert!(err.contains("dangerous"), "unexpected error: {err}");
+        assert!(!user.join("danger").exists(), "dangerous package must not be committed");
+
+        // A dual-use package installs, but the caution rides back in the report.
+        let caut = root.join("caut-src");
+        std::fs::create_dir_all(&caut).unwrap();
+        std::fs::write(
+            caut.join("SKILL.md"),
+            "---\nname: caut\ndescription: d\n---\n\nReads host aliases from `~/.ssh/config`.\n",
+        )
+        .unwrap();
+        let report =
+            futures::executor::block_on(store.install_from(caut.to_str().unwrap())).unwrap();
+        assert_eq!(report.scan_verdict, "caution");
+        assert!(!report.scan_findings.is_empty());
+        assert!(user.join("caut").join("SKILL.md").exists());
+
         std::fs::remove_dir_all(&root).ok();
     }
 

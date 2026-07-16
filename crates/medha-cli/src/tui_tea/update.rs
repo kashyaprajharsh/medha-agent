@@ -1641,6 +1641,32 @@ pub(super) fn handle_agent_event(
             }
             Err(e) => model.push_notice(format!("skill install failed: {e}")),
         },
+        // `/skill search` finished querying the registered sources.
+        TuiEvent::SkillSearchResults(result) => match result {
+            Ok(res) => {
+                let mut s = if res.hits.is_empty() {
+                    String::from("no matching skills found")
+                } else {
+                    let mut s = format!("found {} skill(s):", res.hits.len());
+                    for h in res.hits.iter().take(25) {
+                        let desc: String = h.description.chars().take(100).collect();
+                        s.push_str(&format!(
+                            "\n  · {} v{} ({})\n      {desc}\n      install: /skill install {}",
+                            h.name, h.version, h.repo, h.install_url
+                        ));
+                    }
+                    if res.hits.len() > 25 {
+                        s.push_str(&format!("\n  … and {} more — narrow the query", res.hits.len() - 25));
+                    }
+                    s
+                };
+                for e in &res.errors {
+                    s.push_str(&format!("\n  ⚠ source error — {e}"));
+                }
+                model.push_notice(s);
+            }
+            Err(e) => model.push_notice(format!("skill search failed: {e}")),
+        },
         // Model setup finished querying /v1/models — show the picker or fall
         // back to manual entry.
         TuiEvent::ModelsDiscovered { base_url, result } => {
@@ -1790,6 +1816,8 @@ enum SlashAction {
     /// `/skill sources [add <owner/repo [path]> | remove <owner/repo>]` —
     /// list or edit the registered skill sources ("taps").
     SkillSources(String),
+    /// `/skill search <query>` — search registered sources for skills.
+    SearchSkills(String),
     /// Everything else — handled by `run_slash` (help, status, skills, think…).
     Other,
 }
@@ -1815,6 +1843,14 @@ fn classify_slash(cmd: &str) -> SlashAction {
         c if c.strip_prefix("skill sources").is_some_and(is_cmd_boundary) => {
             SlashAction::SkillSources(
                 c.strip_prefix("skill sources")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            )
+        }
+        c if c.strip_prefix("skill search").is_some_and(is_cmd_boundary) => {
+            SlashAction::SearchSkills(
+                c.strip_prefix("skill search")
                     .unwrap_or("")
                     .trim()
                     .to_string(),
@@ -1893,6 +1929,7 @@ fn dispatch_slash<P, L>(
         }
         SlashAction::InstallSkill(src) => install_skill(model, &src, tx),
         SlashAction::SkillSources(args) => skill_sources(model, &args),
+        SlashAction::SearchSkills(query) => search_skills(model, &query, tx),
         SlashAction::Other => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
     }
 }
@@ -2508,6 +2545,35 @@ fn skill_sources(model: &mut Model, args: &str) {
     }
 }
 
+/// `/skill search <query>` — query the registered sources (async, network) and
+/// report matches with an install command for each. Reads only metadata.
+fn search_skills(model: &mut Model, query: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    if query.is_empty() {
+        return model.push_notice(
+            "usage: /skill search <query>\n  searches your /skill sources — add one first if you have none",
+        );
+    }
+    let taps = match config::user_taps_path()
+        .map_err(|e| e.to_string())
+        .and_then(|p| tools::TapStore::new(p).list())
+    {
+        Ok(t) => t,
+        Err(e) => return model.push_notice(format!("skill search unavailable: {e}")),
+    };
+    if taps.is_empty() {
+        return model.push_notice(
+            "no skill sources registered — add one first:\n  /skill sources add <owner/repo>",
+        );
+    }
+    let count = taps.len();
+    let (q, tx) = (query.to_string(), tx.clone());
+    tokio::spawn(async move {
+        let result = tools::hub::search(&taps, &q).await;
+        let _ = tx.send(TuiEvent::SkillSearchResults(result));
+    });
+    model.push_notice(format!("(searching {count} source(s) for '{query}' …)"));
+}
+
 fn show_skill_info(model: &mut Model, name: &str) {
     if name.is_empty() {
         model.push_notice("usage: /skill info <name>\n  Browse names with /skill or /skills");
@@ -2947,6 +3013,10 @@ mod fix_tests {
         assert_eq!(
             classify_slash("skill sources add anthropics/skills"),
             SlashAction::SkillSources("add anthropics/skills".into())
+        );
+        assert_eq!(
+            classify_slash("skill search pdf"),
+            SlashAction::SearchSkills("pdf".into())
         );
         // …but a name that merely starts with "sources" still loads as a name.
         assert_eq!(

@@ -3,8 +3,17 @@
 //! full URL every time. Persisted as TOML in the user's medha home. The hub
 //! reuses the guard-gated installer in [`crate::skills`] for anything it fetches.
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+/// SKILL.md fetches per tap to run concurrently. Bounds outbound requests so a
+/// large catalog can't open hundreds of sockets at once.
+const SEARCH_CONCURRENCY: usize = 8;
+/// Cap on skill folders inspected per tap, so one huge repo can't dominate a
+/// search (and to keep the request count bounded against rate limits).
+const MAX_SKILLS_PER_TAP: usize = 200;
 
 /// The default subdirectory a tap's skill folders live under, matching the
 /// prevailing `repo/skills/<name>/SKILL.md` convention across the ecosystem.
@@ -161,6 +170,145 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
+// ── search ────────────────────────────────────────────────────────────────
+
+/// One skill found in a source during search — metadata only (progressive
+/// disclosure at the registry level). The full package is pulled, scanned, and
+/// approved only on install via `install_url`.
+#[derive(Debug, Clone)]
+pub struct SkillHit {
+    pub name: String,
+    pub description: String,
+    pub version: u32,
+    /// `owner/repo` the hit came from.
+    pub repo: String,
+    /// GitHub `/tree/` URL that installs this exact skill folder.
+    pub install_url: String,
+    /// Query-match rank (higher = better); name matches outrank description.
+    score: u8,
+}
+
+/// Outcome of a search: ranked hits plus any per-source errors, so a
+/// rate-limited or unreachable source is reported rather than silently dropped.
+#[derive(Debug, Clone, Default)]
+pub struct SearchResults {
+    pub hits: Vec<SkillHit>,
+    pub errors: Vec<String>,
+}
+
+/// Search every registered source for skills whose name or description matches
+/// `query` (empty query lists everything). Metadata only — nothing is
+/// downloaded beyond each candidate's `SKILL.md`. One failing source does not
+/// abort the others.
+pub async fn search(taps: &[Tap], query: &str) -> Result<SearchResults, String> {
+    let client = crate::skills::install_client()?;
+    let q = query.trim().to_lowercase();
+    let mut out = SearchResults::default();
+    for tap in taps {
+        match search_tap(&client, tap, &q).await {
+            Ok(mut hits) => out.hits.append(&mut hits),
+            Err(e) => out.errors.push(format!("{}: {e}", tap.key())),
+        }
+    }
+    out.hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
+    Ok(out)
+}
+
+async fn search_tap(client: &reqwest::Client, tap: &Tap, q: &str) -> Result<Vec<SkillHit>, String> {
+    // 1) List the tap's skills directory — one API call.
+    let ref_qs = tap
+        .git_ref
+        .as_deref()
+        .map(|r| format!("?ref={}", urlencoding::encode(r)))
+        .unwrap_or_default();
+    let api = format!(
+        "https://api.github.com/repos/{}/contents/{}{ref_qs}",
+        tap.repo,
+        encode_path(&tap.path),
+    );
+    let body = crate::skills::fetch_limited(client, &api, 4 * 1024 * 1024).await?;
+    let entries: Value = serde_json::from_slice(&body)
+        .map_err(|e| format!("unexpected listing for {}: {e}", tap.path))?;
+    let dirs: Vec<String> = entries
+        .as_array()
+        .ok_or("source path is not a directory")?
+        .iter()
+        .filter(|e| e.get("type").and_then(Value::as_str) == Some("dir"))
+        .filter_map(|e| e.get("name").and_then(Value::as_str).map(str::to_string))
+        .take(MAX_SKILLS_PER_TAP)
+        .collect();
+
+    // 2) Fetch each folder's SKILL.md via raw.githubusercontent (not subject to
+    //    the API rate limit), bounded-concurrently, keeping only query matches.
+    let hits = futures::stream::iter(dirs)
+        .map(|dir| {
+            let client = client.clone();
+            let (repo, path, git_ref) = (tap.repo.clone(), tap.path.clone(), tap.git_ref.clone());
+            async move { fetch_hit(&client, &repo, &path, &dir, git_ref.as_deref()).await }
+        })
+        .buffer_unordered(SEARCH_CONCURRENCY)
+        .filter_map(|hit| async move { hit.and_then(|h| score(h, q)) })
+        .collect::<Vec<SkillHit>>()
+        .await;
+    Ok(hits)
+}
+
+/// Fetch and parse one folder's `SKILL.md`. `None` (skipped, not an error) when
+/// a subdirectory has no valid SKILL.md — a repo folder need not be a skill.
+async fn fetch_hit(
+    client: &reqwest::Client,
+    repo: &str,
+    path: &str,
+    dir: &str,
+    git_ref: Option<&str>,
+) -> Option<SkillHit> {
+    let r = git_ref.unwrap_or("HEAD");
+    let raw = format!(
+        "https://raw.githubusercontent.com/{repo}/{}/{}/{}/SKILL.md",
+        urlencoding::encode(r),
+        encode_path(path),
+        urlencoding::encode(dir),
+    );
+    let bytes = crate::skills::fetch_limited(client, &raw, 128 * 1024).await.ok()?;
+    let (name, description, version) = crate::skills::skill_meta(std::str::from_utf8(&bytes).ok()?).ok()?;
+    // Browser-style tree URL (unencoded segments); the installer re-resolves it.
+    let install_url = format!("https://github.com/{repo}/tree/{r}/{path}/{dir}");
+    Some(SkillHit { name, description, version, repo: repo.to_string(), install_url, score: 0 })
+}
+
+/// Attach a match score, or drop the hit when the (non-empty) query matches
+/// neither name nor description. Exact name > name substring > description.
+fn score(mut hit: SkillHit, q: &str) -> Option<SkillHit> {
+    hit.score = match_score(&hit.name, &hit.description, q)?;
+    Some(hit)
+}
+
+fn match_score(name: &str, description: &str, q: &str) -> Option<u8> {
+    if q.is_empty() {
+        return Some(1);
+    }
+    let (name, description) = (name.to_lowercase(), description.to_lowercase());
+    if name == q {
+        Some(4)
+    } else if name.contains(q) {
+        Some(3)
+    } else if description.contains(q) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// URL-encode each `/`-separated path segment (empty segments dropped) so a
+/// subpath is safe in a GitHub URL without escaping its slashes.
+fn encode_path(path: &str) -> String {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| urlencoding::encode(s).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +380,23 @@ mod tests {
         std::fs::write(&path, "this is not valid toml : : :").unwrap();
         assert!(TapStore::new(path).list().is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn match_score_ranks_name_over_description_and_drops_misses() {
+        assert_eq!(match_score("pdf", "make pdfs", "pdf"), Some(4)); // exact name
+        assert_eq!(match_score("pdf-tools", "x", "pdf"), Some(3)); // name substring
+        assert_eq!(match_score("charts", "render a pdf", "pdf"), Some(2)); // description
+        assert_eq!(match_score("charts", "render images", "pdf"), None); // no match → dropped
+        assert_eq!(match_score("anything", "x", ""), Some(1)); // empty query lists all
+        // case-insensitive
+        assert_eq!(match_score("PDF", "X", "pdf"), Some(4));
+    }
+
+    #[test]
+    fn encode_path_escapes_segments_not_slashes() {
+        assert_eq!(encode_path("skills"), "skills");
+        assert_eq!(encode_path("a/b c/d"), "a/b%20c/d");
+        assert_eq!(encode_path("/leading//double/"), "leading/double");
     }
 }

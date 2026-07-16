@@ -98,6 +98,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "list or edit skill sources (add/remove a GitHub repo to search)",
     ),
     (
+        "/skill search",
+        "search registered sources for installable skills",
+    ),
+    (
         "/skill info",
         "inspect a skill's files, scope, tools, and source",
     ),
@@ -243,6 +247,8 @@ pub(crate) enum TuiEvent {
     SessionsLoaded(Vec<kernel::SessionMeta>),
     /// `/skill install <src>` finished with a complete package report.
     SkillInstalled(Result<tools::InstallReport, String>),
+    /// `/skill search <query>` finished querying the registered sources.
+    SkillSearchResults(Result<tools::SearchResults, String>),
     /// Model setup queried the endpoint's `/v1/models`; `Err` carries the
     /// reason so the form can fall back to manual model-id entry honestly.
     /// Tagged with the queried base URL so a slow reply for an abandoned

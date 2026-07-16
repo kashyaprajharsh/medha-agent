@@ -1000,7 +1000,7 @@ fn parse_github_tree_url(src: &str) -> Result<Option<GitHubTree>, String> {
     }))
 }
 
-fn install_client() -> Result<reqwest::Client, String> {
+pub(crate) fn install_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(INSTALL_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -1009,7 +1009,11 @@ fn install_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-async fn fetch_limited(client: &reqwest::Client, url: &str, cap: usize) -> Result<Vec<u8>, String> {
+pub(crate) async fn fetch_limited(
+    client: &reqwest::Client,
+    url: &str,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
     let response = client
         .get(url)
         .send()
@@ -1252,6 +1256,14 @@ fn scan_dir(dir: &Path) -> Vec<(PathBuf, Result<ParsedMd, String>)> {
 /// must carry a non-empty `name` and `description`. YAML is the standard
 /// format (skills authored for any other harness drop in unchanged); TOML is
 /// accepted as a read-only legacy fallback for skills saved by older builds.
+/// Minimal metadata `(name, description, version)` from a `SKILL.md` — lets the
+/// hub preview a remote skill (search results) without downloading or trusting
+/// its whole package. Applies the same frontmatter validation as install.
+pub(crate) fn skill_meta(text: &str) -> Result<(String, String, u32), String> {
+    let (fm, _) = parse_skill_md(text)?;
+    Ok((fm.name, fm.description, fm.version))
+}
+
 fn parse_skill_md(text: &str) -> Result<ParsedMd, String> {
     if text.len() > MAX_SKILL_MD_BYTES {
         return Err(format!(

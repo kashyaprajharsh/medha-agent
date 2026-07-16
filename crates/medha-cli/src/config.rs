@@ -385,6 +385,13 @@ fn user_skills_dir_in(home: &std::path::Path) -> PathBuf {
     home.join("skills")
 }
 
+/// Registered skill sources ("taps"). Lives beside the user skills dir so
+/// sources relocate with `MEDHA_HOME` like everything else. Not a skill folder
+/// (no `SKILL.md`), so discovery ignores it.
+pub fn user_taps_path() -> Result<PathBuf> {
+    Ok(user_skills_dir()?.join("taps.toml"))
+}
+
 /// Per-workspace runtime state directory: `~/.medha/projects/<encoded-cwd>/`
 /// (Claude Code style). Runtime state — the event log, artifacts, snapshots,
 /// logs — lives HERE, out of the working tree, so it never clutters or gets

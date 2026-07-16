@@ -1787,6 +1787,9 @@ enum SlashAction {
     SwitchMode(String),
     /// `/skill install <path-or-url>` — install a skill into the user scope.
     InstallSkill(String),
+    /// `/skill sources [add <owner/repo [path]> | remove <owner/repo>]` —
+    /// list or edit the registered skill sources ("taps").
+    SkillSources(String),
     /// Everything else — handled by `run_slash` (help, status, skills, think…).
     Other,
 }
@@ -1808,6 +1811,14 @@ fn classify_slash(cmd: &str) -> SlashAction {
         }
         c if c.starts_with("model ") => {
             SlashAction::SwitchModel(c.strip_prefix("model ").unwrap_or("").trim().to_string())
+        }
+        c if c.strip_prefix("skill sources").is_some_and(is_cmd_boundary) => {
+            SlashAction::SkillSources(
+                c.strip_prefix("skill sources")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            )
         }
         c if c.strip_prefix("skill install").is_some_and(is_cmd_boundary) => {
             SlashAction::InstallSkill(
@@ -1881,6 +1892,7 @@ fn dispatch_slash<P, L>(
             switch_saved_model(model, kernel.provider.as_ref(), &name)
         }
         SlashAction::InstallSkill(src) => install_skill(model, &src, tx),
+        SlashAction::SkillSources(args) => skill_sources(model, &args),
         SlashAction::Other => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
     }
 }
@@ -2435,6 +2447,67 @@ fn install_skill(model: &mut Model, src: &str, tx: &mpsc::UnboundedSender<TuiEve
     model.push_notice("(installing skill …)");
 }
 
+/// `/skill sources` — list registered taps; `add`/`remove` to edit them. Config
+/// is loaded on demand (sources are session-independent). Backend + validation
+/// live in `tools::TapStore`/`Tap`; this only parses the subcommand and reports.
+fn skill_sources(model: &mut Model, args: &str) {
+    let path = match config::user_taps_path() {
+        Ok(p) => p,
+        Err(e) => return model.push_notice(format!("skill sources unavailable: {e}")),
+    };
+    let store = tools::TapStore::new(path);
+    let (sub, rest) = match args.split_once(char::is_whitespace) {
+        Some((s, r)) => (s, r.trim()),
+        None => (args, ""),
+    };
+    match sub {
+        "" | "list" => match store.list() {
+            Ok(taps) if taps.is_empty() => model.push_notice(
+                "no skill sources registered\n  add one: /skill sources add <owner/repo> [subpath]",
+            ),
+            Ok(taps) => {
+                let mut s = String::from("skill sources:");
+                for t in &taps {
+                    let r = t.git_ref.as_deref().map(|r| format!(" @{r}")).unwrap_or_default();
+                    s.push_str(&format!("\n  · {}/{}{r}", t.repo, t.path));
+                }
+                s.push_str("\n  search: /skill search <query> · add: /skill sources add <owner/repo>");
+                model.push_notice(s);
+            }
+            Err(e) => model.push_notice(format!("reading sources: {e}")),
+        },
+        "add" => {
+            let (spec, path_arg) = match rest.split_once(char::is_whitespace) {
+                Some((a, b)) => (a, Some(b.trim())),
+                None => (rest, None),
+            };
+            match tools::Tap::parse(spec, path_arg) {
+                Ok(tap) => match store.add(tap.clone()) {
+                    Ok(true) => model.push_notice(format!("✔ added source {}", tap.key())),
+                    Ok(false) => model.push_notice(format!("updated source {}", tap.key())),
+                    Err(e) => model.push_notice(format!("could not add source: {e}")),
+                },
+                Err(e) => model.push_notice(format!(
+                    "usage: /skill sources add <owner/repo> [subpath]\n  {e}"
+                )),
+            }
+        }
+        "remove" | "rm" => {
+            if rest.is_empty() {
+                return model.push_notice("usage: /skill sources remove <owner/repo>");
+            }
+            match store.remove(rest) {
+                Ok(0) => model.push_notice(format!("no source matching '{rest}'")),
+                Ok(n) => model.push_notice(format!("✔ removed {n} source(s) matching '{rest}'")),
+                Err(e) => model.push_notice(format!("could not remove source: {e}")),
+            }
+        }
+        other => model.push_notice(format!(
+            "unknown: /skill sources {other}\n  usage: /skill sources [add <owner/repo> [subpath] | remove <owner/repo>]"
+        )),
+    }
+}
+
 fn show_skill_info(model: &mut Model, name: &str) {
     if name.is_empty() {
         model.push_notice("usage: /skill info <name>\n  Browse names with /skill or /skills");
@@ -2583,10 +2656,10 @@ fn human_bytes(bytes: usize) -> String {
 }
 
 /// Force-load a skill's full procedure into the conversation, deterministically
-/// (no reliance on the model choosing to call `skill.load`). This is the
-/// model-independent trigger Hermes exposes via `/skill-name`: the procedure
-/// lands in the transcript, so the next turn the model *has* it. Empty name →
-/// open the picker instead. Reached from `/skill <name>` and the skill picker.
+/// (no reliance on the model choosing to call `skill.load`). A model-independent
+/// `/skill-name` trigger: the procedure lands in the transcript, so the next
+/// turn the model *has* it. Empty name → open the picker instead. Reached from
+/// `/skill <name>` and the skill picker.
 fn load_skill_by_name(model: &mut Model, name: &str, transcript: &mut Vec<Message>) {
     if name.is_empty() {
         open_skill_picker(model);
@@ -2866,6 +2939,19 @@ mod fix_tests {
         assert_eq!(
             classify_slash("skill installer"),
             SlashAction::LoadSkill("installer".into())
+        );
+        assert_eq!(
+            classify_slash("skill sources"),
+            SlashAction::SkillSources(String::new())
+        );
+        assert_eq!(
+            classify_slash("skill sources add anthropics/skills"),
+            SlashAction::SkillSources("add anthropics/skills".into())
+        );
+        // …but a name that merely starts with "sources" still loads as a name.
+        assert_eq!(
+            classify_slash("skill sources-of-truth"),
+            SlashAction::LoadSkill("sources-of-truth".into())
         );
         assert_eq!(classify_slash("resume"), SlashAction::Resume);
         assert_eq!(classify_slash("clear"), SlashAction::Clear);

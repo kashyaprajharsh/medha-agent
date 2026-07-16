@@ -94,6 +94,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "install a complete skill folder from disk, GitHub, or raw SKILL.md",
     ),
     (
+        "/skill sources",
+        "list or edit skill sources (add/remove a GitHub repo to search)",
+    ),
+    (
         "/skill info",
         "inspect a skill's files, scope, tools, and source",
     ),

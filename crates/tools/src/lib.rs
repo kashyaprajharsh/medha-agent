@@ -7,12 +7,14 @@ use async_trait::async_trait;
 use ignore::WalkBuilder;
 use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
 
+pub mod hub;
 pub mod skills;
 use regex::{Regex, RegexBuilder};
 use sandbox::WorkspaceSandbox;
 use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
+pub use hub::{Tap, TapStore};
 pub use skills::{InstallReport, SkillScope, SkillStore};
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};

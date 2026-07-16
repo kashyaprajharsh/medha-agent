@@ -724,6 +724,9 @@ enum PickerKind {
     /// `/mode`: pick the autonomy dial. Rows are [`AUTONOMY_MODES`]; choosing one
     /// sets it live for the session.
     AutonomyMode,
+    /// `/skill search` results: pick one to install. Holds the ranked hits;
+    /// Enter installs the selected one through the guard-gated installer.
+    SkillSearch(Vec<tools::SkillHit>),
 }
 
 /// The autonomy levels offered by the `/mode` picker, with self-explanatory
@@ -808,7 +811,10 @@ impl PickerKind {
             PickerKind::SearchProvider => {
                 " web search — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
             }
-            PickerKind::AutonomyMode => {
+            PickerKind::SkillSearch(_) => {
+            " install a skill — ↑↓ select, Enter install, Esc cancel ".into()
+        }
+        PickerKind::AutonomyMode => {
                 " autonomy — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
             }
         }
@@ -951,6 +957,13 @@ impl PickerKind {
             PickerKind::AutonomyMode => AUTONOMY_MODES
                 .iter()
                 .map(|(_, desc)| (*desc).to_string())
+                .collect(),
+            PickerKind::SkillSearch(hits) => hits
+                .iter()
+                .map(|h| {
+                    let desc: String = h.description.chars().take(72).collect();
+                    format!("{} v{} · {} — {desc}", h.name, h.version, h.repo)
+                })
                 .collect(),
         }
     }

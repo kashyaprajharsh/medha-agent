@@ -805,6 +805,16 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
+                // Search result chosen → install it (guard-gated), so the flow is
+                // search → select → install with no copy-paste.
+                if let PickerKind::SkillSearch(hits) = &picker.kind {
+                    let url = hits.get(picker.selected).map(|h| h.install_url.clone());
+                    model.picker = None;
+                    if let Some(url) = url {
+                        install_skill(model, &url, tx);
+                    }
+                    return;
+                }
                 if let PickerKind::RemoveModel(name) = &picker.kind {
                     let name = name.clone();
                     let confirmed = picker.selected == 1;
@@ -1641,29 +1651,22 @@ pub(super) fn handle_agent_event(
             }
             Err(e) => model.push_notice(format!("skill install failed: {e}")),
         },
-        // `/skill search` finished querying the registered sources.
+        // `/skill search` finished — open a results picker (Enter installs the
+        // selection through the guard-gated installer), matching the app's
+        // picker idiom instead of dumping copy-paste commands.
         TuiEvent::SkillSearchResults(result) => match result {
             Ok(res) => {
-                let mut s = if res.hits.is_empty() {
-                    String::from("no matching skills found")
-                } else {
-                    let mut s = format!("found {} skill(s):", res.hits.len());
-                    for h in res.hits.iter().take(25) {
-                        let desc: String = h.description.chars().take(100).collect();
-                        s.push_str(&format!(
-                            "\n  · {} v{} ({})\n      {desc}\n      install: /skill install {}",
-                            h.name, h.version, h.repo, h.install_url
-                        ));
-                    }
-                    if res.hits.len() > 25 {
-                        s.push_str(&format!("\n  … and {} more — narrow the query", res.hits.len() - 25));
-                    }
-                    s
-                };
                 for e in &res.errors {
-                    s.push_str(&format!("\n  ⚠ source error — {e}"));
+                    model.push_notice(format!("⚠ skill source error — {e}"));
                 }
-                model.push_notice(s);
+                if res.hits.is_empty() {
+                    model.push_notice("no matching skills found");
+                } else {
+                    model.picker = Some(Picker {
+                        kind: PickerKind::SkillSearch(res.hits),
+                        selected: 0,
+                    });
+                }
             }
             Err(e) => model.push_notice(format!("skill search failed: {e}")),
         },

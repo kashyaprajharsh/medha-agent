@@ -28,6 +28,7 @@ scraper = "0.20"
 html2md = "0.2"
 urlencoding = "2"
 pdf-extract = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 ulid = "1"

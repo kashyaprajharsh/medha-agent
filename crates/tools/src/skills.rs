@@ -61,6 +61,11 @@ pub struct SkillProvenance {
     pub kind: String,
     pub revision: Option<String>,
     pub installed_at: u64,
+    /// Content hash of the package as installed (`sha256:<hex>`), covering
+    /// every file including `SKILL.md`. Drives update drift-detection and the
+    /// skills lockfile. `None` for packages installed before hashing existed.
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 /// Result of installing a complete skill package.
@@ -73,6 +78,9 @@ pub struct InstallReport {
     pub files: usize,
     pub bytes: usize,
     pub replaced: bool,
+    /// Content hash of the installed package (`sha256:<hex>`) — recorded in the
+    /// lockfile and compared on update to detect upstream changes.
+    pub content_hash: String,
     /// Guard verdict for the installed package: `"safe"` or `"caution"`. A
     /// `"dangerous"` verdict aborts the install, so it never reaches a report.
     pub scan_verdict: &'static str,
@@ -565,6 +573,16 @@ impl SkillStore {
         }))
     }
 
+    /// Hash of a user-installed package as it currently sits on disk. Compared
+    /// against the recorded provenance hash to detect local edits (drift), and
+    /// against a re-fetched upstream to detect available updates. `None` if the
+    /// package or user scope is absent.
+    pub fn installed_hash(&self, name: &str) -> Option<String> {
+        validate_name(name).ok()?;
+        let dir = self.user_dir.as_ref()?.join(name);
+        dir.join("SKILL.md").is_file().then(|| hash_package(&dir))
+    }
+
     /// Provenance recorded for a user-installed package, if it has one.
     pub fn provenance(&self, name: &str) -> Option<SkillProvenance> {
         validate_name(name).ok()?;
@@ -650,6 +668,9 @@ impl SkillStore {
                 .map_err(|e| format!("reading staged {}: {e}", md_path.display()))?;
             let (fm, _) = parse_skill_md(&text)
                 .map_err(|e| format!("{src} is not a valid skill package: {e}"))?;
+            // Hash the package now — before the provenance sidecar is written —
+            // so the hash covers only real content and never itself.
+            let content_hash = hash_package(&stage);
             let provenance = SkillProvenance {
                 source: src.to_string(),
                 kind,
@@ -658,16 +679,17 @@ impl SkillStore {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
+                content_hash: Some(content_hash.clone()),
             };
             let provenance_json = serde_json::to_vec_pretty(&provenance)
                 .map_err(|e| format!("serializing skill provenance: {e}"))?;
             std::fs::write(stage.join(PROVENANCE_FILE), provenance_json)
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>((fm.name, revision, budget))
+            Ok::<_, String>((fm.name, revision, content_hash, budget))
         }
         .await;
 
-        let (name, revision, budget) = match staged {
+        let (name, revision, content_hash, budget) = match staged {
             Ok(result) => result,
             Err(e) => {
                 std::fs::remove_dir_all(&stage).ok();
@@ -707,6 +729,7 @@ impl SkillStore {
             files: budget.files,
             bytes: budget.bytes,
             replaced,
+            content_hash,
             scan_verdict,
             scan_findings,
         })
@@ -772,6 +795,31 @@ fn scan_staged(stage: &Path) -> policy::guard::ScanReport {
         .filter_map(|rel| std::fs::read(stage.join(&rel)).ok().map(|b| (rel, b)))
         .collect();
     policy::guard::scan_package(files.iter().map(|(p, b)| (p.as_str(), b.as_slice())))
+}
+
+/// Deterministic content hash of a package directory (`sha256:<hex>`). Every
+/// file — including `SKILL.md`, excluding the `.`-prefixed provenance sidecar
+/// (`collect_files` skips dotfiles) — contributes its relative path and bytes,
+/// length-prefixed and in sorted order, so the same package always hashes
+/// identically regardless of enumeration order. Powers update drift-detection
+/// and the skills lockfile.
+fn hash_package(dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut rels = Vec::new();
+    collect_files(dir, dir, &mut rels);
+    rels.push("SKILL.md".to_string());
+    rels.sort();
+    rels.dedup();
+    let mut h = Sha256::new();
+    for rel in &rels {
+        if let Ok(bytes) = std::fs::read(dir.join(rel)) {
+            h.update((rel.len() as u64).to_le_bytes());
+            h.update(rel.as_bytes());
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(&bytes);
+        }
+    }
+    format!("sha256:{:x}", h.finalize())
 }
 
 /// Render guard findings as `"file:line — reason"` (or `"file — reason"` for a
@@ -1693,6 +1741,33 @@ mod tests {
         assert_eq!(report.scan_verdict, "caution");
         assert!(!report.scan_findings.is_empty());
         assert!(user.join("caut").join("SKILL.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn content_hash_is_recorded_stable_and_detects_drift() {
+        let root = tmp();
+        let user = root.join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let store = SkillStore::new(root.join("proj"), Some(user.clone()));
+
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("SKILL.md"), DEPLOY).unwrap();
+        std::fs::create_dir_all(src.join("scripts")).unwrap();
+        std::fs::write(src.join("scripts").join("go.sh"), "echo hi\n").unwrap();
+
+        let report = futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
+        assert!(report.content_hash.starts_with("sha256:"));
+        // Recorded in provenance and reproducible from disk (hash excludes the
+        // provenance sidecar, so it matches the install-time hash exactly).
+        assert_eq!(store.provenance("deploy-fly").unwrap().content_hash.as_deref(), Some(report.content_hash.as_str()));
+        assert_eq!(store.installed_hash("deploy-fly").as_deref(), Some(report.content_hash.as_str()));
+
+        // A local edit changes the on-disk hash → drift is detectable.
+        std::fs::write(user.join("deploy-fly").join("scripts").join("go.sh"), "echo edited\n").unwrap();
+        assert_ne!(store.installed_hash("deploy-fly").as_deref(), Some(report.content_hash.as_str()));
 
         std::fs::remove_dir_all(&root).ok();
     }

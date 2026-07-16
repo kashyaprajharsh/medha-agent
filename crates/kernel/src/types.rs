@@ -94,7 +94,12 @@ pub struct Message {
 
 impl Message {
     pub fn new(role: Role, content: impl Into<String>) -> Self {
-        Self { role, content: content.into(), tool_calls: Vec::new(), tool_call_id: None }
+        Self {
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
     }
     pub fn system(content: impl Into<String>) -> Self {
         Self::new(Role::System, content)
@@ -104,7 +109,12 @@ impl Message {
     }
     /// An assistant turn that requested tool calls.
     pub fn assistant_calls(content: impl Into<String>, tool_calls: Vec<ToolIntent>) -> Self {
-        Self { role: Role::Assistant, content: content.into(), tool_calls, tool_call_id: None }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
     }
     /// A tool result answering a specific call.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -201,7 +211,10 @@ pub enum Block {
     /// path/command, sniffed from the partial arguments) while the rest of the
     /// arguments are still arriving. Lets the surface show "writing medha.html…"
     /// while a large tool call is generated, instead of a vague spinner.
-    ToolStarted { name: String, target: Option<String> },
+    ToolStarted {
+        name: String,
+        target: Option<String>,
+    },
     /// End-of-response token accounting (from the provider's `usage`).
     Usage(Usage),
     /// A reasoning/thinking-token delta (the `reasoning_content` field some
@@ -232,7 +245,11 @@ pub struct Observation {
 
 impl Observation {
     pub fn ok(intent_id: impl Into<String>, payload: serde_json::Value) -> Self {
-        Self { intent_id: intent_id.into(), status: ObsStatus::Ok, payload }
+        Self {
+            intent_id: intent_id.into(),
+            status: ObsStatus::Ok,
+            payload,
+        }
     }
     pub fn denial(intent_id: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
@@ -276,16 +293,57 @@ pub struct CompiledContext {
     pub tools: Vec<ToolSpec>,
 }
 
+/// How much the agent may do without asking (§4.6 autonomy dial). This only ever
+/// controls whether *otherwise-allowed* reversible/shell actions are escalated to
+/// the human gate — it can never loosen a base `Human`/`Deny` (the safety floor:
+/// dangerous-command scanner, external actions, out-of-workspace access,
+/// web-taint escalation all sit outside this dial).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutonomyLevel {
+    /// Edits and shell both ask for approval (safest).
+    #[default]
+    Careful,
+    /// Reversible edits auto-run; shell still asks.
+    Normal,
+    /// Everything in-workspace auto-runs; the floor still gates catastrophe.
+    Yolo,
+}
+
+impl AutonomyLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutonomyLevel::Careful => "careful",
+            AutonomyLevel::Normal => "normal",
+            AutonomyLevel::Yolo => "yolo",
+        }
+    }
+    /// Parse a level id; unknown → `Careful` (the safe default).
+    pub fn from_id(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "normal" => AutonomyLevel::Normal,
+            "yolo" => AutonomyLevel::Yolo,
+            _ => AutonomyLevel::Careful,
+        }
+    }
+}
+
 /// Minimal session handle. Grows with budgets/interrupts in later phases.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: Ulid,
     pub done: bool,
+    /// The session's autonomy dial (default `Careful`). Read by the policy to
+    /// decide how much to escalate to the human gate.
+    pub autonomy: AutonomyLevel,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Self { id: Ulid::new(), done: false }
+        Self {
+            id: Ulid::new(),
+            done: false,
+            autonomy: AutonomyLevel::Careful,
+        }
     }
 }
 

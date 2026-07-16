@@ -55,7 +55,9 @@ impl ExecError {
         match self {
             ExecError::Spawn(m) => {
                 let m = m.to_lowercase();
-                m.contains("no such file") || m.contains("not found") || m.contains("entity not found")
+                m.contains("no such file")
+                    || m.contains("not found")
+                    || m.contains("entity not found")
             }
             _ => false,
         }
@@ -156,7 +158,11 @@ fn base_command(program: &str, args: &[String], req: &ExecRequest) -> tokio::pro
 }
 
 fn to_output(o: std::process::Output) -> ExecOutput {
-    ExecOutput { status: o.status.code(), stdout: o.stdout, stderr: o.stderr }
+    ExecOutput {
+        status: o.status.code(),
+        stdout: o.stdout,
+        stderr: o.stderr,
+    }
 }
 
 /// Fires a `SIGKILL` at a whole process group when dropped while still *armed*.
@@ -225,7 +231,10 @@ async fn spawn_and_wait(mut cmd: tokio::process::Command) -> Result<ExecOutput, 
     configure_for_spawn(&mut cmd, true); // reaper backstops the group; kill_on_drop the leader
     let child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
     let mut reaper = GroupReaper::new(child.id());
-    let out = child.wait_with_output().await.map_err(|e| ExecError::Spawn(e.to_string()))?;
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| ExecError::Spawn(e.to_string()))?;
     reaper.disarm(); // finished on its own — nothing to tear down
     Ok(to_output(out))
 }
@@ -311,7 +320,10 @@ impl BgProc {
 /// Wait up to `dur` for a task's done-signal to flip to `true`; returns true if
 /// it completed in time. Free-standing so a caller holding a task table can
 /// clone the receiver out (cheap) and await here without keeping the lock.
-pub async fn wait_done(mut rx: tokio::sync::watch::Receiver<bool>, dur: std::time::Duration) -> bool {
+pub async fn wait_done(
+    mut rx: tokio::sync::watch::Receiver<bool>,
+    dur: std::time::Duration,
+) -> bool {
     tokio::time::timeout(dur, async {
         while !*rx.borrow_and_update() {
             if rx.changed().await.is_err() {
@@ -378,7 +390,13 @@ pub fn spawn_background(mut cmd: tokio::process::Command) -> Result<BgProc, Exec
         let _ = done_tx.send(true);
     });
 
-    Ok(BgProc { pid, stdout, stderr, done_rx, code })
+    Ok(BgProc {
+        pid,
+        stdout,
+        stderr,
+        done_rx,
+        code,
+    })
 }
 
 /// Runs commands directly on the host with no OS isolation.
@@ -419,7 +437,10 @@ pub struct SeatbeltBackend {
 #[cfg(target_os = "macos")]
 impl SeatbeltBackend {
     pub fn new(net: NetPolicy, extra_writable: Vec<PathBuf>) -> Self {
-        Self { net, extra_writable }
+        Self {
+            net,
+            extra_writable,
+        }
     }
 
     fn profile(&self, cwd: &std::path::Path) -> String {
@@ -433,11 +454,13 @@ impl SeatbeltBackend {
         writable.push(PathBuf::from("/private/tmp"));
         writable.push(PathBuf::from("/private/var/folders"));
 
-        let mut p = String::from(
-            "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n",
-        );
+        let mut p =
+            String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n");
         for w in &writable {
-            p.push_str(&format!("    (subpath \"{}\")\n", sbpl_escape(&w.to_string_lossy())));
+            p.push_str(&format!(
+                "    (subpath \"{}\")\n",
+                sbpl_escape(&w.to_string_lossy())
+            ));
         }
         // Devices (/dev/null, /dev/tty, …) must stay writable or ordinary
         // programs break.
@@ -493,7 +516,10 @@ pub struct LandlockBackend {
 #[cfg(target_os = "linux")]
 impl LandlockBackend {
     pub fn new(net: NetPolicy, extra_writable: Vec<PathBuf>) -> Self {
-        Self { net, extra_writable }
+        Self {
+            net,
+            extra_writable,
+        }
     }
 
     fn writable_paths(&self, cwd: &std::path::Path) -> Vec<PathBuf> {
@@ -511,7 +537,10 @@ impl LandlockBackend {
 /// and read-write only under `writable`. Returns `None` if the kernel doesn't
 /// support Landlock, so the caller can run unconfined rather than fail.
 #[cfg(target_os = "linux")]
-fn build_landlock_ruleset(writable: &[PathBuf], net: NetPolicy) -> Option<landlock::RulesetCreated> {
+fn build_landlock_ruleset(
+    writable: &[PathBuf],
+    net: NetPolicy,
+) -> Option<landlock::RulesetCreated> {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
         RulesetAttr, RulesetCreatedAttr,
@@ -531,7 +560,10 @@ fn build_landlock_ruleset(writable: &[PathBuf], net: NetPolicy) -> Option<landlo
     let mut created = ruleset.create().ok()?;
     // Read + execute across the whole filesystem.
     created = created
-        .add_rule(PathBeneath::new(PathFd::new("/").ok()?, AccessFs::from_read(abi)))
+        .add_rule(PathBeneath::new(
+            PathFd::new("/").ok()?,
+            AccessFs::from_read(abi),
+        ))
         .ok()?;
     // Read-write only under the jailed roots. A path that can't be opened is
     // skipped; a ruleset-level failure abandons the jail (run unconfined rather
@@ -641,7 +673,13 @@ impl ContainerBackend {
         memory: Option<String>,
         pids: Option<u32>,
     ) -> Self {
-        Self { runtime, image, net, memory, pids }
+        Self {
+            runtime,
+            image,
+            net,
+            memory,
+            pids,
+        }
     }
 
     /// Build the `run …` argv for the container runtime. Pure, for testing.
@@ -731,7 +769,12 @@ impl SshBackend {
             parts.push(shell_quote(arg));
         }
         let remote_cmd = parts.join(" ");
-        vec!["-o".into(), "BatchMode=yes".into(), self.host.clone(), remote_cmd]
+        vec![
+            "-o".into(),
+            "BatchMode=yes".into(),
+            self.host.clone(),
+            remote_cmd,
+        ]
     }
 }
 
@@ -768,11 +811,19 @@ pub fn select_backend(
         BackendKind::Native => {
             #[cfg(target_os = "macos")]
             {
-                Arc::new(SeatbeltBackend::new(cfg.net, _extra_writable))
+                if native_backend_available() {
+                    Arc::new(SeatbeltBackend::new(cfg.net, _extra_writable))
+                } else {
+                    Arc::new(HostBackend)
+                }
             }
             #[cfg(target_os = "linux")]
             {
-                Arc::new(LandlockBackend::new(cfg.net, _extra_writable))
+                if native_backend_available() {
+                    Arc::new(LandlockBackend::new(cfg.net, _extra_writable))
+                } else {
+                    Arc::new(HostBackend)
+                }
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
@@ -799,13 +850,20 @@ pub fn select_backend(
 }
 
 /// True if a native OS sandbox backend is actually usable on this platform.
-/// macOS always has `sandbox-exec`; on Linux we probe live Landlock support
-/// (kernel ≥5.13 with Landlock enabled) so the CLI can warn honestly when the
-/// jail will degrade to host.
+/// On macOS, `sandbox-exec` can be present while host policy rejects
+/// `sandbox_apply`, so probe a harmless profile rather than treating its path
+/// as proof. On Linux we probe live Landlock support (kernel ≥5.13 with
+/// Landlock enabled).
 pub fn native_backend_available() -> bool {
     #[cfg(target_os = "macos")]
     {
-        true
+        std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1) (allow default)", "/usr/bin/true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
     #[cfg(target_os = "linux")]
     {
@@ -861,14 +919,21 @@ mod tests {
         assert!(r.is_err(), "outer timeout should elapse");
         // Give the reaper + any stray write a moment, then confirm no marker.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        assert!(!marker.exists(), "grandchild survived the group kill (orphaned tree)");
+        assert!(
+            !marker.exists(),
+            "grandchild survived the group kill (orphaned tree)"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn host_backend_runs_and_captures() {
         let out = HostBackend
-            .run(req("/bin/sh", &["-c", "printf hello"], std::env::temp_dir()))
+            .run(req(
+                "/bin/sh",
+                &["-c", "printf hello"],
+                std::env::temp_dir(),
+            ))
             .await
             .unwrap();
         assert_eq!(out.status, Some(0));
@@ -878,6 +943,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn seatbelt_jails_writes_outside_workspace() {
+        // Managed/nested macOS environments may expose sandbox-exec but deny
+        // sandbox_apply. Selection degrades to HostBackend and the CLI warns;
+        // only exercise the jail where the OS can actually apply it.
+        if !native_backend_available() {
+            eprintln!(
+                "Seatbelt unavailable on this host; native backend correctly degrades to host"
+            );
+            return;
+        }
         let ws = std::env::temp_dir().join(format!("medha-seatbelt-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&ws).unwrap();
         let backend = SeatbeltBackend::new(NetPolicy::Allow, vec![]);
@@ -893,12 +967,28 @@ mod tests {
         // Writing to $HOME is denied by the jail (the command exits non-zero).
         let escape_marker = format!(".medha-seatbelt-escape-{}", ulid::Ulid::new());
         let cmd = format!("touch \"$HOME/{escape_marker}\"");
-        let outside = backend.run(req("/bin/sh", &["-c", &cmd], ws.clone())).await.unwrap();
+        let outside = backend
+            .run(req("/bin/sh", &["-c", &cmd], ws.clone()))
+            .await
+            .unwrap();
         assert_ne!(outside.status, Some(0), "write to HOME must be blocked");
         let home = std::env::var("HOME").unwrap();
-        assert!(!std::path::Path::new(&home).join(&escape_marker).exists(), "escape file must not exist");
+        assert!(
+            !std::path::Path::new(&home).join(&escape_marker).exists(),
+            "escape file must not exist"
+        );
 
         std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_selection_degrades_to_host_when_seatbelt_cannot_apply() {
+        if native_backend_available() {
+            return;
+        }
+        let backend = select_backend(&SandboxConfig::default(), vec![]);
+        assert_eq!(backend.label(), "host");
     }
 
     #[test]
@@ -919,21 +1009,30 @@ mod tests {
         assert!(argv.contains(&"--rm".to_string()));
         assert!(joined.contains(":/workspace") && joined.contains("-w /workspace"));
         assert!(joined.contains("--cap-drop ALL") && joined.contains("no-new-privileges"));
-        assert!(joined.contains("--network none"), "net=deny → --network none");
+        assert!(
+            joined.contains("--network none"),
+            "net=deny → --network none"
+        );
         assert!(joined.contains("--memory 2g") && joined.contains("--pids-limit 256"));
         // The key improvement over wrapping the whole process: host env (and thus
         // API keys) is never forwarded into the container.
         assert!(!joined.contains("TAVILY_API_KEY") && !joined.contains("supersecret"));
         // The command follows the image, in order.
         let img = argv.iter().position(|a| a == "alpine").unwrap();
-        assert_eq!(&argv[img + 1..], &["sh".to_string(), "-c".to_string(), "echo hi".to_string()]);
+        assert_eq!(
+            &argv[img + 1..],
+            &["sh".to_string(), "-c".to_string(), "echo hi".to_string()]
+        );
     }
 
     #[test]
     fn container_argv_allows_network_by_default() {
         let be = ContainerBackend::new("podman".into(), "img".into(), NetPolicy::Allow, None, None);
         let argv = be.build_argv(&req("sh", &["-c", "true"], std::env::temp_dir()));
-        assert!(!argv.join(" ").contains("--network"), "net=allow leaves networking default");
+        assert!(
+            !argv.join(" ").contains("--network"),
+            "net=allow leaves networking default"
+        );
     }
 
     #[test]
@@ -943,7 +1042,13 @@ mod tests {
         assert_eq!(argv[0], "-o");
         assert!(argv.contains(&"user@host".to_string()));
         let remote = argv.last().unwrap();
-        assert!(remote.starts_with("cd '/srv/app' &&"), "cd into remote dir: {remote}");
-        assert!(remote.contains("'sh' '-c' 'echo done'"), "args single-quoted: {remote}");
+        assert!(
+            remote.starts_with("cd '/srv/app' &&"),
+            "cd into remote dir: {remote}"
+        );
+        assert!(
+            remote.contains("'sh' '-c' 'echo done'"),
+            "args single-quoted: {remote}"
+        );
     }
 }

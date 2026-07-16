@@ -158,7 +158,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink: &dyn StreamSink,
     ) -> Result<(Vec<Message>, StopReason), KernelError> {
         Self::return_unapplied_steers(q, sink);
-        self.log.append(Event::interrupt(session, "cancel", None)).await.ok();
+        self.log
+            .append(Event::interrupt(session, "cancel", None))
+            .await
+            .ok();
         Ok((messages, StopReason::Interrupted))
     }
 
@@ -222,7 +225,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // Size the tool-def overhead once so token estimates match the real
         // request (tool defs are sent every turn) (P1-9).
         self.context.note_tools(&specs);
-        let max_ctx = self.provider.capabilities().max_ctx;
+        let max_ctx = self.provider.context_window();
         let mut gov = crate::budgets::Governor::new(budget);
         // Spill oversized tool results already in the working set (K11). The live
         // path spills at execute time (below), but messages rebuilt from the log
@@ -241,7 +244,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // user turns were logged on their own prior calls (no duplication).
         if let Some(last) = messages.last() {
             if last.role == crate::types::Role::User {
-                self.log.append(Event::user_message(session, &last.content)).await?;
+                self.log
+                    .append(Event::user_message(session, &last.content))
+                    .await?;
             }
         }
         // Trust-flow taint (§4.6): flips true once a web-labeled observation
@@ -258,7 +263,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
                 for s in q.drain_steers() {
                     self.log.append(Event::user_message(session, &s)).await?;
-                    self.log.append(Event::interrupt(session, "steer", Some(&s))).await.ok();
+                    self.log
+                        .append(Event::interrupt(session, "steer", Some(&s)))
+                        .await
+                        .ok();
                     sink.steered(&s);
                     messages.push(Message::user(s));
                 }
@@ -300,11 +308,19 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 if let Some(q) = interrupts.as_mut() {
                     Self::return_unapplied_steers(q, sink);
                 }
-                return Ok((messages, StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow)));
+                return Ok((
+                    messages,
+                    StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow),
+                ));
             }
             let view = compiled.messages;
             if compiled.compacted {
-                sink.compaction(compiled.before_tokens, compiled.after_tokens, compiled.summarized, compiled.summary.as_deref());
+                sink.compaction(
+                    compiled.before_tokens,
+                    compiled.after_tokens,
+                    compiled.summarized,
+                    compiled.summary.as_deref(),
+                );
                 self.log
                     .append(Event::compaction(
                         session,
@@ -319,7 +335,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 // so this is lossless — better than discarding them.
                 messages = view.clone();
             }
-            let mut ctx = CompiledContext { model: String::new(), messages: view, tools: specs.clone() };
+            let mut ctx = CompiledContext {
+                model: String::new(),
+                messages: view,
+                tools: specs.clone(),
+            };
 
             // Run the turn; if the provider rejects it as too long despite our
             // pre-flight budgeting (P0-6 — the local estimate undercounted), do
@@ -335,7 +355,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         sink.compacting(true);
                         let recompiled = self.context.compile(&messages, emergency).await;
                         sink.compacting(false);
-                        sink.compaction(recompiled.before_tokens, recompiled.after_tokens, recompiled.summarized, recompiled.summary.as_deref());
+                        sink.compaction(
+                            recompiled.before_tokens,
+                            recompiled.after_tokens,
+                            recompiled.summarized,
+                            recompiled.summary.as_deref(),
+                        );
                         self.log
                             .append(Event::compaction(
                                 session,
@@ -356,7 +381,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         if let Some(q) = interrupts.as_mut() {
                             Self::return_unapplied_steers(q, sink);
                         }
-                        return Ok((messages, StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow)));
+                        return Ok((
+                            messages,
+                            StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow),
+                        ));
                     }
                     Err(e) => return Err(e),
                 }
@@ -466,7 +494,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     Some(ToolCategory::Web) => TrustLabel::Web,
                     _ => TrustLabel::Tool,
                 };
-                self.log.append(Event::tool_obs(session, &obs, trust)).await?;
+                self.log
+                    .append(Event::tool_obs(session, &obs, trust))
+                    .await?;
                 // Once untrusted web content lands, taint the rest of the
                 // request so later consequential actions get escalated (§4.6).
                 if matches!(trust, TrustLabel::Web) {
@@ -506,7 +536,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // verifier feedback the model reasoned about (K12) — otherwise
                     // replay diverges (the model self-corrected against text that
                     // no longer exists in the reconstructed history).
-                    self.log.append(Event::user_message(session, &feedback)).await.ok();
+                    self.log
+                        .append(Event::user_message(session, &feedback))
+                        .await
+                        .ok();
                     messages.push(Message::user(feedback));
                 }
             }
@@ -539,8 +572,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                     if e.is_retryable() && !emitted && attempt < MAX_TURN_RETRIES {
                         attempt += 1;
-                        tokio::time::sleep(retry_backoff(attempt)).await;
-                        continue;
+                        // The backoff nap races the cancel token too — Esc
+                        // during a retry wait must stop the turn, not queue
+                        // another attempt.
+                        tokio::select! {
+                            _ = tokio::time::sleep(retry_backoff(attempt)) => continue,
+                            _ = cancel.cancelled() => {
+                                break (String::new(), String::new(), Vec::new(), None, true);
+                            }
+                        }
                     }
                     return Err(KernelError::Provider(e.to_string()));
                 }
@@ -551,12 +591,19 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // NOT logged here — they're logged at dispatch admission, so a logged
         // intent always gets an observation (interrupts invariant).
         if !reasoning.is_empty() {
-            self.log.append(Event::model_reasoning(session, &reasoning)).await?;
+            self.log
+                .append(Event::model_reasoning(session, &reasoning))
+                .await?;
         }
         if !text.is_empty() {
             self.log.append(Event::model_text(session, &text)).await?;
         }
-        Ok((Message::assistant_calls(text, intents.clone()), intents, usage, interrupted))
+        Ok((
+            Message::assistant_calls(text, intents.clone()),
+            intents,
+            usage,
+            interrupted,
+        ))
     }
 
     /// Establish and consume one model stream, emitting deltas to the sink as
@@ -570,10 +617,25 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink: &dyn StreamSink,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<
-        (String, String, Vec<ToolIntent>, Option<crate::types::Usage>, bool),
+        (
+            String,
+            String,
+            Vec<ToolIntent>,
+            Option<crate::types::Usage>,
+            bool,
+        ),
         (crate::provider::ProviderError, bool),
     > {
-        let mut stream = self.provider.stream(ctx).await.map_err(|e| (e, false))?;
+        // Establishing the stream must ALSO race the cancel token: on large
+        // models the server can spend minutes in prompt processing before the
+        // first byte arrives, and an Esc during that window previously did
+        // nothing (the select below only covered an already-open stream).
+        let mut stream = tokio::select! {
+            s = self.provider.stream(ctx) => s.map_err(|e| (e, false))?,
+            _ = cancel.cancelled() => {
+                return Ok((String::new(), String::new(), Vec::new(), None, true));
+            }
+        };
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut intents: Vec<ToolIntent> = Vec::new();
@@ -630,14 +692,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         web_tainted: bool,
     ) -> Observation {
         let radius = self.executor.blast_radius(&intent.tool);
-        let raw = self.policy.authorize(intent, radius);
+        let raw = self.policy.authorize(session.autonomy, intent, radius);
         // Did trust-flow turn a permissive verdict into a gate? Such an escalated
         // gate must never be auto-approved (K9) — capture it before `raw` moves.
         let raw_permissive = matches!(raw, crate::types::Decision::Allow);
         let decision =
             escalate_for_trust_flow(raw, radius, web_tainted, self.executor.containment());
         let escalated = raw_permissive && matches!(decision, crate::types::Decision::Human);
-        self.log.append(Event::policy(session, intent, &decision)).await.ok();
+        self.log
+            .append(Event::policy(session, intent, &decision))
+            .await
+            .ok();
         match decision {
             crate::types::Decision::Deny { reason } => Observation::denial(&intent.id, reason),
             crate::types::Decision::Human => {
@@ -657,7 +722,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // Scope the approval to this specific action (tool + salient arg),
                     // so "always allow" doesn't blanket every call of the tool (K9).
                     let action = approval_key(intent);
-                    self.gate.confirm(&action, Some(&detail), escalated).await.approved()
+                    self.gate
+                        .confirm(&action, Some(&detail), escalated)
+                        .await
+                        .approved()
                 };
                 if approved {
                     self.executor.execute(intent).await
@@ -665,9 +733,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     Observation::denial(&intent.id, "rejected by human".to_string())
                 }
             }
-            crate::types::Decision::Allow => {
-                self.executor.execute(intent).await
-            }
+            crate::types::Decision::Allow => self.executor.execute(intent).await,
         }
     }
 }
@@ -683,8 +749,10 @@ fn escalate_for_trust_flow(
     containment: crate::types::Containment,
 ) -> crate::types::Decision {
     use crate::types::Decision;
-    let consequential =
-        matches!(radius, Some(BlastRadius::IrreversibleLocal | BlastRadius::External));
+    let consequential = matches!(
+        radius,
+        Some(BlastRadius::IrreversibleLocal | BlastRadius::External)
+    );
     if matches!(decision, Decision::Allow)
         && web_tainted
         && consequential
@@ -703,7 +771,11 @@ mod approval_key_tests {
     use serde_json::json;
 
     fn intent(tool: &str, args: serde_json::Value) -> ToolIntent {
-        ToolIntent { id: "1".into(), tool: tool.into(), args }
+        ToolIntent {
+            id: "1".into(),
+            tool: tool.into(),
+            args,
+        }
     }
 
     #[test]
@@ -715,8 +787,14 @@ mod approval_key_tests {
         assert_eq!(a, "shell.exec: cargo build");
         assert_ne!(a, b, "distinct commands must not share an auto-approve key");
         // Path-based tools key on the path; arg-less tools fall back to the tool.
-        assert_eq!(approval_key(&intent("fs.write", json!({ "path": "x.rs" }))), "fs.write: x.rs");
-        assert_eq!(approval_key(&intent("update_plan", json!({}))), "update_plan");
+        assert_eq!(
+            approval_key(&intent("fs.write", json!({ "path": "x.rs" }))),
+            "fs.write: x.rs"
+        );
+        assert_eq!(
+            approval_key(&intent("update_plan", json!({}))),
+            "update_plan"
+        );
     }
 }
 
@@ -771,7 +849,12 @@ mod trust_flow_tests {
         ));
         // Read-class is never consequential.
         assert!(matches!(
-            escalate_for_trust_flow(Decision::Allow, Some(BlastRadius::Read), true, Containment::None),
+            escalate_for_trust_flow(
+                Decision::Allow,
+                Some(BlastRadius::Read),
+                true,
+                Containment::None
+            ),
             Decision::Allow
         ));
         // Reversible-local (snapshotted + jailed) is left alone to avoid nagging.
@@ -790,7 +873,9 @@ mod trust_flow_tests {
     fn only_tightens_never_relaxes() {
         // A denial stays denied even under taint (escalation is one-directional).
         let d = escalate_for_trust_flow(
-            Decision::Deny { reason: "blocked".into() },
+            Decision::Deny {
+                reason: "blocked".into(),
+            },
             Some(BlastRadius::External),
             true,
             Containment::None,

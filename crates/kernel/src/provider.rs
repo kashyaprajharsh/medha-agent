@@ -145,6 +145,14 @@ pub struct ReasoningConfig {
 pub trait Provider: Send + Sync {
     fn capabilities(&self) -> &ProviderCaps;
 
+    /// Context window for the connection currently serving requests. Most
+    /// providers are immutable and use their declared capabilities; adapters
+    /// that support an explicit between-turn profile switch may override this
+    /// with their active connection's value.
+    fn context_window(&self) -> Option<u32> {
+        self.capabilities().max_ctx
+    }
+
     /// Stream canonical blocks for one model call. Phase 0 impls may buffer the
     /// response and yield owned blocks; SSE token streaming lands in Phase 1.
     async fn stream(

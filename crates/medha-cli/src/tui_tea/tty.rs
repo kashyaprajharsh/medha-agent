@@ -15,10 +15,10 @@
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use std::path::Path;
 
 #[cfg(unix)]
@@ -66,7 +66,11 @@ pub fn init(stray_log: &Path) -> anyhow::Result<(TuiTerminal, StrayRedirect)> {
         let _ = stray_log; // no fd redirection off unix
         set_panic_hook_plain();
         enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        )?;
         let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
         Ok((terminal, StrayRedirect {}))
     }
@@ -76,7 +80,11 @@ pub fn init(stray_log: &Path) -> anyhow::Result<(TuiTerminal, StrayRedirect)> {
 /// terminal's own (private) handle, then undo the fd redirection.
 pub fn restore(terminal: &mut TuiTerminal, redirect: &mut StrayRedirect) {
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    );
     redirect.restore();
 }
 
@@ -106,7 +114,11 @@ impl StrayRedirect {
         }
         drop(log);
 
-        Ok(Self { saved_out, saved_err, restored: false })
+        Ok(Self {
+            saved_out,
+            saved_err,
+            restored: false,
+        })
     }
 
     /// Restore fd 1/2 to the real tty. Idempotent.
@@ -142,7 +154,11 @@ fn install_panic_hook(saved_out: std::os::fd::RawFd, saved_err: std::os::fd::Raw
             libc::dup2(saved_err, 2);
         }
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste
+        );
         prev(info);
     }));
 }
@@ -153,7 +169,11 @@ fn set_panic_hook_plain() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste
+        );
         prev(info);
     }));
 }

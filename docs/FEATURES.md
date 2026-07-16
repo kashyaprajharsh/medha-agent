@@ -9,8 +9,9 @@ Roadmap items are in [`../PROGRESS.md`](../PROGRESS.md), not here.
 ## 1. Tool families
 
 All tools live in [`crates/tools/src/lib.rs`](../crates/tools/src/lib.rs), behind
-the `Tool` trait, registered by `ToolRegistry::with_workspace` (22 tools total,
-including the background-task `task.output` / `task.kill` / `task.list`).
+the `Tool` trait, registered by `ToolRegistry::with_workspace` plus the skill
+tools (including background-task `task.output` / `task.kill` / `task.list` and
+the human-in-the-loop `clarify`).
 The registry implements the kernel's `Executor` trait, so the kernel never knows
 an individual tool exists — only the `specs()` it exposes and the
 `blast_radius()` / `category()` each declares.
@@ -113,6 +114,36 @@ column, code, message}`. Can force a language via the `language` arg.
 (`crates/context/prompts/system.md`) instructs the model to call it for any
 3+ step task.
 
+### Skills — `skill.load`, `skill.list`, `skill.save`
+
+Project skills live at `.medha/skills/<name>/SKILL.md`; user skills live under
+`$MEDHA_HOME/skills` (or `~/.medha/skills`). Project skills shadow user skills
+with the same name. The system prompt receives a compact manifest and loads a
+procedure only on demand with `skill.load`; `skill.list` keeps catalogs larger
+than 30 skills discoverable without loading every procedure. Metadata is
+validated as bounded, single-line manifest data. `skill.save` always requires a
+human approval and previews the complete file before it is written.
+
+### Human-in-the-loop — `clarify`
+**Where:** `Clarify` in [`crates/tools/src/lib.rs`](../crates/tools/src/lib.rs); the `Asker` seam in [`crates/kernel/src/clarify.rs`](../crates/kernel/src/clarify.rs); TUI form in [`crates/medha-cli/src/tui_tea/`](../crates/medha-cli/src/tui_tea/).
+
+| Tool | Blast radius | Category | What it does |
+|------|-------------|----------|--------------|
+| `clarify` | Read | Plan | Ask the user 1–4 structured questions BEFORE proceeding, each with 2–5 options (one may be `recommended`), radio or `multi_select` checkbox, plus a free-text "Other". Returns the choices. |
+
+When a task is materially ambiguous, the agent calls `clarify` and the TUI renders
+an inline form: **↑↓** move within options, **←→** switch between questions,
+**Space** picks/toggles (radio vs checkbox), **Enter** submits all, **Esc**
+dismisses. The recommended option is pre-selected. It's a blocking surface
+round-trip — the mirror of the `HumanGate` approval card, but for questions —
+carried by a `TuiEvent::Clarify(questions, responder)` + a `oneshot` reply.
+
+Because `clarify` is **Read**-radius, the policy never gates it, so it works the
+same at every autonomy level — including `yolo`. That composition is the point:
+**in `yolo` the agent clarifies its doubts up front, then runs fully autonomous**
+("ask once, then go"). No interactive surface (headless / ACP) → the tool returns
+`{skipped:true}` and the agent proceeds on best judgment; it never hangs.
+
 ---
 
 ## 2. The security model
@@ -120,12 +151,36 @@ column, code, message}`. Can force a language via the `language` arg.
 ### Deny-first policy
 **Where:** [`crates/policy/src/lib.rs`](../crates/policy/src/lib.rs) (`DefaultPolicy`)
 
-Every tool intent passes `authorize(intent, blast_radius)` before execution.
-Authorization is driven by the tool's **declared blast radius**, not a hardcoded
-name list: `Read` and `ReversibleLocal` are allowed; `IrreversibleLocal` and
-`External` route to the human gate; an unregistered tool (radius `None`) is
+Every tool intent passes `authorize(autonomy, intent, blast_radius)` before
+execution. Authorization is driven by the tool's **declared blast radius**, not a
+hardcoded name list: `Read` and `ReversibleLocal` are allowed; `IrreversibleLocal`
+and `External` route to the human gate; an unregistered tool (radius `None`) is
 denied. A configurable `approve` set escalates otherwise-allowed tools (e.g.
 `fs.write`, `fs.edit`) to the human gate.
+
+### The autonomy dial (`/mode`) — and its unremovable floor
+**Where:** `AutonomyLevel` in [`crates/kernel/src/types.rs`](../crates/kernel/src/types.rs); applied in `DefaultPolicy::authorize` ([`crates/policy/src/lib.rs`](../crates/policy/src/lib.rs)).
+
+A per-session dial controls **how much runs without asking**, switchable live in
+the TUI with `/mode` (an arrow-key picker), set at startup by `[policy] autonomy`
+in `medha.lock`, or overridden by `MEDHA_MODE`:
+
+| Level | Reversible edits (fs.write/edit) | Safe shell (build/test) |
+|-------|----------------------------------|-------------------------|
+| `careful` *(default)* | ask | ask |
+| `normal` | auto | ask |
+| `yolo` | auto | auto |
+
+**The dial can only ever turn `Allow`→`Human` — never the reverse.** It is
+structurally incapable of loosening the base decision, so the **safety floor is
+identical at every level, including `yolo`**: the dangerous-command scanner
+(`rm -rf /`, `mkfs`, `sudo`, `curl|sh`, credential reads) still hard-denies;
+`IrreversibleLocal`/`External` actions and `git commit` still route to the human
+gate; out-of-workspace/personal-file access is still gated by the permission
+manager; web-tainted actions still escalate via trust-flow. A floor action that
+resolves to `Human` is **asked** interactively and **denied** headless (AutoDeny) —
+so `MEDHA_MODE=yolo` unattended can never execute `rm -rf ~`, it's refused.
+(Verification is a *separate* axis — see the Eval Gate §8; `/verify` is future.)
 
 ### Fail-closed shell scanner
 **Where:** `crates/policy/src/lib.rs` — `scan_command` / `hard_dangerous` / `needs_review`
@@ -206,11 +261,12 @@ Precedence: **env var > medha.lock > built-in default**.
 | `[routing]` | `executor`, `verifier` | Provider seats. Only `executor` is consulted today; `verifier` is a placeholder for cross-vendor verification (not yet built). |
 | `[budget]` | `max_turns`, `max_tokens`, `max_cost_usd`, `max_wall_s` | Per-task ceilings enforced by the `Governor` before each turn. Default: `max_turns = 200`. |
 | `[context]` | `trigger_ratio`, `microcompact_ratio`, `tail_ratio`, `protect_first_n`, `protect_last_n`, `prune_min_tool_tokens`, `emergency_ratio` | Compaction tuning. |
-| `[policy]` | `approve` | Tool classes requiring human approval (default: `["fs.write", "fs.edit"]`). |
+| `[policy]` | `approve`, `autonomy` | `approve`: tool classes requiring human approval. `autonomy`: starting dial `careful`/`normal`/`yolo` (default `careful`; live via `/mode`, override `MEDHA_MODE`). |
 | `[sandbox]` | `backend`, `network`, `image`, `runtime`, `memory`, `pids`, `host`, `remote_dir`, `extra_writable` | Execution backend + network posture. Default: `backend = "native"`, `network = "allow"`. |
 | `[verify]` | `command` | Deterministic check run after file-modifying turns (e.g. `cargo check`). Empty = none. |
 | `[reasoning]` | `enabled`, `effort` | Request-side thinking control for reasoning-capable models. |
 | `[ui]` | `show_thinking`, `full_transparency` | TUI presentation defaults. |
+| `[gate]` | `scenarios_dir`, `pass_threshold`, `seeds`, `regression_epsilon` | Eval-gate policy for `medha gate` (§8). Defaults: `scenarios`, `1.0`, `1`, `0.0`. |
 
 Machine-local trust grants (out-of-workspace path permissions) live in
 `.medha/trust.lock`, **not** in the portable `medha.lock` — absolute per-machine
@@ -218,7 +274,7 @@ paths must not travel with the harness artifact. A one-time migration moves any
 legacy `[permissions]` block out of `medha.lock`.
 
 Session-level env overrides: `MEDHA_MAX_TURNS`, `MEDHA_MAX_TOKENS`,
-`MEDHA_MAX_COST`, `MEDHA_MAX_WALL`, `MEDHA_APPROVE`, `MEDHA_VERIFY`,
+`MEDHA_MAX_COST`, `MEDHA_MAX_WALL`, `MEDHA_APPROVE`, `MEDHA_MODE`, `MEDHA_VERIFY`,
 `MEDHA_SANDBOX`, `MEDHA_MAX_CTX`.
 
 ---
@@ -256,6 +312,7 @@ Four run modes, chosen automatically:
 |---------|:---:|:---:|--------|
 | `/help` | ✅ | ✅ | Show commands |
 | `/status` | ✅ | ✅ | Model, context window, pressure, thinking state |
+| `/mode` | — | ✅ | Autonomy dial picker (careful/normal/yolo) — how much runs without asking; floor stays gated |
 | `/reasoning` | — | ✅ | Unified mode, visibility, effort, and delivery-status panel |
 | `/reasoning on\|off\|show\|hide\|status` | — | ✅ | Configure reasoning explicitly |
 | `/reasoning effort auto\|low\|medium\|high` | — | ✅ | Set reasoning depth (`low`/`medium`/`high` also enable it) |
@@ -304,11 +361,21 @@ Resolved without the user typing a number, never fabricated (precedence):
 ### Provider configuration
 **Where:** [`crates/medha-cli/src/config.rs`](../crates/medha-cli/src/config.rs)
 
-Resolution order: **CLI flag → env var → `~/.medha/config.toml` → first-run
-wizard.** The wizard queries `/v1/models` and offers a model picker. API keys
-are stored in the **OS keychain** (`keyring` crate), never in the TOML. Env
-names accept `MEDHA_*` and the common `OPENAI_COMPATIBLE_*` / `OPENAI_*`
-spellings.
+Resolution order: **CLI flag → env var → `~/.medha/config.toml` → TUI
+first-run model setup** (`medha --setup` opens the same form; the old terminal
+wizard is gone — one setup surface). Unconfigured headless runs fail fast with
+an actionable error instead of prompting. API keys
+never live in the TOML; they resolve through a layered secret store: **env var
+→ `~/.medha/credentials.toml` (owner-only 0600, enforced on every write) → OS
+keychain (`keyring` crate)**. File-first is deliberate: macOS binds keychain
+ACLs to the binary's code signature, so keychain-first storage throws a
+password dialog on every rebuild of an ad-hoc-signed dev binary (and headless
+Linux has no keychain at all). Legacy keychain keys migrate into the file on
+first read. `MEDHA_CRED_STORE=keychain` at runtime — or compiling with
+`MEDHA_DEFAULT_CRED_STORE=keychain`, intended for stably-signed release
+builds — restores keychain-first. Found keys are cached in-process — at most
+one store lookup per endpoint per run. Env names accept `MEDHA_*` and the
+common `OPENAI_COMPATIBLE_*` / `OPENAI_*` spellings.
 
 ---
 
@@ -355,8 +422,9 @@ model doesn't guess a stale year for time-sensitive queries).
 ## 7. Persistence & state
 **Where:** [`crates/store/src/lib.rs`](../crates/store/src/lib.rs), [`crates/permissions/src/lib.rs`](../crates/permissions/src/lib.rs).
 
-Under `<workspace>/.medha/` (gitignored by default — a `.gitignore` is written on
-first run):
+Runtime state is under `$MEDHA_HOME/projects/<encoded-workspace>/` (default:
+`~/.medha/projects/<encoded-workspace>/`), outside the repository. The only
+workspace `.medha/` content is committed configuration such as skills:
 
 | Path | What |
 |------|------|
@@ -367,7 +435,8 @@ first run):
 | `logs/medha.log` | Structured `tracing` log (file, never stdout — the TUI owns the screen). |
 | `logs/audit.log` | Audit log of out-of-workspace access attempts. |
 
-A second cache is **global, not per-project**: `~/.medha/models_dev_cache.json`
+A second cache is **global, not per-project**:
+`$MEDHA_HOME/models_dev_cache.json`
 holds the models.dev context-window metadata (shared across workspaces, since
 it's model metadata, not project state — `models_dev.rs:45`).
 
@@ -384,3 +453,71 @@ A live ask-then-persist flow for files outside the workspace jail:
 7. every out-of-workspace access is audited.
 
 Headless / `AutoDeny` mode denies all out-of-workspace access (fail-closed).
+
+---
+
+## 8. The Eval Gate — `medha gate`
+**Where:** [`crates/gate/`](../crates/gate/) — `scenario.rs`, `run.rs`, `checks.rs`, `verdict.rs`, `report.rs`, `lib.rs`; CLI dispatch in [`crates/medha-cli/src/main.rs`](../crates/medha-cli/src/main.rs) (`run_gate_command`).
+
+"CI for cognition" (spec §4.11–4.12): run the *real* agent against fixture
+scenarios in isolation, then score each run with **deterministic checks** over
+the event log + filesystem — **no LLM-as-judge** — and return a
+**promote / hold / reject** verdict. Exit code gates CI: `0` all promote · `1`
+any reject · `2` any hold.
+
+```sh
+medha gate scenarios/fix-failing-test              # one scenario
+medha gate scenarios/                              # every scenario under a dir
+medha gate scenarios/ --seeds 3                    # 3 repeats → pass-rate + Wilson CI
+medha gate scenarios/ --json                       # machine-readable (CI)
+medha gate scenarios/fix-failing-test --validate   # load/lint only — no model run, free
+```
+
+### Scenario format
+A scenario is `scenarios/<id>/scenario.yaml` plus a `fixture/` directory:
+
+| Field | Meaning |
+|-------|---------|
+| `id` | Stable identifier (report key). |
+| `task` | The instruction handed to the agent verbatim. |
+| `fixture` | Directory copied into a throwaway workspace per run (default `fixture`). |
+| `contract` | `max_turns` / `max_tokens` / `max_cost_usd` / `max_wall_s` → the run's budget env. |
+| `checks` | The deterministic checks — all must pass for the run to pass. |
+| `labels` | Free-form tags (`coding`, `golden`, `adversarial`, …). |
+
+A scenario with **zero checks is rejected at load** — a check that can't fail
+would rubber-stamp any run (Vol 5 §2).
+
+### Check kinds (all deterministic, no model call)
+| Check | Passes when |
+|-------|-------------|
+| `command: { run, expect_exit, contains? }` | The command exits `expect_exit` (and stdout contains `contains`, if given). |
+| `unchanged: <glob>` / `changed: <glob>` | Files matching the glob are byte-identical to / differ from the pristine fixture. |
+| `exists: <path>` / `absent: <path>` | The path exists / does not in the post-run workspace. |
+| `tool_used: <tool>` / `tool_not_used: <tool>` | The agent did / did not issue that tool intent (scans `model.tool_intent` events). |
+| `event_absent: { kind, contains }` / `event_present` | No / at least one event of `kind` carries `contains` in its payload (e.g. no `policy` event mentioning `dangerous_pattern`). |
+
+### Isolation & autonomy
+Each run is **hermetic** (`run.rs`): a fresh temp workspace (the fixture,
+copied) and a throwaway `MEDHA_HOME`, so the run's `events.db` is isolated and a
+run never touches the operator's real code or `~/.medha`. The gate spawns the
+**real `medha` binary** (`std::env::current_exe`) — a true black-box, not an
+in-process re-assembly of the kernel — with the provider injected as env
+(`MEDHA_BASE_URL`/`MEDHA_MODEL`/`MEDHA_API_KEY`) and `kill_on_drop` + a wall
+backstop. Because a gate run is **unattended**, it runs autonomously
+(`MEDHA_APPROVE=none`); safety comes from the disposable workspace + OS sandbox +
+the deny-first scanner (which still hard-denies dangerous commands), not a human
+gate.
+
+### Verdict & statistics (`verdict.rs`)
+The *agent run* is stochastic; the *scoring* is a pure function of the finished
+run, so the same run always yields the same verdict. `--seeds N` runs a scenario
+`N` times → a pass-rate with a **Wilson 95% confidence interval** (a single seed
+prints a noise caveat). A seed passes only if the run **completed** (not timed
+out) and every check passed. Verdict: **promote** if pass-rate ≥
+`[gate] pass_threshold`, **reject** if nothing passed, else **hold**.
+
+### Deferred (roadmap — see `PROGRESS.md`)
+LLM-as-judge with calibration (Vol 5 §4), canary / win-rate / promotion /
+rollback (§4.11), microVM isolation, `--ablate`, and the trace→eval flywheel.
+This crate ships the deterministic core those build on.

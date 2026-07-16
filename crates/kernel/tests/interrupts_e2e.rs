@@ -11,7 +11,7 @@ use kernel::{
     ObsStatus, Observation, Provider, ProviderCaps, ProviderError, Role, Session, StopReason,
     StreamSink, ToolCallStrategy, ToolIntent, ToolSpec,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +23,9 @@ enum Turn {
     Blocks(Vec<Block>),
     /// Emit this text, then hang forever (a stream that never finishes).
     TextThenHang(String),
+    /// Hang in `stream()` itself — no first byte ever arrives (models with
+    /// long prompt processing look exactly like this from the kernel's side).
+    HangBeforeFirstByte,
 }
 
 struct ScriptedProvider {
@@ -53,11 +56,13 @@ impl Provider for ScriptedProvider {
         &self,
         _ctx: &CompiledContext,
     ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
-        match self.turns.lock().unwrap().pop_front() {
+        let turn = self.turns.lock().unwrap().pop_front();
+        match turn {
             Some(Turn::Blocks(blocks)) => Ok(stream::iter(blocks.into_iter().map(Ok)).boxed()),
-            Some(Turn::TextThenHang(t)) => {
-                Ok(stream::iter(vec![Ok(Block::Text(t))]).chain(stream::pending()).boxed())
-            }
+            Some(Turn::TextThenHang(t)) => Ok(stream::iter(vec![Ok(Block::Text(t))])
+                .chain(stream::pending())
+                .boxed()),
+            Some(Turn::HangBeforeFirstByte) => futures::future::pending().await,
             None => Ok(stream::iter(vec![Ok(Block::Text("(script exhausted)".into()))]).boxed()),
         }
     }
@@ -130,7 +135,11 @@ impl StreamSink for CaptureSink {
 }
 
 fn intent_block(id: &str, tool: &str) -> Block {
-    Block::ToolIntent(ToolIntent { id: id.into(), tool: tool.into(), args: json!({}) })
+    Block::ToolIntent(ToolIntent {
+        id: id.into(),
+        tool: tool.into(),
+        args: json!({}),
+    })
 }
 
 #[allow(clippy::type_complexity)]
@@ -155,10 +164,58 @@ fn kernel_with(
 }
 
 fn ids_of(events: &[Event], kind: EventKind) -> Vec<Value> {
-    events.iter().filter(|e| e.kind == kind).map(|e| e.payload.clone()).collect()
+    events
+        .iter()
+        .filter(|e| e.kind == kind)
+        .map(|e| e.payload.clone())
+        .collect()
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+/// Esc while the model is still "thinking" — i.e. the HTTP stream is open but
+/// no first byte has arrived (big models spend minutes in prompt processing).
+/// The cancel must abort the connect wait itself, not just an open stream.
+#[tokio::test]
+async fn cancel_aborts_a_stream_still_connecting() {
+    let (kernel, log) = kernel_with(
+        vec![Turn::HangBeforeFirstByte],
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+    );
+    let session = Session::new();
+    let (handle, queue) = InterruptQueue::pair();
+    let sink = CaptureSink::default();
+
+    let k = kernel.clone();
+    let s = session.clone();
+    let task = tokio::spawn(async move {
+        k.run_session(
+            &s,
+            vec![Message::user("go")],
+            Budget::default(),
+            &sink,
+            Some(queue),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await; // connecting…
+    let started = std::time::Instant::now();
+    handle.cancel_turn();
+    let (_messages, reason) = task.await.unwrap().unwrap();
+
+    assert_eq!(reason, StopReason::Interrupted);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "Esc during connect must stop promptly, took {:?}",
+        started.elapsed()
+    );
+    // Nothing streamed → no dangling intents or observations in the log.
+    let events = log.events(session.id).await;
+    assert_eq!(ids_of(&events, EventKind::ModelIntent).len(), 0);
+    assert_eq!(ids_of(&events, EventKind::ToolObs).len(), 0);
+}
 
 #[tokio::test]
 async fn cancel_settles_inflight_tool_and_leaves_no_dangling_intent() {
@@ -175,7 +232,14 @@ async fn cancel_settles_inflight_tool_and_leaves_no_dangling_intent() {
     let k = kernel.clone();
     let s = session.clone();
     let task = tokio::spawn(async move {
-        k.run_session(&s, vec![Message::user("go")], Budget::default(), &sink, Some(queue)).await
+        k.run_session(
+            &s,
+            vec![Message::user("go")],
+            Budget::default(),
+            &sink,
+            Some(queue),
+        )
+        .await
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await; // tool is in flight
@@ -196,7 +260,11 @@ async fn cancel_settles_inflight_tool_and_leaves_no_dangling_intent() {
     let obs = ids_of(&events, EventKind::ToolObs);
     assert_eq!(intents.len(), 1);
     assert_eq!(obs.len(), 1, "every admitted intent gets an observation");
-    assert!(obs[0].to_string().contains("interrupted"), "synthesized: {}", obs[0]);
+    assert!(
+        obs[0].to_string().contains("interrupted"),
+        "synthesized: {}",
+        obs[0]
+    );
     let tool_msgs: Vec<_> = messages.iter().filter(|m| m.role == Role::Tool).collect();
     assert_eq!(tool_msgs.len(), 1);
     assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("i1"));
@@ -221,7 +289,14 @@ async fn steer_lands_at_the_next_turn_boundary() {
     let k = kernel.clone();
     let s = session.clone();
     let task = tokio::spawn(async move {
-        k.run_session(&s, vec![Message::user("go")], Budget::default(), &sink, Some(queue)).await
+        k.run_session(
+            &s,
+            vec![Message::user("go")],
+            Budget::default(),
+            &sink,
+            Some(queue),
+        )
+        .await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await; // mid turn-1
@@ -229,20 +304,31 @@ async fn steer_lands_at_the_next_turn_boundary() {
     let (messages, reason) = task.await.unwrap().unwrap();
 
     assert_eq!(reason, StopReason::Finished);
-    assert_eq!(*steered.lock().unwrap(), vec!["also check the tests".to_string()]);
+    assert_eq!(
+        *steered.lock().unwrap(),
+        vec!["also check the tests".to_string()]
+    );
     // The steer is a real user message BETWEEN turn 1's results and turn 2.
     let pos_steer = messages
         .iter()
         .position(|m| m.role == Role::User && m.content == "also check the tests")
         .expect("steer message in history");
     let pos_done = messages.iter().position(|m| m.content == "done").unwrap();
-    assert!(pos_steer < pos_done, "steer precedes the following turn's answer");
+    assert!(
+        pos_steer < pos_done,
+        "steer precedes the following turn's answer"
+    );
     // And it's logged as a plain user.message → resume needs no special casing.
     let events = log.events(session.id).await;
-    assert!(events.iter().any(|e| e.kind == EventKind::UserMessage
-        && e.payload["text"] == json!("also check the tests")));
-    assert!(events.iter().any(|e| e.kind == EventKind::Interrupt
-        && e.payload["kind"] == json!("steer")));
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::UserMessage
+            && e.payload["text"] == json!("also check the tests"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::Interrupt && e.payload["kind"] == json!("steer"))
+    );
 }
 
 #[tokio::test]
@@ -259,7 +345,14 @@ async fn cancel_mid_stream_keeps_partial_text_and_drops_intents() {
     let k = kernel.clone();
     let s = session.clone();
     let task = tokio::spawn(async move {
-        k.run_session(&s, vec![Message::user("go")], Budget::default(), &sink, Some(queue)).await
+        k.run_session(
+            &s,
+            vec![Message::user("go")],
+            Budget::default(),
+            &sink,
+            Some(queue),
+        )
+        .await
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await; // text streamed, now hanging
@@ -270,7 +363,10 @@ async fn cancel_mid_stream_keeps_partial_text_and_drops_intents() {
     let last = messages.last().unwrap();
     assert_eq!(last.role, Role::Assistant);
     assert_eq!(last.content, "partial answer", "what streamed is kept");
-    assert!(last.tool_calls.is_empty(), "no dangling tool_calls on the partial turn");
+    assert!(
+        last.tool_calls.is_empty(),
+        "no dangling tool_calls on the partial turn"
+    );
     let events = log.events(session.id).await;
     assert!(events.iter().any(|e| e.kind == EventKind::ModelText));
     assert!(
@@ -294,7 +390,14 @@ async fn steer_then_cancel_returns_the_text_instead_of_losing_it() {
     let k = kernel.clone();
     let s = session.clone();
     let task = tokio::spawn(async move {
-        k.run_session(&s, vec![Message::user("go")], Budget::default(), &sink, Some(queue)).await
+        k.run_session(
+            &s,
+            vec![Message::user("go")],
+            Budget::default(),
+            &sink,
+            Some(queue),
+        )
+        .await
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -303,7 +406,10 @@ async fn steer_then_cancel_returns_the_text_instead_of_losing_it() {
     let (messages, reason) = task.await.unwrap().unwrap();
 
     assert_eq!(reason, StopReason::Interrupted);
-    assert_eq!(*returned.lock().unwrap(), vec!["wait, do Y instead".to_string()]);
+    assert_eq!(
+        *returned.lock().unwrap(),
+        vec!["wait, do Y instead".to_string()]
+    );
     assert!(
         !messages.iter().any(|m| m.content == "wait, do Y instead"),
         "an unapplied steer must not sit in the history"
@@ -325,7 +431,13 @@ async fn intent_decision_observation_stay_adjacent_per_id() {
     let sink = CaptureSink::default();
     let (_h, queue) = InterruptQueue::pair();
     let (_msgs, reason) = kernel
-        .run_session(&session, vec![Message::user("go")], Budget::default(), &sink, Some(queue))
+        .run_session(
+            &session,
+            vec![Message::user("go")],
+            Budget::default(),
+            &sink,
+            Some(queue),
+        )
         .await
         .unwrap();
     assert_eq!(reason, StopReason::Finished);
@@ -333,17 +445,20 @@ async fn intent_decision_observation_stay_adjacent_per_id() {
     let events = log.events(session.id).await;
     for id in ["a", "b"] {
         let pos = |kind: EventKind, key: &str| {
-            events.iter().position(|e| e.kind == kind && e.payload[key] == json!(id))
+            events
+                .iter()
+                .position(|e| e.kind == kind && e.payload[key] == json!(id))
         };
         let i = pos(EventKind::ModelIntent, "id").expect("intent logged");
         let d = pos(EventKind::PolicyDecision, "intent_id").expect("decision logged");
         let o = events
             .iter()
-            .position(|e| {
-                e.kind == EventKind::ToolObs && e.payload["intent_id"] == json!(id)
-            })
+            .position(|e| e.kind == EventKind::ToolObs && e.payload["intent_id"] == json!(id))
             .expect("observation logged");
-        assert!(i < d && d < o, "order for {id}: intent({i}) → decision({d}) → obs({o})");
+        assert!(
+            i < d && d < o,
+            "order for {id}: intent({i}) → decision({d}) → obs({o})"
+        );
     }
 }
 
@@ -359,7 +474,13 @@ async fn headless_without_a_queue_finishes_exactly_as_before() {
     );
     let session = Session::new();
     let (msgs, reason) = kernel
-        .run_session(&session, vec![Message::user("go")], Budget::default(), &kernel::NullSink, None)
+        .run_session(
+            &session,
+            vec![Message::user("go")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(reason, StopReason::Finished);

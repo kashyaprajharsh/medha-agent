@@ -8,15 +8,15 @@ use ignore::WalkBuilder;
 use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
 
 pub mod skills;
-pub use skills::{SkillScope, SkillStore};
 use regex::{Regex, RegexBuilder};
 use sandbox::WorkspaceSandbox;
 use scraper::{Html, Selector};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
+pub use skills::{InstallReport, SkillScope, SkillStore};
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Build a compact unified-style diff (with a few lines of context) for display.
 fn make_diff(path: &str, before: &str, after: &str) -> String {
@@ -131,11 +131,41 @@ pub struct ToolRegistry {
     /// Shared background-task table (promoted `shell.exec` runs), kept so the
     /// executor can report live tasks to a surface. `None` for a bare registry.
     tasks: Option<Arc<TaskTable>>,
+    /// Live web-search configuration shared with the `web.*` tools. The TUI's
+    /// `/search` writes it; the tools read it per call, so a provider change
+    /// takes effect mid-session. Defaults to DuckDuckGo (with env fallback).
+    search: SearchHandle,
+    /// The surface's question-asker, populated by `main` per surface (TUI vs
+    /// headless). `None` inside = no interactive user → `clarify` reports skipped.
+    clarify: ClarifyHandle,
 }
+
+/// Shared handle to the surface's question-asker. `main` sets it after building
+/// the registry (TUI → an interactive asker; headless → left `None`).
+pub type ClarifyHandle = Arc<Mutex<Option<Arc<dyn kernel::Asker>>>>;
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: HashMap::new(), sandbox: None, tasks: None }
+        Self {
+            tools: HashMap::new(),
+            sandbox: None,
+            tasks: None,
+            search: Arc::new(Mutex::new(SearchSettings::default())),
+            clarify: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The shared search-settings handle. `main` populates it from the user's
+    /// config after building the registry and hands a clone to the TUI, so the
+    /// web tools and `/search` all read and write the same settings.
+    pub fn search_handle(&self) -> SearchHandle {
+        self.search.clone()
+    }
+
+    /// The shared clarify-asker handle. `main` sets it to the surface's asker
+    /// after building the registry; left `None` for headless (no interactive user).
+    pub fn clarify_handle(&self) -> ClarifyHandle {
+        self.clarify.clone()
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
@@ -149,14 +179,25 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
-    /// Register the Phase-A skill tools (`skill.load`, `skill.save`) over the
-    /// given store. Call *after* the capability tools are registered so the
-    /// captured `known_tools` set (frozen for the session) reflects them — it is
-    /// what `required_tools` is validated against.
+    /// Register the skill tools over the given store. Include the skill tools
+    /// themselves in the frozen capability set so manifest availability, save
+    /// validation, and actual loads agree.
     pub fn register_skills(&mut self, store: Arc<SkillStore>) -> &mut Self {
-        let known = Arc::new(self.tool_names());
-        self.register(Arc::new(skills::SkillLoad { store: store.clone(), known_tools: known.clone() }));
-        self.register(Arc::new(skills::SkillSave { store, known_tools: known }));
+        let mut names = self.tool_names();
+        names.extend(["skill.load", "skill.save", "skill.list"].map(String::from));
+        let known = Arc::new(names);
+        self.register(Arc::new(skills::SkillLoad {
+            store: store.clone(),
+            known_tools: known.clone(),
+        }));
+        self.register(Arc::new(skills::SkillList {
+            store: store.clone(),
+            known_tools: known.clone(),
+        }));
+        self.register(Arc::new(skills::SkillSave {
+            store,
+            known_tools: known,
+        }));
         self
     }
 
@@ -168,32 +209,76 @@ impl ToolRegistry {
     ) -> Self {
         let mut r = Self::new();
         r.sandbox = Some(sandbox.clone());
-        r.register(Arc::new(FsRead { sbx: sandbox.clone() }));
-        r.register(Arc::new(FsWrite { sbx: sandbox.clone() }));
-        r.register(Arc::new(FsList { sbx: sandbox.clone() }));
-        r.register(Arc::new(FsEdit { sbx: sandbox.clone(), pins: Default::default() }));
-        r.register(Arc::new(WordCount { sbx: sandbox.clone() }));
-        r.register(Arc::new(Grep { sbx: sandbox.clone() }));
-        r.register(Arc::new(Glob { sbx: sandbox.clone() }));
-        r.register(Arc::new(CodeOutline { sbx: sandbox.clone() }));
-        r.register(Arc::new(References { sbx: sandbox.clone() }));
-        r.register(Arc::new(Tree { sbx: sandbox.clone() }));
-        r.register(Arc::new(MultiEdit { sbx: sandbox.clone(), pins: Default::default() }));
-        r.register(Arc::new(Git { sbx: sandbox.clone() }));
-        r.register(Arc::new(Diagnostics { sbx: sandbox.clone() }));
+        r.register(Arc::new(FsRead {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(FsWrite {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(FsList {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(FsEdit {
+            sbx: sandbox.clone(),
+            pins: Default::default(),
+        }));
+        r.register(Arc::new(WordCount {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(Grep {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(Glob {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(CodeOutline {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(References {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(Tree {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(MultiEdit {
+            sbx: sandbox.clone(),
+            pins: Default::default(),
+        }));
+        r.register(Arc::new(Git {
+            sbx: sandbox.clone(),
+        }));
+        r.register(Arc::new(Diagnostics {
+            sbx: sandbox.clone(),
+        }));
         // Background-task facility (§2): a slow `shell.exec` promotes to a task in
         // this shared table; `task.output`/`task.kill`/`task.list` operate on it,
         // and the executor exposes it to surfaces via `background_tasks()`.
         let tasks = Arc::new(TaskTable::default());
         r.tasks = Some(tasks.clone());
-        r.register(Arc::new(ShellExec { sbx: sandbox, tasks: tasks.clone() }));
-        r.register(Arc::new(TaskOutput { tasks: tasks.clone() }));
-        r.register(Arc::new(TaskKill { tasks: tasks.clone() }));
+        r.register(Arc::new(ShellExec {
+            sbx: sandbox,
+            tasks: tasks.clone(),
+        }));
+        r.register(Arc::new(TaskOutput {
+            tasks: tasks.clone(),
+        }));
+        r.register(Arc::new(TaskKill {
+            tasks: tasks.clone(),
+        }));
         r.register(Arc::new(TaskList { tasks }));
         r.register(Arc::new(ReadArtifact { store: artifacts }));
-        r.register(Arc::new(WebSearch));
-        r.register(Arc::new(WebFetch));
-        r.register(Arc::new(WebCrawl));
+        r.register(Arc::new(WebSearch {
+            search: r.search.clone(),
+        }));
+        r.register(Arc::new(WebFetch {
+            search: r.search.clone(),
+        }));
+        r.register(Arc::new(WebCrawl {
+            search: r.search.clone(),
+        }));
+        r.register(Arc::new(Clarify {
+            asker: r.clarify.clone(),
+        }));
         r.register(Arc::new(UpdatePlan));
         r
     }
@@ -260,7 +345,11 @@ impl Executor for ToolRegistry {
                 Err(_) => {
                     return Observation::error(
                         &intent.id,
-                        format!("tool '{}' timed out after {}s", intent.tool, limit.as_secs()),
+                        format!(
+                            "tool '{}' timed out after {}s",
+                            intent.tool,
+                            limit.as_secs()
+                        ),
                     );
                 }
             },
@@ -333,7 +422,11 @@ impl Tool for FsRead {
                 }
             }
         }
-        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
+        let content = self
+            .sbx
+            .read(&path)
+            .await
+            .map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
         // Whole-file read (default) — unchanged behavior.
         if offset.is_none() && limit.is_none() {
             return Ok(json!({ "path": path, "content": content }));
@@ -349,7 +442,9 @@ impl Tool for FsRead {
         let start = (offset.unwrap_or(1).max(1) as usize - 1).min(total);
         // `saturating_add` so `start + limit` can't wrap in release and silently
         // return empty content for a large `limit`.
-        let end = limit.map(|l| start.saturating_add(l as usize).min(total)).unwrap_or(total);
+        let end = limit
+            .map(|l| start.saturating_add(l as usize).min(total))
+            .unwrap_or(total);
         let slice = lines.get(start..end).unwrap_or(&[]).concat();
         // Flag an offset that lands past EOF, so an empty slice isn't read as
         // "the file ends here" when really the offset overshot.
@@ -405,10 +500,16 @@ impl Tool for FsWrite {
         // a proper diff: a new file shows as all-additions (empty left column),
         // an overwrite shows the real before/after — same view as fs.edit.
         let (old, unreadable) = read_or_flag_unreadable(&self.sbx, &path).await;
-        let snapshot = self.sbx.write(&path, &content).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let snapshot = self
+            .sbx
+            .write(&path, &content)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         let mut out = json!({ "path": path, "written": true, "snapshot": snapshot, "old": old, "new": content });
         if unreadable {
-            out["note"] = json!("prior file existed but was unreadable (non-UTF-8 or permission denied); diff shows it as empty");
+            out["note"] = json!(
+                "prior file existed but was unreadable (non-UTF-8 or permission denied); diff shows it as empty"
+            );
         }
         Ok(out)
     }
@@ -460,7 +561,9 @@ impl Tool for FsList {
     fn name(&self) -> &str {
         "fs.list"
     }
-    fn icon(&self) -> &'static str { "▸" }
+    fn icon(&self) -> &'static str {
+        "▸"
+    }
     fn description(&self) -> &str {
         "List the immediate entries of a directory (directories suffixed with '/'). \
          For recursive discovery by name use `glob`; to search file contents use \
@@ -477,7 +580,11 @@ impl Tool for FsList {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let entries = self.sbx.list(path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let entries = self
+            .sbx
+            .list(path)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         Ok(json!({ "path": path, "entries": entries }))
     }
 }
@@ -499,7 +606,11 @@ impl PreviewPins {
     }
     /// Take the pin for these args (if any) and verify the content still matches.
     fn check(&self, args: &Value, path: &str, content: &str) -> Result<(), ToolError> {
-        let pinned = self.0.lock().unwrap().remove(&content_hash(&args.to_string()));
+        let pinned = self
+            .0
+            .lock()
+            .unwrap()
+            .remove(&content_hash(&args.to_string()));
         match pinned {
             Some(h) if h != content_hash(content) => Err(ToolError::Failed(format!(
                 "{path} changed after the approved preview; re-run the edit to preview the current content"
@@ -547,13 +658,20 @@ impl Tool for FsEdit {
         let path = arg_str(args, "path")?;
         let old_s = arg_str(args, "old_string")?;
         let new_s = arg_str(args, "new_string")?;
-        let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+        let replace_all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         validate_edit(&old_s, &new_s)?;
 
         // Serialize same-file edits within a turn so a concurrent edit can't read
         // the same original and clobber this one (P0-4).
         let _guard = self.sbx.path_guard(&path).await;
-        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let content = self
+            .sbx
+            .read(&path)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         // Refuse if the file changed since the approved preview (P1-1).
         self.pins.check(args, &path, &content)?;
         // CRLF-tolerant byte-exact match (see `resolve_edit`).
@@ -570,7 +688,11 @@ impl Tool for FsEdit {
         } else {
             content.replacen(&old_s, &new_s, 1)
         };
-        let snapshot = self.sbx.write(&path, &updated).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let snapshot = self
+            .sbx
+            .write(&path, &updated)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         let diff = make_diff(&path, &content, &updated);
         Ok(json!({
             "path": path,
@@ -592,13 +714,18 @@ impl Tool for FsEdit {
         let path = args.get("path")?.as_str()?;
         let old_s = args.get("old_string")?.as_str()?;
         let new_s = args.get("new_string")?.as_str()?;
-        let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+        let replace_all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let content = self.sbx.read(path).await.ok()?;
         // Pin what the approval card will show (P1-1).
         self.pins.pin(args, &content);
         let count = content.matches(old_s).count();
         if count == 0 {
-            return Some(format!("(old_string not found in {path} — this edit would fail)"));
+            return Some(format!(
+                "(old_string not found in {path} — this edit would fail)"
+            ));
         }
         if count > 1 && !replace_all {
             return Some(format!(
@@ -629,7 +756,9 @@ impl Tool for WordCount {
     fn name(&self) -> &str {
         "word_count"
     }
-    fn icon(&self) -> &'static str { "#" }
+    fn icon(&self) -> &'static str {
+        "#"
+    }
     fn description(&self) -> &str {
         "Count words, lines, and characters in a workspace file. Supports paths outside workspace with permission."
     }
@@ -647,7 +776,11 @@ impl Tool for WordCount {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
-        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
+        let content = self
+            .sbx
+            .read(&path)
+            .await
+            .map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
         let lines: Vec<&str> = content.lines().collect();
         let line_count = lines.len();
         let char_count = content.chars().count();
@@ -672,7 +805,9 @@ impl Tool for Grep {
     fn name(&self) -> &str {
         "grep"
     }
-    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
     fn description(&self) -> &str {
         "Search file contents by regular expression across the workspace, \
          gitignore-aware (skips ignored/hidden files, target/, node_modules, binaries). \
@@ -697,16 +832,26 @@ impl Tool for Grep {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let pattern = arg_str(args, "pattern")?;
-        let ci = args.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false);
+        let ci = args
+            .get("case_insensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let context = args.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(200) as usize;
+        let max = args
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(200) as usize;
         let rel_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
 
         let re = RegexBuilder::new(&pattern)
             .case_insensitive(ci)
             .build()
             .map_err(|e| ToolError::Args(format!("bad regex: {e}")))?;
-        let start = self.sbx.resolve(rel_path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let start = self
+            .sbx
+            .resolve(rel_path)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         let root = self.sbx.root().to_path_buf();
 
         // gitignore-aware, parallel-capable walk (ripgrep's engine). Standard
@@ -796,8 +941,12 @@ impl Tool for Glob {
     fn name(&self) -> &str {
         "glob"
     }
-    fn icon(&self) -> &'static str { "✦" }
-    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn icon(&self) -> &'static str {
+        "✦"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
     fn description(&self) -> &str {
         "Find files by name pattern across the whole workspace (recursive, \
          gitignore-aware), e.g. '**/*.rs' or 'src/**/test_*.py'. Faster and more \
@@ -819,7 +968,10 @@ impl Tool for Glob {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let pattern = arg_str(args, "pattern")?;
-        let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(500) as usize;
+        let max = args
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(500) as usize;
         let matcher = glob::Pattern::new(&pattern).map_err(|e| ToolError::Args(e.to_string()))?;
         let root = self.sbx.root().to_path_buf();
 
@@ -871,10 +1023,21 @@ fn outline_rules(path: &str) -> Vec<(&'static str, Regex)> {
     let r = |p: &str| Regex::new(p).unwrap();
     match ext.as_str() {
         "rs" => vec![
-            ("fn", r(r"^\s*(?:pub\s+)?(?:pub\([^)]*\)\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?(?:extern\s+\S+\s+)?fn\s+(?P<name>\w+)")),
-            ("struct", r(r"^\s*(?:pub\s+)?(?:pub\([^)]*\)\s+)?struct\s+(?P<name>\w+)")),
+            (
+                "fn",
+                r(
+                    r"^\s*(?:pub\s+)?(?:pub\([^)]*\)\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?(?:extern\s+\S+\s+)?fn\s+(?P<name>\w+)",
+                ),
+            ),
+            (
+                "struct",
+                r(r"^\s*(?:pub\s+)?(?:pub\([^)]*\)\s+)?struct\s+(?P<name>\w+)"),
+            ),
             ("enum", r(r"^\s*(?:pub\s+)?enum\s+(?P<name>\w+)")),
-            ("trait", r(r"^\s*(?:pub\s+)?(?:unsafe\s+)?trait\s+(?P<name>\w+)")),
+            (
+                "trait",
+                r(r"^\s*(?:pub\s+)?(?:unsafe\s+)?trait\s+(?P<name>\w+)"),
+            ),
             ("impl", r(r"^\s*impl(?:<[^>]*>)?\s+(?P<name>[\w:]+)")),
             ("mod", r(r"^\s*(?:pub\s+)?mod\s+(?P<name>\w+)")),
             ("type", r(r"^\s*(?:pub\s+)?type\s+(?P<name>\w+)")),
@@ -885,16 +1048,36 @@ fn outline_rules(path: &str) -> Vec<(&'static str, Regex)> {
             ("def", r(r"^\s*(?:async\s+)?def\s+(?P<name>\w+)")),
         ],
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => vec![
-            ("class", r(r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(?P<name>\w+)")),
-            ("function", r(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\*?\s+(?P<name>\w+)")),
-            ("const", r(r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>\w+)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|\w+\s*=>)")),
-            ("interface", r(r"^\s*(?:export\s+)?interface\s+(?P<name>\w+)")),
+            (
+                "class",
+                r(r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(?P<name>\w+)"),
+            ),
+            (
+                "function",
+                r(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\*?\s+(?P<name>\w+)"),
+            ),
+            (
+                "const",
+                r(
+                    r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>\w+)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|\w+\s*=>)",
+                ),
+            ),
+            (
+                "interface",
+                r(r"^\s*(?:export\s+)?interface\s+(?P<name>\w+)"),
+            ),
             ("type", r(r"^\s*(?:export\s+)?type\s+(?P<name>\w+)")),
-            ("enum", r(r"^\s*(?:export\s+)?(?:const\s+)?enum\s+(?P<name>\w+)")),
+            (
+                "enum",
+                r(r"^\s*(?:export\s+)?(?:const\s+)?enum\s+(?P<name>\w+)"),
+            ),
         ],
         "go" => vec![
             ("func", r(r"^\s*func\s+(?:\([^)]*\)\s*)?(?P<name>\w+)")),
-            ("type", r(r"^\s*type\s+(?P<name>\w+)\s+(?:struct|interface)")),
+            (
+                "type",
+                r(r"^\s*type\s+(?P<name>\w+)\s+(?:struct|interface)"),
+            ),
         ],
         "rb" => vec![
             ("class", r(r"^\s*class\s+(?P<name>\w+)")),
@@ -902,12 +1085,25 @@ fn outline_rules(path: &str) -> Vec<(&'static str, Regex)> {
             ("def", r(r"^\s*def\s+(?P<name>[\w.?!]+)")),
         ],
         "java" | "kt" | "scala" => vec![
-            ("type", r(r"^\s*(?:public|private|protected|abstract|final|static|sealed|open|data|\s)*\s*(?:class|interface|enum|object)\s+(?P<name>\w+)")),
-            ("method", r(r"^\s*(?:public|private|protected|static|final|abstract|synchronized|override|fun|def|\s)+[\w<>\[\],.\s]+?\s+(?P<name>\w+)\s*\([^;{]*\)\s*\{?\s*$")),
+            (
+                "type",
+                r(
+                    r"^\s*(?:public|private|protected|abstract|final|static|sealed|open|data|\s)*\s*(?:class|interface|enum|object)\s+(?P<name>\w+)",
+                ),
+            ),
+            (
+                "method",
+                r(
+                    r"^\s*(?:public|private|protected|static|final|abstract|synchronized|override|fun|def|\s)+[\w<>\[\],.\s]+?\s+(?P<name>\w+)\s*\([^;{]*\)\s*\{?\s*$",
+                ),
+            ),
         ],
         "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" => vec![
             ("type", r(r"^\s*(?:class|struct)\s+(?P<name>\w+)")),
-            ("fn", r(r"^\s*(?:[\w:<>\*&]+\s+)+(?P<name>\w+)\s*\([^;]*\)\s*\{?\s*$")),
+            (
+                "fn",
+                r(r"^\s*(?:[\w:<>\*&]+\s+)+(?P<name>\w+)\s*\([^;]*\)\s*\{?\s*$"),
+            ),
         ],
         _ => vec![],
     }
@@ -918,8 +1114,12 @@ impl Tool for CodeOutline {
     fn name(&self) -> &str {
         "code_outline"
     }
-    fn icon(&self) -> &'static str { "⌗" }
-    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn icon(&self) -> &'static str {
+        "⌗"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
     fn description(&self) -> &str {
         "Extract a symbol map — functions, classes, structs, traits, methods, etc., \
          each with its line number — from a source file. A fast table of contents so \
@@ -939,10 +1139,16 @@ impl Tool for CodeOutline {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
-        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(format!("read failed: {e}")))?;
+        let content = self
+            .sbx
+            .read(&path)
+            .await
+            .map_err(|e| ToolError::Failed(format!("read failed: {e}")))?;
         let rules = outline_rules(&path);
         if rules.is_empty() {
-            return Ok(json!({ "path": path, "symbols": [], "count": 0, "note": "unsupported file type for outline" }));
+            return Ok(
+                json!({ "path": path, "symbols": [], "count": 0, "note": "unsupported file type for outline" }),
+            );
         }
         let mut symbols: Vec<Value> = Vec::new();
         for (i, line) in content.lines().enumerate() {
@@ -969,8 +1175,12 @@ impl Tool for References {
     fn name(&self) -> &str {
         "references"
     }
-    fn icon(&self) -> &'static str { "↗" }
-    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn icon(&self) -> &'static str {
+        "↗"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
     fn description(&self) -> &str {
         "Find every place a symbol (function/type/variable name) appears — WHOLE-WORD \
          matches only, so 'run' won't match 'running'. Returns {path, line, text} for \
@@ -996,15 +1206,23 @@ impl Tool for References {
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let symbol = arg_str(args, "symbol")?;
         let rel_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(200) as usize;
+        let max = args
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(200) as usize;
 
         // Deterministic whole-word match — the reason to use this over `grep`. We do
         // NOT classify definition-vs-use here: the caller sees the line text and can
         // judge that far more reliably than a language-specific keyword heuristic could.
         let esc = regex::escape(&symbol);
-        let word = Regex::new(&format!(r"\b{esc}\b")).map_err(|e| ToolError::Args(format!("bad symbol: {e}")))?;
+        let word = Regex::new(&format!(r"\b{esc}\b"))
+            .map_err(|e| ToolError::Args(format!("bad symbol: {e}")))?;
 
-        let start = self.sbx.resolve(rel_path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let start = self
+            .sbx
+            .resolve(rel_path)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         let root = self.sbx.root().to_path_buf();
 
         // Full walk + reads are blocking work — off the async runtime.
@@ -1063,8 +1281,12 @@ impl Tool for Tree {
     fn name(&self) -> &str {
         "tree"
     }
-    fn icon(&self) -> &'static str { "├" }
-    fn category(&self) -> ToolCategory { ToolCategory::Search }
+    fn icon(&self) -> &'static str {
+        "├"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
     fn description(&self) -> &str {
         "Show a directory as an indented, depth-limited tree (gitignore-aware, skips \
          .git/target/node_modules) — the fastest way to orient in an unfamiliar \
@@ -1085,9 +1307,20 @@ impl Tool for Tree {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let rel_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let depth = args.get("depth").and_then(Value::as_u64).unwrap_or(2).max(1) as usize;
-        let max = args.get("max_entries").and_then(Value::as_u64).unwrap_or(300) as usize;
-        let start = self.sbx.resolve(rel_path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let depth = args
+            .get("depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(2)
+            .max(1) as usize;
+        let max = args
+            .get("max_entries")
+            .and_then(Value::as_u64)
+            .unwrap_or(300) as usize;
+        let start = self
+            .sbx
+            .resolve(rel_path)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         let rel_path = rel_path.to_string();
 
         // Directory walk is blocking work — off the async runtime.
@@ -1121,7 +1354,9 @@ impl Tool for Tree {
                 count += 1;
             }
             if truncated {
-                out.push_str(&format!("[truncated: first {max} entries shown — raise max_entries or narrow path]\n"));
+                out.push_str(&format!(
+                    "[truncated: first {max} entries shown — raise max_entries or narrow path]\n"
+                ));
             }
             Ok(json!({ "path": rel_path, "tree": out, "entries": count, "truncated": truncated }))
         })
@@ -1140,7 +1375,9 @@ impl Tool for ReadArtifact {
     fn name(&self) -> &str {
         "read_artifact"
     }
-    fn icon(&self) -> &'static str { "⎘" }
+    fn icon(&self) -> &'static str {
+        "⎘"
+    }
     fn description(&self) -> &str {
         "Continue reading a large output that was spilled to the artifact store — \
          whenever a tool result shows a hash and says only the first N chars are \
@@ -1165,9 +1402,15 @@ impl Tool for ReadArtifact {
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let hash = arg_str(args, "hash")?;
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let length = args.get("length").and_then(Value::as_u64).map(|l| l as usize);
+        let length = args
+            .get("length")
+            .and_then(Value::as_u64)
+            .map(|l| l as usize);
         let total = self.store.size(&hash).map_err(ToolError::Failed)?;
-        let bytes = self.store.get(&hash, offset, length).map_err(ToolError::Failed)?;
+        let bytes = self
+            .store
+            .get(&hash, offset, length)
+            .map_err(ToolError::Failed)?;
         // Snap page edges to char boundaries (P2): a byte offset can land
         // mid-UTF-8-sequence; lossy decoding put U+FFFD at the edges and made
         // stitched pages corrupt exact strings. Skip leading continuation
@@ -1261,9 +1504,15 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
 fn validate_public_url(url: &reqwest::Url) -> Result<(), String> {
     match url.scheme() {
         "http" | "https" => {}
-        other => return Err(format!("blocked URL scheme '{other}' (only http/https allowed)")),
+        other => {
+            return Err(format!(
+                "blocked URL scheme '{other}' (only http/https allowed)"
+            ));
+        }
     }
-    let host = url.host_str().ok_or_else(|| "URL has no host".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
 
     // IP literal: check directly, no DNS.
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -1283,7 +1532,10 @@ fn validate_public_url(url: &reqwest::Url) -> Result<(), String> {
     for addr in addrs {
         saw_any = true;
         if is_blocked_ip(addr.ip()) {
-            return Err(format!("blocked non-public address {} for host '{host}'", addr.ip()));
+            return Err(format!(
+                "blocked non-public address {} for host '{host}'",
+                addr.ip()
+            ));
         }
     }
     if !saw_any {
@@ -1311,7 +1563,9 @@ async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| ToolError::Failed(e.to_string()))?;
         if buf.len() + chunk.len() > max {
-            return Err(ToolError::Failed(format!("response exceeded {max}-byte cap")));
+            return Err(ToolError::Failed(format!(
+                "response exceeded {max}-byte cap"
+            )));
         }
         buf.extend_from_slice(&chunk);
     }
@@ -1341,17 +1595,114 @@ async fn validate_public_url_async(url: &reqwest::Url) -> Result<(), ToolError> 
         .map_err(ToolError::Failed)
 }
 
-struct WebSearch;
+/// Which backend `web.search` uses. `DuckDuckGo` needs no key and is always the
+/// fallback; the others need a key (Tavily/Brave) or an instance URL (SearXNG)
+/// supplied via `/search` in the TUI (or the matching env var).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchProvider {
+    #[default]
+    DuckDuckGo,
+    Tavily,
+    Brave,
+    Searxng,
+}
+
+impl SearchProvider {
+    /// Stable lowercase id used in config.toml and credential keys.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchProvider::DuckDuckGo => "duckduckgo",
+            SearchProvider::Tavily => "tavily",
+            SearchProvider::Brave => "brave",
+            SearchProvider::Searxng => "searxng",
+        }
+    }
+    /// Parse a config/id string; anything unrecognized → DuckDuckGo (safe default).
+    pub fn from_id(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tavily" => SearchProvider::Tavily,
+            "brave" => SearchProvider::Brave,
+            "searxng" => SearchProvider::Searxng,
+            _ => SearchProvider::DuckDuckGo,
+        }
+    }
+    /// Human-facing label for TUI notices/pickers.
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchProvider::DuckDuckGo => "DuckDuckGo",
+            SearchProvider::Tavily => "Tavily",
+            SearchProvider::Brave => "Brave",
+            SearchProvider::Searxng => "SearXNG",
+        }
+    }
+}
+
+/// User-chosen web-search configuration, shared live between the TUI (writer)
+/// and the `web.*` tools (readers) via [`SearchHandle`]. Any `None` secret
+/// falls back to the matching env var, so pre-existing env-based setups keep
+/// working untouched.
+#[derive(Debug, Clone, Default)]
+pub struct SearchSettings {
+    pub provider: SearchProvider,
+    pub tavily_key: Option<String>,
+    pub brave_key: Option<String>,
+    pub searxng_url: Option<String>,
+}
+
+/// Shared, mutable search settings. Cloned into each web tool and into the TUI
+/// so `/search` takes effect mid-session without a restart.
+pub type SearchHandle = Arc<Mutex<SearchSettings>>;
+
+impl SearchSettings {
+    /// Tavily key — explicit value first, else `TAVILY_API_KEY`.
+    fn tavily_key(&self) -> Option<String> {
+        resolve_secret(self.tavily_key.as_deref(), "TAVILY_API_KEY")
+    }
+    /// Brave key — explicit value first, else `BRAVE_API_KEY`.
+    fn brave_key(&self) -> Option<String> {
+        resolve_secret(self.brave_key.as_deref(), "BRAVE_API_KEY")
+    }
+    /// SearXNG base URL — explicit value first, else `MEDHA_SEARXNG_URL`.
+    fn searxng_url(&self) -> Option<String> {
+        resolve_secret(self.searxng_url.as_deref(), "MEDHA_SEARXNG_URL")
+    }
+}
+
+/// Prefer an explicit non-empty value; otherwise fall back to a non-empty env var.
+fn resolve_secret(explicit: Option<&str>, env: &str) -> Option<String> {
+    if let Some(v) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(v.to_string());
+    }
+    std::env::var(env)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Read a clone of the current search settings from a handle, tolerating a
+/// poisoned lock (a tool must never panic just because some other holder did).
+fn read_search(handle: &SearchHandle) -> SearchSettings {
+    handle
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_else(|p| p.into_inner().clone())
+}
+
+struct WebSearch {
+    search: SearchHandle,
+}
 #[async_trait]
 impl Tool for WebSearch {
     fn name(&self) -> &str {
         "web.search"
     }
-    fn category(&self) -> ToolCategory { ToolCategory::Web }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Web
+    }
     fn description(&self) -> &str {
-        "Search the web. Returns {title, url, snippet}. Backends tried in order: \
-         Tavily (if TAVILY_API_KEY is set), Brave (BRAVE_API_KEY), a configured \
-         SearXNG (MEDHA_SEARXNG_URL), then DuckDuckGo best-effort. Follow up with \
+        "Search the web. Returns {title, url, snippet}. Uses the provider the \
+         user configured via /search (Tavily, Brave, or SearXNG), falling back \
+         to DuckDuckGo when none is set or the chosen one fails. Follow up with \
          web.fetch on a result url."
     }
     fn blast_radius(&self) -> BlastRadius {
@@ -1371,37 +1722,42 @@ impl Tool for WebSearch {
         let query = arg_str(args, "query")?;
         let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(8) as usize;
         let client = http_client()?;
+        let cfg = read_search(&self.search);
 
-        // Reliable free backends first: Brave (free-tier key), then a self-hosted
-        // SearXNG (no key), then DuckDuckGo best-effort (often anti-botted).
-        // Each tier falls through to the next on ANY failure — not just an
-        // absent key, but an invalid/placeholder key, an expired key, or a
-        // network error — so one misconfigured backend never breaks search.
+        // Sticky selection: use ONLY the provider the user chose (via /search),
+        // then DuckDuckGo. A chosen provider that lacks a key/URL or errors —
+        // invalid/expired key, network failure — falls through to DuckDuckGo so
+        // one misconfigured backend never leaves search dead. DuckDuckGo itself
+        // needs no key and is the default when nothing is configured.
         let mut errors = Vec::new();
-
-        // Tavily first: purpose-built for LLM agents, no scraping, most reliable.
-        if let Ok(key) = std::env::var("TAVILY_API_KEY") {
-            if !key.trim().is_empty() {
-                match tavily_search(&client, &query, max, key.trim()).await {
-                    Ok(v) => return Ok(v),
-                    Err(e) => errors.push(format!("tavily: {e}")),
+        let chosen: Option<(&'static str, Result<Value, ToolError>)> = match cfg.provider {
+            SearchProvider::DuckDuckGo => None,
+            SearchProvider::Tavily => match cfg.tavily_key() {
+                Some(key) => Some(("tavily", tavily_search(&client, &query, max, &key).await)),
+                None => {
+                    errors.push("tavily: no API key configured".to_string());
+                    None
                 }
-            }
-        }
-        if let Ok(key) = std::env::var("BRAVE_API_KEY") {
-            if !key.trim().is_empty() {
-                match brave_search(&client, &query, max, key.trim()).await {
-                    Ok(v) => return Ok(v),
-                    Err(e) => errors.push(format!("brave: {e}")),
+            },
+            SearchProvider::Brave => match cfg.brave_key() {
+                Some(key) => Some(("brave", brave_search(&client, &query, max, &key).await)),
+                None => {
+                    errors.push("brave: no API key configured".to_string());
+                    None
                 }
-            }
-        }
-        if let Ok(base) = std::env::var("MEDHA_SEARXNG_URL") {
-            if !base.trim().is_empty() {
-                match searxng_search(&client, &query, max, base.trim()).await {
-                    Ok(v) => return Ok(v),
-                    Err(e) => errors.push(format!("searxng: {e}")),
+            },
+            SearchProvider::Searxng => match cfg.searxng_url() {
+                Some(url) => Some(("searxng", searxng_search(&client, &query, max, &url).await)),
+                None => {
+                    errors.push("searxng: no instance URL configured".to_string());
+                    None
                 }
+            },
+        };
+        if let Some((name, result)) = chosen {
+            match result {
+                Ok(v) => return Ok(v),
+                Err(e) => errors.push(format!("{name}: {e}")),
             }
         }
 
@@ -1409,9 +1765,8 @@ impl Tool for WebSearch {
             Ok(v) => Ok(v),
             Err(e) => {
                 errors.push(format!("duckduckgo: {e}"));
-                // All configured tiers failed: surface every attempt's error so
-                // the model (and the user) can see exactly what went wrong,
-                // rather than only the last backend's message.
+                // Chosen backend (if any) AND the DuckDuckGo fallback both
+                // failed: surface every attempt so the cause is visible.
                 Err(ToolError::Failed(errors.join("; ")))
             }
         }
@@ -1444,14 +1799,22 @@ async fn duckduckgo_search(
         let html = match resp {
             Ok(r) => match r.text().await {
                 Ok(t) => t,
-                Err(e) => { last_err = e.to_string(); continue; }
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue;
+                }
             },
-            Err(e) => { last_err = e.to_string(); continue; }
+            Err(e) => {
+                last_err = e.to_string();
+                continue;
+            }
         };
         let results = parse(&html, max); // sync: scraper DOM never crosses an await
         if !results.is_empty() {
             let count = results.len();
-            return Ok(json!({ "query": query, "results": results, "count": count, "backend": "duckduckgo" }));
+            return Ok(
+                json!({ "query": query, "results": results, "count": count, "backend": "duckduckgo" }),
+            );
         }
     }
     Err(ToolError::Failed(last_err))
@@ -1486,7 +1849,10 @@ async fn tavily_search(
         let brief: String = body.chars().take(200).collect();
         return Err(ToolError::Failed(format!("tavily {status}: {brief}")));
     }
-    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
     let mut out = Vec::new();
     if let Some(arr) = v.get("results").and_then(Value::as_array) {
         for r in arr.iter().take(max) {
@@ -1506,7 +1872,11 @@ async fn tavily_search(
 
 /// Tavily Extract (https://api.tavily.com/extract) — LLM-optimized page reader.
 /// Handles JS-heavy/anti-bot pages that a plain fetch can't; returns markdown.
-async fn tavily_extract(client: &reqwest::Client, url: &str, key: &str) -> Result<Value, ToolError> {
+async fn tavily_extract(
+    client: &reqwest::Client,
+    url: &str,
+    key: &str,
+) -> Result<Value, ToolError> {
     let body = json!({ "urls": url, "extract_depth": "basic", "format": "markdown" });
     let resp = client
         .post("https://api.tavily.com/extract")
@@ -1517,10 +1887,21 @@ async fn tavily_extract(client: &reqwest::Client, url: &str, key: &str) -> Resul
         .map_err(|e| ToolError::Failed(e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let brief: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
-        return Err(ToolError::Failed(format!("tavily extract {status}: {brief}")));
+        let brief: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        return Err(ToolError::Failed(format!(
+            "tavily extract {status}: {brief}"
+        )));
     }
-    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
     let content = v
         .get("results")
         .and_then(Value::as_array)
@@ -1531,7 +1912,9 @@ async fn tavily_extract(client: &reqwest::Client, url: &str, key: &str) -> Resul
         Some(c) if !c.trim().is_empty() => {
             Ok(json!({ "url": url, "status": 200, "title": "", "content": c, "backend": "tavily" }))
         }
-        _ => Err(ToolError::Failed("tavily extract: no content returned".into())),
+        _ => Err(ToolError::Failed(
+            "tavily extract: no content returned".into(),
+        )),
     }
 }
 
@@ -1566,11 +1949,24 @@ async fn tavily_crawl(
         .map_err(|e| ToolError::Failed(e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let brief: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
+        let brief: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
         return Err(ToolError::Failed(format!("tavily crawl {status}: {brief}")));
     }
-    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
-    let base = v.get("base_url").and_then(Value::as_str).unwrap_or(url).to_string();
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    let base = v
+        .get("base_url")
+        .and_then(Value::as_str)
+        .unwrap_or(url)
+        .to_string();
     let mut pages = Vec::new();
     if let Some(arr) = v.get("results").and_then(Value::as_array) {
         for r in arr {
@@ -1619,7 +2015,10 @@ async fn brave_search(
         let body = resp.text().await.unwrap_or_default();
         return Err(ToolError::Failed(format!("brave search {status}: {body}")));
     }
-    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
     let mut out = Vec::new();
     if let Some(arr) = v.pointer("/web/results").and_then(Value::as_array) {
         for r in arr.iter().take(max) {
@@ -1652,7 +2051,10 @@ async fn searxng_search(
     if !resp.status().is_success() {
         return Err(ToolError::Failed(format!("searxng {}", resp.status())));
     }
-    let v: Value = resp.json().await.map_err(|e| ToolError::Failed(e.to_string()))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
     let mut out = Vec::new();
     if let Some(arr) = v.get("results").and_then(Value::as_array) {
         for r in arr.iter().take(max) {
@@ -1720,7 +2122,9 @@ fn parse_ddg(html: &str, max: usize) -> Vec<Value> {
         if out.len() >= max {
             break;
         }
-        let Some(a) = el.select(&title_sel).next() else { continue };
+        let Some(a) = el.select(&title_sel).next() else {
+            continue;
+        };
         let title = a.text().collect::<String>().trim().to_string();
         let url = decode_ddg_url(a.value().attr("href").unwrap_or_default());
         if title.is_empty() || url.is_empty() {
@@ -1760,7 +2164,9 @@ fn parse_ddg(html: &str, max: usize) -> Vec<Value> {
 fn decode_ddg_url(href: &str) -> String {
     if let Some(i) = href.find("uddg=") {
         let enc = href[i + 5..].split('&').next().unwrap_or("");
-        return urlencoding::decode(enc).map(|c| c.into_owned()).unwrap_or_default();
+        return urlencoding::decode(enc)
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
     }
     if href.starts_with("http") {
         href.to_string()
@@ -1771,14 +2177,20 @@ fn decode_ddg_url(href: &str) -> String {
     }
 }
 
-struct WebFetch;
+struct WebFetch {
+    search: SearchHandle,
+}
 #[async_trait]
 impl Tool for WebFetch {
     fn name(&self) -> &str {
         "web.fetch"
     }
-    fn icon(&self) -> &'static str { "↓" }
-    fn category(&self) -> ToolCategory { ToolCategory::Web }
+    fn icon(&self) -> &'static str {
+        "↓"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Web
+    }
     fn description(&self) -> &str {
         "Fetch a web page and return its readable content as Markdown (free plain \
          fetch; falls back to Tavily Extract if TAVILY_API_KEY is set and the page \
@@ -1800,13 +2212,13 @@ impl Tool for WebFetch {
             Ok(v) => Ok(v),
             Err(e) => {
                 // Plain fetch failed or the page blocked us — fall back to Tavily's
-                // LLM-optimized extractor when a key is configured.
-                if let Ok(key) = std::env::var("TAVILY_API_KEY") {
-                    if !key.trim().is_empty() {
-                        return tavily_extract(&http_client()?, &url, key.trim()).await.map_err(|te| {
+                // LLM-optimized extractor when a key is configured (via /search or env).
+                if let Some(key) = read_search(&self.search).tavily_key() {
+                    return tavily_extract(&http_client()?, &url, &key)
+                        .await
+                        .map_err(|te| {
                             ToolError::Failed(format!("plain fetch failed ({e}); {te}"))
                         });
-                    }
                 }
                 Err(e)
             }
@@ -1817,8 +2229,8 @@ impl Tool for WebFetch {
 /// Free plain HTTP fetch → Markdown. Returns Err on network failure or a non-2xx
 /// status (so the caller can fall back to Tavily Extract on blocked/erroring pages).
 async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| ToolError::Failed(format!("invalid URL: {e}")))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| ToolError::Failed(format!("invalid URL: {e}")))?;
 
     // SSRF guard: reject internal/non-public targets before connecting. DNS is
     // blocking, so resolve off the async workers.
@@ -1868,7 +2280,9 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
     // PDFs need the raw bytes (decoding to text would corrupt them), so
     // branch before `.text()`. arXiv & friends serve `application/pdf`; also
     // catch a `.pdf` URL in case the type header is generic.
-    if status.is_success() && (ctype.contains("pdf") || url.split('?').next().unwrap_or(url).ends_with(".pdf")) {
+    if status.is_success()
+        && (ctype.contains("pdf") || url.split('?').next().unwrap_or(url).ends_with(".pdf"))
+    {
         let bytes = read_body_capped(resp, 25 * 1024 * 1024).await?;
         // Panic-isolated on the blocking pool: a malformed PDF that makes the
         // extractor panic degrades to a message, it never takes down the run.
@@ -1896,7 +2310,11 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
         || ctype.starts_with("text/")
         || (ctype.is_empty() && body.trim_start().starts_with('<'));
     if !texty {
-        let kind = if ctype.is_empty() { "binary content".to_string() } else { ctype };
+        let kind = if ctype.is_empty() {
+            "binary content".to_string()
+        } else {
+            ctype
+        };
         return Ok(json!({
             "url": url, "status": code, "title": title,
             "content": format!(
@@ -1914,17 +2332,24 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
     Ok(json!({ "url": url, "status": code, "title": title, "content": markdown }))
 }
 
-struct WebCrawl;
+struct WebCrawl {
+    search: SearchHandle,
+}
 #[async_trait]
 impl Tool for WebCrawl {
     fn name(&self) -> &str {
         "web.crawl"
     }
-    fn icon(&self) -> &'static str { "⇊" }
-    fn category(&self) -> ToolCategory { ToolCategory::Web }
+    fn icon(&self) -> &'static str {
+        "⇊"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Web
+    }
     fn description(&self) -> &str {
         "Fetch content from MANY pages under ONE site/root in a single call (Tavily; \
-         requires TAVILY_API_KEY). Use this — instead of calling web.fetch page by \
+         requires a Tavily key configured via /search or TAVILY_API_KEY). Use this — \
+         instead of calling web.fetch page by \
          page — when the task needs multiple pages of the SAME site, e.g. 'read all \
          the docs under this URL', 'every posting on this careers page', 'summarize \
          this whole section'. Give natural-language `instructions` to focus it (e.g. \
@@ -1956,11 +2381,188 @@ impl Tool for WebCrawl {
         let instructions = args.get("instructions").and_then(Value::as_str);
         let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(1);
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
-        let key = std::env::var("TAVILY_API_KEY")
-            .ok()
-            .filter(|k| !k.trim().is_empty())
-            .ok_or_else(|| ToolError::Failed("web.crawl requires TAVILY_API_KEY (set it in .env)".into()))?;
-        tavily_crawl(&http_client()?, &url, instructions, max_depth, limit, key.trim()).await
+        let key = read_search(&self.search).tavily_key().ok_or_else(|| {
+            ToolError::Failed(
+                "web.crawl needs a Tavily API key — set one with /search (choose Tavily) \
+                 or TAVILY_API_KEY"
+                    .into(),
+            )
+        })?;
+        tavily_crawl(&http_client()?, &url, instructions, max_depth, limit, &key).await
+    }
+}
+
+// ── clarify (human-in-the-loop questions) ────────────────────────────────────
+
+struct Clarify {
+    asker: ClarifyHandle,
+}
+
+impl Clarify {
+    /// Parse + validate the `questions` argument into kernel `Question`s.
+    /// Bounds mirror a structured-question UI (AskUserQuestion-style): 1–4
+    /// questions, 2–5 options each — enough to be useful, few enough to render.
+    fn parse_questions(args: &Value) -> Result<Vec<kernel::Question>, ToolError> {
+        let raw = args
+            .get("questions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ToolError::Args("expected an array 'questions'".into()))?;
+        if raw.is_empty() || raw.len() > 4 {
+            return Err(ToolError::Args("provide 1–4 questions".into()));
+        }
+        let mut out = Vec::with_capacity(raw.len());
+        for q in raw {
+            let prompt = q
+                .get("question")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    ToolError::Args("each question needs a non-empty 'question'".into())
+                })?
+                .to_string();
+            let header = q
+                .get("header")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let multi_select = q
+                .get("multi_select")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let opts = q
+                .get("options")
+                .and_then(Value::as_array)
+                .ok_or_else(|| ToolError::Args("each question needs an 'options' array".into()))?;
+            if opts.len() < 2 || opts.len() > 5 {
+                return Err(ToolError::Args("each question needs 2–5 options".into()));
+            }
+            let options = opts
+                .iter()
+                .map(|o| {
+                    let label = o
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or_else(|| ToolError::Args("each option needs a 'label'".into()))?
+                        .to_string();
+                    Ok(kernel::QOption {
+                        label,
+                        description: o
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        recommended: o
+                            .get("recommended")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect::<Result<Vec<_>, ToolError>>()?;
+            out.push(kernel::Question {
+                prompt,
+                header,
+                options,
+                multi_select,
+            });
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl Tool for Clarify {
+    fn name(&self) -> &str {
+        "clarify"
+    }
+    fn icon(&self) -> &'static str {
+        "?"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Plan
+    }
+    fn description(&self) -> &str {
+        "Ask the user one or more multiple-choice questions BEFORE proceeding, when \
+         the task is materially ambiguous (missing target, several valid \
+         interpretations, a consequential fork). Each question gives 2–5 options \
+         (mark one `recommended`); set `multi_select` for checkboxes. The user can \
+         also type their own answer. Returns their choices. Don't use it for \
+         trivial decisions you can make yourself — only when guessing wrong would \
+         waste real work."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn timeout(&self) -> Option<std::time::Duration> {
+        // A human question has NO deadline — the agent must wait for the user, not
+        // give up after 60s and proceed on its own. The user can always Esc to
+        // dismiss the form (→ skipped) or cancel the turn.
+        None
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "1–4 questions to ask.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string", "description": "The full question" },
+                            "header": { "type": "string", "description": "Short label/chip, e.g. 'Auth method'" },
+                            "multi_select": { "type": "boolean", "description": "true = checkboxes (any number); false = pick one" },
+                            "options": {
+                                "type": "array",
+                                "description": "2–5 options",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string" },
+                                        "description": { "type": "string" },
+                                        "recommended": { "type": "boolean" }
+                                    },
+                                    "required": ["label"]
+                                }
+                            }
+                        },
+                        "required": ["question", "options"]
+                    }
+                }
+            },
+            "required": ["questions"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let questions = Self::parse_questions(args)?;
+        let prompts: Vec<String> = questions.iter().map(|q| q.prompt.clone()).collect();
+
+        let asker = self.asker.lock().ok().and_then(|g| g.clone());
+        let Some(asker) = asker else {
+            // No interactive surface (headless/CI). Never block — tell the model
+            // to proceed on its own best judgment.
+            return Ok(json!({
+                "skipped": true,
+                "note": "no interactive user is available — proceed using your best judgment"
+            }));
+        };
+
+        match asker.ask(questions).await {
+            Some(answers) => {
+                let out: Vec<Value> = prompts
+                    .iter()
+                    .zip(answers.iter())
+                    .map(
+                        |(q, a)| json!({ "question": q, "selected": a.selected, "other": a.other }),
+                    )
+                    .collect();
+                Ok(json!({ "answers": out }))
+            }
+            None => Ok(json!({
+                "skipped": true,
+                "note": "the user dismissed the question — proceed using your best judgment"
+            })),
+        }
     }
 }
 
@@ -1989,9 +2591,13 @@ fn html_to_markdown(html: &str) -> String {
     } else {
         html
     };
-    let no_script = Regex::new(r"(?is)<script.*?</script>").unwrap().replace_all(truncated, "");
-    let cleaned =
-        Regex::new(r"(?is)<style.*?</style>").unwrap().replace_all(&no_script, "").into_owned();
+    let no_script = Regex::new(r"(?is)<script.*?</script>")
+        .unwrap()
+        .replace_all(truncated, "");
+    let cleaned = Regex::new(r"(?is)<style.*?</style>")
+        .unwrap()
+        .replace_all(&no_script, "")
+        .into_owned();
 
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
@@ -2008,7 +2614,10 @@ fn extract_pdf_text(bytes: &[u8]) -> String {
     const MAX_PDF: usize = 25 * 1024 * 1024;
     const MAX_OUT: usize = 400 * 1024;
     if bytes.len() > MAX_PDF {
-        return format!("[web.fetch: PDF too large to extract ({} bytes)]", bytes.len());
+        return format!(
+            "[web.fetch: PDF too large to extract ({} bytes)]",
+            bytes.len()
+        );
     }
     match pdf_extract::extract_text_from_mem(bytes) {
         Ok(text) => {
@@ -2020,7 +2629,11 @@ fn extract_pdf_text(bytes: &[u8]) -> String {
                 while !text.is_char_boundary(end) {
                     end -= 1;
                 }
-                format!("{}\n\n[…truncated; {} total chars]", &text[..end], text.len())
+                format!(
+                    "{}\n\n[…truncated; {} total chars]",
+                    &text[..end],
+                    text.len()
+                )
             } else {
                 text.to_string()
             }
@@ -2037,13 +2650,37 @@ fn extract_pdf_text(bytes: &[u8]) -> String {
 /// so an arbitrary shell command can't read them out of the environment.
 fn shell_env() -> Vec<(String, String)> {
     const ALLOW: &[&str] = &[
-        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD",
-        "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE", "TERM", "TERMINFO",
-        "TZ", "COLUMNS", "LINES",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "PWD",
+        "OLDPWD",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LANGUAGE",
+        "TERM",
+        "TERMINFO",
+        "TZ",
+        "COLUMNS",
+        "LINES",
         // Toolchain locators (paths, not secrets) so builds/tests still work.
-        "CARGO_HOME", "RUSTUP_HOME", "GOPATH", "GOROOT", "GOCACHE",
-        "JAVA_HOME", "NODE_PATH", "NVM_DIR", "PYENV_ROOT", "VIRTUAL_ENV",
-        "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "GOPATH",
+        "GOROOT",
+        "GOCACHE",
+        "JAVA_HOME",
+        "NODE_PATH",
+        "NVM_DIR",
+        "PYENV_ROOT",
+        "VIRTUAL_ENV",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
     ];
     std::env::vars()
         .filter(|(k, _)| ALLOW.contains(&k.as_str()) || k.starts_with("LC_"))
@@ -2115,7 +2752,9 @@ impl TaskTable {
     }
     /// Kill a task's process group; returns false if the id is unknown.
     fn kill(&self, id: &str) -> bool {
-        let Ok(m) = self.inner.lock() else { return false };
+        let Ok(m) = self.inner.lock() else {
+            return false;
+        };
         match m.get(id) {
             Some(t) => {
                 t.proc.kill();
@@ -2126,7 +2765,9 @@ impl TaskTable {
     }
     /// One-line summaries of every task (for `task.list` / status).
     fn list(&self) -> Vec<Value> {
-        let Ok(m) = self.inner.lock() else { return Vec::new() };
+        let Ok(m) = self.inner.lock() else {
+            return Vec::new();
+        };
         let mut out: Vec<Value> = m
             .iter()
             .map(|(id, t)| {
@@ -2146,7 +2787,9 @@ impl TaskTable {
     /// finished in time. Unknown id → false.
     async fn wait_until(&self, id: &str, dur: std::time::Duration) -> bool {
         let rx = {
-            let Ok(m) = self.inner.lock() else { return false };
+            let Ok(m) = self.inner.lock() else {
+                return false;
+            };
             match m.get(id) {
                 Some(t) => t.proc.done_receiver(),
                 None => return false,
@@ -2175,7 +2818,9 @@ impl TaskTable {
 
     /// Structured task list for surfaces (the TUI status line / `/tasks`).
     fn info(&self) -> Vec<kernel::BackgroundTask> {
-        let Ok(m) = self.inner.lock() else { return Vec::new() };
+        let Ok(m) = self.inner.lock() else {
+            return Vec::new();
+        };
         let mut out: Vec<kernel::BackgroundTask> = m
             .iter()
             .map(|(id, t)| kernel::BackgroundTask {
@@ -2205,7 +2850,9 @@ impl Tool for ShellExec {
     fn name(&self) -> &str {
         "shell.exec"
     }
-    fn category(&self) -> ToolCategory { ToolCategory::Shell }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Shell
+    }
     fn description(&self) -> &str {
         "Run any shell command in the workspace root and capture stdout/stderr/exit \
          code — sed, awk, cat, diff, git, curl, build/test commands, pipelines, \
@@ -2238,9 +2885,14 @@ impl Tool for ShellExec {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let command = arg_str(args, "command")?;
-        let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
+        let background = args
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let promote_after = std::time::Duration::from_secs(
-            args.get("timeout_s").and_then(Value::as_u64).unwrap_or(PROMOTE_AFTER_SECS),
+            args.get("timeout_s")
+                .and_then(Value::as_u64)
+                .unwrap_or(PROMOTE_AFTER_SECS),
         );
         // Spawn through the sandbox's execution backend (host or OS-native jail),
         // rooted at the workspace, as a background task from the start. `clear_env`
@@ -2250,7 +2902,12 @@ impl Tool for ShellExec {
         // tree — no orphans.
         let bg = self
             .sbx
-            .exec_background("sh", &["-c".to_string(), command.clone()], shell_env(), true)
+            .exec_background(
+                "sh",
+                &["-c".to_string(), command.clone()],
+                shell_env(),
+                true,
+            )
             .map_err(|e| ToolError::Failed(e.to_string()))?;
 
         // Register in the table BEFORE waiting. If the caller cancels (Esc) during
@@ -2276,7 +2933,10 @@ impl Tool for ShellExec {
 
         // Still running past the deadline (or explicitly backgrounded): leave it
         // tracked and hand back the task id + partial output.
-        let (pid, stdout, stderr) = self.tasks.running_view(&task_id).unwrap_or((None, String::new(), String::new()));
+        let (pid, stdout, stderr) =
+            self.tasks
+                .running_view(&task_id)
+                .unwrap_or((None, String::new(), String::new()));
         Ok(json!({
             "command": command,
             "status": "running",
@@ -2289,7 +2949,9 @@ impl Tool for ShellExec {
     }
 
     async fn preview(&self, args: &Value) -> Option<String> {
-        args.get("command").and_then(|v| v.as_str()).map(|c| format!("$ {c}"))
+        args.get("command")
+            .and_then(|v| v.as_str())
+            .map(|c| format!("$ {c}"))
     }
 }
 
@@ -2444,7 +3106,11 @@ fn resolve_edit(content: &str, old: &str, new: &str) -> Option<(String, String)>
     let file_is_crlf = content.contains("\r\n");
     let to_crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
     if content.contains(old) {
-        let new = if file_is_crlf { to_crlf(new) } else { new.to_string() };
+        let new = if file_is_crlf {
+            to_crlf(new)
+        } else {
+            new.to_string()
+        };
         return Some((old.to_string(), new));
     }
     if file_is_crlf {
@@ -2469,7 +3135,10 @@ fn apply_edits(content: &str, edits: &[Value]) -> Result<String, ToolError> {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::Args(format!("edit #{n}: missing 'new_string'")))?;
         validate_edit(old, new).map_err(|err| ToolError::Failed(format!("edit #{n}: {err}")))?;
-        let replace_all = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+        let replace_all = e
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (old, new) = resolve_edit(&cur, old, new)
             .ok_or_else(|| ToolError::Failed(format!("edit #{n}: old_string not found")))?;
         let count = cur.matches(&old).count();
@@ -2478,7 +3147,11 @@ fn apply_edits(content: &str, edits: &[Value]) -> Result<String, ToolError> {
                 "edit #{n}: old_string appears {count} times; pass replace_all or use a more specific string"
             )));
         }
-        cur = if replace_all { cur.replace(&old, &new) } else { cur.replacen(&old, &new, 1) };
+        cur = if replace_all {
+            cur.replace(&old, &new)
+        } else {
+            cur.replacen(&old, &new, 1)
+        };
     }
     Ok(cur)
 }
@@ -2488,7 +3161,9 @@ impl Tool for MultiEdit {
     fn name(&self) -> &str {
         "multi_edit"
     }
-    fn icon(&self) -> &'static str { "❏" }
+    fn icon(&self) -> &'static str {
+        "❏"
+    }
     fn description(&self) -> &str {
         "Apply several exact-substring edits to ONE file atomically, in order — one \
          snapshot, one write, one combined diff. All-or-nothing: if any edit's \
@@ -2533,12 +3208,19 @@ impl Tool for MultiEdit {
         }
         // Serialize same-file edits within a turn (P0-4).
         let _guard = self.sbx.path_guard(&path).await;
-        let content = self.sbx.read(&path).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let content = self
+            .sbx
+            .read(&path)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         // Refuse if the file changed since the approved preview (P1-1).
         self.pins.check(args, &path, &content)?;
         let updated = apply_edits(&content, edits)?;
-        let snapshot =
-            self.sbx.write(&path, &updated).await.map_err(|e| ToolError::Failed(e.to_string()))?;
+        let snapshot = self
+            .sbx
+            .write(&path, &updated)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         let diff = make_diff(&path, &content, &updated);
         Ok(json!({
             "path": path,
@@ -2586,7 +3268,9 @@ impl Tool for Git {
     fn name(&self) -> &str {
         "git"
     }
-    fn category(&self) -> ToolCategory { ToolCategory::Vcs }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Vcs
+    }
     fn description(&self) -> &str {
         "Git as a structured tool. Read-only inspection — `status`, `diff`, `log`, \
          `blame`, `show` — plus `add` and `commit` (which are approval-gated). Use this \
@@ -2642,7 +3326,11 @@ impl Tool for Git {
                 ga.push("blame".into());
             }
             "show" => {
-                ga.extend(["show".into(), "--stat".into(), safe_git_arg(rev.unwrap_or("HEAD"))?.into()]);
+                ga.extend([
+                    "show".into(),
+                    "--stat".into(),
+                    safe_git_arg(rev.unwrap_or("HEAD"))?.into(),
+                ]);
             }
             "add" => ga.push("add".into()),
             "commit" => {
@@ -2701,12 +3389,17 @@ impl Tool for Git {
         match args.get("subcommand").and_then(Value::as_str)? {
             "commit" => {
                 let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
-                let all = if args.get("all").and_then(Value::as_bool).unwrap_or(false) { " -a" } else { "" };
+                let all = if args.get("all").and_then(Value::as_bool).unwrap_or(false) {
+                    " -a"
+                } else {
+                    ""
+                };
                 Some(format!("git commit{all} -m {msg:?}"))
             }
-            "add" => {
-                Some(format!("git add -- {}", args.get("path").and_then(Value::as_str).unwrap_or(".")))
-            }
+            "add" => Some(format!(
+                "git add -- {}",
+                args.get("path").and_then(Value::as_str).unwrap_or(".")
+            )),
             _ => None,
         }
     }
@@ -2724,18 +3417,29 @@ struct Diagnostics {
 fn cargo_diagnostics(stdout: &str) -> Vec<Value> {
     let mut out = Vec::new();
     for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if v.get("reason").and_then(Value::as_str) != Some("compiler-message") {
             continue;
         }
-        let Some(msg) = v.get("message") else { continue };
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
         let level = msg.get("level").and_then(Value::as_str).unwrap_or("");
         if !matches!(level, "error" | "warning") {
             continue;
         }
-        let text = msg.get("message").and_then(Value::as_str).unwrap_or("").to_string();
-        let code =
-            msg.get("code").and_then(|c| c.get("code")).and_then(Value::as_str).map(str::to_string);
+        let text = msg
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let code = msg
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let (file, line_no, col) = msg
             .get("spans")
             .and_then(Value::as_array)
@@ -2747,7 +3451,10 @@ fn cargo_diagnostics(stdout: &str) -> Vec<Value> {
             })
             .map(|s| {
                 (
-                    s.get("file_name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    s.get("file_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     s.get("line_start").and_then(Value::as_u64).unwrap_or(0),
                     s.get("column_start").and_then(Value::as_u64).unwrap_or(0),
                 )
@@ -2811,7 +3518,9 @@ fn tsc_diagnostics(stdout: &str) -> Vec<Value> {
 /// `{filename, location:{row,column}, code, message}`. Ruff emits lint findings
 /// (no per-item severity), so all are reported as `warning`.
 fn ruff_diagnostics(stdout: &str) -> Vec<Value> {
-    let Ok(items) = serde_json::from_str::<Vec<Value>>(stdout) else { return vec![] };
+    let Ok(items) = serde_json::from_str::<Vec<Value>>(stdout) else {
+        return vec![];
+    };
     items
         .iter()
         .map(|it| {
@@ -2833,7 +3542,9 @@ impl Tool for Diagnostics {
     fn name(&self) -> &str {
         "diagnostics"
     }
-    fn category(&self) -> ToolCategory { ToolCategory::Diagnostic }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
     fn description(&self) -> &str {
         "Get STRUCTURED compiler/linter diagnostics — {file, line, column, severity, \
          code, message} — for the workspace, instead of scraping raw build output. \
@@ -2868,7 +3579,7 @@ impl Tool for Diagnostics {
             Some(other) => {
                 return Err(ToolError::Args(format!(
                     "unknown language '{other}' (rust|typescript|python)"
-                )))
+                )));
             }
             None => detect_lang(root),
         };
@@ -2880,8 +3591,16 @@ impl Tool for Diagnostics {
         };
         // Each language → ONE fixed command with fixed args.
         let (program, cmd_args, checker): (&str, &[&str], &str) = match lang {
-            DiagLang::Rust => ("cargo", &["check", "--message-format=json", "--quiet"], "cargo check"),
-            DiagLang::TypeScript => ("npx", &["--no-install", "tsc", "--noEmit", "--pretty", "false"], "tsc"),
+            DiagLang::Rust => (
+                "cargo",
+                &["check", "--message-format=json", "--quiet"],
+                "cargo check",
+            ),
+            DiagLang::TypeScript => (
+                "npx",
+                &["--no-install", "tsc", "--noEmit", "--pretty", "false"],
+                "tsc",
+            ),
             DiagLang::Python => ("ruff", &["check", "--output-format=json", "."], "ruff"),
         };
         // Under a sandbox wrapper a missing checker no longer surfaces as a
@@ -2903,7 +3622,7 @@ impl Tool for Diagnostics {
                     "supported": false,
                     "checker": checker,
                     "note": format!("could not run {checker}: {e}. Is it installed and on PATH?")
-                }))
+                }));
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2951,7 +3670,9 @@ impl Tool for UpdatePlan {
     fn name(&self) -> &str {
         "update_plan"
     }
-    fn category(&self) -> ToolCategory { ToolCategory::Plan }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Plan
+    }
     fn description(&self) -> &str {
         "Create and maintain your TODO list for the current task — this is your planning \
          tool and the user's live progress view. Call it PROACTIVELY: the moment a task \
@@ -3010,7 +3731,11 @@ impl Tool for UpdatePlan {
                 _ => "pending",
             };
             if status == "in_progress" {
-                if seen_active { status = "pending"; } else { seen_active = true; }
+                if seen_active {
+                    status = "pending";
+                } else {
+                    seen_active = true;
+                }
             }
             out.push(json!({ "title": title, "status": status }));
         }
@@ -3048,7 +3773,8 @@ mod tests {
 
     #[test]
     fn code_outline_rust() {
-        let src = "pub fn foo() {}\nstruct Bar;\n    async fn baz() {}\nimpl Bar {}\npub trait T {}\n";
+        let src =
+            "pub fn foo() {}\nstruct Bar;\n    async fn baz() {}\nimpl Bar {}\npub trait T {}\n";
         let s = scan_outline("x.rs", src);
         assert!(s.iter().any(|(k, n, _)| k == "fn" && n == "foo"));
         assert!(s.iter().any(|(k, n, _)| k == "struct" && n == "Bar"));
@@ -3061,7 +3787,10 @@ mod tests {
     fn code_outline_python() {
         let src = "class A:\n    def m(self):\n        pass\nasync def h():\n    pass\n";
         let s = scan_outline("x.py", src);
-        assert!(s.iter().any(|(k, n, l)| k == "class" && n == "A" && *l == 1));
+        assert!(
+            s.iter()
+                .any(|(k, n, l)| k == "class" && n == "A" && *l == 1)
+        );
         assert!(s.iter().any(|(k, n, _)| k == "def" && n == "m"));
         assert!(s.iter().any(|(k, n, _)| k == "def" && n == "h"));
     }
@@ -3082,16 +3811,19 @@ mod tests {
             "http://172.16.0.1/",
             "http://[::1]/",
             "http://0.0.0.0/",
-            "http://100.64.0.1/",           // CGNAT
-            "ftp://example.com/passwd",     // disallowed scheme
-            "file:///etc/passwd",           // disallowed scheme
+            "http://100.64.0.1/",       // CGNAT
+            "ftp://example.com/passwd", // disallowed scheme
+            "file:///etc/passwd",       // disallowed scheme
         ] {
             let u = reqwest::Url::parse(bad).unwrap();
             assert!(validate_public_url(&u).is_err(), "should block {bad}");
         }
         // A public IP literal passes the guard.
         let ok = reqwest::Url::parse("http://1.1.1.1/").unwrap();
-        assert!(validate_public_url(&ok).is_ok(), "public address should pass");
+        assert!(
+            validate_public_url(&ok).is_ok(),
+            "public address should pass"
+        );
     }
 
     #[tokio::test]
@@ -3099,14 +3831,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-refs-{}", ulid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         // `helper` is defined once and called once; `helperx` must NOT match.
-        std::fs::write(dir.join("a.rs"), "fn helper() {}\nfn main() {\n    helper();\n    let helperx = 1;\n}\n").unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn helper() {}\nfn main() {\n    helper();\n    let helperx = 1;\n}\n",
+        )
+        .unwrap();
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let tool = References { sbx };
         let out = tool.execute(&json!({ "symbol": "helper" })).await.unwrap();
         // Whole-word: matches the def line and the call, but NOT `helperx`.
-        assert_eq!(out["count"].as_u64().unwrap(), 2, "should match the def line and the call, not helperx");
+        assert_eq!(
+            out["count"].as_u64().unwrap(),
+            2,
+            "should match the def line and the call, not helperx"
+        );
         let refs = out["references"].as_array().unwrap();
-        assert!(refs.iter().all(|r| r["text"].as_str().unwrap().contains("helper")));
+        assert!(
+            refs.iter()
+                .all(|r| r["text"].as_str().unwrap().contains("helper"))
+        );
     }
 
     #[tokio::test]
@@ -3168,7 +3911,11 @@ mod tests {
             },
             vec![],
         );
-        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap().with_exec_backend(backend));
+        let sbx = Arc::new(
+            WorkspaceSandbox::new_jailed(&dir)
+                .unwrap()
+                .with_exec_backend(backend),
+        );
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
 
         let inside = reg
@@ -3178,7 +3925,11 @@ mod tests {
                 args: json!({ "command": "touch inside.txt" }),
             })
             .await;
-        assert_eq!(inside.payload["exit_code"].as_i64(), Some(0), "in-workspace write should succeed");
+        assert_eq!(
+            inside.payload["exit_code"].as_i64(),
+            Some(0),
+            "in-workspace write should succeed"
+        );
         assert!(dir.join("inside.txt").exists());
 
         let marker = format!(".medha-shelljail-escape-{}", ulid_like());
@@ -3189,9 +3940,16 @@ mod tests {
                 args: json!({ "command": format!("touch \"$HOME/{marker}\"") }),
             })
             .await;
-        assert_ne!(outside.payload["exit_code"].as_i64(), Some(0), "shell write to HOME must be blocked");
+        assert_ne!(
+            outside.payload["exit_code"].as_i64(),
+            Some(0),
+            "shell write to HOME must be blocked"
+        );
         let home = std::env::var("HOME").unwrap();
-        assert!(!std::path::Path::new(&home).join(&marker).exists(), "escape file must not exist");
+        assert!(
+            !std::path::Path::new(&home).join(&marker).exists(),
+            "escape file must not exist"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3237,19 +3995,31 @@ mod tests {
             })
             .await;
         assert_eq!(obs.payload["steps"][0]["status"], "in_progress");
-        assert_eq!(obs.payload["steps"][1]["status"], "pending", "a second active step is demoted");
+        assert_eq!(
+            obs.payload["steps"][1]["status"], "pending",
+            "a second active step is demoted"
+        );
         assert_eq!(obs.payload["explanation"], "starting the write");
     }
 
     #[test]
     fn extract_pdf_text_smoke() {
         // Set MEDHA_TEST_PDF=/path/to.pdf to exercise against a real file.
-        let Ok(path) = std::env::var("MEDHA_TEST_PDF") else { return };
+        let Ok(path) = std::env::var("MEDHA_TEST_PDF") else {
+            return;
+        };
         let bytes = std::fs::read(path).unwrap();
         let out = extract_pdf_text(&bytes);
         assert!(!out.is_empty());
-        assert!(!out.starts_with("[web.fetch: could not"), "extraction errored: {out}");
-        eprintln!("extracted {} chars; head: {:?}", out.len(), &out[..out.len().min(120)]);
+        assert!(
+            !out.starts_with("[web.fetch: could not"),
+            "extraction errored: {out}"
+        );
+        eprintln!(
+            "extracted {} chars; head: {:?}",
+            out.len(),
+            &out[..out.len().min(120)]
+        );
     }
 
     #[test]
@@ -3269,7 +4039,11 @@ mod tests {
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
         let obs = reg
-            .execute(&ToolIntent { id: "9".into(), tool: "nope".into(), args: json!({}) })
+            .execute(&ToolIntent {
+                id: "9".into(),
+                tool: "nope".into(),
+                args: json!({}),
+            })
             .await;
         assert_eq!(obs.status, kernel::ObsStatus::Denied);
     }
@@ -3288,7 +4062,10 @@ mod tests {
         assert_eq!(out[0]["title"], "One");
         assert_eq!(out[0]["snippet"], "", "missing snippet must stay missing");
         assert_eq!(out[1]["title"], "Two");
-        assert_eq!(out[1]["snippet"], "snippet for two", "snippet stays with ITS result");
+        assert_eq!(
+            out[1]["snippet"], "snippet for two",
+            "snippet stays with ITS result"
+        );
     }
 
     #[tokio::test]
@@ -3310,7 +4087,10 @@ mod tests {
             })
             .await;
         let c1 = page1.payload["content"].as_str().unwrap();
-        assert!(!c1.contains('\u{FFFD}'), "no replacement char at a cut page edge: {c1:?}");
+        assert!(
+            !c1.contains('\u{FFFD}'),
+            "no replacement char at a cut page edge: {c1:?}"
+        );
         assert_eq!(c1, "h", "the split 'é' is dropped, not mangled");
         // Continue from next_offset: the dropped bytes re-appear.
         let next = page1.payload["next_offset"].as_u64().unwrap();
@@ -3323,7 +4103,10 @@ mod tests {
             })
             .await;
         let c2 = page2.payload["content"].as_str().unwrap();
-        assert!(!c2.contains('\u{FFFD}'), "leading continuation bytes snapped: {c2:?}");
+        assert!(
+            !c2.contains('\u{FFFD}'),
+            "leading continuation bytes snapped: {c2:?}"
+        );
         assert_eq!(c2, "éll");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3338,10 +4121,21 @@ mod tests {
         std::fs::write(dir.join("big.txt"), "line\n".repeat(600_000)).unwrap();
 
         let whole = reg
-            .execute(&ToolIntent { id: "1".into(), tool: "fs.read".into(), args: json!({ "path": "big.txt" }) })
+            .execute(&ToolIntent {
+                id: "1".into(),
+                tool: "fs.read".into(),
+                args: json!({ "path": "big.txt" }),
+            })
             .await;
-        assert_eq!(whole.status, kernel::ObsStatus::Error, "whole read must refuse");
-        assert!(whole.payload.to_string().contains("offset"), "error points at ranged reads");
+        assert_eq!(
+            whole.status,
+            kernel::ObsStatus::Error,
+            "whole read must refuse"
+        );
+        assert!(
+            whole.payload.to_string().contains("offset"),
+            "error points at ranged reads"
+        );
 
         let ranged = reg
             .execute(&ToolIntent {
@@ -3350,7 +4144,11 @@ mod tests {
                 args: json!({ "path": "big.txt", "offset": 1, "limit": 3 }),
             })
             .await;
-        assert_eq!(ranged.status, kernel::ObsStatus::Ok, "ranged read still works");
+        assert_eq!(
+            ranged.status,
+            kernel::ObsStatus::Ok,
+            "ranged read still works"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3369,13 +4167,26 @@ mod tests {
         };
         // Gate flow: preview pins the content, then the file changes underneath.
         assert!(reg.preview(&intent).await.is_some());
-        sbx.write("p.txt", "alpha\nbeta\nnew line sneaked in\n").await.unwrap();
+        sbx.write("p.txt", "alpha\nbeta\nnew line sneaked in\n")
+            .await
+            .unwrap();
         let obs = reg.execute(&intent).await;
-        assert_eq!(obs.status, kernel::ObsStatus::Error, "stale preview must refuse");
-        assert!(obs.payload.to_string().contains("changed after the approved preview"));
+        assert_eq!(
+            obs.status,
+            kernel::ObsStatus::Error,
+            "stale preview must refuse"
+        );
+        assert!(
+            obs.payload
+                .to_string()
+                .contains("changed after the approved preview")
+        );
 
         // Re-running (fresh preview against current content) succeeds.
-        let intent2 = ToolIntent { id: "2".into(), ..intent.clone() };
+        let intent2 = ToolIntent {
+            id: "2".into(),
+            ..intent.clone()
+        };
         assert!(reg.preview(&intent2).await.is_some());
         let obs2 = reg.execute(&intent2).await;
         assert_eq!(obs2.status, kernel::ObsStatus::Ok);
@@ -3389,7 +4200,11 @@ mod tests {
         assert!(reg.preview(&mintent).await.is_some());
         sbx.write("p.txt", "changed\nalpha\n").await.unwrap();
         let mobs = reg.execute(&mintent).await;
-        assert_eq!(mobs.status, kernel::ObsStatus::Error, "stale multi_edit preview must refuse");
+        assert_eq!(
+            mobs.status,
+            kernel::ObsStatus::Error,
+            "stale multi_edit preview must refuse"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3463,11 +4278,18 @@ mod tests {
                 json!({ "old_string": "nope", "new_string": "x" }),
             ],
         );
-        assert!(err.is_err(), "batch must fail atomically on a missing match");
+        assert!(
+            err.is_err(),
+            "batch must fail atomically on a missing match"
+        );
         // Ambiguous match without replace_all is rejected.
         assert!(apply_edits("a a a", &[json!({ "old_string": "a", "new_string": "b" })]).is_err());
         assert_eq!(
-            apply_edits("a a a", &[json!({ "old_string": "a", "new_string": "b", "replace_all": true })]).unwrap(),
+            apply_edits(
+                "a a a",
+                &[json!({ "old_string": "a", "new_string": "b", "replace_all": true })]
+            )
+            .unwrap(),
             "b b b"
         );
     }
@@ -3491,7 +4313,11 @@ mod tests {
             r#"{"reason":"compiler-message","message":{"level":"note","message":"just a note","spans":[]}}"#,
         );
         let diags = cargo_diagnostics(stdout);
-        assert_eq!(diags.len(), 1, "keeps errors/warnings, drops notes and artifacts");
+        assert_eq!(
+            diags.len(),
+            1,
+            "keeps errors/warnings, drops notes and artifacts"
+        );
         assert_eq!(diags[0]["severity"], "error");
         assert_eq!(diags[0]["file"], "src/lib.rs");
         assert_eq!(diags[0]["line"], 42);
@@ -3547,9 +4373,16 @@ mod tests {
             .await;
         assert_eq!(bad.status, kernel::ObsStatus::Error);
         let after = reg
-            .execute(&ToolIntent { id: "3".into(), tool: "fs.read".into(), args: json!({ "path": "f.txt" }) })
+            .execute(&ToolIntent {
+                id: "3".into(),
+                tool: "fs.read".into(),
+                args: json!({ "path": "f.txt" }),
+            })
             .await;
-        assert!(after.payload["content"].as_str().unwrap().contains("alpha"), "must not be partially edited");
+        assert!(
+            after.payload["content"].as_str().unwrap().contains("alpha"),
+            "must not be partially edited"
+        );
     }
 
     #[tokio::test]
@@ -3575,10 +4408,17 @@ mod tests {
             })
             .await
             .expect("edit preview should render a diff");
-        assert!(prev.contains("-beta") && prev.contains("+BETA"), "preview is a real diff: {prev}");
+        assert!(
+            prev.contains("-beta") && prev.contains("+BETA"),
+            "preview is a real diff: {prev}"
+        );
         // The file is untouched (preview is side-effect-free).
         let after = reg
-            .execute(&ToolIntent { id: "3".into(), tool: "fs.read".into(), args: json!({ "path": "f.txt" }) })
+            .execute(&ToolIntent {
+                id: "3".into(),
+                tool: "fs.read".into(),
+                args: json!({ "path": "f.txt" }),
+            })
             .await;
         assert!(after.payload["content"].as_str().unwrap().contains("beta"));
 
@@ -3591,7 +4431,10 @@ mod tests {
             })
             .await
             .expect("write preview should render additions");
-        assert!(np.contains("+hello"), "new-file preview shows additions: {np}");
+        assert!(
+            np.contains("+hello"),
+            "new-file preview shows additions: {np}"
+        );
 
         // An edit whose old_string is absent previews the failure, not a diff.
         let miss = reg
@@ -3638,7 +4481,10 @@ mod tests {
     // tiny unique-ish suffix without pulling ulid into dev-deps
     fn ulid_like() -> u128 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     }
 
     // Minimal in-memory artifact store for tests (read_artifact isn't exercised).
@@ -3654,11 +4500,19 @@ mod tests {
             let map = self.0.lock().unwrap();
             let data = map.get(hash).ok_or("not found")?;
             let start = offset.min(data.len());
-            let end = len.map(|l| (start + l).min(data.len())).unwrap_or(data.len());
+            let end = len
+                .map(|l| (start + l).min(data.len()))
+                .unwrap_or(data.len());
             Ok(data[start..end].to_vec())
         }
         fn size(&self, hash: &str) -> Result<usize, String> {
-            Ok(self.0.lock().unwrap().get(hash).map(|d| d.len()).unwrap_or(0))
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(hash)
+                .map(|d| d.len())
+                .unwrap_or(0))
         }
     }
     fn mem_artifacts() -> Arc<dyn kernel::ArtifactStore> {
@@ -3672,7 +4526,12 @@ mod tests {
         ToolRegistry::with_workspace(sbx, mem_artifacts())
     }
     async fn run(reg: &ToolRegistry, tool: &str, args: Value) -> kernel::Observation {
-        reg.execute(&ToolIntent { id: "t".into(), tool: tool.into(), args }).await
+        reg.execute(&ToolIntent {
+            id: "t".into(),
+            tool: tool.into(),
+            args,
+        })
+        .await
     }
 
     // ── P0-1: ranged reads keep raw bytes (CRLF + trailing newline) so an edit
@@ -3681,20 +4540,47 @@ mod tests {
     async fn ranged_read_preserves_crlf_then_edit_roundtrips() {
         let dir = std::env::temp_dir().join(format!("medha-crlf-{}", ulid_like()));
         let reg = reg_in(&dir);
-        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "one\r\ntwo\r\nthree\r\n" })).await;
+        run(
+            &reg,
+            "fs.write",
+            json!({ "path": "f.txt", "content": "one\r\ntwo\r\nthree\r\n" }),
+        )
+        .await;
 
         // A ranged read returns the slice with its CRLF terminator intact.
-        let r = run(&reg, "fs.read", json!({ "path": "f.txt", "offset": 2, "limit": 1 })).await;
+        let r = run(
+            &reg,
+            "fs.read",
+            json!({ "path": "f.txt", "offset": 2, "limit": 1 }),
+        )
+        .await;
         assert_eq!(r.status, kernel::ObsStatus::Ok);
-        assert_eq!(r.payload["content"], "two\r\n", "CRLF preserved (was LF-normalized)");
+        assert_eq!(
+            r.payload["content"], "two\r\n",
+            "CRLF preserved (was LF-normalized)"
+        );
 
         // The model copies that exact slice into an edit — it must match.
-        let e = run(&reg, "fs.edit", json!({
-            "path": "f.txt", "old_string": "two\r\n", "new_string": "TWO\r\n"
-        })).await;
-        assert_eq!(e.status, kernel::ObsStatus::Ok, "edit failed: {:?}", e.payload);
-        assert_eq!(run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"],
-                   "one\r\nTWO\r\nthree\r\n");
+        let e = run(
+            &reg,
+            "fs.edit",
+            json!({
+                "path": "f.txt", "old_string": "two\r\n", "new_string": "TWO\r\n"
+            }),
+        )
+        .await;
+        assert_eq!(
+            e.status,
+            kernel::ObsStatus::Ok,
+            "edit failed: {:?}",
+            e.payload
+        );
+        assert_eq!(
+            run(&reg, "fs.read", json!({ "path": "f.txt" }))
+                .await
+                .payload["content"],
+            "one\r\nTWO\r\nthree\r\n"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3705,13 +4591,31 @@ mod tests {
         // endings — new is normalized to the file's CRLF.
         let dir = std::env::temp_dir().join(format!("medha-crlf3-{}", ulid_like()));
         let reg = reg_in(&dir);
-        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "a\r\nb\r\nc\r\n" })).await;
-        let e = run(&reg, "fs.edit", json!({
-            "path": "f.txt", "old_string": "b\r\n", "new_string": "X\nY\n"
-        })).await;
+        run(
+            &reg,
+            "fs.write",
+            json!({ "path": "f.txt", "content": "a\r\nb\r\nc\r\n" }),
+        )
+        .await;
+        let e = run(
+            &reg,
+            "fs.edit",
+            json!({
+                "path": "f.txt", "old_string": "b\r\n", "new_string": "X\nY\n"
+            }),
+        )
+        .await;
         assert_eq!(e.status, kernel::ObsStatus::Ok, "{:?}", e.payload);
-        let out = run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"].as_str().unwrap().to_string();
-        assert!(!out.contains("X\nY") || out.contains("X\r\nY"), "no bare LF introduced: {out:?}");
+        let out = run(&reg, "fs.read", json!({ "path": "f.txt" }))
+            .await
+            .payload["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !out.contains("X\nY") || out.contains("X\r\nY"),
+            "no bare LF introduced: {out:?}"
+        );
         assert_eq!(out, "a\r\nX\r\nY\r\nc\r\n", "new_string normalized to CRLF");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3720,13 +4624,33 @@ mod tests {
     async fn edit_is_crlf_tolerant_for_lf_only_needle() {
         let dir = std::env::temp_dir().join(format!("medha-crlf2-{}", ulid_like()));
         let reg = reg_in(&dir);
-        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "one\r\ntwo\r\n" })).await;
+        run(
+            &reg,
+            "fs.write",
+            json!({ "path": "f.txt", "content": "one\r\ntwo\r\n" }),
+        )
+        .await;
         // Needle uses LF though the file is CRLF — resolve_edit should still match.
-        let e = run(&reg, "fs.edit", json!({
-            "path": "f.txt", "old_string": "one\ntwo", "new_string": "1\n2"
-        })).await;
-        assert_eq!(e.status, kernel::ObsStatus::Ok, "CRLF-tolerant match failed: {:?}", e.payload);
-        assert_eq!(run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"], "1\r\n2\r\n");
+        let e = run(
+            &reg,
+            "fs.edit",
+            json!({
+                "path": "f.txt", "old_string": "one\ntwo", "new_string": "1\n2"
+            }),
+        )
+        .await;
+        assert_eq!(
+            e.status,
+            kernel::ObsStatus::Ok,
+            "CRLF-tolerant match failed: {:?}",
+            e.payload
+        );
+        assert_eq!(
+            run(&reg, "fs.read", json!({ "path": "f.txt" }))
+                .await
+                .payload["content"],
+            "1\r\n2\r\n"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3735,13 +4659,36 @@ mod tests {
     async fn ranged_read_huge_limit_does_not_overflow() {
         let dir = std::env::temp_dir().join(format!("medha-ovf-{}", ulid_like()));
         let reg = reg_in(&dir);
-        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "a\nb\nc\n" })).await;
-        let r = run(&reg, "fs.read", json!({ "path": "f.txt", "offset": 2, "limit": u64::MAX })).await;
-        assert_eq!(r.payload["content"], "b\nc\n", "saturating end, not wrapped-empty");
+        run(
+            &reg,
+            "fs.write",
+            json!({ "path": "f.txt", "content": "a\nb\nc\n" }),
+        )
+        .await;
+        let r = run(
+            &reg,
+            "fs.read",
+            json!({ "path": "f.txt", "offset": 2, "limit": u64::MAX }),
+        )
+        .await;
+        assert_eq!(
+            r.payload["content"], "b\nc\n",
+            "saturating end, not wrapped-empty"
+        );
         // Offset past EOF is flagged, not silently empty.
-        let past = run(&reg, "fs.read", json!({ "path": "f.txt", "offset": 99, "limit": 1 })).await;
+        let past = run(
+            &reg,
+            "fs.read",
+            json!({ "path": "f.txt", "offset": 99, "limit": 1 }),
+        )
+        .await;
         assert_eq!(past.payload["content"], "");
-        assert!(past.payload["note"].as_str().unwrap_or("").contains("past end"));
+        assert!(
+            past.payload["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("past end")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3750,24 +4697,57 @@ mod tests {
     async fn edit_rejects_empty_and_noop_old_string() {
         let dir = std::env::temp_dir().join(format!("medha-empty-{}", ulid_like()));
         let reg = reg_in(&dir);
-        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "abc" })).await;
+        run(
+            &reg,
+            "fs.write",
+            json!({ "path": "f.txt", "content": "abc" }),
+        )
+        .await;
 
-        let empty = run(&reg, "fs.edit", json!({
-            "path": "f.txt", "old_string": "", "new_string": "X", "replace_all": true
-        })).await;
-        assert_eq!(empty.status, kernel::ObsStatus::Error, "empty old_string must be rejected");
+        let empty = run(
+            &reg,
+            "fs.edit",
+            json!({
+                "path": "f.txt", "old_string": "", "new_string": "X", "replace_all": true
+            }),
+        )
+        .await;
+        assert_eq!(
+            empty.status,
+            kernel::ObsStatus::Error,
+            "empty old_string must be rejected"
+        );
         // File untouched.
-        assert_eq!(run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"], "abc");
+        assert_eq!(
+            run(&reg, "fs.read", json!({ "path": "f.txt" }))
+                .await
+                .payload["content"],
+            "abc"
+        );
 
-        let noop = run(&reg, "fs.edit", json!({
-            "path": "f.txt", "old_string": "abc", "new_string": "abc"
-        })).await;
-        assert_eq!(noop.status, kernel::ObsStatus::Error, "old==new must be rejected");
+        let noop = run(
+            &reg,
+            "fs.edit",
+            json!({
+                "path": "f.txt", "old_string": "abc", "new_string": "abc"
+            }),
+        )
+        .await;
+        assert_eq!(
+            noop.status,
+            kernel::ObsStatus::Error,
+            "old==new must be rejected"
+        );
 
         // multi_edit guards the same way.
-        let me = run(&reg, "multi_edit", json!({
-            "path": "f.txt", "edits": [{ "old_string": "", "new_string": "Y" }]
-        })).await;
+        let me = run(
+            &reg,
+            "multi_edit",
+            json!({
+                "path": "f.txt", "edits": [{ "old_string": "", "new_string": "Y" }]
+            }),
+        )
+        .await;
         assert_eq!(me.status, kernel::ObsStatus::Error);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3781,7 +4761,10 @@ mod tests {
         assert_eq!(obs.status, kernel::ObsStatus::Ok);
         assert_eq!(obs.payload["exit_code"].as_i64(), Some(0));
         assert_eq!(obs.payload["stdout"], "hi");
-        assert!(obs.payload.get("task_id").is_none(), "fast command should not promote");
+        assert!(
+            obs.payload.get("task_id").is_none(),
+            "fast command should not promote"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3790,11 +4773,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-sh-bg-{}", ulid_like()));
         let reg = reg_in(&dir);
         // background:true → returns a task id immediately, keeps running.
-        let started = run(&reg, "shell.exec", json!({
-            "command": "sleep 30; echo done", "background": true
-        })).await;
+        let started = run(
+            &reg,
+            "shell.exec",
+            json!({
+                "command": "sleep 30; echo done", "background": true
+            }),
+        )
+        .await;
         assert_eq!(started.payload["status"], "running");
-        let id = started.payload["task_id"].as_str().expect("task id").to_string();
+        let id = started.payload["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string();
 
         // task.output reports it running.
         let poll = run(&reg, "task.output", json!({ "task_id": id })).await;
@@ -3802,13 +4793,22 @@ mod tests {
 
         // task.list shows it.
         let list = run(&reg, "task.list", json!({})).await;
-        assert!(list.payload["tasks"].as_array().unwrap().iter().any(|t| t["task_id"] == id.as_str()));
+        assert!(
+            list.payload["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["task_id"] == id.as_str())
+        );
 
         // The executor exposes it to surfaces (what the TUI status line polls).
         {
             use kernel::Executor;
             let live = reg.background_tasks();
-            assert!(live.iter().any(|t| t.id == id && t.running), "executor should report the running task");
+            assert!(
+                live.iter().any(|t| t.id == id && t.running),
+                "executor should report the running task"
+            );
         }
 
         // task.kill stops it.
@@ -3818,10 +4818,18 @@ mod tests {
         // Give the reaper a moment; the task is no longer running.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let after = run(&reg, "task.output", json!({ "task_id": id })).await;
-        assert_eq!(after.payload["status"], "exited", "killed task should no longer run");
+        assert_eq!(
+            after.payload["status"], "exited",
+            "killed task should no longer run"
+        );
 
         // Unknown task ids are errors, not silent success.
-        assert_eq!(run(&reg, "task.kill", json!({ "task_id": "nope" })).await.status, kernel::ObsStatus::Error);
+        assert_eq!(
+            run(&reg, "task.kill", json!({ "task_id": "nope" }))
+                .await
+                .status,
+            kernel::ObsStatus::Error
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3839,17 +4847,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-sh-cancel-{}", ulid_like()));
         let reg = Arc::new(reg_in(&dir));
         // Long foreground window so the call is definitely mid-wait when dropped.
-        let fut = run(&reg, "shell.exec", json!({ "command": "sleep 30", "timeout_s": 30 }));
+        let fut = run(
+            &reg,
+            "shell.exec",
+            json!({ "command": "sleep 30", "timeout_s": 30 }),
+        );
         // Drop the future partway through the wait — this is what a cancel does.
         let _ = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
 
         // The task is still tracked (register-before-wait), not leaked.
         let list = run(&reg, "task.list", json!({})).await;
         let tasks = list.payload["tasks"].as_array().unwrap();
-        assert_eq!(tasks.len(), 1, "cancelled shell.exec must stay tracked: {:?}", list.payload);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "cancelled shell.exec must stay tracked: {:?}",
+            list.payload
+        );
         let id = tasks[0]["task_id"].as_str().unwrap().to_string();
         // And it's reapable via the table (also what session-end kill_all does).
-        assert_eq!(run(&reg, "task.kill", json!({ "task_id": id })).await.payload["killed"], true);
+        assert_eq!(
+            run(&reg, "task.kill", json!({ "task_id": id }))
+                .await
+                .payload["killed"],
+            true
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3860,9 +4882,19 @@ mod tests {
         // A quick local tool keeps the default 60s.
         assert_eq!(WordCount { sbx: mk_sbx() }.timeout(), Some(default));
         // shell.exec self-manages (promotes to background) → no outer cap.
-        assert_eq!(ShellExec { sbx: mk_sbx(), tasks: Arc::new(TaskTable::default()) }.timeout(), None);
+        assert_eq!(
+            ShellExec {
+                sbx: mk_sbx(),
+                tasks: Arc::new(TaskTable::default())
+            }
+            .timeout(),
+            None
+        );
         // A long-running fixed tool widens its ceiling past the default.
-        assert!(Diagnostics { sbx: mk_sbx() }.timeout().unwrap() > default, "diagnostics must exceed 60s");
+        assert!(
+            Diagnostics { sbx: mk_sbx() }.timeout().unwrap() > default,
+            "diagnostics must exceed 60s"
+        );
     }
 
     fn mk_sbx() -> Arc<WorkspaceSandbox> {
@@ -3876,24 +4908,44 @@ mod tests {
     async fn concurrent_edits_to_one_file_both_apply() {
         let dir = std::env::temp_dir().join(format!("medha-p04-{}", ulid_like()));
         let reg = Arc::new(reg_in(&dir));
-        run(&reg, "fs.write", json!({ "path": "f.txt", "content": "alpha beta" })).await;
+        run(
+            &reg,
+            "fs.write",
+            json!({ "path": "f.txt", "content": "alpha beta" }),
+        )
+        .await;
 
         // Fire two edits to the SAME file at once. Without per-path serialization
         // both read "alpha beta" and last-write-wins drops one; the lock forces
         // the second to see the first's result, so both land.
         let (a, b) = (reg.clone(), reg.clone());
         let e1 = tokio::spawn(async move {
-            run(&a, "fs.edit", json!({ "path": "f.txt", "old_string": "alpha", "new_string": "A" })).await
+            run(
+                &a,
+                "fs.edit",
+                json!({ "path": "f.txt", "old_string": "alpha", "new_string": "A" }),
+            )
+            .await
         });
         let e2 = tokio::spawn(async move {
-            run(&b, "fs.edit", json!({ "path": "f.txt", "old_string": "beta", "new_string": "B" })).await
+            run(
+                &b,
+                "fs.edit",
+                json!({ "path": "f.txt", "old_string": "beta", "new_string": "B" }),
+            )
+            .await
         });
         let (r1, r2) = (e1.await.unwrap(), e2.await.unwrap());
         assert_eq!(r1.status, kernel::ObsStatus::Ok);
         assert_eq!(r2.status, kernel::ObsStatus::Ok);
 
         // Final file reflects BOTH edits (order-independent).
-        let out = run(&reg, "fs.read", json!({ "path": "f.txt" })).await.payload["content"].as_str().unwrap().to_string();
+        let out = run(&reg, "fs.read", json!({ "path": "f.txt" }))
+            .await
+            .payload["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert_eq!(out, "A B", "both edits applied, neither lost: {out:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3904,16 +4956,110 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-glob-{}", ulid_like()));
         let reg = reg_in(&dir);
         run(&reg, "fs.write", json!({ "path": "top.rs", "content": "" })).await;
-        run(&reg, "fs.write", json!({ "path": "src/main.rs", "content": "" })).await;
+        run(
+            &reg,
+            "fs.write",
+            json!({ "path": "src/main.rs", "content": "" }),
+        )
+        .await;
 
         let shallow = run(&reg, "glob", json!({ "pattern": "*.rs" })).await;
         let m = shallow.payload["matches"].as_array().unwrap();
         assert!(m.iter().any(|v| v == "top.rs"), "matches top-level");
-        assert!(!m.iter().any(|v| v == "src/main.rs"), "* must not descend into src/");
+        assert!(
+            !m.iter().any(|v| v == "src/main.rs"),
+            "* must not descend into src/"
+        );
 
         let deep = run(&reg, "glob", json!({ "pattern": "**/*.rs" })).await;
         let m = deep.payload["matches"].as_array().unwrap();
         assert!(m.iter().any(|v| v == "src/main.rs"), "** spans directories");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn skill_registry_exposes_a_consistent_skill_capability_set() {
+        use kernel::Executor;
+
+        let dir = std::env::temp_dir().join(format!("medha-skills-reg-{}", ulid_like()));
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("nested-loader")).unwrap();
+        std::fs::write(
+            project.join("nested-loader").join("SKILL.md"),
+            "---\nname = \"nested-loader\"\ndescription = \"Loads another skill\"\nrequired_tools = [\"skill.load\"]\n---\nbody",
+        )
+        .unwrap();
+
+        let store = Arc::new(SkillStore::new(project, Some(dir.join("user"))));
+        let mut reg = ToolRegistry::new();
+        reg.register_skills(store);
+        let names = reg.tool_names();
+        assert!(
+            names.contains("skill.load")
+                && names.contains("skill.save")
+                && names.contains("skill.list")
+        );
+
+        let obs = reg
+            .execute(&ToolIntent {
+                id: "load".into(),
+                tool: "skill.load".into(),
+                args: json!({ "name": "nested-loader" }),
+            })
+            .await;
+        assert_eq!(obs.status, kernel::ObsStatus::Ok);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── clarify tool ─────────────────────────────────────────────────────────
+    #[test]
+    fn clarify_parse_validates_bounds() {
+        // Good input parses (2 questions, options within 2–5, recommended flag).
+        let ok = json!({ "questions": [
+            { "question": "Which DB?", "header": "DB", "options": [
+                { "label": "Postgres", "recommended": true }, { "label": "SQLite" } ] },
+            { "question": "Extras?", "multi_select": true, "options": [
+                { "label": "Auth" }, { "label": "Cache" }, { "label": "Queue" } ] }
+        ]});
+        let qs = Clarify::parse_questions(&ok).expect("valid");
+        assert_eq!(qs.len(), 2);
+        assert!(qs[0].options[0].recommended, "recommended flag parsed");
+        assert!(!qs[0].multi_select, "default single-select");
+        assert!(qs[1].multi_select, "multi_select parsed");
+        // Too many questions → rejected.
+        let many = json!({ "questions": (0..5).map(|i| json!({
+            "question": format!("q{i}"), "options": [{"label":"a"},{"label":"b"}] })).collect::<Vec<_>>() });
+        assert!(Clarify::parse_questions(&many).is_err());
+        // A question with <2 options → rejected (a non-choice).
+        let thin = json!({ "questions": [ { "question": "x", "options": [ {"label":"only"} ] } ] });
+        assert!(Clarify::parse_questions(&thin).is_err());
+    }
+
+    #[test]
+    fn clarify_never_times_out() {
+        // Regression: a human question must have NO deadline — with the default
+        // 60s tool timeout it fired and the agent proceeded without an answer.
+        let tool = Clarify {
+            asker: Arc::new(Mutex::new(None)),
+        };
+        assert!(
+            tool.timeout().is_none(),
+            "clarify must wait indefinitely for the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn clarify_without_an_asker_reports_skipped_never_blocks() {
+        // Headless/no-surface: the tool must return promptly with skipped=true,
+        // never hang waiting for an answer that can't come.
+        let tool = Clarify {
+            asker: Arc::new(Mutex::new(None)),
+        };
+        let out = tool
+            .execute(&json!({ "questions": [
+                { "question": "pick", "options": [{"label":"a"},{"label":"b"}] } ] }))
+            .await
+            .expect("ok");
+        assert_eq!(out.get("skipped").and_then(Value::as_bool), Some(true));
     }
 }

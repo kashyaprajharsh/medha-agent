@@ -47,7 +47,7 @@ pub struct WorkspaceSandbox {
 
 impl WorkspaceSandbox {
     /// Create a new sandbox with permission management.
-    /// 
+    ///
     /// The lock_path should point to medha.lock, audit_path to medha_audit.log
     pub fn new(
         root: impl Into<PathBuf>,
@@ -81,7 +81,8 @@ impl WorkspaceSandbox {
         let snapshots = root.join(".medha").join("snapshots");
 
         // Create a permission manager with no human gate - will deny all out-of-workspace
-        let permission_manager = PermissionManager::new(&root, root.join("medha.lock"), root.join("medha_audit.log"))?;
+        let permission_manager =
+            PermissionManager::new(&root, root.join("medha.lock"), root.join("medha_audit.log"))?;
         // No human gate set = will deny all external access
 
         Ok(Self {
@@ -102,7 +103,10 @@ impl WorkspaceSandbox {
     pub async fn path_guard(&self, path: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.write_locks.lock().expect("write_locks poisoned");
-            locks.entry(path.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+            locks
+                .entry(path.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
         };
         lock.lock_owned().await
     }
@@ -111,6 +115,17 @@ impl WorkspaceSandbox {
     /// [`HostBackend`]; the CLI swaps in the OS-native jail per `medha.lock`.
     pub fn with_exec_backend(mut self, backend: Arc<dyn ExecBackend>) -> Self {
         self.exec = backend;
+        self
+    }
+
+    /// Grant prompt-free READ access to harness-owned directories outside the
+    /// workspace — e.g. the user skills root, whose bundled reference files
+    /// the model reads on demand (a dialog per file would break skills).
+    /// In-memory only; writes stay gated.
+    pub fn with_readable_roots(self, roots: &[PathBuf]) -> Self {
+        for root in roots {
+            self.permission_manager.allow_read_dir(root);
+        }
         self
     }
 
@@ -195,7 +210,11 @@ impl WorkspaceSandbox {
     /// nearest existing ancestor (which resolves any symlinked directory in the
     /// path) and re-append the missing tail components verbatim — a `..`-free
     /// tail appended to an in-jail canonical dir cannot escape.
-    fn canonicalize_within_root(&self, candidate: &Path, requested: &str) -> Result<PathBuf, SandboxError> {
+    fn canonicalize_within_root(
+        &self,
+        candidate: &Path,
+        requested: &str,
+    ) -> Result<PathBuf, SandboxError> {
         let mut tail: Vec<std::ffi::OsString> = Vec::new();
         let mut current: &Path = candidate;
         loop {
@@ -232,8 +251,13 @@ impl WorkspaceSandbox {
         let path = Path::new(path);
 
         // If it's a relative path without .. or absolute components, treat as workspace-relative
-        let is_simple_relative = path.is_relative() 
-            && !path.components().any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)));
+        let is_simple_relative = path.is_relative()
+            && !path.components().any(|c| {
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            });
 
         if is_simple_relative {
             // Traditional workspace-relative resolution
@@ -255,7 +279,8 @@ impl WorkspaceSandbox {
             self.canonicalize_within_root(&out, &path.display().to_string())
         } else {
             // Absolute path or path with .. - use permission system
-            Ok(self.permission_manager
+            Ok(self
+                .permission_manager
                 .request_read(path)
                 .await
                 .map_err(SandboxError::Permission)?)
@@ -266,8 +291,13 @@ impl WorkspaceSandbox {
     pub async fn resolve_for_write(&self, path: &str) -> Result<PathBuf, SandboxError> {
         let path = Path::new(path);
 
-        let is_simple_relative = path.is_relative() 
-            && !path.components().any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)));
+        let is_simple_relative = path.is_relative()
+            && !path.components().any(|c| {
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            });
 
         if is_simple_relative {
             // Traditional workspace-relative resolution
@@ -289,7 +319,8 @@ impl WorkspaceSandbox {
             self.canonicalize_within_root(&out, &path.display().to_string())
         } else {
             // Absolute path or path with .. - use permission system for write access
-            Ok(self.permission_manager
+            Ok(self
+                .permission_manager
                 .request_write(path)
                 .await
                 .map_err(SandboxError::Permission)?)
@@ -334,7 +365,9 @@ impl WorkspaceSandbox {
         let resolved = self.resolve(path).await?;
         tokio::task::spawn_blocking(move || {
             let mut entries = Vec::new();
-            for entry in std::fs::read_dir(&resolved).map_err(|e| SandboxError::Io(e.to_string()))? {
+            for entry in
+                std::fs::read_dir(&resolved).map_err(|e| SandboxError::Io(e.to_string()))?
+            {
                 let entry = entry.map_err(|e| SandboxError::Io(e.to_string()))?;
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let suffix = if entry.path().is_dir() { "/" } else { "" };
@@ -347,7 +380,10 @@ impl WorkspaceSandbox {
         .map_err(|e| SandboxError::Io(e.to_string()))?
     }
 
-    fn snapshot_if_exists_at(snapshots: &Path, path: &Path) -> Result<Option<String>, SandboxError> {
+    fn snapshot_if_exists_at(
+        snapshots: &Path,
+        path: &Path,
+    ) -> Result<Option<String>, SandboxError> {
         if !path.exists() {
             return Ok(None);
         }
@@ -437,7 +473,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains("medha-tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -449,7 +488,11 @@ mod tests {
 
         // v1 exists, then a second write snapshots v1 and stores v2.
         sbx.write("f.txt", "v1").await.unwrap();
-        let snap = sbx.write("f.txt", "v2").await.unwrap().expect("snapshot of v1");
+        let snap = sbx
+            .write("f.txt", "v2")
+            .await
+            .unwrap()
+            .expect("snapshot of v1");
         assert_eq!(sbx.read("f.txt").await.unwrap(), "v2");
 
         // Restoring the snapshot rolls the file back to v1.
@@ -462,7 +505,11 @@ mod tests {
         assert!(sbx.read("new.txt").await.is_err(), "created file removed");
 
         // A bogus (non-ULID) snapshot id can't escape the snapshots dir.
-        assert!(sbx.restore("f.txt", Some("../../etc/passwd")).await.is_err());
+        assert!(
+            sbx.restore("f.txt", Some("../../etc/passwd"))
+                .await
+                .is_err()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -471,8 +518,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let gate = Arc::new(AutoDeny);
-        let sbx = WorkspaceSandbox::new(&dir, dir.join("medha.lock"), dir.join("medha_audit.log"), Some(gate)).unwrap();
-        
+        let sbx = WorkspaceSandbox::new(
+            &dir,
+            dir.join("medha.lock"),
+            dir.join("medha_audit.log"),
+            Some(gate),
+        )
+        .unwrap();
+
         // Write a test file
         sbx.write("test.txt", "hello").await.unwrap();
         // Read it back
@@ -485,12 +538,54 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let gate = Arc::new(AutoDeny); // AutoDeny always returns false
-        let sbx = WorkspaceSandbox::new(&dir, dir.join("medha.lock"), dir.join("medha_audit.log"), Some(gate)).unwrap();
-        
+        let sbx = WorkspaceSandbox::new(
+            &dir,
+            dir.join("medha.lock"),
+            dir.join("medha_audit.log"),
+            Some(gate),
+        )
+        .unwrap();
+
         // Try to read /etc/passwd - should be denied
         let result = sbx.read("/etc/passwd").await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), SandboxError::Permission(_)));
+    }
+
+    /// A readable root (e.g. the user skills dir) reads without any gate —
+    /// bundled skill files must not raise a permission card per read. Writes
+    /// under the same root remain gated.
+    #[tokio::test]
+    async fn readable_roots_read_without_prompt_but_writes_stay_gated() {
+        let base = std::env::temp_dir().join(format!("medha-sbx-skills-{}", ulid::Ulid::new()));
+        let ws = base.join("ws");
+        let skills = base.join("home-skills");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(skills.join("pdf")).unwrap();
+        std::fs::write(skills.join("pdf").join("reference.md"), "details").unwrap();
+
+        let gate = Arc::new(AutoDeny); // would deny any prompt — proves no prompt happens
+        let sbx = WorkspaceSandbox::new(
+            &ws,
+            ws.join("medha.lock"),
+            ws.join("medha_audit.log"),
+            Some(gate),
+        )
+        .unwrap()
+        .with_readable_roots(std::slice::from_ref(&skills));
+
+        let text = sbx
+            .read(skills.join("pdf").join("reference.md").to_str().unwrap())
+            .await
+            .expect("bundled skill file reads prompt-free");
+        assert_eq!(text, "details");
+
+        // Writing into the readable root still requires permission (denied here).
+        let write = sbx
+            .write(skills.join("pdf").join("evil.md").to_str().unwrap(), "x")
+            .await;
+        assert!(write.is_err(), "readable roots must not grant writes");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// A symlink *inside* the workspace pointing *out* of it must not let a
@@ -513,12 +608,18 @@ mod tests {
 
         // Reading an existing file through the symlink is refused as an escape.
         let read = sbx.resolve("escape/secret.txt").await;
-        assert!(matches!(read, Err(SandboxError::Escape(_))), "symlink read escape not blocked: {read:?}");
+        assert!(
+            matches!(read, Err(SandboxError::Escape(_))),
+            "symlink read escape not blocked: {read:?}"
+        );
 
         // Writing a *new* file through the symlink is also refused (the symlinked
         // ancestor resolves outside root).
         let write = sbx.resolve_for_write("escape/planted.txt").await;
-        assert!(matches!(write, Err(SandboxError::Escape(_))), "symlink write escape not blocked: {write:?}");
+        assert!(
+            matches!(write, Err(SandboxError::Escape(_))),
+            "symlink write escape not blocked: {write:?}"
+        );
     }
 
     /// Creating a brand-new file under not-yet-existing nested dirs must still

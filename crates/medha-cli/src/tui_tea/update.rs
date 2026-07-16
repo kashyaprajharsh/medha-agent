@@ -4,9 +4,16 @@
 use super::*;
 use sandbox::WorkspaceSandbox;
 
-pub(super) fn update<P, L>(model: &mut Model, msg: Msg, kernel: &Arc<Kernel<P, L>>, session: &mut Session, transcript: &mut Vec<Message>, budget: &Budget, tx: &mpsc::UnboundedSender<TuiEvent>) 
-where
-    P: Provider + 'static,
+pub(super) fn update<P, L>(
+    model: &mut Model,
+    msg: Msg,
+    kernel: &Arc<Kernel<P, L>>,
+    session: &mut Session,
+    transcript: &mut Vec<Message>,
+    budget: &Budget,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) where
+    P: ProfileProvider + 'static,
     L: EventLog + 'static,
 {
     match msg {
@@ -86,6 +93,462 @@ pub(super) fn handle_paste(model: &mut Model, data: String) {
     model.ac_sel = 0;
 }
 
+/// Give a visible picker first refusal on Esc while an agent turn is running.
+/// Returning `true` tells the caller not to forward that same keypress to the
+/// turn-cancellation path.
+fn dismiss_running_picker_on_esc(model: &mut Model, key: &KeyEvent) -> bool {
+    // Approval cards suppress picker rendering. A hidden picker must not steal
+    // Esc from the visible approval/running-turn cancellation path.
+    if key.code != KeyCode::Esc
+        || !model.running
+        || model.picker.is_none()
+        || model.pending_approval().is_some()
+    {
+        return false;
+    }
+    model.picker = None;
+    model.dirty = true;
+    true
+}
+
+/// Process shortcuts that must remain available regardless of which modal,
+/// form, picker, or approval currently owns ordinary keyboard input.
+fn handle_global_key(model: &mut Model, key: &KeyEvent) -> bool {
+    if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Signal the running kernel before the event loop restores the terminal
+        // and exits, so streams/tools get the same cancellation notification as
+        // an ordinary Esc stop. Pending gates must be answered to unblock them.
+        if let Some(handle) = &model.interrupt {
+            handle.cancel_turn();
+        }
+        model.deny_pending_approvals();
+        model.should_quit = true;
+        return true;
+    }
+    false
+}
+
+/// Capture one `/model add` form field. This has its own input path so an API
+/// key never reaches command history, completion, a transcript entry, or the
+/// session event log.
+fn handle_model_setup_key<P: ProfileProvider>(
+    model: &mut Model,
+    key: KeyEvent,
+    provider: &P,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) -> bool {
+    if model.model_setup.is_none() {
+        return false;
+    }
+    // The provider and discovered-model steps are real arrow-key pickers; let
+    // the generic picker handler own navigation while the draft remains alive.
+    if matches!(
+        model.picker.as_ref().map(|p| &p.kind),
+        Some(PickerKind::ProviderPreset) | Some(PickerKind::ModelDiscovery(_))
+    ) {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            model.model_setup = None;
+            model.input.clear();
+            model.cursor = 0;
+            model.push_notice("model setup cancelled — /model reopens it");
+        }
+        KeyCode::Backspace => model.backspace(),
+        KeyCode::Left => model.move_left(),
+        KeyCode::Right => model.move_right(),
+        KeyCode::Enter => advance_model_setup(model, provider, tx),
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => model.insert_char(c),
+        _ => {}
+    }
+    true
+}
+
+pub(super) fn begin_model_setup(model: &mut Model) {
+    if model.running {
+        model.push_notice("finish or Esc the current turn before adding a model");
+        return;
+    }
+    open_model_setup_quiet(model);
+    model.push_notice("Add a model — choose a provider. Esc cancels.");
+}
+
+/// Capture one `/search` form field. Like `handle_model_setup_key`, this owns
+/// the keyboard while a draft is alive so an API key never reaches command
+/// history, completion, the transcript, or the session log. Returns false while
+/// the provider picker is up, letting the generic picker handler drive it.
+fn handle_search_setup_key(model: &mut Model, key: KeyEvent) -> bool {
+    if model.search_setup.is_none() {
+        return false;
+    }
+    if matches!(
+        model.picker.as_ref().map(|p| &p.kind),
+        Some(PickerKind::SearchProvider)
+    ) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            model.search_setup = None;
+            model.input.clear();
+            model.cursor = 0;
+            model.push_notice("web-search setup cancelled — /search reopens it");
+        }
+        KeyCode::Backspace => model.backspace(),
+        KeyCode::Left => model.move_left(),
+        KeyCode::Right => model.move_right(),
+        KeyCode::Enter => advance_search_setup(model),
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => model.insert_char(c),
+        _ => {}
+    }
+    true
+}
+
+/// Open the `/mode` autonomy picker, cursor on the current level.
+pub(super) fn open_mode_picker(model: &mut Model) {
+    let sel = AUTONOMY_MODES
+        .iter()
+        .position(|(l, _)| *l == model.autonomy)
+        .unwrap_or(0);
+    model.picker = Some(Picker::with_selected(PickerKind::AutonomyMode, sel));
+}
+
+/// Set the session autonomy dial live and confirm with a level-appropriate notice
+/// (yolo gets a warning glyph — autonomous mode is never silent).
+fn set_autonomy(model: &mut Model, level: kernel::AutonomyLevel) {
+    model.autonomy = level;
+    let note = match level {
+        kernel::AutonomyLevel::Careful => {
+            "✔ mode: careful — edits and shell ask for approval".to_string()
+        }
+        kernel::AutonomyLevel::Normal => {
+            "✔ mode: normal — edits auto-apply; shell still asks".to_string()
+        }
+        kernel::AutonomyLevel::Yolo => {
+            "⚠ mode: yolo — edits and shell auto-run; only dangerous ops (rm -rf, personal files, deploys) still ask".to_string()
+        }
+    };
+    model.push_notice(note);
+}
+
+/// Open the `/search` flow on the provider picker.
+pub(super) fn begin_search_setup(model: &mut Model) {
+    if model.running {
+        model.push_notice("finish or Esc the current turn before changing web search");
+        return;
+    }
+    model.search_setup = Some(SearchSetup::new());
+    // Preselect the currently-configured provider so Enter is a no-surprise
+    // confirm of the status quo.
+    let current = model
+        .model_config
+        .lock()
+        .map(|c| c.search_provider())
+        .unwrap_or_default();
+    let selected = SEARCH_PROVIDERS
+        .iter()
+        .position(|(p, _)| *p == current)
+        .unwrap_or(0);
+    model.picker = Some(Picker::with_selected(PickerKind::SearchProvider, selected));
+    model.input.clear();
+    model.cursor = 0;
+    model.push_notice("Web search — choose a provider. Esc cancels.");
+}
+
+/// Advance the `/search` draft after a value is typed in the Secret step
+/// (an API key for Tavily/Brave, or the instance URL for SearXNG).
+fn advance_search_setup(model: &mut Model) {
+    let value = std::mem::take(&mut model.input).trim().to_string();
+    model.cursor = 0;
+    let Some(setup) = model.search_setup.as_ref() else {
+        return;
+    };
+    match setup.provider {
+        tools::SearchProvider::Tavily | tools::SearchProvider::Brave => {
+            if value.is_empty() {
+                model.push_notice("an API key is required (Esc to cancel)");
+                model.input.clear();
+                return;
+            }
+            let provider = setup.provider;
+            if let Some(cred_id) = config::search_cred_id(provider) {
+                if let Err(e) = config::store_key(cred_id, &value) {
+                    model.push_notice(format!("could not store API key: {e}"));
+                    return;
+                }
+            }
+            commit_search(model, provider, None);
+        }
+        tools::SearchProvider::Searxng => {
+            if value.is_empty() {
+                model.push_notice("a SearXNG instance URL is required (Esc to cancel)");
+                model.input.clear();
+                return;
+            }
+            let url = value.trim_end_matches('/').to_string();
+            commit_search(model, tools::SearchProvider::Searxng, Some(url));
+        }
+        // DuckDuckGo never reaches the Secret step; committed straight from the picker.
+        tools::SearchProvider::DuckDuckGo => {
+            commit_search(model, tools::SearchProvider::DuckDuckGo, None)
+        }
+    }
+}
+
+/// Persist the chosen provider, save config, and update the live search handle
+/// the running `web.*` tools read — so the change applies on the next search
+/// without a restart.
+fn commit_search(model: &mut Model, provider: tools::SearchProvider, searxng_url: Option<String>) {
+    model.search_setup = None;
+    let saved = match model.model_config.lock() {
+        Ok(mut cfg) => {
+            cfg.set_search(provider, searxng_url);
+            config::save(&cfg)
+                .map_err(|e| format!("could not write config: {e}"))
+                .map(|_| config::resolve_search(&cfg))
+        }
+        Err(_) => Err("configuration is temporarily unavailable".into()),
+    };
+    match saved {
+        Ok(settings) => {
+            if let Ok(mut live) = model.search.lock() {
+                *live = settings;
+            }
+            model.push_notice(format!(
+                "✔ web search now uses {} (DuckDuckGo remains the fallback)",
+                provider.label()
+            ));
+        }
+        Err(e) => model.push_notice(e),
+    }
+}
+
+/// Open the add-model form without pushing a transcript notice. First-run uses
+/// this so the welcome identity screen stays visible behind the form.
+pub(super) fn open_model_setup_quiet(model: &mut Model) {
+    // Provider choice is the first visible step. Custom continues into the
+    // base-URL input; presets already supply it.
+    model.model_setup = Some(ModelSetup::new());
+    model.picker = Some(Picker::new(PickerKind::ProviderPreset));
+    model.input.clear();
+    model.cursor = 0;
+}
+
+fn begin_model_key_update(model: &mut Model, profile: config::ModelProfile) {
+    if model.running {
+        model.push_notice("finish or Esc the current turn before updating credentials");
+        return;
+    }
+    model.model_setup = Some(ModelSetup::update_key(
+        profile.name.clone(),
+        profile.provider.base_url,
+    ));
+    model.input.clear();
+    model.cursor = 0;
+    model.push_notice(format!(
+        "Update API key for '{}' — input is masked; Esc cancels.",
+        profile.name
+    ));
+}
+
+fn advance_model_setup<P: ProfileProvider>(
+    model: &mut Model,
+    provider: &P,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    let value = std::mem::take(&mut model.input).trim().to_string();
+    model.cursor = 0;
+    let Some(setup) = model.model_setup.as_mut() else {
+        return;
+    };
+    match setup.step {
+        ModelSetupStep::BaseUrl => {
+            if value.is_empty() {
+                model.push_notice("a base URL is required");
+                return;
+            }
+            setup.base_url = value.trim_end_matches('/').to_string();
+            setup.step = ModelSetupStep::ApiKey;
+        }
+        // The server is being queried; Enter is inert (Esc still cancels).
+        ModelSetupStep::Discovering => {}
+        ModelSetupStep::ApiKey => {
+            if let ModelSetupMode::UpdateKey { profile } = &setup.mode {
+                if value.is_empty() {
+                    model.push_notice("an API key is required");
+                    return;
+                }
+                let profile = profile.clone();
+                let base_url = setup.base_url.clone();
+                if let Err(e) = config::store_key(&base_url, &value) {
+                    model.push_notice(format!("could not store API key: {e}"));
+                    return;
+                }
+                model.model_setup = None;
+                let resolved: Result<config::Resolved, String> = match model.model_config.lock() {
+                    Ok(mut cfg) => {
+                        if let Some(saved) = cfg.models.get_mut(&profile) {
+                            saved.needs_key = true;
+                        }
+                        config::save(&cfg)
+                            .map_err(|e| format!("could not write config: {e}"))
+                            .and_then(|_| {
+                                config::resolve_model_with_key(&cfg, &profile, &value)
+                                    .map_err(|e| e.to_string())
+                            })
+                    }
+                    Err(_) => Err("model configuration is temporarily unavailable".into()),
+                };
+                match resolved {
+                    Ok(resolved) => {
+                        let activate =
+                            model.active_profile == profile || model.active_profile == "override";
+                        if activate {
+                            provider.switch_profile(&resolved);
+                            model.model = resolved.model;
+                            model.max_ctx = resolved.max_ctx;
+                            model.ctx_pct = None;
+                            model.active_profile = resolved.profile;
+                        }
+                        model.push_notice(if activate {
+                            format!("✔ API key updated; switched to '{profile}'")
+                        } else {
+                            format!("✔ API key updated for '{profile}'")
+                        });
+                    }
+                    Err(e) => model.push_notice(e),
+                }
+                return;
+            }
+            setup.api_key = value;
+            setup.step = ModelSetupStep::Discovering;
+            // Ask the endpoint what it serves — picking from a live list beats
+            // typing a model id blind (and typos in ids are the #1 setup bug).
+            let base_url = setup.base_url.clone();
+            let api_key = setup.api_key.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = providers::openai_compat::list_models(&base_url, &api_key)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(TuiEvent::ModelsDiscovered { base_url, result });
+            });
+        }
+        ModelSetupStep::ModelId => {
+            if value.is_empty() {
+                model.push_notice("a model ID is required");
+                return;
+            }
+            setup.model = value;
+            setup.step = ModelSetupStep::ContextWindow;
+        }
+        ModelSetupStep::ContextWindow => {
+            let typed = if value.is_empty() {
+                None
+            } else {
+                match value.parse::<u32>() {
+                    Ok(v) if v > 0 => Some(v),
+                    _ => {
+                        model.push_notice(
+                            "context window must be a positive whole number, or blank",
+                        );
+                        return;
+                    }
+                }
+            };
+            setup.max_ctx = setup.max_ctx.or(typed);
+            finish_model_setup(model, provider);
+        }
+    }
+}
+
+/// Discovery result for an in-flight add-model draft: a non-empty list opens
+/// the model picker; anything else falls back to manual id entry, honestly
+/// labelled with the reason.
+pub(super) fn on_models_discovered(
+    model: &mut Model,
+    base_url: String,
+    result: Result<Vec<providers::openai_compat::ModelInfo>, String>,
+) {
+    let Some(setup) = model.model_setup.as_mut() else {
+        return;
+    };
+    // Only the draft that asked may consume this reply (guards against a slow
+    // response from an abandoned draft landing in a newer one).
+    if !matches!(setup.step, ModelSetupStep::Discovering) || setup.base_url != base_url {
+        return;
+    }
+    match result {
+        Ok(models) if !models.is_empty() => {
+            model.picker = Some(Picker::new(PickerKind::ModelDiscovery(models)));
+        }
+        Ok(_) => {
+            setup.step = ModelSetupStep::ModelId;
+            model.push_notice("the server reported no models — type the model id");
+        }
+        Err(e) => {
+            setup.step = ModelSetupStep::ModelId;
+            model.push_notice(format!(
+                "model discovery unavailable ({e}) — type the model id"
+            ));
+        }
+    }
+}
+
+/// Complete an add-model draft: derive the profile name from the model id
+/// (never asked; users pasted model ids into the old name field), persist the
+/// key + config, and switch to the new connection.
+fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
+    let Some(completed) = model.model_setup.take() else {
+        return;
+    };
+    let profile = config::ProviderConfig {
+        base_url: completed.base_url.clone(),
+        model: completed.model.clone(),
+        needs_key: !completed.api_key.is_empty(),
+        max_ctx: completed.max_ctx,
+    };
+    if !completed.api_key.is_empty() {
+        if let Err(e) = config::store_key(&completed.base_url, &completed.api_key) {
+            model.push_notice(format!("could not store API key: {e}"));
+            return;
+        }
+    }
+    let saved: Result<(String, config::Resolved), String> = match model.model_config.lock() {
+        Ok(mut cfg) => {
+            let name = config::derive_profile_name(&cfg, &completed.model);
+            match cfg.add_model(name.clone(), profile, false) {
+                Err(e) => Err(format!("could not save model: {e}")),
+                Ok(()) => match config::save(&cfg) {
+                    Ok(()) => config::resolve_model_with_key(&cfg, &name, &completed.api_key)
+                        .map(|r| (name, r))
+                        .map_err(|e| e.to_string()),
+                    Err(e) => {
+                        // Do not leave a session-only ghost profile if the
+                        // durable write fails (disk permissions/full disk).
+                        cfg.models.remove(&name);
+                        Err(format!("could not write config: {e}"))
+                    }
+                },
+            }
+        }
+        Err(_) => Err("model configuration is temporarily unavailable".into()),
+    };
+    match saved {
+        Ok((name, resolved)) => {
+            provider.switch_profile(&resolved);
+            model.model = resolved.model;
+            model.max_ctx = resolved.max_ctx;
+            model.ctx_pct = None;
+            model.active_profile = resolved.profile;
+            model.push_notice(format!("✔ saved '{name}' and switched to it"));
+        }
+        Err(e) => model.push_notice(e),
+    }
+}
+
 /// Handle keyboard input
 pub(super) fn handle_key<P, L>(
     model: &mut Model,
@@ -96,19 +559,41 @@ pub(super) fn handle_key<P, L>(
     budget: &Budget,
     tx: &mpsc::UnboundedSender<TuiEvent>,
 ) where
-    P: Provider + 'static,
+    P: ProfileProvider + 'static,
     L: EventLog + 'static,
 {
     if key.kind != KeyEventKind::Press {
         return;
     }
 
-    // Esc is reserved for stopping a running turn, not for answering an
-    // approval. Intercept it before the approval branch so Esc always does
-    // what the user expects — interrupt — instead of silently denying
-    // whichever prompt happens to be on screen. The cancel is GRACEFUL: the
-    // kernel lets in-flight tools settle (bounded) and returns Done with
-    // StopReason::Interrupted — the handle stays until then.
+    // Ctrl-D is the unconditional escape hatch. Keep it ahead of every modal
+    // handler so no picker, credential form, or approval can trap the user.
+    if handle_global_key(model, &key) {
+        return;
+    }
+
+    // A visible picker owns the first Esc, even while a turn is running. This
+    // lets `/reasoning` behave like a normal dismissible panel; a second Esc,
+    // now that no picker is open, interrupts the turn. Without this ordering the
+    // global running-turn handler swallowed Esc and left the panel stuck open.
+    if dismiss_running_picker_on_esc(model, &key) {
+        return;
+    }
+
+    // A `clarify` question form owns all input while it's up. It appears mid-turn
+    // (the tool awaits an answer), so intercept BEFORE the Esc→cancel path: here
+    // Esc dismisses the form (agent proceeds on best judgment), it never kills
+    // the turn.
+    if model.clarify.is_some() {
+        handle_clarify_key(model, key);
+        return;
+    }
+
+    // With no picker open, Esc is reserved for stopping a running turn, not for
+    // answering an approval. Intercept it before the approval branch so it
+    // interrupts instead of silently denying whichever prompt is on screen.
+    // The cancel is GRACEFUL: the kernel lets in-flight tools settle (bounded)
+    // and returns Done with StopReason::Interrupted.
     if key.code == KeyCode::Esc && model.running {
         if let Some(h) = &model.interrupt {
             h.cancel_turn();
@@ -120,12 +605,23 @@ pub(super) fn handle_key<P, L>(
         // Answering the pending approvals unblocks any gate the kernel is
         // waiting on, so the cancel settles immediately (K8, by design).
         model.deny_pending_approvals();
+        // A picker may have been suppressed while the approval card was shown;
+        // do not let it unexpectedly reappear after cancellation.
+        model.picker = None;
         return;
     }
 
     // Inline approval handling (PART 3) — input captured when last item is approval
     if model.pending_approval().is_some() {
         handle_approval_key(model, key);
+        return;
+    }
+
+    if handle_model_setup_key(model, key, kernel.provider.as_ref(), tx) {
+        return;
+    }
+
+    if handle_search_setup_key(model, key) {
         return;
     }
 
@@ -137,9 +633,103 @@ pub(super) fn handle_key<P, L>(
     if let Some(picker) = model.picker.as_mut() {
         let labels = picker.kind.labels();
         match key.code {
-            KeyCode::Up => picker.selected = picker.selected.checked_sub(1).unwrap_or(labels.len().saturating_sub(1)),
+            KeyCode::Up => {
+                picker.selected = picker
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or(labels.len().saturating_sub(1))
+            }
             KeyCode::Down => picker.selected = (picker.selected + 1) % labels.len().max(1),
-            KeyCode::Enter => {
+            // → mirrors Enter and ← mirrors Esc, so the pickers navigate like
+            // a nested menu: right descends, left backs out one level.
+            KeyCode::Enter | KeyCode::Right => {
+                if matches!(picker.kind, PickerKind::ProviderPreset) {
+                    let selected = picker.selected;
+                    let presets = config::provider_presets();
+                    model.picker = None;
+                    if let Some(setup) = model.model_setup.as_mut() {
+                        if let Some((name, url)) = presets.get(selected) {
+                            setup.base_url = (*url).to_string();
+                            setup.step = ModelSetupStep::ApiKey;
+                            model.push_notice(format!(
+                                "{name} — now the API key (blank for local servers)"
+                            ));
+                        } else {
+                            setup.step = ModelSetupStep::BaseUrl;
+                            model.push_notice("Custom provider selected — enter its base URL");
+                        }
+                    }
+                    return;
+                }
+                // `/mode`: a level was chosen — set it live and close.
+                if matches!(picker.kind, PickerKind::AutonomyMode) {
+                    let selected = picker.selected;
+                    model.picker = None;
+                    if let Some((level, _)) = AUTONOMY_MODES.get(selected).copied() {
+                        set_autonomy(model, level);
+                    }
+                    return;
+                }
+                // `/search` step 1: a provider was chosen. DuckDuckGo needs
+                // nothing more and commits here; the others advance to the key
+                // (Tavily/Brave) or URL (SearXNG) input.
+                if matches!(picker.kind, PickerKind::SearchProvider) {
+                    let selected = picker.selected;
+                    model.picker = None;
+                    let Some((provider, _)) = SEARCH_PROVIDERS.get(selected).copied() else {
+                        model.search_setup = None;
+                        return;
+                    };
+                    if provider == tools::SearchProvider::DuckDuckGo {
+                        commit_search(model, provider, None);
+                    } else if let Some(setup) = model.search_setup.as_mut() {
+                        setup.provider = provider;
+                        setup.step = SearchSetupStep::Secret;
+                        model.push_notice(match provider {
+                            tools::SearchProvider::Searxng => {
+                                "SearXNG selected — enter its instance URL".to_string()
+                            }
+                            _ => format!("{} selected — enter the API key", provider.label()),
+                        });
+                    }
+                    return;
+                }
+                // Discovery step 2: a live model was chosen (or manual entry).
+                // With a server-reported context window the profile completes
+                // right here — name derived, saved, switched.
+                if let PickerKind::ModelDiscovery(models) = &picker.kind {
+                    let choice = models.get(picker.selected).cloned();
+                    model.picker = None;
+                    if model.model_setup.is_none() {
+                        return;
+                    }
+                    match choice {
+                        Some(m) => {
+                            let ctx_known = m.context_length.is_some();
+                            if let Some(setup) = model.model_setup.as_mut() {
+                                setup.model = m.id;
+                                setup.max_ctx = m.context_length;
+                                if !ctx_known {
+                                    setup.step = ModelSetupStep::ContextWindow;
+                                }
+                            }
+                            if ctx_known {
+                                finish_model_setup(model, kernel.provider.as_ref());
+                            } else {
+                                model.push_notice(
+                                    "the server didn't report a context window — enter it in tokens (blank = unknown)",
+                                );
+                            }
+                        }
+                        // Trailing "Type a model id manually…" row.
+                        None => {
+                            if let Some(setup) = model.model_setup.as_mut() {
+                                setup.step = ModelSetupStep::ModelId;
+                            }
+                        }
+                    }
+                    return;
+                }
                 // Session picker: fetch the selected session's events and replay
                 // them into the transcript.
                 if let PickerKind::Session(sessions) = &picker.kind {
@@ -169,7 +759,10 @@ pub(super) fn handle_key<P, L>(
                 // for the "+ code" scope, roll the workspace back. `None` = cancel
                 // (return to no picker; the user can re-open with /rewind).
                 if let PickerKind::RewindMode(point) = &picker.kind {
-                    let scope = point.scope_options().get(picker.selected).and_then(|(_, s)| *s);
+                    let scope = point
+                        .scope_options()
+                        .get(picker.selected)
+                        .and_then(|(_, s)| *s);
                     let at_event = point.at_event; // Copy — ends the picker borrow
                     match scope {
                         Some(scope) => {
@@ -186,16 +779,155 @@ pub(super) fn handle_key<P, L>(
                 // the transcript (same as `/skill <name>`).
                 if let PickerKind::Skill(skills) = &picker.kind {
                     let name = skills.get(picker.selected).map(|(n, _)| n.clone());
+                    // Trailing row: install. Prefill the command so the user
+                    // only pastes a source and presses Enter.
+                    let install_row = picker.selected == skills.len();
+                    model.picker = None;
                     if let Some(name) = name {
-                        model.picker = None;
                         load_skill_by_name(model, &name, transcript);
+                    } else if install_row {
+                        model.input = "/skill install ".to_string();
+                        model.cursor = model.input.len();
+                        model.push_notice(
+                            "paste a skill source after the command — a local folder, GitHub /tree/ URL, or raw SKILL.md URL — then press Enter",
+                        );
+                    }
+                    return;
+                }
+                if let PickerKind::RemoveSkill(name) = &picker.kind {
+                    let name = name.clone();
+                    let confirmed = picker.selected == 1;
+                    model.picker = None;
+                    if confirmed {
+                        remove_user_skill(model, &name, transcript);
                     } else {
+                        open_skill_picker(model);
+                    }
+                    return;
+                }
+                if let PickerKind::RemoveModel(name) = &picker.kind {
+                    let name = name.clone();
+                    let confirmed = picker.selected == 1;
+                    model.picker = None;
+                    if confirmed {
+                        remove_saved_model(model, &name);
+                    } else {
+                        open_model_picker(model);
+                    }
+                    return;
+                }
+                if let PickerKind::ModelCredential(profiles) = &picker.kind {
+                    let profile = profiles.get(picker.selected).cloned();
+                    model.picker = None;
+                    if let Some(profile) = profile {
+                        begin_model_key_update(model, profile);
+                    }
+                    return;
+                }
+                if let PickerKind::ModelDefault(profiles) = &picker.kind {
+                    let name = profiles.get(picker.selected).map(|p| p.name.clone());
+                    model.picker = None;
+                    if let Some(name) = name {
+                        set_default_model(model, &name);
+                    }
+                    return;
+                }
+                if let PickerKind::ModelRemove(profiles) = &picker.kind {
+                    let name = profiles.get(picker.selected).map(|p| p.name.clone());
+                    if let Some(name) = name {
+                        if name == model.active_profile {
+                            model.picker = None;
+                            model.push_notice(
+                                "switch to another model before removing the active profile",
+                            );
+                        } else {
+                            model.picker = Some(Picker::new(PickerKind::RemoveModel(name)));
+                        }
+                    }
+                    return;
+                }
+                if let PickerKind::Model { profiles, active } = &picker.kind {
+                    // Rows 0..n are the models themselves — Enter switches
+                    // directly. Management actions sit after the list.
+                    if let Some(profile) = profiles.get(picker.selected) {
+                        let name = profile.name.clone();
                         model.picker = None;
+                        switch_saved_model(model, kernel.provider.as_ref(), &name);
+                        return;
+                    }
+                    match picker.selected - profiles.len() {
+                        0 => {
+                            model.picker = None;
+                            begin_model_setup(model);
+                        }
+                        1 => {
+                            model.picker =
+                                Some(Picker::new(PickerKind::ModelCredential(profiles.clone())));
+                        }
+                        2 => {
+                            model.picker =
+                                Some(Picker::new(PickerKind::ModelDefault(profiles.clone())));
+                        }
+                        3 => {
+                            // Any model but the one in use can be removed.
+                            let removable: Vec<_> = profiles
+                                .iter()
+                                .filter(|p| p.name != *active)
+                                .cloned()
+                                .collect();
+                            if removable.is_empty() {
+                                model.upsert_notice(
+                                    "model manager:",
+                                    "model manager: only the active model is saved — add another before removing."
+                                        .to_string(),
+                                );
+                            } else {
+                                model.picker =
+                                    Some(Picker::new(PickerKind::ModelRemove(removable)));
+                            }
+                        }
+                        _ => {}
                     }
                     return;
                 }
             }
-            KeyCode::Esc => model.picker = None,
+            KeyCode::Esc | KeyCode::Left => {
+                if matches!(
+                    picker.kind,
+                    PickerKind::ProviderPreset | PickerKind::ModelDiscovery(_)
+                ) {
+                    // Back out of "add model" to the model menu, not to nothing —
+                    // ← behaves like a menu's back button. On a fresh install
+                    // there is no menu to go back to (the menu would immediately
+                    // reopen this form — an Esc trap), so just close.
+                    model.model_setup = None;
+                    model.picker = None;
+                    let has_models = model
+                        .model_config
+                        .lock()
+                        .map(|c| !c.models.is_empty())
+                        .unwrap_or(false);
+                    if has_models {
+                        open_model_picker(model);
+                    } else {
+                        model.push_notice("model setup cancelled — /model reopens it");
+                    }
+                } else if matches!(
+                    picker.kind,
+                    PickerKind::RemoveModel(_)
+                        | PickerKind::ModelCredential(_)
+                        | PickerKind::ModelDefault(_)
+                        | PickerKind::ModelRemove(_)
+                ) {
+                    open_model_picker(model);
+                } else if matches!(picker.kind, PickerKind::SearchProvider) {
+                    model.picker = None;
+                    model.search_setup = None;
+                    model.push_notice("web-search setup cancelled — /search reopens it");
+                } else {
+                    model.picker = None;
+                }
+            }
             _ => {}
         }
         return;
@@ -220,7 +952,11 @@ pub(super) fn handle_key<P, L>(
                     model.cursor = model.input.len();
                     return;
                 }
-                KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                KeyCode::Enter
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
                     let cmd = matches[model.ac_sel].0.trim_start_matches('/').to_string();
                     model.input.clear();
                     model.cursor = 0;
@@ -244,7 +980,11 @@ pub(super) fn handle_key<P, L>(
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             model.show_summary = !model.show_summary;
             model.invalidate_all_renders();
-            model.push_notice(if model.show_summary { "summaries: expanded (^E)" } else { "summaries: collapsed (^E)" });
+            model.push_notice(if model.show_summary {
+                "summaries: expanded (^E)"
+            } else {
+                "summaries: collapsed (^E)"
+            });
         }
         KeyCode::Esc if model.running => {
             // Unreachable in practice (the top-of-handler intercept fires
@@ -253,11 +993,12 @@ pub(super) fn handle_key<P, L>(
                 h.cancel_turn();
             }
         }
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            model.should_quit = true;
-        }
         // Shift/Alt+Enter or Ctrl+J for newline (PART 2)
-        KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
             model.insert_char('\n');
         }
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -317,7 +1058,10 @@ pub(super) fn handle_key<P, L>(
         KeyCode::Down if model.input.is_empty() => model.scroll_by(1),
         KeyCode::Up => {
             if !model.history.is_empty() {
-                let idx = model.history_idx.map(|i| i.saturating_sub(1)).unwrap_or(model.history.len() - 1);
+                let idx = model
+                    .history_idx
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(model.history.len() - 1);
                 model.input = model.history[idx].clone();
                 model.cursor = model.input.len();
                 model.history_idx = Some(idx);
@@ -404,17 +1148,297 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
     }
 }
 
+/// Keyboard input for the `clarify` question form. Owns all keys while a form is
+/// up. Rows per question = options, then "✎ Other…". Space toggles (multi) or
+/// selects (single); Enter on a radio option selects it before submitting, Enter
+/// on Other opens free text, and Esc dismisses the whole form (agent proceeds).
+pub(super) fn handle_clarify_key(model: &mut Model, key: KeyEvent) {
+    // Snapshot the layout from a short immutable borrow (mutating helpers below
+    // re-borrow `model`, so we can't hold the state borrow across them).
+    let Some((rows, other_row, multi, cursor, entering_other)) = model.clarify.as_ref().map(|s| {
+        (
+            s.row_count(),
+            s.other_row(),
+            s.questions[s.idx].multi_select,
+            s.cursor,
+            s.entering_other,
+        )
+    }) else {
+        return;
+    };
+
+    // Free-text "Other" owns keys until Enter (commit) or Esc (cancel input). It
+    // has a form-local buffer so the user's main composer draft remains untouched.
+    if entering_other {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(s) = model.clarify.as_mut() {
+                    let text = std::mem::take(&mut s.other_input).trim().to_string();
+                    s.other_cursor = 0;
+                    let i = s.idx;
+                    let has_text = !text.is_empty();
+                    s.drafts[i].other = has_text.then_some(text);
+                    // Radio: a typed Other IS the answer — clear the option pick so
+                    // the user can't submit "Python" and "actually Java" at once.
+                    if has_text && !s.questions[i].multi_select {
+                        s.drafts[i].selected.clear();
+                    }
+                    s.entering_other = false;
+                    s.validation = None;
+                }
+                model.dirty = true;
+            }
+            KeyCode::Esc => {
+                if let Some(s) = model.clarify.as_mut() {
+                    s.other_input.clear();
+                    s.other_cursor = 0;
+                    s.entering_other = false;
+                    s.validation = None;
+                }
+                model.dirty = true;
+            }
+            KeyCode::Backspace => edit_other(model, OtherEdit::Backspace),
+            KeyCode::Left => edit_other(model, OtherEdit::Left),
+            KeyCode::Right => edit_other(model, OtherEdit::Right),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                edit_other(model, OtherEdit::Insert(c));
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => cancel_clarify(model), // dismiss → tool returns skipped
+        // ←→ switch between questions (each keeps its own selections).
+        KeyCode::Left => switch_question(model, -1),
+        KeyCode::Right => switch_question(model, 1),
+        // ↑↓ move within the current question's rows (options + Other).
+        KeyCode::Up => {
+            if let Some(s) = model.clarify.as_mut() {
+                s.cursor = s.cursor.checked_sub(1).unwrap_or(rows - 1);
+            }
+            model.dirty = true;
+        }
+        KeyCode::Down => {
+            if let Some(s) = model.clarify.as_mut() {
+                s.cursor = (s.cursor + 1) % rows;
+            }
+            model.dirty = true;
+        }
+        // Space interacts with the highlighted row: pick/toggle an option, or
+        // open the free-text editor on the Other row.
+        KeyCode::Char(' ') => {
+            if cursor < other_row {
+                if let Some(s) = model.clarify.as_mut() {
+                    toggle_option(s, cursor, multi);
+                    s.validation = None;
+                }
+                model.dirty = true;
+            } else {
+                open_other(model);
+            }
+        }
+        // Enter submits ALL answers — except on the Other row, where it opens the
+        // editor (so you can type your own answer there).
+        KeyCode::Enter => {
+            if cursor == other_row {
+                open_other(model);
+            } else {
+                // For radio questions, Enter means "choose the focused row and
+                // submit". This keeps the visible focus and committed answer in
+                // sync even when the model recommended a different option.
+                if !multi {
+                    if let Some(s) = model.clarify.as_mut() {
+                        toggle_option(s, cursor, false);
+                        s.validation = None;
+                    }
+                }
+                submit_clarify(model);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Toggle (multi) or set (single) an option in the current question's draft.
+/// For a radio (single-select) question, options and "Other" are mutually
+/// exclusive — picking an option clears any typed Other, so the answer is never
+/// self-contradictory.
+fn toggle_option(s: &mut ClarifyState, i: usize, multi: bool) {
+    let d = &mut s.drafts[s.idx];
+    if multi {
+        if let Some(pos) = d.selected.iter().position(|&x| x == i) {
+            d.selected.remove(pos);
+        } else {
+            d.selected.push(i);
+        }
+    } else {
+        d.selected = vec![i];
+        d.other = None;
+    }
+}
+
+enum OtherEdit {
+    Insert(char),
+    Backspace,
+    Left,
+    Right,
+}
+
+/// Edit the form-local Other buffer while maintaining the same UTF-8 byte-offset
+/// invariant as the main composer.
+fn edit_other(model: &mut Model, edit: OtherEdit) {
+    let Some(s) = model.clarify.as_mut() else {
+        return;
+    };
+    match edit {
+        OtherEdit::Insert(c) => {
+            s.other_input.insert(s.other_cursor, c);
+            s.other_cursor += c.len_utf8();
+        }
+        OtherEdit::Backspace => {
+            if let Some(c) = s.other_input[..s.other_cursor].chars().next_back() {
+                s.other_cursor -= c.len_utf8();
+                s.other_input.remove(s.other_cursor);
+            }
+        }
+        OtherEdit::Left => {
+            if let Some(c) = s.other_input[..s.other_cursor].chars().next_back() {
+                s.other_cursor -= c.len_utf8();
+            }
+        }
+        OtherEdit::Right => {
+            if let Some(c) = s.other_input[s.other_cursor..].chars().next() {
+                s.other_cursor += c.len_utf8();
+            }
+        }
+    }
+    s.validation = None;
+    model.dirty = true;
+}
+
+/// Open the free-text "Other" editor for the current question, seeded with any
+/// text already entered in this form's dedicated buffer.
+fn open_other(model: &mut Model) {
+    if let Some(s) = model.clarify.as_mut() {
+        let i = s.idx;
+        s.other_input = s.drafts[i].other.clone().unwrap_or_default();
+        s.other_cursor = s.other_input.len();
+        s.entering_other = true;
+        s.validation = None;
+    }
+    model.dirty = true;
+}
+
+/// Move between questions by `delta`, clamped to the range; reset the row cursor.
+fn switch_question(model: &mut Model, delta: isize) {
+    if let Some(s) = model.clarify.as_mut() {
+        let n = s.questions.len() as isize;
+        let next = (s.idx as isize + delta).clamp(0, n - 1);
+        s.idx = next as usize;
+        s.cursor = s.drafts[s.idx].selected.first().copied().unwrap_or(0);
+        s.validation = None;
+        model.dirty = true;
+    }
+}
+
+/// Submit every question's draft as the answer set and close the form, echoing
+/// the choices into the transcript so the user has a record of what they answered.
+fn submit_clarify(model: &mut Model) {
+    // A radio question promises exactly one answer. Keep the form open and move
+    // focus to the first incomplete question instead of returning an ambiguous
+    // empty selection to the agent.
+    if let Some(state) = model.clarify.as_mut() {
+        if let Some(i) = state.questions.iter().enumerate().find_map(|(i, q)| {
+            let d = &state.drafts[i];
+            (!q.multi_select && d.selected.is_empty() && d.other.is_none()).then_some(i)
+        }) {
+            state.idx = i;
+            state.cursor = 0;
+            let label = state.questions[i].header.trim();
+            state.validation = Some(if label.is_empty() {
+                "Choose one option or enter an Other answer before submitting.".to_string()
+            } else {
+                format!("Choose an answer for {label}, or enter Other.")
+            });
+            model.dirty = true;
+            return;
+        }
+    }
+
+    if let Some(state) = model.clarify.take() {
+        // Human-readable summary, per question: "Header: pick, pick (“other”)".
+        let mut parts = Vec::new();
+        for (q, d) in state.questions.iter().zip(state.drafts.iter()) {
+            let label = if q.header.trim().is_empty() {
+                q.prompt.trim().to_string()
+            } else {
+                q.header.trim().to_string()
+            };
+            let mut picks: Vec<String> = d
+                .selected
+                .iter()
+                .filter_map(|&i| q.options.get(i))
+                .map(|o| o.label.clone())
+                .collect();
+            if let Some(o) = d.other.as_ref().filter(|s| !s.is_empty()) {
+                picks.push(format!("“{o}”"));
+            }
+            let val = if picks.is_empty() {
+                "—".to_string()
+            } else {
+                picks.join(", ")
+            };
+            parts.push(format!("{label}: {val}"));
+        }
+        let summary = format!("✔ answered — {}", parts.join(" · "));
+        let answers = state.answers();
+        let _ = state.responder.send(Some(answers));
+        model.push_notice(summary);
+        model.dirty = true;
+    }
+}
+
+/// Dismiss the whole form; the tool receives `None` → the agent proceeds.
+pub(super) fn cancel_clarify(model: &mut Model) {
+    if let Some(state) = model.clarify.take() {
+        let _ = state.responder.send(None);
+        model.push_notice("clarify dismissed — proceeding on best judgment");
+        model.dirty = true;
+    }
+}
+
 /// Handle agent events. `session` is swapped when a `/resume` completes.
-pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut Session, transcript: &mut Vec<Message>) {
+pub(super) fn handle_agent_event(
+    model: &mut Model,
+    ev: TuiEvent,
+    session: &mut Session,
+    transcript: &mut Vec<Message>,
+) {
     match ev {
         TuiEvent::ToolStarted(tool, target) => model.current_tool = Some((tool, target)),
-        TuiEvent::Text(delta) => { model.current_tool = None; model.push_text_delta(&delta); }
+        TuiEvent::Text(delta) => {
+            model.current_tool = None;
+            model.push_text_delta(&delta);
+        }
         TuiEvent::Reasoning(delta) => model.push_thinking_delta(&delta),
-        TuiEvent::ToolCall(tool, args) => { model.current_tool = None; model.push_item(Item::ToolCall { tool, args }); }
-        TuiEvent::ToolResult(tool, ok, payload) => { model.current_tool = None; model.push_item(Item::ToolResult { tool, ok, payload }); }
+        TuiEvent::ToolCall(tool, args) => {
+            model.current_tool = None;
+            model.push_item(Item::ToolCall { tool, args });
+        }
+        TuiEvent::ToolResult(tool, ok, payload) => {
+            model.current_tool = None;
+            model.push_item(Item::ToolResult { tool, ok, payload });
+        }
         TuiEvent::Compaction(before, after, summarized, summary) => {
             model.compacting = false;
-            model.push_item(Item::Compaction { before, after, summarized, summary });
+            model.push_item(Item::Compaction {
+                before,
+                after,
+                summarized,
+                summary,
+            });
         }
         TuiEvent::Compacting(active) => model.compacting = active,
         TuiEvent::Usage(prompt_tokens, _total) => {
@@ -440,13 +1464,58 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
                 // would drop its `oneshot::Sender` and the kernel would read that
                 // as `Approval::Deny` (the spurious "rejected by human").
                 let was_empty = model.pending_approvals.is_empty();
-                model.pending_approvals.push_back(PendingApproval { action, detail, escalated, responder });
+                model.pending_approvals.push_back(PendingApproval {
+                    action,
+                    detail,
+                    escalated,
+                    responder,
+                });
                 if was_empty {
                     model.approval_sel = 0;
                     model.approval_ready = false;
                     model.dirty = true;
                     model.scroll_to_bottom();
                 }
+            }
+        }
+        TuiEvent::Clarify(questions, responder) => {
+            // One form at a time. If somehow another is up, decline the new one.
+            if model.clarify.is_some() || questions.is_empty() {
+                let _ = responder.send(None);
+            } else {
+                // Pre-select the recommended option for radio questions, so a
+                // single-question form is one Enter away from accepting the
+                // suggested answer.
+                let drafts: Vec<ClarifyDraft> = questions
+                    .iter()
+                    .map(|q| {
+                        let mut d = ClarifyDraft::default();
+                        if !q.multi_select {
+                            if let Some(i) = q.options.iter().position(|o| o.recommended) {
+                                d.selected = vec![i];
+                            }
+                        }
+                        d
+                    })
+                    .collect();
+                let cursor = drafts
+                    .first()
+                    .and_then(|d: &ClarifyDraft| d.selected.first())
+                    .copied()
+                    .unwrap_or(0);
+                model.clarify = Some(ClarifyState {
+                    questions,
+                    idx: 0,
+                    drafts,
+                    cursor,
+                    entering_other: false,
+                    other_input: String::new(),
+                    other_cursor: 0,
+                    validation: None,
+                    responder,
+                });
+                model.dirty = true;
+                model.scroll_to_bottom();
             }
         }
         TuiEvent::Done(updated, reason) => {
@@ -511,7 +1580,10 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
         TuiEvent::Resumed(id, msgs) => {
             session.id = id;
             // Preserve transcript[0] (the system prompt); replace the rest.
-            let system = transcript.first().cloned().unwrap_or_else(|| Message::system(""));
+            let system = transcript
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Message::system(""));
             transcript.clear();
             transcript.push(system);
             transcript.extend(msgs.clone());
@@ -519,6 +1591,49 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
             model.reasoning_received_this_turn = false;
             model.last_turn_reasoning_received = None;
             model.push_notice(format!("(resumed session {id})"));
+        }
+        // `/skill install` finished (async when fetching a URL).
+        TuiEvent::SkillInstalled(result) => match result {
+            Ok(report) => {
+                model.refresh_skill_manifest(transcript);
+                let revision = report
+                    .revision
+                    .as_deref()
+                    .map(|sha| format!(" @ {}", &sha[..sha.len().min(8)]))
+                    .unwrap_or_default();
+                let verb = if report.replaced {
+                    "updated"
+                } else {
+                    "installed"
+                };
+                let effective_scope = model.skills.as_ref().and_then(|store| {
+                    store
+                        .discover(&model.known_tools)
+                        .effective()
+                        .find(|listing| listing.skill.name == report.name)
+                        .map(|listing| listing.skill.scope)
+                });
+                let shadowing = if effective_scope == Some(tools::SkillScope::Project) {
+                    "\n  Note: a project skill with this name takes precedence; the user copy is installed but inactive."
+                } else {
+                    ""
+                };
+                model.push_notice(format!(
+                    "✔ {verb} skill '{}' — {} files · {}{}\n  Load: /skill {} · Inspect: /skill info {}{shadowing}",
+                    report.name,
+                    report.files,
+                    human_bytes(report.bytes),
+                    revision,
+                    report.name,
+                    report.name,
+                ));
+            }
+            Err(e) => model.push_notice(format!("skill install failed: {e}")),
+        },
+        // Model setup finished querying /v1/models — show the picker or fall
+        // back to manual entry.
+        TuiEvent::ModelsDiscovered { base_url, result } => {
+            on_models_discovered(model, base_url, result)
         }
         // `/rewind` cut points arrived from the log — open the rewind picker.
         TuiEvent::RewindPointsLoaded(points) => {
@@ -534,15 +1649,28 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
         // re-send (edit-and-resubmit). The original session stays in the log
         // (non-destructive). Code-only (`new_id == None`) leaves the conversation
         // untouched and just reports the files reverted.
-        TuiEvent::Rewound { new_id, msgs, rolled, scope, prefill } => {
+        TuiEvent::Rewound {
+            new_id,
+            msgs,
+            rolled,
+            scope,
+            prefill,
+        } => {
             // "tracked" is honest (K18): only snapshot-carrying writes revert —
             // files mutated via shell (`sed -i`, `git checkout`) are not rolled back.
             let files = |n: usize| {
-                if n == 1 { "1 tracked file".to_string() } else { format!("{n} tracked files") }
+                if n == 1 {
+                    "1 tracked file".to_string()
+                } else {
+                    format!("{n} tracked files")
+                }
             };
             if let Some(id) = new_id {
                 session.id = id;
-                let system = transcript.first().cloned().unwrap_or_else(|| Message::system(""));
+                let system = transcript
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| Message::system(""));
                 transcript.clear();
                 transcript.push(system);
                 transcript.extend(msgs.clone());
@@ -559,7 +1687,8 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
                     files(rolled)
                 ),
                 RewindScope::Conversation => {
-                    "(rewound · code kept · prompt ready to edit · new branch, original kept)".to_string()
+                    "(rewound · code kept · prompt ready to edit · new branch, original kept)"
+                        .to_string()
                 }
                 RewindScope::Code => {
                     format!("({} rolled back · conversation kept)", files(rolled))
@@ -573,11 +1702,15 @@ pub(super) fn handle_agent_event(model: &mut Model, ev: TuiEvent, session: &mut 
 /// Rebuild the visible transcript items from a projected message list.
 /// Used when resuming a past session: the replayed conversation replaces the
 /// on-screen items. User text → `Item::User`; assistant text → `Item::Assistant`,
-/// and each of that turn's tool calls → an `Item::ToolCall` card so the resumed
-/// history shows *what the agent did*, not just what it said. Raw tool results
-/// are skipped (verbose JSON; the model still has them in the transcript).
+/// each tool call → `Item::ToolCall`, and each tool result → `Item::ToolResult`
+/// — a resumed session shows what the agent did AND what came back, exactly
+/// like the live view (results were silently dropped here once).
 pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
     model.items.clear();
+    // Tool results reference their call by id; remember each call's tool name
+    // so the result row carries the right icon/label.
+    let mut call_tools: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for m in msgs {
         match m.role {
             kernel::Role::User => model.push_item(Item::User(m.content.clone())),
@@ -586,10 +1719,28 @@ pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
                     model.push_item(Item::Assistant(m.content.clone()));
                 }
                 for tc in &m.tool_calls {
-                    model.push_item(Item::ToolCall { tool: tc.tool.clone(), args: tc.args.clone() });
+                    call_tools.insert(tc.id.clone(), tc.tool.clone());
+                    model.push_item(Item::ToolCall {
+                        tool: tc.tool.clone(),
+                        args: tc.args.clone(),
+                    });
                 }
             }
-            // system/tool messages are not shown as transcript rows.
+            kernel::Role::Tool => {
+                let payload: serde_json::Value = serde_json::from_str(&m.content)
+                    .unwrap_or_else(|_| serde_json::Value::String(m.content.clone()));
+                // Status isn't projected into the message; a top-level "error"
+                // key is how every failing observation payload reports itself.
+                let ok = payload.get("error").is_none();
+                let tool = m
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| call_tools.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| "tool".to_string());
+                model.push_item(Item::ToolResult { tool, ok, payload });
+            }
+            // system messages are not shown as transcript rows.
             _ => {}
         }
     }
@@ -611,6 +1762,20 @@ enum SlashAction {
     Clear,
     SkillPicker,
     LoadSkill(String),
+    SkillInfo(String),
+    RemoveSkill(String),
+    ModelPicker,
+    AddModel,
+    /// `/model <name>` — switch to a saved profile without opening the picker.
+    SwitchModel(String),
+    /// `/search` — open the web-search provider picker.
+    SearchConfig,
+    /// `/mode` — open the autonomy-level picker.
+    ModePicker,
+    /// `/mode <level>` — set the autonomy level without opening the picker.
+    SwitchMode(String),
+    /// `/skill install <path-or-url>` — install a skill into the user scope.
+    InstallSkill(String),
     /// Everything else — handled by `run_slash` (help, status, skills, think…).
     Other,
 }
@@ -623,6 +1788,44 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "rewind" => SlashAction::Rewind,
         "clear" => SlashAction::Clear,
         "skill" => SlashAction::SkillPicker,
+        "model" => SlashAction::ModelPicker,
+        "model add" => SlashAction::AddModel,
+        "search" => SlashAction::SearchConfig,
+        "mode" => SlashAction::ModePicker,
+        c if c.starts_with("mode ") => {
+            SlashAction::SwitchMode(c.strip_prefix("mode ").unwrap_or("").trim().to_string())
+        }
+        c if c.starts_with("model ") => {
+            SlashAction::SwitchModel(c.strip_prefix("model ").unwrap_or("").trim().to_string())
+        }
+        c if c.strip_prefix("skill install").is_some_and(is_cmd_boundary) => {
+            SlashAction::InstallSkill(
+                c.strip_prefix("skill install")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            )
+        }
+        c if c.strip_prefix("skill info").is_some_and(is_cmd_boundary) => SlashAction::SkillInfo(
+            c.strip_prefix("skill info")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        ),
+        c if c.strip_prefix("skill remove").is_some_and(is_cmd_boundary) => {
+            SlashAction::RemoveSkill(
+                c.strip_prefix("skill remove")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            )
+        }
+        c if c.strip_prefix("skill load").is_some_and(is_cmd_boundary) => SlashAction::LoadSkill(
+            c.strip_prefix("skill load")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        ),
         c if c.starts_with("skill ") => {
             SlashAction::LoadSkill(c.strip_prefix("skill ").unwrap_or("").trim().to_string())
         }
@@ -641,7 +1844,7 @@ fn dispatch_slash<P, L>(
     transcript: &mut Vec<Message>,
     tx: &mpsc::UnboundedSender<TuiEvent>,
 ) where
-    P: Provider + 'static,
+    P: ProfileProvider + 'static,
     L: EventLog + 'static,
 {
     // Clear the welcome splash: the view draws it INSTEAD of the transcript, so
@@ -654,6 +1857,19 @@ fn dispatch_slash<P, L>(
         SlashAction::Clear => do_clear(model, session, transcript),
         SlashAction::SkillPicker => open_skill_picker(model),
         SlashAction::LoadSkill(name) => load_skill_by_name(model, &name, transcript),
+        SlashAction::SkillInfo(name) => show_skill_info(model, &name),
+        SlashAction::RemoveSkill(name) => begin_remove_skill(model, &name),
+        SlashAction::ModelPicker => open_model_picker(model),
+        SlashAction::AddModel => begin_model_setup(model),
+        SlashAction::SearchConfig => begin_search_setup(model),
+        SlashAction::ModePicker => open_mode_picker(model),
+        SlashAction::SwitchMode(level) => {
+            set_autonomy(model, kernel::AutonomyLevel::from_id(&level))
+        }
+        SlashAction::SwitchModel(name) => {
+            switch_saved_model(model, kernel.provider.as_ref(), &name)
+        }
+        SlashAction::InstallSkill(src) => install_skill(model, &src, tx),
         SlashAction::Other => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
     }
 }
@@ -714,7 +1930,11 @@ fn start_rewind<L: EventLog + 'static>(
                 // Files a code rollback from this prompt onward would revert —
                 // shown in the picker; hides the code options when zero.
                 let files = kernel::rollback_plan(&events, e.id).len();
-                RewindPoint { at_event: e.id, label, files }
+                RewindPoint {
+                    at_event: e.id,
+                    label,
+                    files,
+                }
             })
             .collect();
         let _ = tx.send(TuiEvent::RewindPointsLoaded(points));
@@ -740,14 +1960,20 @@ fn spawn_rewind<L: EventLog + 'static>(
     let tx = tx.clone();
     tokio::spawn(async move {
         let events = log.events(session_id).await;
-        let Some(idx) = kernel::cut_index(&events, at_event) else { return };
+        let Some(idx) = kernel::cut_index(&events, at_event) else {
+            return;
+        };
 
         // Code rollback: revert every file written from this prompt onward,
         // returning the workspace to its state before the turn ran.
         let mut rolled = 0usize;
         if scope.touches_code() {
             for fr in kernel::rollback_plan(&events, at_event) {
-                if restore.restore(&fr.path, fr.snapshot.as_deref()).await.is_ok() {
+                if restore
+                    .restore(&fr.path, fr.snapshot.as_deref())
+                    .await
+                    .is_ok()
+                {
                     rolled += 1;
                 }
             }
@@ -765,17 +1991,30 @@ fn spawn_rewind<L: EventLog + 'static>(
                 .and_then(|e| e.payload.get("text"))
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
-            (Some(new_id), kernel::project_messages(&events[..idx]), prefill)
+            (
+                Some(new_id),
+                kernel::project_messages(&events[..idx]),
+                prefill,
+            )
         } else {
             (None, Vec::new(), None)
         };
-        let _ = tx.send(TuiEvent::Rewound { new_id, msgs, rolled, scope, prefill });
+        let _ = tx.send(TuiEvent::Rewound {
+            new_id,
+            msgs,
+            rolled,
+            scope,
+            prefill,
+        });
     });
 }
 
 /// Spawn the async session-list fetch for `/resume`. Reads `log.sessions()`
 /// off the main loop and sends `SessionsLoaded` back through the channel.
-fn spawn_sessions_fetch<L: EventLog + 'static>(kernel: &Arc<Kernel<impl Provider + 'static, L>>, tx: &mpsc::UnboundedSender<TuiEvent>) {
+fn spawn_sessions_fetch<L: EventLog + 'static>(
+    kernel: &Arc<Kernel<impl Provider + 'static, L>>,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
     let log = kernel.log.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -816,16 +2055,25 @@ pub(super) fn spawn_turn<P, L>(
     model.cancelling = false;
 
     let kernel = kernel.clone();
-    let session = session.clone();
+    // Apply the live autonomy dial to this turn's session (the policy reads it).
+    let mut session = session.clone();
+    session.autonomy = model.autonomy;
     let messages = transcript.clone();
     let budget = budget.clone();
     let tx = tx.clone();
 
     tokio::spawn(async move {
         let sink = TuiSink { tx: tx.clone() };
-        match kernel.run_session(&session, messages, budget, &sink, Some(queue)).await {
-            Ok((updated, reason)) => { let _ = tx.send(TuiEvent::Done(updated, reason)); }
-            Err(e) => { let _ = tx.send(TuiEvent::Error(e.to_string())); }
+        match kernel
+            .run_session(&session, messages, budget, &sink, Some(queue))
+            .await
+        {
+            Ok((updated, reason)) => {
+                let _ = tx.send(TuiEvent::Done(updated, reason));
+            }
+            Err(e) => {
+                let _ = tx.send(TuiEvent::Error(e.to_string()));
+            }
         }
     });
 }
@@ -847,18 +2095,54 @@ impl TuiSink {
 }
 
 impl kernel::StreamSink for TuiSink {
-    fn tool_started(&self, tool: &str, target: Option<&str>) { self.emit("tool_started", TuiEvent::ToolStarted(tool.to_string(), target.map(str::to_string))); }
-    fn text(&self, delta: &str) { self.emit("text", TuiEvent::Text(delta.to_string())); }
-    fn reasoning(&self, delta: &str) { self.emit("reasoning", TuiEvent::Reasoning(delta.to_string())); }
-    fn tool_call(&self, tool: &str, args: &serde_json::Value) { self.emit("tool_call", TuiEvent::ToolCall(tool.to_string(), args.clone())); }
-    fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) { self.emit("tool_result", TuiEvent::ToolResult(tool.to_string(), ok, payload.clone())); }
-    fn compacting(&self, active: bool) { self.emit("compacting", TuiEvent::Compacting(active)); }
-    fn compaction(&self, before: u32, after: u32, summarized: bool, summary: Option<&str>) { self.emit("compaction", TuiEvent::Compaction(before, after, summarized, summary.map(str::to_string))); }
-    fn usage(&self, prompt_tokens: u32, total_tokens: u32) { self.emit("usage", TuiEvent::Usage(prompt_tokens, total_tokens)); }
-    fn cost(&self, total_usd: f64, indicative: bool) { self.emit("cost", TuiEvent::Cost(total_usd, indicative)); }
-    fn verify(&self, ok: bool, summary: &str) { self.emit("verify", TuiEvent::Verify(ok, summary.to_string())); }
-    fn steered(&self, text: &str) { self.emit("steered", TuiEvent::Steered(text.to_string())); }
-    fn steers_returned(&self, texts: &[String]) { self.emit("steers_returned", TuiEvent::SteersReturned(texts.to_vec())); }
+    fn tool_started(&self, tool: &str, target: Option<&str>) {
+        self.emit(
+            "tool_started",
+            TuiEvent::ToolStarted(tool.to_string(), target.map(str::to_string)),
+        );
+    }
+    fn text(&self, delta: &str) {
+        self.emit("text", TuiEvent::Text(delta.to_string()));
+    }
+    fn reasoning(&self, delta: &str) {
+        self.emit("reasoning", TuiEvent::Reasoning(delta.to_string()));
+    }
+    fn tool_call(&self, tool: &str, args: &serde_json::Value) {
+        self.emit(
+            "tool_call",
+            TuiEvent::ToolCall(tool.to_string(), args.clone()),
+        );
+    }
+    fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) {
+        self.emit(
+            "tool_result",
+            TuiEvent::ToolResult(tool.to_string(), ok, payload.clone()),
+        );
+    }
+    fn compacting(&self, active: bool) {
+        self.emit("compacting", TuiEvent::Compacting(active));
+    }
+    fn compaction(&self, before: u32, after: u32, summarized: bool, summary: Option<&str>) {
+        self.emit(
+            "compaction",
+            TuiEvent::Compaction(before, after, summarized, summary.map(str::to_string)),
+        );
+    }
+    fn usage(&self, prompt_tokens: u32, total_tokens: u32) {
+        self.emit("usage", TuiEvent::Usage(prompt_tokens, total_tokens));
+    }
+    fn cost(&self, total_usd: f64, indicative: bool) {
+        self.emit("cost", TuiEvent::Cost(total_usd, indicative));
+    }
+    fn verify(&self, ok: bool, summary: &str) {
+        self.emit("verify", TuiEvent::Verify(ok, summary.to_string()));
+    }
+    fn steered(&self, text: &str) {
+        self.emit("steered", TuiEvent::Steered(text.to_string()));
+    }
+    fn steers_returned(&self, texts: &[String]) {
+        self.emit("steers_returned", TuiEvent::SteersReturned(texts.to_vec()));
+    }
 }
 
 /// Run slash command
@@ -877,7 +2161,10 @@ fn handle_reasoning_picker_key<P: kernel::Provider>(
     provider: &P,
 ) -> bool {
     let selected = match model.picker.as_ref() {
-        Some(Picker { kind: PickerKind::Reasoning(_), selected }) => *selected,
+        Some(Picker {
+            kind: PickerKind::Reasoning(_),
+            selected,
+        }) => *selected,
         _ => return false,
     };
 
@@ -912,7 +2199,9 @@ fn handle_reasoning_picker_key<P: kernel::Provider>(
                     let effort = match cfg.effort {
                         None => Some(kernel::ReasoningEffort::Low),
                         Some(kernel::ReasoningEffort::Low) => Some(kernel::ReasoningEffort::Medium),
-                        Some(kernel::ReasoningEffort::Medium) => Some(kernel::ReasoningEffort::High),
+                        Some(kernel::ReasoningEffort::Medium) => {
+                            Some(kernel::ReasoningEffort::High)
+                        }
                         Some(kernel::ReasoningEffort::High) => None,
                     };
                     provider.set_reasoning(kernel::ReasoningConfig {
@@ -946,7 +2235,10 @@ fn do_clear(model: &mut Model, session: &mut Session, transcript: &mut Vec<Messa
         model.push_notice("finish or Esc the current turn before clearing");
         return;
     }
-    let system = transcript.first().cloned().unwrap_or_else(|| Message::system(""));
+    let system = transcript
+        .first()
+        .cloned()
+        .unwrap_or_else(|| Message::system(""));
     transcript.clear();
     transcript.push(system);
     *session = Session::new();
@@ -965,15 +2257,318 @@ fn open_skill_picker(model: &mut Model) {
         return;
     };
     let disc = store.discover(&model.known_tools);
+    let unavailable = disc
+        .effective()
+        .filter(|listing| !listing.available())
+        .count();
     let list: Vec<(String, String)> = disc
         .effective()
-        .map(|l| (l.skill.name.clone(), l.skill.description.clone()))
+        .filter(|listing| listing.available())
+        .map(|listing| {
+            (
+                listing.skill.name.clone(),
+                format!(
+                    "[{}] {}",
+                    listing.skill.scope.as_str(),
+                    listing.skill.description
+                ),
+            )
+        })
         .collect();
     if list.is_empty() {
-        model.push_notice("no skills installed — add one under ~/.medha/skills/<name>/SKILL.md");
+        if unavailable > 0 {
+            model.push_notice(format!(
+                "{unavailable} installed skill(s) need tools that are unavailable in this session; use /skills for details"
+            ));
+        } else {
+            model.push_notice(
+                "no skills installed yet — install one below, or add ~/.medha/skills/<name>/SKILL.md",
+            );
+        }
+    } else if unavailable > 0 {
+        model.push_notice(format!(
+            "{unavailable} unavailable skill(s) are hidden here; use /skills for missing-tool details"
+        ));
+    }
+    // The picker always carries the trailing "Install a skill" row, so an
+    // empty catalog still opens to a useful action instead of a dead end.
+    model.picker = Some(Picker::new(PickerKind::Skill(list)));
+}
+
+/// `/model`: list the persisted profiles. A profile name represents the full
+/// connection (endpoint, model id, key reference, and context window), not
+/// merely a provider label.
+fn open_model_picker(model: &mut Model) {
+    if model.running {
+        model.push_notice("finish or Esc the current turn before switching models");
         return;
     }
-    model.picker = Some(Picker::new(PickerKind::Skill(list)));
+    let Ok(cfg) = model.model_config.lock() else {
+        model.push_notice("model configuration is temporarily unavailable");
+        return;
+    };
+    let profiles = cfg.model_profiles();
+    drop(cfg);
+    if profiles.is_empty() {
+        // Nothing saved yet (first run, or an env-only session): the useful
+        // next step IS the add form, so open it instead of a dead-end notice.
+        begin_model_setup(model);
+        return;
+    }
+    // Cursor starts on the model in use, marked ✓ — Enter without moving
+    // keeps the status quo. A one-session override matches no saved row and
+    // falls back to the top.
+    let active = model.active_profile.clone();
+    let selected = profiles.iter().position(|p| p.name == active).unwrap_or(0);
+    model.picker = Some(Picker::with_selected(
+        PickerKind::Model { profiles, active },
+        selected,
+    ));
+}
+
+fn switch_saved_model<P: ProfileProvider>(model: &mut Model, provider: &P, name: &str) {
+    if model.running {
+        model.push_notice("finish or Esc the current turn before switching models");
+        return;
+    }
+    let resolved: Result<config::Resolved, String> = match model.model_config.lock() {
+        Ok(cfg) => config::resolve_model(&cfg, name).map_err(|e| e.to_string()),
+        Err(_) => Err("model configuration is temporarily unavailable".into()),
+    };
+    match resolved {
+        Ok(resolved) => {
+            provider.switch_profile(&resolved);
+            model.model = resolved.model;
+            model.max_ctx = resolved.max_ctx;
+            model.ctx_pct = None;
+            model.active_profile = resolved.profile;
+            model.push_notice(format!("switched to model profile '{name}'"));
+        }
+        Err(e) => model.push_notice(format!("could not switch model: {e}")),
+    }
+}
+
+fn remove_saved_model(model: &mut Model, name: &str) {
+    if name == model.active_profile {
+        model.push_notice("switch to another model before removing the active profile");
+        return;
+    }
+    let outcome: Result<(), String> = match model.model_config.lock() {
+        Ok(mut cfg) => {
+            let previous_default = cfg.default_model.clone();
+            match cfg.remove_model(name) {
+                Err(e) => Err(e.to_string()),
+                Ok(removed) => match config::save(&cfg) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        cfg.models.insert(name.to_string(), removed);
+                        cfg.default_model = previous_default;
+                        Err(format!("could not write config: {e}"))
+                    }
+                },
+            }
+        }
+        Err(_) => Err("model configuration is temporarily unavailable".into()),
+    };
+    match outcome {
+        Ok(()) => model.push_notice(format!("removed model profile '{name}'")),
+        Err(e) => model.push_notice(format!("could not remove model: {e}")),
+    }
+}
+
+fn set_default_model(model: &mut Model, name: &str) {
+    let outcome: Result<(), String> = match model.model_config.lock() {
+        Ok(mut cfg) => {
+            let previous = cfg.default_model.clone();
+            match cfg.set_default_model(name) {
+                Err(e) => Err(e.to_string()),
+                Ok(()) => match config::save(&cfg) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        cfg.default_model = previous;
+                        Err(format!("could not write config: {e}"))
+                    }
+                },
+            }
+        }
+        Err(_) => Err("model configuration is temporarily unavailable".into()),
+    };
+    match outcome {
+        Ok(()) => {
+            model.picker = None;
+            model.push_notice(format!(
+                "'{name}' is now the default model for new sessions"
+            ));
+        }
+        Err(e) => model.push_notice(format!("could not set default model: {e}")),
+    }
+}
+
+/// `/skill install <path-or-url>` — install a complete skill package into user
+/// scope from a local folder, GitHub `/tree/` folder, or raw `SKILL.md`.
+fn install_skill(model: &mut Model, src: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    if src.is_empty() {
+        model.push_notice("usage: /skill install <source>\n  source: local skill folder · GitHub /tree/ URL · local/raw SKILL.md");
+        return;
+    }
+    let Some(store) = model.skills.clone() else {
+        model.push_notice("skills unavailable in this session");
+        return;
+    };
+    let src = src.to_string();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = store.install_from(&src).await;
+        let _ = tx.send(TuiEvent::SkillInstalled(result));
+    });
+    model.push_notice("(installing skill …)");
+}
+
+fn show_skill_info(model: &mut Model, name: &str) {
+    if name.is_empty() {
+        model.push_notice("usage: /skill info <name>\n  Browse names with /skill or /skills");
+        return;
+    }
+    let Some(store) = model.skills.as_ref() else {
+        model.push_notice("skills unavailable in this session");
+        return;
+    };
+    match store.inspect(name, &model.known_tools) {
+        Ok(info) => {
+            let text = |key: &str| {
+                info.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("—")
+            };
+            let available = info
+                .get("available")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let required = info
+                .get("required_tools")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "none".into());
+            let missing = info
+                .get("missing_tools")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let files = info
+                .get("bundled_files")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let shown = files
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .take(12)
+                .map(|file| format!("\n    {file}"))
+                .collect::<String>();
+            let more = files.len().saturating_sub(12);
+            let more = if more > 0 {
+                format!("\n    … and {more} more")
+            } else {
+                String::new()
+            };
+            let status = if available {
+                "available".to_string()
+            } else {
+                format!("unavailable — missing {missing}")
+            };
+            let source = info
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("manual/project checkout");
+            let revision = info
+                .get("revision")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| format!(" @ {}", &value[..value.len().min(8)]))
+                .unwrap_or_default();
+            model.push_notice(format!(
+                "skill: {}\n  {}\n  scope: {} · status: {} · version: {}\n  required tools: {}\n  source: {}{}\n  path: {}\n  bundled files: {}{}{}",
+                text("name"),
+                text("description"),
+                text("scope"),
+                status,
+                info.get("version").and_then(serde_json::Value::as_u64).unwrap_or(1),
+                required,
+                source,
+                revision,
+                text("path"),
+                files.len(),
+                shown,
+                more,
+            ));
+        }
+        Err(error) => model.push_notice(format!("skill '{name}': {error}")),
+    }
+}
+
+fn begin_remove_skill(model: &mut Model, name: &str) {
+    if name.is_empty() {
+        model.push_notice(
+            "usage: /skill remove <name>\n  Only user-scoped skills can be removed here",
+        );
+        return;
+    }
+    let Some(store) = model.skills.as_ref() else {
+        model.push_notice("skills unavailable in this session");
+        return;
+    };
+    let discovery = store.discover(&model.known_tools);
+    let has_user_copy = discovery.listings.iter().any(|listing| {
+        listing.skill.name == name && listing.skill.scope == tools::SkillScope::User
+    });
+    if !has_user_copy {
+        let project_only = discovery.listings.iter().any(|listing| {
+            listing.skill.name == name && listing.skill.scope == tools::SkillScope::Project
+        });
+        model.push_notice(if project_only {
+            format!("'{name}' is a project skill; remove it from the repository instead")
+        } else {
+            format!("no user skill named '{name}' is installed")
+        });
+        return;
+    }
+    model.picker = Some(Picker::new(PickerKind::RemoveSkill(name.to_string())));
+}
+
+fn remove_user_skill(model: &mut Model, name: &str, transcript: &mut [Message]) {
+    let Some(store) = model.skills.as_ref() else {
+        model.push_notice("skills unavailable in this session");
+        return;
+    };
+    match store.remove_user(name) {
+        Ok(_) => {
+            model.refresh_skill_manifest(transcript);
+            model.push_notice(format!("removed user skill '{name}'"));
+        }
+        Err(error) => model.push_notice(format!("could not remove skill: {error}")),
+    }
+}
+
+fn human_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 /// Force-load a skill's full procedure into the conversation, deterministically
@@ -1007,7 +2602,12 @@ fn load_skill_by_name(model: &mut Model, name: &str, transcript: &mut Vec<Messag
     }
 }
 
-pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, transcript: &[Message], provider: &P) {
+pub(super) fn run_slash<P: kernel::Provider>(
+    model: &mut Model,
+    cmd: &str,
+    transcript: &[Message],
+    provider: &P,
+) {
     if let Some(rest) = cmd.strip_prefix("reasoning").filter(|r| is_cmd_boundary(r)) {
         apply_reasoning_command(model, provider, rest.trim());
         return;
@@ -1055,7 +2655,11 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
         "detail" => {
             model.full_transparency = !model.full_transparency;
             model.invalidate_all_renders();
-            model.push_notice(if model.full_transparency { "detail: full tool input/output" } else { "detail: summarized" });
+            model.push_notice(if model.full_transparency {
+                "detail: full tool input/output"
+            } else {
+                "detail: summarized"
+            });
         }
         "tasks" => {
             let text = if model.bg_tasks.is_empty() {
@@ -1080,7 +2684,11 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
             model.upsert_notice("skills", text);
         }
         "help" => {
-            let mut text = COMMANDS.iter().map(|(c, d)| format!("{c}  {d}")).collect::<Vec<_>>().join("\n");
+            let mut text = COMMANDS
+                .iter()
+                .map(|(c, d)| format!("{c}  {d}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             text.push_str("\n\nshortcuts:\n\n  Esc     interrupt a running turn\n  Ctrl-D  quit\n  ↑/↓     scroll (empty input) · history (while typing)");
             model.push_notice(text);
         }
@@ -1094,8 +2702,9 @@ pub(super) fn run_slash<P: kernel::Provider>(model: &mut Model, cmd: &str, trans
                 None => "unknown window".to_string(),
             };
             model.push_notice(format!(
-                "model: {}  |  {ctx}  |  ~{toks} est. tokens\n\n{}",
+                "model: {} ({})  |  {ctx}  |  ~{toks} est. tokens\n\n{}",
                 model.model,
+                model.active_profile,
                 model.reasoning_status_block()
             ));
         }
@@ -1117,12 +2726,18 @@ fn apply_reasoning_command<P: kernel::Provider>(model: &mut Model, provider: &P,
         "status" => Ok(()),
         "on" => {
             let effort = provider.reasoning().effort;
-            provider.set_reasoning(kernel::ReasoningConfig { enabled: Some(true), effort });
+            provider.set_reasoning(kernel::ReasoningConfig {
+                enabled: Some(true),
+                effort,
+            });
             model.reasoning = provider.reasoning();
             Ok(())
         }
         "off" => {
-            provider.set_reasoning(kernel::ReasoningConfig { enabled: Some(false), effort: None });
+            provider.set_reasoning(kernel::ReasoningConfig {
+                enabled: Some(false),
+                effort: None,
+            });
             model.reasoning = provider.reasoning();
             Ok(())
         }
@@ -1133,7 +2748,10 @@ fn apply_reasoning_command<P: kernel::Provider>(model: &mut Model, provider: &P,
         }
         "effort auto" => {
             let enabled = provider.reasoning().enabled;
-            provider.set_reasoning(kernel::ReasoningConfig { enabled, effort: None });
+            provider.set_reasoning(kernel::ReasoningConfig {
+                enabled,
+                effort: None,
+            });
             model.reasoning = provider.reasoning();
             Ok(())
         }
@@ -1159,8 +2777,6 @@ fn apply_reasoning_command<P: kernel::Provider>(model: &mut Model, provider: &P,
     }
 }
 
-
-
 #[cfg(test)]
 mod fix_tests {
     use super::*;
@@ -1170,8 +2786,28 @@ mod fix_tests {
         let dir = std::env::temp_dir().join(format!("medha-upd-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
-        Model::new("m".into(), None, kernel::ReasoningConfig::default(),
-                   lockfile::UiConfig::default(), HashMap::new(), sbx)
+        Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            lockfile::UiConfig::default(),
+            HashMap::new(),
+            sbx,
+        )
+    }
+
+    fn input_kernel() -> Arc<Kernel<providers::OpenAiCompat, kernel::InMemoryLog>> {
+        let dir = std::env::temp_dir().join(format!("medha-input-{}", ulid::Ulid::new()));
+        Arc::new(Kernel::new(
+            Arc::new(providers::OpenAiCompat::new("http://localhost/v1", "", "m")),
+            Arc::new(kernel::InMemoryLog::new()),
+            Arc::new(tools::ToolRegistry::new()),
+            Arc::new(context::PipelineEngine::default()),
+            Arc::new(store::FileArtifactStore::open(dir).unwrap()),
+            Arc::new(kernel::AllowAll),
+            Arc::new(kernel::AutoDeny),
+            Arc::new(kernel::NoVerify),
+        ))
     }
 
     // ── slash ROUTING (the bug that shipped: `/skill` reached only one of the
@@ -1186,9 +2822,80 @@ mod fix_tests {
         );
         // `/skills` (list) must NOT be mistaken for `/skill` (load).
         assert_eq!(classify_slash("skills"), SlashAction::Other);
+        assert_eq!(classify_slash("model"), SlashAction::ModelPicker);
+        assert_eq!(classify_slash("model add"), SlashAction::AddModel);
+        // `/model <name>` switches directly, matching other agent CLIs.
+        assert_eq!(
+            classify_slash("model fast-local"),
+            SlashAction::SwitchModel("fast-local".into())
+        );
+        // `/skill install <src>` routes to the installer, not skill loading.
+        assert_eq!(
+            classify_slash("skill install https://example.com/SKILL.md"),
+            SlashAction::InstallSkill("https://example.com/SKILL.md".into())
+        );
+        assert_eq!(
+            classify_slash("skill install"),
+            SlashAction::InstallSkill(String::new())
+        );
+        assert_eq!(
+            classify_slash("skill info frontend-ui-design"),
+            SlashAction::SkillInfo("frontend-ui-design".into())
+        );
+        assert_eq!(
+            classify_slash("skill remove frontend-ui-design"),
+            SlashAction::RemoveSkill("frontend-ui-design".into())
+        );
+        assert_eq!(
+            classify_slash("skill load frontend-ui-design"),
+            SlashAction::LoadSkill("frontend-ui-design".into())
+        );
+        // Subcommand prefixes require a word boundary; valid skill names that
+        // merely begin with one must still route as names.
+        assert_eq!(
+            classify_slash("skill installer"),
+            SlashAction::LoadSkill("installer".into())
+        );
         assert_eq!(classify_slash("resume"), SlashAction::Resume);
         assert_eq!(classify_slash("clear"), SlashAction::Clear);
         assert_eq!(classify_slash("help"), SlashAction::Other);
+        assert_eq!(classify_slash("search"), SlashAction::SearchConfig);
+        assert_eq!(classify_slash("mode"), SlashAction::ModePicker);
+        assert_eq!(
+            classify_slash("mode yolo"),
+            SlashAction::SwitchMode("yolo".into())
+        );
+    }
+
+    // ── /search opens the provider picker with the current choice preselected ──
+    #[test]
+    fn begin_search_setup_opens_provider_picker() {
+        let mut m = model();
+        begin_search_setup(&mut m);
+        assert!(m.search_setup.is_some(), "a draft must be started");
+        assert!(
+            matches!(
+                m.picker.as_ref().map(|p| &p.kind),
+                Some(PickerKind::SearchProvider)
+            ),
+            "the provider picker must be open"
+        );
+        // Unconfigured → DuckDuckGo row (index 0) preselected.
+        assert_eq!(m.picker.as_ref().unwrap().selected, 0);
+        // Esc-equivalent cleanup leaves no dangling draft.
+        m.search_setup = None;
+    }
+
+    // ── a keyed provider advances to the masked Secret step, not a direct commit ─
+    #[test]
+    fn keyed_provider_needs_a_secret_step() {
+        // Tavily/Brave mask input; SearXNG (a URL) does not; DuckDuckGo is not secret.
+        let mut s = SearchSetup::new();
+        s.provider = tools::SearchProvider::Tavily;
+        s.step = SearchSetupStep::Secret;
+        assert!(s.is_secret(), "an API key must be masked");
+        s.provider = tools::SearchProvider::Searxng;
+        assert!(!s.is_secret(), "a SearXNG URL must stay visible");
     }
 
     // ── /skill <name> force-loads the procedure into the transcript ───────────
@@ -1208,13 +2915,20 @@ mod fix_tests {
 
         load_skill_by_name(&mut m, "greet", &mut transcript);
         let injected = &transcript.last().unwrap().content;
-        assert!(injected.contains("say hello"), "procedure body must be injected");
+        assert!(
+            injected.contains("say hello"),
+            "procedure body must be injected"
+        );
         assert!(injected.contains("Loaded skill: greet"));
 
         // Unknown skill → no injection, a clear notice instead.
         let n = transcript.len();
         load_skill_by_name(&mut m, "nope", &mut transcript);
-        assert_eq!(transcript.len(), n, "unknown skill must not inject anything");
+        assert_eq!(
+            transcript.len(),
+            n,
+            "unknown skill must not inject anything"
+        );
 
         // Empty name → opens the picker (no injection), listing the one skill.
         load_skill_by_name(&mut m, "", &mut transcript);
@@ -1227,9 +2941,9 @@ mod fix_tests {
     fn cmd_boundary_distinguishes_think_from_thinking() {
         // `strip_prefix("think")` on "thinking" leaves "ing" (no boundary) → not
         // the think command; on "think"/"think high" it leaves ""/" high".
-        assert!(is_cmd_boundary(""));            // /think
-        assert!(is_cmd_boundary(" high"));       // /think high
-        assert!(!is_cmd_boundary("ing"));        // /thinking → must fall through
+        assert!(is_cmd_boundary("")); // /think
+        assert!(is_cmd_boundary(" high")); // /think high
+        assert!(!is_cmd_boundary("ing")); // /thinking → must fall through
     }
 
     #[test]
@@ -1253,13 +2967,119 @@ mod fix_tests {
         run_slash(&mut m, "reasoning", &transcript, &provider);
         assert!(matches!(
             &m.picker,
-            Some(Picker { kind: PickerKind::Reasoning(_), .. })
+            Some(Picker {
+                kind: PickerKind::Reasoning(_),
+                ..
+            })
         ));
         let labels = m.picker.as_ref().unwrap().kind.labels();
         assert_eq!(labels[0], "Mode:       On");
         assert_eq!(labels[1], "Visibility: Shown");
         assert_eq!(labels[2], "Effort:     Auto");
         assert_eq!(labels[3], "Last turn:  No completed turn yet");
+    }
+
+    #[test]
+    fn running_reasoning_panel_consumes_first_esc_then_second_cancels() {
+        let kernel = input_kernel();
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (handle, queue) = kernel::InterruptQueue::pair();
+
+        m.running = true;
+        m.interrupt = Some(handle.clone());
+        run_slash(&mut m, "reasoning", &transcript, kernel.provider.as_ref());
+        assert!(m.picker.is_some());
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+        assert!(m.picker.is_none());
+        assert!(!queue.cancel_requested());
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+        assert!(queue.cancel_requested());
+    }
+
+    #[test]
+    fn ctrl_d_remains_a_global_exit_while_a_running_picker_is_open() {
+        let kernel = input_kernel();
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (handle, queue) = kernel::InterruptQueue::pair();
+
+        m.running = true;
+        m.interrupt = Some(handle);
+        run_slash(&mut m, "reasoning", &transcript, kernel.provider.as_ref());
+        assert!(m.picker.is_some());
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+        assert!(m.should_quit);
+        assert!(queue.cancel_requested());
+    }
+
+    #[test]
+    fn hidden_picker_does_not_steal_esc_from_a_visible_approval() {
+        let kernel = input_kernel();
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (interrupt, queue) = kernel::InterruptQueue::pair();
+        let (approval_tx, mut approval_rx) = oneshot::channel();
+
+        m.running = true;
+        m.interrupt = Some(interrupt);
+        run_slash(&mut m, "reasoning", &transcript, kernel.provider.as_ref());
+        m.pending_approvals.push_back(PendingApproval {
+            action: "test".into(),
+            detail: None,
+            escalated: false,
+            responder: approval_tx,
+        });
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &event_tx,
+        );
+        assert!(queue.cancel_requested());
+        assert!(m.picker.is_none());
+        assert!(m.pending_approvals.is_empty());
+        assert_eq!(approval_rx.try_recv(), Ok(kernel::Approval::Deny));
     }
 
     #[test]
@@ -1317,7 +3137,9 @@ mod fix_tests {
         assert_eq!(transcript[0].content, "SYS");
         // Conversation items are gone (only the "(cleared)" notice remains).
         assert!(
-            !m.items.iter().any(|e| matches!(&e.item, Item::User(t) if t == "hello")),
+            !m.items
+                .iter()
+                .any(|e| matches!(&e.item, Item::User(t) if t == "hello")),
             "prior conversation items cleared"
         );
         assert_ne!(session.id, old_id, "a fresh session id is minted");
@@ -1331,7 +3153,11 @@ mod fix_tests {
         let id = session.id;
         let mut transcript = vec![Message::system("SYS"), Message::user("x")];
         do_clear(&mut m, &mut session, &mut transcript);
-        assert_eq!(transcript.len(), 2, "transcript untouched while a turn runs");
+        assert_eq!(
+            transcript.len(),
+            2,
+            "transcript untouched while a turn runs"
+        );
         assert_eq!(session.id, id);
     }
 
@@ -1348,6 +3174,158 @@ mod fix_tests {
         });
         m.deny_pending_approvals();
         assert!(m.pending_approvals.is_empty(), "queue drained");
-        assert!(matches!(rx.await, Ok(kernel::Approval::Deny)), "dangling responder got Deny");
+        assert!(
+            matches!(rx.await, Ok(kernel::Approval::Deny)),
+            "dangling responder got Deny"
+        );
+    }
+
+    // ── clarify form ─────────────────────────────────────────────────────────
+    fn clarify_state(
+        multi: bool,
+        recommended: Option<usize>,
+        responder: oneshot::Sender<Option<Vec<kernel::Answer>>>,
+    ) -> ClarifyState {
+        let options = vec![
+            kernel::QOption {
+                label: "Postgres".into(),
+                description: String::new(),
+                recommended: recommended == Some(0),
+            },
+            kernel::QOption {
+                label: "SQLite".into(),
+                description: String::new(),
+                recommended: recommended == Some(1),
+            },
+        ];
+        let selected = if !multi {
+            recommended.map(|i| vec![i]).unwrap_or_default()
+        } else {
+            vec![]
+        };
+        ClarifyState {
+            questions: vec![kernel::Question {
+                prompt: "Which DB?".into(),
+                header: "DB".into(),
+                options,
+                multi_select: multi,
+            }],
+            idx: 0,
+            drafts: vec![ClarifyDraft {
+                selected,
+                other: None,
+            }],
+            cursor: recommended.unwrap_or(0),
+            entering_other: false,
+            other_input: String::new(),
+            other_cursor: 0,
+            validation: None,
+            responder,
+        }
+    }
+    fn kc(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn clarify_enter_submits_the_recommended_default() {
+        let mut m = model();
+        let (tx, mut rx) = oneshot::channel();
+        m.clarify = Some(clarify_state(false, Some(0), tx)); // Postgres pre-selected
+        handle_clarify_key(&mut m, kc(KeyCode::Enter));
+        assert!(m.clarify.is_none(), "form closed on submit");
+        let ans = rx.try_recv().expect("responder fired").expect("answers");
+        assert_eq!(ans[0].selected, vec!["Postgres".to_string()]);
+    }
+
+    #[test]
+    fn clarify_space_toggles_multi_select() {
+        let mut m = model();
+        let (tx, mut rx) = oneshot::channel();
+        m.clarify = Some(clarify_state(true, None, tx));
+        // cursor on option 0 → space selects it; move down, space selects option 1.
+        handle_clarify_key(&mut m, kc(KeyCode::Char(' ')));
+        handle_clarify_key(&mut m, kc(KeyCode::Down));
+        handle_clarify_key(&mut m, kc(KeyCode::Char(' ')));
+        handle_clarify_key(&mut m, kc(KeyCode::Enter)); // submit
+        let ans = rx.try_recv().unwrap().unwrap();
+        assert_eq!(
+            ans[0].selected,
+            vec!["Postgres".to_string(), "SQLite".to_string()]
+        );
+    }
+
+    #[test]
+    fn clarify_esc_dismisses_with_none() {
+        let mut m = model();
+        let (tx, mut rx) = oneshot::channel();
+        m.clarify = Some(clarify_state(false, Some(0), tx));
+        handle_clarify_key(&mut m, kc(KeyCode::Esc));
+        assert!(m.clarify.is_none());
+        assert!(
+            rx.try_recv().expect("responder fired").is_none(),
+            "dismiss → None"
+        );
+    }
+
+    #[test]
+    fn clarify_enter_commits_the_focused_radio_option() {
+        let mut m = model();
+        let (tx, mut rx) = oneshot::channel();
+        let mut state = clarify_state(false, Some(0), tx);
+        state.cursor = 1; // move focus away from the recommended Postgres row
+        m.clarify = Some(state);
+
+        handle_clarify_key(&mut m, kc(KeyCode::Enter));
+
+        let ans = rx.try_recv().expect("responder fired").expect("answers");
+        assert_eq!(ans[0].selected, vec!["SQLite".to_string()]);
+    }
+
+    #[test]
+    fn clarify_rejects_an_unanswered_radio_question() {
+        let mut m = model();
+        let (tx, _rx) = oneshot::channel();
+        m.clarify = Some(clarify_state(false, None, tx));
+
+        submit_clarify(&mut m);
+
+        let state = m.clarify.as_ref().expect("incomplete form stays open");
+        assert!(state.validation.is_some(), "validation is shown inline");
+        assert_eq!(state.idx, 0);
+    }
+
+    #[test]
+    fn clarify_other_is_unicode_safe_and_preserves_the_composer() {
+        let mut m = model();
+        m.input = "keep this steer".into();
+        m.cursor = m.input.len();
+        let (tx, _rx) = oneshot::channel();
+        let mut state = clarify_state(false, None, tx);
+        state.cursor = state.other_row();
+        m.clarify = Some(state);
+
+        handle_clarify_key(&mut m, kc(KeyCode::Enter)); // open Other
+        handle_clarify_key(&mut m, kc(KeyCode::Char('é')));
+        handle_clarify_key(&mut m, kc(KeyCode::Char('🙂')));
+        handle_clarify_key(&mut m, kc(KeyCode::Enter)); // save Other
+
+        assert_eq!(m.input, "keep this steer", "main composer was untouched");
+        let state = m.clarify.as_mut().expect("form remains open");
+        assert_eq!(state.drafts[0].other.as_deref(), Some("é🙂"));
+        state.cursor = state.other_row();
+
+        handle_clarify_key(&mut m, kc(KeyCode::Enter)); // reopen saved Unicode
+        let state = m.clarify.as_ref().unwrap();
+        assert_eq!(state.other_cursor, "é🙂".len(), "cursor is a byte offset");
+        assert!(state.other_input.is_char_boundary(state.other_cursor));
+
+        // Moving across both multi-byte characters must preserve the invariant.
+        handle_clarify_key(&mut m, kc(KeyCode::Left));
+        handle_clarify_key(&mut m, kc(KeyCode::Left));
+        handle_clarify_key(&mut m, kc(KeyCode::Right));
+        let state = m.clarify.as_ref().unwrap();
+        assert!(state.other_input.is_char_boundary(state.other_cursor));
+        assert_eq!(m.input, "keep this steer");
     }
 }

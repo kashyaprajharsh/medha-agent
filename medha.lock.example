@@ -34,7 +34,7 @@ emergency_ratio = 0.95
 # dangerous-pattern scanner (blocks rm -rf/, sudo, credential reads, etc.) so
 # ordinary commands like `open` or `ls` don't need approval. Add "shell.exec"
 # here too if you want every shell command to ask first. [] = fully autonomous.
-approve = ["fs.write", "fs.edit"]
+approve = ["fs.write", "fs.edit", "skill.save"]
 
 [sandbox]
 # Execution isolation for shell/build/VCS commands (§4.8). Makes the containment

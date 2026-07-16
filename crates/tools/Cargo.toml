@@ -14,7 +14,9 @@ async-trait.workspace = true
 thiserror.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["process"] }
-# Skills: parse/emit SKILL.md TOML frontmatter (agentskills.io-compatible).
+# Skills: parse/emit SKILL.md frontmatter. YAML is the ecosystem standard;
+# TOML stays as a read-only legacy fallback.
+serde_yaml = "0.9"
 toml = "0.8"
 similar = "2"
 regex = "1"
@@ -24,7 +26,7 @@ reqwest = { workspace = true }
 scraper = "0.20"
 html2md = "0.2"
 urlencoding = "2"
-pdf-extract = "0.7"
+pdf-extract = "0.12"
 
 [dev-dependencies]
 ulid = "1"

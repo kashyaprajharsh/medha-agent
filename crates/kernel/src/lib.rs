@@ -3,6 +3,7 @@
 
 pub mod artifacts;
 pub mod budgets;
+pub mod clarify;
 pub mod context;
 pub mod errors;
 pub mod events;
@@ -19,24 +20,26 @@ pub mod verify;
 pub mod kernel_loop;
 
 pub use artifacts::ArtifactStore;
-pub use budgets::{Budget, BudgetStop, Governor, DEFAULT_MAX_TURNS};
+pub use budgets::{Budget, BudgetStop, DEFAULT_MAX_TURNS, Governor};
+pub use clarify::{Answer, Asker, NoAsker, QOption, Question};
 pub use context::{CompileResult, ContextEngine};
 pub use errors::KernelError;
 pub use events::{
-    cut_index, project_messages, rollback_plan, Event, EventKind, EventLog, FileRollback,
-    InMemoryLog, Provenance, SessionMeta,
+    Event, EventKind, EventLog, FileRollback, InMemoryLog, Provenance, SessionMeta, cut_index,
+    project_messages, rollback_plan,
 };
 pub use executor::{BackgroundTask, Executor};
 pub use gate::{Approval, AutoDeny, HumanGate};
 pub use interrupts::{Interrupt, InterruptHandle, InterruptQueue};
+pub use kernel_loop::{DEFAULT_MAX_PARALLEL_TOOLS, Kernel, StopReason};
 pub use policy::{AllowAll, Policy};
-pub use sink::{NullSink, StreamSink};
-pub use verify::{NoVerify, VerifyReport, Verifier};
-pub use kernel_loop::{Kernel, StopReason, DEFAULT_MAX_PARALLEL_TOOLS};
 pub use provider::{
     Provider, ProviderCaps, ProviderError, ReasoningConfig, ReasoningEffort, ToolCallStrategy,
 };
+pub use sink::{NullSink, StreamSink};
 pub use types::{
-    BlastRadius, Block, CompiledContext, Containment, Decision, Message, ObsStatus, Observation,
-    Pricing, Role, Session, ToolCategory, ToolIntent, ToolSpec, TrustLabel, TurnResult, Usage,
+    AutonomyLevel, BlastRadius, Block, CompiledContext, Containment, Decision, Message, ObsStatus,
+    Observation, Pricing, Role, Session, ToolCategory, ToolIntent, ToolSpec, TrustLabel,
+    TurnResult, Usage,
 };
+pub use verify::{NoVerify, Verifier, VerifyReport};

@@ -3,21 +3,33 @@
 //! this trait; the declarative rules + command scanner live in the policy crate
 //! (P8). Returns a `Decision` (allow / deny / verify / human).
 
-use crate::types::{BlastRadius, Decision, ToolIntent};
+use crate::types::{AutonomyLevel, BlastRadius, Decision, ToolIntent};
 
 pub trait Policy: Send + Sync {
     /// Authorize an intent. `blast_radius` is the tool's declared radius (§4.7),
     /// looked up by the kernel from the executor — `None` means the tool isn't
-    /// registered (deny-first). The policy decides from the radius plus any
-    /// tool-specific rules (e.g. a shell scanner).
-    fn authorize(&self, intent: &ToolIntent, blast_radius: Option<BlastRadius>) -> Decision;
+    /// registered (deny-first). `autonomy` is the session's dial: it may relax
+    /// escalation of *otherwise-allowed* reversible/shell actions, but never
+    /// loosens the base `Human`/`Deny` floor. The policy decides from the radius
+    /// plus any tool-specific rules (e.g. a shell scanner).
+    fn authorize(
+        &self,
+        autonomy: AutonomyLevel,
+        intent: &ToolIntent,
+        blast_radius: Option<BlastRadius>,
+    ) -> Decision;
 }
 
 /// Permissive policy (tests / explicit opt-out). The real default is deny-first
 /// (see the `policy` crate).
 pub struct AllowAll;
 impl Policy for AllowAll {
-    fn authorize(&self, _intent: &ToolIntent, _blast_radius: Option<BlastRadius>) -> Decision {
+    fn authorize(
+        &self,
+        _autonomy: AutonomyLevel,
+        _intent: &ToolIntent,
+        _blast_radius: Option<BlastRadius>,
+    ) -> Decision {
         Decision::Allow
     }
 }

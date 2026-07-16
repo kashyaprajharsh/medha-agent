@@ -5,7 +5,9 @@
 
 use async_trait::async_trait;
 use kernel::events::chain_hash;
-use kernel::{ArtifactStore, Event, EventKind, EventLog, KernelError, Provenance, SessionMeta, TrustLabel};
+use kernel::{
+    ArtifactStore, Event, EventKind, EventLog, KernelError, Provenance, SessionMeta, TrustLabel,
+};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -103,7 +105,9 @@ impl SqliteLog {
         // The chain head is read from the DB inside each append's transaction
         // (see `append`), not cached — so a second MEDHA process on the same
         // workspace can't append against a stale head and corrupt the chain (K10).
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Verify the tamper-evident hash chain over the ENTIRE log (all sessions,
@@ -112,7 +116,10 @@ impl SqliteLog {
     /// its hash reproduces the stored `hash` column, so a direct edit to any row
     /// — including the last — is detected. Call this on open / session resume.
     pub fn verify(&self) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, session_id, parent_id, kind, payload, trust, provenance, prev_hash, hash, ts
@@ -164,7 +171,10 @@ impl SqliteLog {
     /// picker. Title is the first user message (truncated); a session with no
     /// user message (pre-logging, or empty) shows a placeholder.
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>, StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT e1.session_id, MIN(e1.ts), MAX(e1.ts), COUNT(*),
@@ -192,7 +202,9 @@ impl SqliteLog {
         for row in rows {
             let (id, started, last, count, first_user) =
                 row.map_err(|e| StoreError::Db(e.to_string()))?;
-            let Ok(id) = Ulid::from_string(&id) else { continue };
+            let Ok(id) = Ulid::from_string(&id) else {
+                continue;
+            };
             let title = first_user
                 .as_deref()
                 .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
@@ -207,7 +219,13 @@ impl SqliteLog {
                 })
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| "(no user message)".to_string());
-            out.push(SessionMeta { id, title, started_ts: started, last_ts: last, events: count as u64 });
+            out.push(SessionMeta {
+                id,
+                title,
+                started_ts: started,
+                last_ts: last,
+                events: count as u64,
+            });
         }
         Ok(out)
     }
@@ -217,7 +235,10 @@ impl SqliteLog {
 impl EventLog for SqliteLog {
     async fn append(&self, mut e: Event) -> Result<Event, KernelError> {
         use rusqlite::OptionalExtension;
-        let mut conn = self.conn.lock().map_err(|_| KernelError::Log("poisoned".into()))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| KernelError::Log("poisoned".into()))?;
         // Read the chain head and insert inside ONE `IMMEDIATE` transaction, so
         // the read-then-append is atomic against any other writer — including a
         // second MEDHA process on the same DB. Trusting an in-memory cached head
@@ -228,7 +249,11 @@ impl EventLog for SqliteLog {
             .map_err(|err| KernelError::Log(err.to_string()))?;
 
         let head: Option<Vec<u8>> = tx
-            .query_row("SELECT hash FROM events ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT hash FROM events ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(|err| KernelError::Log(err.to_string()))?;
         let mut prev = [0u8; 32];
@@ -258,12 +283,15 @@ impl EventLog for SqliteLog {
             ],
         )
         .map_err(|err| KernelError::Log(err.to_string()))?;
-        tx.commit().map_err(|err| KernelError::Log(err.to_string()))?;
+        tx.commit()
+            .map_err(|err| KernelError::Log(err.to_string()))?;
         Ok(e)
     }
 
     async fn events(&self, session: Ulid) -> Vec<Event> {
-        let Ok(conn) = self.conn.lock() else { return Vec::new() };
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
         let Ok(mut stmt) = conn.prepare(
             "SELECT id, session_id, parent_id, kind, payload, trust, provenance, prev_hash, ts
              FROM events WHERE session_id = ?1 ORDER BY rowid ASC",
@@ -327,7 +355,9 @@ impl Row {
             kind: EventKind::parse(&self.kind)?,
             payload: serde_json::from_str(&self.payload).unwrap_or(serde_json::Value::Null),
             trust: TrustLabel::parse(&self.trust)?,
-            provenance: Provenance { source: self.provenance },
+            provenance: Provenance {
+                source: self.provenance,
+            },
             prev_hash: prev,
             ts: self.ts,
         })
@@ -344,11 +374,23 @@ mod tests {
         let db = dir.join("events.db");
         let log = SqliteLog::open(&db).unwrap();
 
-        let s1 = kernel::Session { id: Ulid::new(), done: false };
-        log.append(Event::user_message(&s1, "first task here")).await.unwrap();
+        let s1 = kernel::Session {
+            id: Ulid::new(),
+            done: false,
+            ..Default::default()
+        };
+        log.append(Event::user_message(&s1, "first task here"))
+            .await
+            .unwrap();
         log.append(Event::model_text(&s1, "ok")).await.unwrap();
-        let s2 = kernel::Session { id: Ulid::new(), done: false };
-        log.append(Event::user_message(&s2, "second task")).await.unwrap();
+        let s2 = kernel::Session {
+            id: Ulid::new(),
+            done: false,
+            ..Default::default()
+        };
+        log.append(Event::user_message(&s2, "second task"))
+            .await
+            .unwrap();
 
         let sessions = log.list_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
@@ -380,7 +422,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-fork-{}", Ulid::new()));
         let db = dir.join("events.db");
         let log = SqliteLog::open(&db).unwrap();
-        let s = kernel::Session { id: Ulid::new(), done: false };
+        let s = kernel::Session {
+            id: Ulid::new(),
+            done: false,
+            ..Default::default()
+        };
 
         log.append(Event::user_message(&s, "one")).await.unwrap();
         let cut = log.append(Event::user_message(&s, "two")).await.unwrap();
@@ -390,7 +436,10 @@ mod tests {
         let branch_id = log.fork(s.id, cut.id).await.unwrap();
         let branch = log.events(branch_id).await;
         assert_eq!(branch.len(), 1);
-        assert_eq!(branch[0].payload.get("text").and_then(|v| v.as_str()), Some("one"));
+        assert_eq!(
+            branch[0].payload.get("text").and_then(|v| v.as_str()),
+            Some("one")
+        );
         assert_eq!(branch[0].session_id, branch_id);
 
         // Original session untouched; whole log still verifies (fork appended a
@@ -405,7 +454,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-store-{}", Ulid::new()));
         let db = dir.join("events.db");
         let session = Ulid::new();
-        let s = kernel::Session { id: session, done: false };
+        let s = kernel::Session {
+            id: session,
+            done: false,
+            ..Default::default()
+        };
 
         // Append two events, then drop and reopen → events must persist.
         {
@@ -434,11 +487,17 @@ mod tests {
         let db = dir.join("events.db");
         let a = SqliteLog::open(&db).unwrap();
         let b = SqliteLog::open(&db).unwrap();
-        let s = kernel::Session { id: Ulid::new(), done: false };
+        let s = kernel::Session {
+            id: Ulid::new(),
+            done: false,
+            ..Default::default()
+        };
 
         for i in 0..6 {
             let log = if i % 2 == 0 { &a } else { &b };
-            log.append(Event::model_text(&s, &format!("event {i}"))).await.unwrap();
+            log.append(Event::model_text(&s, &format!("event {i}")))
+                .await
+                .unwrap();
         }
 
         // Either handle sees all six, and the global chain verifies clean.
@@ -451,7 +510,11 @@ mod tests {
     async fn verify_detects_tampering() {
         let dir = std::env::temp_dir().join(format!("medha-verify-{}", Ulid::new()));
         let db = dir.join("events.db");
-        let s = kernel::Session { id: Ulid::new(), done: false };
+        let s = kernel::Session {
+            id: Ulid::new(),
+            done: false,
+            ..Default::default()
+        };
 
         {
             let log = SqliteLog::open(&db).unwrap();

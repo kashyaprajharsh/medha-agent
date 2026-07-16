@@ -156,14 +156,19 @@ impl PermissionManager {
             let home = dirs::home_dir().ok_or_else(|| {
                 PermissionError::Resolution("Could not determine home directory".into())
             })?;
-            path.strip_prefix("~").map(|p| home.join(p)).unwrap_or(path.to_path_buf())
+            path.strip_prefix("~")
+                .map(|p| home.join(p))
+                .unwrap_or(path.to_path_buf())
         } else {
             path.to_path_buf()
         };
 
         // Canonicalize to resolve symlinks and collapse .. - target must exist for read
         path.canonicalize().map_err(|e| {
-            PermissionError::Resolution(format!("Failed to canonicalize path {}: {e}", path.display()))
+            PermissionError::Resolution(format!(
+                "Failed to canonicalize path {}: {e}",
+                path.display()
+            ))
         })
     }
 
@@ -175,7 +180,9 @@ impl PermissionManager {
             let home = dirs::home_dir().ok_or_else(|| {
                 PermissionError::Resolution("Could not determine home directory".into())
             })?;
-            path.strip_prefix("~").map(|p| home.join(p)).unwrap_or(path.to_path_buf())
+            path.strip_prefix("~")
+                .map(|p| home.join(p))
+                .unwrap_or(path.to_path_buf())
         } else {
             path.to_path_buf()
         };
@@ -185,7 +192,10 @@ impl PermissionManager {
             PermissionError::Resolution(format!("Path has no parent directory: {}", path.display()))
         })?;
         let filename = path.file_name().ok_or_else(|| {
-            PermissionError::Resolution(format!("Path has no filename component: {}", path.display()))
+            PermissionError::Resolution(format!(
+                "Path has no filename component: {}",
+                path.display()
+            ))
         })?;
 
         // Canonicalize the nearest existing ancestor, keeping the intermediate
@@ -219,7 +229,10 @@ impl PermissionManager {
             if current.exists() && current.is_dir() {
                 // Found existing directory - canonicalize it
                 let canonical = current.canonicalize().map_err(|e| {
-                    PermissionError::Resolution(format!("Failed to canonicalize parent directory {}: {e}", current.display()))
+                    PermissionError::Resolution(format!(
+                        "Failed to canonicalize parent directory {}: {e}",
+                        current.display()
+                    ))
                 })?;
                 missing.reverse(); // collected bottom-up → restore top-to-bottom
                 return Ok((canonical, missing));
@@ -237,7 +250,10 @@ impl PermissionManager {
         // but as fallback, try to canonicalize the original path
         // (may fail if it doesn't exist, which is correct fail-closed behavior).
         let canonical = path.canonicalize().map_err(|e| {
-            PermissionError::Resolution(format!("Failed to canonicalize parent directory {}: {e}", path.display()))
+            PermissionError::Resolution(format!(
+                "Failed to canonicalize parent directory {}: {e}",
+                path.display()
+            ))
         })?;
         Ok((canonical, Vec::new()))
     }
@@ -245,6 +261,16 @@ impl PermissionManager {
     /// Check if a resolved path is inside the workspace root
     fn is_inside_workspace(&self, resolved_path: &Path) -> bool {
         resolved_path.starts_with(&self.workspace_root)
+    }
+
+    /// Grant prompt-free READ access to a harness-owned directory for this
+    /// process only (in-memory; never persisted to the trust file). Exists for
+    /// roots like the user skills dir: skills bundle reference files the model
+    /// must read on demand, and a permission dialog per file would break them.
+    /// Writes stay fully gated.
+    pub fn allow_read_dir(&self, dir: &Path) {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        self.trusted_read_paths.write().unwrap().insert(dir);
     }
 
     /// Check if a path (or its parent) is trusted for the given permission
@@ -266,14 +292,24 @@ impl PermissionManager {
     }
 
     /// Add a path to the trusted set (in memory and persisted)
-    fn trust_path(&self, resolved_path: PathBuf, perm: PermissionType) -> Result<(), PermissionError> {
+    fn trust_path(
+        &self,
+        resolved_path: PathBuf,
+        perm: PermissionType,
+    ) -> Result<(), PermissionError> {
         // Add to in-memory set
         match perm {
             PermissionType::Read => {
-                self.trusted_read_paths.write().unwrap().insert(resolved_path.clone());
+                self.trusted_read_paths
+                    .write()
+                    .unwrap()
+                    .insert(resolved_path.clone());
             }
             PermissionType::Write => {
-                self.trusted_write_paths.write().unwrap().insert(resolved_path.clone());
+                self.trusted_write_paths
+                    .write()
+                    .unwrap()
+                    .insert(resolved_path.clone());
             }
         }
 
@@ -282,7 +318,11 @@ impl PermissionManager {
     }
 
     /// Persist a trusted path to medha.lock
-    fn persist_trusted_path(&self, path: &Path, perm: PermissionType) -> Result<(), PermissionError> {
+    fn persist_trusted_path(
+        &self,
+        path: &Path,
+        perm: PermissionType,
+    ) -> Result<(), PermissionError> {
         // Read existing lock file
         let content = std::fs::read_to_string(&self.lock_path).unwrap_or_default();
         let mut value: toml::Value = if content.trim().is_empty() {
@@ -321,7 +361,10 @@ impl PermissionManager {
 
         trusted_paths_array.push(toml::Value::Table({
             let mut table = toml::Table::new();
-            table.insert("path".into(), toml::Value::String(path.to_string_lossy().to_string()));
+            table.insert(
+                "path".into(),
+                toml::Value::String(path.to_string_lossy().to_string()),
+            );
             table.insert("permission".into(), toml::Value::String(perm_str.into()));
             table.insert(
                 "granted_at".into(),
@@ -336,7 +379,8 @@ impl PermissionManager {
         }));
 
         // Write back to file
-        let new_content = toml::to_string_pretty(&value).map_err(|e| PermissionError::Io(e.to_string()))?;
+        let new_content =
+            toml::to_string_pretty(&value).map_err(|e| PermissionError::Io(e.to_string()))?;
         std::fs::write(&self.lock_path, new_content).map_err(|e| PermissionError::Io(e.to_string()))
     }
 
@@ -399,7 +443,10 @@ impl PermissionManager {
         // Step 4: Not trusted → prompt user via HumanGate
         let _guard = self.prompt_mutex.lock().await; // Serialize prompts
 
-        let human_gate = self.human_gate.as_ref().ok_or(PermissionError::NoHumanGate)?;
+        let human_gate = self
+            .human_gate
+            .as_ref()
+            .ok_or(PermissionError::NoHumanGate)?;
 
         // The surface (TUI/terminal) renders the selectable options; keep the
         // detail to just the explanation so it isn't duplicated.
@@ -427,7 +474,12 @@ impl PermissionManager {
             kernel::Approval::Always => {
                 // Persist the resolved path to medha.lock for this permission type.
                 self.trust_path(resolved.clone(), permission)?;
-                self.audit_log(path, &resolved, permission, "allowed (user approved, persisted)")?;
+                self.audit_log(
+                    path,
+                    &resolved,
+                    permission,
+                    "allowed (user approved, persisted)",
+                )?;
                 Ok(resolved)
             }
         }
@@ -453,7 +505,12 @@ mod tests {
     struct FixedGate(Approval);
     #[async_trait::async_trait]
     impl HumanGate for FixedGate {
-        async fn confirm(&self, _action: &str, _detail: Option<&str>, _escalated: bool) -> Approval {
+        async fn confirm(
+            &self,
+            _action: &str,
+            _detail: Option<&str>,
+            _escalated: bool,
+        ) -> Approval {
             self.0
         }
     }
@@ -487,7 +544,10 @@ mod tests {
         // A fresh manager has no trust for it → a Deny gate now blocks it.
         let mut mgr2 = PermissionManager::new(&ws, &lock, &audit).unwrap();
         mgr2.set_human_gate(Arc::new(FixedGate(Approval::Deny)));
-        assert!(mgr2.request_read(&target).await.is_err(), "should re-ask, not silently allow");
+        assert!(
+            mgr2.request_read(&target).await.is_err(),
+            "should re-ask, not silently allow"
+        );
     }
 
     /// PART 1: "Always allow" persists to medha.lock and is trusted on reload.
@@ -503,11 +563,18 @@ mod tests {
         let mut mgr = PermissionManager::new(&ws, &lock, &audit).unwrap();
         mgr.set_human_gate(Arc::new(FixedGate(Approval::Always)));
         assert!(mgr.request_read(&target).await.is_ok());
-        assert!(std::fs::read_to_string(&lock).unwrap().contains("trusted_paths"));
+        assert!(
+            std::fs::read_to_string(&lock)
+                .unwrap()
+                .contains("trusted_paths")
+        );
 
         // Fresh manager with NO gate: must already trust the path from the lock file.
         let mgr2 = PermissionManager::new(&ws, &lock, &audit).unwrap();
-        assert!(mgr2.request_read(&target).await.is_ok(), "persisted path should be trusted on reload");
+        assert!(
+            mgr2.request_read(&target).await.is_ok(),
+            "persisted path should be trusted on reload"
+        );
     }
 
     /// PART 1: read trust never grants write trust (permissions tracked separately).
@@ -527,7 +594,10 @@ mod tests {
         // Reload; write should still be untrusted → a Deny gate blocks it.
         let mut mgr2 = PermissionManager::new(&ws, &lock, &audit).unwrap();
         mgr2.set_human_gate(Arc::new(FixedGate(Approval::Deny)));
-        assert!(mgr2.request_write(&target).await.is_err(), "read trust must not grant write");
+        assert!(
+            mgr2.request_write(&target).await.is_err(),
+            "read trust must not grant write"
+        );
     }
 
     /// A write target under not-yet-existing nested subdirectories must resolve

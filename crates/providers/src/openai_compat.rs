@@ -4,8 +4,8 @@
 //! kernel stays vendor-neutral (§4.4).
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use kernel::{
     Block, CompiledContext, Message, Provider, ProviderCaps, ProviderError, ReasoningConfig,
     ReasoningEffort, Role, ToolCallStrategy, ToolIntent, Usage,
@@ -14,9 +14,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
 pub struct OpenAiCompat {
-    base_url: String,
-    api_key: String,
-    model: String,
+    /// Active connection is mutable between turns so an interactive surface can
+    /// switch a saved model profile without rebuilding the kernel. A stream
+    /// snapshots it before its first await, so one request always uses exactly
+    /// one endpoint/model/key tuple.
+    connection: Mutex<Connection>,
     http: reqwest::Client,
     caps: ProviderCaps,
     /// Runtime-mutable (config at startup, `/think` slash command live) —
@@ -26,6 +28,14 @@ pub struct OpenAiCompat {
     /// Which exact-token-count route this host offers, discovered on first use
     /// (see `count_tokens`). Cached so we probe once, not every turn.
     count_probe: Mutex<ProbeState>,
+}
+
+#[derive(Clone)]
+struct Connection {
+    base_url: String,
+    api_key: String,
+    model: String,
+    max_ctx: Option<u32>,
 }
 
 /// A host's exact-token-count route, if any. Hosts differ: a direct vLLM serves
@@ -55,6 +65,25 @@ enum ProbeState {
 /// Re-try a failed count-tokens probe after this many skipped calls (K16).
 const REPROBE_AFTER: u32 = 20;
 
+/// Add Authorization only when a credential exists. Accepting a pasted
+/// `Bearer …` value here also prevents a malformed double scheme at the final
+/// network boundary, regardless of which configuration path supplied it.
+fn with_bearer(request: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+    let key = api_key.trim();
+    if key.is_empty() || key.eq_ignore_ascii_case("bearer") {
+        return request;
+    }
+    let key = match key.split_once(char::is_whitespace) {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
+        _ => key,
+    };
+    if key.is_empty() {
+        request
+    } else {
+        request.bearer_auth(key)
+    }
+}
+
 impl OpenAiCompat {
     pub fn new(
         base_url: impl Into<String>,
@@ -62,9 +91,12 @@ impl OpenAiCompat {
         model: impl Into<String>,
     ) -> Self {
         Self {
-            base_url: base_url.into(),
-            api_key: api_key.into(),
-            model: model.into(),
+            connection: Mutex::new(Connection {
+                base_url: base_url.into(),
+                api_key: api_key.into(),
+                model: model.into(),
+                max_ctx: None,
+            }),
             http: reqwest::Client::new(),
             caps: ProviderCaps {
                 vision: false,
@@ -103,6 +135,43 @@ impl OpenAiCompat {
     pub fn with_reasoning(self, config: ReasoningConfig) -> Self {
         *self.reasoning.lock().unwrap() = config;
         self
+    }
+
+    /// Switch the active OpenAI-compatible connection. Safe callers invoke
+    /// this only between turns; [`Provider::stream`] snapshots the connection
+    /// before I/O so an already-running request is never retargeted midstream.
+    pub fn switch_connection(
+        &self,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) {
+        self.switch_connection_with_context(base_url, api_key, model, None);
+    }
+
+    /// Same as [`Self::switch_connection`], with the context limit discovered
+    /// or configured for the selected profile. This value feeds the kernel's
+    /// context compiler on the very next turn.
+    pub fn switch_connection_with_context(
+        &self,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        max_ctx: Option<u32>,
+    ) {
+        *self.connection.lock().unwrap() = Connection {
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+            max_ctx,
+        };
+        // Exact-token routes are endpoint-specific; discover again after a
+        // profile switch instead of carrying an incompatible cached route.
+        *self.count_probe.lock().unwrap() = ProbeState::Unknown;
+    }
+
+    pub fn active_model(&self) -> String {
+        self.connection.lock().unwrap().model.clone()
     }
 
     /// Build `chat_template_kwargs` from the current reasoning config, for the
@@ -144,22 +213,23 @@ impl OpenAiCompat {
     /// (route absent → 404, bad payload → 4xx, transport error, timeout) returns
     /// `None` so the probe can move on or the caller can fall back.
     async fn count_via(&self, route: CountRoute, messages: &[Message]) -> Option<u32> {
+        let connection = self.connection.lock().unwrap().clone();
         let (url, body, field) = match route {
             CountRoute::VllmTokenize => (
-                vllm_tokenize_url(&self.base_url),
-                vllm_tokenize_body(&self.model, messages),
+                vllm_tokenize_url(&connection.base_url),
+                vllm_tokenize_body(&connection.model, messages),
                 "count",
             ),
             CountRoute::Anthropic => (
-                format!("{}/messages/count_tokens", self.base_url.trim_end_matches('/')),
-                anthropic_count_body(&self.model, messages),
+                format!(
+                    "{}/messages/count_tokens",
+                    connection.base_url.trim_end_matches('/')
+                ),
+                anthropic_count_body(&connection.model, messages),
                 "input_tokens",
             ),
         };
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
+        let resp = with_bearer(self.http.post(&url), &connection.api_key)
             .json(&body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -316,9 +386,13 @@ fn sniff_target(args: &str) -> Option<String> {
     for key in ["\"path\"", "\"file_path\"", "\"command\""] {
         if let Some(i) = args.find(key) {
             let rest = args[i + key.len()..].trim_start();
-            let Some(rest) = rest.strip_prefix(':') else { continue };
+            let Some(rest) = rest.strip_prefix(':') else {
+                continue;
+            };
             let rest = rest.trim_start();
-            let Some(rest) = rest.strip_prefix('"') else { continue };
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue;
+            };
             // Scan to the first UNESCAPED quote (K19): a command like
             // `echo \"hi\"` must not be cut at its inner escaped quote.
             let mut val = String::new();
@@ -451,7 +525,10 @@ impl ThinkTagFilter {
         let margin = CLOSE_TAG.len().max(OPEN_TAG.len()) - 1;
         if self.buf.len() > margin {
             let split = self.buf.len() - margin;
-            let split = (0..=split).rev().find(|&i| self.buf.is_char_boundary(i)).unwrap_or(0);
+            let split = (0..=split)
+                .rev()
+                .find(|&i| self.buf.is_char_boundary(i))
+                .unwrap_or(0);
             let emit = self.buf[..split].to_string();
             self.buf = self.buf[split..].to_string();
             if !emit.is_empty() {
@@ -471,7 +548,11 @@ impl ThinkTagFilter {
             return None;
         }
         let rest = std::mem::take(&mut self.buf);
-        Some(if self.in_think { Block::Reasoning(rest) } else { Block::Text(rest) })
+        Some(if self.in_think {
+            Block::Reasoning(rest)
+        } else {
+            Block::Text(rest)
+        })
     }
 }
 
@@ -510,9 +591,7 @@ pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>
         .timeout(std::time::Duration::from_secs(6))
         .build()
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(api_key)
+    let resp = with_bearer(client.get(&url), api_key)
         .send()
         .await
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -530,7 +609,10 @@ pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>
     Ok(parsed
         .data
         .into_iter()
-        .map(|m| ModelInfo { id: m.id, context_length: m.context_length })
+        .map(|m| ModelInfo {
+            id: m.id,
+            context_length: m.context_length,
+        })
         .collect())
 }
 
@@ -569,7 +651,13 @@ fn vllm_tokenize_body(model: &str, messages: &[Message]) -> serde_json::Value {
 fn anthropic_count_body(model: &str, messages: &[Message]) -> serde_json::Value {
     let mut system = String::new();
     let mut msgs: Vec<serde_json::Value> = Vec::new();
-    let non_empty = |c: &str| if c.is_empty() { " ".to_string() } else { c.to_string() };
+    let non_empty = |c: &str| {
+        if c.is_empty() {
+            " ".to_string()
+        } else {
+            c.to_string()
+        }
+    };
     for m in messages {
         match m.role {
             Role::System => {
@@ -578,9 +666,8 @@ fn anthropic_count_body(model: &str, messages: &[Message]) -> serde_json::Value 
                 }
                 system.push_str(&m.content);
             }
-            Role::Assistant => {
-                msgs.push(serde_json::json!({ "role": "assistant", "content": non_empty(&m.content) }))
-            }
+            Role::Assistant => msgs
+                .push(serde_json::json!({ "role": "assistant", "content": non_empty(&m.content) })),
             // user + tool results both map to a user turn.
             _ => msgs.push(serde_json::json!({ "role": "user", "content": non_empty(&m.content) })),
         }
@@ -596,6 +683,14 @@ fn anthropic_count_body(model: &str, messages: &[Message]) -> serde_json::Value 
 impl Provider for OpenAiCompat {
     fn capabilities(&self) -> &ProviderCaps {
         &self.caps
+    }
+
+    fn context_window(&self) -> Option<u32> {
+        self.connection
+            .lock()
+            .unwrap()
+            .max_ctx
+            .or(self.caps.max_ctx)
     }
 
     fn set_reasoning(&self, config: ReasoningConfig) {
@@ -679,7 +774,12 @@ impl Provider for OpenAiCompat {
             })
             .collect();
 
-        let model = if ctx.model.is_empty() { self.model.clone() } else { ctx.model.clone() };
+        let connection = self.connection.lock().unwrap().clone();
+        let model = if ctx.model.is_empty() {
+            connection.model.clone()
+        } else {
+            ctx.model.clone()
+        };
 
         // Real SSE streaming: text deltas surface token-by-token; tool calls
         // arrive as fragments keyed by index and are reassembled, then emitted
@@ -690,10 +790,15 @@ impl Provider for OpenAiCompat {
             messages,
             stream: true,
             tools,
-            stream_options: Some(StreamOptions { include_usage: true }),
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
             chat_template_kwargs,
         };
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            connection.base_url.trim_end_matches('/')
+        );
 
         // Direct proof of what actually goes over the wire — no guessing, no
         // separate curl experiment needed. Set MEDHA_DEBUG_HTTP=1 to see the
@@ -703,10 +808,7 @@ impl Provider for OpenAiCompat {
             eprintln!("\n[MEDHA_DEBUG_HTTP] POST {url}\n{body}\n");
         }
 
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
+        let resp = with_bearer(self.http.post(&url), &connection.api_key)
             .json(&req)
             .send()
             .await
@@ -810,15 +912,61 @@ fn finalize_tool_calls(
         if name.is_empty() {
             continue;
         }
-        let id = if id.is_empty() { format!("call_{idx}") } else { id };
+        let id = if id.is_empty() {
+            format!("call_{idx}")
+        } else {
+            id
+        };
         let parsed = if args.trim().is_empty() {
             serde_json::json!({})
         } else {
             serde_json::from_str(&args).unwrap_or_else(|_| serde_json::json!({ "_raw": args }))
         };
-        out.push(ToolIntent { id, tool: name, args: parsed });
+        out.push(ToolIntent {
+            id,
+            tool: name,
+            args: repair_args(parsed),
+        });
     }
     out
+}
+
+/// Repair the argument shapes models actually emit instead of a plain object.
+/// Two real-world failure modes, both otherwise fatal to the tool call:
+///   1. double-encoded — the whole object arrives as a JSON *string*:
+///      `"{\"path\": \"src/main.rs\"}"`
+///   2. wrapper key — the object is nested under a lone envelope key whose
+///      value is the (possibly stringified) real object:
+///      `{"arguments": "{\"path\": ...}"}`
+///
+/// Anything unrecognized passes through untouched — never guess beyond these.
+fn repair_args(args: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    // Case 1: the entire args value is a stringified JSON object.
+    if let Value::String(s) = &args {
+        if let Ok(inner @ Value::Object(_)) = serde_json::from_str::<Value>(s) {
+            return inner;
+        }
+        return args;
+    }
+    // Case 2: a single envelope key holding the real object (or its string).
+    if let Value::Object(map) = &args {
+        if map.len() == 1 {
+            let (key, val) = map.iter().next().expect("len checked");
+            if matches!(key.as_str(), "arguments" | "input" | "parameters" | "args") {
+                match val {
+                    Value::Object(_) => return val.clone(),
+                    Value::String(s) => {
+                        if let Ok(inner @ Value::Object(_)) = serde_json::from_str::<Value>(s) {
+                            return inner;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    args
 }
 
 /// Parse one SSE record's `data:` lines into the blocks to yield, folding
@@ -889,7 +1037,10 @@ fn process_sse_record(
                             // can show "writing…/reading…" while the (possibly huge)
                             // arguments are still streaming in.
                             if first {
-                                out.push(Block::ToolStarted { name: n, target: None });
+                                out.push(Block::ToolStarted {
+                                    name: n,
+                                    target: None,
+                                });
                             }
                         }
                     }
@@ -901,7 +1052,10 @@ fn process_sse_record(
                         if !e.1.is_empty() && !target_announced.contains(&idx) {
                             if let Some(t) = sniff_target(&e.2) {
                                 target_announced.insert(idx);
-                                out.push(Block::ToolStarted { name: e.1.clone(), target: Some(t) });
+                                out.push(Block::ToolStarted {
+                                    name: e.1.clone(),
+                                    target: Some(t),
+                                });
                             }
                         }
                     }
@@ -910,6 +1064,54 @@ fn process_sse_record(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod repair_args_tests {
+    use super::repair_args;
+    use serde_json::json;
+
+    #[test]
+    fn well_formed_args_pass_through_untouched() {
+        let args = json!({"path": "src/main.rs", "limit": 5});
+        assert_eq!(repair_args(args.clone()), args);
+    }
+
+    #[test]
+    fn double_encoded_args_are_unwrapped() {
+        // The whole object arrived as a JSON string — the exact shape behind
+        // the "expected string 'path'" failures.
+        let args = json!("{\"path\": \"/w/PROGRESS.md\"}");
+        assert_eq!(repair_args(args), json!({"path": "/w/PROGRESS.md"}));
+    }
+
+    #[test]
+    fn envelope_keys_are_unwrapped_object_or_stringified() {
+        assert_eq!(
+            repair_args(json!({"arguments": {"path": "a.md"}})),
+            json!({"path": "a.md"})
+        );
+        assert_eq!(
+            repair_args(json!({"input": "{\"path\": \"a.md\"}"})),
+            json!({"path": "a.md"})
+        );
+    }
+
+    #[test]
+    fn plain_strings_and_real_single_keys_are_not_mangled() {
+        // A non-JSON string stays as-is (still fails honestly downstream).
+        assert_eq!(repair_args(json!("just text")), json!("just text"));
+        // A single key that isn't an envelope name is a real argument.
+        assert_eq!(
+            repair_args(json!({"path": "arguments.md"})),
+            json!({"path": "arguments.md"})
+        );
+        // An envelope-named key holding a plain string is a real argument too.
+        assert_eq!(
+            repair_args(json!({"input": "hello"})),
+            json!({"input": "hello"})
+        );
+    }
 }
 
 #[cfg(test)]
@@ -928,12 +1130,18 @@ mod sniff_tests {
     #[test]
     fn none_until_closing_quote_arrives() {
         assert_eq!(sniff_target(r#"{"file_path": "src/mai"#), None);
-        assert_eq!(sniff_target(r#"{"file_path":"src/main.rs"}"#), Some("src/main.rs".to_string()));
+        assert_eq!(
+            sniff_target(r#"{"file_path":"src/main.rs"}"#),
+            Some("src/main.rs".to_string())
+        );
     }
 
     #[test]
     fn command_and_unknown_keys() {
-        assert_eq!(sniff_target(r#"{"command":"cargo build"}"#), Some("cargo build".to_string()));
+        assert_eq!(
+            sniff_target(r#"{"command":"cargo build"}"#),
+            Some("cargo build".to_string())
+        );
         assert_eq!(sniff_target(r#"{"pattern":"foo"}"#), None);
     }
 
@@ -994,7 +1202,8 @@ mod sse_tests {
                 "data: {}\n",
                 serde_json::json!({"choices":[{"delta":{"content": d}}]})
             );
-            blocks.extend(process_sse_record(&record, &mut accum, &mut tf, &mut announced).unwrap());
+            blocks
+                .extend(process_sse_record(&record, &mut accum, &mut tf, &mut announced).unwrap());
         }
         if let Some(b) = tf.flush() {
             blocks.push(b);
@@ -1029,7 +1238,10 @@ mod sse_tests {
             "ve`, `Guided` (planned)\n- `models.dev` integration for pricing",
         ];
         let (text, reasoning) = join(&drive_many(&deltas));
-        assert_eq!(reasoning, "", "no part of the answer may become hidden reasoning");
+        assert_eq!(
+            reasoning, "",
+            "no part of the answer may become hidden reasoning"
+        );
         assert_eq!(text, full, "the full answer must stay visible");
     }
 
@@ -1048,11 +1260,17 @@ mod sse_tests {
         // A CRLF-delimited content frame must yield its text (previously the
         // whole response was silently dropped on CRLF servers).
         let blocks = drive("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\r\n");
-        let text: String = blocks.iter().filter_map(|b| match b {
-            Block::Text(t) => Some(t.as_str()),
-            _ => None,
-        }).collect();
-        assert_eq!(text, "hello", "CRLF record must be parsed, not dropped: {blocks:?}");
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "hello",
+            "CRLF record must be parsed, not dropped: {blocks:?}"
+        );
     }
 
     // ── K13: a tool call the server never gave an id gets a synthesized one ─────
@@ -1060,10 +1278,20 @@ mod sse_tests {
     fn missing_tool_call_id_is_synthesized() {
         let mut accum = BTreeMap::new();
         // index 0, a name, no id (empty) — as a lax gateway streams it.
-        accum.insert(0u32, (String::new(), "fs.read".to_string(), r#"{"path":"a"}"#.to_string()));
+        accum.insert(
+            0u32,
+            (
+                String::new(),
+                "fs.read".to_string(),
+                r#"{"path":"a"}"#.to_string(),
+            ),
+        );
         let intents = finalize_tool_calls(accum);
         assert_eq!(intents.len(), 1);
-        assert_eq!(intents[0].id, "call_0", "empty id must be synthesized, not left blank");
+        assert_eq!(
+            intents[0].id, "call_0",
+            "empty id must be synthesized, not left blank"
+        );
         assert_eq!(intents[0].tool, "fs.read");
         assert_eq!(intents[0].args["path"], "a");
     }
@@ -1071,10 +1299,17 @@ mod sse_tests {
     #[test]
     fn present_tool_call_id_is_preserved() {
         let mut accum = BTreeMap::new();
-        accum.insert(0u32, ("real-id".to_string(), "fs.read".to_string(), String::new()));
+        accum.insert(
+            0u32,
+            ("real-id".to_string(), "fs.read".to_string(), String::new()),
+        );
         let intents = finalize_tool_calls(accum);
         assert_eq!(intents[0].id, "real-id");
-        assert_eq!(intents[0].args, serde_json::json!({}), "empty args → empty object");
+        assert_eq!(
+            intents[0].args,
+            serde_json::json!({}),
+            "empty args → empty object"
+        );
     }
 }
 
@@ -1130,7 +1365,10 @@ mod think_tag_tests {
         all.extend(f.feed("` tags). The rest of the answer must stay visible."));
         all.extend(f.flush());
         let (text, reasoning) = collect(&all);
-        assert_eq!(reasoning, "", "mid-answer literal must not open a think block");
+        assert_eq!(
+            reasoning, "",
+            "mid-answer literal must not open a think block"
+        );
         assert_eq!(
             text,
             "Reasoning support (Shape 2: `<think>` tags). The rest of the answer must stay visible."
@@ -1168,7 +1406,10 @@ mod think_tag_tests {
         let mut all = f.feed("wrap reasoning in `<think>` and `</think>` in templates");
         all.extend(f.flush());
         let (text, reasoning) = collect(&all);
-        assert_eq!(text, "wrap reasoning in `<think>` and `</think>` in templates");
+        assert_eq!(
+            text,
+            "wrap reasoning in `<think>` and `</think>` in templates"
+        );
         assert_eq!(reasoning, "");
     }
 
@@ -1199,10 +1440,19 @@ mod count_tokens_tests {
 
     #[test]
     fn tokenize_url_is_server_root_sibling_of_v1() {
-        assert_eq!(vllm_tokenize_url("https://h.example/v1"), "https://h.example/tokenize");
-        assert_eq!(vllm_tokenize_url("https://h.example/v1/"), "https://h.example/tokenize");
+        assert_eq!(
+            vllm_tokenize_url("https://h.example/v1"),
+            "https://h.example/tokenize"
+        );
+        assert_eq!(
+            vllm_tokenize_url("https://h.example/v1/"),
+            "https://h.example/tokenize"
+        );
         // No /v1 suffix → append at the given root.
-        assert_eq!(vllm_tokenize_url("https://h.example"), "https://h.example/tokenize");
+        assert_eq!(
+            vllm_tokenize_url("https://h.example"),
+            "https://h.example/tokenize"
+        );
     }
 
     #[test]
@@ -1227,7 +1477,11 @@ mod count_tokens_tests {
 
     #[test]
     fn vllm_body_keeps_all_roles_for_the_chat_template() {
-        let msgs = vec![Message::system("s"), Message::user("u"), Message::tool_result("c1", "t")];
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("u"),
+            Message::tool_result("c1", "t"),
+        ];
         let body = vllm_tokenize_body("m", &msgs);
         assert_eq!(body["add_generation_prompt"], serde_json::json!(true));
         let arr = body["messages"].as_array().unwrap();
@@ -1248,17 +1502,25 @@ mod reasoning_request_tests {
     /// proxy/gateway stripping the field), not in this construction step.
     #[test]
     fn think_on_produces_enable_thinking_true() {
-        let p = OpenAiCompat::new("http://x", "", "m")
-            .with_reasoning(ReasoningConfig { enabled: Some(true), effort: None });
-        let kwargs = p.chat_template_kwargs(false).expect("must be Some when enabled");
+        let p = OpenAiCompat::new("http://x", "", "m").with_reasoning(ReasoningConfig {
+            enabled: Some(true),
+            effort: None,
+        });
+        let kwargs = p
+            .chat_template_kwargs(false)
+            .expect("must be Some when enabled");
         assert_eq!(kwargs["enable_thinking"], serde_json::json!(true));
     }
 
     #[test]
     fn think_off_produces_enable_thinking_false() {
-        let p = OpenAiCompat::new("http://x", "", "m")
-            .with_reasoning(ReasoningConfig { enabled: Some(false), effort: None });
-        let kwargs = p.chat_template_kwargs(false).expect("must be Some when explicitly off");
+        let p = OpenAiCompat::new("http://x", "", "m").with_reasoning(ReasoningConfig {
+            enabled: Some(false),
+            effort: None,
+        });
+        let kwargs = p
+            .chat_template_kwargs(false)
+            .expect("must be Some when explicitly off");
         assert_eq!(kwargs["enable_thinking"], serde_json::json!(false));
     }
 
@@ -1269,10 +1531,45 @@ mod reasoning_request_tests {
     }
 
     #[test]
+    fn switching_connection_updates_model_and_context_for_the_next_turn() {
+        let p = OpenAiCompat::new("http://one", "", "first").with_max_ctx(8_192);
+        assert_eq!(p.active_model(), "first");
+        assert_eq!(p.context_window(), Some(8_192));
+
+        p.switch_connection_with_context("http://two", "secret", "second", Some(32_768));
+        assert_eq!(p.active_model(), "second");
+        assert_eq!(p.context_window(), Some(32_768));
+    }
+
+    #[test]
+    fn auth_header_is_omitted_when_empty_and_normalizes_bearer_prefix() {
+        let client = reqwest::Client::new();
+        let no_key = with_bearer(client.get("http://localhost"), "")
+            .build()
+            .unwrap();
+        assert!(
+            no_key
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
+
+        let key = with_bearer(client.get("http://localhost"), "Bearer secret")
+            .build()
+            .unwrap();
+        assert_eq!(
+            key.headers().get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer secret"
+        );
+    }
+
+    #[test]
     fn full_request_json_actually_contains_the_field() {
         // End-to-end through serde, exactly as it would serialize onto the wire.
-        let p = OpenAiCompat::new("http://x", "", "m")
-            .with_reasoning(ReasoningConfig { enabled: Some(true), effort: Some(ReasoningEffort::Medium) });
+        let p = OpenAiCompat::new("http://x", "", "m").with_reasoning(ReasoningConfig {
+            enabled: Some(true),
+            effort: Some(ReasoningEffort::Medium),
+        });
         let req = ChatReq {
             model: "m".into(),
             messages: vec![],
@@ -1282,7 +1579,10 @@ mod reasoning_request_tests {
             chat_template_kwargs: p.chat_template_kwargs(false),
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("chat_template_kwargs"), "field missing from wire JSON: {json}");
+        assert!(
+            json.contains("chat_template_kwargs"),
+            "field missing from wire JSON: {json}"
+        );
         assert!(json.contains("enable_thinking"));
         // The standard string effort knob (GLM/Qwen/OpenAI-compatible), not a
         // vendor-specific boolean.

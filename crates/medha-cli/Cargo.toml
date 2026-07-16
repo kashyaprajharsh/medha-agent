@@ -19,6 +19,7 @@ store = { path = "../store" }
 ulid.workspace = true
 policy = { path = "../policy" }
 lockfile = { path = "../lockfile" }
+gate = { path = "../gate" }
 tokio = { workspace = true, features = ["process", "io-std", "io-util"] }
 tokio-util = { version = "0.7" }
 serde.workspace = true

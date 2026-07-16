@@ -14,7 +14,7 @@
 //!   → (in)  {"jsonrpc":"2.0","method":"approval.respond","params":{"gate_id":3,"approve":true}}
 
 use kernel::{Budget, EventLog, Kernel, Message, Provider, Session, StopReason};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,7 +58,12 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>;
 /// Build the shared writer + pending-approval map. Created before the kernel so
 /// the gate (wired into the kernel at construction) shares them with the loop.
 pub fn bridge() -> (Arc<Writer>, Pending) {
-    (Arc::new(Writer { out: Mutex::new(std::io::stdout()) }), Arc::new(Mutex::new(HashMap::new())))
+    (
+        Arc::new(Writer {
+            out: Mutex::new(std::io::stdout()),
+        }),
+        Arc::new(Mutex::new(HashMap::new())),
+    )
 }
 
 /// Human gate over the wire: emit an `approval` request carrying a fresh
@@ -72,13 +77,22 @@ pub struct AcpGate {
 
 impl AcpGate {
     pub fn new(writer: Arc<Writer>, pending: Pending) -> Self {
-        Self { writer, pending, next_id: AtomicU64::new(1) }
+        Self {
+            writer,
+            pending,
+            next_id: AtomicU64::new(1),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl kernel::HumanGate for AcpGate {
-    async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> kernel::Approval {
+    async fn confirm(
+        &self,
+        action: &str,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::Approval {
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(gate_id, tx);
@@ -109,19 +123,28 @@ impl kernel::StreamSink for AcpSink {
         self.writer.event("model.text", json!({ "delta": delta }));
     }
     fn reasoning(&self, delta: &str) {
-        self.writer.event("model.reasoning", json!({ "delta": delta }));
+        self.writer
+            .event("model.reasoning", json!({ "delta": delta }));
     }
     fn tool_call(&self, tool: &str, args: &Value) {
-        self.writer.event("tool.call", json!({ "tool": tool, "args": args }));
+        self.writer
+            .event("tool.call", json!({ "tool": tool, "args": args }));
     }
     fn tool_result(&self, tool: &str, ok: bool, payload: &Value) {
-        self.writer.event("tool.observation", json!({ "tool": tool, "ok": ok, "payload": payload }));
+        self.writer.event(
+            "tool.observation",
+            json!({ "tool": tool, "ok": ok, "payload": payload }),
+        );
     }
     fn usage(&self, prompt_tokens: u32, total_tokens: u32) {
-        self.writer.event("usage", json!({ "prompt_tokens": prompt_tokens, "total_tokens": total_tokens }));
+        self.writer.event(
+            "usage",
+            json!({ "prompt_tokens": prompt_tokens, "total_tokens": total_tokens }),
+        );
     }
     fn verify(&self, ok: bool, summary: &str) {
-        self.writer.event("verify", json!({ "ok": ok, "summary": summary }));
+        self.writer
+            .event("verify", json!({ "ok": ok, "summary": summary }));
     }
     fn compacting(&self, active: bool) {
         self.writer.event("compacting", json!({ "active": active }));
@@ -133,10 +156,12 @@ impl kernel::StreamSink for AcpSink {
         );
     }
     fn steered(&self, text: &str) {
-        self.writer.event("message.steered", json!({ "content": text }));
+        self.writer
+            .event("message.steered", json!({ "content": text }));
     }
     fn steers_returned(&self, texts: &[String]) {
-        self.writer.event("message.returned", json!({ "contents": texts }));
+        self.writer
+            .event("message.returned", json!({ "contents": texts }));
     }
 }
 
@@ -144,6 +169,35 @@ impl kernel::StreamSink for AcpSink {
 enum TurnDone {
     Ok(Vec<Message>, StopReason),
     Err(String),
+}
+
+/// Upper bound for one JSON-RPC frame — far beyond any legitimate message,
+/// small enough that a runaway peer can't balloon the process.
+const MAX_FRAME: u64 = 16 * 1024 * 1024;
+
+/// Read one newline-terminated frame with the size cap enforced. Cancel-safe:
+/// `read_until` accumulates into `buf` across `select!` cancellations, and the
+/// buffer is only drained once a full line has arrived. Returns `Ok(None)` on
+/// EOF; an oversized frame is an error (protocol violation — disconnect).
+async fn read_frame(
+    stdin: &mut tokio::io::Take<BufReader<tokio::io::Stdin>>,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    let n = stdin.read_until(b'\n', buf).await?;
+    if n == 0 && buf.is_empty() {
+        return Ok(None); // clean EOF
+    }
+    if buf.last() == Some(&b'\n') || n == 0 {
+        let line = String::from_utf8_lossy(buf).into_owned();
+        buf.clear();
+        stdin.set_limit(MAX_FRAME); // fresh cap for the next frame
+        return Ok(Some(line));
+    }
+    // No newline and the reader stopped: the cap was exhausted mid-frame.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "frame exceeds the 16 MiB limit",
+    ))
 }
 
 /// Run the bridge until stdin closes. Single session, one turn at a time — a
@@ -171,15 +225,18 @@ where
     );
 
     let mut transcript: Vec<Message> = vec![Message::system(system)];
-    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    // Frame reads are capped: `lines()` would buffer a single unterminated
+    // "line" without bound, so a runaway peer could grow memory indefinitely.
+    let mut stdin = tokio::io::AsyncReadExt::take(BufReader::new(tokio::io::stdin()), MAX_FRAME);
+    let mut frame_buf: Vec<u8> = Vec::new();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<TurnDone>();
     let mut running = false;
     let mut interrupt: Option<kernel::InterruptHandle> = None;
 
     loop {
         tokio::select! {
-            line = stdin.next_line() => {
-                let Ok(Some(line)) = line else { break }; // stdin closed → exit
+            line = read_frame(&mut stdin, &mut frame_buf) => {
+                let Ok(Some(line)) = line else { break }; // stdin closed / oversized frame → exit
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;

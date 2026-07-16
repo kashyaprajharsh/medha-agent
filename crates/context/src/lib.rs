@@ -11,10 +11,10 @@ pub mod prompts;
 pub mod tokens;
 
 pub use budget::ContextBudget;
-pub use engine::PipelineEngine;
 pub use compactor::{
-    compact, decide, total_tokens, CompactionResult, ExtractiveSummarizer, HistoryItem, ItemKind,
-    LlmSummarizer, Summarizer, SummarizeError,
+    CompactionResult, ExtractiveSummarizer, HistoryItem, ItemKind, LlmSummarizer, SummarizeError,
+    Summarizer, compact, decide, total_tokens,
 };
+pub use engine::PipelineEngine;
 pub use policy::{CompactionAction, CompactionPolicy};
 pub use tokens::{BpeCounter, HeuristicCounter, TokenCounter};

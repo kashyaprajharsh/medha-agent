@@ -1,11 +1,12 @@
 //! `medha` — Phase 0 entrypoint.
 //!
 //! Config is *resolved*, never hardcoded (see `config.rs`):
-//!   CLI flag  >  env override  >  ~/.medha/config.toml  >  first-run wizard
+//!   CLI flag  >  env override  >  ~/.medha/config.toml  >  TUI first-run model setup
 //!
 //! Usage:
-//!   medha "your task"            run one turn (first run launches setup)
-//!   medha --setup                (re)configure the provider interactively
+//!   medha                        interactive TUI (first run opens model setup)
+//!   medha --setup                open the TUI straight into model setup
+//!   medha "your task"            run one turn headless
 //!   medha --model X "your task"  one-off model override
 //!
 //! Env overrides: MEDHA_BASE_URL, MEDHA_MODEL, MEDHA_API_KEY
@@ -63,7 +64,7 @@ fn apply_budget_env(mut b: kernel::Budget) -> kernel::Budget {
     about = "MEDHA — a verification-first, open-first agent harness"
 )]
 struct Cli {
-    /// (Re)configure the model provider interactively
+    /// Open the TUI straight into model setup (same form as /model add)
     #[arg(long)]
     setup: bool,
 
@@ -107,6 +108,98 @@ struct Cli {
     prompt: Vec<String>,
 }
 
+/// `medha gate <scenario>` — the Eval Gate (§4.11–4.12, Vol 5). Runs the real
+/// agent against fixture scenarios in isolation and scores each run with
+/// deterministic checks over the event log + filesystem. Exit code gates CI.
+#[derive(Parser)]
+#[command(
+    name = "medha gate",
+    about = "Run eval scenarios against the agent (deterministic CI for cognition)"
+)]
+struct GateCli {
+    /// A scenario file, a scenario directory, or a directory of scenarios
+    path: std::path::PathBuf,
+    /// Repeats per scenario — >1 gives a pass-rate + confidence interval
+    /// (overrides `[gate] seeds`)
+    #[arg(long)]
+    seeds: Option<u32>,
+    /// Promote threshold, 0.0–1.0 (overrides `[gate] pass_threshold`)
+    #[arg(long)]
+    threshold: Option<f64>,
+    /// Machine-readable JSON output for CI
+    #[arg(long)]
+    json: bool,
+    /// Only load and validate the scenario(s) — no model runs. Cheap CI lint.
+    #[arg(long)]
+    validate: bool,
+}
+
+/// Resolve the operator's model + gate policy, then run the scenarios. The gate
+/// injects the provider as env into each isolated child run, so a run reaches a
+/// model without seeing the operator's real `~/.medha` (its `MEDHA_HOME` is a
+/// throwaway). Exit code: 0 all promote · 1 any reject · 2 any hold.
+async fn run_gate_command(args: Vec<String>) -> Result<()> {
+    let gc = GateCli::parse_from(std::iter::once("medha-gate".to_string()).chain(args));
+
+    // `--validate` never runs the agent, so it needs no provider — a fast lint
+    // for CI (and safe to run without spending API budget).
+    if gc.validate {
+        let paths = gate::discover(&gc.path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut ok = true;
+        for p in &paths {
+            match gate::Scenario::load(p) {
+                Ok(s) => println!("✔ {} — {} check(s), fixture ok", s.id, s.checks.len()),
+                Err(e) => {
+                    println!("✗ {}: {e}", p.display());
+                    ok = false;
+                }
+            }
+        }
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    let cfg = config::load()?;
+    let resolved = config::resolve(cfg.as_ref(), None, None)
+        .filter(|r| !r.base_url.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the gate needs a configured model — add one with `medha`, or set \
+                 MEDHA_BASE_URL / MEDHA_MODEL / MEDHA_API_KEY"
+            )
+        })?;
+
+    let lock = lockfile::MedhaLock::load_default();
+    let seeds = gc.seeds.unwrap_or(lock.gate.seeds).max(1);
+    let threshold = gc.threshold.unwrap_or(lock.gate.pass_threshold);
+
+    let run = gate::RunConfig {
+        binary: std::env::current_exe()
+            .map_err(|e| anyhow::anyhow!("locating the medha binary: {e}"))?,
+        provider_env: vec![
+            ("MEDHA_BASE_URL".to_string(), resolved.base_url.clone()),
+            ("MEDHA_MODEL".to_string(), resolved.model.clone()),
+            ("MEDHA_API_KEY".to_string(), resolved.api_key.clone()),
+        ],
+        default_wall_s: 600,
+    };
+
+    let results = gate::run_gate(gate::GateOptions {
+        path: gc.path,
+        seeds,
+        threshold,
+        run,
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if gc.json {
+        println!("{}", gate::report::json(&results));
+    } else {
+        print!("{}", gate::report::human(&results, seeds));
+    }
+    std::process::exit(gate::report::exit_code(&results));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load a .env from the current dir or any ancestor (industry-standard BYOK
@@ -114,12 +207,23 @@ async fn main() -> Result<()> {
     // overrides values already set in the environment.
     let _ = dotenvy::dotenv();
 
+    // `medha gate <scenario>` is an operator subcommand (the Eval Gate, §4.11–4.12).
+    // It's dispatched by hand *before* the main clap parse: the interactive/headless
+    // CLI uses a trailing free-form prompt positional, which cannot coexist with a
+    // clap subcommand — so we peel `gate` off argv and parse it with its own parser
+    // (real --help/validation), leaving the existing `medha "task"` UX untouched.
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).map(|s| s == "gate").unwrap_or(false) {
+        return run_gate_command(raw[2..].to_vec()).await;
+    }
+
     let cli = Cli::parse();
 
-    // Explicit reconfigure.
-    if cli.setup {
-        config::run_wizard().await?;
-        return Ok(());
+    // `--setup` is only a doorway: it opens the normal TUI directly in the
+    // model-setup form (the exact surface `/model add` uses — one
+    // implementation, never a second wizard). Handled below with use_tui.
+    if cli.setup && !std::io::stdin().is_terminal() {
+        anyhow::bail!("--setup opens the interactive TUI and needs a terminal");
     }
 
     // --sessions only reads the local event log — handle it here, before the
@@ -134,24 +238,40 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve provider from flags → env → saved config. Only fall back to the
-    // first-run wizard if nothing supplies a base URL + model.
-    let mut cfg = config::load()?;
+    // Resolve provider from flags → env → saved config. Nothing resolvable +
+    // interactive TUI = first-run: start unconfigured and open the model-setup
+    // form inside the TUI. Headless callers get an actionable error instead —
+    // scripts must never hang on interactive prompts.
+    let cfg = config::load()?;
+    let is_tty_early = std::io::stdin().is_terminal();
+    let tui_possible =
+        !cli.acp && !cli.plain && cli.prompt.join(" ").trim().is_empty() && is_tty_early;
     let resolved = match config::resolve(cfg.as_ref(), cli.base_url.clone(), cli.model.clone()) {
         Some(r) => r,
-        None => {
-            let new_cfg = config::run_wizard().await?;
-            let r = config::resolve(Some(&new_cfg), cli.base_url.clone(), cli.model.clone())
-                .ok_or_else(|| anyhow::anyhow!("provider unresolved after setup"))?;
-            cfg = Some(new_cfg);
-            r
-        }
+        None if tui_possible || cli.setup => config::Resolved {
+            profile: String::new(),
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+            max_ctx: None,
+        },
+        None => anyhow::bail!(
+            "no model configured. Run `medha` to add one in the TUI, \
+             or set MEDHA_BASE_URL / MEDHA_MODEL / MEDHA_API_KEY."
+        ),
     };
+    // Open the TUI in model setup on explicit --setup or an unconfigured start.
+    let open_setup = cli.setup || resolved.base_url.is_empty();
 
     let prompt = cli.prompt.join(" ");
     let use_plain_repl = cli.plain;
 
     let model_name = resolved.model.clone();
+    // Keep a mutable, persisted profile registry available to the TUI. A
+    // session started purely from flags/environment (or still unconfigured)
+    // begins with an empty registry; `/model add` writes the first profile.
+    let model_profiles = Arc::new(std::sync::Mutex::new(cfg.unwrap_or_default()));
+    let active_profile = resolved.profile.clone();
 
     // Resolve the context window so compaction sizes itself — without the user
     // ever typing a number, and without fabricating one. Precedence:
@@ -162,25 +282,30 @@ async fn main() -> Result<()> {
     //      hardcoded table baked into this binary)
     //   4. otherwise unknown → compaction off, say so (never guess, §4.3)
     let (mut max_ctx, mut ctx_source) = (resolved.max_ctx, "config/env");
-    if max_ctx.is_none() {
+    // Unconfigured first-run start: no endpoint to ask yet — the TUI's model
+    // setup captures the context window when the first profile is saved.
+    if max_ctx.is_none() && !resolved.base_url.is_empty() {
         if let Ok(models) =
             providers::openai_compat::list_models(&resolved.base_url, &resolved.api_key).await
         {
-            if let Some(c) =
-                models.iter().find(|m| m.id == model_name).and_then(|m| m.context_length)
+            if let Some(c) = models
+                .iter()
+                .find(|m| m.id == model_name)
+                .and_then(|m| m.context_length)
             {
                 max_ctx = Some(c);
                 ctx_source = "discovered from /v1/models";
             }
         }
     }
-    if max_ctx.is_none() {
+    if max_ctx.is_none() && !model_name.is_empty() {
         if let Some(c) = providers::models_dev::context_window(&model_name).await {
             max_ctx = Some(c);
             ctx_source = "models.dev";
         }
     }
     match max_ctx {
+        _ if model_name.is_empty() => {} // nothing configured yet — stay quiet
         Some(n) => {
             eprintln!("context window: {n} tokens ({ctx_source}) — compaction enabled");
             if ctx_source == "models.dev" {
@@ -253,12 +378,18 @@ async fn main() -> Result<()> {
     // Human gate (§4.7): the editor's approval card in ACP mode, the TUI's modal
     // in TUI mode, a y/N prompt in the terminal REPL/one-shot, auto-deny headless.
     // Created early so it can be passed to WorkspaceSandbox for permission prompts.
-    let has_task = !prompt.trim().is_empty();
+    // --setup always lands in the TUI's model-setup form; it outranks a stray
+    // trailing task string (there is nothing to run against mid-setup).
+    let has_task = !cli.setup && !prompt.trim().is_empty();
     let is_tty = std::io::stdin().is_terminal();
     let use_acp = cli.acp;
-    let use_tui = !use_acp && is_tty && !has_task && !use_plain_repl;
+    let use_tui = cli.setup || (!use_acp && is_tty && !has_task && !use_plain_repl);
 
-    let tui_channel = if use_tui { Some(tui_tea::channel()) } else { None };
+    let tui_channel = if use_tui {
+        Some(tui_tea::channel())
+    } else {
+        None
+    };
     let acp_bridge = if use_acp { Some(acp::bridge()) } else { None };
 
     let gate: Arc<dyn kernel::HumanGate> = if let Some((writer, pending)) = &acp_bridge {
@@ -269,6 +400,15 @@ async fn main() -> Result<()> {
         Arc::new(TerminalGate)
     } else {
         Arc::new(kernel::AutoDeny)
+    };
+
+    // The `clarify` tool's question-asker: only the full TUI renders the form;
+    // every other surface has no interactive question UI, so `clarify` reports
+    // "skipped" and the agent proceeds on best judgment (never blocks).
+    let asker: Arc<dyn kernel::Asker> = if let Some((tx, _)) = &tui_channel {
+        Arc::new(tui_tea::TuiAsker { tx: tx.clone() })
+    } else {
+        Arc::new(kernel::NoAsker)
     };
 
     // Workspace = current directory; fs/shell tools use permission system for out-of-workspace access (§4.8).
@@ -294,7 +434,11 @@ async fn main() -> Result<()> {
     // with `--no-sandbox` / MEDHA_SANDBOX=host|native|off as session overrides.
     // Default is the OS-native jail where available.
     let mut sbx_cfg = lock.sandbox.to_config();
-    match std::env::var("MEDHA_SANDBOX").ok().as_deref().map(str::trim) {
+    match std::env::var("MEDHA_SANDBOX")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
         Some("host") | Some("off") | Some("none") => sbx_cfg.backend = sandbox::BackendKind::Host,
         Some("native") | Some("on") => sbx_cfg.backend = sandbox::BackendKind::Native,
         _ => {}
@@ -308,16 +452,22 @@ async fn main() -> Result<()> {
         sandbox::BackendKind::Container => {
             let runtime = sbx_cfg.runtime.clone().unwrap_or_else(|| "docker".into());
             if sbx_cfg.image.as_deref().unwrap_or("").is_empty() {
-                eprintln!("warning: [sandbox] backend=container needs an `image` — falling back to the native jail.");
+                eprintln!(
+                    "warning: [sandbox] backend=container needs an `image` — falling back to the native jail."
+                );
                 sbx_cfg.backend = sandbox::BackendKind::Native;
             } else if !sandbox::program_on_path(&runtime) {
-                eprintln!("warning: container runtime '{runtime}' not found on PATH — falling back to the native jail.");
+                eprintln!(
+                    "warning: container runtime '{runtime}' not found on PATH — falling back to the native jail."
+                );
                 sbx_cfg.backend = sandbox::BackendKind::Native;
             }
         }
         sandbox::BackendKind::Ssh => {
             if sbx_cfg.host.as_deref().unwrap_or("").is_empty() {
-                eprintln!("warning: [sandbox] backend=ssh needs a `host` — falling back to the native jail.");
+                eprintln!(
+                    "warning: [sandbox] backend=ssh needs a `host` — falling back to the native jail."
+                );
                 sbx_cfg.backend = sandbox::BackendKind::Native;
             } else if !sandbox::program_on_path("ssh") {
                 eprintln!("warning: `ssh` not found on PATH — falling back to the native jail.");
@@ -337,7 +487,16 @@ async fn main() -> Result<()> {
     // (these are non-secret; ~/.ssh, ~/.aws, etc. stay denied by omission).
     let mut extra_writable = lock.sandbox.extra_writable_paths();
     if let Some(home) = dirs::home_dir() {
-        for cache in [".cargo", ".rustup", ".npm", ".cache", ".pnpm-store", ".gradle", ".m2", "go/pkg"] {
+        for cache in [
+            ".cargo",
+            ".rustup",
+            ".npm",
+            ".cache",
+            ".pnpm-store",
+            ".gradle",
+            ".m2",
+            "go/pkg",
+        ] {
             extra_writable.push(home.join(cache));
         }
     }
@@ -346,6 +505,10 @@ async fn main() -> Result<()> {
     let workspace = Arc::new(
         WorkspaceSandbox::new(cwd.clone(), trust_path, audit_path, Some(gate.clone()))?
             .with_exec_backend(exec_backend)
+            // Skills bundle reference files the model reads on demand; the
+            // user skills root lives outside the workspace, so without this
+            // every bundled-file read would raise a permission card.
+            .with_readable_roots(&[config::user_skills_dir()?])
             .with_snapshots_dir(state.join("snapshots")),
     );
     // Skills (Phase A, §4.11 consumption side): discover project + user skills
@@ -354,11 +517,22 @@ async fn main() -> Result<()> {
     // never prompts for permission.
     let skill_store = Arc::new(tools::SkillStore::new(
         workspace.root().join(".medha").join("skills"),
-        dirs::home_dir().map(|h| h.join(".medha").join("skills")),
+        Some(config::user_skills_dir()?),
     ));
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
     registry.register_skills(skill_store.clone());
     let known_tools = registry.tool_names();
+    // Live web-search settings, shared with the `web.*` tools. Seed from the
+    // saved config (provider choice + stored keys, env fallback); the TUI's
+    // `/search` writes this same handle so a change applies without a restart.
+    let search_handle = registry.search_handle();
+    if let Ok(cfg_guard) = model_profiles.lock() {
+        *search_handle.lock().expect("search settings lock") = config::resolve_search(&cfg_guard);
+    }
+    // Hand the `clarify` tool the surface's question-asker (TUI form, or NoAsker).
+    if let Ok(mut slot) = registry.clarify_handle().lock() {
+        *slot = Some(asker);
+    }
     let executor = Arc::new(registry);
 
     // Context engine: budget-aware two-phase compaction (§4.3), tuned from
@@ -381,9 +555,15 @@ async fn main() -> Result<()> {
 
     // Deterministic verifier (§4.7): medha.lock's [verify] command, overridden
     // by MEDHA_VERIFY="cargo check" if set. Empty/absent = no verifier.
-    let verify_cmd = std::env::var("MEDHA_VERIFY").ok().filter(|s| !s.trim().is_empty()).or(lock.verify.command.clone());
+    let verify_cmd = std::env::var("MEDHA_VERIFY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or(lock.verify.command.clone());
     let verifier: Arc<dyn kernel::Verifier> = match verify_cmd {
-        Some(cmd) => Arc::new(CommandVerifier { command: cmd, dir: cwd.clone() }),
+        Some(cmd) => Arc::new(CommandVerifier {
+            command: cmd,
+            dir: cwd.clone(),
+        }),
         None => Arc::new(kernel::NoVerify),
     };
 
@@ -394,14 +574,18 @@ async fn main() -> Result<()> {
     // models.dev list price as an *indicative* figure (self-hosted routes don't
     // bill list price); else the meter stays off — never a silent $0.00.
     let pricing = match (lock.pricing.input_per_mtok, lock.pricing.output_per_mtok) {
-        (Some(i), Some(o)) => {
-            Some(kernel::Pricing { input_per_mtok: i, output_per_mtok: o, indicative: false })
-        }
-        _ => providers::models_dev::pricing(&model_name).await.map(|(i, o)| kernel::Pricing {
+        (Some(i), Some(o)) => Some(kernel::Pricing {
             input_per_mtok: i,
             output_per_mtok: o,
-            indicative: true,
+            indicative: false,
         }),
+        _ => providers::models_dev::pricing(&model_name)
+            .await
+            .map(|(i, o)| kernel::Pricing {
+                input_per_mtok: i,
+                output_per_mtok: o,
+                indicative: true,
+            }),
     };
     match &pricing {
         Some(p) if p.indicative => eprintln!(
@@ -422,14 +606,24 @@ async fn main() -> Result<()> {
     }
 
     let kernel = Kernel::new(
-        provider, log.clone(), executor, context_engine, artifacts, policy, gate, verifier,
+        provider,
+        log.clone(),
+        executor,
+        context_engine,
+        artifacts,
+        policy,
+        gate,
+        verifier,
     )
     .with_pricing(pricing);
 
     // K1 Identity sheath is assembled by the context compiler, not hardcoded
     // here; config may override the persona (§4.3).
-    let persona = cfg.as_ref().and_then(|c| c.agent.identity.as_deref());
-    let mut system = context::identity::system_prompt(persona);
+    let persona = model_profiles
+        .lock()
+        .ok()
+        .and_then(|c| c.agent.identity.clone());
+    let mut system = context::identity::system_prompt(persona.as_deref());
     // Ground the model in the real current date + workspace — without this it
     // guesses a stale year for time-sensitive queries ("latest news" → 2024).
     let today = chrono::Local::now().format("%A, %-d %B %Y").to_string();
@@ -443,8 +637,14 @@ async fn main() -> Result<()> {
     // what it can `skill.load`. Empty (no section) when no skills exist — zero
     // behaviour change for workspaces without skills. In headless mode the task
     // narrows the list when there are many; the interactive session lists all.
-    let skills_manifest =
-        skill_store.manifest(&known_tools, if has_task { Some(prompt.as_str()) } else { None });
+    let skills_manifest = skill_store.manifest(
+        &known_tools,
+        if has_task {
+            Some(prompt.as_str())
+        } else {
+            None
+        },
+    );
     if !skills_manifest.is_empty() {
         system.push_str("\n\n");
         system.push_str(&skills_manifest);
@@ -453,10 +653,17 @@ async fn main() -> Result<()> {
     // Resume (--continue / --resume <id>): rebuild the prior conversation from
     // the event log and continue the SAME session (new events append onward).
     // Empty `resumed` = a fresh session.
-    let (session, resumed) = match resolve_resume(&log, &cli).await {
+    let (mut session, resumed) = match resolve_resume(&log, &cli).await {
         Ok(Some((id, msgs))) => {
             eprintln!("resumed session {id} ({} prior messages)", msgs.len());
-            (Session { id, done: false }, msgs)
+            (
+                Session {
+                    id,
+                    done: false,
+                    autonomy: kernel::AutonomyLevel::Careful,
+                },
+                msgs,
+            )
         }
         Ok(None) => (Session::new(), Vec::new()),
         Err(e) => {
@@ -464,7 +671,21 @@ async fn main() -> Result<()> {
             (Session::new(), Vec::new())
         }
     };
-    let mode = if use_acp { "acp" } else if use_tui { "tui" } else if has_task { "headless" } else { "repl" };
+    // Starting autonomy dial: medha.lock's [policy] autonomy, overridable by
+    // MEDHA_MODE. The TUI can change it live via /mode; headless keeps this.
+    session.autonomy = kernel::AutonomyLevel::from_id(
+        &std::env::var("MEDHA_MODE").unwrap_or_else(|_| lock.policy.autonomy.clone()),
+    );
+
+    let mode = if use_acp {
+        "acp"
+    } else if use_tui {
+        "tui"
+    } else if has_task {
+        "headless"
+    } else {
+        "repl"
+    };
     tracing::info!(model = %model_name, mode, "medha session start");
 
     // Editor bridge mode: hand the whole session to the ACP loop over stdio and
@@ -494,6 +715,9 @@ async fn main() -> Result<()> {
                 system,
                 model_name,
                 max_ctx,
+                model_profiles,
+                active_profile,
+                open_setup,
                 apply_budget_env(base_budget),
                 ui_config,
                 resumed,
@@ -501,12 +725,22 @@ async fn main() -> Result<()> {
                 logs_dir.join("stray-stdout.log"),
                 skill_store.clone(),
                 known_tools.clone(),
+                search_handle.clone(),
                 tx,
                 rx,
             )
             .await?;
         } else if is_tty {
-            run_repl(&kernel, &session, system, &model_name, max_ctx, apply_budget_env(base_budget), resumed).await?;
+            run_repl(
+                &kernel,
+                &session,
+                system,
+                &model_name,
+                max_ctx,
+                apply_budget_env(base_budget),
+                resumed,
+            )
+            .await?;
         } else {
             eprintln!("usage: medha \"<task>\"   (run `medha --setup` to reconfigure)");
         }
@@ -519,9 +753,21 @@ async fn main() -> Result<()> {
     messages.extend(resumed);
     messages.push(Message::user(prompt));
     let sink = PrintSink::plain();
-    match kernel.run_session(&session, messages, apply_budget_env(base_budget), &sink, None).await {
+    match kernel
+        .run_session(
+            &session,
+            messages,
+            apply_budget_env(base_budget),
+            &sink,
+            None,
+        )
+        .await
+    {
         Ok((_t, kernel::StopReason::Budget(stop))) => {
-            eprintln!("\n(stopped: {} reached — raise the limit to continue)", stop.label());
+            eprintln!(
+                "\n(stopped: {} reached — raise the limit to continue)",
+                stop.label()
+            );
         }
         Ok(_) => println!(),
         Err(e) => eprintln!("error: {e}"),
@@ -541,7 +787,11 @@ async fn main() -> Result<()> {
 /// be blocked entirely.
 fn approve_list(base: Vec<String>) -> Vec<String> {
     let raw = std::env::var("MEDHA_APPROVE").unwrap_or_default();
-    let parts: Vec<&str> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
 
     // Explicit autonomous escape hatch: no gating at all.
     if parts.contains(&"none") {
@@ -589,7 +839,11 @@ impl kernel::Verifier for CommandVerifier {
         );
         Some(kernel::VerifyReport {
             ok: out.status.success(),
-            summary: format!("`{}` exit {}", self.command, out.status.code().unwrap_or(-1)),
+            summary: format!(
+                "`{}` exit {}",
+                self.command,
+                out.status.code().unwrap_or(-1)
+            ),
             output,
         })
     }
@@ -600,10 +854,17 @@ struct TerminalGate;
 
 #[async_trait::async_trait]
 impl kernel::HumanGate for TerminalGate {
-    async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> kernel::Approval {
+    async fn confirm(
+        &self,
+        action: &str,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::Approval {
         println!("\n\x1b[33m⚠ approve {action}?\x1b[0m");
         if escalated {
-            println!("\x1b[31m  ⚠ web-tainted action — reviewed every time; 'always' is not offered\x1b[0m");
+            println!(
+                "\x1b[31m  ⚠ web-tainted action — reviewed every time; 'always' is not offered\x1b[0m"
+            );
         }
         if let Some(d) = detail {
             for line in d.lines() {
@@ -679,7 +940,10 @@ impl kernel::StreamSink for PrintSink {
                 }
             }
         } else if !ok {
-            let err = payload.get("error").and_then(|v| v.as_str()).unwrap_or("error");
+            let err = payload
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error");
             println!("  ⎿ \x1b[31m✗ {err}\x1b[0m");
         } else {
             println!("  ⎿ {}", result_summary(tool, payload));
@@ -713,13 +977,16 @@ fn salient_arg(tool: &str, args: &serde_json::Value) -> String {
         "web.fetch" => "url",
         "read_artifact" => "hash",
         "grep" => "pattern",
+        // Skill rows read by their name; the description is prose and makes
+        // an unreadable label ("Save(Guidance for distinctive, intent…)").
+        t if t.starts_with("skill.") => "name",
         _ => "",
     };
     // Preferred key, else the first string argument as a fallback.
-    let val = args
-        .get(key)
-        .and_then(|v| v.as_str())
-        .or_else(|| args.as_object().and_then(|o| o.values().find_map(|v| v.as_str())));
+    let val = args.get(key).and_then(|v| v.as_str()).or_else(|| {
+        args.as_object()
+            .and_then(|o| o.values().find_map(|v| v.as_str()))
+    });
     match val {
         Some(v) => {
             let short: String = v.chars().take(60).collect();
@@ -734,13 +1001,30 @@ fn salient_arg(tool: &str, args: &serde_json::Value) -> String {
 fn result_summary(tool: &str, p: &serde_json::Value) -> String {
     let u = |k: &str| p.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let s = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    let chars = |k: &str| p.get(k).and_then(|v| v.as_str()).map(|x| x.len()).unwrap_or(0);
-    let arr = |k: &str| p.get(k).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let chars = |k: &str| {
+        p.get(k)
+            .and_then(|v| v.as_str())
+            .map(|x| x.len())
+            .unwrap_or(0)
+    };
+    let arr = |k: &str| {
+        p.get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    };
     match tool {
         "web.search" => format!("{} results", u("count")),
         "grep" => {
-            let t = p.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false);
-            format!("{} matches{}", u("count"), if t { " (truncated)" } else { "" })
+            let t = p
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            format!(
+                "{} matches{}",
+                u("count"),
+                if t { " (truncated)" } else { "" }
+            )
         }
         "fs.read" => format!("{} chars", chars("content")),
         "fs.list" => format!("{} entries", arr("entries")),
@@ -748,11 +1032,18 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
         "web.fetch" => {
             let title = s("title");
             let len = chars("content");
-            if title.is_empty() { format!("{len} chars") } else { format!("{title} ({len} chars)") }
+            if title.is_empty() {
+                format!("{len} chars")
+            } else {
+                format!("{title} ({len} chars)")
+            }
         }
         "shell.exec" => {
             // Show exit code + a peek at the first non-empty stdout line.
-            let first = s("stdout").lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            let first = s("stdout")
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
             let peek: String = first.chars().take(80).collect();
             match p.get("exit_code").and_then(|v| v.as_i64()) {
                 Some(c) if peek.is_empty() => format!("exit {c}"),
@@ -777,8 +1068,13 @@ fn migrate_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
     }
     // events.db carries WAL/SHM sidecars — move them together or the log breaks.
     for name in [
-        "events.db", "events.db-wal", "events.db-shm",
-        "artifacts", "snapshots", "logs", "trust.lock",
+        "events.db",
+        "events.db-wal",
+        "events.db-shm",
+        "artifacts",
+        "snapshots",
+        "logs",
+        "trust.lock",
     ] {
         let (from, to) = (legacy.join(name), state.join(name));
         if from.exists() && !to.exists() {
@@ -803,7 +1099,10 @@ fn migrate_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
     }
     // If nothing committed is left (no skills/agents/etc.), remove the empty dir
     // so a migrated workspace carries no stray .medha at all.
-    if std::fs::read_dir(&legacy).map(|mut d| d.next().is_none()).unwrap_or(false) {
+    if std::fs::read_dir(&legacy)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(false)
+    {
         std::fs::remove_dir(&legacy).ok();
     }
 }
@@ -864,7 +1163,11 @@ fn print_sessions(log: &store::SqliteLog) -> Result<()> {
     println!("Sessions in this workspace (newest first):\n");
     for s in &sessions {
         let when = chrono::DateTime::from_timestamp(s.last_ts as i64, 0)
-            .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+            .map(|d| {
+                d.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
             .unwrap_or_default();
         println!("  {}", s.id);
         println!("    {when} · {} events · {}", s.events, s.title);
@@ -876,7 +1179,10 @@ fn print_sessions(log: &store::SqliteLog) -> Result<()> {
 /// Resolve `--continue` / `--resume <id>` into the session to reopen and its
 /// reconstructed conversation (projected from the event log). `None` when
 /// neither flag is set — a fresh session.
-async fn resolve_resume(log: &store::SqliteLog, cli: &Cli) -> Result<Option<(ulid::Ulid, Vec<Message>)>> {
+async fn resolve_resume(
+    log: &store::SqliteLog,
+    cli: &Cli,
+) -> Result<Option<(ulid::Ulid, Vec<Message>)>> {
     let id = if let Some(idstr) = &cli.resume {
         ulid::Ulid::from_string(idstr.trim())
             .map_err(|_| anyhow::anyhow!("invalid session id '{idstr}'"))?
@@ -915,8 +1221,8 @@ where
     P: kernel::Provider,
     L: kernel::EventLog,
 {
-    use rustyline::error::ReadlineError;
     use rustyline::DefaultEditor;
+    use rustyline::error::ReadlineError;
 
     println!("MEDHA — interactive session. /help for commands, /exit to quit.\n");
     let mut rl = DefaultEditor::new()?;
@@ -956,7 +1262,11 @@ where
                             transcript.truncate(1); // keep the system message
                             println!("(conversation cleared)");
                         }
-                        "status" => print_status(model, max_ctx, usage.load(std::sync::atomic::Ordering::Relaxed)),
+                        "status" => print_status(
+                            model,
+                            max_ctx,
+                            usage.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
                         other => println!("unknown command: /{other}   (try /help)"),
                     }
                     continue;
@@ -967,7 +1277,10 @@ where
                 // through the sink, which also records real token usage.
                 let sink = PrintSink::tracking(usage.clone());
                 // Each user message is a fresh task → fresh budget contract.
-                match kernel.run_session(session, transcript.clone(), budget.clone(), &sink, None).await {
+                match kernel
+                    .run_session(session, transcript.clone(), budget.clone(), &sink, None)
+                    .await
+                {
                     Ok((updated, kernel::StopReason::Budget(stop))) => {
                         transcript = updated;
                         println!(
@@ -1028,14 +1341,22 @@ fn apply_think_command<P: kernel::Provider>(provider: &P, args: &str) -> String 
         "" | "status" => think_status(provider),
         "on" => {
             let effort = provider.reasoning().effort;
-            provider.set_reasoning(kernel::ReasoningConfig { enabled: Some(true), effort });
+            provider.set_reasoning(kernel::ReasoningConfig {
+                enabled: Some(true),
+                effort,
+            });
             "thinking: on".to_string()
         }
         "off" => {
-            provider.set_reasoning(kernel::ReasoningConfig { enabled: Some(false), effort: None });
+            provider.set_reasoning(kernel::ReasoningConfig {
+                enabled: Some(false),
+                effort: None,
+            });
             "thinking: off".to_string()
         }
-        other => format!("usage: /think [on|off|status]  (got '{other}') — use /effort for reasoning level"),
+        other => format!(
+            "usage: /think [on|off|status]  (got '{other}') — use /effort for reasoning level"
+        ),
     }
 }
 
@@ -1046,7 +1367,10 @@ fn think_status<P: kernel::Provider>(provider: &P) -> String {
         Some(false) => "off",
         None => "server default",
     };
-    format!("thinking: {enabled}  |  effort: {}", effort_label(cfg.effort))
+    format!(
+        "thinking: {enabled}  |  effort: {}",
+        effort_label(cfg.effort)
+    )
 }
 
 /// `/effort [low|medium|high]` — set reasoning depth; also turns thinking on
@@ -1062,7 +1386,10 @@ pub(crate) fn apply_effort_command<P: kernel::Provider>(provider: &P, args: &str
                 "medium" => kernel::ReasoningEffort::Medium,
                 _ => kernel::ReasoningEffort::High,
             };
-            provider.set_reasoning(kernel::ReasoningConfig { enabled: Some(true), effort: Some(effort) });
+            provider.set_reasoning(kernel::ReasoningConfig {
+                enabled: Some(true),
+                effort: Some(effort),
+            });
             format!(
                 "effort: {level} (thinking: on) — sent if this server supports it, \
                  otherwise silently ignored"
@@ -1131,7 +1458,11 @@ mod migration_tests {
         std::fs::create_dir_all(legacy.join("skills").join("mine")).unwrap();
         std::fs::write(legacy.join("events.db"), b"DB").unwrap();
         std::fs::write(legacy.join("logs").join("medha.log"), b"log").unwrap();
-        std::fs::write(legacy.join(".gitignore"), "# MEDHA local state — never commit\n*\n").unwrap();
+        std::fs::write(
+            legacy.join(".gitignore"),
+            "# MEDHA local state — never commit\n*\n",
+        )
+        .unwrap();
         std::fs::write(legacy.join("skills").join("mine").join("SKILL.md"), "x").unwrap();
         std::fs::create_dir_all(&state).unwrap();
 
@@ -1143,7 +1474,10 @@ mod migration_tests {
         assert!(!legacy.join("events.db").exists());
         // Stale auto-gitignore dropped; committed skills kept in the workspace.
         assert!(!legacy.join(".gitignore").exists());
-        assert!(legacy.join("skills").join("mine").join("SKILL.md").exists(), "committed config must stay");
+        assert!(
+            legacy.join("skills").join("mine").join("SKILL.md").exists(),
+            "committed config must stay"
+        );
         // Legacy dir NOT removed because skills/ remains.
         assert!(legacy.exists());
         std::fs::remove_dir_all(&root).ok();
@@ -1162,7 +1496,11 @@ mod migration_tests {
 
         migrate_legacy_state(&cwd, &state);
 
-        assert_eq!(std::fs::read(state.join("events.db")).unwrap(), b"NEW", "existing state wins");
+        assert_eq!(
+            std::fs::read(state.join("events.db")).unwrap(),
+            b"NEW",
+            "existing state wins"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1181,7 +1519,10 @@ mod migration_tests {
 
         assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"A");
         assert_eq!(std::fs::read(to.join("sub").join("b.txt")).unwrap(), b"B");
-        assert!(!from.exists(), "source is removed after a successful copy-move");
+        assert!(
+            !from.exists(),
+            "source is removed after a successful copy-move"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

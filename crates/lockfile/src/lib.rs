@@ -79,6 +79,40 @@ pub struct MedhaLock {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub pricing: PricingConfig,
+    #[serde(default)]
+    pub gate: GateConfig,
+}
+
+/// Eval-gate policy (§4.11–4.12, Vol 5 §5). Thresholds live here so the pass/fail
+/// bar is part of the portable, diffable harness artifact — a harness A/B can
+/// change the gate policy and that change is itself reviewable. `medha gate`
+/// reads these; `#[serde(default)]` keeps existing locks parsing unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GateConfig {
+    /// Where `medha gate` looks when handed a bare id or no path. Relative to cwd.
+    pub scenarios_dir: String,
+    /// Minimum pass-rate (0.0–1.0) for a `promote` verdict. Goldens default to
+    /// 1.0 — a golden that regresses at all is a regression.
+    pub pass_threshold: f64,
+    /// Repeats per scenario. Agents are stochastic; >1 turns a single noisy
+    /// verdict into a pass-rate with a confidence interval (Vol 5 §5). Kept at 1
+    /// by default so local runs stay cheap; CI raises it.
+    pub seeds: u32,
+    /// Max tolerated per-scenario pass-rate drop vs a baseline before a
+    /// regression is called (reserved for the global non-inferiority check).
+    pub regression_epsilon: f64,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            scenarios_dir: "scenarios".into(),
+            pass_threshold: 1.0,
+            seeds: 1,
+            regression_epsilon: 0.0,
+        }
+    }
 }
 
 /// Operator-declared per-token pricing for the executor model (P1-12), USD per
@@ -154,11 +188,13 @@ impl SandboxLockConfig {
         };
         // `backend = "docker"/"podman"` is shorthand that also picks the runtime.
         let runtime =
-            self.runtime.clone().or_else(|| match self.backend.trim().to_lowercase().as_str() {
-                "docker" => Some("docker".into()),
-                "podman" => Some("podman".into()),
-                _ => None,
-            });
+            self.runtime
+                .clone()
+                .or_else(|| match self.backend.trim().to_lowercase().as_str() {
+                    "docker" => Some("docker".into()),
+                    "podman" => Some("podman".into()),
+                    _ => None,
+                });
         sandbox::SandboxConfig {
             backend,
             net,
@@ -274,18 +310,37 @@ impl ContextConfig {
 fn default_approve() -> Vec<String> {
     // skill.save always shows an approval card so the user sees the full SKILL.md
     // being written before it lands (Phase A skills).
-    vec!["fs.write".into(), "fs.edit".into(), "multi_edit".into(), "skill.save".into()]
+    vec![
+        "fs.write".into(),
+        "fs.edit".into(),
+        "multi_edit".into(),
+        "skill.save".into(),
+    ]
+}
+
+fn default_autonomy() -> String {
+    "careful".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
     #[serde(default = "default_approve")]
     pub approve: Vec<String>,
+    /// Starting autonomy dial: `careful` (edits+shell ask) · `normal` (edits
+    /// auto, shell asks) · `yolo` (everything in-workspace auto). The safety
+    /// floor (dangerous-command scanner, external actions, out-of-workspace
+    /// access) is gated at every level. Live-switchable via `/mode` in the TUI
+    /// or the `MEDHA_MODE` env override.
+    #[serde(default = "default_autonomy")]
+    pub autonomy: String,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
-        Self { approve: default_approve() }
+        Self {
+            approve: default_approve(),
+            autonomy: default_autonomy(),
+        }
     }
 }
 
@@ -312,7 +367,6 @@ pub struct UiConfig {
     pub full_transparency: bool,
 }
 
-
 /// Reasoning/thinking request-side control (§4.4), config-file counterpart to
 /// the live `/reasoning` slash command. `enabled`/`effort` both `None` = don't
 /// touch the server's own default. Not every model/server has a "medium" tier
@@ -335,7 +389,10 @@ impl ReasoningLockConfig {
             Some("high") => Some(kernel::ReasoningEffort::High),
             _ => None,
         };
-        kernel::ReasoningConfig { enabled: self.enabled, effort }
+        kernel::ReasoningConfig {
+            enabled: self.enabled,
+            effort,
+        }
     }
 }
 
@@ -375,7 +432,10 @@ fn default_path() -> PathBuf {
 ///
 /// After migration, `medha.lock` no longer carries `[permissions]` and the
 /// trust file holds them in the identical shape the permission manager reads.
-pub fn migrate_permissions_to_trust_file(medha_lock: &Path, trust_path: &Path) -> Result<(), String> {
+pub fn migrate_permissions_to_trust_file(
+    medha_lock: &Path,
+    trust_path: &Path,
+) -> Result<(), String> {
     if trust_path.exists() {
         return Ok(()); // already migrated / trust file is the source of truth
     }
@@ -399,13 +459,19 @@ pub fn migrate_permissions_to_trust_file(medha_lock: &Path, trust_path: &Path) -
     if let Some(parent) = trust_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(trust_path, toml::to_string_pretty(&trust_doc).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        trust_path,
+        toml::to_string_pretty(&trust_doc).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
 
     // Rewrite medha.lock without the permissions table so the portable artifact
     // stays clean and machine-independent.
-    std::fs::write(medha_lock, toml::to_string_pretty(&value).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    std::fs::write(
+        medha_lock,
+        toml::to_string_pretty(&value).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -433,7 +499,10 @@ mod tests {
         // ...and out of the portable lock (which keeps its real config).
         let lock_txt = std::fs::read_to_string(&lock).unwrap();
         assert!(lock_txt.contains("max_turns"), "real config preserved");
-        assert!(!lock_txt.contains("permissions"), "portable lock must not carry grants");
+        assert!(
+            !lock_txt.contains("permissions"),
+            "portable lock must not carry grants"
+        );
 
         // Idempotent: a second run is a no-op because the trust file now exists.
         migrate_permissions_to_trust_file(&lock, &trust).unwrap();
@@ -447,13 +516,19 @@ mod tests {
         let lock = MedhaLock::default();
         // Matches kernel::Budget::default() / context::CompactionPolicy::default()
         // exactly, so introducing this artifact changes nothing by default.
-        assert_eq!(lock.budget.to_budget().max_turns, kernel::Budget::default().max_turns);
+        assert_eq!(
+            lock.budget.to_budget().max_turns,
+            kernel::Budget::default().max_turns
+        );
         assert_eq!(
             lock.context.to_policy().trigger_ratio,
             context::CompactionPolicy::default().trigger_ratio
         );
         // File-write default (§4.6): writes need approval; shell is scanner-gated.
-        assert_eq!(lock.policy.approve, vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]);
+        assert_eq!(
+            lock.policy.approve,
+            vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]
+        );
         assert!(lock.verify.command.is_none());
     }
 
@@ -476,7 +551,10 @@ mod tests {
         assert_eq!(lock.policy.approve, vec!["fs.write", "shell.exec"]);
         assert_eq!(lock.verify.command, Some("cargo check".to_string()));
         // context section wasn't in the TOML at all — full default applies.
-        assert_eq!(lock.context.trigger_ratio, context::CompactionPolicy::default().trigger_ratio);
+        assert_eq!(
+            lock.context.trigger_ratio,
+            context::CompactionPolicy::default().trigger_ratio
+        );
     }
 
     #[test]
@@ -499,7 +577,10 @@ mod tests {
         assert!(loaded.is_none()); // load() is explicit Option; load_default() covers the fallback
         let default_used = MedhaLock::load("/nonexistent/path/medha.lock").unwrap_or_default();
         // Deny-first default applies even when no file exists at all.
-        assert_eq!(default_used.policy.approve, vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]);
+        assert_eq!(
+            default_used.policy.approve,
+            vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]
+        );
     }
 
     #[test]
@@ -527,6 +608,9 @@ mod tests {
         assert_eq!(cfg2.effort, None);
 
         // Absent section entirely -> both None (server default untouched).
-        assert_eq!(MedhaLock::default().reasoning.to_config(), kernel::ReasoningConfig::default());
+        assert_eq!(
+            MedhaLock::default().reasoning.to_config(),
+            kernel::ReasoningConfig::default()
+        );
     }
 }

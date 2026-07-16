@@ -4,17 +4,20 @@
 //! View is a pure function of model — same state always renders identically.
 //! Message-passing, not shared mutable state.
 
-use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crate::config;
+use crossterm::event::{
+    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use futures::StreamExt;
 use kernel::{Budget, EventLog, Kernel, Message, Provider, Session, StopReason, ToolCategory};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::{Frame};
 use sandbox::WorkspaceSandbox;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -55,23 +58,81 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
     ("/status", "model, context window, current pressure"),
-    ("/reasoning", "configure mode, visibility, effort, and inspect delivery"),
+    (
+        "/reasoning",
+        "configure mode, visibility, effort, and inspect delivery",
+    ),
+    (
+        "/model",
+        "switch models, or /model <name>; add presets/custom endpoints and keys",
+    ),
+    (
+        "/search",
+        "choose the web-search provider (Tavily/Brave/SearXNG) & key; DuckDuckGo fallback",
+    ),
+    (
+        "/mode",
+        "autonomy: how much runs without asking (careful · normal · yolo)",
+    ),
     ("/detail", "expand/collapse full tool input & output"),
     ("/resume", "switch to a past session"),
-    ("/rewind", "time-travel: branch from an earlier turn (undoes later edits)"),
+    (
+        "/rewind",
+        "time-travel: branch from an earlier turn (undoes later edits)",
+    ),
     ("/tasks", "list background shell tasks (running/finished)"),
-    ("/skills", "list installed skills (scope, availability, shadowing)"),
-    ("/skill", "pick a skill to load into context (or /skill <name>)"),
+    (
+        "/skills",
+        "list installed skills (scope, availability, shadowing)",
+    ),
+    (
+        "/skill",
+        "pick a skill to load into context (or /skill <name>)",
+    ),
+    (
+        "/skill install",
+        "install a complete skill folder from disk, GitHub, or raw SKILL.md",
+    ),
+    (
+        "/skill info",
+        "inspect a skill's files, scope, tools, and source",
+    ),
+    (
+        "/skill remove",
+        "remove an installed user skill (with confirmation)",
+    ),
     ("/clear", "reset the conversation"),
     ("/exit", "quit (also Ctrl-D)"),
 ];
+
+/// Providers used by the interactive TUI must be able to atomically apply a
+/// saved profile between turns. The kernel remains provider-neutral; this small
+/// surface exists only because the TUI owns the explicit user action.
+pub(crate) trait ProfileProvider: Provider {
+    fn switch_profile(&self, profile: &config::Resolved);
+}
+
+impl ProfileProvider for providers::OpenAiCompat {
+    fn switch_profile(&self, profile: &config::Resolved) {
+        self.switch_connection_with_context(
+            profile.base_url.clone(),
+            profile.api_key.clone(),
+            profile.model.clone(),
+            profile.max_ctx,
+        );
+    }
+}
 
 /// Accepted for compatibility, but intentionally omitted from autocomplete and
 /// `/help`: one visible `/reasoning` surface replaces these overlapping names.
 const LEGACY_REASONING_COMMANDS: &[&str] = &["/think", "/thinking", "/effort"];
 
 fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
-    COMMANDS.iter().filter(|(c, _)| c.starts_with(input)).copied().collect()
+    COMMANDS
+        .iter()
+        .filter(|(c, _)| c.starts_with(input))
+        .copied()
+        .collect()
 }
 
 /// A line is a slash command only when its FIRST TOKEN is a known command.
@@ -80,15 +141,17 @@ fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
 fn is_slash_command(line: &str) -> bool {
     match line.split_whitespace().next() {
         Some(tok) => {
-            COMMANDS.iter().any(|(c, _)| *c == tok)
-                || LEGACY_REASONING_COMMANDS.contains(&tok)
+            COMMANDS.iter().any(|(c, _)| *c == tok) || LEGACY_REASONING_COMMANDS.contains(&tok)
         }
         None => false,
     }
 }
 
 /// Channel shared by sink (agent → UI events) and human gate (agent → UI approval requests)
-pub(crate) fn channel() -> (mpsc::UnboundedSender<TuiEvent>, mpsc::UnboundedReceiver<TuiEvent>) {
+pub(crate) fn channel() -> (
+    mpsc::UnboundedSender<TuiEvent>,
+    mpsc::UnboundedReceiver<TuiEvent>,
+) {
     mpsc::unbounded_channel()
 }
 
@@ -99,13 +162,41 @@ pub(crate) struct TuiGate {
 
 #[async_trait::async_trait]
 impl kernel::HumanGate for TuiGate {
-    async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> kernel::Approval {
+    async fn confirm(
+        &self,
+        action: &str,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::Approval {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let req = TuiEvent::Approval(action.to_string(), detail.map(str::to_string), escalated, resp_tx);
+        let req = TuiEvent::Approval(
+            action.to_string(),
+            detail.map(str::to_string),
+            escalated,
+            resp_tx,
+        );
         if self.tx.send(req).is_err() {
             return kernel::Approval::Deny;
         }
         resp_rx.await.unwrap_or(kernel::Approval::Deny)
+    }
+}
+
+/// Question-asker for the TUI: the `clarify` tool's questions are sent as a
+/// `TuiEvent` with a oneshot responder, mirroring `TuiGate`. `None` back = the
+/// user dismissed the form or the channel closed.
+pub(crate) struct TuiAsker {
+    pub(crate) tx: mpsc::UnboundedSender<TuiEvent>,
+}
+
+#[async_trait::async_trait]
+impl kernel::Asker for TuiAsker {
+    async fn ask(&self, questions: Vec<kernel::Question>) -> Option<Vec<kernel::Answer>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if self.tx.send(TuiEvent::Clarify(questions, resp_tx)).is_err() {
+            return None;
+        }
+        resp_rx.await.ok().flatten()
     }
 }
 
@@ -124,7 +215,18 @@ pub(crate) enum TuiEvent {
     /// Session cost so far in USD; `true` = indicative list price (shown "est.").
     Cost(f64, bool),
     Verify(bool, String),
-    Approval(String, Option<String>, bool, oneshot::Sender<kernel::Approval>),
+    Approval(
+        String,
+        Option<String>,
+        bool,
+        oneshot::Sender<kernel::Approval>,
+    ),
+    /// `clarify` tool: ask the user structured questions, reply with their
+    /// answers (or `None` if dismissed).
+    Clarify(
+        Vec<kernel::Question>,
+        oneshot::Sender<Option<Vec<kernel::Answer>>>,
+    ),
     Done(Vec<Message>, StopReason),
     Error(String),
     /// A queued steer was applied at a turn boundary — promote its "queued"
@@ -135,6 +237,16 @@ pub(crate) enum TuiEvent {
     SteersReturned(Vec<String>),
     /// `/resume` completed loading the session list from the log.
     SessionsLoaded(Vec<kernel::SessionMeta>),
+    /// `/skill install <src>` finished with a complete package report.
+    SkillInstalled(Result<tools::InstallReport, String>),
+    /// Model setup queried the endpoint's `/v1/models`; `Err` carries the
+    /// reason so the form can fall back to manual model-id entry honestly.
+    /// Tagged with the queried base URL so a slow reply for an abandoned
+    /// draft can never populate a newer draft for a different endpoint.
+    ModelsDiscovered {
+        base_url: String,
+        result: Result<Vec<providers::openai_compat::ModelInfo>, String>,
+    },
     /// A past session's events were replayed into a transcript; swap to it.
     Resumed(ulid::Ulid, Vec<Message>),
     /// `/rewind` completed loading this session's rewind points from the log.
@@ -184,7 +296,10 @@ pub(crate) enum RewindScope {
 impl RewindScope {
     /// True for scopes that rewind the conversation (fork + prefill + swap).
     fn touches_conversation(self) -> bool {
-        matches!(self, RewindScope::Conversation | RewindScope::ConversationAndCode)
+        matches!(
+            self,
+            RewindScope::Conversation | RewindScope::ConversationAndCode
+        )
     }
     /// True for scopes that roll files back.
     fn touches_code(self) -> bool {
@@ -200,11 +315,18 @@ impl RewindPoint {
     fn scope_options(&self) -> Vec<(String, Option<RewindScope>)> {
         // "tracked" (K18): rollback reverts only snapshot-carrying writes —
         // shell-side mutations (`sed -i`, `git checkout`) are not undone.
-        let plural = if self.files == 1 { "tracked file" } else { "tracked files" };
+        let plural = if self.files == 1 {
+            "tracked file"
+        } else {
+            "tracked files"
+        };
         let mut opts = Vec::new();
         if self.files > 0 {
             opts.push((
-                format!("⏪ restore code + conversation — roll back {} {plural}", self.files),
+                format!(
+                    "⏪ restore code + conversation — roll back {} {plural}",
+                    self.files
+                ),
                 Some(RewindScope::ConversationAndCode),
             ));
         }
@@ -214,7 +336,10 @@ impl RewindPoint {
         ));
         if self.files > 0 {
             opts.push((
-                format!("⟲ restore code only — keep conversation, roll back {} {plural}", self.files),
+                format!(
+                    "⟲ restore code only — keep conversation, roll back {} {plural}",
+                    self.files
+                ),
                 Some(RewindScope::Code),
             ));
         }
@@ -228,10 +353,25 @@ impl RewindPoint {
 enum Item {
     User(String),
     Assistant(String),
-    ToolCall { tool: String, args: serde_json::Value },
-    ToolResult { tool: String, ok: bool, payload: serde_json::Value },
-    Compaction { before: u32, after: u32, summarized: bool, summary: Option<String> },
-    Verify { ok: bool, summary: String },
+    ToolCall {
+        tool: String,
+        args: serde_json::Value,
+    },
+    ToolResult {
+        tool: String,
+        ok: bool,
+        payload: serde_json::Value,
+    },
+    Compaction {
+        before: u32,
+        after: u32,
+        summarized: bool,
+        summary: Option<String>,
+    },
+    Verify {
+        ok: bool,
+        summary: String,
+    },
     Notice(String),
     Thinking(String),
 }
@@ -260,7 +400,12 @@ struct StreamCache {
 
 impl Entry {
     fn new(item: Item) -> Self {
-        Self { item, lines: None, height: 0, stream_cache: None }
+        Self {
+            item,
+            lines: None,
+            height: 0,
+            stream_cache: None,
+        }
     }
     fn invalidate(&mut self) {
         self.lines = None;
@@ -287,7 +432,11 @@ impl Entry {
                 for logical in view::render_assistant(&s[..split]) {
                     rows.extend(wrap_line(&logical, width as usize));
                 }
-                self.stream_cache = Some(StreamCache { prefix_bytes: split, width, rows });
+                self.stream_cache = Some(StreamCache {
+                    prefix_bytes: split,
+                    width,
+                    rows,
+                });
             }
             let mut rows = self.stream_cache.as_ref().unwrap().rows.clone();
             for logical in view::render_assistant(&s[split..]) {
@@ -393,6 +542,66 @@ struct PendingApproval {
     responder: oneshot::Sender<kernel::Approval>,
 }
 
+/// The user's in-progress answer to one clarify question.
+#[derive(Default)]
+struct ClarifyDraft {
+    /// Chosen option indices (one for radio, any for checkbox).
+    selected: Vec<usize>,
+    /// Free-text entered via the "Other" row.
+    other: Option<String>,
+}
+
+/// An in-flight `clarify` form: the questions, per-question drafts, and the
+/// responder the `clarify` tool is awaiting. Owns all keyboard input while up.
+struct ClarifyState {
+    questions: Vec<kernel::Question>,
+    /// Which question is on screen.
+    idx: usize,
+    /// One draft per question (same length/order as `questions`).
+    drafts: Vec<ClarifyDraft>,
+    /// Highlighted row in the current question (options, then Other).
+    cursor: usize,
+    /// True while the free-text "Other" input owns keys.
+    entering_other: bool,
+    /// Dedicated free-text editor buffer. Keeping this inside the form means a
+    /// clarify request can never overwrite a message the user was already typing
+    /// in the main composer while the agent was running.
+    other_input: String,
+    /// UTF-8 byte offset into `other_input`, always on a character boundary.
+    other_cursor: usize,
+    /// Inline validation feedback (for example, an unanswered radio question).
+    validation: Option<String>,
+    responder: oneshot::Sender<Option<Vec<kernel::Answer>>>,
+}
+
+impl ClarifyState {
+    /// Row count for the current question: options + the "Other" row. Navigation
+    /// between questions is ←→; Enter submits ALL answers, so there is no
+    /// per-question "continue" row.
+    fn row_count(&self) -> usize {
+        self.questions[self.idx].options.len() + 1
+    }
+    fn other_row(&self) -> usize {
+        self.questions[self.idx].options.len()
+    }
+    /// Build the final answers from the drafts (option indices → labels + other).
+    fn answers(&self) -> Vec<kernel::Answer> {
+        self.questions
+            .iter()
+            .zip(self.drafts.iter())
+            .map(|(q, d)| kernel::Answer {
+                selected: d
+                    .selected
+                    .iter()
+                    .filter_map(|&i| q.options.get(i))
+                    .map(|o| o.label.clone())
+                    .collect(),
+                other: d.other.clone(),
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 struct ReasoningPanelState {
     enabled: Option<bool>,
@@ -475,20 +684,123 @@ enum PickerKind {
     /// `/skill` with no name: pick an installed skill to force-load. Holds
     /// (name, description) for each effective skill.
     Skill(Vec<(String, String)>),
+    /// Destructive user-skill removal always gets explicit confirmation.
+    RemoveSkill(String),
+    /// Provider presets shared with first-run setup, followed by Custom.
+    ProviderPreset,
+    /// Models the endpoint reported during setup — pick one instead of typing
+    /// an id blind. A trailing row keeps manual entry available.
+    ModelDiscovery(Vec<providers::openai_compat::ModelInfo>),
+    /// Saved provider/model profiles. Switching is available only while idle,
+    /// so a stream can never be retargeted midway through a response.
+    /// `active` is the profile driving THIS session (may differ from the
+    /// startup default) — it gets the ✓ mark and the initial cursor.
+    Model {
+        profiles: Vec<config::ModelProfile>,
+        active: String,
+    },
+    /// Pick a saved profile whose key should be added or replaced.
+    ModelCredential(Vec<config::ModelProfile>),
+    /// Pick which saved profile becomes the startup default.
+    ModelDefault(Vec<config::ModelProfile>),
+    /// Pick a saved profile to remove before entering confirmation.
+    ModelRemove(Vec<config::ModelProfile>),
+    /// Destructive profile removal always gets a second, explicit confirmation.
+    RemoveModel(String),
+    /// `/search` step 1: pick the web-search backend. Rows are the entries of
+    /// [`SEARCH_PROVIDERS`]; Tavily/Brave continue to a key, SearXNG to a URL,
+    /// DuckDuckGo finishes immediately.
+    SearchProvider,
+    /// `/mode`: pick the autonomy dial. Rows are [`AUTONOMY_MODES`]; choosing one
+    /// sets it live for the session.
+    AutonomyMode,
 }
+
+/// The autonomy levels offered by the `/mode` picker, with self-explanatory
+/// descriptions (the picker shows these verbatim). Order = increasing autonomy.
+const AUTONOMY_MODES: &[(kernel::AutonomyLevel, &str)] = &[
+    (
+        kernel::AutonomyLevel::Careful,
+        "careful — ask before every edit and shell command (safest)",
+    ),
+    (
+        kernel::AutonomyLevel::Normal,
+        "normal — auto-apply edits; still ask before shell commands",
+    ),
+    (
+        kernel::AutonomyLevel::Yolo,
+        "yolo — auto-apply edits AND shell; only dangerous ops (rm -rf, personal files, deploys) still ask",
+    ),
+];
+
+/// Providers offered by the `/search` picker, in display order. DuckDuckGo
+/// first: it needs no key and is the safe, always-available default.
+const SEARCH_PROVIDERS: &[(tools::SearchProvider, &str)] = &[
+    (
+        tools::SearchProvider::DuckDuckGo,
+        "DuckDuckGo — free, no key (default fallback)",
+    ),
+    (
+        tools::SearchProvider::Tavily,
+        "Tavily — LLM-optimized API (needs API key)",
+    ),
+    (
+        tools::SearchProvider::Brave,
+        "Brave — Search API (needs API key)",
+    ),
+    (
+        tools::SearchProvider::Searxng,
+        "SearXNG — your self-hosted instance (needs URL)",
+    ),
+];
 
 impl PickerKind {
     fn title(&self) -> String {
         match self {
-            PickerKind::Reasoning(_) => {
-                " reasoning — ↑↓ select, Enter change, Esc done ".into()
+            PickerKind::Reasoning(_) => " reasoning — ↑↓ select, Enter change, Esc done ".into(),
+            PickerKind::Session(_) => {
+                " resume a session — ↑↓ select, Enter open, Esc cancel ".into()
             }
-            PickerKind::Session(_) => " resume a session — ↑↓ select, Enter open, Esc cancel ".into(),
-            PickerKind::Rewind(_) => " rewind to a turn — ↑↓ select, Enter choose, Esc cancel ".into(),
+            PickerKind::Rewind(_) => {
+                " rewind to a turn — ↑↓ select, Enter choose, Esc cancel ".into()
+            }
             PickerKind::RewindMode(p) => {
-                format!(" rewind → “{}” — ↑↓ select, Enter apply, Esc back ", p.label)
+                format!(
+                    " rewind → “{}” — ↑↓ select, Enter apply, Esc back ",
+                    p.label
+                )
             }
             PickerKind::Skill(_) => " load a skill — ↑↓ select, Enter load, Esc cancel ".into(),
+            PickerKind::RemoveSkill(name) => {
+                format!(" remove user skill '{name}'? — ↑↓ move · Enter confirm · Esc back ")
+            }
+            PickerKind::ProviderPreset => {
+                " choose provider — ↑↓ move · Enter/→ continue · Esc/← back ".into()
+            }
+            PickerKind::ModelDiscovery(_) => {
+                " choose a model — ↑↓ move · Enter/→ select · Esc/← back ".into()
+            }
+            PickerKind::Model { .. } => {
+                " model — ↑↓ move · Enter/→ switch or open · Esc close ".into()
+            }
+            PickerKind::ModelCredential(_) => {
+                " update API key — ↑↓ move · Enter/→ continue · Esc/← back ".into()
+            }
+            PickerKind::ModelDefault(_) => {
+                " choose default model — ↑↓ move · Enter/→ save · Esc/← back ".into()
+            }
+            PickerKind::ModelRemove(_) => {
+                " choose model to remove — ↑↓ move · Enter/→ continue · Esc/← back ".into()
+            }
+            PickerKind::RemoveModel(name) => {
+                format!(" remove '{name}'? — ↑↓ move · Enter/→ confirm · Esc/← back ")
+            }
+            PickerKind::SearchProvider => {
+                " web search — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
+            }
+            PickerKind::AutonomyMode => {
+                " autonomy — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
+            }
         }
     }
     /// Dynamic labels for each row. For `Session`, each row is a one-line
@@ -500,9 +812,17 @@ impl PickerKind {
                 .iter()
                 .map(|s| {
                     let when = chrono::DateTime::from_timestamp(s.last_ts as i64, 0)
-                        .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+                        .map(|d| {
+                            d.with_timezone(&chrono::Local)
+                                .format("%m-%d %H:%M")
+                                .to_string()
+                        })
                         .unwrap_or_else(|| "?".into());
-                    let title = if s.title.is_empty() { "(no messages)" } else { &s.title };
+                    let title = if s.title.is_empty() {
+                        "(no messages)"
+                    } else {
+                        &s.title
+                    };
                     format!("{when} · {} events · {title}", s.events)
                 })
                 .collect(),
@@ -521,9 +841,107 @@ impl PickerKind {
                 })
                 .collect(),
             PickerKind::RewindMode(p) => p.scope_options().into_iter().map(|(l, _)| l).collect(),
-            PickerKind::Skill(skills) => {
-                skills.iter().map(|(n, d)| format!("{n} — {d}")).collect()
+            PickerKind::Skill(skills) => skills
+                .iter()
+                .map(|(n, d)| format!("{n} — {d}"))
+                .chain(std::iter::once(
+                    "⇩ Install a skill — local folder, GitHub folder, or raw SKILL.md".to_string(),
+                ))
+                .collect(),
+            PickerKind::RemoveSkill(_) => {
+                vec!["Keep skill".to_string(), "Remove user skill".to_string()]
             }
+            PickerKind::ProviderPreset => config::provider_presets()
+                .iter()
+                .enumerate()
+                .map(|(i, (name, url))| format!("{}. {name} — {url}", i + 1))
+                .chain(std::iter::once(format!(
+                    "{}. Custom — enter your own base URL",
+                    config::provider_presets().len() + 1
+                )))
+                .collect(),
+            PickerKind::ModelDiscovery(models) => models
+                .iter()
+                .map(|m| match m.context_length {
+                    Some(c) => format!("{} · {c} ctx", m.id),
+                    None => m.id.clone(),
+                })
+                .chain(std::iter::once("Type a model id manually…".to_string()))
+                .collect(),
+            PickerKind::Model { profiles, active } => {
+                // Models first (Enter switches immediately — the common case,
+                // as in other agent CLIs); management actions follow below.
+                let remove = if profiles.iter().any(|p| p.name != *active) {
+                    "− Remove a saved model"
+                } else {
+                    "− Remove a saved model · unavailable (only the active model is saved)"
+                };
+                profiles
+                    .iter()
+                    .map(|p| {
+                        let mark = if p.name == *active { "✓ " } else { "  " };
+                        let startup = if p.is_default {
+                            " · startup default"
+                        } else {
+                            ""
+                        };
+                        let ctx = p
+                            .provider
+                            .max_ctx
+                            .map(|n| format!(" · {n} ctx"))
+                            .unwrap_or_default();
+                        format!(
+                            "{}{} — {} · {}{}{}",
+                            mark, p.name, p.provider.model, p.provider.base_url, ctx, startup
+                        )
+                    })
+                    .chain(
+                        [
+                            "＋ Add a model (presets or custom URL + API key)".to_string(),
+                            "🔑 Add or update an API key".to_string(),
+                            "★ Set the default model".to_string(),
+                            remove.to_string(),
+                        ]
+                        .map(|s| format!("  {s}")),
+                    )
+                    .collect()
+            }
+            PickerKind::ModelCredential(profiles) => profiles
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{} — {} · {}",
+                        p.name, p.provider.model, p.provider.base_url
+                    )
+                })
+                .collect(),
+            PickerKind::ModelDefault(profiles) => profiles
+                .iter()
+                .map(|p| {
+                    let current = if p.is_default {
+                        " · current default"
+                    } else {
+                        ""
+                    };
+                    format!("{} — {}{}", p.name, p.provider.model, current)
+                })
+                .collect(),
+            PickerKind::ModelRemove(profiles) => profiles
+                .iter()
+                .map(|p| format!("{} — {}", p.name, p.provider.model))
+                .collect(),
+            PickerKind::RemoveModel(name) => vec![
+                "Cancel".to_string(),
+                format!("Remove '{name}' from saved models"),
+            ],
+            PickerKind::SearchProvider => SEARCH_PROVIDERS
+                .iter()
+                .map(|(_, desc)| (*desc).to_string())
+                .collect(),
+            PickerKind::AutonomyMode => AUTONOMY_MODES
+                .iter()
+                .map(|(_, desc)| (*desc).to_string())
+                .collect(),
         }
     }
 }
@@ -534,9 +952,143 @@ struct Picker {
     selected: usize,
 }
 
+/// Stages in the guided `/model add` flow. A form rather than a shell command
+/// keeps secrets out of terminal history and makes all required connection
+/// details discoverable for first-time users. There is deliberately no
+/// "profile name" question — the name is derived from the chosen model id
+/// (users kept pasting the model id into it).
+#[derive(Clone, Copy)]
+enum ModelSetupStep {
+    BaseUrl,
+    ApiKey,
+    /// `/v1/models` is being queried in the background; Enter is inert until
+    /// the result arrives (picker on success, manual ModelId on failure).
+    Discovering,
+    ModelId,
+    ContextWindow,
+}
+
+struct ModelSetup {
+    mode: ModelSetupMode,
+    step: ModelSetupStep,
+    base_url: String,
+    api_key: String,
+    model: String,
+    /// Context window carried over from discovery, when the server reports it.
+    max_ctx: Option<u32>,
+}
+
+enum ModelSetupMode {
+    Add,
+    UpdateKey { profile: String },
+}
+
+impl ModelSetup {
+    fn new() -> Self {
+        Self {
+            mode: ModelSetupMode::Add,
+            step: ModelSetupStep::BaseUrl,
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            max_ctx: None,
+        }
+    }
+
+    fn update_key(profile: String, base_url: String) -> Self {
+        Self {
+            mode: ModelSetupMode::UpdateKey { profile },
+            step: ModelSetupStep::ApiKey,
+            base_url,
+            api_key: String::new(),
+            model: String::new(),
+            max_ctx: None,
+        }
+    }
+
+    fn prompt(&self) -> &'static str {
+        match self.step {
+            ModelSetupStep::BaseUrl => {
+                "OpenAI-compatible base URL (for example http://localhost:11434/v1):"
+            }
+            ModelSetupStep::ApiKey => match &self.mode {
+                ModelSetupMode::Add => {
+                    "API key (leave blank for a local server; stored securely, never in config.toml):"
+                }
+                ModelSetupMode::UpdateKey { .. } => {
+                    "New API key (stored securely, never in config.toml):"
+                }
+            },
+            ModelSetupStep::Discovering => "Querying the server for its models… (Esc cancels)",
+            ModelSetupStep::ModelId => "Model ID (as the server names it):",
+            ModelSetupStep::ContextWindow => {
+                "Context window in tokens (optional; blank = unknown):"
+            }
+        }
+    }
+
+    fn is_secret(&self) -> bool {
+        matches!(self.step, ModelSetupStep::ApiKey)
+    }
+}
+
+/// Stages in the guided `/search` flow. Like `/model add`, a form (not a shell
+/// command) keeps the API key out of terminal history and the transcript.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchSetupStep {
+    /// The provider picker is open (owned by the generic picker handler).
+    Provider,
+    /// Entering the secret: an API key (Tavily/Brave, masked) or the instance
+    /// URL (SearXNG, not masked).
+    Secret,
+}
+
+/// In-flight `/search` draft. `provider` is set once the picker is confirmed.
+struct SearchSetup {
+    provider: tools::SearchProvider,
+    step: SearchSetupStep,
+}
+
+impl SearchSetup {
+    fn new() -> Self {
+        // DuckDuckGo is a placeholder until the picker sets the real choice.
+        Self {
+            provider: tools::SearchProvider::DuckDuckGo,
+            step: SearchSetupStep::Provider,
+        }
+    }
+
+    fn prompt(&self) -> &'static str {
+        match self.provider {
+            tools::SearchProvider::Tavily | tools::SearchProvider::Brave => {
+                "API key (stored securely, never in config.toml):"
+            }
+            tools::SearchProvider::Searxng => {
+                "SearXNG instance base URL (for example https://searx.example.com):"
+            }
+            tools::SearchProvider::DuckDuckGo => "",
+        }
+    }
+
+    /// True while entering a value that must be masked — an API key, not a URL.
+    fn is_secret(&self) -> bool {
+        self.step == SearchSetupStep::Secret
+            && matches!(
+                self.provider,
+                tools::SearchProvider::Tavily | tools::SearchProvider::Brave
+            )
+    }
+}
+
 impl Picker {
     fn new(kind: PickerKind) -> Self {
         Self { kind, selected: 0 }
+    }
+
+    /// Open with the cursor on a specific row (e.g. the active model), so
+    /// Enter with no navigation is a no-surprise confirm of the status quo.
+    fn with_selected(kind: PickerKind, selected: usize) -> Self {
+        Self { kind, selected }
     }
 }
 
@@ -584,6 +1136,24 @@ struct Model {
     model: String,
     /// Max context
     max_ctx: Option<u32>,
+    /// The saved profile currently active for this session. This is distinct
+    /// from `model`, which is the provider's model id and may be duplicated
+    /// across endpoints.
+    active_profile: String,
+    /// Persistent model profiles, shared with the main entrypoint so a TUI add
+    /// is immediately available to this and future sessions.
+    model_config: Arc<Mutex<config::Config>>,
+    /// `/model add` is a guided flow. Its API-key field is masked and never
+    /// enters history, the transcript, or config.toml.
+    model_setup: Option<ModelSetup>,
+    /// Live web-search settings shared with the `web.*` tools. `/search` writes
+    /// it so a provider change takes effect on the next search without restart.
+    search: tools::SearchHandle,
+    /// `/search` is a guided flow like `/model add`; its key field is masked.
+    search_setup: Option<SearchSetup>,
+    /// Autonomy dial (`/mode`): how much runs without asking. Applied to the
+    /// session at the start of each turn; the safety floor is level-independent.
+    autonomy: kernel::AutonomyLevel,
     /// Whether agent turn is running
     running: bool,
     /// Tool whose call is currently streaming: (name, optional target file/command).
@@ -605,6 +1175,8 @@ struct Model {
     /// silent `Approval::Deny` (the "rejected by human" after a real approval).
     /// Queue them instead and advance as each is answered.
     pending_approvals: VecDeque<PendingApproval>,
+    /// In-flight `clarify` question form (owns input while `Some`).
+    clarify: Option<ClarifyState>,
     /// Selected approval option (0=Yes, 1=Yes-all, 2=No)
     approval_sel: usize,
     /// Auto-approved tool classes for session
@@ -687,12 +1259,19 @@ impl Model {
             cost_usd: None,
             model,
             max_ctx,
+            active_profile: String::new(),
+            model_config: Arc::new(Mutex::new(config::Config::default())),
+            model_setup: None,
+            search: Arc::new(Mutex::new(tools::SearchSettings::default())),
+            search_setup: None,
+            autonomy: kernel::AutonomyLevel::Careful,
             running: false,
             current_tool: None,
             turn_started: None,
             interrupt: None,
             cancelling: false,
             pending_approvals: VecDeque::new(),
+            clarify: None,
             approval_sel: 0,
             auto_approve: std::collections::HashSet::new(),
             reasoning,
@@ -720,9 +1299,30 @@ impl Model {
 
     /// Wire the skill store (project + user dirs) and the session's tool names so
     /// `/skills` can list them. Set once in `run_tea`.
-    fn with_skills(mut self, store: Arc<tools::SkillStore>, known_tools: std::collections::HashSet<String>) -> Self {
+    fn with_skills(
+        mut self,
+        store: Arc<tools::SkillStore>,
+        known_tools: std::collections::HashSet<String>,
+    ) -> Self {
         self.skills = Some(store);
         self.known_tools = Arc::new(known_tools);
+        self
+    }
+
+    fn with_model_profiles(
+        mut self,
+        profiles: Arc<Mutex<config::Config>>,
+        active_profile: String,
+    ) -> Self {
+        self.model_config = profiles;
+        self.active_profile = active_profile;
+        self
+    }
+
+    /// Share the tools' live search-settings handle so `/search` updates the
+    /// same settings the running `web.*` tools read.
+    fn with_search(mut self, search: tools::SearchHandle) -> Self {
+        self.search = search;
         self
     }
 
@@ -733,7 +1333,9 @@ impl Model {
     /// one; no-op when skills aren't wired or transcript[0] isn't the system msg.
     fn refresh_skill_manifest(&self, transcript: &mut [Message]) {
         let Some(store) = &self.skills else { return };
-        let Some(sys) = transcript.first_mut() else { return };
+        let Some(sys) = transcript.first_mut() else {
+            return;
+        };
         if sys.role != kernel::Role::System {
             return;
         }
@@ -769,7 +1371,13 @@ impl Model {
             } else {
                 format!("  (unavailable: needs {})", l.missing_tools.join(", "))
             };
-            out.push_str(&format!("\n  {} [{}]  {}{}", s.name, s.scope.as_str(), s.description, avail));
+            out.push_str(&format!(
+                "\n  {} [{}]  {}{}",
+                s.name,
+                s.scope.as_str(),
+                s.description,
+                avail
+            ));
         }
         for l in disc.listings.iter().filter(|l| l.shadowed) {
             out.push_str(&format!(
@@ -807,12 +1415,20 @@ impl Model {
         }
         self.approval_sel = 0;
         self.approval_ready = false;
+        // Also drop any live clarify form (its tool future is gone once the turn
+        // settles) so a stale question can't linger on screen owning input.
+        if let Some(state) = self.clarify.take() {
+            let _ = state.responder.send(None);
+        }
     }
 
     /// The declared category of a tool (from the executor specs), or `Other` if
     /// the surface hasn't been told about it.
     fn category(&self, tool: &str) -> ToolCategory {
-        self.tool_viz.get(tool).map(|v| v.category).unwrap_or(ToolCategory::Other)
+        self.tool_viz
+            .get(tool)
+            .map(|v| v.category)
+            .unwrap_or(ToolCategory::Other)
     }
 
     /// Expand paste placeholder tokens back into their full content before a line
@@ -827,7 +1443,9 @@ impl Model {
 
     fn scroll_by(&mut self, delta: i32) {
         let max = self.max_scroll();
-        let next = (self.scroll_offset as i32).saturating_add(delta).clamp(0, max as i32) as usize;
+        let next = (self.scroll_offset as i32)
+            .saturating_add(delta)
+            .clamp(0, max as i32) as usize;
         self.scroll_offset = next;
         self.auto_scroll = next >= max;
     }
@@ -930,7 +1548,11 @@ impl Model {
 
     fn reasoning_trace_label(&self) -> &'static str {
         if self.running {
-            if self.reasoning_received_this_turn { "receiving" } else { "waiting" }
+            if self.reasoning_received_this_turn {
+                "receiving"
+            } else {
+                "waiting"
+            }
         } else {
             match self.last_turn_reasoning_received {
                 Some(true) => "received",
@@ -1009,6 +1631,9 @@ pub async fn run_tea<P, L>(
     system: String,
     model_name: String,
     max_ctx: Option<u32>,
+    model_profiles: Arc<Mutex<config::Config>>,
+    active_profile: String,
+    open_setup: bool,
     budget: Budget,
     ui: lockfile::UiConfig,
     resumed: Vec<Message>,
@@ -1016,11 +1641,12 @@ pub async fn run_tea<P, L>(
     stray_log: std::path::PathBuf,
     skill_store: Arc<tools::SkillStore>,
     known_tools: std::collections::HashSet<String>,
+    search_handle: tools::SearchHandle,
     tx: mpsc::UnboundedSender<TuiEvent>,
     mut rx: mpsc::UnboundedReceiver<TuiEvent>,
 ) -> anyhow::Result<()>
 where
-    P: Provider + 'static,
+    P: ProfileProvider + 'static,
     L: EventLog + 'static,
 {
     // Terminal setup with panic-safe restore hook (PART 0/2). Draws on a private
@@ -1034,10 +1660,35 @@ where
         .executor
         .specs()
         .into_iter()
-        .map(|s| (s.name, ToolViz { icon: s.icon, category: s.category }))
+        .map(|s| {
+            (
+                s.name,
+                ToolViz {
+                    icon: s.icon,
+                    category: s.category,
+                },
+            )
+        })
         .collect();
-    let mut model = Model::new(model_name, max_ctx, kernel.provider.reasoning(), ui, tool_viz, restore)
-        .with_skills(skill_store, known_tools);
+    let mut model = Model::new(
+        model_name,
+        max_ctx,
+        kernel.provider.reasoning(),
+        ui,
+        tool_viz,
+        restore,
+    )
+    .with_skills(skill_store, known_tools)
+    .with_model_profiles(model_profiles, active_profile)
+    .with_search(search_handle);
+    // Reflect the session's starting autonomy (from lock/MEDHA_MODE) in the TUI.
+    model.autonomy = session.autonomy;
+    // First run (nothing configured) or explicit `medha --setup`: open the
+    // model-setup form immediately — the same surface `/model add` uses. The
+    // quiet variant keeps the welcome identity screen visible behind the form.
+    if open_setup {
+        update::open_model_setup_quiet(&mut model);
+    }
     let mut transcript = vec![Message::system(system)];
     transcript.extend(resumed); // prior conversation when resuming (else empty)
     let mut events = EventStream::new();
@@ -1049,7 +1700,9 @@ where
 
     // Async event loop driven directly on the current runtime (PART 0.4).
     loop {
-        if model.should_quit { break; }
+        if model.should_quit {
+            break;
+        }
 
         // Input (scroll/keys) redraws IMMEDIATELY (bypasses the frame throttle) so
         // scrolling steps evenly and feels responsive, instead of coalescing a burst
@@ -1113,7 +1766,6 @@ where
             model.last_redraw = Instant::now();
             redraw_needed = false;
         }
-
     }
 
     // Restore terminal on exit (PART 2): leave the alternate screen on the
@@ -1157,8 +1809,12 @@ mod tests {
         let mut known = std::collections::HashSet::new();
         known.insert("fs.write".to_string());
         let model = Model::new(
-            "m".into(), None, kernel::ReasoningConfig::default(),
-            lockfile::UiConfig::default(), HashMap::new(), test_sbx(),
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            lockfile::UiConfig::default(),
+            HashMap::new(),
+            test_sbx(),
         )
         .with_skills(store, known);
 
@@ -1169,7 +1825,10 @@ mod tests {
         assert!(transcript[0].content.contains("note-taker"));
         // Idempotent: a second refresh must not stack a duplicate section.
         model.refresh_skill_manifest(&mut transcript);
-        assert_eq!(transcript[0].content.matches("## Skills available").count(), 1);
+        assert_eq!(
+            transcript[0].content.matches("## Skills available").count(),
+            1
+        );
         assert!(transcript[0].content.starts_with("BASE PROMPT"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1180,26 +1839,45 @@ mod tests {
     fn rewind_scope_menu_hides_code_options_when_nothing_to_undo() {
         // No file edits from this point on → only "restore conversation" + cancel;
         // offering a code rollback that reverts nothing would be misleading.
-        let p = RewindPoint { at_event: ulid::Ulid::new(), label: "hi".into(), files: 0 };
+        let p = RewindPoint {
+            at_event: ulid::Ulid::new(),
+            label: "hi".into(),
+            files: 0,
+        };
         let opts = p.scope_options();
         assert_eq!(opts.len(), 2);
         assert_eq!(opts[0].1, Some(RewindScope::Conversation));
         assert_eq!(opts[1].1, None, "last row is cancel");
-        assert!(!opts.iter().any(|(_, s)| matches!(s, Some(RewindScope::ConversationAndCode | RewindScope::Code))));
+        assert!(!opts.iter().any(|(_, s)| matches!(
+            s,
+            Some(RewindScope::ConversationAndCode | RewindScope::Code)
+        )));
     }
 
     #[test]
     fn rewind_scope_menu_offers_all_three_with_count_when_edits_exist() {
         // Order: code+conversation, conversation, code, then cancel.
-        let p = RewindPoint { at_event: ulid::Ulid::new(), label: "hi".into(), files: 3 };
+        let p = RewindPoint {
+            at_event: ulid::Ulid::new(),
+            label: "hi".into(),
+            files: 3,
+        };
         let opts = p.scope_options();
         assert_eq!(opts.len(), 4);
         assert_eq!(opts[0].1, Some(RewindScope::ConversationAndCode));
         // "tracked" is deliberate (K18): only snapshot-tracked writes revert.
-        assert!(opts[0].0.contains("3 tracked files"), "count shown: {}", opts[0].0);
+        assert!(
+            opts[0].0.contains("3 tracked files"),
+            "count shown: {}",
+            opts[0].0
+        );
         assert_eq!(opts[1].1, Some(RewindScope::Conversation));
         assert_eq!(opts[2].1, Some(RewindScope::Code));
-        assert!(opts[2].0.contains("3 tracked files"), "count shown: {}", opts[2].0);
+        assert!(
+            opts[2].0.contains("3 tracked files"),
+            "count shown: {}",
+            opts[2].0
+        );
         assert_eq!(opts[3].1, None, "last row is cancel");
     }
 
@@ -1218,7 +1896,10 @@ mod tests {
         assert!(out.contains("↑↓"));
         // Explicit ready signal so the card can't be mistaken for "still generating".
         assert!(out.contains("waiting for your input"));
-        assert!(!out.contains('┌') && !out.contains('│') && !out.contains('╭'), "approval must not draw a box");
+        assert!(
+            !out.contains('┌') && !out.contains('│') && !out.contains('╭'),
+            "approval must not draw a box"
+        );
     }
 
     #[test]
@@ -1235,9 +1916,18 @@ mod tests {
     #[test]
     fn typing_and_editing_multibyte_does_not_panic() {
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            ui,
+            HashMap::new(),
+            test_sbx(),
+        );
         // Type "café" then a trailing char — the classic char-vs-byte panic case.
-        for c in "café".chars() { m.insert_char(c); }
+        for c in "café".chars() {
+            m.insert_char(c);
+        }
         m.insert_char('!');
         assert_eq!(m.input, "café!");
         assert_eq!(m.cursor, m.input.len()); // byte offset, on a boundary
@@ -1263,10 +1953,19 @@ mod tests {
         new[20] = "line 20 CHANGED".to_string();
         let rows = hunk_rows(&old.join("\n"), &new.join("\n"));
         // Far-away unchanged lines must be collapsed, not emitted one-by-one.
-        assert!(rows.iter().any(|r| matches!(r, DiffRow::Gap(n) if *n > 0)), "expected a gap marker");
-        assert!(rows.iter().any(|r| matches!(r, DiffRow::Ins(_, t) if t.contains("CHANGED"))));
+        assert!(
+            rows.iter().any(|r| matches!(r, DiffRow::Gap(n) if *n > 0)),
+            "expected a gap marker"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r, DiffRow::Ins(_, t) if t.contains("CHANGED")))
+        );
         // Only context (3) around the change on each side survives, never all 40 lines.
-        let ctx = rows.iter().filter(|r| matches!(r, DiffRow::Ctx(..))).count();
+        let ctx = rows
+            .iter()
+            .filter(|r| matches!(r, DiffRow::Ctx(..)))
+            .count();
         assert!(ctx <= 8, "kept too much context: {ctx}");
     }
 
@@ -1275,15 +1974,26 @@ mod tests {
         // All-additions (new file) at wide width must NOT go side-by-side (which
         // would waste the whole left column) — single column instead.
         let out = block(&render_diff("", "line a\nline b\nline c", "f.rs", 200));
-        assert!(!out.contains('│'), "one-sided diff should be single-column: {out}");
+        assert!(
+            !out.contains('│'),
+            "one-sided diff should be single-column: {out}"
+        );
         assert!(out.contains("line a"));
     }
 
     #[test]
     fn diff_modification_uses_side_by_side_when_wide() {
         // A real modification (deletion + insertion) at wide width uses side-by-side.
-        let out = block(&render_diff("old line\ncommon", "new line\ncommon", "f.rs", 200));
-        assert!(out.contains('│'), "modification should be side-by-side when wide: {out}");
+        let out = block(&render_diff(
+            "old line\ncommon",
+            "new line\ncommon",
+            "f.rs",
+            200,
+        ));
+        assert!(
+            out.contains('│'),
+            "modification should be side-by-side when wide: {out}"
+        );
     }
 
     #[test]
@@ -1291,7 +2001,11 @@ mod tests {
         let line = Line::from(Span::styled("abcdefghij", Style::default().fg(theme::TEXT)));
         let rows = wrap_line(&line, 4);
         assert_eq!(rows.len(), 3, "10 chars / width 4 = 3 rows");
-        let joined: String = rows.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.to_string()).collect();
+        let joined: String = rows
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect();
         assert_eq!(joined, "abcdefghij");
         assert!(rows.iter().all(|r| text(r).chars().count() <= 4));
     }
@@ -1301,7 +2015,10 @@ mod tests {
         let rows = wrap_line(&Line::from("hello world foo"), 8);
         let texts: Vec<String> = rows.iter().map(text).collect();
         assert!(texts.iter().all(|t| t.chars().count() <= 8), "{texts:?}");
-        assert!(texts.iter().all(|t| !t.starts_with(' ')), "breaking space should be dropped: {texts:?}");
+        assert!(
+            texts.iter().all(|t| !t.starts_with(' ')),
+            "breaking space should be dropped: {texts:?}"
+        );
         assert_eq!(texts, vec!["hello", "world", "foo"]);
     }
 
@@ -1322,7 +2039,9 @@ mod tests {
         assert!(is_slash_command("/think on"));
         assert!(is_slash_command("/effort high"));
         // A pasted absolute path is CHAT, not an unknown-command error.
-        assert!(!is_slash_command("/Users/x/medha/learn.html open this in browser"));
+        assert!(!is_slash_command(
+            "/Users/x/medha/learn.html open this in browser"
+        ));
         assert!(!is_slash_command("/tmp/foo.txt"));
         // Near-miss typo goes to the model too (autocomplete guides while typing).
         assert!(!is_slash_command("/claer"));
@@ -1332,23 +2051,55 @@ mod tests {
     #[test]
     fn steer_events_promote_queued_notice_and_return_unsent_text() {
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            ui,
+            HashMap::new(),
+            test_sbx(),
+        );
         let mut session = kernel::Session::new();
         let mut transcript: Vec<Message> = Vec::new();
 
         // Steer queued in the TUI → notice; kernel applies it → Steered
         // promotes the notice to a real user line (exactly one).
         m.push_notice("↳ queued for this task: check the tests");
-        update::handle_agent_event(&mut m, TuiEvent::Steered("check the tests".into()), &mut session, &mut transcript);
-        assert!(!m.items.iter().any(|e| matches!(&e.item, Item::Notice(n) if n.starts_with("↳ queued"))));
-        assert!(m.items.iter().any(|e| matches!(&e.item, Item::User(s) if s == "check the tests")));
+        update::handle_agent_event(
+            &mut m,
+            TuiEvent::Steered("check the tests".into()),
+            &mut session,
+            &mut transcript,
+        );
+        assert!(
+            !m.items
+                .iter()
+                .any(|e| matches!(&e.item, Item::Notice(n) if n.starts_with("↳ queued")))
+        );
+        assert!(
+            m.items
+                .iter()
+                .any(|e| matches!(&e.item, Item::User(s) if s == "check the tests"))
+        );
 
         // Cancel raced a steer → the text lands back in the input box.
         m.push_notice("↳ queued for this task: do Y instead");
-        update::handle_agent_event(&mut m, TuiEvent::SteersReturned(vec!["do Y instead".into()]), &mut session, &mut transcript);
-        assert_eq!(m.input, "do Y instead", "returned steer must be editable, not lost");
+        update::handle_agent_event(
+            &mut m,
+            TuiEvent::SteersReturned(vec!["do Y instead".into()]),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(
+            m.input, "do Y instead",
+            "returned steer must be editable, not lost"
+        );
         assert_eq!(m.cursor, m.input.len());
-        assert!(!m.items.iter().any(|e| matches!(&e.item, Item::Notice(n) if n.starts_with("↳ queued"))));
+        assert!(
+            !m.items
+                .iter()
+                .any(|e| matches!(&e.item, Item::Notice(n) if n.starts_with("↳ queued")))
+        );
     }
 
     #[test]
@@ -1357,15 +2108,35 @@ mod tests {
         // deltas must build ONE visible Assistant item; only Reasoning deltas
         // may create a (collapsible) Thinking item.
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            ui,
+            HashMap::new(),
+            test_sbx(),
+        );
         let mut session = kernel::Session::new();
         let mut transcript: Vec<Message> = Vec::new();
 
         // A pure-text answer that mentions think tags — streamed in deltas.
-        for d in ["Shape 2: `<think>", "` tags) and the rest ", "of the answer"] {
-            update::handle_agent_event(&mut m, TuiEvent::Text(d.to_string()), &mut session, &mut transcript);
+        for d in [
+            "Shape 2: `<think>",
+            "` tags) and the rest ",
+            "of the answer",
+        ] {
+            update::handle_agent_event(
+                &mut m,
+                TuiEvent::Text(d.to_string()),
+                &mut session,
+                &mut transcript,
+            );
         }
-        let thinking = m.items.iter().filter(|e| matches!(e.item, Item::Thinking(_))).count();
+        let thinking = m
+            .items
+            .iter()
+            .filter(|e| matches!(e.item, Item::Thinking(_)))
+            .count();
         assert_eq!(thinking, 0, "no Thinking item for a text-only answer");
         assert!(
             m.items.iter().any(|e| matches!(&e.item, Item::Assistant(s) if s == "Shape 2: `<think>` tags) and the rest of the answer")),
@@ -1373,20 +2144,101 @@ mod tests {
         );
 
         // Genuine reasoning deltas DO make a Thinking item, answer separate.
-        update::handle_agent_event(&mut m, TuiEvent::Reasoning("planning".into()), &mut session, &mut transcript);
-        update::handle_agent_event(&mut m, TuiEvent::Text("done.".into()), &mut session, &mut transcript);
-        assert!(m.items.iter().any(|e| matches!(&e.item, Item::Thinking(s) if s == "planning")));
-        assert!(m.items.iter().any(|e| matches!(&e.item, Item::Assistant(s) if s == "done.")));
+        update::handle_agent_event(
+            &mut m,
+            TuiEvent::Reasoning("planning".into()),
+            &mut session,
+            &mut transcript,
+        );
+        update::handle_agent_event(
+            &mut m,
+            TuiEvent::Text("done.".into()),
+            &mut session,
+            &mut transcript,
+        );
+        assert!(
+            m.items
+                .iter()
+                .any(|e| matches!(&e.item, Item::Thinking(s) if s == "planning"))
+        );
+        assert!(
+            m.items
+                .iter()
+                .any(|e| matches!(&e.item, Item::Assistant(s) if s == "done."))
+        );
+    }
+
+    // Resume regression: tool RESULTS must replay into the transcript, not
+    // just the calls — outputs silently vanished from resumed sessions once.
+    #[test]
+    fn resumed_history_replays_tool_results_with_their_tool_names() {
+        let ui = lockfile::UiConfig::default();
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            ui,
+            HashMap::new(),
+            test_sbx(),
+        );
+        let msgs = vec![
+            Message::user("list files"),
+            Message::assistant_calls(
+                "checking",
+                vec![kernel::ToolIntent {
+                    id: "call-1".into(),
+                    tool: "fs.list".into(),
+                    args: serde_json::json!({"path": "."}),
+                }],
+            ),
+            Message::tool_result("call-1", r#"{"entries": 3}"#),
+            Message::tool_result("call-1", r#"{"error": "denied"}"#),
+        ];
+        update::repaint_history(&mut m, &msgs);
+        assert!(
+            m.items
+                .iter()
+                .any(|e| matches!(&e.item, Item::ToolCall { tool, .. } if tool == "fs.list"))
+        );
+        assert!(
+            m.items.iter().any(
+                |e| matches!(&e.item, Item::ToolResult { tool, ok: true, .. } if tool == "fs.list")
+            ),
+            "successful result replays with its tool name"
+        );
+        assert!(
+            m.items
+                .iter()
+                .any(|e| matches!(&e.item, Item::ToolResult { ok: false, .. })),
+            "error payloads replay as failures"
+        );
     }
 
     #[test]
     fn upsert_notice_replaces_the_previous_matching_block() {
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
-        m.upsert_notice("background tasks", "background tasks:\n  t1 [running] find".into());
-        m.upsert_notice("background tasks", "background tasks:\n  t1 [done] find".into());
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            ui,
+            HashMap::new(),
+            test_sbx(),
+        );
+        m.upsert_notice(
+            "background tasks",
+            "background tasks:\n  t1 [running] find".into(),
+        );
+        m.upsert_notice(
+            "background tasks",
+            "background tasks:\n  t1 [done] find".into(),
+        );
         let notices: Vec<&Item> = m.items.iter().map(|e| &e.item).collect();
-        assert_eq!(notices.len(), 1, "re-running /tasks must refresh, not stack");
+        assert_eq!(
+            notices.len(),
+            1,
+            "re-running /tasks must refresh, not stack"
+        );
         assert!(matches!(notices[0], Item::Notice(n) if n.contains("[done]")));
         // A different item in between → a fresh block is appended, not merged.
         m.push_item(Item::User("hi".into()));
@@ -1399,19 +2251,26 @@ mod tests {
         // K15: the prefix-cache path must produce byte-identical rows to a
         // from-scratch render at every step of a simulated stream.
         let cats = HashMap::new();
-        let cx = RenderCtx { width: 12, full_transparency: false, show_thinking: true, show_summary: false, viz: &cats };
+        let cx = RenderCtx {
+            width: 12,
+            full_transparency: false,
+            show_thinking: true,
+            show_summary: false,
+            viz: &cats,
+        };
         let mut streamed = Entry::new(Item::Assistant(String::new()));
         let mut acc = String::new();
         for delta in ["- [x] do", "ne\nnow a long", " line that wraps\n", "tail"] {
             acc.push_str(delta);
-            if let Item::Assistant(buf) = &mut streamed.item { buf.push_str(delta); }
+            if let Item::Assistant(buf) = &mut streamed.item {
+                buf.push_str(delta);
+            }
             streamed.invalidate();
             streamed.ensure(&cx, 12);
             let mut fresh = Entry::new(Item::Assistant(acc.clone()));
             fresh.ensure(&cx, 12);
-            let flat = |e: &Entry| -> Vec<String> {
-                e.lines.as_ref().unwrap().iter().map(text).collect()
-            };
+            let flat =
+                |e: &Entry| -> Vec<String> { e.lines.as_ref().unwrap().iter().map(text).collect() };
             assert_eq!(flat(&streamed), flat(&fresh), "diverged after {acc:?}");
             assert_eq!(streamed.height, fresh.height);
         }
@@ -1420,7 +2279,10 @@ mod tests {
         streamed.ensure(&cx, 7);
         let mut fresh = Entry::new(Item::Assistant(acc.clone()));
         fresh.ensure(&cx, 7);
-        assert_eq!(streamed.height, fresh.height, "cache must not survive a width change");
+        assert_eq!(
+            streamed.height, fresh.height,
+            "cache must not survive a width change"
+        );
     }
 
     #[test]
@@ -1431,11 +2293,19 @@ mod tests {
         let rows = wrap_line(&Line::from("你好世界"), 4);
         let texts: Vec<String> = rows.iter().map(text).collect();
         assert_eq!(texts, vec!["你好", "世界"]);
-        assert!(texts.iter().all(|t| UnicodeWidthStr::width(t.as_str()) <= 4));
+        assert!(
+            texts
+                .iter()
+                .all(|t| UnicodeWidthStr::width(t.as_str()) <= 4)
+        );
         // Cursor/layout side: emoji before the cursor offsets it by 2 cells.
         let (rows, crow, ccol) = view::layout_input("🙂ab", 3, 80);
         assert_eq!(rows, vec!["🙂ab".to_string()]);
-        assert_eq!((crow, ccol), (0, 4), "cursor lands after 2-cell emoji + 2 chars");
+        assert_eq!(
+            (crow, ccol),
+            (0, 4),
+            "cursor lands after 2-cell emoji + 2 chars"
+        );
     }
 
     #[test]
@@ -1443,24 +2313,45 @@ mod tests {
         // The virtualization invariant: an item's reported height is exactly the
         // number of physical rows it renders (so scroll math can't drift).
         let cats = HashMap::new();
-        let cx = RenderCtx { width: 20, full_transparency: false, show_thinking: true, show_summary: false, viz: &cats };
-        let mut e = Entry::new(Item::Assistant("a fairly long line that must wrap across several rows here".into()));
+        let cx = RenderCtx {
+            width: 20,
+            full_transparency: false,
+            show_thinking: true,
+            show_summary: false,
+            viz: &cats,
+        };
+        let mut e = Entry::new(Item::Assistant(
+            "a fairly long line that must wrap across several rows here".into(),
+        ));
         e.ensure(&cx, 20);
         assert_eq!(e.height, e.lines.as_ref().unwrap().len());
-        assert!(e.height > 1, "long line should wrap to multiple physical rows");
+        assert!(
+            e.height > 1,
+            "long line should wrap to multiple physical rows"
+        );
     }
 
     #[test]
     fn activity_label_shows_streaming_tool_and_target() {
         let ui = lockfile::UiConfig::default();
         // The surface learns tool presentation from the executor specs; simulate it.
-        let viz = |icon: &str, c: ToolCategory| ToolViz { icon: icon.into(), category: c };
+        let viz = |icon: &str, c: ToolCategory| ToolViz {
+            icon: icon.into(),
+            category: c,
+        };
         let cats = HashMap::from([
             ("fs.write".to_string(), viz("✎", ToolCategory::Write)),
             ("fs.read".to_string(), viz("◇", ToolCategory::Read)),
             ("shell.exec".to_string(), viz("❯", ToolCategory::Shell)),
         ]);
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, cats, test_sbx());
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            ui,
+            cats,
+            test_sbx(),
+        );
         // A streaming write shows the file basename — "writing medha.html", not "thinking".
         m.current_tool = Some(("fs.write".into(), Some("/Users/x/medha/medha.html".into())));
         assert_eq!(activity_label(&m), "writing medha.html");
@@ -1481,7 +2372,13 @@ mod tests {
     #[test]
     fn entry_memoizes_render() {
         let cats = HashMap::new();
-        let cx = RenderCtx { width: 80, full_transparency: false, show_thinking: true, show_summary: false, viz: &cats };
+        let cx = RenderCtx {
+            width: 80,
+            full_transparency: false,
+            show_thinking: true,
+            show_summary: false,
+            viz: &cats,
+        };
         let mut e = Entry::new(Item::User("hi".into()));
         assert!(e.lines.is_none());
         e.ensure(&cx, 80);
@@ -1495,12 +2392,18 @@ mod tests {
 
     #[test]
     fn diff_render_shows_gap_and_change() {
-        let old = (0..30).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        let old = (0..30)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut v: Vec<String> = (0..30).map(|i| format!("l{i}")).collect();
         v[15] = "l15!".to_string();
         let new = v.join("\n");
         let out = block(&render_diff(&old, &new, "f.rs", 80));
-        assert!(out.contains("unchanged line"), "should show a collapsed-context marker: {out}");
+        assert!(
+            out.contains("unchanged line"),
+            "should show a collapsed-context marker: {out}"
+        );
         assert!(out.contains("l15!"));
     }
 
@@ -1516,11 +2419,17 @@ mod tests {
     #[test]
     fn expand_tokens_round_trips_and_ignores_plain_text() {
         let pastes = vec!["FULL CONTENT".to_string()];
-        assert_eq!(expand_paste_tokens(&pastes, "before [paste #0: 12 chars] after"), "before FULL CONTENT after");
+        assert_eq!(
+            expand_paste_tokens(&pastes, "before [paste #0: 12 chars] after"),
+            "before FULL CONTENT after"
+        );
         // A bare bracket that isn't a real token is left untouched.
         assert_eq!(expand_paste_tokens(&pastes, "arr[0] = 1"), "arr[0] = 1");
         // No pastes → identity.
-        assert_eq!(expand_paste_tokens(&[], "[paste #0: 5 chars]"), "[paste #0: 5 chars]");
+        assert_eq!(
+            expand_paste_tokens(&[], "[paste #0: 5 chars]"),
+            "[paste #0: 5 chars]"
+        );
     }
 
     // ---- approval queue: concurrent approvals must not clobber each other ----
@@ -1536,7 +2445,11 @@ mod tests {
         push_approval_ex(model, action, false)
     }
 
-    fn push_approval_ex(model: &mut Model, action: &str, escalated: bool) -> oneshot::Receiver<kernel::Approval> {
+    fn push_approval_ex(
+        model: &mut Model,
+        action: &str,
+        escalated: bool,
+    ) -> oneshot::Receiver<kernel::Approval> {
         let (tx, rx) = oneshot::channel();
         let ev = TuiEvent::Approval(action.to_string(), None, escalated, tx);
         // Drive the same path handle_agent_event uses, minus the generic plumbing.
@@ -1546,7 +2459,12 @@ mod tests {
                     let _ = responder.send(kernel::Approval::Once);
                 } else {
                     let was_empty = model.pending_approvals.is_empty();
-                    model.pending_approvals.push_back(PendingApproval { action, detail, escalated, responder });
+                    model.pending_approvals.push_back(PendingApproval {
+                        action,
+                        detail,
+                        escalated,
+                        responder,
+                    });
                     if was_empty {
                         model.approval_sel = 0;
                         model.approval_ready = false;
@@ -1562,25 +2480,47 @@ mod tests {
     #[test]
     fn escalated_approval_is_never_auto_approved() {
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            ui,
+            HashMap::new(),
+            test_sbx(),
+        );
         // The user previously chose "always" for this exact action.
-        m.auto_approve.insert("shell.exec: curl example.com".to_string());
+        m.auto_approve
+            .insert("shell.exec: curl example.com".to_string());
 
         // A normal request for it auto-approves (no card queued).
         let mut rx = push_approval_ex(&mut m, "shell.exec: curl example.com", false);
-        assert!(m.pending_approvals.is_empty(), "remembered action auto-approves");
+        assert!(
+            m.pending_approvals.is_empty(),
+            "remembered action auto-approves"
+        );
         assert_eq!(rx.try_recv(), Ok(kernel::Approval::Once));
 
         // The SAME action, but trust-flow ESCALATED (web-tainted), must NOT be
         // auto-approved — it queues a fresh card for review (K9).
         let _rx2 = push_approval_ex(&mut m, "shell.exec: curl example.com", true);
-        assert_eq!(m.pending_approvals.len(), 1, "escalated action is always re-asked, never waved through");
+        assert_eq!(
+            m.pending_approvals.len(),
+            1,
+            "escalated action is always re-asked, never waved through"
+        );
     }
 
     #[test]
     fn concurrent_approvals_queue_without_dropping_responders() {
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            ui,
+            HashMap::new(),
+            test_sbx(),
+        );
 
         // Two approvals arrive back-to-back (the concurrent-dispatch case).
         let mut rx1 = push_approval(&mut m, "Read access to /outside/a");
@@ -1588,20 +2528,32 @@ mod tests {
 
         // Both are queued; the first is the one rendered/answerable.
         assert_eq!(m.pending_approvals.len(), 2);
-        assert_eq!(m.pending_approval().map(|p| p.action.as_str()), Some("Read access to /outside/a"));
+        assert_eq!(
+            m.pending_approval().map(|p| p.action.as_str()),
+            Some("Read access to /outside/a")
+        );
 
         // Answer the visible one (Yes, allow once). Its responder must fire.
         m.approval_ready = true;
-        handle_approval_key(&mut m, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        handle_approval_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
         assert_eq!(rx1.try_recv(), Ok(kernel::Approval::Once));
 
         // The second approval is now front-and-center — NOT dropped.
         assert_eq!(m.pending_approvals.len(), 1);
-        assert_eq!(m.pending_approval().map(|p| p.action.as_str()), Some("Read access to /outside/b"));
+        assert_eq!(
+            m.pending_approval().map(|p| p.action.as_str()),
+            Some("Read access to /outside/b")
+        );
 
         // Answer it too; its responder fires as well (this was the dropped one).
         m.approval_ready = true;
-        handle_approval_key(&mut m, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        handle_approval_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
         assert_eq!(rx2.try_recv(), Ok(kernel::Approval::Deny));
         assert!(m.pending_approvals.is_empty());
     }
@@ -1614,15 +2566,29 @@ mod tests {
         // handler intercepts it before handle_approval_key ever runs).
         let lines = render_approval("fs_write", None, 0);
         let help = block(&lines);
-        assert!(!help.contains("esc to reject"), "help text still ties Esc to deny: {help}");
+        assert!(
+            !help.contains("esc to reject"),
+            "help text still ties Esc to deny: {help}"
+        );
 
         // And at the queue level: routing Esc through handle_approval_key must not
         // pop or answer anything (Esc is handled by the caller, not here).
         let ui = lockfile::UiConfig::default();
-        let mut m = Model::new("m".into(), None, kernel::ReasoningConfig::default(), ui, HashMap::new(), test_sbx());
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            ui,
+            HashMap::new(),
+            test_sbx(),
+        );
         let _rx = push_approval(&mut m, "Read access to /outside/a");
         m.approval_ready = true;
         handle_approval_key(&mut m, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(m.pending_approvals.len(), 1, "Esc must not consume a pending approval");
+        assert_eq!(
+            m.pending_approvals.len(),
+            1,
+            "Esc must not consume a pending approval"
+        );
     }
 }

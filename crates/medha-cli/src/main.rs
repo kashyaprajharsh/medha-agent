@@ -13,6 +13,7 @@
 
 mod acp;
 mod config;
+mod skill_judge;
 mod tui_tea;
 
 use anyhow::Result;
@@ -515,10 +516,16 @@ async fn main() -> Result<()> {
     // and register `skill.load`/`skill.save`. The store reads the harness's own
     // `.medha/skills` config dirs directly (not via the sandbox), so scanning
     // never prompts for permission.
-    let skill_store = Arc::new(tools::SkillStore::new(
-        workspace.root().join(".medha").join("skills"),
-        Some(config::user_skills_dir()?),
-    ));
+    // The skill store gets the two-tier guard: the deterministic regex scanner
+    // (in the store) plus an LLM judge (MEDHA's own model) that reviews the
+    // ambiguous Caution cases. See `skill_judge`.
+    let skill_store = Arc::new(
+        tools::SkillStore::new(
+            workspace.root().join(".medha").join("skills"),
+            Some(config::user_skills_dir()?),
+        )
+        .with_judge(Arc::new(skill_judge::LlmJudge::new(provider.clone()))),
+    );
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
     registry.register_skills(skill_store.clone());
     let known_tools = registry.tool_names();

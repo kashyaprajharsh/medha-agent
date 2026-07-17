@@ -181,6 +181,9 @@ pub struct SkillStore {
     project_dir: PathBuf,
     /// `None` when the platform has no home directory (user scope unavailable).
     user_dir: Option<PathBuf>,
+    /// Optional LLM escalation for the guard's ambiguous (Caution) verdicts.
+    /// Attached by the surface that owns a model; `None` = regex-only.
+    judge: Option<Arc<dyn crate::judge::SkillJudge>>,
 }
 
 impl SkillStore {
@@ -188,7 +191,15 @@ impl SkillStore {
         Self {
             project_dir,
             user_dir,
+            judge: None,
         }
+    }
+
+    /// Attach an LLM judge for the guard's ambiguous verdicts (regex + judge,
+    /// two-tier). Without one the store is regex-only.
+    pub fn with_judge(mut self, judge: Arc<dyn crate::judge::SkillJudge>) -> Self {
+        self.judge = Some(judge);
+        self
     }
 
     /// Scan both scopes. Project is scanned first; a same-named user skill is
@@ -677,11 +688,11 @@ impl SkillStore {
             // hash covers only real content and never itself. Provenance is
             // written after the scan (below) so it can record the verdict.
             let content_hash = hash_package(&stage);
-            Ok::<_, String>((fm.name, kind, revision, content_hash, budget))
+            Ok::<_, String>((fm.name, fm.description, kind, revision, content_hash, budget))
         }
         .await;
 
-        let (name, kind, revision, content_hash, budget) = match staged {
+        let (name, description, kind, revision, content_hash, budget) = match staged {
             Ok(result) => result,
             Err(e) => {
                 std::fs::remove_dir_all(&stage).ok();
@@ -702,8 +713,36 @@ impl SkillStore {
                 scan_findings.join("\n  ")
             ));
         }
+        // Regex flagged Caution (ambiguous) → escalate to the LLM judge to
+        // refine it. The judge can clear it (safe), keep it (caution), or block
+        // it (dangerous). No judge / a judge error keeps the regex Caution — a
+        // model hiccup never blocks a legitimate skill (fail-safe).
         let scan_verdict = if scan.verdict == policy::guard::ScanVerdict::Caution {
-            "caution"
+            match &self.judge {
+                Some(judge) => {
+                    let req = crate::judge::JudgeRequest {
+                        name: name.clone(),
+                        description: description.clone(),
+                        findings: scan_findings.clone(),
+                        content: gather_flagged_content(&stage, &scan),
+                    };
+                    match judge.judge(req).await {
+                        Ok(o) => match o.verdict {
+                            crate::judge::JudgeVerdict::Dangerous => {
+                                std::fs::remove_dir_all(&stage).ok();
+                                return Err(format!(
+                                    "refusing to install '{name}': security review flagged it — {}",
+                                    o.reason
+                                ));
+                            }
+                            crate::judge::JudgeVerdict::Safe => "safe",
+                            crate::judge::JudgeVerdict::Caution => "caution",
+                        },
+                        Err(_) => "caution", // fail-safe: keep the regex verdict
+                    }
+                }
+                None => "caution",
+            }
         } else {
             "safe"
         };
@@ -837,6 +876,31 @@ fn hash_package(dir: &Path) -> String {
         }
     }
     format!("sha256:{:x}", h.finalize())
+}
+
+/// Collect the flagged files' contents for the judge, bounded so a large package
+/// can't blow up the review prompt. `SKILL.md` (the main doc) is always included,
+/// then each distinct flagged file — capped per file and in total.
+fn gather_flagged_content(stage: &Path, scan: &policy::guard::ScanReport) -> String {
+    const PER_FILE: usize = 6 * 1024;
+    const TOTAL: usize = 24 * 1024;
+    let mut files = vec!["SKILL.md".to_string()];
+    for f in &scan.findings {
+        if !files.contains(&f.file) {
+            files.push(f.file.clone());
+        }
+    }
+    let mut out = String::new();
+    for rel in files {
+        if out.len() >= TOTAL {
+            break;
+        }
+        if let Ok(text) = std::fs::read_to_string(stage.join(&rel)) {
+            let snippet: String = text.chars().take(PER_FILE).collect();
+            out.push_str(&format!("### {rel}\n{snippet}\n\n"));
+        }
+    }
+    out.chars().take(TOTAL).collect()
 }
 
 /// Render guard findings as `"file:line — reason"` (or `"file — reason"` for a
@@ -1794,6 +1858,61 @@ mod tests {
         assert!(user.join("caut").join("SKILL.md").exists());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn judge_refines_the_caution_verdict() {
+        use crate::judge::{JudgeOutcome, JudgeRequest, JudgeVerdict, SkillJudge};
+        struct Fake(Result<JudgeVerdict, String>);
+        #[async_trait]
+        impl SkillJudge for Fake {
+            async fn judge(&self, _r: JudgeRequest) -> Result<JudgeOutcome, String> {
+                self.0
+                    .clone()
+                    .map(|v| JudgeOutcome { verdict: v, reason: "t".into() })
+            }
+        }
+        // Install a package the regex flags as Caution (reads ~/.ssh), through a
+        // fresh store with the given judge; return the install result.
+        let run = |judge: Option<Arc<dyn SkillJudge>>| -> Result<InstallReport, String> {
+            let root = tmp();
+            let user = root.join("user");
+            std::fs::create_dir_all(&user).unwrap();
+            let mut store = SkillStore::new(root.join("proj"), Some(user));
+            if let Some(j) = judge {
+                store = store.with_judge(j);
+            }
+            let src = root.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("SKILL.md"),
+                "---\nname: caut\ndescription: d\n---\n\nReads host aliases from `~/.ssh/config`.\n",
+            )
+            .unwrap();
+            let r = futures::executor::block_on(store.install_from(src.to_str().unwrap()));
+            std::fs::remove_dir_all(&root).ok();
+            r
+        };
+
+        // No judge → regex Caution stands.
+        assert_eq!(run(None).unwrap().scan_verdict, "caution");
+        // Judge clears it → Safe.
+        assert_eq!(
+            run(Some(Arc::new(Fake(Ok(JudgeVerdict::Safe))))).unwrap().scan_verdict,
+            "safe"
+        );
+        // Judge keeps it → Caution.
+        assert_eq!(
+            run(Some(Arc::new(Fake(Ok(JudgeVerdict::Caution))))).unwrap().scan_verdict,
+            "caution"
+        );
+        // Judge blocks it → install refused.
+        assert!(run(Some(Arc::new(Fake(Ok(JudgeVerdict::Dangerous))))).is_err());
+        // Judge errors → fail-safe: keep the regex Caution, never block.
+        assert_eq!(
+            run(Some(Arc::new(Fake(Err("model down".into()))))).unwrap().scan_verdict,
+            "caution"
+        );
     }
 
     #[test]

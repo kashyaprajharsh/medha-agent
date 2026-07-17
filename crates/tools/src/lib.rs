@@ -8,6 +8,7 @@ use ignore::WalkBuilder;
 use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
 
 pub mod hub;
+pub mod judge;
 pub mod skills;
 use regex::{Regex, RegexBuilder};
 use sandbox::WorkspaceSandbox;
@@ -15,6 +16,7 @@ use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 pub use hub::{LockEntry, SearchResults, SkillHit, SkillLock, Tap, TapStore};
+pub use judge::{JudgeOutcome, JudgeRequest, JudgeVerdict, SkillJudge};
 pub use skills::{InstallReport, SkillScope, SkillStore};
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};

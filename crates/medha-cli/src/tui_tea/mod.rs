@@ -820,9 +820,7 @@ impl PickerKind {
             PickerKind::SearchProvider => {
                 " web search — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
             }
-            PickerKind::SkillSearch(_) => {
-            " install a skill — ↑↓ select, Enter install, Esc cancel ".into()
-        }
+            PickerKind::SkillSearch(_) => " add a skill — ↑↓ select · Enter · Esc back ".into(),
         PickerKind::SkillManage => " manage skills — ↑↓ select · Enter · Esc back ".into(),
         PickerKind::SkillSources(_) => " skill sources — ↑↓ · Enter · Esc back ".into(),
         PickerKind::AutonomyMode => {
@@ -967,13 +965,16 @@ impl PickerKind {
                 .iter()
                 .map(|(_, desc)| (*desc).to_string())
                 .collect(),
-            PickerKind::SkillSearch(hits) => hits
-                .iter()
-                .map(|h| {
-                    let desc: String = h.description.chars().take(72).collect();
-                    format!("{} v{} · {} — {desc}", h.name, h.version, h.repo)
-                })
-                .collect(),
+            // Row 0 is always "install from a link" (never a dead end); the rest
+            // are the browsable catalog, one row per skill.
+            PickerKind::SkillSearch(hits) => {
+                std::iter::once("🔗 Install from a GitHub link…".to_string())
+                    .chain(hits.iter().map(|h| {
+                        let desc: String = h.description.chars().take(66).collect();
+                        format!("{} · {} — {desc}", h.name, h.repo)
+                    }))
+                    .collect()
+            }
             PickerKind::SkillManage => SKILL_MANAGE_ACTIONS
                 .iter()
                 .map(|(label, _)| (*label).to_string())

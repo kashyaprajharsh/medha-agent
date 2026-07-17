@@ -785,13 +785,11 @@ pub(super) fn handle_key<P, L>(
                     let skill_name = skills.get(sel.wrapping_sub(n_actions)).map(|(n, _)| n.clone());
                     model.picker = None;
                     match action {
-                        // The one everyday action: a link/path installs, a word
-                        // searches — auto-detected, so there's no "which option?".
-                        Some("add") => prefill_command(
-                            model,
-                            "/skill add ",
-                            "type a word to search (e.g. pdf) · paste a GitHub link to install · or just Enter to browse all",
-                        ),
+                        // "Add a skill" immediately opens the scrollable catalog
+                        // (browse all from your sources) — arrow-keys → Enter to
+                        // install. To filter or install a link directly, type
+                        // `/skill add <word|link>`.
+                        Some("add") => search_skills(model, "", tx),
                         // Power operations live one layer deep, not on the main path.
                         Some("manage") => {
                             model.picker = Some(Picker::new(PickerKind::SkillManage));
@@ -853,12 +851,21 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // Search result chosen → install it (guard-gated), so the flow is
-                // search → select → install with no copy-paste.
+                // Add-a-skill picker: row 0 installs from a pasted link; every
+                // other row is a catalog skill → install it (guard-gated).
                 if let PickerKind::SkillSearch(hits) = &picker.kind {
-                    let url = hits.get(picker.selected).map(|h| h.install_url.clone());
+                    let sel = picker.selected;
+                    let url = (sel >= 1)
+                        .then(|| hits.get(sel - 1).map(|h| h.install_url.clone()))
+                        .flatten();
                     model.picker = None;
-                    if let Some(url) = url {
+                    if sel == 0 {
+                        prefill_command(
+                            model,
+                            "/skill add ",
+                            "paste a GitHub link (…/tree/main/skills/<name>) then Enter",
+                        );
+                    } else if let Some(url) = url {
                         install_skill(model, &url, tx);
                     }
                     return;
@@ -1708,13 +1715,11 @@ pub(super) fn handle_agent_event(
                     model.push_notice(format!("⚠ skill source error — {e}"));
                 }
                 if res.hits.is_empty() {
-                    model.push_notice("no matching skills found");
-                } else {
-                    model.picker = Some(Picker {
-                        kind: PickerKind::SkillSearch(res.hits),
-                        selected: 0,
-                    });
+                    // No catalog matches, but the picker still opens on its
+                    // "Install from a link" row — never a dead end.
+                    hub_notice(model, "no skills matched — install from a link, or Esc");
                 }
+                model.picker = Some(Picker::new(PickerKind::SkillSearch(res.hits)));
             }
             Err(e) => model.push_notice(format!("skill search failed: {e}")),
         },

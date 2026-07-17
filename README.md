@@ -22,7 +22,7 @@ This repository builds one binary, `medha`, from a Cargo workspace of eleven cra
 | `providers` | The OpenAI-compatible streaming adapter (`rustls`, no OpenSSL), plus model-discovery via `/v1/models` and models.dev. |
 | `tools` | The tool families — fs, shell, web, git, grep, glob, diagnostics, plan — behind one `Executor`. |
 | `sandbox` | The execution seam: host / macOS Seatbelt / Linux Landlock / container / ssh backends. |
-| `policy` | Deny-first authorization + the fail-closed shell command scanner. |
+| `policy` | Deny-first authorization + the fail-closed shell command scanner, and the Skills Guard that screens skill packages at install. |
 | `context` | Budget-aware two-phase compaction (deterministic prune + LLM summarize). |
 | `lockfile` | `medha.lock` — the portable, declarative harness configuration. |
 | `store` | SQLite (WAL) persistent event log + content-addressed artifact store. |
@@ -117,6 +117,46 @@ personal-file access is still gated, and web-tainted actions still escalate. A
 floor action is **asked** interactively and **denied** when unattended — so
 `MEDHA_MODE=yolo` headless can't delete your home directory, it refuses. The TUI
 shows a **⚠ yolo** badge so autonomous mode is never invisible.
+
+## Skills: discover, install, keep current
+
+A **skill** is a folder with a `SKILL.md` (YAML frontmatter + a markdown
+procedure) — a reusable workflow the model loads on demand. MEDHA discovers
+project- and user-scoped skills and shows a one-line manifest; the model pulls a
+full procedure (and its bundled files) only when relevant (progressive
+disclosure). On top of that consumption core is a **managed, secured
+ecosystem**: find → install (screened) → keep updated → reproduce across a team.
+
+**Install-time Skills Guard.** A skill's `SKILL.md` becomes model context and
+its scripts may run, so every package is **scanned before it is saved** — the
+same deny-first discipline the shell scanner applies at exec. It flags
+destructive commands (in scripts *and* markdown code blocks), prompt injection
+(instruction override, fake conversation roles, jailbreak personas), safety /
+sandbox-bypass directives, secret access and exfiltration, and hidden Unicode
+(invisible tag characters, bidirectional overrides). Verdict is three-tier:
+**Dangerous → install refused** (nothing written), **Caution → installs but the
+findings are shown**, **Safe → silent**.
+
+```sh
+/skill install <folder | GitHub /tree/ URL | raw SKILL.md>   # guard-gated, atomic
+/skill sources add anthropics/skills          # register a source once ("tap")
+/skill sources                                 # list registered sources
+/skill search pdf                              # search sources → pick → install
+/skill update                                  # show which skills have updates
+/skill update <name> | --all                   # apply (local edits are protected)
+/skill lock                                     # write medha-skills.lock (commit it)
+/skill sync                                     # reproduce a teammate's exact set
+```
+
+**Content-hashed, so update never clobbers your edits.** Each install records a
+`sha256` of the package. `/skill update` re-resolves a GitHub source's current
+revision and offers the update — but if you edited a skill locally, its hash no
+longer matches and it is reported **modified locally (protected)**, never
+overwritten. `/skill lock` snapshots every installed skill's source + revision +
+hash into a committable lockfile; `/skill sync` installs each **pinned to its
+exact commit**, so a team gets byte-identical skills (each still guard-screened
+on the way in). Search reads only metadata (name/version/description) and opens
+an arrow-key picker — Enter installs the selection; no copy-pasting URLs.
 
 ## The Eval Gate: `medha gate`
 
@@ -225,7 +265,10 @@ streaming; all ten tool families; the Seatbelt/Landlock/host/container/ssh
 sandbox; the deny-first policy + shell scanner + the `/mode` autonomy dial (careful/normal/yolo
 with a floor that stays gated at every level); two-phase compaction; the
 SQLite event log + artifact store; the TUI, plain REPL, headless mode, and ACP
-editor bridge; scoped project/user skills with progressive loading; the human-in-the-loop
+editor bridge; scoped project/user skills with progressive loading, plus the
+skill ecosystem — install-time Skills Guard, content-hashing, registered sources
+(taps), `/skill search`, drift-protected `/skill update`, and a `/skill
+lock`/`sync` lockfile; the human-in-the-loop
 `clarify` tool (multi-question radio/checkbox forms that compose with `yolo` —
 ask up front, then run autonomous); `medha.lock`
 configuration; the OpenAI-compatible provider with reasoning support; and the
@@ -238,7 +281,11 @@ model as verifier); the full five-sheath context compiler; guided/constrained
 decoding for weak-tool-call models; long-term memory; the *evolution* layer on
 top of the Eval Gate (LLM-as-judge, canary/win-rate, skill promotion/rollback,
 the trace→eval flywheel); native Anthropic/Gemini adapters; `medha undo` over
-snapshots (snapshots are taken but the undo surface isn't wired).
+snapshots (snapshots are taken but the undo surface isn't wired); and the
+skill-ecosystem follow-ons — per-source trust tiers (overriding a guard verdict
+for a trusted repo), private-repo token auth, a pre-install preview/approval
+card (a caution verdict is currently shown *after* install), dependency
+declaration, and TUI status badges.
 
 > **Note on the spec:** the code comments reference a multi-volume design spec
 > ("Vol 1/3/4/7", "§4.x", "Phase 0–7") that is **not present in this

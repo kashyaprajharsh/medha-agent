@@ -799,10 +799,6 @@ pub(super) fn handle_key<P, L>(
                         Some("sources") => skill_sources(model, ""),
                         Some("lock") => lock_skills(model),
                         Some("sync") => sync_skills(model, tx),
-                        Some("list") => {
-                            let text = model.skills_notice();
-                            model.upsert_notice("skills", text);
-                        }
                         _ => {
                             if let Some(name) = skill_name {
                                 load_skill_by_name(model, &name, transcript);

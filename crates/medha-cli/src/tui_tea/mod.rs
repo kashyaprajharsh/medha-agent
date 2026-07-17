@@ -83,7 +83,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tasks", "list background shell tasks (running/finished)"),
     (
         "/skill",
-        "skill hub — load, search, install, update, sources, lock/sync, list (or /skill <name>)",
+        "skill hub — load, search, install, update, sources, lock/sync (or /skill <name>)",
     ),
     ("/clear", "reset the conversation"),
     ("/exit", "quit (also Ctrl-D)"),
@@ -125,7 +125,6 @@ pub(super) const SKILL_HUB_ACTIONS: &[(&str, &str)] = &[
     ("▸ Manage sources (add/remove repos)", "sources"),
     ("▸ Lock installed skills → lockfile", "lock"),
     ("▸ Sync skills from the lockfile", "sync"),
-    ("▸ List all skills & status", "list"),
 ];
 
 fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {

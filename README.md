@@ -138,9 +138,10 @@ sandbox-bypass directives, secret access and exfiltration, and hidden Unicode
 findings are shown**, **Safe → silent**.
 
 **One entry point: `/skill`** opens an interactive hub — arrow-key select to
-load an installed skill, or pick an action (Search · Install · Check updates ·
-Manage sources · Lock · Sync · List all). It is the *only* skill entry in the
-command palette; the typed forms below are shortcuts for power users:
+load an installed skill (the full list scrolls below the actions), or pick an
+action (Search · Install · Check updates · Manage sources · Lock · Sync). It is
+the *only* skill entry in the command palette; the typed forms below are
+shortcuts for power users:
 
 ```sh
 /skill                                          # the hub (load a skill or pick an action)

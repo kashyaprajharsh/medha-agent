@@ -1190,14 +1190,29 @@ pub(super) fn draw_autocomplete(f: &mut Frame, model: &Model, input_area: Rect) 
     if matches.is_empty() {
         return;
     }
-    let height = matches.len() as u16;
+    let n = matches.len();
+    let sel = model.ac_sel.min(n - 1);
+    // Never let the menu grow taller than the space above the input box (it
+    // would push the prompt off-screen). Reserve one row for the hint line and
+    // one top margin, then window around the selection — same discipline as the
+    // picker overlay.
+    let capacity = (input_area.y as usize).saturating_sub(2).max(1);
+    let visible = n.min(capacity).max(1);
+    let start = if n <= visible {
+        0
+    } else {
+        sel.saturating_sub(visible / 2).min(n - visible)
+    };
+    let end = (start + visible).min(n);
+
+    let height = visible as u16 + 1; // + hint row
     let y = input_area.y.saturating_sub(height + 1);
     let area = Rect::new(input_area.x, y, input_area.width, height + 1);
     f.render_widget(ratatui::widgets::Clear, area);
-    let sel = model.ac_sel.min(matches.len() - 1);
-    let mut lines: Vec<Line> = Vec::with_capacity(matches.len());
-    for (i, (c, d)) in matches.iter().enumerate() {
-        if i == sel {
+    let mut lines: Vec<Line> = Vec::with_capacity(visible + 1);
+    for (i, (c, d)) in matches[start..end].iter().enumerate() {
+        let idx = start + i;
+        if idx == sel {
             lines.push(Line::from(vec![
                 Span::styled("▌ ", Style::default().fg(theme::ACCENT)),
                 Span::styled(
@@ -1216,10 +1231,14 @@ pub(super) fn draw_autocomplete(f: &mut Frame, model: &Model, input_area: Rect) 
             ]));
         }
     }
-    lines.push(Line::from(Span::styled(
-        "  ↑↓ select · tab/enter accept · esc dismiss",
-        Style::default().fg(theme::FAINT),
-    )));
+    // Show how many are scrolled out of view, so a windowed menu isn't silent.
+    let more = n - (end - start);
+    let hint = if more > 0 {
+        format!("  ↑↓ select · tab/enter accept · esc dismiss · +{more} more")
+    } else {
+        "  ↑↓ select · tab/enter accept · esc dismiss".to_string()
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(theme::FAINT))));
     f.render_widget(Paragraph::new(lines), area);
 }
 

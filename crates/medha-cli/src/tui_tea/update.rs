@@ -775,22 +775,35 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // Skill picker: a name was chosen → force-load its procedure into
-                // the transcript (same as `/skill <name>`).
+                // Skill hub: the top rows are actions, the rest are installed
+                // skills. An action runs (or prefills a command needing input); a
+                // skill row force-loads its procedure (same as `/skill <name>`).
                 if let PickerKind::Skill(skills) = &picker.kind {
-                    let name = skills.get(picker.selected).map(|(n, _)| n.clone());
-                    // Trailing row: install. Prefill the command so the user
-                    // only pastes a source and presses Enter.
-                    let install_row = picker.selected == skills.len();
+                    let sel = picker.selected;
+                    let n_actions = SKILL_HUB_ACTIONS.len();
+                    let action = (sel < n_actions).then(|| SKILL_HUB_ACTIONS[sel].1);
+                    let skill_name = skills.get(sel.wrapping_sub(n_actions)).map(|(n, _)| n.clone());
                     model.picker = None;
-                    if let Some(name) = name {
-                        load_skill_by_name(model, &name, transcript);
-                    } else if install_row {
-                        model.input = "/skill install ".to_string();
-                        model.cursor = model.input.len();
-                        model.push_notice(
-                            "paste a skill source after the command — a local folder, GitHub /tree/ URL, or raw SKILL.md URL — then press Enter",
-                        );
+                    match action {
+                        Some("search") => prefill_command(
+                            model,
+                            "/skill search ",
+                            "type a query, then Enter to search your sources",
+                        ),
+                        Some("install") => prefill_command(
+                            model,
+                            "/skill install ",
+                            "paste a source — a local folder, GitHub /tree/ URL, or raw SKILL.md — then Enter",
+                        ),
+                        Some("update") => update_skills(model, "", tx),
+                        Some("sources") => skill_sources(model, ""),
+                        Some("lock") => lock_skills(model),
+                        Some("sync") => sync_skills(model, tx),
+                        _ => {
+                            if let Some(name) = skill_name {
+                                load_skill_by_name(model, &name, transcript);
+                            }
+                        }
                     }
                     return;
                 }
@@ -2369,7 +2382,7 @@ fn open_skill_picker(model: &mut Model) {
             ));
         } else {
             model.push_notice(
-                "no skills installed yet — install one below, or add ~/.medha/skills/<name>/SKILL.md",
+                "no skills installed yet — pick Search or Install at the top, or add ~/.medha/skills/<name>/SKILL.md",
             );
         }
     } else if unavailable > 0 {
@@ -2377,8 +2390,8 @@ fn open_skill_picker(model: &mut Model) {
             "{unavailable} unavailable skill(s) are hidden here; use /skills for missing-tool details"
         ));
     }
-    // The picker always carries the trailing "Install a skill" row, so an
-    // empty catalog still opens to a useful action instead of a dead end.
+    // The hub always carries its action rows, so an empty catalog still opens to
+    // useful actions (search / install) instead of a dead end.
     model.picker = Some(Picker::new(PickerKind::Skill(list)));
 }
 
@@ -2678,6 +2691,15 @@ fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEve
         }
         let _ = tx.send(TuiEvent::SkillUpdateReport(lines));
     });
+}
+
+/// Put a command stub in the input box (cursor at end) and hint what to type
+/// next — used by hub actions that need a free-text argument (a search query,
+/// an install source) so the user completes one line instead of guessing syntax.
+fn prefill_command(model: &mut Model, cmd: &str, hint: &str) {
+    model.input = cmd.to_string();
+    model.cursor = model.input.len();
+    model.push_notice(hint);
 }
 
 /// `/skill lock` — snapshot every installed user skill (that has a recorded
@@ -3206,6 +3228,19 @@ mod fix_tests {
         );
         assert_eq!(classify_slash("skill lock"), SlashAction::LockSkills);
         assert_eq!(classify_slash("skill sync"), SlashAction::SyncSkills);
+    }
+
+    #[test]
+    fn skill_hub_lists_actions_then_installed_skills() {
+        // The Enter dispatch indexes skills as `selected - SKILL_HUB_ACTIONS.len()`,
+        // so the layout must be exactly: every action (in order), then the skills.
+        let kind = PickerKind::Skill(vec![("deploy".into(), "[user] ship it".into())]);
+        let labels = kind.labels();
+        assert_eq!(labels.len(), SKILL_HUB_ACTIONS.len() + 1);
+        for (i, (label, _)) in SKILL_HUB_ACTIONS.iter().enumerate() {
+            assert_eq!(&labels[i], label, "action row {i} out of order");
+        }
+        assert_eq!(labels[SKILL_HUB_ACTIONS.len()], "deploy — [user] ship it");
         // …but a name that merely starts with "sources" still loads as a name.
         assert_eq!(
             classify_slash("skill sources-of-truth"),

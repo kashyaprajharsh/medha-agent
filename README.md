@@ -137,15 +137,18 @@ sandbox-bypass directives, secret access and exfiltration, and hidden Unicode
 **Dangerous → install refused** (nothing written), **Caution → installs but the
 findings are shown**, **Safe → silent**.
 
+**One entry point: `/skill`** opens an interactive hub — arrow-key select to
+load an installed skill, or pick an action (Search · Install · Check updates ·
+Manage sources · Lock · Sync). The command palette stays uncluttered (just
+`/skills` and `/skill`); the typed forms below are shortcuts for power users:
+
 ```sh
+/skill                                          # the hub (load a skill or pick an action)
 /skill install <folder | GitHub /tree/ URL | raw SKILL.md>   # guard-gated, atomic
 /skill sources add anthropics/skills          # register a source once ("tap")
-/skill sources                                 # list registered sources
 /skill search pdf                              # search sources → pick → install
-/skill update                                  # show which skills have updates
-/skill update <name> | --all                   # apply (local edits are protected)
-/skill lock                                     # write medha-skills.lock (commit it)
-/skill sync                                     # reproduce a teammate's exact set
+/skill update [<name> | --all]                 # check / apply (local edits protected)
+/skill lock  ·  /skill sync                     # write / reproduce medha-skills.lock
 ```
 
 **Content-hashed, so update never clobbers your edits.** Each install records a

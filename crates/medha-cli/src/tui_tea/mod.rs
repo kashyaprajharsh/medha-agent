@@ -87,39 +87,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/skill",
-        "pick a skill to load into context (or /skill <name>)",
-    ),
-    (
-        "/skill install",
-        "install a complete skill folder from disk, GitHub, or raw SKILL.md",
-    ),
-    (
-        "/skill sources",
-        "list or edit skill sources (add/remove a GitHub repo to search)",
-    ),
-    (
-        "/skill search",
-        "search registered sources for installable skills",
-    ),
-    (
-        "/skill update",
-        "check (or apply with a name / --all) updates to installed skills",
-    ),
-    (
-        "/skill lock",
-        "write the skills lockfile for reproducible team setups",
-    ),
-    (
-        "/skill sync",
-        "install/repair skills to match the committed lockfile",
-    ),
-    (
-        "/skill info",
-        "inspect a skill's files, scope, tools, and source",
-    ),
-    (
-        "/skill remove",
-        "remove an installed user skill (with confirmation)",
+        "skill hub — load, search, install, update, sources, lock/sync (or /skill <name>)",
     ),
     ("/clear", "reset the conversation"),
     ("/exit", "quit (also Ctrl-D)"),
@@ -146,6 +114,20 @@ impl ProfileProvider for providers::OpenAiCompat {
 /// Accepted for compatibility, but intentionally omitted from autocomplete and
 /// `/help`: one visible `/reasoning` surface replaces these overlapping names.
 const LEGACY_REASONING_COMMANDS: &[&str] = &["/think", "/thinking", "/effort"];
+
+/// The action rows at the top of the `/skill` hub picker, before the installed
+/// skills. `(row label, action id)`; the id drives Enter dispatch. This one menu
+/// replaces what were separate `/skill install|search|update|sources|lock|sync`
+/// palette entries — discoverable in a menu instead of cluttering autocomplete.
+/// The typed forms still work for power users.
+pub(super) const SKILL_HUB_ACTIONS: &[(&str, &str)] = &[
+    ("▸ Search for a skill to install…", "search"),
+    ("▸ Install from a folder or URL…", "install"),
+    ("▸ Check for updates", "update"),
+    ("▸ Manage sources (add/remove repos)", "sources"),
+    ("▸ Lock installed skills → lockfile", "lock"),
+    ("▸ Sync skills from the lockfile", "sync"),
+];
 
 fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
     COMMANDS
@@ -798,7 +780,7 @@ impl PickerKind {
                     p.label
                 )
             }
-            PickerKind::Skill(_) => " load a skill — ↑↓ select, Enter load, Esc cancel ".into(),
+            PickerKind::Skill(_) => " skill hub — ↑↓ select · Enter · Esc cancel ".into(),
             PickerKind::RemoveSkill(name) => {
                 format!(" remove user skill '{name}'? — ↑↓ move · Enter confirm · Esc back ")
             }
@@ -872,12 +854,10 @@ impl PickerKind {
                 })
                 .collect(),
             PickerKind::RewindMode(p) => p.scope_options().into_iter().map(|(l, _)| l).collect(),
-            PickerKind::Skill(skills) => skills
+            PickerKind::Skill(skills) => SKILL_HUB_ACTIONS
                 .iter()
-                .map(|(n, d)| format!("{n} — {d}"))
-                .chain(std::iter::once(
-                    "⇩ Install a skill — local folder, GitHub folder, or raw SKILL.md".to_string(),
-                ))
+                .map(|(label, _)| (*label).to_string())
+                .chain(skills.iter().map(|(n, d)| format!("{n} — {d}")))
                 .collect(),
             PickerKind::RemoveSkill(_) => {
                 vec!["Keep skill".to_string(), "Remove user skill".to_string()]

@@ -732,6 +732,10 @@ enum PickerKind {
     /// The skill hub's "Manage skills…" sub-menu (updates / sources / lock /
     /// sync). Fixed rows from [`SKILL_MANAGE_ACTIONS`]; no data to carry.
     SkillManage,
+    /// The sources sub-picker (reached from Manage → Sources). Each entry is
+    /// `(repo, path, removable)`; built-ins are shown but not removable. Rows are
+    /// an "Add a source…" row, one per source, then "Back".
+    SkillSources(Vec<(String, String, bool)>),
 }
 
 /// The autonomy levels offered by the `/mode` picker, with self-explanatory
@@ -820,6 +824,7 @@ impl PickerKind {
             " install a skill — ↑↓ select, Enter install, Esc cancel ".into()
         }
         PickerKind::SkillManage => " manage skills — ↑↓ select · Enter · Esc back ".into(),
+        PickerKind::SkillSources(_) => " skill sources — ↑↓ · Enter · Esc back ".into(),
         PickerKind::AutonomyMode => {
                 " autonomy — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
             }
@@ -973,6 +978,18 @@ impl PickerKind {
                 .iter()
                 .map(|(label, _)| (*label).to_string())
                 .collect(),
+            PickerKind::SkillSources(sources) => {
+                let mut rows = vec!["➕ Add a source…".to_string()];
+                for (repo, path, removable) in sources {
+                    rows.push(if *removable {
+                        format!("✕  {repo}  ·  {path}/     (remove)")
+                    } else {
+                        format!("·  {repo}  ·  {path}/     (built-in)")
+                    });
+                }
+                rows.push("← Back".to_string());
+                rows
+            }
         }
     }
 }

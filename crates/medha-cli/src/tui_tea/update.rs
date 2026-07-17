@@ -810,10 +810,35 @@ pub(super) fn handle_key<P, L>(
                     model.picker = None;
                     match id {
                         Some("update") => update_skills(model, "", tx),
-                        Some("sources") => skill_sources(model, ""),
+                        Some("sources") => open_sources_picker(model),
                         Some("lock") => lock_skills(model),
                         Some("sync") => sync_skills(model, tx),
                         _ => open_skill_picker(model), // Back (or anything unknown)
+                    }
+                    return;
+                }
+                // Sources sub-picker: Add / Remove <source> / Back.
+                if let PickerKind::SkillSources(sources) = &picker.kind {
+                    let sel = picker.selected;
+                    let n = sources.len();
+                    let chosen = (sel >= 1 && sel <= n).then(|| sources[sel - 1].clone());
+                    model.picker = None;
+                    if sel == 0 {
+                        prefill_command(
+                            model,
+                            "/skill sources add ",
+                            "type owner/repo (e.g. anthropics/skills), then Enter",
+                        );
+                    } else if let Some((repo, path, removable)) = chosen {
+                        if removable {
+                            remove_source(model, &format!("{repo}/{path}"));
+                        } else {
+                            hub_notice(model, format!("{repo} is built-in — always available"));
+                        }
+                        open_sources_picker(model); // reopen with the updated list
+                    } else {
+                        // "← Back" (or past the end) → back to Manage.
+                        model.picker = Some(Picker::new(PickerKind::SkillManage));
                     }
                     return;
                 }
@@ -2565,6 +2590,36 @@ fn browse_taps() -> Vec<tools::Tap> {
         }
     }
     taps
+}
+
+/// Open the interactive sources sub-picker: shipped built-ins (non-removable)
+/// plus the user's own (removable), an "Add a source…" row, and "Back".
+fn open_sources_picker(model: &mut Model) {
+    let defaults = tools::hub::default_taps();
+    let mut sources: Vec<(String, String, bool)> = defaults
+        .iter()
+        .map(|t| (t.repo.clone(), t.path.clone(), false))
+        .collect();
+    for t in registered_taps() {
+        if defaults.iter().any(|d| d.key() == t.key()) {
+            continue; // a user source shadowing a default: show once, as built-in
+        }
+        sources.push((t.repo.clone(), t.path.clone(), true));
+    }
+    model.picker = Some(Picker::new(PickerKind::SkillSources(sources)));
+}
+
+/// Remove a registered source by its `repo/path` key and report the result.
+fn remove_source(model: &mut Model, key: &str) {
+    let path = match config::user_taps_path() {
+        Ok(p) => p,
+        Err(e) => return hub_notice(model, format!("sources unavailable: {e}")),
+    };
+    match tools::TapStore::new(path).remove(key) {
+        Ok(0) => hub_notice(model, format!("no source matching '{key}'")),
+        Ok(n) => hub_notice(model, format!("✔ removed {n} source(s)")),
+        Err(e) => hub_notice(model, format!("could not remove source: {e}")),
+    }
 }
 
 /// `/skill add <word-or-link>` — the one friendly way to get a skill. A URL or

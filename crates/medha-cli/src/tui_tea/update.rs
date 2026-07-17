@@ -1828,6 +1828,10 @@ enum SlashAction {
     SearchSkills(String),
     /// `/skill update [<name> | --all]` — check (and optionally apply) updates.
     UpdateSkills(String),
+    /// `/skill lock` — write the skills lockfile from what's installed.
+    LockSkills,
+    /// `/skill sync` — install/repair skills to match the lockfile.
+    SyncSkills,
     /// Everything else — handled by `run_slash` (help, status, skills, think…).
     Other,
 }
@@ -1874,6 +1878,8 @@ fn classify_slash(cmd: &str) -> SlashAction {
                     .to_string(),
             )
         }
+        "skill lock" => SlashAction::LockSkills,
+        "skill sync" => SlashAction::SyncSkills,
         c if c.strip_prefix("skill install").is_some_and(is_cmd_boundary) => {
             SlashAction::InstallSkill(
                 c.strip_prefix("skill install")
@@ -1949,6 +1955,8 @@ fn dispatch_slash<P, L>(
         SlashAction::SkillSources(args) => skill_sources(model, &args),
         SlashAction::SearchSkills(query) => search_skills(model, &query, tx),
         SlashAction::UpdateSkills(arg) => update_skills(model, &arg, tx),
+        SlashAction::LockSkills => lock_skills(model),
+        SlashAction::SyncSkills => sync_skills(model, tx),
         SlashAction::Other => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
     }
 }
@@ -2672,6 +2680,81 @@ fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEve
     });
 }
 
+/// `/skill lock` — snapshot every installed user skill (that has a recorded
+/// source) into the workspace lockfile for reproducible team setups. Local, sync.
+fn lock_skills(model: &mut Model) {
+    let Some(store) = model.skills.clone() else {
+        return model.push_notice("skills unavailable in this session");
+    };
+    let names: Vec<String> = store
+        .discover(&model.known_tools)
+        .effective()
+        .filter(|l| l.skill.scope == tools::SkillScope::User)
+        .map(|l| l.skill.name.clone())
+        .collect();
+    let entries = tools::hub::lock_entries(&store, &names);
+    let path = match config::skills_lock_path() {
+        Ok(p) => p,
+        Err(e) => return model.push_notice(format!("could not locate lockfile: {e}")),
+    };
+    match tools::SkillLock::new(path.clone()).write(entries.clone()) {
+        Ok(()) => model.push_notice(format!(
+            "✔ locked {} skill(s) → {}\n  commit it so your team can /skill sync the same set",
+            entries.len(),
+            path.display()
+        )),
+        Err(e) => model.push_notice(format!("could not write lockfile: {e}")),
+    }
+}
+
+/// `/skill sync` — install/repair skills so they match the lockfile (pinned to
+/// each locked revision). Skips entries already at their locked hash. Async.
+fn sync_skills(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let Some(store) = model.skills.clone() else {
+        return model.push_notice("skills unavailable in this session");
+    };
+    let path = match config::skills_lock_path() {
+        Ok(p) => p,
+        Err(e) => return model.push_notice(format!("could not locate lockfile: {e}")),
+    };
+    let entries = match tools::SkillLock::new(path).read() {
+        Ok(e) => e,
+        Err(e) => return model.push_notice(format!("could not read lockfile: {e}")),
+    };
+    if entries.is_empty() {
+        return model.push_notice(
+            "no lockfile (or it is empty) — run /skill lock first, or commit one from a teammate",
+        );
+    }
+    model.push_notice(format!("(syncing {} locked skill(s) …)", entries.len()));
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let mut lines = Vec::new();
+        for entry in entries {
+            // Already at the locked bytes → nothing to do.
+            if entry.content_hash.is_some()
+                && store.installed_hash(&entry.name) == entry.content_hash
+            {
+                lines.push(format!("✓ {} — already at locked revision", entry.name));
+                continue;
+            }
+            match store.install_from(&tools::hub::locked_source(&entry)).await {
+                Ok(r) => {
+                    let flag = if r.scan_verdict == "caution" {
+                        " (⚠ guard flagged — /skill info to review)"
+                    } else {
+                        ""
+                    };
+                    let verb = if r.replaced { "synced" } else { "installed" };
+                    lines.push(format!("✔ {verb} {}{flag}", entry.name));
+                }
+                Err(e) => lines.push(format!("✖ {} — {e}", entry.name)),
+            }
+        }
+        let _ = tx.send(TuiEvent::SkillUpdateReport(lines));
+    });
+}
+
 fn show_skill_info(model: &mut Model, name: &str) {
     if name.is_empty() {
         model.push_notice("usage: /skill info <name>\n  Browse names with /skill or /skills");
@@ -3121,6 +3204,8 @@ mod fix_tests {
             classify_slash("skill update --all"),
             SlashAction::UpdateSkills("--all".into())
         );
+        assert_eq!(classify_slash("skill lock"), SlashAction::LockSkills);
+        assert_eq!(classify_slash("skill sync"), SlashAction::SyncSkills);
         // …but a name that merely starts with "sources" still loads as a name.
         assert_eq!(
             classify_slash("skill sources-of-truth"),

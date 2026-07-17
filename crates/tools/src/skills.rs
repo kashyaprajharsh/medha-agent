@@ -1035,6 +1035,19 @@ pub(crate) async fn fetch_limited(
     Ok(out)
 }
 
+/// Rewrite a github-folder `source` to pin it at an exact `revision`, so a
+/// lockfile reproduces the same bytes regardless of later branch movement.
+/// Returns the source unchanged if it isn't a GitHub tree URL.
+pub(crate) fn pin_tree_url(source: &str, revision: &str) -> String {
+    match parse_github_tree_url(source).ok().flatten() {
+        Some(t) => format!(
+            "https://github.com/{}/{}/tree/{revision}/{}",
+            t.owner, t.repo, t.path
+        ),
+        None => source.to_string(),
+    }
+}
+
 /// Re-resolve the commit a github-folder `source` currently points at (its ref
 /// resolved *now*), for update detection. `None` if `source` isn't a GitHub
 /// tree URL. A pinned-sha source resolves to itself → never reports an update.

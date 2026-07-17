@@ -392,6 +392,13 @@ pub fn user_taps_path() -> Result<PathBuf> {
     Ok(user_skills_dir()?.join("taps.toml"))
 }
 
+/// The skills lockfile for reproducible team setups. Lives in the workspace
+/// (committed with the repo) — not the user home — so a team shares one file
+/// and `/skill sync` reproduces the same skill set.
+pub fn skills_lock_path() -> Result<PathBuf> {
+    Ok(std::env::current_dir()?.join("medha-skills.lock"))
+}
+
 /// Per-workspace runtime state directory: `~/.medha/projects/<encoded-cwd>/`
 /// (Claude Code style). Runtime state — the event log, artifacts, snapshots,
 /// logs — lives HERE, out of the working tree, so it never clutters or gets

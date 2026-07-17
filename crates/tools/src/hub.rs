@@ -348,6 +348,84 @@ pub async fn check_update(store: &crate::skills::SkillStore, name: &str) -> Upda
     }
 }
 
+// ── lockfile ────────────────────────────────────────────────────────────────
+
+/// One locked skill: enough to reproduce an exact install. Committed with the
+/// repo so a team shares the same skill set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockEntry {
+    pub name: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LockDoc {
+    #[serde(default, rename = "skill")]
+    skills: Vec<LockEntry>,
+}
+
+/// The skills lockfile: name → exact source/revision/hash for every installed
+/// skill, so a teammate reproduces the same set byte-for-byte. Reads tolerate
+/// absence; a corrupt file is an error, never a silent empty lock.
+pub struct SkillLock {
+    path: PathBuf,
+}
+
+impl SkillLock {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn read(&self) -> Result<Vec<LockEntry>, String> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(t) => Ok(toml::from_str::<LockDoc>(&t)
+                .map_err(|e| format!("{} is malformed: {e}", self.path.display()))?
+                .skills),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("reading {}: {e}", self.path.display())),
+        }
+    }
+
+    /// Write the lock, sorted by name for a stable, review-friendly diff.
+    pub fn write(&self, mut entries: Vec<LockEntry>) -> Result<(), String> {
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let body = toml::to_string_pretty(&LockDoc { skills: entries })
+            .map_err(|e| format!("serializing lockfile: {e}"))?;
+        atomic_write(&self.path, body.as_bytes())
+    }
+}
+
+/// Build lock entries from the recorded provenance of the given installed
+/// skills. Skills without provenance (hand-authored, no source) are skipped —
+/// there is nothing to reproduce them from.
+pub fn lock_entries(store: &crate::skills::SkillStore, names: &[String]) -> Vec<LockEntry> {
+    names
+        .iter()
+        .filter_map(|n| {
+            let p = store.provenance(n)?;
+            Some(LockEntry {
+                name: n.clone(),
+                source: p.source,
+                revision: p.revision,
+                content_hash: p.content_hash,
+            })
+        })
+        .collect()
+}
+
+/// The source to install a locked entry from — pinned to its exact revision
+/// when known, so a sync reproduces the recorded bytes rather than the latest.
+pub fn locked_source(entry: &LockEntry) -> String {
+    match &entry.revision {
+        Some(rev) => crate::skills::pin_tree_url(&entry.source, rev),
+        None => entry.source.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +550,52 @@ mod tests {
             UpdateStatus::Unmanaged("no recorded source")
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lockfile_round_trips_and_captures_installed_provenance() {
+        let dir = tmp();
+        let user = dir.join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let store = crate::skills::SkillStore::new(dir.join("proj"), Some(user.clone()));
+
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("SKILL.md"), "---\nname: demo\ndescription: d\n---\n\nbody\n").unwrap();
+        futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
+
+        let entries = lock_entries(&store, &["demo".to_string(), "missing".to_string()]);
+        assert_eq!(entries.len(), 1); // 'missing' has no provenance → skipped
+        assert_eq!(entries[0].name, "demo");
+        assert!(entries[0].content_hash.as_deref().unwrap().starts_with("sha256:"));
+
+        let lock = SkillLock::new(dir.join("skills.lock"));
+        assert!(lock.read().unwrap().is_empty()); // absent = empty, not error
+        lock.write(entries.clone()).unwrap();
+        assert_eq!(SkillLock::new(dir.join("skills.lock")).read().unwrap(), entries);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn locked_source_pins_github_to_revision() {
+        let entry = LockEntry {
+            name: "pdf".into(),
+            source: "https://github.com/anthropics/skills/tree/main/document/pdf".into(),
+            revision: Some("abc123".into()),
+            content_hash: None,
+        };
+        assert_eq!(
+            locked_source(&entry),
+            "https://github.com/anthropics/skills/tree/abc123/document/pdf"
+        );
+        // A local source (no revision) is used verbatim.
+        let local = LockEntry {
+            name: "x".into(),
+            source: "/home/u/x".into(),
+            revision: None,
+            content_hash: None,
+        };
+        assert_eq!(locked_source(&local), "/home/u/x");
     }
 }

@@ -106,6 +106,14 @@ const COMMANDS: &[(&str, &str)] = &[
         "check (or apply with a name / --all) updates to installed skills",
     ),
     (
+        "/skill lock",
+        "write the skills lockfile for reproducible team setups",
+    ),
+    (
+        "/skill sync",
+        "install/repair skills to match the committed lockfile",
+    ),
+    (
         "/skill info",
         "inspect a skill's files, scope, tools, and source",
     ),

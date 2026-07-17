@@ -14,7 +14,7 @@ use sandbox::WorkspaceSandbox;
 use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
-pub use hub::{SearchResults, SkillHit, Tap, TapStore};
+pub use hub::{LockEntry, SearchResults, SkillHit, SkillLock, Tap, TapStore};
 pub use skills::{InstallReport, SkillScope, SkillStore};
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};

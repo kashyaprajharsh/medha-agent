@@ -82,12 +82,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/tasks", "list background shell tasks (running/finished)"),
     (
-        "/skills",
-        "list installed skills (scope, availability, shadowing)",
-    ),
-    (
         "/skill",
-        "skill hub — load, search, install, update, sources, lock/sync (or /skill <name>)",
+        "skill hub — load, search, install, update, sources, lock/sync, list (or /skill <name>)",
     ),
     ("/clear", "reset the conversation"),
     ("/exit", "quit (also Ctrl-D)"),
@@ -111,9 +107,11 @@ impl ProfileProvider for providers::OpenAiCompat {
     }
 }
 
-/// Accepted for compatibility, but intentionally omitted from autocomplete and
-/// `/help`: one visible `/reasoning` surface replaces these overlapping names.
-const LEGACY_REASONING_COMMANDS: &[&str] = &["/think", "/thinking", "/effort"];
+/// Recognized when typed, but intentionally omitted from autocomplete and
+/// `/help` so the palette stays lean: the `/reasoning` surface replaces the
+/// overlapping `/think`/`/thinking`/`/effort` names, and `/skills` folded into
+/// the `/skill` hub's "List all skills" action (typed `/skills` still works).
+const HIDDEN_COMMANDS: &[&str] = &["/think", "/thinking", "/effort", "/skills"];
 
 /// The action rows at the top of the `/skill` hub picker, before the installed
 /// skills. `(row label, action id)`; the id drives Enter dispatch. This one menu
@@ -127,6 +125,7 @@ pub(super) const SKILL_HUB_ACTIONS: &[(&str, &str)] = &[
     ("▸ Manage sources (add/remove repos)", "sources"),
     ("▸ Lock installed skills → lockfile", "lock"),
     ("▸ Sync skills from the lockfile", "sync"),
+    ("▸ List all skills & status", "list"),
 ];
 
 fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
@@ -143,7 +142,7 @@ fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
 fn is_slash_command(line: &str) -> bool {
     match line.split_whitespace().next() {
         Some(tok) => {
-            COMMANDS.iter().any(|(c, _)| *c == tok) || LEGACY_REASONING_COMMANDS.contains(&tok)
+            COMMANDS.iter().any(|(c, _)| *c == tok) || HIDDEN_COMMANDS.contains(&tok)
         }
         None => false,
     }

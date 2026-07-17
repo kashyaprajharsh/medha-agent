@@ -139,8 +139,8 @@ findings are shown**, **Safe → silent**.
 
 **One entry point: `/skill`** opens an interactive hub — arrow-key select to
 load an installed skill, or pick an action (Search · Install · Check updates ·
-Manage sources · Lock · Sync). The command palette stays uncluttered (just
-`/skills` and `/skill`); the typed forms below are shortcuts for power users:
+Manage sources · Lock · Sync · List all). It is the *only* skill entry in the
+command palette; the typed forms below are shortcuts for power users:
 
 ```sh
 /skill                                          # the hub (load a skill or pick an action)

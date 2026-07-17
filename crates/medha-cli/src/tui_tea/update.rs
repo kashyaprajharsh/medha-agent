@@ -863,7 +863,7 @@ pub(super) fn handle_key<P, L>(
                         prefill_command(
                             model,
                             "/skill add ",
-                            "paste a GitHub link (…/tree/main/skills/<name>) then Enter",
+                            "paste a GitHub link, or a local folder / SKILL.md path — then Enter",
                         );
                     } else if let Some(url) = url {
                         install_skill(model, &url, tx);

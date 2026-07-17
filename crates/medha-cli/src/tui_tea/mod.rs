@@ -968,7 +968,7 @@ impl PickerKind {
             // Row 0 is always "install from a link" (never a dead end); the rest
             // are the browsable catalog, one row per skill.
             PickerKind::SkillSearch(hits) => {
-                std::iter::once("🔗 Install from a GitHub link…".to_string())
+                std::iter::once("🔗 Install from a link or local folder…".to_string())
                     .chain(hits.iter().map(|h| {
                         let desc: String = h.description.chars().take(66).collect();
                         format!("{} · {} — {desc}", h.name, h.repo)

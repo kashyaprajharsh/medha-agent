@@ -102,6 +102,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "search registered sources for installable skills",
     ),
     (
+        "/skill update",
+        "check (or apply with a name / --all) updates to installed skills",
+    ),
+    (
         "/skill info",
         "inspect a skill's files, scope, tools, and source",
     ),
@@ -249,6 +253,9 @@ pub(crate) enum TuiEvent {
     SkillInstalled(Result<tools::InstallReport, String>),
     /// `/skill search <query>` finished querying the registered sources.
     SkillSearchResults(Result<tools::SearchResults, String>),
+    /// `/skill update` finished checking (and possibly applying) updates; the
+    /// lines are ready-to-show status/outcome rows.
+    SkillUpdateReport(Vec<String>),
     /// Model setup queried the endpoint's `/v1/models`; `Err` carries the
     /// reason so the form can fall back to manual model-id entry honestly.
     /// Tagged with the queried base URL so a slow reply for an abandoned

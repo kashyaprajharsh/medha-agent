@@ -1670,6 +1670,11 @@ pub(super) fn handle_agent_event(
             }
             Err(e) => model.push_notice(format!("skill search failed: {e}")),
         },
+        // `/skill update` finished — show the per-skill status/outcome rows.
+        TuiEvent::SkillUpdateReport(lines) => {
+            model.refresh_skill_manifest(transcript);
+            model.push_notice(lines.join("\n"));
+        }
         // Model setup finished querying /v1/models — show the picker or fall
         // back to manual entry.
         TuiEvent::ModelsDiscovered { base_url, result } => {
@@ -1821,6 +1826,8 @@ enum SlashAction {
     SkillSources(String),
     /// `/skill search <query>` — search registered sources for skills.
     SearchSkills(String),
+    /// `/skill update [<name> | --all]` — check (and optionally apply) updates.
+    UpdateSkills(String),
     /// Everything else — handled by `run_slash` (help, status, skills, think…).
     Other,
 }
@@ -1854,6 +1861,14 @@ fn classify_slash(cmd: &str) -> SlashAction {
         c if c.strip_prefix("skill search").is_some_and(is_cmd_boundary) => {
             SlashAction::SearchSkills(
                 c.strip_prefix("skill search")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            )
+        }
+        c if c.strip_prefix("skill update").is_some_and(is_cmd_boundary) => {
+            SlashAction::UpdateSkills(
+                c.strip_prefix("skill update")
                     .unwrap_or("")
                     .trim()
                     .to_string(),
@@ -1933,6 +1948,7 @@ fn dispatch_slash<P, L>(
         SlashAction::InstallSkill(src) => install_skill(model, &src, tx),
         SlashAction::SkillSources(args) => skill_sources(model, &args),
         SlashAction::SearchSkills(query) => search_skills(model, &query, tx),
+        SlashAction::UpdateSkills(arg) => update_skills(model, &arg, tx),
         SlashAction::Other => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
     }
 }
@@ -2577,6 +2593,85 @@ fn search_skills(model: &mut Model, query: &str, tx: &mpsc::UnboundedSender<TuiE
     model.push_notice(format!("(searching {count} source(s) for '{query}' …)"));
 }
 
+/// `/skill update [<name> | --all]` — check registered sources for newer
+/// revisions of installed user skills. No argument only reports; a name or
+/// `--all` applies available updates (guard-gated, atomic). Locally edited
+/// skills are always protected. Async (network).
+fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let Some(store) = model.skills.clone() else {
+        return model.push_notice("skills unavailable in this session");
+    };
+    // Only active, user-scoped skills are updatable (project skills are committed
+    // config; provenance exists only for installed user skills).
+    let names: Vec<String> = store
+        .discover(&model.known_tools)
+        .effective()
+        .filter(|l| l.skill.scope == tools::SkillScope::User)
+        .map(|l| l.skill.name.clone())
+        .collect();
+    if names.is_empty() {
+        return model.push_notice("no installed user skills to update");
+    }
+    let arg = arg.trim();
+    let apply_all = arg == "--all" || arg == "all";
+    let single = (!arg.is_empty() && !apply_all).then(|| arg.to_string());
+    if let Some(name) = &single {
+        if !names.iter().any(|n| n == name) {
+            return model.push_notice(format!("no installed user skill named '{name}'"));
+        }
+    }
+    let notice = match &single {
+        _ if apply_all => "updating all skills".to_string(),
+        Some(n) => format!("updating '{n}'"),
+        None => "checking for skill updates".to_string(),
+    };
+    model.push_notice(format!("({notice} …)"));
+
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let targets = single.clone().map(|n| vec![n]).unwrap_or(names);
+        let mut lines = Vec::new();
+        for name in targets {
+            match tools::hub::check_update(&store, &name).await {
+                tools::hub::UpdateStatus::UpToDate => lines.push(format!("✓ {name} — up to date")),
+                tools::hub::UpdateStatus::ModifiedLocally => {
+                    lines.push(format!("✎ {name} — modified locally (protected; not updated)"))
+                }
+                tools::hub::UpdateStatus::Unmanaged(reason) => {
+                    lines.push(format!("· {name} — {reason}"))
+                }
+                tools::hub::UpdateStatus::Available { to, .. } => {
+                    let short = &to[..to.len().min(8)];
+                    if apply_all || single.is_some() {
+                        match store.provenance(&name).map(|p| p.source) {
+                            Some(source) => match store.install_from(&source).await {
+                                Ok(r) => {
+                                    let flag = if r.scan_verdict == "caution" {
+                                        " (⚠ guard flagged — /skill info to review)"
+                                    } else {
+                                        ""
+                                    };
+                                    lines.push(format!("✔ updated {name} → {short}{flag}"));
+                                }
+                                Err(e) => lines.push(format!("✖ {name} — update failed: {e}")),
+                            },
+                            None => lines.push(format!("✖ {name} — source unavailable")),
+                        }
+                    } else {
+                        lines.push(format!(
+                            "↑ {name} — update available → {short}  (apply: /skill update {name})"
+                        ));
+                    }
+                }
+            }
+        }
+        if !apply_all && single.is_none() {
+            lines.push("apply: /skill update <name> · /skill update --all".to_string());
+        }
+        let _ = tx.send(TuiEvent::SkillUpdateReport(lines));
+    });
+}
+
 fn show_skill_info(model: &mut Model, name: &str) {
     if name.is_empty() {
         model.push_notice("usage: /skill info <name>\n  Browse names with /skill or /skills");
@@ -3020,6 +3115,11 @@ mod fix_tests {
         assert_eq!(
             classify_slash("skill search pdf"),
             SlashAction::SearchSkills("pdf".into())
+        );
+        assert_eq!(classify_slash("skill update"), SlashAction::UpdateSkills(String::new()));
+        assert_eq!(
+            classify_slash("skill update --all"),
+            SlashAction::UpdateSkills("--all".into())
         );
         // …but a name that merely starts with "sources" still loads as a name.
         assert_eq!(

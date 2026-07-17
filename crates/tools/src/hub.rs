@@ -309,6 +309,45 @@ fn encode_path(path: &str) -> String {
         .join("/")
 }
 
+// ── update / drift ──────────────────────────────────────────────────────────
+
+/// Update status of one installed skill relative to its recorded source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateStatus {
+    /// Installed revision matches the current upstream.
+    UpToDate,
+    /// Upstream has moved; `from`/`to` are the recorded and current revisions.
+    Available { from: Option<String>, to: String },
+    /// The on-disk package no longer matches its install hash — the user edited
+    /// it. Protected: never overwritten by an update.
+    ModifiedLocally,
+    /// No re-fetchable remote to update from (local install, missing source, …).
+    Unmanaged(&'static str),
+}
+
+/// Decide whether an installed user skill can/should be updated. Drift is
+/// checked first and wins: a locally edited skill is protected, never clobbered.
+/// Otherwise a re-fetchable GitHub source's current revision is compared with
+/// the one recorded at install.
+pub async fn check_update(store: &crate::skills::SkillStore, name: &str) -> UpdateStatus {
+    let Some(prov) = store.provenance(name) else {
+        return UpdateStatus::Unmanaged("no recorded source");
+    };
+    if let (Some(recorded), Some(disk)) = (prov.content_hash.as_deref(), store.installed_hash(name)) {
+        if recorded != disk {
+            return UpdateStatus::ModifiedLocally;
+        }
+    }
+    if prov.kind != "github-folder" {
+        return UpdateStatus::Unmanaged("installed from a non-GitHub source");
+    }
+    match crate::skills::current_revision(&prov.source).await {
+        Some(cur) if Some(cur.as_str()) == prov.revision.as_deref() => UpdateStatus::UpToDate,
+        Some(cur) => UpdateStatus::Available { from: prov.revision, to: cur },
+        None => UpdateStatus::Unmanaged("source is not a resolvable GitHub folder"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +437,40 @@ mod tests {
         assert_eq!(encode_path("skills"), "skills");
         assert_eq!(encode_path("a/b c/d"), "a/b%20c/d");
         assert_eq!(encode_path("/leading//double/"), "leading/double");
+    }
+
+    #[test]
+    fn check_update_protects_edits_and_reports_unmanaged() {
+        let dir = tmp();
+        let user = dir.join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let store = crate::skills::SkillStore::new(dir.join("proj"), Some(user.clone()));
+
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("SKILL.md"), "---\nname: demo\ndescription: d\n---\n\nbody\n").unwrap();
+        futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
+
+        // Installed from a local folder → nothing remote to update from.
+        assert_eq!(
+            futures::executor::block_on(check_update(&store, "demo")),
+            UpdateStatus::Unmanaged("installed from a non-GitHub source")
+        );
+        // Edit on disk → drift wins and the skill is protected.
+        std::fs::write(
+            user.join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\n\nedited\n",
+        )
+        .unwrap();
+        assert_eq!(
+            futures::executor::block_on(check_update(&store, "demo")),
+            UpdateStatus::ModifiedLocally
+        );
+        // Unknown skill → unmanaged, not a panic.
+        assert_eq!(
+            futures::executor::block_on(check_update(&store, "nope")),
+            UpdateStatus::Unmanaged("no recorded source")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

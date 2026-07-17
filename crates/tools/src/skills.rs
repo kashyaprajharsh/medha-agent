@@ -1035,6 +1035,15 @@ pub(crate) async fn fetch_limited(
     Ok(out)
 }
 
+/// Re-resolve the commit a github-folder `source` currently points at (its ref
+/// resolved *now*), for update detection. `None` if `source` isn't a GitHub
+/// tree URL. A pinned-sha source resolves to itself → never reports an update.
+pub(crate) async fn current_revision(source: &str) -> Option<String> {
+    let tree = parse_github_tree_url(source).ok().flatten()?;
+    let client = install_client().ok()?;
+    Some(github_revision(&client, &tree).await)
+}
+
 async fn github_revision(client: &reqwest::Client, tree: &GitHubTree) -> String {
     let url = format!(
         "https://api.github.com/repos/{}/{}/commits/{}",

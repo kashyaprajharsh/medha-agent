@@ -83,7 +83,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tasks", "list background shell tasks (running/finished)"),
     (
         "/skill",
-        "skill hub — load, search, install, update, sources, lock/sync (or /skill <name>)",
+        "skill hub — use a skill, or add one (search / paste a link)  ·  /skill <name> to load",
     ),
     ("/clear", "reset the conversation"),
     ("/exit", "quit (also Ctrl-D)"),
@@ -119,12 +119,19 @@ const HIDDEN_COMMANDS: &[&str] = &["/think", "/thinking", "/effort", "/skills"];
 /// palette entries — discoverable in a menu instead of cluttering autocomplete.
 /// The typed forms still work for power users.
 pub(super) const SKILL_HUB_ACTIONS: &[(&str, &str)] = &[
-    ("▸ Search for a skill to install…", "search"),
-    ("▸ Install from a folder or URL…", "install"),
+    ("➕ Add a skill…      search the catalog, or paste a GitHub link", "add"),
+    ("⚙  Manage skills…    updates · sources · lock / sync", "manage"),
+];
+
+/// The Manage sub-menu, reached from the hub's "Manage skills…" row. Keeps the
+/// power operations one layer deep — present and usable, but off the everyday
+/// path. `(row label, action id)`; `back` returns to the hub.
+pub(super) const SKILL_MANAGE_ACTIONS: &[(&str, &str)] = &[
     ("▸ Check for updates", "update"),
-    ("▸ Manage sources (add/remove repos)", "sources"),
-    ("▸ Lock installed skills → lockfile", "lock"),
-    ("▸ Sync skills from the lockfile", "sync"),
+    ("▸ Sources — add or remove repositories", "sources"),
+    ("▸ Lock — save this set (for your team)", "lock"),
+    ("▸ Sync — restore skills from the lockfile", "sync"),
+    ("← Back", "back"),
 ];
 
 fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
@@ -722,6 +729,9 @@ enum PickerKind {
     /// `/skill search` results: pick one to install. Holds the ranked hits;
     /// Enter installs the selected one through the guard-gated installer.
     SkillSearch(Vec<tools::SkillHit>),
+    /// The skill hub's "Manage skills…" sub-menu (updates / sources / lock /
+    /// sync). Fixed rows from [`SKILL_MANAGE_ACTIONS`]; no data to carry.
+    SkillManage,
 }
 
 /// The autonomy levels offered by the `/mode` picker, with self-explanatory
@@ -809,6 +819,7 @@ impl PickerKind {
             PickerKind::SkillSearch(_) => {
             " install a skill — ↑↓ select, Enter install, Esc cancel ".into()
         }
+        PickerKind::SkillManage => " manage skills — ↑↓ select · Enter · Esc back ".into(),
         PickerKind::AutonomyMode => {
                 " autonomy — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
             }
@@ -957,6 +968,10 @@ impl PickerKind {
                     let desc: String = h.description.chars().take(72).collect();
                     format!("{} v{} · {} — {desc}", h.name, h.version, h.repo)
                 })
+                .collect(),
+            PickerKind::SkillManage => SKILL_MANAGE_ACTIONS
+                .iter()
+                .map(|(label, _)| (*label).to_string())
                 .collect(),
         }
     }

@@ -785,25 +785,35 @@ pub(super) fn handle_key<P, L>(
                     let skill_name = skills.get(sel.wrapping_sub(n_actions)).map(|(n, _)| n.clone());
                     model.picker = None;
                     match action {
-                        Some("search") => prefill_command(
+                        // The one everyday action: a link/path installs, a word
+                        // searches — auto-detected, so there's no "which option?".
+                        Some("add") => prefill_command(
                             model,
-                            "/skill search ",
-                            "type a query, then Enter to search your sources",
+                            "/skill add ",
+                            "type a word to search (e.g. pdf), or paste a GitHub link — then Enter",
                         ),
-                        Some("install") => prefill_command(
-                            model,
-                            "/skill install ",
-                            "paste a source — a local folder, GitHub /tree/ URL, or raw SKILL.md — then Enter",
-                        ),
-                        Some("update") => update_skills(model, "", tx),
-                        Some("sources") => skill_sources(model, ""),
-                        Some("lock") => lock_skills(model),
-                        Some("sync") => sync_skills(model, tx),
+                        // Power operations live one layer deep, not on the main path.
+                        Some("manage") => {
+                            model.picker = Some(Picker::new(PickerKind::SkillManage));
+                        }
                         _ => {
                             if let Some(name) = skill_name {
                                 load_skill_by_name(model, &name, transcript);
                             }
                         }
+                    }
+                    return;
+                }
+                // Manage sub-menu: run the chosen power operation, or go back.
+                if matches!(&picker.kind, PickerKind::SkillManage) {
+                    let id = SKILL_MANAGE_ACTIONS.get(picker.selected).map(|(_, id)| *id);
+                    model.picker = None;
+                    match id {
+                        Some("update") => update_skills(model, "", tx),
+                        Some("sources") => skill_sources(model, ""),
+                        Some("lock") => lock_skills(model),
+                        Some("sync") => sync_skills(model, tx),
+                        _ => open_skill_picker(model), // Back (or anything unknown)
                     }
                     return;
                 }
@@ -1839,6 +1849,8 @@ enum SlashAction {
     SkillSources(String),
     /// `/skill search <query>` — search registered sources for skills.
     SearchSkills(String),
+    /// `/skill add <word-or-link>` — search the catalog or install a link/path.
+    AddSkill(String),
     /// `/skill update [<name> | --all]` — check (and optionally apply) updates.
     UpdateSkills(String),
     /// `/skill lock` — write the skills lockfile from what's installed.
@@ -1890,6 +1902,9 @@ fn classify_slash(cmd: &str) -> SlashAction {
                     .trim()
                     .to_string(),
             )
+        }
+        c if c.strip_prefix("skill add").is_some_and(is_cmd_boundary) => {
+            SlashAction::AddSkill(c.strip_prefix("skill add").unwrap_or("").trim().to_string())
         }
         "skill lock" => SlashAction::LockSkills,
         "skill sync" => SlashAction::SyncSkills,
@@ -1967,6 +1982,7 @@ fn dispatch_slash<P, L>(
         SlashAction::InstallSkill(src) => install_skill(model, &src, tx),
         SlashAction::SkillSources(args) => skill_sources(model, &args),
         SlashAction::SearchSkills(query) => search_skills(model, &query, tx),
+        SlashAction::AddSkill(input) => add_skill(model, &input, tx),
         SlashAction::UpdateSkills(arg) => update_skills(model, &arg, tx),
         SlashAction::LockSkills => lock_skills(model),
         SlashAction::SyncSkills => sync_skills(model, tx),
@@ -2365,10 +2381,21 @@ fn open_skill_picker(model: &mut Model) {
         .effective()
         .filter(|listing| listing.available())
         .map(|listing| {
+            // Trust receipt from the guard verdict recorded at install (only
+            // installed user skills have provenance; others show no mark).
+            let receipt = match store
+                .provenance(&listing.skill.name)
+                .and_then(|p| p.scan_verdict)
+                .as_deref()
+            {
+                Some("safe") => "✓ ",
+                Some("caution") => "⚠ ",
+                _ => "",
+            };
             (
                 listing.skill.name.clone(),
                 format!(
-                    "[{}] {}",
+                    "{receipt}[{}] {}",
                     listing.skill.scope.as_str(),
                     listing.skill.description
                 ),
@@ -2504,6 +2531,73 @@ fn set_default_model(model: &mut Model, name: &str) {
     }
 }
 
+/// A distinctive lead shared by every transient skill-hub hint so that clicking
+/// hub actions refreshes ONE line via `upsert_notice` instead of stacking
+/// identical notices (the notice-wall bug).
+const HUB_LEAD: &str = "◈ ";
+
+/// Standard, actionable "no sources yet" line — shared by search and the sources
+/// view so the guidance is worded identically everywhere.
+const NO_SOURCES: &str =
+    "no skill sources yet — add one:  /skill sources add <owner/repo>  (e.g. anthropics/skills)";
+
+/// Show a single, self-replacing skill-hub hint (never stacks).
+fn hub_notice(model: &mut Model, text: impl std::fmt::Display) {
+    model.upsert_notice(HUB_LEAD, format!("{HUB_LEAD}{text}"));
+}
+
+/// The registered skill sources; empty on any error (missing file / bad config).
+fn registered_taps() -> Vec<tools::Tap> {
+    config::user_taps_path()
+        .ok()
+        .map(tools::TapStore::new)
+        .and_then(|s| s.list().ok())
+        .unwrap_or_default()
+}
+
+/// Sources to browse/search: the shipped defaults plus the user's own (deduped),
+/// so search works out of the box without registering anything.
+fn browse_taps() -> Vec<tools::Tap> {
+    let mut taps = tools::hub::default_taps();
+    for t in registered_taps() {
+        if !taps.iter().any(|d| d.key() == t.key()) {
+            taps.push(t);
+        }
+    }
+    taps
+}
+
+/// `/skill add <word-or-link>` — the one friendly way to get a skill. A URL or
+/// path installs it; anything else searches the catalog. Auto-detected, so a
+/// user never has to choose between "install" and "search".
+fn add_skill(model: &mut Model, input: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let input = input.trim();
+    if input.is_empty() {
+        return hub_notice(
+            model,
+            "type a word to search (e.g. pdf), or paste a GitHub link — then Enter",
+        );
+    }
+    if looks_like_source(input) {
+        install_skill(model, input, tx);
+    } else {
+        search_skills(model, input, tx);
+    }
+}
+
+/// True when the input is a URL or filesystem path (→ install); otherwise it is
+/// treated as a search term.
+fn looks_like_source(s: &str) -> bool {
+    s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.contains("github.com")
+        || s.starts_with('/')
+        || s.starts_with("~/")
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || std::path::Path::new(s).exists()
+}
+
 /// `/skill install <path-or-url>` — install a complete skill package into user
 /// scope from a local folder, GitHub `/tree/` folder, or raw `SKILL.md`.
 fn install_skill(model: &mut Model, src: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
@@ -2539,19 +2633,27 @@ fn skill_sources(model: &mut Model, args: &str) {
     };
     match sub {
         "" | "list" => match store.list() {
-            Ok(taps) if taps.is_empty() => model.push_notice(
-                "no skill sources registered\n  add one: /skill sources add <owner/repo> [subpath]",
-            ),
-            Ok(taps) => {
+            Ok(user) => {
+                // Show the shipped default(s) first (marked built-in) so it's
+                // clear search works out of the box, then the user's own.
+                let defaults = tools::hub::default_taps();
                 let mut s = String::from("skill sources:");
-                for t in &taps {
+                for t in &defaults {
+                    s.push_str(&format!("\n  · {}/{}  (built-in)", t.repo, t.path));
+                }
+                for t in &user {
+                    if defaults.iter().any(|d| d.key() == t.key()) {
+                        continue; // don't double-list a source that shadows a default
+                    }
                     let r = t.git_ref.as_deref().map(|r| format!(" @{r}")).unwrap_or_default();
                     s.push_str(&format!("\n  · {}/{}{r}", t.repo, t.path));
                 }
-                s.push_str("\n  search: /skill search <query> · add: /skill sources add <owner/repo>");
-                model.push_notice(s);
+                s.push_str(
+                    "\n  add: /skill sources add <owner/repo>   ·   remove: /skill sources remove <owner/repo>",
+                );
+                hub_notice(model, s);
             }
-            Err(e) => model.push_notice(format!("reading sources: {e}")),
+            Err(e) => hub_notice(model, format!("reading sources: {e}")),
         },
         "add" => {
             let (spec, path_arg) = match rest.split_once(char::is_whitespace) {
@@ -2560,58 +2662,54 @@ fn skill_sources(model: &mut Model, args: &str) {
             };
             match tools::Tap::parse(spec, path_arg) {
                 Ok(tap) => match store.add(tap.clone()) {
-                    Ok(true) => model.push_notice(format!("✔ added source {}", tap.key())),
-                    Ok(false) => model.push_notice(format!("updated source {}", tap.key())),
-                    Err(e) => model.push_notice(format!("could not add source: {e}")),
+                    Ok(true) => hub_notice(model, format!("✔ added source {}", tap.key())),
+                    Ok(false) => hub_notice(model, format!("updated source {}", tap.key())),
+                    Err(e) => hub_notice(model, format!("could not add source: {e}")),
                 },
-                Err(e) => model.push_notice(format!(
-                    "usage: /skill sources add <owner/repo> [subpath]\n  {e}"
-                )),
+                Err(e) => hub_notice(
+                    model,
+                    format!("usage: /skill sources add <owner/repo> [subpath] — {e}"),
+                ),
             }
         }
         "remove" | "rm" => {
             if rest.is_empty() {
-                return model.push_notice("usage: /skill sources remove <owner/repo>");
+                return hub_notice(model, "usage: /skill sources remove <owner/repo>");
             }
             match store.remove(rest) {
-                Ok(0) => model.push_notice(format!("no source matching '{rest}'")),
-                Ok(n) => model.push_notice(format!("✔ removed {n} source(s) matching '{rest}'")),
-                Err(e) => model.push_notice(format!("could not remove source: {e}")),
+                Ok(0) => hub_notice(model, format!("no source matching '{rest}'")),
+                Ok(n) => hub_notice(model, format!("✔ removed {n} source(s) matching '{rest}'")),
+                Err(e) => hub_notice(model, format!("could not remove source: {e}")),
             }
         }
-        other => model.push_notice(format!(
-            "unknown: /skill sources {other}\n  usage: /skill sources [add <owner/repo> [subpath] | remove <owner/repo>]"
-        )),
+        other => hub_notice(
+            model,
+            format!("unknown: /skill sources {other} — use add / remove"),
+        ),
     }
 }
 
-/// `/skill search <query>` — query the registered sources (async, network) and
-/// report matches with an install command for each. Reads only metadata.
+/// `/skill search <query>` — search the sources (shipped defaults + the user's)
+/// and open a results picker. Metadata only; an empty query browses everything.
+/// Async (network).
 fn search_skills(model: &mut Model, query: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
-    if query.is_empty() {
-        return model.push_notice(
-            "usage: /skill search <query>\n  searches your /skill sources — add one first if you have none",
-        );
-    }
-    let taps = match config::user_taps_path()
-        .map_err(|e| e.to_string())
-        .and_then(|p| tools::TapStore::new(p).list())
-    {
-        Ok(t) => t,
-        Err(e) => return model.push_notice(format!("skill search unavailable: {e}")),
-    };
+    let taps = browse_taps();
     if taps.is_empty() {
-        return model.push_notice(
-            "no skill sources registered — add one first:\n  /skill sources add <owner/repo>",
-        );
+        return hub_notice(model, NO_SOURCES);
     }
     let count = taps.len();
-    let (q, tx) = (query.to_string(), tx.clone());
+    let q = query.trim().to_string();
+    let label = if q.is_empty() {
+        format!("browsing skills in {count} source(s) …")
+    } else {
+        format!("searching for '{q}' in {count} source(s) …")
+    };
+    let tx = tx.clone();
     tokio::spawn(async move {
         let result = tools::hub::search(&taps, &q).await;
         let _ = tx.send(TuiEvent::SkillSearchResults(result));
     });
-    model.push_notice(format!("(searching {count} source(s) for '{query}' …)"));
+    hub_notice(model, format!("({label})"));
 }
 
 /// `/skill update [<name> | --all]` — check registered sources for newer
@@ -2699,7 +2797,7 @@ fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEve
 fn prefill_command(model: &mut Model, cmd: &str, hint: &str) {
     model.input = cmd.to_string();
     model.cursor = model.input.len();
-    model.push_notice(hint);
+    hub_notice(model, hint);
 }
 
 /// `/skill lock` — snapshot every installed user skill (that has a recorded
@@ -3228,6 +3326,26 @@ mod fix_tests {
         );
         assert_eq!(classify_slash("skill lock"), SlashAction::LockSkills);
         assert_eq!(classify_slash("skill sync"), SlashAction::SyncSkills);
+        assert_eq!(classify_slash("skill add pdf"), SlashAction::AddSkill("pdf".into()));
+        assert_eq!(classify_slash("skill add"), SlashAction::AddSkill(String::new()));
+        // a name that merely starts with "add" still loads as a skill name
+        assert_eq!(
+            classify_slash("skill adder"),
+            SlashAction::LoadSkill("adder".into())
+        );
+    }
+
+    #[test]
+    fn add_auto_detects_link_or_path_vs_search_term() {
+        // links / paths → install
+        assert!(looks_like_source("https://github.com/anthropics/skills/tree/main/skills/pdf"));
+        assert!(looks_like_source("github.com/owner/repo"));
+        assert!(looks_like_source("/tmp/my-skill"));
+        assert!(looks_like_source("~/skills/foo"));
+        assert!(looks_like_source("./local"));
+        // plain words → search
+        assert!(!looks_like_source("pdf"));
+        assert!(!looks_like_source("excel spreadsheet"));
     }
 
     #[test]

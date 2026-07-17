@@ -23,6 +23,18 @@ fn default_tap_path() -> String {
     DEFAULT_TAP_PATH.to_string()
 }
 
+/// Sources shipped enabled out of the box, so browse/search works with zero
+/// setup — a user never has to register a source to find common skills (mirrors
+/// how mature agents ship an official catalog on). Merged with the user's own
+/// taps for browse/search; a user can still add more or shadow these.
+pub fn default_taps() -> Vec<Tap> {
+    vec![Tap {
+        repo: "anthropics/skills".into(),
+        path: DEFAULT_TAP_PATH.into(),
+        git_ref: None,
+    }]
+}
+
 /// One registered source: a GitHub repo plus the subpath its skills live under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tap {

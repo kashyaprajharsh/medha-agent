@@ -66,6 +66,11 @@ pub struct SkillProvenance {
     /// skills lockfile. `None` for packages installed before hashing existed.
     #[serde(default)]
     pub content_hash: Option<String>,
+    /// Guard verdict recorded at install: `"safe"` or `"caution"` (dangerous
+    /// never installs). Lets a surface show a trust receipt without re-scanning.
+    /// `None` for packages installed before the guard existed.
+    #[serde(default)]
+    pub scan_verdict: Option<String>,
 }
 
 /// Result of installing a complete skill package.
@@ -668,28 +673,15 @@ impl SkillStore {
                 .map_err(|e| format!("reading staged {}: {e}", md_path.display()))?;
             let (fm, _) = parse_skill_md(&text)
                 .map_err(|e| format!("{src} is not a valid skill package: {e}"))?;
-            // Hash the package now — before the provenance sidecar is written —
-            // so the hash covers only real content and never itself.
+            // Hash the package now — no provenance sidecar exists yet, so the
+            // hash covers only real content and never itself. Provenance is
+            // written after the scan (below) so it can record the verdict.
             let content_hash = hash_package(&stage);
-            let provenance = SkillProvenance {
-                source: src.to_string(),
-                kind,
-                revision: revision.clone(),
-                installed_at: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                content_hash: Some(content_hash.clone()),
-            };
-            let provenance_json = serde_json::to_vec_pretty(&provenance)
-                .map_err(|e| format!("serializing skill provenance: {e}"))?;
-            std::fs::write(stage.join(PROVENANCE_FILE), provenance_json)
-                .map_err(|e| e.to_string())?;
-            Ok::<_, String>((fm.name, revision, content_hash, budget))
+            Ok::<_, String>((fm.name, kind, revision, content_hash, budget))
         }
         .await;
 
-        let (name, revision, content_hash, budget) = match staged {
+        let (name, kind, revision, content_hash, budget) = match staged {
             Ok(result) => result,
             Err(e) => {
                 std::fs::remove_dir_all(&stage).ok();
@@ -715,6 +707,31 @@ impl SkillStore {
         } else {
             "safe"
         };
+        // Write provenance now that the verdict is known (the sidecar is a
+        // dotfile, so it is excluded from both the hash and the scan above).
+        let provenance = SkillProvenance {
+            source: src.to_string(),
+            kind,
+            revision: revision.clone(),
+            installed_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            content_hash: Some(content_hash.clone()),
+            scan_verdict: Some(scan_verdict.to_string()),
+        };
+        match serde_json::to_vec_pretty(&provenance) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(stage.join(PROVENANCE_FILE), json) {
+                    std::fs::remove_dir_all(&stage).ok();
+                    return Err(format!("writing skill provenance: {e}"));
+                }
+            }
+            Err(e) => {
+                std::fs::remove_dir_all(&stage).ok();
+                return Err(format!("serializing skill provenance: {e}"));
+            }
+        }
         let dest = user_dir.join(&name);
         let replaced = dest.exists();
         if let Err(e) = replace_dir_atomically(&stage, &dest) {

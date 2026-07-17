@@ -137,19 +137,21 @@ sandbox-bypass directives, secret access and exfiltration, and hidden Unicode
 **Dangerous → install refused** (nothing written), **Caution → installs but the
 findings are shown**, **Safe → silent**.
 
-**One entry point: `/skill`** opens an interactive hub — arrow-key select to
-load an installed skill (the full list scrolls below the actions), or pick an
-action (Search · Install · Check updates · Manage sources · Lock · Sync). It is
-the *only* skill entry in the command palette; the typed forms below are
-shortcuts for power users:
+**One front door: `/skill`** opens an interactive hub — arrow-key select to
+**load** one of your installed skills (each tagged with a trust receipt from the
+Guard, `✓`/`⚠`), or pick **➕ Add a skill…** (a word searches the catalog; a
+GitHub link/path installs it — auto-detected). Power operations sit one layer
+down under **⚙ Manage skills…** (updates · sources · lock/sync). `anthropics/skills`
+ships enabled, so search works with zero setup. It's the *only* skill entry in
+the palette; the typed forms are shortcuts for power users:
 
 ```sh
-/skill                                          # the hub (load a skill or pick an action)
-/skill install <folder | GitHub /tree/ URL | raw SKILL.md>   # guard-gated, atomic
-/skill sources add anthropics/skills          # register a source once ("tap")
-/skill search pdf                              # search sources → pick → install
-/skill update [<name> | --all]                 # check / apply (local edits protected)
-/skill lock  ·  /skill sync                     # write / reproduce medha-skills.lock
+/skill                                          # the hub
+/skill add pdf                                  # word → search catalog; link/path → install
+/skill add https://github.com/anthropics/skills/tree/main/skills/pdf   # install (guard-gated)
+/skill update [<name> | --all]                  # check / apply (local edits protected)
+/skill sources [add|remove] <owner/repo>        # extra sources beyond the shipped default
+/skill lock  ·  /skill sync                      # write / reproduce medha-skills.lock (teams)
 ```
 
 **Content-hashed, so update never clobbers your edits.** Each install records a

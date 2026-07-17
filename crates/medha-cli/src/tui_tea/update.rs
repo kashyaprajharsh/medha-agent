@@ -790,7 +790,7 @@ pub(super) fn handle_key<P, L>(
                         Some("add") => prefill_command(
                             model,
                             "/skill add ",
-                            "type a word to search (e.g. pdf), or paste a GitHub link — then Enter",
+                            "type a word to search (e.g. pdf) · paste a GitHub link to install · or just Enter to browse all",
                         ),
                         // Power operations live one layer deep, not on the main path.
                         Some("manage") => {
@@ -2627,15 +2627,11 @@ fn remove_source(model: &mut Model, key: &str) {
 /// user never has to choose between "install" and "search".
 fn add_skill(model: &mut Model, input: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let input = input.trim();
-    if input.is_empty() {
-        return hub_notice(
-            model,
-            "type a word to search (e.g. pdf), or paste a GitHub link — then Enter",
-        );
-    }
     if looks_like_source(input) {
         install_skill(model, input, tx);
     } else {
+        // A word filters; empty browses the whole catalog (search treats an
+        // empty query as "list everything from your sources").
         search_skills(model, input, tx);
     }
 }

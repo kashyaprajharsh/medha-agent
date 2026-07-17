@@ -77,9 +77,9 @@ where
 {
     let mut findings = Vec::new();
     for (path, bytes) in files {
-        match std::str::from_utf8(bytes) {
-            Ok(text) => scan_text(path, text, &mut findings),
-            Err(_) => {} // binary asset: inert until referenced; nothing to scan
+        // A binary asset is inert until referenced and has no text to scan.
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            scan_text(path, text, &mut findings);
         }
     }
     ScanReport::from_findings(findings)

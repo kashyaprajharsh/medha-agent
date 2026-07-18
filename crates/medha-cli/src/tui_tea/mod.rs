@@ -801,7 +801,7 @@ impl PickerKind {
                 )
             }
             PickerKind::Memory(_) => {
-                " memory — ↑↓ select, Enter jump to provenance, Esc cancel ".into()
+                " memory — ↑↓ select · Enter provenance · p pin/unpin · f forget · Esc cancel ".into()
             }
             PickerKind::Skill(_) => " skill hub — ↑↓ select · Enter · Esc cancel ".into(),
             PickerKind::RemoveSkill(name) => {

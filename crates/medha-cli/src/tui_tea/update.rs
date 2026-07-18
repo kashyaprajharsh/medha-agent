@@ -625,6 +625,9 @@ pub(super) fn handle_key<P, L>(
         return;
     }
 
+    if handle_memory_picker_key(model, &key, kernel, session, tx) {
+        return;
+    }
     if handle_reasoning_picker_key(model, key, kernel.provider.as_ref()) {
         return;
     }
@@ -2094,6 +2097,92 @@ fn open_memory<L: EventLog + 'static>(
     };
     spawn_memory_provenance(entry, kernel, tx);
     model.push_notice(format!("(opening memory '{name}' provenance …)"));
+}
+
+/// Memory picker actions (p = pin/unpin, f = forget). Returns true if the key
+/// was handled. Mutations go through the log first (an event) then the
+/// projection, exactly like the CLI — so trust/provenance and fork-safety hold.
+fn handle_memory_picker_key<P, L>(
+    model: &mut Model,
+    key: &KeyEvent,
+    kernel: &Arc<Kernel<P, L>>,
+    session: &Session,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) -> bool
+where
+    P: Provider + 'static,
+    L: EventLog + 'static,
+{
+    let Some(picker) = model.picker.as_ref() else {
+        return false;
+    };
+    let PickerKind::Memory(entries) = &picker.kind else {
+        return false;
+    };
+    let Some(entry) = entries.get(picker.selected).cloned() else {
+        return false;
+    };
+    let op = match key.code {
+        KeyCode::Char('p') => memory::MemoryOp::Pin {
+            scope: entry.scope,
+            name: entry.name.clone(),
+            pinned: !entry.pinned,
+        },
+        KeyCode::Char('f') => memory::MemoryOp::Forget {
+            scope: entry.scope,
+            name: entry.name.clone(),
+        },
+        _ => return false,
+    };
+    let verb = match &op {
+        memory::MemoryOp::Pin { pinned: true, .. } => format!("pinned '{}'", entry.name),
+        memory::MemoryOp::Pin { .. } => format!("unpinned '{}'", entry.name),
+        memory::MemoryOp::Forget { .. } => format!("forgot '{}'", entry.name),
+        _ => String::new(),
+    };
+    apply_tui_memory_op(model, kernel, session, op, tx);
+    model.push_notice(format!("✔ {verb}"));
+    true
+}
+
+/// Append a memory mutation as a durable event, apply it to the projection, and
+/// refresh the open picker's entry list so the change shows immediately.
+fn apply_tui_memory_op<P, L>(
+    model: &mut Model,
+    kernel: &Arc<Kernel<P, L>>,
+    session: &Session,
+    op: memory::MemoryOp,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) where
+    P: Provider + 'static,
+    L: EventLog + 'static,
+{
+    let Some(store) = model.memory.clone().filter(|_| model.memory_enabled) else {
+        model.push_notice("memory: unavailable");
+        return;
+    };
+    // Event is the source of truth; the projection is a rebuildable cache.
+    let log = kernel.log.clone();
+    let session = session.clone();
+    let event_op = op.clone();
+    let _ = tx;
+    tokio::spawn(async move {
+        if let Ok(payload) = serde_json::to_value(&event_op) {
+            let _ = log.append(kernel::Event::memory_write(&session, payload)).await;
+        }
+    });
+    let _ = store.apply(&op);
+    // Refresh the picker in place (or close it if nothing is left to show).
+    if let Some(picker) = model.picker.as_mut() {
+        if let PickerKind::Memory(entries) = &mut picker.kind {
+            *entries = store.list().unwrap_or_default();
+            if entries.is_empty() {
+                model.picker = None;
+            } else if picker.selected >= entries.len() {
+                picker.selected = entries.len() - 1;
+            }
+        }
+    }
 }
 
 fn spawn_memory_provenance<L: EventLog + 'static>(
@@ -3573,7 +3662,9 @@ mod fix_tests {
             })
             .unwrap();
         let picker = PickerKind::Memory(store.list().unwrap());
-        assert!(picker.title().contains("jump to provenance"));
+        let title = picker.title();
+        assert!(title.contains("provenance"));
+        assert!(title.contains("p pin/unpin") && title.contains("f forget"));
         let labels = picker.labels();
         assert!(labels[0].contains("[user · 2d · pinned]"));
         assert!(labels[0].contains("quoted-fact — a hyphenated hook"));

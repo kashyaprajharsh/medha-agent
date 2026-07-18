@@ -632,6 +632,11 @@ fn role_str(r: &Role) -> &'static str {
 /// wire-format invariant at the boundary that owns it — a durable guarantee
 /// against any future upstream regression. Non-system messages keep their exact
 /// order, so tool-call ↔ tool-result pairing is untouched.
+///
+/// Tool-call names in assistant history are also sanitized to the wire form
+/// (`fs.edit` → `fs_edit`): strict OpenAI-compat backends validate names in the
+/// message history, not just the tool defs, so a prior dotted call would 400 on
+/// the next turn.
 fn build_chat_messages(messages: &[Message]) -> Vec<ChatMsg> {
     let mut system = String::new();
     let mut rest: Vec<ChatMsg> = Vec::with_capacity(messages.len());
@@ -653,7 +658,7 @@ fn build_chat_messages(messages: &[Message]) -> Vec<ChatMsg> {
                     id: tc.id.clone(),
                     typ: "function",
                     function: OutFn {
-                        name: tc.tool.clone(),
+                        name: wire_tool_name(&tc.tool),
                         arguments: tc.args.to_string(),
                     },
                 })
@@ -803,14 +808,19 @@ impl Provider for OpenAiCompat {
         // `system` at the very beginning; compaction can insert a mid-array one).
         let messages = build_chat_messages(&ctx.messages);
 
-        // Expose the K2 capability sheath as OpenAI tool definitions.
+        // Expose the K2 capability sheath as OpenAI tool definitions, with names
+        // sanitized to the strict OpenAI contract ([a-zA-Z0-9_-]) — canonical
+        // dotted names (`fs.edit`) 400 on strict backends (NVIDIA NIM, OpenAI,
+        // most hosted OpenAI-compat gateways). `names` maps the wire form back
+        // when the model calls a tool; vLLM (permissive) is unaffected.
+        let names = wire_name_map(&ctx.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>());
         let tools: Vec<ToolDef> = ctx
             .tools
             .iter()
             .map(|t| ToolDef {
                 typ: "function",
                 function: FnDef {
-                    name: t.name.clone(),
+                    name: wire_tool_name(&t.name),
                     description: t.description.clone(),
                     parameters: t.schema.clone(),
                 },
@@ -919,7 +929,7 @@ impl Provider for OpenAiCompat {
             }
 
             // Emit fully-assembled tool calls, in the order the model issued them.
-            for intent in finalize_tool_calls(accum) {
+            for intent in finalize_tool_calls(accum, &names) {
                 yield Ok(Block::ToolIntent(intent));
             }
         };
@@ -943,12 +953,39 @@ fn find_record_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
+/// Canonical tool name → the name sent on the wire. Strict OpenAI-compatible
+/// validators (NVIDIA API among them) enforce `[a-zA-Z0-9_-]+` for function
+/// names, so the dotted canonical names (`fs.edit`) are mapped (`fs_edit`) at
+/// this boundary — the rest of the system never sees wire names.
+fn wire_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
+}
+
+/// Wire→canonical map for the tool names exposed this request. Collisions get a
+/// trailing `_` so two canonical names can never share a wire name.
+fn wire_name_map(canonical: &[String]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for name in canonical {
+        let mut wire = wire_tool_name(name);
+        while map.contains_key(&wire) {
+            wire.push('_');
+        }
+        map.insert(wire, name.clone());
+    }
+    map
+}
+
 /// Turn accumulated tool-call fragments into final intents, in issue order.
 /// Synthesizes `call_{idx}` for any call the stream never gave an id — some
 /// gateways (llama.cpp and others) omit it, and an empty `tool_call_id` 400s on
-/// strict backends when the result is sent back.
+/// strict backends when the result is sent back. Wire names map back to their
+/// canonical (dotted) form; an unmapped name passes through for the kernel's
+/// deny-first policy to handle.
 fn finalize_tool_calls(
     accum: std::collections::BTreeMap<u32, (String, String, String)>,
+    names: &std::collections::HashMap<String, String>,
 ) -> Vec<ToolIntent> {
     let mut out = Vec::new();
     for (idx, (id, name, args)) in accum {
@@ -967,7 +1004,7 @@ fn finalize_tool_calls(
         };
         out.push(ToolIntent {
             id,
-            tool: name,
+            tool: names.get(&name).cloned().unwrap_or(name),
             args: repair_args(parsed),
         });
     }
@@ -1329,7 +1366,7 @@ mod sse_tests {
                 r#"{"path":"a"}"#.to_string(),
             ),
         );
-        let intents = finalize_tool_calls(accum);
+        let intents = finalize_tool_calls(accum, &std::collections::HashMap::new());
         assert_eq!(intents.len(), 1);
         assert_eq!(
             intents[0].id, "call_0",
@@ -1346,7 +1383,7 @@ mod sse_tests {
             0u32,
             ("real-id".to_string(), "fs.read".to_string(), String::new()),
         );
-        let intents = finalize_tool_calls(accum);
+        let intents = finalize_tool_calls(accum, &std::collections::HashMap::new());
         assert_eq!(intents[0].id, "real-id");
         assert_eq!(
             intents[0].args,
@@ -1571,6 +1608,65 @@ mod count_tokens_tests {
         assert_eq!(built[1].role, "user");
         assert_eq!(built[2].role, "assistant");
         assert_eq!(built[3].role, "tool");
+    }
+}
+
+#[cfg(test)]
+mod wire_tool_name_tests {
+    use super::*;
+    use kernel::ToolIntent;
+
+    fn is_strict_valid(name: &str) -> bool {
+        !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[test]
+    fn dotted_names_become_strict_valid() {
+        for n in ["fs.edit", "shell.exec", "memory.write", "web.fetch"] {
+            let wire = wire_tool_name(n);
+            assert!(is_strict_valid(&wire), "{n} -> {wire} still invalid");
+        }
+        assert_eq!(wire_tool_name("fs.edit"), "fs_edit");
+        // Already-valid names pass through unchanged.
+        assert_eq!(wire_tool_name("read_artifact"), "read_artifact");
+    }
+
+    #[test]
+    fn map_round_trips_wire_back_to_canonical() {
+        let canonical = vec!["fs.edit".to_string(), "shell.exec".to_string()];
+        let map = wire_name_map(&canonical);
+        assert_eq!(map.get("fs_edit").unwrap(), "fs.edit");
+        assert_eq!(map.get("shell_exec").unwrap(), "shell.exec");
+    }
+
+    #[test]
+    fn colliding_wire_names_stay_distinct() {
+        // `fs.edit` and `fs-edit` both sanitize toward `fs_edit`/`fs-edit`;
+        // force a real collision with two dot variants.
+        let canonical = vec!["a.b".to_string(), "a_b".to_string()];
+        let map = wire_name_map(&canonical);
+        assert_eq!(map.len(), 2, "collision must not drop a tool");
+        let mut targets: Vec<_> = map.values().cloned().collect();
+        targets.sort();
+        assert_eq!(targets, vec!["a.b", "a_b"]);
+    }
+
+    #[test]
+    fn finalize_maps_wire_call_back_to_dotted_tool() {
+        let mut accum = std::collections::BTreeMap::new();
+        accum.insert(0u32, ("id".to_string(), "fs_edit".to_string(), r#"{"path":"x"}"#.to_string()));
+        let map = wire_name_map(&["fs.edit".to_string()]);
+        let intents: Vec<ToolIntent> = finalize_tool_calls(accum, &map);
+        assert_eq!(intents[0].tool, "fs.edit", "kernel must see the canonical name");
+    }
+
+    #[test]
+    fn assistant_history_tool_calls_are_sanitized() {
+        let intent = ToolIntent { id: "c1".into(), tool: "fs.edit".into(), args: serde_json::json!({}) };
+        let msgs = vec![Message::assistant_calls("", vec![intent])];
+        let built = build_chat_messages(&msgs);
+        assert_eq!(built[0].tool_calls[0].function.name, "fs_edit", "history name must be wire-valid");
     }
 }
 

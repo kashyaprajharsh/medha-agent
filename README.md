@@ -263,7 +263,6 @@ Twelve crates. `kernel` is the only code that calls a model, writes an event, or
 |---|---|
 | [docs/FEATURES.md](docs/FEATURES.md) | Full feature reference with code locations |
 | [medha.lock.example](medha.lock.example) | Every configuration option, annotated |
-| [docs/REASONING_STREAMING.md](docs/REASONING_STREAMING.md) | How reasoning arrives across OpenAI-compatible servers |
 
 ---
 

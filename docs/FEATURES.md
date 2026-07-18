@@ -339,7 +339,7 @@ Groq, OpenAI). Uses `rustls` (no OpenSSL) so the binary is self-contained.
 - **Reasoning support** — handles all three shapes of reasoning delivery
   (separate `reasoning_content`/`reasoning` delta field, inline `‹think›` tags
   in content, and none), normalized to `Block::Reasoning` on a separate channel
-  from the answer. See [`docs/REASONING_STREAMING.md`](REASONING_STREAMING.md).
+  from the answer.
 - **Request-side reasoning control** — `ReasoningConfig {enabled, effort}` maps
   to `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`) and is
   silently omitted for servers that don't support a given knob. Set via

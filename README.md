@@ -72,6 +72,27 @@ Nothing the model says *causes* an effect. Only a validated, policy-approved, sa
 
 ---
 
+## What the model sees each turn
+
+The prompt sent to the model isn't one flat blob — MEDHA assembles it in **five ordered layers**, each with its own token budget. Understanding these makes the rest of MEDHA (memory, context files, compaction) click into place.
+
+```
+1. Identity    Who the agent is — your PERSONA.md, the harness rules, the mode.
+2. Capability  Which tools it may call, and any skills you've loaded.
+3. Knowledge   What it knows — a compact, ranked memory index + project facts.
+4. History     The conversation and tool results so far. The biggest layer.
+5. Immediate   Your current message and the live progress checklist.
+```
+
+Two rules follow from this order:
+
+- **The top layers stay stable across turns.** Identity and capability rarely change mid-session, so the provider's prompt cache keeps working and turns stay fast. Memory is compiled once at session start and frozen — it only refreshes when the history is compacted (which breaks the cache anyway).
+- **Pressure is absorbed at the bottom.** When the context window fills up, MEDHA compacts the *History* layer (summarizing old turns, spilling large tool outputs to disk) and never touches your current message or the progress checklist.
+
+Memory lives in the **Knowledge** layer as a short, ranked list — not every fact the agent has ever learned, just the most relevant ones under a hard token budget. When the model needs the full entry, it calls `memory.search`; for older conversations, `sessions.search`.
+
+---
+
 ## Features
 
 ### Model & providers
@@ -93,7 +114,7 @@ Memory is event-sourced, not hidden model state:
 1. The model calls `memory.write` / `memory.update` / `memory.forget`.
 2. The **kernel** computes the entry's trust, confidence, and provenance from the current turn — these are stripped from the model's arguments and can never be self-asserted. A turn that read a web page can only produce web-trust memory.
 3. The mutation is appended to the hash-chained event log, then projected into project- and user-scoped SQLite databases with FTS5 search.
-4. A compact **K3 index** (ranked by pin → trust → recency, under a hard token budget) is compiled into the system prompt at session start and frozen for the session — refreshed only after a full compaction, so the prompt prefix stays cache-stable.
+4. A compact **memory index** — the Knowledge layer above — is ranked (pinned → trust → recency), fit under a hard token budget, and compiled into the prompt at session start. It's frozen for the session and refreshes only after a full compaction, so the prompt stays cache-stable.
 5. `memory.search` returns full entries; `sessions.search` returns verbatim exchanges from past sessions — no extra model call.
 
 Because memory writes are events, **time-travel applies to memory for free**: fork a session before a bad write and the branch never learned it.
@@ -220,8 +241,8 @@ Twelve crates. `kernel` is the only code that calls a model, writes an event, or
 |---|---|
 | [`kernel`](crates/kernel/) | Agent loop, budgets, trust-flow, interrupts, dispatch |
 | [`providers`](crates/providers/) | OpenAI-compatible streaming + non-streaming, model discovery |
-| [`context`](crates/context/) | Compaction pipeline, K1–K5 sheaths, identity, context files |
-| [`memory`](crates/memory/) | Typed memory: projection, recall (frozen K3), consolidation |
+| [`context`](crates/context/) | Prompt assembly (the five context layers), compaction, identity, context files |
+| [`memory`](crates/memory/) | Typed memory: projection, ranked recall, consolidation |
 | [`tools`](crates/tools/) | 23 tools: fs, shell, web, git, search, diagnostics, skills, memory |
 | [`policy`](crates/policy/) | Deny-first authorization, shell scanner, content guard |
 | [`sandbox`](crates/sandbox/) | Exec backends: host · Seatbelt/Landlock · container · ssh |

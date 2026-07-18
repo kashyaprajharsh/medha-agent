@@ -244,7 +244,15 @@ impl ContextEngine for PipelineEngine {
         let mut summary_text: Option<String> = None;
         let mut out: Vec<Message> = Vec::with_capacity(n);
         out.extend_from_slice(&messages[..head_end]);
-        let middle = &messages[head_end..tail_start];
+        // Stage 1 (budget reduction): a re-read/re-run tool result identical to
+        // an earlier one in this window costs nothing to elide.
+        let raw_middle = &messages[head_end..tail_start];
+        let deduped = dedupe_tool_outputs(raw_middle, self.policy.prune_floor(budget.usable()), counter);
+        // Stage 3 (microcompact): a step `update_plan` marked completed is a
+        // verified checkpoint — the turns that did it collapse to one line.
+        let microcompacted = microcompact(&group_into_turns(&deduped));
+        let pre_pass_saved = count_all(raw_middle, counter).saturating_sub(count_all(&microcompacted, counter));
+        let middle: &[Message] = &microcompacted;
 
         match action {
             CompactionAction::Prune => {
@@ -255,7 +263,7 @@ impl ContextEngine for PipelineEngine {
                 // threw away recent context the model was still using (P2).
                 let floor = self.policy.prune_floor(budget.usable()).max(1);
                 let target = usable * self.policy.microcompact_ratio;
-                let mut est = basis;
+                let mut est = basis - pre_pass_saved as f32;
                 for m in middle {
                     let toks = if m.role == Role::Tool { counter.count(&m.content) } else { 0 };
                     if m.role == Role::Tool && toks >= floor && est >= target {
@@ -277,8 +285,12 @@ impl ContextEngine for PipelineEngine {
                 }
             }
             CompactionAction::Full => {
-                // Replace the whole middle with one summary system message. The
-                // full history is retained by the kernel/log (P3).
+                // Replace the whole middle with one summary message. The full
+                // history is retained by the kernel/log (P3). It is an ASSISTANT
+                // message, not system: a mid-array system message is invalid for
+                // strict providers (vLLM: "system must be at the beginning"), and
+                // the summary belongs in its chronological place, not hoisted to
+                // the top. It compresses the model's own working context.
                 let items: Vec<HistoryItem> = middle.iter().map(msg_to_item).collect();
                 // Injected summarizer (LLM), then extractive fallback — never the
                 // useless "[summary unavailable]" placeholder that produced
@@ -300,7 +312,7 @@ impl ContextEngine for PipelineEngine {
                     *g = Some(text.clone());
                 }
                 summary_text = Some(text.clone());
-                out.push(Message::system(text));
+                out.push(Message::new(Role::Assistant, text));
             }
             CompactionAction::None => unreachable!(),
         }
@@ -352,6 +364,120 @@ fn cap_summary(text: String, max_tokens: u32, counter: &dyn TokenCounter) -> Str
         cut -= 1;
     }
     format!("{}\n…[summary truncated to fit context]", &text[..cut])
+}
+
+/// Split messages into turns — an assistant message plus every tool result
+/// answering it, as one atomic unit; a plain message is its own turn. Every
+/// operation below collapses whole turns, never a partial one, so pairing
+/// can't break.
+fn group_into_turns(messages: &[Message]) -> Vec<Vec<Message>> {
+    let mut turns = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        let end = if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+            (i + 1 + m.tool_calls.len()).min(messages.len())
+        } else {
+            i + 1
+        };
+        turns.push(messages[i..end].to_vec());
+        i = end;
+    }
+    turns
+}
+
+/// The `update_plan` snapshot in this turn, if it called that tool: `(title,
+/// status)` per step, read from the tool's own echoed result.
+fn plan_snapshot(turn: &[Message]) -> Option<Vec<(String, String)>> {
+    let call = turn.first()?.tool_calls.iter().find(|c| c.tool == "update_plan")?;
+    let result = turn
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(call.id.as_str()))?;
+    let v: serde_json::Value = serde_json::from_str(&result.content).ok()?;
+    let steps = v.get("steps")?.as_array()?;
+    Some(
+        steps
+            .iter()
+            .filter_map(|s| Some((s.get("title")?.as_str()?.to_string(), s.get("status")?.as_str()?.to_string())))
+            .collect(),
+    )
+}
+
+/// Stage 3 (microcompact, §4.3): a step that `update_plan` marks completed is
+/// a verified sub-task boundary — the turns between the plan snapshot that
+/// last had it unfinished and the one that completed it collapse to one line.
+fn microcompact(turns: &[Vec<Message>]) -> Vec<Message> {
+    let plans: Vec<(usize, Vec<(String, String)>)> =
+        turns.iter().enumerate().filter_map(|(i, t)| plan_snapshot(t).map(|s| (i, s))).collect();
+
+    let mut spans: Vec<(usize, usize, String)> = Vec::new();
+    for pair in plans.windows(2) {
+        let (i0, before) = &pair[0];
+        let (i1, after) = &pair[1];
+        if i1.saturating_sub(*i0) <= 1 {
+            continue; // no turns in between to collapse
+        }
+        for (title, status) in after {
+            if status != "completed" {
+                continue;
+            }
+            let was_incomplete = before.iter().any(|(t, s)| t == title && s != "completed");
+            if was_incomplete {
+                spans.push((*i0 + 1, *i1, title.clone()));
+            }
+        }
+    }
+    spans.sort_by_key(|(start, ..)| *start);
+    let mut cursor = 0;
+    spans.retain(|(start, end, _)| {
+        let keep = *start >= cursor;
+        if keep {
+            cursor = *end;
+        }
+        keep
+    });
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut next_span = 0;
+    while i < turns.len() {
+        if next_span < spans.len() && spans[next_span].0 == i {
+            let (_, end, title) = &spans[next_span];
+            // An ASSISTANT checkpoint, not system: it sits mid-conversation
+            // (chronological), and a mid-array system message is invalid for
+            // strict providers (vLLM). It compresses the model's own completed
+            // turns into one line.
+            out.push(Message::new(Role::Assistant, format!("✓ {title}")));
+            i = *end;
+            next_span += 1;
+        } else {
+            out.extend(turns[i].iter().cloned());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A tool result byte-identical to an earlier one in `middle` is elided to a
+/// pointer — content and pairing (`tool_call_id`) are otherwise untouched.
+fn dedupe_tool_outputs(middle: &[Message], floor: u32, counter: &dyn TokenCounter) -> Vec<Message> {
+    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(middle.len());
+    for m in middle {
+        if m.role != Role::Tool || counter.count(&m.content) < floor {
+            out.push(m.clone());
+            continue;
+        }
+        if let Some(&first_id) = seen.get(m.content.as_str()) {
+            let mut dup = m.clone();
+            dup.content = format!("[duplicate of tool result {first_id} — identical output elided]");
+            out.push(dup);
+        } else {
+            seen.insert(&m.content, m.tool_call_id.as_deref().unwrap_or(""));
+            out.push(m.clone());
+        }
+    }
+    out
 }
 
 fn msg_to_item(m: &Message) -> HistoryItem {
@@ -437,7 +563,13 @@ mod tests {
         msgs
     }
     fn full_policy() -> CompactionPolicy {
-        CompactionPolicy { protect_first_n: 1, protect_last_n: 2, tail_ratio: 0.1, ..Default::default() }
+        CompactionPolicy {
+            protect_first_n: 1,
+            protect_last_n: 2,
+            tail_ratio: 0.1,
+            trigger_ratio: 0.85,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -558,6 +690,7 @@ mod tests {
             protect_first_n: 1,
             protect_last_n: 2,
             tail_ratio: 0.05,
+            trigger_ratio: 0.85,
             ..Default::default()
         });
         // Prune band (~3120..4420 of usable 5200 @8k), but the middle holds no
@@ -645,7 +778,7 @@ mod tests {
         let mut msgs = vec![Message::system("S")];
         for i in 0..8 {
             msgs.push(user(&format!("ask {i}")));
-            msgs.push(Message::tool_result(format!("c{i}"), "z".repeat(1600)));
+            msgs.push(Message::tool_result(format!("c{i}"), format!("{i}{}", "z".repeat(1600))));
         }
         msgs.push(user("LAST"));
         let r = eng.compile(&msgs, Some(8_000)).await;
@@ -771,6 +904,129 @@ mod tests {
                     .any(|later| later.role == Role::Tool && later.tool_call_id.as_deref() == Some(&call.id));
                 assert!(paired, "dangling tool_call `{}` at head boundary (index {i})", call.id);
             }
+        }
+    }
+
+    fn update_plan_turn(id: &str, steps: &[(&str, &str)]) -> Vec<Message> {
+        let call = ToolIntent { id: id.into(), tool: "update_plan".into(), args: serde_json::json!({}) };
+        let steps_json: Vec<serde_json::Value> =
+            steps.iter().map(|(t, s)| serde_json::json!({"title": t, "status": s})).collect();
+        let result = serde_json::json!({"steps": steps_json}).to_string();
+        vec![Message::assistant_calls(String::new(), vec![call]), Message::tool_result(id, result)]
+    }
+
+    fn work_turn(id: &str, tool: &str, output: &str) -> Vec<Message> {
+        let call = ToolIntent { id: id.into(), tool: tool.into(), args: serde_json::json!({}) };
+        vec![Message::assistant_calls(String::new(), vec![call]), Message::tool_result(id, output)]
+    }
+
+    #[test]
+    fn dedupe_elides_a_repeated_tool_output_but_keeps_the_first() {
+        let repeated = "a".repeat(400);
+        let middle = vec![
+            Message::tool_result("c0", repeated.clone()),
+            user("ask"),
+            Message::tool_result("c1", repeated.clone()),
+        ];
+        let out = dedupe_tool_outputs(&middle, 10, &HeuristicCounter);
+        assert_eq!(out[0].content, repeated, "first occurrence kept verbatim");
+        assert!(out[2].content.contains("duplicate of tool result c0"), "{}", out[2].content);
+    }
+
+    #[test]
+    fn microcompact_collapses_turns_between_a_step_becoming_completed() {
+        let turns = vec![
+            update_plan_turn("p1", &[("write foo", "in_progress"), ("write bar", "pending")]),
+            vec![user("working on foo")],
+            work_turn("w1", "fs.write", "wrote foo"),
+            update_plan_turn("p2", &[("write foo", "completed"), ("write bar", "in_progress")]),
+            vec![user("now bar")],
+        ];
+        let out = microcompact(&turns);
+        assert!(out.iter().any(|m| m.content == "✓ write foo"));
+        assert!(!out.iter().any(|m| m.content.contains("wrote foo")));
+        // The plan turns themselves are untouched, only the work between them collapses.
+        assert!(out.iter().any(|m| m.content.contains("write bar")));
+        assert!(out.iter().any(|m| m.content == "now bar"));
+    }
+
+    #[test]
+    fn microcompact_is_a_noop_without_a_completed_transition() {
+        let turns = vec![
+            update_plan_turn("p1", &[("a", "pending")]),
+            vec![user("x")],
+            update_plan_turn("p2", &[("a", "in_progress")]),
+        ];
+        let out = microcompact(&turns);
+        let flat: Vec<Message> = turns.into_iter().flatten().collect();
+        assert_eq!(out.len(), flat.len());
+    }
+
+    #[test]
+    fn microcompact_collapses_a_multi_tool_call_turn_atomically() {
+        let calls = vec![
+            ToolIntent { id: "a".into(), tool: "fs.read".into(), args: serde_json::json!({}) },
+            ToolIntent { id: "b".into(), tool: "fs.read".into(), args: serde_json::json!({}) },
+        ];
+        let work = vec![
+            Message::assistant_calls(String::new(), calls),
+            Message::tool_result("a", "content a"),
+            Message::tool_result("b", "content b"),
+        ];
+        let turns = vec![
+            update_plan_turn("p1", &[("read files", "in_progress")]),
+            work,
+            update_plan_turn("p2", &[("read files", "completed")]),
+        ];
+        let out = microcompact(&turns);
+        assert!(out.iter().any(|m| m.content == "✓ read files"));
+        assert!(!out.iter().any(|m| m.content.contains("content a") || m.content.contains("content b")));
+        for m in &out {
+            for c in &m.tool_calls {
+                assert!(
+                    out.iter().any(|r| r.role == Role::Tool && r.tool_call_id.as_deref() == Some(c.id.as_str())),
+                    "dangling call {}",
+                    c.id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compile_microcompacts_a_completed_plan_step_before_pruning() {
+        let eng = engine(CompactionPolicy {
+            protect_first_n: 1,
+            protect_last_n: 1,
+            tail_ratio: 0.0,
+            prune_min_tool_tokens: Some(100),
+            ..Default::default()
+        });
+        let mut msgs = vec![Message::system("S")];
+        msgs.extend(update_plan_turn("p1", &[("big task", "in_progress")]));
+        msgs.extend(work_turn("w0", "fs.read", &"a".repeat(15_000)));
+        msgs.extend(update_plan_turn("p2", &[("big task", "completed")]));
+        msgs.push(user("LAST"));
+
+        let r = eng.compile(&msgs, Some(8_000)).await;
+        assert!(r.compacted, "expected compaction to fire (before={})", r.before_tokens);
+        assert!(r.messages.iter().any(|m| m.content == "✓ big task"));
+        assert!(!r.messages.iter().any(|m| m.content.len() > 1_000), "the big output must be gone, not just pruned");
+        // Regression: the checkpoint marker must NOT be a mid-array system
+        // message (strict providers reject `system` that isn't first — the 400
+        // "System message must be at the beginning").
+        assert_no_mid_array_system(&r.messages);
+    }
+
+    /// A `system` message anywhere but index 0 is rejected by strict providers
+    /// (vLLM). Compaction must never emit one — summaries and checkpoints are
+    /// non-system so they stay in their chronological place.
+    fn assert_no_mid_array_system(messages: &[Message]) {
+        for (i, m) in messages.iter().enumerate() {
+            assert!(
+                i == 0 || m.role != Role::System,
+                "mid-array system message at index {i}: {:?}",
+                m.content
+            );
         }
     }
 }

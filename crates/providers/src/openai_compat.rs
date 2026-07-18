@@ -625,6 +625,55 @@ fn role_str(r: &Role) -> &'static str {
     }
 }
 
+/// Translate canonical messages → OpenAI/vLLM chat shape, hoisting ALL system
+/// content into a single leading message. vLLM/LiteLLM reject a `system` message
+/// that isn't at the very start. Upstream keeps system content at index 0 (the
+/// compactor no longer inserts mid-array system messages), but this enforces the
+/// wire-format invariant at the boundary that owns it — a durable guarantee
+/// against any future upstream regression. Non-system messages keep their exact
+/// order, so tool-call ↔ tool-result pairing is untouched.
+fn build_chat_messages(messages: &[Message]) -> Vec<ChatMsg> {
+    let mut system = String::new();
+    let mut rest: Vec<ChatMsg> = Vec::with_capacity(messages.len());
+    for m in messages {
+        if m.role == Role::System {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&m.content);
+            continue;
+        }
+        rest.push(ChatMsg {
+            role: role_str(&m.role),
+            content: m.content.clone(),
+            tool_calls: m
+                .tool_calls
+                .iter()
+                .map(|tc| OutToolCall {
+                    id: tc.id.clone(),
+                    typ: "function",
+                    function: OutFn {
+                        name: tc.tool.clone(),
+                        arguments: tc.args.to_string(),
+                    },
+                })
+                .collect(),
+            tool_call_id: m.tool_call_id.clone(),
+        });
+    }
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    if !system.is_empty() {
+        out.push(ChatMsg {
+            role: "system",
+            content: system,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+    out.extend(rest);
+    out
+}
+
 /// vLLM's `/tokenize` lives at the server root, a sibling of `/v1` — not under
 /// it. Derive the root from the (usually `…/v1`) chat base URL.
 fn vllm_tokenize_url(base_url: &str) -> String {
@@ -738,27 +787,9 @@ impl Provider for OpenAiCompat {
     ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
         // Translate canonical messages → OpenAI shape, carrying tool calls and
         // tool results so the native tool-calling protocol round-trips (§4.4).
-        let messages: Vec<ChatMsg> = ctx
-            .messages
-            .iter()
-            .map(|m| ChatMsg {
-                role: role_str(&m.role),
-                content: m.content.clone(),
-                tool_calls: m
-                    .tool_calls
-                    .iter()
-                    .map(|tc| OutToolCall {
-                        id: tc.id.clone(),
-                        typ: "function",
-                        function: OutFn {
-                            name: tc.tool.clone(),
-                            arguments: tc.args.to_string(),
-                        },
-                    })
-                    .collect(),
-                tool_call_id: m.tool_call_id.clone(),
-            })
-            .collect();
+        // System content is hoisted to a single leading message (vLLM requires
+        // `system` at the very beginning; compaction can insert a mid-array one).
+        let messages = build_chat_messages(&ctx.messages);
 
         // Expose the K2 capability sheath as OpenAI tool definitions.
         let tools: Vec<ToolDef> = ctx
@@ -1488,6 +1519,29 @@ mod count_tokens_tests {
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["role"], "system");
         assert_eq!(arr[2]["role"], "tool");
+    }
+
+    #[test]
+    fn build_chat_hoists_and_merges_system_to_the_front() {
+        // Regression: vLLM rejects a `system` message that isn't first, and
+        // compaction can insert a summary as a mid-array system message. All
+        // system content must merge into one leading message, rest kept in order.
+        let msgs = vec![
+            Message::system("SYS PROMPT"),
+            Message::user("do X"),
+            Message::system("earlier conversation summary"), // mid-array (compaction)
+            Message::new(Role::Assistant, "ok"),
+            Message::tool_result("c1", "out"),
+        ];
+        let built = build_chat_messages(&msgs);
+        assert_eq!(built[0].role, "system");
+        assert!(built[0].content.starts_with("SYS PROMPT"));
+        assert!(built[0].content.contains("earlier conversation summary"));
+        assert_eq!(built.iter().filter(|m| m.role == "system").count(), 1);
+        // non-system messages keep their exact order (tool pairing untouched)
+        assert_eq!(built[1].role, "user");
+        assert_eq!(built[2].role, "assistant");
+        assert_eq!(built[3].role, "tool");
     }
 }
 

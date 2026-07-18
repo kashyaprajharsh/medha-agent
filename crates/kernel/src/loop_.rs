@@ -17,10 +17,10 @@ use crate::types::{
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 
-/// Default cap on tool calls executed concurrently within one turn (§12,
-/// `max_parallel_tools`). A sensible default, not a fixed limit — override per
-/// session via [`Kernel::with_max_parallel_tools`] (will come from `medha.lock`).
-pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
+/// Default cap on tool calls executed concurrently within one turn (§12).
+/// Overridable via `[budget] max_parallel_tools` in `medha.lock` or
+/// `MEDHA_MAX_PARALLEL_TOOLS`, or per session via [`Kernel::with_max_parallel_tools`].
+pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 10_000;
 
 /// A short, human-readable preview of what an intent will do — shown at the
 /// approval gate. (A rendered diff via tool dry-run is a later refinement.)

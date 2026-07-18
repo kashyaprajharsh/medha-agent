@@ -36,6 +36,9 @@ fn env_u64(name: &str) -> Option<u64> {
 fn env_f64(name: &str) -> Option<f64> {
     std::env::var(name).ok().and_then(|s| s.parse().ok())
 }
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|s| s.parse().ok())
+}
 
 /// Apply the per-task budget overrides from the environment on top of a base
 /// budget (from `medha.lock`, §4.1/§18.5). Precedence: env > lock > built-in
@@ -201,6 +204,125 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
     std::process::exit(gate::report::exit_code(&results));
 }
 
+/// Restore file(s) from a snapshot, headlessly — `/rewind` without the TUI
+/// or the conversation fork.
+#[derive(Parser)]
+#[command(name = "medha undo", about = "Restore file(s) from a snapshot (no conversation change)")]
+struct UndoCli {
+    /// Undo this event and everything after it, instead of just the last write.
+    #[arg(long)]
+    event: Option<String>,
+    /// List recent write events instead of restoring anything.
+    #[arg(long)]
+    list: bool,
+}
+
+struct WriteEvent {
+    id: ulid::Ulid,
+    session: ulid::Ulid,
+    path: String,
+    ts: f64,
+}
+
+/// Write-family observations (same `snapshot`-key check as `rollback_plan`),
+/// newest first across all sessions.
+async fn recent_writes(log: &store::SqliteLog, limit: usize) -> Vec<WriteEvent> {
+    let mut out = Vec::new();
+    for meta in log.list_sessions().unwrap_or_default() {
+        let events = kernel::EventLog::events(log, meta.id).await;
+        for e in events.iter().rev() {
+            if e.kind != kernel::EventKind::ToolObs {
+                continue;
+            }
+            let Some(result) = e.payload.get("payload").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            if !result.contains_key("snapshot") {
+                continue;
+            }
+            let Some(path) = result.get("path").and_then(|p| p.as_str()) else {
+                continue;
+            };
+            out.push(WriteEvent { id: e.id, session: meta.id, path: path.to_string(), ts: e.ts });
+            if out.len() >= limit {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+async fn run_undo_command(args: Vec<String>) -> Result<()> {
+    let uc = UndoCli::parse_from(std::iter::once("medha-undo".to_string()).chain(args));
+
+    let cwd = std::env::current_dir()?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let state = config::state_dir(&cwd)?;
+    let log = store::SqliteLog::open(state.join("events.db"))?;
+
+    if uc.list {
+        let writes = recent_writes(&log, 10).await;
+        if writes.is_empty() {
+            println!("No file writes recorded in this workspace yet.");
+            return Ok(());
+        }
+        println!("Recent writes in this workspace (newest first):\n");
+        for w in &writes {
+            let when = chrono::DateTime::from_timestamp(w.ts as i64, 0)
+                .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            println!("  {}  {when}  {}", w.id, w.path);
+        }
+        println!("\nUndo one:  medha undo --event <id>");
+        return Ok(());
+    }
+
+    let (session_id, target) = if let Some(idstr) = &uc.event {
+        let target = ulid::Ulid::from_string(idstr.trim())
+            .map_err(|_| anyhow::anyhow!("invalid event id '{idstr}'"))?;
+        let mut found = None;
+        for meta in log.list_sessions().unwrap_or_default() {
+            let events = kernel::EventLog::events(&log, meta.id).await;
+            if events.iter().any(|e| e.id == target) {
+                found = Some(meta.id);
+                break;
+            }
+        }
+        let session_id = found
+            .ok_or_else(|| anyhow::anyhow!("event {target} not found in this workspace's log"))?;
+        (session_id, target)
+    } else {
+        let writes = recent_writes(&log, 1).await;
+        let Some(last) = writes.into_iter().next() else {
+            println!("Nothing to undo — no file writes recorded in this workspace yet.");
+            return Ok(());
+        };
+        (last.session, last.id)
+    };
+
+    let events = kernel::EventLog::events(&log, session_id).await;
+    let plan = kernel::events::rollback_plan(&events, target);
+    if plan.is_empty() {
+        println!("Nothing to undo at event {target} (not a write, or already at the workspace's HEAD state).");
+        return Ok(());
+    }
+
+    let trust_path = state.join("trust.lock");
+    let audit_path = state.join("logs").join("audit.log");
+    let sandbox = WorkspaceSandbox::new(cwd.clone(), trust_path, audit_path, Some(Arc::new(kernel::AutoDeny)))?
+        .with_snapshots_dir(state.join("snapshots"));
+
+    println!("Restoring {} file(s) to their state at event {target}:", plan.len());
+    for f in &plan {
+        match &f.snapshot {
+            Some(_) => println!("  {} — reverted to the snapshot before that write", f.path),
+            None => println!("  {} — removed (it was created at/after this point)", f.path),
+        }
+        sandbox.restore(&f.path, f.snapshot.as_deref()).await?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load a .env from the current dir or any ancestor (industry-standard BYOK
@@ -216,6 +338,9 @@ async fn main() -> Result<()> {
     let raw: Vec<String> = std::env::args().collect();
     if raw.get(1).map(|s| s == "gate").unwrap_or(false) {
         return run_gate_command(raw[2..].to_vec()).await;
+    }
+    if raw.get(1).map(|s| s == "undo").unwrap_or(false) {
+        return run_undo_command(raw[2..].to_vec()).await;
     }
 
     let cli = Cli::parse();
@@ -612,6 +737,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    let max_parallel_tools = env_usize("MEDHA_MAX_PARALLEL_TOOLS")
+        .or(lock.budget.max_parallel_tools)
+        .unwrap_or(kernel::DEFAULT_MAX_PARALLEL_TOOLS);
     let kernel = Kernel::new(
         provider,
         log.clone(),
@@ -622,7 +750,8 @@ async fn main() -> Result<()> {
         gate,
         verifier,
     )
-    .with_pricing(pricing);
+    .with_pricing(pricing)
+    .with_max_parallel_tools(max_parallel_tools);
 
     // K1 Identity sheath is assembled by the context compiler, not hardcoded
     // here; config may override the persona (§4.3).

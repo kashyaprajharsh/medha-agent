@@ -231,6 +231,9 @@ pub struct BudgetConfig {
     pub max_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
     pub max_wall_s: Option<u64>,
+    /// Concurrent tool-call cap within one turn (§12). `None` = the kernel's
+    /// built-in default (`kernel::DEFAULT_MAX_PARALLEL_TOOLS`).
+    pub max_parallel_tools: Option<usize>,
 }
 
 impl Default for BudgetConfig {
@@ -241,6 +244,7 @@ impl Default for BudgetConfig {
             max_tokens: d.max_tokens,
             max_cost_usd: d.max_cost_usd,
             max_wall_s: d.max_wall_s,
+            max_parallel_tools: None,
         }
     }
 }

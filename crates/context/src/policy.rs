@@ -37,13 +37,13 @@ pub struct CompactionPolicy {
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
-            trigger_ratio: 0.85,
+            trigger_ratio: 0.99,
             microcompact_ratio: 0.60,
             tail_ratio: 0.20,
             protect_first_n: 3,
             protect_last_n: 20,
             prune_min_tool_tokens: None,
-            emergency_ratio: 0.95,
+            emergency_ratio: 0.98,
         }
     }
 }

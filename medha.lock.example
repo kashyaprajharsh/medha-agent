@@ -16,17 +16,18 @@ max_turns = 200
 # max_tokens = 5000000
 # max_cost_usd = 5.0
 # max_wall_s = 7200
+# max_parallel_tools = 10000   # concurrent tool calls per turn (§12)
 
 [context]
 # Compaction tuning (§4.3). These are the built-in defaults — override only if
 # you know what you're changing; get eval-gated once the Gate exists (§4.11).
-trigger_ratio = 0.85
+trigger_ratio = 0.99
 microcompact_ratio = 0.60
 tail_ratio = 0.20
 protect_first_n = 3
 protect_last_n = 20
 prune_min_tool_tokens = 8000
-emergency_ratio = 0.95
+emergency_ratio = 0.98
 
 [policy]
 # Tool classes requiring human approval before execution (§4.7). File writes

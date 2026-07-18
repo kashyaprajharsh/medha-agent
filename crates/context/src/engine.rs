@@ -375,11 +375,18 @@ fn group_into_turns(messages: &[Message]) -> Vec<Vec<Message>> {
     let mut i = 0;
     while i < messages.len() {
         let m = &messages[i];
-        let end = if m.role == Role::Assistant && !m.tool_calls.is_empty() {
-            (i + 1 + m.tool_calls.len()).min(messages.len())
-        } else {
-            i + 1
-        };
+        let mut end = i + 1;
+        if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+            // Consume only the tool results answering this turn's calls — an
+            // interrupted turn may have fewer than tool_calls.len(), and
+            // anything else (e.g. a user steer) must start its own turn.
+            while end < messages.len()
+                && end - i <= m.tool_calls.len()
+                && messages[end].role == Role::Tool
+            {
+                end += 1;
+            }
+        }
         turns.push(messages[i..end].to_vec());
         i = end;
     }
@@ -410,44 +417,53 @@ fn microcompact(turns: &[Vec<Message>]) -> Vec<Message> {
     let plans: Vec<(usize, Vec<(String, String)>)> =
         turns.iter().enumerate().filter_map(|(i, t)| plan_snapshot(t).map(|s| (i, s))).collect();
 
-    let mut spans: Vec<(usize, usize, String)> = Vec::new();
+    // One span per plan-snapshot pair, carrying EVERY step that completed in
+    // that window — two steps finishing in the same window used to shadow each
+    // other (identical bounds, second span dropped by the overlap filter).
+    let mut spans: Vec<(usize, usize, Vec<String>)> = Vec::new();
     for pair in plans.windows(2) {
         let (i0, before) = &pair[0];
         let (i1, after) = &pair[1];
         if i1.saturating_sub(*i0) <= 1 {
             continue; // no turns in between to collapse
         }
-        for (title, status) in after {
-            if status != "completed" {
-                continue;
-            }
-            let was_incomplete = before.iter().any(|(t, s)| t == title && s != "completed");
-            if was_incomplete {
-                spans.push((*i0 + 1, *i1, title.clone()));
-            }
+        let titles: Vec<String> = after
+            .iter()
+            .filter(|(title, status)| {
+                status == "completed"
+                    && before.iter().any(|(t, s)| t == title && s != "completed")
+            })
+            .map(|(title, _)| title.clone())
+            .collect();
+        if !titles.is_empty() {
+            spans.push((*i0 + 1, *i1, titles));
         }
     }
-    spans.sort_by_key(|(start, ..)| *start);
-    let mut cursor = 0;
-    spans.retain(|(start, end, _)| {
-        let keep = *start >= cursor;
-        if keep {
-            cursor = *end;
-        }
-        keep
-    });
+    // Plan pairs are windows over an index-sorted list, so spans are already
+    // ordered and disjoint by construction.
 
     let mut out = Vec::new();
     let mut i = 0;
     let mut next_span = 0;
     while i < turns.len() {
         if next_span < spans.len() && spans[next_span].0 == i {
-            let (_, end, title) = &spans[next_span];
+            let (start, end, titles) = &spans[next_span];
+            // User words are never synthesized away: keep any user message
+            // from the collapsed window verbatim, in order (a mid-task steer
+            // may still bind the model — "use tabs not spaces").
+            for turn in &turns[*start..*end] {
+                for m in turn {
+                    if m.role == Role::User {
+                        out.push(m.clone());
+                    }
+                }
+            }
             // An ASSISTANT checkpoint, not system: it sits mid-conversation
             // (chronological), and a mid-array system message is invalid for
             // strict providers (vLLM). It compresses the model's own completed
-            // turns into one line.
-            out.push(Message::new(Role::Assistant, format!("✓ {title}")));
+            // turns into one line per step.
+            let marker = titles.iter().map(|t| format!("✓ {t}")).collect::<Vec<_>>().join("\n");
+            out.push(Message::new(Role::Assistant, marker));
             i = *end;
             next_span += 1;
         } else {
@@ -948,6 +964,45 @@ mod tests {
         // The plan turns themselves are untouched, only the work between them collapses.
         assert!(out.iter().any(|m| m.content.contains("write bar")));
         assert!(out.iter().any(|m| m.content == "now bar"));
+        // User words inside the collapsed window survive verbatim — a mid-task
+        // steer may still bind the model.
+        assert!(
+            out.iter().any(|m| m.role == Role::User && m.content == "working on foo"),
+            "user message in the collapsed span must be preserved"
+        );
+    }
+
+    #[test]
+    fn microcompact_emits_one_marker_per_step_completed_in_the_same_window() {
+        let turns = vec![
+            update_plan_turn("p1", &[("a", "in_progress"), ("b", "pending")]),
+            work_turn("w1", "fs.write", "did both"),
+            update_plan_turn("p2", &[("a", "completed"), ("b", "completed")]),
+        ];
+        let out = microcompact(&turns);
+        let marker = out.iter().find(|m| m.content.contains('✓')).expect("checkpoint marker");
+        assert!(marker.content.contains("✓ a") && marker.content.contains("✓ b"), "{}", marker.content);
+        assert!(!out.iter().any(|m| m.content.contains("did both")));
+    }
+
+    #[test]
+    fn group_into_turns_does_not_swallow_a_user_steer_after_an_interrupted_turn() {
+        // Assistant fired two calls but only one result landed (interrupt);
+        // the user's steer must start its own turn, not be glued into the
+        // tool-call group where a collapse could delete it.
+        let calls = vec![
+            ToolIntent { id: "a".into(), tool: "fs.read".into(), args: serde_json::json!({}) },
+            ToolIntent { id: "b".into(), tool: "fs.read".into(), args: serde_json::json!({}) },
+        ];
+        let msgs = vec![
+            Message::assistant_calls(String::new(), calls),
+            Message::tool_result("a", "partial"),
+            user("stop — do it differently"),
+        ];
+        let turns = group_into_turns(&msgs);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].len(), 2, "assistant + its one landed result");
+        assert_eq!(turns[1][0].role, Role::User);
     }
 
     #[test]

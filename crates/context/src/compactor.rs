@@ -187,8 +187,11 @@ pub async fn compact(
         let summary_text = summarizer.summarize(previous_summary, &compactable).await?;
         let source_events: Vec<String> =
             compactable.iter().flat_map(|i| i.source_events.clone()).collect();
+        // Assistant, not system: the summary sits mid-array (after the head),
+        // and strict providers (vLLM) reject a `system` message that isn't
+        // first. Same invariant as the live engine's summary.
         let summary = HistoryItem {
-            role: Role::System,
+            role: Role::Assistant,
             content: summary_text,
             kind: ItemKind::Summary,
             source_events,

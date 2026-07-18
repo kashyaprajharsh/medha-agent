@@ -683,13 +683,25 @@ fn vllm_tokenize_url(base_url: &str) -> String {
 }
 
 /// vLLM `/tokenize` body: messages rendered through the model's chat template.
-/// Keeps every role (system/tool/assistant), so the count matches what the chat
-/// endpoint would actually send.
+/// Keeps every role (system/tool/assistant) and mirrors the same system-hoist
+/// as `build_chat_messages`, so the count matches what the chat endpoint would
+/// actually send — and a strict template can't reject a mid-array `system`.
 fn vllm_tokenize_body(model: &str, messages: &[Message]) -> serde_json::Value {
-    let msgs: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|m| serde_json::json!({ "role": role_str(&m.role), "content": m.content }))
-        .collect();
+    let mut system = String::new();
+    let mut msgs: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+    for m in messages {
+        if m.role == Role::System {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&m.content);
+            continue;
+        }
+        msgs.push(serde_json::json!({ "role": role_str(&m.role), "content": m.content }));
+    }
+    if !system.is_empty() {
+        msgs.insert(0, serde_json::json!({ "role": "system", "content": system }));
+    }
     serde_json::json!({ "model": model, "messages": msgs, "add_generation_prompt": true })
 }
 
@@ -1519,6 +1531,23 @@ mod count_tokens_tests {
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["role"], "system");
         assert_eq!(arr[2]["role"], "tool");
+    }
+
+    #[test]
+    fn vllm_body_hoists_a_mid_array_system_like_the_chat_path() {
+        let msgs = vec![
+            Message::system("SYS"),
+            Message::user("u"),
+            Message::system("earlier summary"), // mid-array (compaction)
+            Message::new(Role::Assistant, "ok"),
+        ];
+        let body = vllm_tokenize_body("m", &msgs);
+        let arr = body["messages"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[0]["content"], "SYS\n\nearlier summary");
+        assert_eq!(arr[1]["role"], "user");
+        assert_eq!(arr[2]["role"], "assistant");
     }
 
     #[test]

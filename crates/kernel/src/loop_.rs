@@ -242,11 +242,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // reconstructable from the log (resume/replay). Callers append the user
         // message then call run_session, so the tail is the new prompt; earlier
         // user turns were logged on their own prior calls (no duplication).
+        // Memory taint window (D6): the evidence a memory write may cite — event
+        // ids since the last real user message, and the lowest trust label seen
+        // among them. Kernel-owned; the model can never assert these.
+        let mut window_events: Vec<ulid::Ulid> = Vec::new();
+        let mut window_taint = TrustLabel::User;
         if let Some(last) = messages.last() {
             if last.role == crate::types::Role::User {
-                self.log
+                let e = self
+                    .log
                     .append(Event::user_message(session, &last.content))
                     .await?;
+                window_events.push(e.id);
             }
         }
         // Trust-flow taint (§4.6): flips true once a web-labeled observation
@@ -262,7 +269,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     return self.finish_interrupted(session, messages, q, sink).await;
                 }
                 for s in q.drain_steers() {
-                    self.log.append(Event::user_message(session, &s)).await?;
+                    let e = self.log.append(Event::user_message(session, &s)).await?;
+                    // Fresh user input starts a new memory-evidence window.
+                    window_events.clear();
+                    window_events.push(e.id);
+                    window_taint = TrustLabel::User;
                     self.log
                         .append(Event::interrupt(session, "steer", Some(&s)))
                         .await
@@ -424,6 +435,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 return Ok((messages, StopReason::Finished)); // text-only finish
             }
 
+            // Memory intents get their trust fields HERE, kernel-side (D6): any
+            // model-supplied trust/confidence/provenance is stripped and replaced
+            // with the taint-window values. The window covers events up to this
+            // turn's dispatch — same-turn sibling observations aren't evidence
+            // the model has seen yet.
+            let mut intents = intents;
+            for it in &mut intents {
+                if it.tool.starts_with("memory.") {
+                    enrich_memory_intent(&mut it.args, window_taint, &window_events, session.id);
+                }
+            }
+
             // Dispatch admission: intents are logged HERE — after the cancel
             // check, immediately before execution — so a logged intent always
             // gets an observation (real or synthesized). Replay order per id is
@@ -494,15 +517,28 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     Some(ToolCategory::Web) => TrustLabel::Web,
                     _ => TrustLabel::Tool,
                 };
-                self.log
+                let e = self
+                    .log
                     .append(Event::tool_obs(session, &obs, trust))
                     .await?;
+                window_events.push(e.id);
+                window_taint = window_taint.min(trust);
                 // Once untrusted web content lands, taint the rest of the
                 // request so later consequential actions get escalated (§4.6).
                 if matches!(trust, TrustLabel::Web) {
                     web_tainted = true;
                 }
                 let ok = matches!(obs.status, crate::types::ObsStatus::Ok);
+                // A settled memory mutation becomes a MemoryWrite event — the
+                // durable record the projection rebuilds from (I1). The tool
+                // echoes the exact op it applied under `applied`; opaque here.
+                if ok && tool.starts_with("memory.") {
+                    if let Some(op) = obs.payload.get("applied").filter(|o| o.is_object()) {
+                        self.log
+                            .append(Event::memory_write(session, op.clone()))
+                            .await?;
+                    }
+                }
                 sink.tool_result(&tool, ok, &obs.payload);
                 let content = serde_json::to_string(&obs.payload).unwrap_or_default();
                 messages.push(Message::tool_result(&id, self.maybe_spill(content)));
@@ -738,6 +774,35 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     }
 }
 
+/// Kernel-computed trust for memory writes (D6): strip every trust-adjacent key
+/// the model may have passed, then inject the taint-window values under `_`-
+/// prefixed keys the memory tools read. Pure so it's unit-testable.
+fn enrich_memory_intent(
+    args: &mut serde_json::Value,
+    taint: TrustLabel,
+    window: &[ulid::Ulid],
+    session_id: ulid::Ulid,
+) {
+    if !args.is_object() {
+        *args = serde_json::json!({});
+    }
+    let obj = args.as_object_mut().expect("just ensured object");
+    for key in [
+        "trust", "confidence", "provenance", "sessions",
+        "_trust", "_provenance", "_session", "_user_stated",
+    ] {
+        obj.remove(key);
+    }
+    obj.insert("_trust".into(), serde_json::json!(taint.as_str()));
+    obj.insert(
+        "_provenance".into(),
+        serde_json::json!(window.iter().map(|u| u.to_string()).collect::<Vec<_>>()),
+    );
+    obj.insert("_session".into(), serde_json::json!(session_id.to_string()));
+    // User-stated only when nothing below user trust entered the window.
+    obj.insert("_user_stated".into(), serde_json::json!(taint == TrustLabel::User));
+}
+
 /// Trust-flow escalation (§4.6): gate a consequential, web-tainted action unless
 /// the sandbox's containment blocks network exfiltration. Only ever *tightens*
 /// an `Allow` to `Human` — it never relaxes a denial or an existing gate. Pure
@@ -761,6 +826,50 @@ fn escalate_for_trust_flow(
         Decision::Human
     } else {
         decision
+    }
+}
+
+#[cfg(test)]
+mod enrich_memory_tests {
+    use super::enrich_memory_intent;
+    use crate::types::TrustLabel;
+    use serde_json::json;
+    use ulid::Ulid;
+
+    #[test]
+    fn strips_smuggled_trust_keys_and_injects_kernel_values() {
+        let mut args = json!({
+            "name": "n", "claim": "c",
+            "trust": "user", "confidence": "confirmed",
+            "provenance": ["fake"], "_trust": "system", "_user_stated": true,
+        });
+        let w = [Ulid::new(), Ulid::new()];
+        let sid = Ulid::new();
+        enrich_memory_intent(&mut args, TrustLabel::Web, &w, sid);
+
+        assert_eq!(args["_trust"], "web", "taint wins, smuggled 'trust' gone");
+        assert_eq!(args["_user_stated"], false);
+        assert_eq!(args["_session"], sid.to_string());
+        assert_eq!(args["_provenance"].as_array().unwrap().len(), 2);
+        assert!(args.get("trust").is_none());
+        assert!(args.get("confidence").is_none());
+        assert_eq!(args["name"], "n", "real args untouched");
+    }
+
+    #[test]
+    fn clean_user_window_is_user_stated() {
+        let mut args = json!({ "name": "n" });
+        enrich_memory_intent(&mut args, TrustLabel::User, &[Ulid::new()], Ulid::new());
+        assert_eq!(args["_trust"], "user");
+        assert_eq!(args["_user_stated"], true);
+    }
+
+    #[test]
+    fn taint_min_flows_to_the_floor() {
+        assert_eq!(TrustLabel::User.min(TrustLabel::Web), TrustLabel::Web);
+        assert_eq!(TrustLabel::User.min(TrustLabel::Tool), TrustLabel::Tool);
+        assert_eq!(TrustLabel::Tool.min(TrustLabel::User), TrustLabel::Tool);
+        assert_eq!(TrustLabel::User.min(TrustLabel::User), TrustLabel::User);
     }
 }
 

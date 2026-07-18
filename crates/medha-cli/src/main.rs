@@ -653,6 +653,13 @@ async fn main() -> Result<()> {
     );
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
     registry.register_skills(skill_store.clone());
+    // Typed memory (D9): project entries in the workspace state dir, user
+    // entries in the user-global store — recall merges both.
+    let memory_store = Arc::new(memory::MemoryProjection::open(
+        state.join("memory.db"),
+        config::medha_home()?.join("memory.db"),
+    )?);
+    registry.register_memory(memory_store.clone());
     let known_tools = registry.tool_names();
     // Live web-search settings, shared with the `web.*` tools. Seed from the
     // saved config (provider choice + stored keys, env fallback); the TUI's

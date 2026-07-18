@@ -14,6 +14,7 @@ kernel.workspace = true
 providers.workspace = true
 context.workspace = true
 tools = { path = "../tools" }
+memory = { path = "../memory" }
 sandbox = { path = "../sandbox" }
 store = { path = "../store" }
 ulid.workspace = true

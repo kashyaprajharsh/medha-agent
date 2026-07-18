@@ -9,6 +9,8 @@ rust-version.workspace = true
 kernel.workspace = true
 sandbox = { path = "../sandbox" }
 policy = { path = "../policy" }
+memory = { path = "../memory" }
+ulid = "1"
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
@@ -31,4 +33,3 @@ pdf-extract = "0.12"
 sha2 = "0.10"
 
 [dev-dependencies]
-ulid = "1"

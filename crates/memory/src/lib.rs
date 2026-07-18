@@ -78,6 +78,7 @@ mod tests {
             trust: TrustLabel::User,
             confidence: ConfidenceRung::Candidate,
             provenance: vec![],
+            sessions: vec![],
             version: 1,
             pinned: false,
             links: vec![],

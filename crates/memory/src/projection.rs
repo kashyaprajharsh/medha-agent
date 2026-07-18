@@ -51,6 +51,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             trust       TEXT NOT NULL,
             confidence  TEXT NOT NULL,
             provenance  TEXT NOT NULL,
+            sessions    TEXT NOT NULL DEFAULT '[]',
             version     INTEGER NOT NULL,
             pinned      INTEGER NOT NULL,
             links       TEXT NOT NULL,
@@ -72,6 +73,7 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
     let trust: String = row.get("trust")?;
     let confidence: String = row.get("confidence")?;
     let provenance: String = row.get("provenance")?;
+    let sessions: String = row.get("sessions")?;
     let links: String = row.get("links")?;
     Ok(MemoryEntry {
         name: row.get("name")?,
@@ -83,6 +85,7 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
         confidence: crate::entry::ConfidenceRung::parse(&confidence)
             .unwrap_or(crate::entry::ConfidenceRung::Candidate),
         provenance: serde_json::from_str(&provenance).unwrap_or_default(),
+        sessions: serde_json::from_str(&sessions).unwrap_or_default(),
         version: row.get("version")?,
         pinned: row.get::<_, i64>("pinned")? != 0,
         links: serde_json::from_str(&links).unwrap_or_default(),
@@ -93,17 +96,18 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
 
 fn upsert(conn: &Connection, entry: &MemoryEntry) -> Result<(), MemoryError> {
     let provenance = serde_json::to_string(&entry.provenance).unwrap_or_default();
+    let sessions = serde_json::to_string(&entry.sessions).unwrap_or_default();
     let links = serde_json::to_string(&entry.links).unwrap_or_default();
     conn.execute(
         "INSERT INTO entries
             (scope, name, claim, description, kind, trust, confidence, provenance,
-             version, pinned, links, created, updated, tombstoned)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13, 0)
+             sessions, version, pinned, links, created, updated, tombstoned)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14, 0)
          ON CONFLICT(scope, name) DO UPDATE SET
             claim=excluded.claim, description=excluded.description, kind=excluded.kind,
             trust=excluded.trust, confidence=excluded.confidence, provenance=excluded.provenance,
-            version=excluded.version, pinned=excluded.pinned, links=excluded.links,
-            created=entries.created, updated=excluded.updated, tombstoned=0",
+            sessions=excluded.sessions, version=excluded.version, pinned=excluded.pinned,
+            links=excluded.links, created=entries.created, updated=excluded.updated, tombstoned=0",
         rusqlite::params![
             entry.scope.as_str(),
             entry.name,
@@ -113,6 +117,7 @@ fn upsert(conn: &Connection, entry: &MemoryEntry) -> Result<(), MemoryError> {
             entry.trust.as_str(),
             entry.confidence.as_str(),
             provenance,
+            sessions,
             entry.version,
             entry.pinned as i64,
             links,
@@ -321,6 +326,7 @@ mod tests {
             trust: TrustLabel::User,
             confidence: ConfidenceRung::UserStated,
             provenance: vec![Ulid::new()],
+            sessions: vec![Ulid::new()],
             version,
             pinned: false,
             links: vec![],

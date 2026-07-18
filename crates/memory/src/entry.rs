@@ -106,6 +106,10 @@ pub struct MemoryEntry {
     pub trust: TrustLabel,
     pub confidence: ConfidenceRung,
     pub provenance: Vec<Ulid>,
+    /// Sessions that contributed evidence — drives Candidate→Confirmed
+    /// promotion (a corroborating write must come from a NEW session).
+    #[serde(default)]
+    pub sessions: Vec<Ulid>,
     pub version: u32,
     pub pinned: bool,
     pub links: Vec<String>,
@@ -127,6 +131,7 @@ mod tests {
             trust: TrustLabel::User,
             confidence: ConfidenceRung::UserStated,
             provenance: vec![Ulid::new(), Ulid::new()],
+            sessions: vec![Ulid::new()],
             version: 1,
             pinned: false,
             links: vec!["no-competitor-names-in-code".into()],

@@ -131,6 +131,12 @@ impl Event {
         Self::new(s, EventKind::ToolObs, payload, trust)
     }
 
+    /// A memory mutation (D1). `op` is the memory crate's `MemoryOp` JSON —
+    /// opaque here; the projection rebuilds from it.
+    pub fn memory_write(s: &Session, op: Value) -> Self {
+        Self::new(s, EventKind::MemoryWrite, op, TrustLabel::Memory)
+    }
+
     pub fn policy(s: &Session, intent: &ToolIntent, decision: &Decision) -> Self {
         let (verdict, reason) = match decision {
             Decision::Allow => ("allow", String::new()),

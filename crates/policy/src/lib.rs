@@ -100,9 +100,17 @@ impl Policy for DefaultPolicy {
             //  - git: authorized per subcommand (reads free, add/commit gate).
             //  - skill.save persists agent-authored instructions for future
             //    turns, including in user scope outside the workspace.
+            //  - memory.write/update: user-scope entries follow the person into
+            //    every future session, so they earn a gate; project scope rides
+            //    its Read blast radius (D9).
             "shell.exec" => scan_command(intent, self.workspace.as_deref()),
             "git" => authorize_git(intent),
             "skill.save" => Decision::Human,
+            "memory.write" | "memory.update" | "memory.forget"
+                if intent.args.get("scope").and_then(|v| v.as_str()) == Some("user") =>
+            {
+                Decision::Human
+            }
 
             // Everything else is authorized by its DECLARED blast radius (§4.7),
             // not a hardcoded name list — so a new tool needs no policy edit, and
@@ -427,6 +435,17 @@ mod tests {
     }
     fn auth_at(p: &DefaultPolicy, level: AutonomyLevel, i: &ToolIntent) -> Decision {
         p.authorize(level, i, radius_of(&i.tool))
+    }
+
+    #[test]
+    fn user_scope_memory_writes_gate_project_scope_rides_read_radius() {
+        let p = DefaultPolicy::default();
+        for tool in ["memory.write", "memory.update", "memory.forget"] {
+            let user = auth(&p, &intent(tool, json!({ "name": "n", "scope": "user" })));
+            assert!(matches!(user, Decision::Human), "{tool} user scope must gate");
+            let project = auth(&p, &intent(tool, json!({ "name": "n" })));
+            assert!(matches!(project, Decision::Allow), "{tool} project scope rides Read radius");
+        }
     }
 
     #[test]

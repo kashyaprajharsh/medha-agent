@@ -9,6 +9,7 @@ use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolS
 
 pub mod hub;
 pub mod judge;
+pub mod memory_tools;
 pub mod skills;
 use regex::{Regex, RegexBuilder};
 use sandbox::WorkspaceSandbox;
@@ -202,6 +203,15 @@ impl ToolRegistry {
             store,
             known_tools: known,
         }));
+        self
+    }
+
+    /// Persistent typed memory (D5): write/update/forget over the projection.
+    /// Trust fields arrive kernel-injected at dispatch — see `memory_tools`.
+    pub fn register_memory(&mut self, store: Arc<memory::MemoryProjection>) -> &mut Self {
+        self.register(Arc::new(memory_tools::MemoryWrite { store: store.clone() }));
+        self.register(Arc::new(memory_tools::MemoryUpdate { store: store.clone() }));
+        self.register(Arc::new(memory_tools::MemoryForget { store }));
         self
     }
 

@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/kernel",
     "crates/providers",
-    "crates/medha-cli", "crates/context", "crates/sandbox", "crates/tools", "crates/store", "crates/policy", "crates/lockfile", "crates/permissions", "crates/gate",
+    "crates/medha-cli", "crates/context", "crates/sandbox", "crates/tools", "crates/store", "crates/policy", "crates/lockfile", "crates/permissions", "crates/gate", "crates/memory",
 ]
 
 [workspace.package]

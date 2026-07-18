@@ -450,6 +450,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_write_kind_round_trips_through_persistence() {
+        let dir = std::env::temp_dir().join(format!("medha-memkind-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let s = kernel::Session { id: Ulid::new(), done: false, ..Default::default() };
+        let payload = serde_json::json!({ "op": "write", "entry": { "name": "e1" } });
+
+        let log = SqliteLog::open(&db).unwrap();
+        log.append(kernel::Event {
+            id: Ulid::new(),
+            session_id: s.id,
+            parent_id: None,
+            kind: EventKind::MemoryWrite,
+            payload: payload.clone(),
+            trust: TrustLabel::Memory,
+            provenance: kernel::Provenance { source: "test".into() },
+            prev_hash: [0u8; 32],
+            ts: 0.0,
+        })
+        .await
+        .unwrap();
+
+        let reopened = SqliteLog::open(&db).unwrap();
+        let events = reopened.events(s.id).await;
+        assert_eq!(events.len(), 1, "unknown-kind rows are silently dropped by Row::into_event — this must not be one");
+        assert_eq!(events[0].kind, EventKind::MemoryWrite);
+        assert_eq!(events[0].payload, payload);
+        reopened.verify().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn persists_and_chains() {
         let dir = std::env::temp_dir().join(format!("medha-store-{}", Ulid::new()));
         let db = dir.join("events.db");

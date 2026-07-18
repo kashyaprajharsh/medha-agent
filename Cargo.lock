@@ -2031,6 +2031,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "futures",
+ "kernel",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

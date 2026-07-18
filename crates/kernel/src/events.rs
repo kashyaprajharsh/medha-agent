@@ -25,6 +25,9 @@ pub enum EventKind {
     /// (Vol 3's Interrupt kind). Steer text ALSO logs as `user.message`, so
     /// projection ignores this kind entirely.
     Interrupt,
+    /// A memory write/update/forget/pin (D1). Payload = the `memory` crate's
+    /// `MemoryOp`, kept as opaque JSON here — the kernel doesn't parse it.
+    MemoryWrite,
 }
 
 impl EventKind {
@@ -40,6 +43,7 @@ impl EventKind {
             EventKind::Session => "session",
             EventKind::ModelReasoning => "model.reasoning",
             EventKind::Interrupt => "interrupt",
+            EventKind::MemoryWrite => "memory.write",
         }
     }
 
@@ -54,6 +58,7 @@ impl EventKind {
             "session" => EventKind::Session,
             "model.reasoning" => EventKind::ModelReasoning,
             "interrupt" => EventKind::Interrupt,
+            "memory.write" => EventKind::MemoryWrite,
             _ => return None,
         })
     }

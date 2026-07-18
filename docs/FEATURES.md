@@ -420,20 +420,243 @@ The system prompt is assembled from a config persona override or the built-in
 model doesn't guess a stale year for time-sensitive queries).
 
 ### Typed memory and context files
-**Where:** `crates/memory/`, `crates/context/src/ctxfiles.rs`, and `crates/tools/src/memory_tools.rs`
 
-Memory mutations are hash-chained events projected into SQLite + FTS5. K3 is
-compiled once per session under a hard token budget and refreshed only after a
-Full compaction. `memory.search` retrieves full typed entries;
-`sessions.search` returns verbatim prior exchanges without a model call.
+**Where:** `crates/memory/`, `crates/context/src/ctxfiles.rs`,
+`crates/tools/src/memory_tools.rs`, and `crates/store/src/lib.rs`.
 
-Project instructions use the first available `MEDHA.md`, `AGENTS.md`, or
-`CLAUDE.md` per directory from cwd to git root, plus the global MEDHA file.
-Every file is guard-scanned and bounded; blocked files produce a visible notice.
-`$MEDHA_HOME/PERSONA.md` supplies the global K1 persona.
+#### Architecture
 
-Human surfaces: `medha memory list|show|search|edit|forget|pin|pending|approve`
-and TUI `/memory` with trust/age chips and provenance lookup.
+```text
+visible turn
+    │
+    ├─ memory.write/update/forget
+    │       └─ kernel computes trust + confidence + provenance
+    │
+    └─ hash-chained EventKind::MemoryWrite       single source of truth
+            ├─ project/user SQLite + FTS5         rebuildable projection
+            │      ├─ frozen K3 index             prompt recall
+            │      └─ memory.search               full-entry recall
+            └─ event-text FTS5 ─ sessions.search  verbatim episodic recall
+```
+
+Workspace logs own memory history. Project memory is rebuilt from the current
+workspace log; user memory is incrementally maintained in the global projection,
+while its provenance event remains in the workspace where it was written.
+Recall merges both scopes, with project scope winning a name collision. Forking
+reconstructs branch-specific project memory; user-global memory remains visible
+until it is explicitly forgotten in user scope.
+
+K3 is compiled once at session start. Entries rank by pinned status, trust, and
+recency, and the rendered block cannot exceed `[memory].k3_budget_tokens`.
+Mid-session writes are immediately searchable but do not alter K3 until a new
+session or Full compaction. Stale candidates leave K3 without being deleted;
+pinned entries remain and stale results carry a verification warning.
+
+Trust is a kernel boundary. Tool arguments contain the claim and classification,
+but never trust, confidence, or provenance. The kernel derives them from turn
+taint, so web/tool evidence cannot promote itself to user trust. Contradictions
+append a new version and produce reconciliation choices instead of silently
+overwriting the prior claim.
+
+#### What M1–M7 added
+
+| Milestone | Shipped behavior |
+|---|---|
+| M1 | Typed entries and memory events; SQLite/FTS5 projection; deterministic log rebuild and fork-aware state. |
+| M2 | `memory.write`, `memory.update`, and `memory.forget`; kernel-owned trust/provenance; duplicate and contradiction handling; user-scope approval gate. |
+| M3 | Token-bounded frozen K3 recall, stable `## Memory` replacement, staleness stamps, Full-compaction refresh, and `memory.search`. |
+| M4 | Structured consolidation pressure, terminal success responses, three-failure cap, and stale-candidate decay. |
+| M5 | FTS5 mirror of text-bearing events and verbatim `sessions.search` discover/scroll/browse modes with automation demotion. |
+| M6 | Guarded startup context chain, bounded progressive discovery, load events, and global `PERSONA.md` through K1. |
+| M7 | Memory CLI, TUI `/memory`, provenance jumps, reconciliation card, lockfile settings, and fork-aware end-to-end coverage. |
+
+#### Prompt composition
+
+No base prompt edit is required for memory or context files. Startup assembles
+the effective system message in this order:
+
+1. built-in identity, or `$MEDHA_HOME/PERSONA.md` through the K1 override;
+2. guarded `## Project context` from context files;
+3. the skills manifest;
+4. the frozen `## Memory` K3 block.
+
+Do not paste memory entries, `MEDHA.md`, or `PERSONA.md` into
+`crates/context/prompts/system.md`. Runtime assembly keeps data current,
+preserves event provenance, and keeps the K3 prefix byte-stable. Change the base
+prompt only when MEDHA's universal behavior should change for every user and
+workspace, not when adding memory or project instructions.
+
+Context files are instructions, not memories. Startup selects the first existing
+file per directory in `MEDHA.md` → `AGENTS.md` → `CLAUDE.md` order while walking
+cwd to git root, then adds `$MEDHA_HOME/MEDHA.md`. Files are guard-scanned and
+limited to 20K characters using a 70/20 head/tail split. Progressive discovery
+checks at most five ancestors once per directory and appends at most 8K
+characters to a tool observation with workspace trust. Blocked files produce a
+visible notice. `$MEDHA_HOME/PERSONA.md` is global and never sourced from cwd.
+
+#### Files and storage locations
+
+`$MEDHA_HOME` means the `MEDHA_HOME` environment variable when set, otherwise
+`~/.medha`. Runtime state stays outside the repository. For example, workspace
+`/Users/me/code/app` maps to
+`~/.medha/projects/-Users-me-code-app/`.
+
+| File or directory | Who creates it | Meaning |
+|---|---|---|
+| `<repo>/MEDHA.md` | You, optional and recommended | Project instructions. Commit it when the team should share it. |
+| `<repo>/AGENTS.md` | You or an existing tool, optional | Compatibility fallback when that directory has no `MEDHA.md`. |
+| `<repo>/CLAUDE.md` | You or an existing tool, optional | Compatibility fallback when that directory has neither `MEDHA.md` nor `AGENTS.md`. |
+| `<repo>/<subdir>/MEDHA.md` | You, optional | More specific instructions, discovered when MEDHA works in that subtree. |
+| `$MEDHA_HOME/MEDHA.md` | You, optional | User-global instructions appended in every workspace. |
+| `$MEDHA_HOME/PERSONA.md` | MEDHA seeds it; you customize it | Global K1 identity and communication style. Comment-only seed keeps the built-in persona. |
+| `<repo>/medha.lock` | You, optional | Versioned memory/context limits and policy; defaults apply when absent. |
+| `$MEDHA_HOME/projects/<encoded-workspace>/events.db` | MEDHA | Workspace hash-chained log and provenance source. Never edit directly. |
+| `$MEDHA_HOME/projects/<encoded-workspace>/memory.db` | MEDHA | Rebuildable project-memory SQLite/FTS5 projection. Never edit directly. |
+| `$MEDHA_HOME/memory.db` | MEDHA | User-global SQLite/FTS5 memory projection shared across workspaces. Never edit directly. |
+| `$MEDHA_HOME/projects/<encoded-workspace>/memory-pending/` | MEDHA when approval is staged | Pending operations consumed by `medha memory approve <id>`. |
+
+Only one context filename wins in each directory. If all three exist beside one
+another, MEDHA loads `MEDHA.md` and ignores `AGENTS.md` and `CLAUDE.md` there.
+It can still load the winning file from each ancestor directory up to the git
+root. You do not need to copy the same instructions into all three files.
+
+There is no user-authored `MEMORY.md`. To save a project fact, call
+`memory.write` with `scope: "project"` (the default). MEDHA appends the operation
+to that workspace's `events.db` and updates its project `memory.db`. A project
+fork rebuilt before that event will not contain the fact.
+
+To save a preference across repositories, call `memory.write` with
+`scope: "user"`. The operation is still recorded in the originating workspace's
+`events.db` for provenance, but its projection is `$MEDHA_HOME/memory.db` and it
+appears in K3/search for every workspace. The default `write_approval =
+"user-scope"` applies the human gate. Rewinding one project does not remove a
+global user preference; use `medha memory forget <name> --scope user`.
+
+Useful scope checks:
+
+```sh
+medha memory list --scope project
+medha memory list --scope user
+medha memory show <name> --scope project
+medha memory show <name> --scope user
+medha memory search <words> # merged; project wins a same-name collision
+```
+
+#### Configuration and surfaces
+
+```toml
+[memory]
+enabled = true
+k3_budget_tokens = 1200
+write_approval = "user-scope" # "none" | "user-scope" | "all"
+stale_after_days = 30
+
+[context_files]
+enabled = true
+max_chars = 20000
+progressive_discovery = true
+```
+
+`medha memory list|show|search|edit|forget|pin|pending|approve` operates directly
+on the event-backed memory state. `edit` opens `$EDITOR` and appends a user-trust
+update event; it never writes the projection directly. TUI `/memory` shows
+trust/age chips and opens the provenance event.
+
+#### Test M1–M7 exactly
+
+Run milestone-focused tests from the repository root:
+
+```sh
+# M1: event model, projection, replay, FTS5, and fork semantics
+cargo test -p memory projection::tests
+cargo test -p store memory_write_kind_round_trips_through_persistence
+
+# M2: kernel trust boundary, poisoning resistance, updates, and contradictions
+cargo test -p tools --test memory_poisoning_e2e
+cargo test -p tools write_stores_kernel_trust_not_model_trust
+cargo test -p tools contradictory_update_returns_reconciliation_actions
+
+# M3: ranked/budgeted/frozen K3, cross-session recall, and compaction refresh
+cargo test -p memory recall::tests
+cargo test -p context frozen_system_refresh_runs_only_at_full_compaction
+
+# M4: consolidation payload, retry cap, in-turn recovery, and stale decay
+cargo test -p memory consolidate::tests
+cargo test -p tools over_budget_write_lists_pressure_and_caps_retries
+cargo test -p tools scripted_consolidation_then_retry_lands_in_one_turn
+
+# M5: verbatim event search plus discover/scroll/browse behavior
+cargo test -p store search_window_and_bookends_return_verbatim_prior_session_events
+cargo test -p tools sessions_search_discovers_scrolls_and_browses_verbatim
+
+# M6: precedence, guards, truncation, progressive context, and persona
+cargo test -p context ctxfiles::tests
+
+# M7: CLI lifecycle, provenance, editing, pinning, approval, and fork exclusion
+cargo test -p medha-cli --test memory_e2e
+cargo test -p medha-cli memory_picker_shows_trust_age_and_provenance_action
+```
+
+Then run the release gate:
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets
+```
+
+The M7 end-to-end test is the deterministic no-provider proof of the main
+lifecycle: write → fresh projection recalls → CLI provenance resolves → fork
+before the write excludes it. The poisoning and `sessions.search` tests also use
+scripted/local components, so they make zero external model calls.
+
+For a manual smoke test with a configured provider, use one unique project-scope
+name so it can be removed afterward:
+
+```sh
+cargo build -p medha-cli
+
+target/debug/medha \
+  "Call memory.write exactly once with name m7-smoke-quoted-hyphen, claim 'The quoted-hyphen cache key is alpha-beta.', description 'Smoke-test cache decision', kind decision, scope project, and no links."
+target/debug/medha memory show m7-smoke-quoted-hyphen
+target/debug/medha memory search quoted-hyphen
+
+# This is a fresh session; ask from K3 without explicitly searching.
+target/debug/medha \
+  "Without calling any search tool, what is the quoted-hyphen cache key?"
+
+# Deep memory and prior-session retrieval through their tools.
+target/debug/medha \
+  "Call memory.search for quoted-hyphen and report the exact stored claim."
+target/debug/medha \
+  "Call sessions.search with query quoted-hyphen and return the verbatim exchange."
+
+target/debug/medha memory pin m7-smoke-quoted-hyphen
+target/debug/medha memory pin m7-smoke-quoted-hyphen --off
+target/debug/medha memory forget m7-smoke-quoted-hyphen
+target/debug/medha memory list
+```
+
+Expected observations: `show` includes trust, confidence, version, claim, event
+ID, and session ID; the fresh session answers from K3; searches return the exact
+claim/exchange; and the final list no longer contains the forgotten name. A
+user-scope write should additionally exercise the configured human approval
+gate. In the TUI, run `/memory`, select an entry, and use the provenance action
+to jump to the event that created it.
+
+#### Remaining work
+
+M1–M7 and their normal test coverage are complete. The intentionally deferred
+work is: golden Eval Gate memory scenarios; embedding/hybrid retrieval if FTS5
+evals justify it; post-session distillation; sleep-time consolidation with
+staged approval; external memory providers; and cross-agent shared memory.
+These are later phases, not missing M1–M7 exit criteria.
+
+One operational recovery gap remains: startup automatically rebuilds the
+project projection from its workspace log, but there is not yet a production
+command that scans every workspace log to reconstruct a deleted
+`$MEDHA_HOME/memory.db`. User-global writes persist and work across projects in
+normal operation; fully automatic global-projection disaster recovery still
+needs that scanner/command.
 
 ---
 

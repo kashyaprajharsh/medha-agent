@@ -111,11 +111,69 @@ A **skill** is a reusable workflow (`SKILL.md` + scripts) that MEDHA can load on
 
 ### 🗂 Typed Memory & Context
 
-- Frozen, token-bounded K3 recall with trust, confidence, age, and pin ranking
-- `memory.search` plus verbatim `sessions.search` over the event log
-- Kernel-owned trust/provenance; memory writes, edits, pins, and forgets remain replayable events
-- `medha memory list|show|search|edit|forget|pin|pending|approve` and TUI `/memory`
-- Guarded `MEDHA.md` → `AGENTS.md` → `CLAUDE.md` discovery, progressive subdirectory context, and global `PERSONA.md`
+Memory is event-sourced rather than hidden model state:
+
+1. The model proposes `memory.write`, `memory.update`, or `memory.forget`.
+2. The kernel computes trust, confidence, and provenance from the current turn;
+   these are never accepted from model arguments.
+3. The mutation is appended to the hash-chained event log, then projected into
+   project/user SQLite databases with FTS5 search.
+4. A compact K3 index is ranked by pin, trust, and recency under a hard token
+   budget. It is frozen for the session and refreshed only after Full compaction.
+5. `memory.search` retrieves full entries; `sessions.search` retrieves verbatim
+   exchanges from prior sessions without another model call.
+
+Project context is separate from memory. MEDHA guard-scans the first available
+`MEDHA.md` → `AGENTS.md` → `CLAUDE.md` in each directory from cwd to the git
+root, plus `~/.medha/MEDHA.md`. `~/.medha/PERSONA.md` supplies the global K1
+persona. These sections and the frozen `## Memory` block are assembled at
+runtime, so memory content must not be copied into the base system prompt.
+
+| Purpose | Location | Scope |
+|---|---|---|
+| Project instructions | `<repo>/MEDHA.md` (recommended), `AGENTS.md`, or `CLAUDE.md` | Current project/directory |
+| Nested instructions | `<repo>/<subdir>/MEDHA.md`, `AGENTS.md`, or `CLAUDE.md` | Loaded when that directory is used |
+| Global instructions | `$MEDHA_HOME/MEDHA.md` (normally `~/.medha/MEDHA.md`) | Every project |
+| Global persona | `$MEDHA_HOME/PERSONA.md` | K1 identity in every project |
+| Project memory | `$MEDHA_HOME/projects/<encoded-workspace>/memory.db` | Current workspace; follows project forks |
+| User memory | `$MEDHA_HOME/memory.db` | Shared by every workspace |
+| Memory provenance | `$MEDHA_HOME/projects/<encoded-workspace>/events.db` | Hash-chained source events |
+
+You only need one project instruction file; use `MEDHA.md` for new MEDHA-native
+projects. Existing `AGENTS.md` or `CLAUDE.md` files work without duplication.
+Do not create a `MEMORY.md` or edit either `memory.db`: durable facts enter
+through the memory tools or `medha memory edit`, preserving trust and provenance.
+
+```toml
+[memory]
+enabled = true
+k3_budget_tokens = 1200
+write_approval = "user-scope" # "none" | "user-scope" | "all"
+stale_after_days = 30
+
+[context_files]
+enabled = true
+max_chars = 20000
+progressive_discovery = true
+```
+
+Inspect and manage memory without a model call:
+
+```sh
+medha memory list
+medha memory show <name>
+medha memory search <words>
+medha memory edit <name>       # uses $EDITOR; appends a user-trust event
+medha memory pin <name>
+medha memory pin <name> --off
+medha memory forget <name>
+medha memory pending
+medha memory approve <id>
+```
+
+The TUI `/memory` picker shows trust/age chips and can jump to an entry's
+provenance. See [FEATURES.md](docs/FEATURES.md#typed-memory-and-context-files)
+for the M1–M7 architecture and exact test commands.
 
 ### ⏪ Time-Travel & Undo
 

@@ -22,7 +22,7 @@ pub mod kernel_loop;
 pub use artifacts::ArtifactStore;
 pub use budgets::{Budget, BudgetStop, DEFAULT_MAX_TURNS, Governor};
 pub use clarify::{Answer, Asker, NoAsker, QOption, Question};
-pub use context::{CompileResult, ContextEngine};
+pub use context::{CompileResult, ContextEngine, DiscoveredContext, ProgressiveContext};
 pub use errors::KernelError;
 pub use events::{
     Event, EventKind, EventLog, FileRollback, InMemoryLog, Provenance, SessionMeta, cut_index,

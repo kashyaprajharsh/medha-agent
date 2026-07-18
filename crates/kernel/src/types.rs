@@ -14,6 +14,7 @@ pub enum TrustLabel {
     Web,
     Memory,
     Skill,
+    Workspace,
 }
 
 impl TrustLabel {
@@ -25,6 +26,7 @@ impl TrustLabel {
             TrustLabel::Web => "web",
             TrustLabel::Memory => "memory",
             TrustLabel::Skill => "skill",
+            TrustLabel::Workspace => "workspace",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -35,6 +37,7 @@ impl TrustLabel {
             "web" => TrustLabel::Web,
             "memory" => TrustLabel::Memory,
             "skill" => TrustLabel::Skill,
+            "workspace" => TrustLabel::Workspace,
             _ => return None,
         })
     }
@@ -46,6 +49,7 @@ impl TrustLabel {
             TrustLabel::System => 5,
             TrustLabel::User => 4,
             TrustLabel::Skill => 3,
+            TrustLabel::Workspace => 3,
             TrustLabel::Memory => 2,
             TrustLabel::Tool => 2,
             TrustLabel::Web => 0,

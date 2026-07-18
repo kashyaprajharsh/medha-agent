@@ -28,6 +28,8 @@ pub enum EventKind {
     /// A memory write/update/forget/pin (D1). Payload = the `memory` crate's
     /// `MemoryOp`, kept as opaque JSON here — the kernel doesn't parse it.
     MemoryWrite,
+    ContextFileLoaded,
+    ContextFileBlocked,
 }
 
 impl EventKind {
@@ -44,6 +46,8 @@ impl EventKind {
             EventKind::ModelReasoning => "model.reasoning",
             EventKind::Interrupt => "interrupt",
             EventKind::MemoryWrite => "memory.write",
+            EventKind::ContextFileLoaded => "context.file_loaded",
+            EventKind::ContextFileBlocked => "context.file_blocked",
         }
     }
 
@@ -59,6 +63,8 @@ impl EventKind {
             "model.reasoning" => EventKind::ModelReasoning,
             "interrupt" => EventKind::Interrupt,
             "memory.write" => EventKind::MemoryWrite,
+            "context.file_loaded" => EventKind::ContextFileLoaded,
+            "context.file_blocked" => EventKind::ContextFileBlocked,
             _ => return None,
         })
     }
@@ -135,6 +141,19 @@ impl Event {
     /// opaque here; the projection rebuilds from it.
     pub fn memory_write(s: &Session, op: Value) -> Self {
         Self::new(s, EventKind::MemoryWrite, op, TrustLabel::Memory)
+    }
+
+    pub fn context_file(s: &Session, path: &str, content: &str, blocked: bool) -> Self {
+        Self::new(
+            s,
+            if blocked {
+                EventKind::ContextFileBlocked
+            } else {
+                EventKind::ContextFileLoaded
+            },
+            json!({ "path": path, "content": content }),
+            TrustLabel::Workspace,
+        )
     }
 
     pub fn policy(s: &Session, intent: &ToolIntent, decision: &Decision) -> Self {
@@ -510,6 +529,20 @@ mod tests {
 
     fn ev() -> Event {
         Event::model_text(&Session::new(), "hello")
+    }
+
+    #[test]
+    fn context_file_events_are_workspace_trusted_and_round_trip_kinds() {
+        let session = Session::new();
+        let loaded = Event::context_file(&session, "sub/AGENTS.md", "use quotes-and-hyphens", false);
+        assert_eq!(loaded.kind, EventKind::ContextFileLoaded);
+        assert_eq!(loaded.trust, TrustLabel::Workspace);
+        assert_eq!(loaded.payload["path"], "sub/AGENTS.md");
+        let blocked = Event::context_file(&session, "CLAUDE.md", "[blocked context file]", true);
+        assert_eq!(blocked.kind, EventKind::ContextFileBlocked);
+        for kind in [EventKind::ContextFileLoaded, EventKind::ContextFileBlocked] {
+            assert_eq!(EventKind::parse(kind.as_str()), Some(kind));
+        }
     }
 
     #[test]

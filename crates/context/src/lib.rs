@@ -4,6 +4,7 @@
 
 pub mod budget;
 pub mod compactor;
+pub mod ctxfiles;
 pub mod engine;
 pub mod identity;
 pub mod policy;

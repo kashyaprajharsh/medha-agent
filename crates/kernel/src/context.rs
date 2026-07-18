@@ -7,6 +7,7 @@
 
 use crate::types::{Message, ToolSpec};
 use async_trait::async_trait;
+use std::path::Path;
 
 pub struct CompileResult {
     /// The (possibly compacted) messages to send to the provider this turn.
@@ -43,4 +44,16 @@ pub trait ContextEngine: Send + Sync {
     /// Compile outbound context from the working history. `max_ctx` is the
     /// model's window (`None` = unknown → no compaction; never guess a window).
     async fn compile(&self, messages: &[Message], max_ctx: Option<u32>) -> CompileResult;
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredContext {
+    pub path: String,
+    pub content: String,
+    pub blocked: bool,
+}
+
+#[async_trait]
+pub trait ProgressiveContext: Send + Sync {
+    async fn discover(&self, touched_path: &Path) -> Option<DiscoveredContext>;
 }

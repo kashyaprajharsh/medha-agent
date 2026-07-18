@@ -52,6 +52,30 @@ impl SkillJudge for LlmJudge {
     }
 }
 
+#[async_trait]
+impl context::ctxfiles::ContextJudge for LlmJudge {
+    async fn judge(
+        &self,
+        request: context::ctxfiles::ContextJudgeRequest,
+    ) -> Result<context::ctxfiles::ContextJudgeVerdict, String> {
+        let outcome = <Self as SkillJudge>::judge(
+            self,
+            JudgeRequest {
+                name: request.path,
+                description: "project context file".into(),
+                findings: request.findings,
+                content: request.content,
+            },
+        )
+        .await?;
+        Ok(match outcome.verdict {
+            judge::JudgeVerdict::Safe => context::ctxfiles::ContextJudgeVerdict::Safe,
+            judge::JudgeVerdict::Caution => context::ctxfiles::ContextJudgeVerdict::Caution,
+            judge::JudgeVerdict::Dangerous => context::ctxfiles::ContextJudgeVerdict::Dangerous,
+        })
+    }
+}
+
 /// Drive one model call to completion, concatenating its text (ignoring
 /// reasoning/usage/tool blocks — the judge has no tools and returns only JSON).
 async fn collect_text(provider: &dyn Provider, ctx: &CompiledContext) -> Result<String, String> {

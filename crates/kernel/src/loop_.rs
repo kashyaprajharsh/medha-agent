@@ -55,6 +55,27 @@ fn approval_key(intent: &ToolIntent) -> String {
     }
 }
 
+fn attach_discovered_context(
+    observation: &mut Observation,
+    discovered: &crate::context::DiscoveredContext,
+) {
+    let attachment = serde_json::json!({
+        "path": discovered.path,
+        "trust": "workspace",
+        "blocked": discovered.blocked,
+        "content": discovered.content,
+    });
+    if let Some(payload) = observation.payload.as_object_mut() {
+        payload.insert("project_context".into(), attachment);
+    } else {
+        let result = std::mem::take(&mut observation.payload);
+        observation.payload = serde_json::json!({
+            "result": result,
+            "project_context": attachment,
+        });
+    }
+}
+
 /// Why a session loop stopped — so the surface can tell the user (e.g. which
 /// budget ceiling was hit, and that it can be resumed) instead of returning
 /// silently.
@@ -78,6 +99,7 @@ pub struct Kernel<P: Provider, L: EventLog> {
     pub policy: Arc<dyn crate::policy::Policy>,
     pub gate: Arc<dyn crate::gate::HumanGate>,
     pub verifier: Arc<dyn crate::verify::Verifier>,
+    progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     max_parallel_tools: usize,
     /// Resolved model pricing (P1-12); `None` = cost unknown, meter stays off.
     pricing: Option<crate::types::Pricing>,
@@ -128,6 +150,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             policy,
             gate,
             verifier,
+            progressive_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             pricing: None,
             gate_serial: futures::lock::Mutex::new(()),
@@ -138,6 +161,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     /// Set resolved model pricing so the governor meters real dollars (P1-12).
     pub fn with_pricing(mut self, pricing: Option<crate::types::Pricing>) -> Self {
         self.pricing = pricing;
+        self
+    }
+
+    pub fn with_progressive_context(
+        mut self,
+        progressive_context: Arc<dyn crate::context::ProgressiveContext>,
+    ) -> Self {
+        self.progressive_context = Some(progressive_context);
         self
     }
 
@@ -475,7 +506,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // refinement (parallel.rs); for now tools are sandbox-jailed and
             // conflicting same-turn writes are rare.
             let dispatch_cancel = cancel.clone();
-            let results: Vec<(String, String, Observation)> = stream::iter(intents)
+            let results: Vec<(String, String, Observation, Option<crate::context::DiscoveredContext>)> = stream::iter(intents)
                 .map(|intent| {
                     let cancel = dispatch_cancel.clone();
                     async move {
@@ -501,7 +532,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 }
                             }
                         };
-                        (intent.id, intent.tool, obs)
+                        let discovered = match (
+                            &self.progressive_context,
+                            intent.args.get("path").and_then(|value| value.as_str()),
+                        ) {
+                            (Some(loader), Some(path)) => {
+                                loader.discover(std::path::Path::new(path)).await
+                            }
+                            _ => None,
+                        };
+                        (intent.id, intent.tool, obs, discovered)
                     }
                 })
                 .buffered(self.max_parallel_tools)
@@ -510,13 +550,27 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
             // Append in deterministic (request) order; surface each result to the
             // sink (diffs, errors) and feed it back to the model.
-            for (id, tool, mut obs) in results {
+            for (id, tool, mut obs, discovered) in results {
                 // Label web-tool output as untrusted content (P7): a fetched
                 // page must not be treated like a local file read.
                 let trust = match self.executor.category(&tool) {
                     Some(ToolCategory::Web) => TrustLabel::Web,
                     _ => TrustLabel::Tool,
                 };
+                if let Some(discovered) = discovered {
+                    let context_event = self
+                        .log
+                        .append(Event::context_file(
+                            session,
+                            &discovered.path,
+                            &discovered.content,
+                            discovered.blocked,
+                        ))
+                        .await?;
+                    window_events.push(context_event.id);
+                    window_taint = window_taint.min(TrustLabel::Workspace);
+                    attach_discovered_context(&mut obs, &discovered);
+                }
                 let applied = if matches!(obs.status, crate::types::ObsStatus::Ok)
                     && tool.starts_with("memory.")
                 {
@@ -879,6 +933,47 @@ mod enrich_memory_tests {
         assert_eq!(TrustLabel::User.min(TrustLabel::Tool), TrustLabel::Tool);
         assert_eq!(TrustLabel::Tool.min(TrustLabel::User), TrustLabel::Tool);
         assert_eq!(TrustLabel::User.min(TrustLabel::User), TrustLabel::User);
+    }
+}
+
+#[cfg(test)]
+mod progressive_context_tests {
+    use super::attach_discovered_context;
+    use crate::{DiscoveredContext, Observation};
+    use serde_json::json;
+
+    #[test]
+    fn progressive_context_is_visible_and_workspace_labeled() {
+        let mut observation = Observation::ok("tool-1", json!("plain result"));
+        attach_discovered_context(
+            &mut observation,
+            &DiscoveredContext {
+                path: "sub/AGENTS.md".into(),
+                content: "use the submodule rules".into(),
+                blocked: false,
+            },
+        );
+        assert_eq!(observation.payload["result"], "plain result");
+        assert_eq!(observation.payload["project_context"]["trust"], "workspace");
+        assert_eq!(
+            observation.payload["project_context"]["content"],
+            "use the submodule rules"
+        );
+
+        let mut blocked = Observation::ok("tool-2", json!({ "ok": true }));
+        attach_discovered_context(
+            &mut blocked,
+            &DiscoveredContext {
+                path: "sub/CLAUDE.md".into(),
+                content: "[blocked context file sub/CLAUDE.md]".into(),
+                blocked: true,
+            },
+        );
+        assert_eq!(blocked.payload["project_context"]["blocked"], true);
+        assert!(blocked.payload["project_context"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("blocked context file"));
     }
 }
 

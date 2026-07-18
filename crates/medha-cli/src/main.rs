@@ -18,7 +18,7 @@ mod tui_tea;
 
 use anyhow::Result;
 use clap::Parser;
-use kernel::{Kernel, Message, Provider, Session};
+use kernel::{EventLog, Kernel, Message, Provider, Session};
 use providers::OpenAiCompat;
 use sandbox::WorkspaceSandbox;
 use std::io::{IsTerminal, Write};
@@ -648,12 +648,22 @@ async fn main() -> Result<()> {
     // The skill store gets the two-tier guard: the deterministic regex scanner
     // (in the store) plus an LLM judge (MEDHA's own model) that reviews the
     // ambiguous Caution cases. See `skill_judge`.
+    let security_judge = Arc::new(skill_judge::LlmJudge::new(provider.clone()));
+    let context_file_loader =
+        context::ctxfiles::ContextFileLoader::new().with_judge(security_judge.clone());
+    let medha_home = config::medha_home()?;
+    let startup_context = context_file_loader.discover_startup(&cwd, &medha_home).await;
+    let persona_file = context_file_loader.load_persona(&medha_home).await?;
+    let progressive_context = Arc::new(context::ctxfiles::ProgressiveContextFiles::new(
+        context_file_loader,
+        cwd.clone(),
+    ));
     let skill_store = Arc::new(
         tools::SkillStore::new(
             workspace.root().join(".medha").join("skills"),
             Some(config::user_skills_dir()?),
         )
-        .with_judge(Arc::new(skill_judge::LlmJudge::new(provider.clone()))),
+        .with_judge(security_judge),
     );
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
     registry.register_skills(skill_store.clone());
@@ -775,15 +785,24 @@ async fn main() -> Result<()> {
         verifier,
     )
     .with_pricing(pricing)
+    .with_progressive_context(progressive_context)
     .with_max_parallel_tools(max_parallel_tools);
 
     // K1 Identity sheath is assembled by the context compiler, not hardcoded
     // here; config may override the persona (§4.3).
-    let persona = model_profiles
+    let configured_persona = model_profiles
         .lock()
         .ok()
         .and_then(|c| c.agent.identity.clone());
-    let mut system = context::identity::system_prompt(persona.as_deref());
+    let persona = persona_file
+        .as_ref()
+        .filter(|file| !file.blocked())
+        .map(|file| file.content.as_str())
+        .or(configured_persona.as_deref());
+    if let Some(file) = persona_file.as_ref().filter(|file| file.blocked()) {
+        eprintln!("{}", file.content);
+    }
+    let mut system = context::identity::system_prompt(persona);
     // Ground the model in the real current date + workspace — without this it
     // guesses a stale year for time-sensitive queries ("latest news" → 2024).
     let today = chrono::Local::now().format("%A, %-d %B %Y").to_string();
@@ -793,6 +812,11 @@ async fn main() -> Result<()> {
          date above — do not assume an older year in your searches or answers.",
         cwd.display()
     ));
+    let project_context = context::ctxfiles::render_startup(&startup_context);
+    if !project_context.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&project_context);
+    }
     // K2 skills manifest: one compact line per installed skill so the model knows
     // what it can `skill.load`. Empty (no section) when no skills exist — zero
     // behaviour change for workspaces without skills. In headless mode the task
@@ -842,6 +866,15 @@ async fn main() -> Result<()> {
     session.autonomy = kernel::AutonomyLevel::from_id(
         &std::env::var("MEDHA_MODE").unwrap_or_else(|_| lock.policy.autonomy.clone()),
     );
+    for file in startup_context.iter().chain(persona_file.iter()) {
+        log.append(kernel::Event::context_file(
+            &session,
+            &file.path.display().to_string(),
+            &file.content,
+            file.blocked(),
+        ))
+        .await?;
+    }
 
     let mode = if use_acp {
         "acp"

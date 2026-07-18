@@ -10,6 +10,7 @@ kernel.workspace = true
 sandbox = { path = "../sandbox" }
 policy = { path = "../policy" }
 memory = { path = "../memory" }
+store = { path = "../store" }
 ulid = "1"
 serde.workspace = true
 serde_json.workspace = true

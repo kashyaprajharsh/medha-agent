@@ -14,6 +14,112 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use ulid::Ulid;
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SessionSearchHit {
+    pub session_id: Ulid,
+    pub event_id: Ulid,
+    pub kind: String,
+    pub snippet: String,
+    pub ts: f64,
+    pub source: String,
+}
+
+fn search_text(kind: &EventKind, payload: &serde_json::Value) -> Option<String> {
+    let text = match kind {
+        EventKind::UserMessage | EventKind::ModelText => payload.get("text")?.as_str()?.to_string(),
+        EventKind::ToolObs => match payload.get("payload")? {
+            serde_json::Value::String(text) => text.clone(),
+            value => serde_json::to_string(value).ok()?,
+        },
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn event_source(event: &Event) -> &'static str {
+    if event.provenance.source == "automation"
+        || event.payload.get("source").and_then(|value| value.as_str()) == Some("automation")
+    {
+        "automation"
+    } else {
+        "interactive"
+    }
+}
+
+fn fts_match_expr(raw: &str) -> Option<String> {
+    let terms = raw
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+fn backfill_event_fts(conn: &mut Connection) -> Result<(), StoreError> {
+    let done = conn
+        .query_row(
+            "SELECT value FROM store_meta WHERE key = 'event_fts_backfilled_v1'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .is_some();
+    if done {
+        return Ok(());
+    }
+
+    let tx = conn.transaction().map_err(|error| StoreError::Db(error.to_string()))?;
+    tx.execute("DELETE FROM events_fts", [])
+        .map_err(|error| StoreError::Db(error.to_string()))?;
+    let rows = {
+        let mut stmt = tx
+            .prepare("SELECT id, session_id, kind, payload, provenance, ts FROM events ORDER BY rowid")
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, f64>(5)?,
+                ))
+            })
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Db(error.to_string()))?
+    };
+    for (event_id, session_id, kind, payload, provenance, ts) in rows {
+        let Some(kind_value) = EventKind::parse(&kind) else {
+            continue;
+        };
+        let payload_value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+        let Some(text) = search_text(&kind_value, &payload_value) else {
+            continue;
+        };
+        let source = if provenance == "automation"
+            || payload_value.get("source").and_then(|value| value.as_str()) == Some("automation")
+        {
+            "automation"
+        } else {
+            "interactive"
+        };
+        tx.execute(
+            "INSERT INTO events_fts (event_id, session_id, kind, text, source, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![event_id, session_id, kind, text, source, ts],
+        )
+        .map_err(|error| StoreError::Db(error.to_string()))?;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO store_meta (key, value) VALUES ('event_fts_backfilled_v1', '1')",
+        [],
+    )
+    .map_err(|error| StoreError::Db(error.to_string()))?;
+    tx.commit().map_err(|error| StoreError::Db(error.to_string()))
+}
+
 /// Content-addressed blob store on disk (§4.2/§4.5). Blobs live under a dir,
 /// named by their SHA-256 hash, so identical content is stored once.
 pub struct FileArtifactStore {
@@ -82,7 +188,7 @@ impl SqliteLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::Io(e.to_string()))?;
         }
-        let conn = Connection::open(path).map_err(|e| StoreError::Db(e.to_string()))?;
+        let mut conn = Connection::open(path).map_err(|e| StoreError::Db(e.to_string()))?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
@@ -98,9 +204,22 @@ impl SqliteLog {
                 hash       BLOB NOT NULL,
                 ts         REAL NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);",
+            CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+            CREATE TABLE IF NOT EXISTS store_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+                event_id UNINDEXED,
+                session_id UNINDEXED,
+                kind UNINDEXED,
+                text,
+                source UNINDEXED,
+                ts UNINDEXED
+            );",
         )
         .map_err(|e| StoreError::Db(e.to_string()))?;
+        backfill_event_fts(&mut conn)?;
 
         // The chain head is read from the DB inside each append's transaction
         // (see `append`), not cached — so a second MEDHA process on the same
@@ -229,6 +348,159 @@ impl SqliteLog {
         }
         Ok(out)
     }
+
+    /// Search text-bearing events. Interactive sessions rank ahead of
+    /// automation, which remains searchable rather than disappearing.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SessionSearchHit>, StoreError> {
+        let Some(match_expr) = fts_match_expr(query) else {
+            return Ok(Vec::new());
+        };
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, event_id, kind,
+                        snippet(events_fts, 3, '[', ']', '…', 24), ts, source
+                 FROM events_fts
+                 WHERE events_fts MATCH ?1
+                 ORDER BY CASE source WHEN 'automation' THEN 1 ELSE 0 END,
+                          bm25(events_fts)
+                 LIMIT ?2",
+            )
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![match_expr, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        let mut hits = Vec::new();
+        for row in rows {
+            let (session_id, event_id, kind, snippet, ts, source) =
+                row.map_err(|error| StoreError::Db(error.to_string()))?;
+            let (Ok(session_id), Ok(event_id)) =
+                (Ulid::from_string(&session_id), Ulid::from_string(&event_id))
+            else {
+                continue;
+            };
+            hits.push(SessionSearchHit {
+                session_id,
+                event_id,
+                kind,
+                snippet,
+                ts,
+                source,
+            });
+        }
+        Ok(hits)
+    }
+
+    /// Return a chronological event window centered on one event.
+    pub fn window(
+        &self,
+        session_id: Ulid,
+        around_event_id: Ulid,
+        radius: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let anchor = conn
+            .query_row(
+                "SELECT rowid FROM events WHERE session_id = ?1 AND id = ?2",
+                rusqlite::params![session_id.to_string(), around_event_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance, prev_hash, ts
+                 FROM events
+                 WHERE session_id = ?1
+                 ORDER BY ABS(rowid - ?2), rowid
+                 LIMIT ?3",
+            )
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![session_id.to_string(), anchor, radius.saturating_mul(2).saturating_add(1) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        Row {
+                            id: row.get(1)?,
+                            session_id: row.get(2)?,
+                            parent_id: row.get(3)?,
+                            kind: row.get(4)?,
+                            payload: row.get(5)?,
+                            trust: row.get(6)?,
+                            provenance: row.get(7)?,
+                            prev_hash: row.get(8)?,
+                            ts: row.get(9)?,
+                        },
+                    ))
+                },
+            )
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        let mut events = rows
+            .filter_map(Result::ok)
+            .filter_map(|(rowid, row)| row.into_event().map(|event| (rowid, event)))
+            .collect::<Vec<_>>();
+        events.sort_by_key(|(rowid, _)| *rowid);
+        Ok(events.into_iter().map(|(_, event)| event).collect())
+    }
+
+    /// First and last text-bearing user/model events for discover-mode context.
+    pub fn bookends(&self, session_id: Ulid, count: usize) -> Result<Vec<Event>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let read = |direction: &str| -> Result<Vec<(i64, Event)>, StoreError> {
+            let sql = format!(
+                "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance, prev_hash, ts
+                 FROM events WHERE session_id = ?1 AND kind IN ('user.message', 'model.text')
+                 ORDER BY rowid {direction} LIMIT ?2"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|error| StoreError::Db(error.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![session_id.to_string(), count as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        Row {
+                            id: row.get(1)?,
+                            session_id: row.get(2)?,
+                            parent_id: row.get(3)?,
+                            kind: row.get(4)?,
+                            payload: row.get(5)?,
+                            trust: row.get(6)?,
+                            provenance: row.get(7)?,
+                            prev_hash: row.get(8)?,
+                            ts: row.get(9)?,
+                        },
+                    ))
+                })
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            Ok(rows
+                .filter_map(Result::ok)
+                .filter_map(|(rowid, row)| row.into_event().map(|event| (rowid, event)))
+                .collect())
+        };
+        let mut events = read("ASC")?;
+        events.extend(read("DESC")?);
+        events.sort_by_key(|(rowid, _)| *rowid);
+        events.dedup_by_key(|(rowid, _)| *rowid);
+        Ok(events.into_iter().map(|(_, event)| event).collect())
+    }
 }
 
 #[async_trait]
@@ -283,6 +555,21 @@ impl EventLog for SqliteLog {
             ],
         )
         .map_err(|err| KernelError::Log(err.to_string()))?;
+        if let Some(text) = search_text(&e.kind, &e.payload) {
+            tx.execute(
+                "INSERT INTO events_fts (event_id, session_id, kind, text, source, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    e.id.to_string(),
+                    e.session_id.to_string(),
+                    e.kind.as_str(),
+                    text,
+                    event_source(&e),
+                    e.ts,
+                ],
+            )
+            .map_err(|err| KernelError::Log(err.to_string()))?;
+        }
         tx.commit()
             .map_err(|err| KernelError::Log(err.to_string()))?;
         Ok(e)
@@ -401,6 +688,92 @@ mod tests {
         assert_eq!(sessions[1].title, "first task here");
         assert_eq!(sessions[1].events, 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn search_window_and_bookends_return_verbatim_prior_session_events() {
+        let dir = std::env::temp_dir().join(format!("medha-session-search-{}", Ulid::new()));
+        let log = SqliteLog::open(dir.join("events.db")).unwrap();
+        let session = kernel::Session::new();
+        let first = log
+            .append(Event::user_message(
+                &session,
+                "We chose quoted-values for the cache-key.",
+            ))
+            .await
+            .unwrap();
+        let answer = log
+            .append(Event::model_text(
+                &session,
+                "Yes — keep the cache-key byte-for-byte.",
+            ))
+            .await
+            .unwrap();
+        log.append(Event::user_message(&session, "Anything else?"))
+            .await
+            .unwrap();
+
+        let hits = log.search("quoted-values", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].event_id, first.id);
+        assert!(hits[0].snippet.contains("quoted-values"));
+        assert!(log.search("", 10).unwrap().is_empty());
+
+        let window = log.window(session.id, answer.id, 1).unwrap();
+        assert_eq!(window.len(), 3);
+        assert_eq!(window[0].payload["text"], "We chose quoted-values for the cache-key.");
+        assert_eq!(window[1].id, answer.id);
+        let bookends = log.bookends(session.id, 1).unwrap();
+        assert_eq!(bookends.len(), 2);
+        assert_eq!(bookends[0].id, first.id);
+        assert_eq!(bookends[1].payload["text"], "Anything else?");
+    }
+
+    #[tokio::test]
+    async fn automation_hits_are_demoted_not_excluded() {
+        let dir = std::env::temp_dir().join(format!("medha-session-source-{}", Ulid::new()));
+        let log = SqliteLog::open(dir.join("events.db")).unwrap();
+        let automated = kernel::Session::new();
+        let mut cron = Event::user_message(&automated, "shared retrieval phrase");
+        cron.provenance.source = "automation".into();
+        log.append(cron).await.unwrap();
+        let interactive = kernel::Session::new();
+        log.append(Event::user_message(&interactive, "shared retrieval phrase"))
+            .await
+            .unwrap();
+
+        let hits = log.search("shared retrieval phrase", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].session_id, interactive.id);
+        assert_eq!(hits[0].source, "interactive");
+        assert_eq!(hits[1].source, "automation");
+    }
+
+    #[tokio::test]
+    async fn opening_an_old_database_backfills_the_fts_mirror_once() {
+        let dir = std::env::temp_dir().join(format!("medha-session-backfill-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let session = kernel::Session::new();
+        {
+            let log = SqliteLog::open(&db).unwrap();
+            log.append(Event::model_text(&session, "backfill-only phrase"))
+                .await
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("DELETE FROM events_fts", []).unwrap();
+            conn.execute(
+                "DELETE FROM store_meta WHERE key = 'event_fts_backfilled_v1'",
+                [],
+            )
+            .unwrap();
+        }
+        let reopened = SqliteLog::open(&db).unwrap();
+        assert_eq!(reopened.search("backfill-only", 10).unwrap().len(), 1);
+        drop(reopened);
+        let reopened_again = SqliteLog::open(&db).unwrap();
+        assert_eq!(reopened_again.search("backfill-only", 10).unwrap().len(), 1);
     }
 
     #[test]

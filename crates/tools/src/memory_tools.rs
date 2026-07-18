@@ -7,7 +7,7 @@
 
 use crate::{Tool, ToolError};
 use async_trait::async_trait;
-use kernel::{BlastRadius, ToolCategory, TrustLabel};
+use kernel::{ArtifactStore, BlastRadius, Event, EventKind, ToolCategory, TrustLabel};
 use memory::{ConfidenceRung, MemoryEntry, MemoryKind, MemoryOp, MemoryProjection, Scope};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -424,6 +424,183 @@ pub struct MemorySearch {
     pub store: Arc<MemoryProjection>,
 }
 
+pub struct SessionsSearch {
+    pub log: Arc<store::SqliteLog>,
+    pub artifacts: Arc<dyn ArtifactStore>,
+}
+
+impl SessionsSearch {
+    fn event_record(&self, event: Event) -> Value {
+        let role = match &event.kind {
+            EventKind::UserMessage => "user",
+            EventKind::ModelText => "assistant",
+            EventKind::ToolObs => "tool",
+            _ => event.kind.as_str(),
+        };
+        let text = match &event.kind {
+            EventKind::UserMessage | EventKind::ModelText => event
+                .payload
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            EventKind::ToolObs => event
+                .payload
+                .get("payload")
+                .map(|payload| match payload {
+                    Value::String(text) => text.clone(),
+                    value => serde_json::to_string(value).unwrap_or_default(),
+                })
+                .unwrap_or_default(),
+            _ => event.payload.to_string(),
+        };
+        let text = if text.len() > 16_000 {
+            match self.artifacts.put(text.as_bytes()) {
+                Ok(hash) => format!(
+                    "[oversized event stored as an artifact — read_artifact hash=\"{hash}\"]"
+                ),
+                Err(_) => "[oversized event; open it by event id from the session log]".into(),
+            }
+        } else {
+            text
+        };
+        json!({
+            "event_id": event.id,
+            "role": role,
+            "text": text,
+            "ts": event.ts,
+            "source": event.provenance.source,
+        })
+    }
+
+    fn parse_id(args: &Value, key: &str) -> Result<Ulid, ToolError> {
+        let raw = arg_str(args, key)?;
+        Ulid::from_string(raw)
+            .map_err(|_| ToolError::Args(format!("'{key}' must be a valid ULID")))
+    }
+}
+
+#[async_trait]
+impl Tool for SessionsSearch {
+    fn name(&self) -> &str {
+        "sessions.search"
+    }
+
+    fn description(&self) -> &str {
+        "Search prior sessions without an LLM. Pass `query` to discover verbatim exchanges, `session_id` plus `around_event_id` to scroll, or no arguments to browse recent sessions."
+    }
+
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "session_id": { "type": "string" },
+                "around_event_id": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 20 },
+                "radius": { "type": "integer", "minimum": 1, "maximum": 50 }
+            }
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        if let Some(query) = args.get("query") {
+            let query = query
+                .as_str()
+                .filter(|query| !query.trim().is_empty())
+                .ok_or_else(|| ToolError::Args("expected non-empty string 'query'".into()))?;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5).clamp(1, 20) as usize;
+            let hits = self.log.search(query, limit.saturating_mul(10)).map_err(|error| {
+                ToolError::Failed(format!("session search store: {error}"))
+            })?;
+            let mut seen = std::collections::HashSet::new();
+            let mut sessions = Vec::new();
+            for hit in hits {
+                if !seen.insert(hit.session_id) {
+                    continue;
+                }
+                let window = self
+                    .log
+                    .window(hit.session_id, hit.event_id, 5)
+                    .map_err(|error| ToolError::Failed(format!("session window: {error}")))?
+                    .into_iter()
+                    .map(|event| self.event_record(event))
+                    .collect::<Vec<_>>();
+                let bookends = self
+                    .log
+                    .bookends(hit.session_id, 3)
+                    .map_err(|error| ToolError::Failed(format!("session bookends: {error}")))?
+                    .into_iter()
+                    .map(|event| self.event_record(event))
+                    .collect::<Vec<_>>();
+                sessions.push(json!({
+                    "session_id": hit.session_id,
+                    "hit": hit,
+                    "window": window,
+                    "bookends": bookends,
+                }));
+                if sessions.len() == limit {
+                    break;
+                }
+            }
+            return Ok(json!({ "mode": "discover", "query": query, "sessions": sessions }));
+        }
+
+        let has_session = args.get("session_id").is_some();
+        let has_anchor = args.get("around_event_id").is_some();
+        if has_session || has_anchor {
+            if !(has_session && has_anchor) {
+                return Err(ToolError::Args(
+                    "scroll mode requires both 'session_id' and 'around_event_id'".into(),
+                ));
+            }
+            let session_id = Self::parse_id(args, "session_id")?;
+            let around_event_id = Self::parse_id(args, "around_event_id")?;
+            let radius = args.get("radius").and_then(Value::as_u64).unwrap_or(5).clamp(1, 50) as usize;
+            let events = self
+                .log
+                .window(session_id, around_event_id, radius)
+                .map_err(|error| ToolError::Failed(format!("session window: {error}")))?
+                .into_iter()
+                .map(|event| self.event_record(event))
+                .collect::<Vec<_>>();
+            return Ok(json!({
+                "mode": "scroll",
+                "session_id": session_id,
+                "around_event_id": around_event_id,
+                "events": events,
+            }));
+        }
+
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10).clamp(1, 20) as usize;
+        let sessions = self
+            .log
+            .list_sessions()
+            .map_err(|error| ToolError::Failed(format!("session browse: {error}")))?
+            .into_iter()
+            .take(limit)
+            .map(|session| {
+                json!({
+                    "session_id": session.id,
+                    "title": session.title,
+                    "started_ts": session.started_ts,
+                    "last_ts": session.last_ts,
+                    "events": session.events,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "mode": "browse", "sessions": sessions }))
+    }
+}
+
 #[async_trait]
 impl Tool for MemorySearch {
     fn name(&self) -> &str {
@@ -491,6 +668,7 @@ fn store_err(e: memory::MemoryError) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel::{EventLog, Executor, Observation, Session};
 
     fn store() -> Arc<MemoryProjection> {
         let dir = std::env::temp_dir().join(format!("medha-memtools-{}", Ulid::new()));
@@ -716,5 +894,90 @@ mod tests {
         assert_eq!(saved["name"], "new-fact");
         assert!(s.get(Scope::Project, "new-fact").unwrap().is_some());
         assert!(s.get(Scope::Project, "old-fact").unwrap().is_none());
+    }
+
+    fn session_search_tool(tag: &str) -> (SessionsSearch, Arc<store::FileArtifactStore>) {
+        let dir = std::env::temp_dir().join(format!("medha-session-tool-{tag}-{}", Ulid::new()));
+        let log = Arc::new(store::SqliteLog::open(dir.join("events.db")).unwrap());
+        let artifacts = Arc::new(store::FileArtifactStore::open(dir.join("artifacts")).unwrap());
+        (
+            SessionsSearch {
+                log,
+                artifacts: artifacts.clone(),
+            },
+            artifacts,
+        )
+    }
+
+    #[tokio::test]
+    async fn sessions_search_discovers_scrolls_and_browses_verbatim() {
+        let (tool, artifacts) = session_search_tool("modes");
+        let session = Session::new();
+        let user = tool
+            .log
+            .append(Event::user_message(
+                &session,
+                "We decided the cache-key is 'quoted-hyphen-value'.",
+            ))
+            .await
+            .unwrap();
+        let answer = tool
+            .log
+            .append(Event::model_text(&session, "Keep that value verbatim."))
+            .await
+            .unwrap();
+
+        let discover = tool
+            .execute(&json!({ "query": "quoted-hyphen-value" }))
+            .await
+            .unwrap();
+        assert_eq!(discover["mode"], "discover");
+        assert_eq!(
+            discover["sessions"][0]["window"][0]["text"],
+            "We decided the cache-key is 'quoted-hyphen-value'."
+        );
+        let scroll = tool
+            .execute(&json!({
+                "session_id": session.id,
+                "around_event_id": answer.id,
+                "radius": 1,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(scroll["mode"], "scroll");
+        assert_eq!(scroll["events"][0]["event_id"], user.id.to_string());
+        let browse = tool.execute(&json!({})).await.unwrap();
+        assert_eq!(browse["mode"], "browse");
+        assert_eq!(browse["sessions"][0]["session_id"], session.id.to_string());
+
+        let mut registry = crate::ToolRegistry::new();
+        registry.register_session_search(tool.log.clone(), artifacts);
+        assert!(registry.specs().iter().any(|spec| spec.name == "sessions.search"));
+        assert!(tool.execute(&json!({ "query": "" })).await.is_err());
+        assert!(tool.execute(&json!({ "session_id": session.id })).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sessions_search_spills_oversized_verbatim_events() {
+        let (tool, artifacts) = session_search_tool("spill");
+        let session = Session::new();
+        let body = format!("spill-marker {}", "x".repeat(20_000));
+        let observation = Observation::ok("tool-1", json!({ "content": body }));
+        tool.log
+            .append(Event::tool_obs(&session, &observation, TrustLabel::Tool))
+            .await
+            .unwrap();
+
+        let result = tool
+            .execute(&json!({ "query": "spill-marker" }))
+            .await
+            .unwrap();
+        let text = result["sessions"][0]["window"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("read_artifact hash="), "{text}");
+        assert!(!text.contains(&"x".repeat(1_000)));
+        let hash = text.split('"').nth(1).unwrap();
+        assert!(artifacts.size(hash).unwrap() > 20_000);
     }
 }

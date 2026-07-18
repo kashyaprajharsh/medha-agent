@@ -221,6 +221,16 @@ impl ToolRegistry {
         self
     }
 
+    /// Verbatim episodic recall over the persistent event log (D4).
+    pub fn register_session_search(
+        &mut self,
+        log: Arc<store::SqliteLog>,
+        artifacts: Arc<dyn kernel::ArtifactStore>,
+    ) -> &mut Self {
+        self.register(Arc::new(memory_tools::SessionsSearch { log, artifacts }));
+        self
+    }
+
     /// Convenience: a registry with the default fs + shell + search/edit tools,
     /// plus `read_artifact` over the given artifact store.
     pub fn with_workspace(

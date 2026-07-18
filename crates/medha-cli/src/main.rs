@@ -665,6 +665,7 @@ async fn main() -> Result<()> {
     )?);
     let k3_budget_tokens = memory::recall::DEFAULT_K3_BUDGET_TOKENS;
     registry.register_memory(memory_store.clone());
+    registry.register_session_search(log.clone(), artifacts.clone());
     let known_tools = registry.tool_names();
     // Live web-search settings, shared with the `web.*` tools. Seed from the
     // saved config (provider choice + stored keys, env fallback); the TUI's

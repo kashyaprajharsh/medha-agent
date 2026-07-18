@@ -211,7 +211,8 @@ impl ToolRegistry {
     pub fn register_memory(&mut self, store: Arc<memory::MemoryProjection>) -> &mut Self {
         self.register(Arc::new(memory_tools::MemoryWrite { store: store.clone() }));
         self.register(Arc::new(memory_tools::MemoryUpdate { store: store.clone() }));
-        self.register(Arc::new(memory_tools::MemoryForget { store }));
+        self.register(Arc::new(memory_tools::MemoryForget { store: store.clone() }));
+        self.register(Arc::new(memory_tools::MemorySearch { store }));
         self
     }
 

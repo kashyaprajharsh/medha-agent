@@ -663,6 +663,7 @@ async fn main() -> Result<()> {
         state.join("memory.db"),
         config::medha_home()?.join("memory.db"),
     )?);
+    let k3_budget_tokens = memory::recall::DEFAULT_K3_BUDGET_TOKENS;
     registry.register_memory(memory_store.clone());
     let known_tools = registry.tool_names();
     // Live web-search settings, shared with the `web.*` tools. Seed from the
@@ -683,10 +684,21 @@ async fn main() -> Result<()> {
     // LLM summarizer for Full compaction (falls back to extractive on failure),
     // so a compacted session keeps a real handoff summary instead of a keyword
     // scrape that invites hallucination.
+    let recall_store = memory_store.clone();
     let context_engine = Arc::new(
         context::PipelineEngine::new(lock.context.to_policy())
             .with_summarizer(Arc::new(context::LlmSummarizer::new(provider.clone())))
-            .with_artifacts(artifacts.clone()),
+            .with_artifacts(artifacts.clone())
+            .with_full_compaction_refresh(Arc::new(move |system| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs_f64())
+                    .unwrap_or(0.0);
+                match memory::recall::compile_k3(&recall_store, k3_budget_tokens, now) {
+                    Ok(block) => memory::recall::replace_k3(system, &block),
+                    Err(_) => system.to_string(),
+                }
+            })),
     );
 
     // Deny-first policy + shell command scanner (§4.6). Approval set comes from
@@ -796,6 +808,12 @@ async fn main() -> Result<()> {
         system.push_str("\n\n");
         system.push_str(&skills_manifest);
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+    let k3 = memory::recall::compile_k3(&memory_store, k3_budget_tokens, now)?;
+    system = memory::recall::replace_k3(&system, &k3);
 
     // Resume (--continue / --resume <id>): rebuild the prior conversation from
     // the event log and continue the SAME session (new events append onward).

@@ -345,6 +345,70 @@ impl Tool for MemoryForget {
     }
 }
 
+pub struct MemorySearch {
+    pub store: Arc<MemoryProjection>,
+}
+
+#[async_trait]
+impl Tool for MemorySearch {
+    fn name(&self) -> &str {
+        "memory.search"
+    }
+
+    fn description(&self) -> &str {
+        "Search full persistent memories beyond the frozen recall index. Returns exact claims, scope, kernel-computed trust/confidence, age, and provenance event ids."
+    }
+
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Words or a phrase to find in memory names, hooks, and claims." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let query = arg_str(args, "query")?;
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10).clamp(1, 50) as usize;
+        let now = now_secs();
+        let results = self
+            .store
+            .search(query, limit)
+            .map_err(store_err)?
+            .into_iter()
+            .map(|entry| {
+                let age_days = ((now - entry.updated).max(0.0) / 86_400.0).floor() as u64;
+                json!({
+                    "name": entry.name,
+                    "claim": entry.claim,
+                    "description": entry.description,
+                    "kind": entry.kind.as_str(),
+                    "scope": entry.scope.as_str(),
+                    "trust": entry.trust.as_str(),
+                    "confidence": entry.confidence.as_str(),
+                    "age_days": age_days,
+                    "stale": age_days > 30,
+                    "provenance": entry.provenance,
+                    "version": entry.version,
+                    "pinned": entry.pinned,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "query": query, "count": results.len(), "results": results }))
+    }
+}
+
 fn store_err(e: memory::MemoryError) -> ToolError {
     ToolError::Failed(format!("memory store: {e}"))
 }
@@ -488,5 +552,27 @@ mod tests {
         // Round-trip: the echoed op must deserialize as a MemoryOp.
         let op: MemoryOp = serde_json::from_value(out["applied"].clone()).unwrap();
         assert!(matches!(op, MemoryOp::Write { .. }));
+    }
+
+    #[tokio::test]
+    async fn search_returns_exact_claim_metadata_and_rejects_empty_query() {
+        let s = store();
+        let write = MemoryWrite { store: s.clone() };
+        let search = MemorySearch { store: s };
+        let mut args = write_args("hyphenated-fact");
+        args["claim"] = json!("The user said: 'keep quoted-values' exactly.");
+        write
+            .execute(&enriched(args, "user", Ulid::new(), true))
+            .await
+            .unwrap();
+
+        let out = search.execute(&json!({ "query": "quoted-values" })).await.unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["results"][0]["claim"], "The user said: 'keep quoted-values' exactly.");
+        assert_eq!(out["results"][0]["trust"], "user");
+        assert!(out["results"][0]["provenance"].is_array());
+
+        let err = search.execute(&json!({ "query": "" })).await.unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "{err}");
     }
 }

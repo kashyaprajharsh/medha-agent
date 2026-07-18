@@ -15,6 +15,8 @@ use kernel::{CompileResult, ContextEngine, Message, Role};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+type SystemRefresh = dyn Fn(&str) -> String + Send + Sync;
+
 pub struct PipelineEngine {
     policy: CompactionPolicy,
     /// Token counter for the pre-flight estimate and per-item boundaries. A real
@@ -45,6 +47,9 @@ pub struct PipelineEngine {
     /// Fixed per-request tool-definition token overhead, sized once by
     /// `note_tools` and added to every estimate (P1-9).
     tool_overhead: AtomicU32,
+    /// Full compaction already breaks the prompt prefix, so frozen startup
+    /// sheaths may refresh at that boundary and nowhere else.
+    full_compaction_refresh: Option<Arc<SystemRefresh>>,
 }
 
 impl PipelineEngine {
@@ -66,6 +71,7 @@ impl PipelineEngine {
             last_summary: std::sync::Mutex::new(None),
             artifacts: None,
             tool_overhead: AtomicU32::new(0),
+            full_compaction_refresh: None,
         }
     }
 
@@ -79,6 +85,15 @@ impl PipelineEngine {
     /// (lossless prune, P1-3).
     pub fn with_artifacts(mut self, artifacts: Arc<dyn kernel::ArtifactStore>) -> Self {
         self.artifacts = Some(artifacts);
+        self
+    }
+
+    /// Refresh frozen system-prompt sections only after a Full compaction.
+    pub fn with_full_compaction_refresh(
+        mut self,
+        refresh: Arc<SystemRefresh>,
+    ) -> Self {
+        self.full_compaction_refresh = Some(refresh);
         self
     }
 }
@@ -318,6 +333,14 @@ impl ContextEngine for PipelineEngine {
         }
 
         out.extend_from_slice(&messages[tail_start..]);
+        if summarized {
+            if let (Some(refresh), Some(system)) = (
+                &self.full_compaction_refresh,
+                out.iter_mut().find(|message| message.role == Role::System),
+            ) {
+                system.content = refresh(&system.content);
+            }
+        }
         let after = count_all(&out, counter) + overhead;
 
         // Track effectiveness: a compaction that frees <10% counts as
@@ -618,6 +641,27 @@ mod tests {
         assert!(r.compacted && r.summarized);
         assert_eq!(r.summary.as_deref(), Some("HANDOFF"), "summary text carried out for K12 persistence");
         assert!(r.messages.iter().any(|m| m.content == "HANDOFF"), "summary is in the compacted view");
+    }
+
+    #[tokio::test]
+    async fn frozen_system_refresh_runs_only_at_full_compaction() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let eng = engine(full_policy())
+            .with_summarizer(Arc::new(OkSummarizer("HANDOFF")))
+            .with_full_compaction_refresh(Arc::new(move |system| {
+                seen.fetch_add(1, Ordering::Relaxed);
+                format!("{system}\n\n## Memory\n\nrefreshed")
+            }));
+
+        let unchanged = eng.compile(&[Message::system("SYSTEM"), user("short")], Some(2_000)).await;
+        assert!(!unchanged.compacted);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let compacted = eng.compile(&full_compaction_history(), Some(2_000)).await;
+        assert!(compacted.compacted && compacted.summarized);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(compacted.messages[0].content.ends_with("## Memory\n\nrefreshed"));
     }
 
     #[tokio::test]

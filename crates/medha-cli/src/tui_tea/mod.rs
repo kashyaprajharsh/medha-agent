@@ -1396,14 +1396,24 @@ impl Model {
             return;
         }
         const MARKER: &str = "## Skills available";
+        let memory = sys
+            .content
+            .find(memory::recall::MEMORY_MARKER)
+            .map(|idx| sys.content[idx..].trim().to_string());
         if let Some(idx) = sys.content.find(MARKER) {
             let head = sys.content[..idx].trim_end().to_string();
             sys.content = head;
+        } else if let Some(idx) = sys.content.find(memory::recall::MEMORY_MARKER) {
+            sys.content = sys.content[..idx].trim_end().to_string();
         }
         let fresh = store.manifest(&self.known_tools, None);
         if !fresh.is_empty() {
             sys.content.push_str("\n\n");
             sys.content.push_str(&fresh);
+        }
+        if let Some(memory) = memory {
+            sys.content.push_str("\n\n");
+            sys.content.push_str(&memory);
         }
     }
 
@@ -1877,7 +1887,9 @@ mod tests {
         .with_skills(store, known);
 
         // A system message with no skills section yet (as at startup with none).
-        let mut transcript = vec![Message::system("BASE PROMPT")];
+        let mut transcript = vec![Message::system(
+            "BASE PROMPT\n\n## Memory\n\n── MEMORY (0 entries) ──",
+        )];
         model.refresh_skill_manifest(&mut transcript);
         assert!(transcript[0].content.contains("## Skills available"));
         assert!(transcript[0].content.contains("note-taker"));
@@ -1888,6 +1900,8 @@ mod tests {
             1
         );
         assert!(transcript[0].content.starts_with("BASE PROMPT"));
+        assert_eq!(transcript[0].content.matches("## Memory").count(), 1);
+        assert!(transcript[0].content.ends_with("── MEMORY (0 entries) ──"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

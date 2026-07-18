@@ -2036,6 +2036,7 @@ name = "memory"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "context",
  "futures",
  "kernel",
  "rusqlite",

@@ -5,6 +5,7 @@
 
 pub mod entry;
 pub mod projection;
+pub mod recall;
 
 pub use entry::{ConfidenceRung, MemoryEntry, MemoryKind, Scope};
 pub use projection::{MemoryError, MemoryOp, MemoryProjection};

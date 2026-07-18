@@ -4,7 +4,7 @@
 
 > **मेधा (Medha)** — Sanskrit for *sharp intelligence, retentive power, mental fire.*
 
-MEDHA runs an autonomous coding agent on top of **any** OpenAI-compatible endpoint — vLLM, NVIDIA NIM, Ollama, llama.cpp, or a hosted gateway. The model proposes actions (read a file, run a command, search the web, edit code); the harness validates, polices, sandboxes, and records every one of them behind a deny-first policy and a tamper-evident event log.
+MEDHA runs an autonomous, general-purpose agent on top of **any** OpenAI-compatible endpoint — vLLM, NVIDIA NIM, Ollama, llama.cpp, or a hosted gateway. The model proposes actions — read and edit files, run commands, search and fetch the web, use git, call tools you define — and the harness validates, polices, sandboxes, and records every one of them behind a deny-first policy and a tamper-evident event log. Coding is where it's sharpest today, but nothing in the kernel is coding-specific: it's a tool-using agent for whatever tools you give it.
 
 The bet: **the frontier of agent reliability has moved from the model to the harness.** The same model behind a stronger harness is a dramatically more reliable agent. MEDHA is that harness — sandboxed, auditable, and able to accumulate memory and skills across sessions.
 
@@ -47,7 +47,8 @@ Then work interactively or headless:
 
 ```sh
 medha                                  # full-screen TUI
-medha "fix the failing test in tests/calc.rs"   # one-shot, headless
+medha "fix the failing test in tests/calc.rs"       # one-shot, headless
+medha "summarize the open issues in this repo and draft a triage plan"
 ```
 
 In the TUI: type a task and press **Enter**, approve or deny prompted actions, **Esc** to interrupt, **Ctrl-D** to quit.
@@ -99,7 +100,11 @@ Memory lives in the **Knowledge** layer as a short, ranked list — not every fa
 Any OpenAI-compatible Chat Completions endpoint. Tool names are sanitized to the strict OpenAI contract on the wire, so endpoints that reject non-standard names (NIM, OpenAI) work out of the box. Reasoning traces (`reasoning_content` or `<think>` tags) stream natively. Toggle streaming with `/stream` — useful for gateways that only expose reasoning in a non-streamed response.
 
 ### Deny-first policy & sandbox
-- **Policy** — unregistered tools denied; `shell.exec` run through a dangerous-pattern scanner; file writes and other consequential actions gate for approval. Autonomy dial: `careful · normal · yolo`.
+- **Policy** — unregistered tools denied; `shell.exec` run through a dangerous-pattern scanner; file writes and other consequential actions gate for approval.
+- **Autonomy modes** (`/mode`, or `[policy].autonomy`) — how much runs without asking. The safety floor never moves: dangerous commands, credential reads, and web-tainted external actions gate or deny at *every* level, even `yolo`.
+  - `careful` (default) — ask before every configured consequential action (file writes, commits, skill saves).
+  - `normal` — file edits run freely; other consequential actions still ask.
+  - `yolo` — no approval prompts for already-allowed actions; the deny-first floor still bites.
 - **Sandbox** — pick your isolation in `medha.lock`:
   - `native` (default) — OS jail: writes confined to the workspace, temp, and dev caches; `~/.ssh` and the like are blocked. Zero dependencies.
   - `host` — no OS isolation (scanner + approval only).

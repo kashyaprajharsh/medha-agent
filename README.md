@@ -1,255 +1,149 @@
 # MEDHA
 
-**A self-evolving AI agent harness — verification-first, open-first, one static binary.**
+**A verification-first AI agent harness — one static Rust binary, any OpenAI-compatible model.**
 
-> **मेधा (Medha)** — Sanskrit for *sharp intelligence, retentive power, mental fire*. From the Vedic *Medha Suktam*.
+> **मेधा (Medha)** — Sanskrit for *sharp intelligence, retentive power, mental fire.*
 
-MEDHA is an autonomous agent kernel written in Rust. Point it at any OpenAI-compatible model (vLLM, Ollama, llama.cpp, or hosted) and it runs an autonomous loop: read files, run shell commands, fetch the web, edit code — all behind a deny-first policy, flexible sandbox (Host · Native · Docker/Podman · SSH), and tamper-evident audit log. The model proposes; the harness disposes.
+MEDHA runs an autonomous coding agent on top of **any** OpenAI-compatible endpoint — vLLM, NVIDIA NIM, Ollama, llama.cpp, or a hosted gateway. The model proposes actions (read a file, run a command, search the web, edit code); the harness validates, polices, sandboxes, and records every one of them behind a deny-first policy and a tamper-evident event log.
+
+The bet: **the frontier of agent reliability has moved from the model to the harness.** The same model behind a stronger harness is a dramatically more reliable agent. MEDHA is that harness — sandboxed, auditable, and able to accumulate memory and skills across sessions.
 
 ```sh
 cargo build --release
 ./target/release/medha
 ```
 
-**The thesis:** The frontier of agent capability has moved from the model to the harness. The same model behind different harnesses produces wildly different reliability. MEDHA is the harness that learns — accumulating skills, evolving from traces, and gating every change with deterministic evals.
+---
+
+## Highlights
+
+- **Runs anywhere OpenAI's API shape is spoken** — strict-compliant wire format, so it works on vLLM, NIM, Together, Fireworks, OpenRouter, Groq, Ollama, and OpenAI itself. Live streaming *or* whole-response mode (`/stream`).
+- **Deny-first by construction** — unregistered tools are denied; `shell.exec` is scanned for dangerous patterns; consequential actions gate for human approval.
+- **OS-native sandbox, no Docker required** — filesystem jail via macOS Seatbelt / Linux Landlock by default; Host, Container, and SSH backends available.
+- **Tamper-evident memory** — every fact the agent learns is an event in a SHA-256 hash-chained log, with kernel-computed trust and provenance the model cannot forge.
+- **Time travel** — rewind to any past turn and branch a new session; the original is never destroyed.
+- **Skills** — reusable, security-scanned workflows the agent loads on demand and can author with your approval.
+- **Eval Gate** — deterministic, CI-style scenarios that score an agent setup pass/reject.
 
 ---
 
-## ⚡ Quick Start (30 seconds)
+## Quick start
 
-**1. Install & Run**
 ```sh
-cargo install --path .    # or: cargo build --release
-medha                     # First run opens TUI setup
+# Build (Rust 1.85+, edition 2024)
+cargo build --release
+./target/release/medha          # first run walks you through model setup
 ```
 
-**2. Configure Your Model**
-The TUI guides you through:
-- Enter base URL (e.g., `http://localhost:8000` for vLLM, or hosted provider)
-- Paste API key (stored encrypted, never in config)
-- Select model ID
+Point it at a model — in the setup form, or via environment:
 
-**3. Start Working**
 ```sh
-medha "Fix the failing test in tests/calc.rs"
+export MEDHA_BASE_URL="http://localhost:8000/v1"   # any OpenAI-compatible server
+export MEDHA_MODEL="qwen3-coder"
+export MEDHA_API_KEY="…"                            # if the endpoint needs one
 ```
 
-Or interactive TUI:
-- Type task, press **Enter**
-- Watch live streaming output
-- Approve/deny actions when prompted
-- **Esc** to interrupt, **Ctrl-D** to quit
+Then work interactively or headless:
 
-**That's it.** Sandboxed, auditable, self-improving.
+```sh
+medha                                  # full-screen TUI
+medha "fix the failing test in tests/calc.rs"   # one-shot, headless
+```
+
+In the TUI: type a task and press **Enter**, approve or deny prompted actions, **Esc** to interrupt, **Ctrl-D** to quit.
 
 ---
 
-## 🖥️ TUI Commands
+## How a turn works
 
-Type `/` + command. **Tab-complete** available. **↑↓ arrows** in menus.
+```
+model streams a response
+      │
+      ▼
+ ┌──────────────────────────────────────────────┐
+ │  validate → police → (verify) → sandbox → run │   for every tool the model calls
+ └──────────────────────────────────────────────┘
+      │
+      ▼
+ observations fed back to the model · every step appended to the event log
+```
 
-| Command | What It Does |
-|---------|--------------|
-| `/help` | Show all commands |
-| `/status` | Model, context window, token estimate |
-| `/reasoning` | Configure thinking mode (on/off/effort/visibility) |
-| `/model` | Switch models or add/edit saved profiles |
-| `/search` | Change web search provider (Tavily/Brave/SearXNG/DuckDuckGo) |
-| `/mode` | Autonomy: `careful` · `normal` · `yolo` |
-| `/detail` | Toggle full tool I/O vs summarized |
-| `/resume` | Load past session from event log |
-| `/rewind` | Time-travel: branch from earlier turn (undoes later edits) |
-| `/tasks` | List background shell tasks (running/finished) |
-| `/skill` | Skill hub: load, add, search, update, lock/sync |
-| `/clear` | Reset conversation (keeps system prompt) |
-| `/exit` or `/quit` | Quit TUI (or Ctrl-D) |
-
-**Keyboard Shortcuts:**
-- **Esc** — Interrupt running turn
-- **Ctrl-D** — Quit
-- **↑/↓** — Scroll history (empty input) or cycle input history (typing)
-- **Tab** — Auto-complete commands
+Nothing the model says *causes* an effect. Only a validated, policy-approved, sandbox-confined tool intent does — and every intent, decision, and result is a durable event that can be replayed, audited, or forked.
 
 ---
 
-## 📦 Core Capabilities
+## Features
 
-### 🔒 Verification-First Architecture
+### Model & providers
+Any OpenAI-compatible Chat Completions endpoint. Tool names are sanitized to the strict OpenAI contract on the wire, so endpoints that reject non-standard names (NIM, OpenAI) work out of the box. Reasoning traces (`reasoning_content` or `<think>` tags) stream natively. Toggle streaming with `/stream` — useful for gateways that only expose reasoning in a non-streamed response.
 
-Every tool call: **stream → validate → police → execute**
+### Deny-first policy & sandbox
+- **Policy** — unregistered tools denied; `shell.exec` run through a dangerous-pattern scanner; file writes and other consequential actions gate for approval. Autonomy dial: `careful · normal · yolo`.
+- **Sandbox** — pick your isolation in `medha.lock`:
+  - `native` (default) — OS jail: writes confined to the workspace, temp, and dev caches; `~/.ssh` and the like are blocked. Zero dependencies.
+  - `host` — no OS isolation (scanner + approval only).
+  - `container` — throwaway Docker/Podman container; host env is **not** forwarded, so API keys stay put.
+  - `ssh` — run commands on a remote host.
+- **Env hygiene** — `shell.exec` starts from an empty environment with an explicit allowlist, so a leaked key never reaches an arbitrary command.
+- **Trust-flow escalation** — an action derived from web-fetched content is escalated to human approval unless the sandbox confines the network.
 
-**Verification tiers:**
-- **Deterministic** (default) — `cargo check`, `pytest`, typecheck after edits (free)
-- **Human gate** — Approval required for consequential actions (file writes, git commits, external actions)
+### Typed memory
+Memory is event-sourced, not hidden model state:
 
-Configured in `medha.lock` `[verify]` section. Multi-judge consensus is Phase 4 roadmap.
+1. The model calls `memory.write` / `memory.update` / `memory.forget`.
+2. The **kernel** computes the entry's trust, confidence, and provenance from the current turn — these are stripped from the model's arguments and can never be self-asserted. A turn that read a web page can only produce web-trust memory.
+3. The mutation is appended to the hash-chained event log, then projected into project- and user-scoped SQLite databases with FTS5 search.
+4. A compact **K3 index** (ranked by pin → trust → recency, under a hard token budget) is compiled into the system prompt at session start and frozen for the session — refreshed only after a full compaction, so the prompt prefix stays cache-stable.
+5. `memory.search` returns full entries; `sessions.search` returns verbatim exchanges from past sessions — no extra model call.
 
-### 🧠 Self-Evolving via Skills
-
-A **skill** is a reusable workflow (`SKILL.md` + scripts) that MEDHA can load on demand:
-
-**Authoring:**
-- Manual: Write `SKILL.md` by hand in `.medha/skills/` or `~/.medha/skills/`
-- Agent-assisted: "save this as a skill" → `skill.save` tool (human approval required)
-- Proactive: MEDHA offers to save when you repeat instructions
-
-**Features (Phase A - shipped):**
-- Install/load/save with Skills Guard security scan
-- Content-hashed updates (your edits protected)
-- `/skill lock` / `/skill sync` for team reproducibility
-- Search catalog, add from GitHub URLs
-
-**Roadmap (Phase D):** Auto-distill skills from traces, eval-gated promotion, canary deployment, win-rate tracking
-
-### ⚡ Parallel Execution
-
-**Parallel tool calls:** Kernel executes independent tools concurrently
-- Dependency-aware DAG (not queue)
-- Write-safety: same-path writes serialized with snapshot barriers
-- Governed: `max_parallel_tools` (default 8 in `medha.lock`)
-- Per-tool-family semaphores (e.g., `web.*` ≤ 4 for rate limits)
-
-### 🗂 Typed Memory & Context
-
-Memory is event-sourced rather than hidden model state:
-
-1. The model proposes `memory.write`, `memory.update`, or `memory.forget`.
-2. The kernel computes trust, confidence, and provenance from the current turn;
-   these are never accepted from model arguments.
-3. The mutation is appended to the hash-chained event log, then projected into
-   project/user SQLite databases with FTS5 search.
-4. A compact K3 index is ranked by pin, trust, and recency under a hard token
-   budget. It is frozen for the session and refreshed only after Full compaction.
-5. `memory.search` retrieves full entries; `sessions.search` retrieves verbatim
-   exchanges from prior sessions without another model call.
-
-Project context is separate from memory. MEDHA guard-scans the first available
-`MEDHA.md` → `AGENTS.md` → `CLAUDE.md` in each directory from cwd to the git
-root, plus `~/.medha/MEDHA.md`. `~/.medha/PERSONA.md` supplies the global K1
-persona. These sections and the frozen `## Memory` block are assembled at
-runtime, so memory content must not be copied into the base system prompt.
-
-| Purpose | Location | Scope |
-|---|---|---|
-| Project instructions | `<repo>/MEDHA.md` (recommended), `AGENTS.md`, or `CLAUDE.md` | Current project/directory |
-| Nested instructions | `<repo>/<subdir>/MEDHA.md`, `AGENTS.md`, or `CLAUDE.md` | Loaded when that directory is used |
-| Global instructions | `$MEDHA_HOME/MEDHA.md` (normally `~/.medha/MEDHA.md`) | Every project |
-| Global persona | `$MEDHA_HOME/PERSONA.md` | K1 identity in every project |
-| Project memory | `$MEDHA_HOME/projects/<encoded-workspace>/memory.db` | Current workspace; follows project forks |
-| User memory | `$MEDHA_HOME/memory.db` | Shared by every workspace |
-| Memory provenance | `$MEDHA_HOME/projects/<encoded-workspace>/events.db` | Hash-chained source events |
-
-You only need one project instruction file; use `MEDHA.md` for new MEDHA-native
-projects. Existing `AGENTS.md` or `CLAUDE.md` files work without duplication.
-Do not create a `MEMORY.md` or edit either `memory.db`: durable facts enter
-through the memory tools or `medha memory edit`, preserving trust and provenance.
-
-```toml
-[memory]
-enabled = true
-k3_budget_tokens = 1200
-write_approval = "user-scope" # "none" | "user-scope" | "all"
-stale_after_days = 30
-
-[context_files]
-enabled = true
-max_chars = 20000
-progressive_discovery = true
-```
-
-Inspect and manage memory without a model call:
+Because memory writes are events, **time-travel applies to memory for free**: fork a session before a bad write and the branch never learned it.
 
 ```sh
 medha memory list
-medha memory show <name>
+medha memory show <name>          # includes the provenance events it was born from
 medha memory search <words>
-medha memory edit <name>       # uses $EDITOR; appends a user-trust event
-medha memory pin <name>
-medha memory pin <name> --off
+medha memory edit <name>          # $EDITOR; re-enters through the log as a user-trust update
+medha memory pin <name> [--off]
 medha memory forget <name>
-medha memory pending
+medha memory pending              # writes staged for approval
 medha memory approve <id>
 ```
 
-The TUI `/memory` picker shows trust/age chips and can jump to an entry's
-provenance. See [FEATURES.md](docs/FEATURES.md#typed-memory-and-context-files)
-for the M1–M7 architecture and exact test commands.
+| Scope | Location |
+|---|---|
+| Project memory | `$MEDHA_HOME/projects/<workspace>/memory.db` |
+| User (global) memory | `$MEDHA_HOME/memory.db` |
+| Provenance events | `$MEDHA_HOME/projects/<workspace>/events.db` |
 
-### ⏪ Time-Travel & Undo
+### Context files & persona
+Drop project instructions in **`MEDHA.md`**, `AGENTS.md`, or `CLAUDE.md` (first match wins, per directory from cwd to the git root, plus `~/.medha/MEDHA.md` for global rules). Files are guard-scanned before they enter the prompt; a subdirectory's file is discovered and attached the first time the agent touches that directory. `~/.medha/PERSONA.md` sets the agent's global identity. Existing `AGENTS.md`/`CLAUDE.md` files work with no changes — adopting MEDHA on an existing repo is zero-config.
 
-**`medha undo`** — CLI snapshot restore:
+### Skills
+A **skill** is a versioned `SKILL.md` + supporting scripts the agent loads on demand. Author them by hand, or say "save this as a skill" and approve the `skill.save`. Every skill passes a security guard (static scan + an LLM judge for ambiguous cases). `/skill lock` and `/skill sync` pin a team's skill set for reproducibility.
+
+### Time travel & undo
 ```sh
-medha undo                    # Undo last write
-medha undo --event <id>       # Undo from event <id> onward
-medha undo --list             # List recent writes
+medha undo                # restore the last file write
+medha undo --list         # recent writes
+medha undo --event <id>   # undo from an event onward
 ```
+In the TUI, `/rewind` branches a new session from an earlier turn (conversation only, code only, or both) — the original session is preserved.
 
-**`/rewind`** (TUI) — Non-destructive branching:
-1. Pick previous prompt
-2. Choose scope: conversation only, code only, or both
-3. Forks session (original preserved), prefills prompt to re-run
-
-**Hash-chained event log:** SHA-256 linked events in SQLite (WAL)
-- Tamper-evident: any modification breaks chain
-- Replay from any point: exact reconstruction of session state
-- Fork at any event: new chain, shared prefix
-
-### 🧪 Eval Gate: CI for Cognition
-
-Test agent setups with deterministic scenarios:
-
+### Eval Gate — CI for cognition
 ```sh
-medha gate scenarios/fix-failing-test            # One scenario
-medha gate scenarios/                            # All in directory
-medha gate scenarios/ --seeds 3                  # 3 repeats → pass-rate + CI
-medha gate scenarios/ --json                     # Machine-readable for CI
+medha gate scenarios/                 # run every scenario
+medha gate scenarios/ --seeds 3       # repeat → pass-rate with a Wilson interval
+medha gate scenarios/ --json          # machine-readable for CI
 ```
-
-**Scenario anatomy:**
-```yaml
-id: fix-failing-test-007
-fixture: sha256:...            # Content-addressed workspace
-task: "The test suite fails. Diagnose and fix."
-contract: { max_cost_usd: 1.50, max_turns: 40 }
-checks:                        # Deterministic first
-  - kind: command; run: "pytest -q"; expect: { exit: 0 }
-  - kind: file_diff; path: "tests/**"; expect: { unchanged: true }
-trajectory:                    # Soft-scored, multiple valid paths
-  must_use_any: [["fs.read", "code.outline"]]
-  must_not: ["web.fetch"]
-```
-
-**Verdicts:** promote / hold / reject
-- Pass-rate ± Wilson interval (multi-seed)
-- Exit codes: `0` = all pass, `1` = reject, `2` = hold
-
-**Roadmap:** LLM-as-judge with calibration, ablation studies, trace→eval flywheel
-
-### 🛡️ Security Model
-
-- **Deny-first policy** — Unregistered tools denied; `shell.exec` scanned for dangerous patterns ([`crates/policy/src/lib.rs`](crates/policy/src/lib.rs))
-- **Flexible sandbox backends** — Choose your isolation level:
-  - **Host** — Run directly (scanner + approval only)
-  - **Native** — macOS Seatbelt / Linux Landlock (filesystem jail, zero dependencies)
-  - **Container** — Docker/Podman with bind-mount, cap-drop, no host env forwarding
-  - **SSH** — Remote execution on `user@host`
-  ([`crates/sandbox/src/exec.rs`](crates/sandbox/src/exec.rs))
-- **Environment clearing** — `shell.exec` starts from empty env with explicit allowlist, so injected API keys never reach arbitrary commands
-- **Trust-flow escalation** — Web-tainted consequential actions require human approval unless network confined ([`crates/kernel/src/loop_.rs`](crates/kernel/src/loop_.rs))
-- **Tamper-evident log** — SHA-256 hash-chained events; SQLite verifies chain on resume ([`crates/store/src/lib.rs`](crates/store/src/lib.rs))
+A scenario declares a fixture workspace, a task, a budget contract, and deterministic checks (command exit codes, file diffs, tools used). Verdict: **promote / hold / reject**, with matching exit codes.
 
 ---
 
-## 📁 Configuration: `medha.lock`
+## Configuration — `medha.lock`
 
-Drop `medha.lock` (TOML) in project root to version harness config. Absent = defaults.
+Commit a `medha.lock` (TOML) to version your harness config. Absent file = built-in defaults; nothing changes for a bare checkout. Precedence: **env var > `medha.lock` > default.**
 
-**Example:**
 ```toml
-[routing]
-executor = "openai-compat://localhost:8000/qwen3-coder"
-# verifier = "openai-compat://together/llama-3.3-70b"  # Phase 3
-
 [budget]
 max_turns = 200
 max_cost_usd = 5.0
@@ -257,192 +151,111 @@ max_parallel_tools = 8
 
 [policy]
 approve = ["fs.write", "fs.edit", "skill.save"]
-autonomy = "careful"   # careful · normal · yolo
+autonomy = "careful"          # careful · normal · yolo
 
 [sandbox]
-backend = "native"     # Seatbelt/Landlock
-network = "allow"      # or "deny" for stronger containment
+backend = "native"            # native · host · container · ssh
+network = "allow"             # or "deny" for stronger containment
+
+[memory]
+enabled = true
+k3_budget_tokens = 1200
+write_approval = "user-scope" # none · user-scope · all
+stale_after_days = 30
+
+[context_files]
+enabled = true
+max_chars = 20000
+progressive_discovery = true
+
+[reasoning]
+# stream = false              # whole reply at once; surfaces reasoning on some gateways
 
 [verify]
-default_mode = "deterministic"   # off · deterministic · single · multi · human
-
-[context]
-trigger_ratio = 0.99
-protect_first_n = 3
-protect_last_n = 20
+# command = "cargo check"     # deterministic check after file-modifying turns
 ```
 
-**Precedence:** env vars > `medha.lock` > built-in defaults
-
-**Env overrides:** `MEDHA_MAX_TURNS`, `MEDHA_APPROVE`, `MEDHA_VERIFY`, `MEDHA_SANDBOX`, `MEDHA_MODE`
-
-See [`medha.lock.example`](medha.lock.example) for all options.
+See [`medha.lock.example`](medha.lock.example) for every option. Quick env overrides: `MEDHA_MAX_TURNS`, `MEDHA_APPROVE`, `MEDHA_SANDBOX`, `MEDHA_MODE`.
 
 ---
 
-## 🏗️ Architecture
+## TUI commands
 
-```
-                 ┌─────────────────────────────────────────┐
-   OpenAI-compat │                                         │
-   endpoint  ───▶│  Kernel loop                            │
-   (streaming)   │  stream → validate → police → verify    │
-                 │           → execute → feed back         │
-                 └────────┬───────────────────────┬────────┘
-                          │                       │
-              ┌───────────▼──────────┐  ┌─────────▼──────────┐
-              │  Executor / Tools    │  │  Event log (SQLite) │
-              │  fs · shell · web ·  │  │  hash-chained,      │
-              │  git · grep · diag   │  │  tamper-evident     │
-              └───────────┬──────────┘  └────────────────────┘
-                          │
-              ┌───────────▼──────────┐
-              │  Sandbox (ExecBackend)│
-              │  host · Seatbelt ·    │
-              │  Landlock · container │
-              │  · ssh                │
-              └──────────────────────┘
-```
+Type `/` for the palette (Tab completes, ↑↓ navigate menus).
 
-**11 Crates:**
-
-| Crate | Role | Source |
-|-------|------|--------|
-| `kernel` | Agent loop, budget governor, trust-flow, interrupts | [`crates/kernel/`](crates/kernel/) |
-| `providers` | OpenAI-compatible streaming, model discovery | [`crates/providers/`](crates/providers/) |
-| `tools` | 22+ tools: fs, shell, web, git, search, diagnostics, skills, sub-agents | [`crates/tools/`](crates/tools/) |
-| `sandbox` | Flexible backends: Host · Seatbelt/Landlock · Docker/Podman · SSH | [`crates/sandbox/`](crates/sandbox/) |
-| `policy` | Deny-first authorization + shell scanner + Skills Guard | [`crates/policy/`](crates/policy/) |
-| `context` | Budget-aware two-phase compaction, identity, K1-K5 sheaths | [`crates/context/`](crates/context/) |
-| `lockfile` | `medha.lock` parser, defaults, migration | [`crates/lockfile/`](crates/lockfile/) |
-| `store` | SQLite event log (WAL, FTS5) + content-addressed artifact store | [`crates/store/`](crates/store/) |
-| `permissions` | Out-of-workspace access: ask-then-persist trust flow | [`crates/permissions/`](crates/permissions/) |
-| `gate` | Eval Gate: scenario runner, deterministic checks, judge calibration | [`crates/gate/`](crates/gate/) |
-| `medha-cli` | TUI (ratatui), REPL, headless, ACP bridge, gateway server | [`crates/medha-cli/`](crates/medha-cli/) |
+| Command | Does |
+|---|---|
+| `/help` · `/status` | Commands · model, context window, pressure |
+| `/reasoning` | Thinking mode, effort, visibility |
+| `/stream` | Toggle live token streaming |
+| `/model` · `/search` | Switch model/profile · web-search provider |
+| `/mode` | Autonomy: careful · normal · yolo |
+| `/memory` | Browse memory with trust/age chips; jump to provenance |
+| `/skill` | Load, add, search, update, lock/sync skills |
+| `/rewind` · `/resume` | Branch from an earlier turn · reopen a past session |
+| `/detail` · `/tasks` | Full tool I/O · background shell tasks |
+| `/clear` · `/exit` | Reset conversation · quit (or Ctrl-D) |
 
 ---
 
-## 🚧 What's Built vs. Roadmap
-
-### ✅ Shipped Today (Phase 0-2)
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| **Kernel loop** | ✅ | Stream → validate → police → execute (verify stub) |
-| **Provider** | ✅ | OpenAI-compatible (vLLM, Ollama, hosted) |
-| **Tools (22)** | ✅ | fs, shell, web, git, grep, glob, diagnostics, skills, tasks |
-| **Sandbox** | ✅ | Host, Seatbelt, Landlock; container/ssh backends |
-| **Policy** | ✅ | Deny-first, shell scanner, autonomy dial |
-| **Context compaction** | ✅ | Two-phase (prune + LLM summarize) |
-| **Typed memory** | ✅ | Frozen K3 recall, FTS search, provenance, trust, rewind-aware projection |
-| **Context files + persona** | ✅ | Guarded startup/progressive discovery and global persona |
-| **Event log** | ✅ | SQLite WAL, hash-chained, FTS5 |
-| **Permissions** | ✅ | Ask-then-persist for out-of-workspace |
-| **`medha undo`** | ✅ | CLI snapshot restore |
-| **TUI `/rewind`** | ✅ | Time-travel branching |
-| **Skills (Phase A)** | ✅ | Install/load/save, Skills Guard, lock/sync |
-| **Eval Gate (deterministic)** | ✅ | Scenario runner, command/file/event checks |
-| **Gateway protocol** | ⬜ Phase 3 | WebSocket JSON-RPC, ACP bridge |
-
-### 🔜 Roadmap (from Spec Volumes 1-7)
-
-| Feature | Phase | Status | Why It Matters |
-|---------|-------|--------|----------------|
-| **Adversarial verifier** | Phase 3 | ⬜ Not started | Cross-vendor model reviews proposals before execution |
-| **Span-level trust taint** | Phase 3 | ⬜ Not started | Track which context spans influenced a tool call |
-| **Guided decoding** | Phase 3 | ⬜ Not started | Force schema-valid tool intents from weak models |
-| **Multi-judge consensus** | Phase 4 | ⬜ Not started | 3+ judges, position debiasing, κ ≥ 0.75 |
-| **Sub-agent swarms** | Phase 4 | ⬜ Not started | Dynamic spawn, parallel harvest (10-100 agents) |
-| **Deep Research pipeline** | Phase 5 | ⬜ Not started | Evidence store, claim graph, parallel writers, assembler |
-| **Trace → skill distillation** | Phase D | ⬜ Not started | Auto-extract skills from successful traces |
-| **Eval-gated evolution** | Phase D | ⬜ Not started | Canary, win-rate tracking, promote/rollback |
-| **Native Anthropic/Gemini** | Phase 2 | ⬜ Not started | Multi-provider routing beyond OpenAI-compatible |
-| **Gateway server** | Phase 3 | ⬜ Not started | WebSocket + HTTP+SSE fallback, thin clients |
-
-> **Note on the spec:** Code comments reference a multi-volume design spec ("Vol 1-7", "§4.x") that is **not in this repository**. The roadmap here is reconstructed from the code's own phase language and the spec documents (stored separately). See `MEDHA_01_MASTER_SPEC.md` through `MEDHA_07_TERMINAL_UX.md` for the complete blueprint.
-
----
-
-## ⚠️ Honest Assessment
-
-**MEDHA is 7/10 production-ready** with a clear path to 9/10.
-
-**What works well today:**
-- ✅ Kernel loop, tools, sandbox, permissions
-- ✅ Event log, time-travel, `medha undo`
-- ✅ TUI, skills (Phase A), deterministic Eval Gate
-- ✅ Trust-flow escalation (session-wide)
-
-**What's partial or missing:**
-- ⚠️ **Verifier is a stub** — `CommandVerifier` runs `cargo check`, but adversarial model review is Phase 3. The `[routing].verifier` config exists but is not consulted.
-- ⚠️ **Trust-flow taint is coarse** — `web_tainted` is session-wide boolean. Once any web content enters, all subsequent consequential actions are escalated. Span-level provenance is Phase 3.
-- ⚠️ **Single provider** — Only OpenAI-compatible endpoints. Native Anthropic/Gemini adapters are Phase 2.
-- ⚠️ **No sub-agents yet** — Parallel tool execution works, but dynamic sub-agent spawning is Phase 4.
-- ⚠️ **No deep research pipeline** — Evidence store, claim graph, parallel writers are Phase 5.
-- ⚠️ **Skills don't auto-evolve** — Phase A supports manual/agent-assisted authoring. Trace distillation + eval-gated promotion is Phase D.
-
-**When to use MEDHA today:**
-- ✅ You want a sandboxed, auditable agent for local development
-- ✅ You value time-travel and undo capabilities
-- ✅ You're comfortable with OpenAI-compatible endpoints
-- ✅ You want deterministic eval for your agent setup
-- ✅ You want to author skills manually or with agent assistance
-
-**When to wait (Phase 3-5):**
-- ⏳ You need adversarial verification before execution
-- ⏳ You need fine-grained trust tracking (span-level taint)
-- ⏳ You want multi-judge consensus for high-stakes actions
-- ⏳ You need sub-agent swarms for parallel research
-- ⏳ You want auto-evolving skills from traces with win-rate tracking
-- ⏳ You need native Anthropic/Gemini support
-
----
-
-## 📚 Documentation
-
-| Document | What It Covers |
-|----------|----------------|
-| **[FEATURES.md](docs/FEATURES.md)** | Complete feature reference with code locations |
-| **[PROGRESS.md](PROGRESS.md)** | Phase-by-phase status of what's built |
-| **[medha.lock.example](medha.lock.example)** | All configuration options with inline comments |
-| **Spec Volumes (internal)** | `MEDHA_01_MASTER_SPEC.md` through `MEDHA_07_TERMINAL_UX.md` — the complete blueprint |
-
----
-
-## 🛠️ Build & Run
-
-**Requirements:** Rust 1.85+ (edition 2024)
+## Run modes
 
 ```sh
-cargo build --release       # → target/release/medha
-./target/release/medha      # First run opens TUI setup
+medha                          # interactive TUI
+medha "…task…"                 # headless one-shot
+medha --plain                  # scrolling REPL
+medha --acp                    # editor bridge (JSON-RPC over stdio)
+medha gate scenarios/          # run eval scenarios
+medha memory <cmd>             # inspect/manage memory
+medha undo                     # restore the last write
 ```
-
-**Modes:**
-```sh
-medha                        # Interactive full-screen TUI
-medha "fix the failing test" # Headless one-shot
-medha --plain                # Scrolling REPL
-medha --acp                  # Editor bridge (JSON-RPC over stdio)
-medha gate scenarios/        # Run eval scenarios
-medha undo                   # Restore last file write
-medha serve                  # Start gateway server (Phase 3)
-```
-
-**Provider config precedence:** CLI flag → env var → `~/.medha/config.toml` → TUI first-run setup
-
-**API key storage:** env var → `~/.medha/credentials.toml` (0600) → OS keychain (optional)
-
-**Env overrides:** `MEDHA_BASE_URL`, `MEDHA_MODEL`, `MEDHA_API_KEY` (also accepts `OPENAI_*`)
 
 ---
 
-## 📄 License
+## Architecture
 
-Apache-2.0
+Twelve crates. `kernel` is the only code that calls a model, writes an event, or enforces a budget; everything else is a trait behind it.
+
+| Crate | Role |
+|---|---|
+| [`kernel`](crates/kernel/) | Agent loop, budgets, trust-flow, interrupts, dispatch |
+| [`providers`](crates/providers/) | OpenAI-compatible streaming + non-streaming, model discovery |
+| [`context`](crates/context/) | Compaction pipeline, K1–K5 sheaths, identity, context files |
+| [`memory`](crates/memory/) | Typed memory: projection, recall (frozen K3), consolidation |
+| [`tools`](crates/tools/) | 23 tools: fs, shell, web, git, search, diagnostics, skills, memory |
+| [`policy`](crates/policy/) | Deny-first authorization, shell scanner, content guard |
+| [`sandbox`](crates/sandbox/) | Exec backends: host · Seatbelt/Landlock · container · ssh |
+| [`store`](crates/store/) | SQLite (WAL) hash-chained event log + FTS5 + artifact store |
+| [`lockfile`](crates/lockfile/) | `medha.lock` parsing, defaults, migration |
+| [`permissions`](crates/permissions/) | Ask-then-persist trust for out-of-workspace access |
+| [`gate`](crates/gate/) | Eval Gate: scenario runner, deterministic checks |
+| [`medha-cli`](crates/medha-cli/) | TUI (ratatui), REPL, headless, ACP bridge |
+
+**Provider config precedence:** CLI flag → env var → `~/.medha/config.toml` → first-run setup.
+**API keys:** env var → `~/.medha/credentials.toml` (0600) → OS keychain (optional). Keys are never written to `medha.lock`.
 
 ---
 
-**Built with ❤️ in Rust.** No runtime, no Docker, no vendor lock-in.
+## Documentation
+
+| Doc | Covers |
+|---|---|
+| [docs/FEATURES.md](docs/FEATURES.md) | Full feature reference with code locations |
+| [medha.lock.example](medha.lock.example) | Every configuration option, annotated |
+| [docs/REASONING_STREAMING.md](docs/REASONING_STREAMING.md) | How reasoning arrives across OpenAI-compatible servers |
+
+---
+
+## Status
+
+Shipped and in daily use: the kernel loop, OpenAI-compatible provider (streaming + non-streaming), the tool suite, all four sandbox backends, deny-first policy, context compaction, **typed memory with provenance**, context files and persona, the hash-chained event log, time-travel/undo, skills, and the deterministic Eval Gate.
+
+On the roadmap: cross-vendor adversarial verification, span-level trust taint, sub-agent swarms, a deep-research pipeline, trace→skill distillation with eval-gated promotion, native Anthropic/Gemini adapters, and the WebSocket gateway server.
+
+---
+
+## License
+
+Apache-2.0.
 
 > *मेधा सूक्ताय नमः* — Salutations to the hymn of sharp intelligence.

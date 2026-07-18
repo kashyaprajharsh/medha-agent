@@ -137,6 +137,17 @@ fn upsert(conn: &Connection, entry: &MemoryEntry) -> Result<(), MemoryError> {
     Ok(())
 }
 
+/// Turn raw text into a safe FTS5 MATCH expression: each whitespace-split term
+/// becomes a quoted phrase (internal `"` doubled), terms AND together. `None`
+/// when no terms survive (empty/whitespace query).
+fn fts_match_expr(raw: &str) -> Option<String> {
+    let terms: Vec<String> = raw
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() { None } else { Some(terms.join(" ")) }
+}
+
 fn forget(conn: &Connection, scope: Scope, name: &str) -> Result<(), MemoryError> {
     conn.execute(
         "UPDATE entries SET tombstoned = 1 WHERE scope = ?1 AND name = ?2",
@@ -257,7 +268,7 @@ impl MemoryProjection {
         Ok(out)
     }
 
-    fn search_scope(&self, scope: Scope, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, MemoryError> {
+    fn search_scope(&self, scope: Scope, match_expr: &str, limit: usize) -> Result<Vec<MemoryEntry>, MemoryError> {
         let conn = self.conn_for(scope).lock().map_err(|_| MemoryError::Poisoned)?;
         let mut stmt = conn
             .prepare(
@@ -268,17 +279,23 @@ impl MemoryProjection {
             )
             .map_err(|e| MemoryError::Db(e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![query, limit as i64], row_to_entry)
+            .query_map(rusqlite::params![match_expr, limit as i64], row_to_entry)
             .map_err(|e| MemoryError::Db(e.to_string()))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| MemoryError::Db(e.to_string()))
     }
 
     /// FTS5 search merged across both scopes — project wins on name collision.
+    /// The raw query is quoted term-by-term first: MATCH treats `-`, `'`, `:`
+    /// as operators, so unsanitized model/user text ("co-authored", "don't")
+    /// would be a syntax error, not a search.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, MemoryError> {
-        let mut out = self.search_scope(Scope::Project, query, limit)?;
+        let Some(match_expr) = fts_match_expr(query) else {
+            return Ok(Vec::new());
+        };
+        let mut out = self.search_scope(Scope::Project, &match_expr, limit)?;
         let seen: std::collections::HashSet<String> = out.iter().map(|e| e.name.clone()).collect();
         out.extend(
-            self.search_scope(Scope::User, query, limit)?
+            self.search_scope(Scope::User, &match_expr, limit)?
                 .into_iter()
                 .filter(|e| !seen.contains(&e.name)),
         );
@@ -428,6 +445,31 @@ mod tests {
 
         assert!(proj.get(Scope::Project, "before-fork").unwrap().is_some());
         assert!(proj.get(Scope::Project, "after-fork").unwrap().is_none(), "fork must not see post-cut memories");
+
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn search_finds_entries_and_survives_fts5_syntax_characters() {
+        let (p, u) = temp_paths("search");
+        let proj = MemoryProjection::open(&p, &u).unwrap();
+        let mut e = entry("no-coauthored-by", Scope::Project, 1);
+        e.claim = "Omit the Co-Authored-By trailer from commits.".into();
+        e.description = "commit trailer preference".into();
+        proj.apply(&MemoryOp::Write { entry: e }).unwrap();
+
+        // Plain word, ranked JOIN path.
+        assert_eq!(proj.search("trailer", 5).unwrap().len(), 1);
+        // Multi-word (terms AND together).
+        assert_eq!(proj.search("commit trailer", 5).unwrap().len(), 1);
+        // Hyphen and apostrophe are FTS5 MATCH syntax — must search, not error.
+        assert_eq!(proj.search("co-authored", 5).unwrap().len(), 1);
+        assert_eq!(proj.search("don't", 5).unwrap().len(), 0);
+        // Empty/whitespace query is a no-op, not a syntax error.
+        assert_eq!(proj.search("   ", 5).unwrap().len(), 0);
+        // Tombstoned entries never surface.
+        proj.apply(&MemoryOp::Forget { scope: Scope::Project, name: "no-coauthored-by".into() }).unwrap();
+        assert_eq!(proj.search("trailer", 5).unwrap().len(), 0);
 
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }

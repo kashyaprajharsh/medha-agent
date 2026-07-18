@@ -383,6 +383,12 @@ pub struct ReasoningLockConfig {
     /// "low" | "medium" | "high" — unrecognized/absent values map to `None`.
     #[serde(default)]
     pub effort: Option<String>,
+    /// SSE streaming. Absent/true → stream token-by-token (the norm). `false` →
+    /// one blocking request per turn, whole reply at once; surfaces reasoning on
+    /// gateways that only populate it in the non-streamed response. Toggle live
+    /// with `/stream`.
+    #[serde(default)]
+    pub stream: Option<bool>,
 }
 
 impl ReasoningLockConfig {

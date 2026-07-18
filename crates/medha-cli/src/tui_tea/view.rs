@@ -999,12 +999,15 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     let effort = crate::effort_label(model.reasoning.effort);
     let trace = model.reasoning_trace_label();
     let reasoning = format!("reasoning {mode} · {visibility} · {effort} · {trace}");
+    // Only surface the streaming state when it's OFF — on is the norm and adds
+    // noise to the status bar.
+    let stream = if model.streaming { "" } else { " · stream off" };
     let hints = if model.running {
         "esc interrupt"
     } else {
         "/reasoning · /detail · /help"
     };
-    let right = format!("{ctx}{cost} · {reasoning}   {hints}");
+    let right = format!("{ctx}{cost} · {reasoning}{stream}   {hints}");
     // Pad in terminal cells (K14) so the right block stays right-aligned even
     // with wide glyphs in the left block.
     let left_w: usize = left

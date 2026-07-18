@@ -170,6 +170,20 @@ pub trait Provider: Send + Sync {
         ReasoningConfig::default()
     }
 
+    /// Toggle SSE streaming for calls made after this returns. With streaming
+    /// off the provider makes one blocking request and yields the whole response
+    /// as a single batch of blocks — the loop is unchanged, only the arrival
+    /// shape differs. Some gateways only populate `reasoning_content` (or
+    /// structured output) in the non-streaming response, so this is the escape
+    /// hatch to see it. Default no-op for providers without the concept.
+    fn set_streaming(&self, _on: bool) {}
+
+    /// Whether SSE streaming is currently on, for status UIs. Default true —
+    /// streaming is the norm.
+    fn streaming(&self) -> bool {
+        true
+    }
+
     /// Exact server-side token count for the given prompt messages, when the
     /// host exposes a tokenization route (e.g. vLLM's `/tokenize`, or an
     /// Anthropic-style `/messages/count_tokens`). Returns `None` when no such

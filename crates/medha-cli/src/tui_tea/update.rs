@@ -3120,6 +3120,11 @@ pub(super) fn run_slash<P: kernel::Provider>(
         return;
     }
 
+    if let Some(rest) = cmd.strip_prefix("stream").filter(|r| is_cmd_boundary(r)) {
+        apply_stream_command(model, provider, rest.trim());
+        return;
+    }
+
     // Compatibility aliases. They are accepted but hidden from autocomplete
     // and help so the product presents one clear reasoning surface.
     if let Some(rest) = cmd.strip_prefix("think").filter(|r| is_cmd_boundary(r)) {
@@ -3222,6 +3227,27 @@ pub(super) fn run_slash<P: kernel::Provider>(
 fn open_reasoning_panel(model: &mut Model) {
     let state = ReasoningPanelState::from_model(model);
     model.picker = Some(Picker::new(PickerKind::Reasoning(state)));
+}
+
+fn apply_stream_command<P: kernel::Provider>(model: &mut Model, provider: &P, args: &str) {
+    let on = match args {
+        "" => !provider.streaming(), // bare `/stream` toggles
+        "on" => true,
+        "off" => false,
+        "status" => provider.streaming(),
+        _ => {
+            model.push_notice("usage: /stream [on|off]  (bare /stream toggles)".to_string());
+            return;
+        }
+    };
+    provider.set_streaming(on);
+    model.streaming = on;
+    let msg = if on {
+        "streaming on — replies render token-by-token"
+    } else {
+        "streaming off — each reply arrives whole when the model finishes (surfaces reasoning on gateways that only send it non-streamed)"
+    };
+    model.push_notice(format!("✔ {msg}"));
 }
 
 fn apply_reasoning_command<P: kernel::Provider>(model: &mut Model, provider: &P, args: &str) {

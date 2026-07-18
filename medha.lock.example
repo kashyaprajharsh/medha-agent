@@ -83,3 +83,6 @@ full_transparency = false
 # Live override: /reasoning in a TUI session.
 # enabled = true
 # effort = "medium"   # "low" | "medium" | "high" — not every server has all three
+# stream = true       # false → one blocking request per turn (whole reply at once).
+#                     # Use when a gateway only sends reasoning in the non-streamed
+#                     # response. Live override: /stream.

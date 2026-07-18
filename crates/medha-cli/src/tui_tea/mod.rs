@@ -63,6 +63,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "configure mode, visibility, effort, and inspect delivery",
     ),
     (
+        "/stream",
+        "toggle live token streaming (off: whole reply at once — surfaces reasoning on some gateways)",
+    ),
+    (
         "/model",
         "switch models, or /model <name>; add presets/custom endpoints and keys",
     ),
@@ -1232,6 +1236,8 @@ struct Model {
     auto_approve: std::collections::HashSet<String>,
     /// Current reasoning config
     reasoning: kernel::ReasoningConfig,
+    /// SSE streaming on/off (mirrors the provider; shown in the status bar).
+    streaming: bool,
     /// Whether any reasoning delta arrived during the active turn.
     reasoning_received_this_turn: bool,
     /// Delivery result for the most recently completed turn. `None` means this
@@ -1324,6 +1330,7 @@ impl Model {
             approval_sel: 0,
             auto_approve: std::collections::HashSet::new(),
             reasoning,
+            streaming: true,
             reasoning_received_this_turn: false,
             last_turn_reasoning_received: None,
             picker: None,
@@ -1732,6 +1739,8 @@ where
     .with_search(search_handle);
     // Reflect the session's starting autonomy (from lock/MEDHA_MODE) in the TUI.
     model.autonomy = session.autonomy;
+    // Mirror the provider's streaming state (lock default) into the status bar.
+    model.streaming = kernel.provider.streaming();
     // First run (nothing configured) or explicit `medha --setup`: open the
     // model-setup form immediately — the same surface `/model add` uses. The
     // quiet variant keeps the welcome identity screen visible behind the form.

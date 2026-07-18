@@ -462,6 +462,10 @@ async fn main() -> Result<()> {
     // Reasoning/thinking request-side control (§4.4): config-file default,
     // further adjustable live via /think.
     provider.set_reasoning(lock.reasoning.to_config());
+    // Streaming default from the lock; live-toggle via /stream. Absent → on.
+    if let Some(stream) = lock.reasoning.stream {
+        provider.set_streaming(stream);
+    }
 
     // Runtime state lives OUT of the working tree, under
     // ~/.medha/projects/<encoded-cwd>/ (Claude Code style) — event log,

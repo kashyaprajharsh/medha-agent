@@ -25,6 +25,10 @@ pub struct OpenAiCompat {
     /// interior mutability since `Provider` methods take `&self` (shared
     /// behind `Arc`, §4.4).
     reasoning: Mutex<ReasoningConfig>,
+    /// SSE streaming on/off (`/stream` slash command). Off → one blocking
+    /// request, whole response yielded at once. Same interior-mutability reason
+    /// as `reasoning`.
+    streaming: std::sync::atomic::AtomicBool,
     /// Which exact-token-count route this host offers, discovered on first use
     /// (see `count_tokens`). Cached so we probe once, not every turn.
     count_probe: Mutex<ProbeState>,
@@ -113,6 +117,7 @@ impl OpenAiCompat {
                 tool_calls: ToolCallStrategy::Native,
             },
             reasoning: Mutex::new(ReasoningConfig::default()),
+            streaming: std::sync::atomic::AtomicBool::new(true),
             count_probe: Mutex::new(ProbeState::Unknown),
         }
     }
@@ -372,6 +377,45 @@ struct DeltaFn {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+}
+
+// ── non-streaming response shapes ───────────────────────────────────────────
+// One aggregated `message` per choice. Some gateways only populate
+// `reasoning_content` here (not in streamed deltas), so this path is the way to
+// surface reasoning on those hosts.
+
+#[derive(Deserialize)]
+struct ChatCompletion {
+    #[serde(default)]
+    choices: Vec<CompletionChoice>,
+    #[serde(default)]
+    usage: Option<UsageRaw>,
+    #[serde(default)]
+    error: Option<StreamError>,
+}
+
+#[derive(Deserialize)]
+struct CompletionChoice {
+    #[serde(default)]
+    message: CompletionMessage,
+}
+
+#[derive(Default, Deserialize)]
+struct CompletionMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<CompletionToolCall>,
+}
+
+#[derive(Deserialize)]
+struct CompletionToolCall {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<DeltaFn>,
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -767,6 +811,14 @@ impl Provider for OpenAiCompat {
         self.reasoning.lock().unwrap().clone()
     }
 
+    fn set_streaming(&self, on: bool) {
+        self.streaming.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn streaming(&self) -> bool {
+        self.streaming.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Exact server-side token count, when the host offers one. Probes the known
     /// routes once (vLLM `/tokenize`, then Anthropic `/messages/count_tokens`),
     /// caches the result, and returns `None` if neither works — so the same code
@@ -837,15 +889,16 @@ impl Provider for OpenAiCompat {
         // Real SSE streaming: text deltas surface token-by-token; tool calls
         // arrive as fragments keyed by index and are reassembled, then emitted
         // once complete (§4.4).
+        let streaming = self.streaming();
         let chat_template_kwargs = self.chat_template_kwargs(!tools.is_empty());
         let req = ChatReq {
             model,
             messages,
-            stream: true,
+            stream: streaming,
             tools,
-            stream_options: Some(StreamOptions {
-                include_usage: true,
-            }),
+            // `stream_options` is only meaningful with streaming on; some strict
+            // servers reject it on a non-streamed request.
+            stream_options: streaming.then_some(StreamOptions { include_usage: true }),
             chat_template_kwargs,
         };
         let url = format!(
@@ -871,6 +924,15 @@ impl Provider for OpenAiCompat {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Status(status.as_u16(), body));
+        }
+
+        // Non-streaming: one blocking body, parsed and yielded as a single batch
+        // of blocks (reasoning → text → tool intents → usage). The kernel loop
+        // is identical; only the arrival shape differs.
+        if !streaming {
+            let body = resp.text().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+            let blocks = parse_completion(&body, &names)?;
+            return Ok(futures::stream::iter(blocks.into_iter().map(Ok)).boxed());
         }
 
         let byte_stream = resp.bytes_stream();
@@ -975,6 +1037,61 @@ fn wire_name_map(canonical: &[String]) -> std::collections::HashMap<String, Stri
         map.insert(wire, name.clone());
     }
     map
+}
+
+/// Parse a non-streamed chat completion into the same blocks the SSE path
+/// yields, in the same order (reasoning → text → tool intents → usage). Wire
+/// tool names map back to canonical, matching `finalize_tool_calls`.
+fn parse_completion(
+    body: &str,
+    names: &std::collections::HashMap<String, String>,
+) -> Result<Vec<Block>, ProviderError> {
+    let parsed: ChatCompletion = serde_json::from_str(body)
+        .map_err(|e| ProviderError::Stream(format!("non-streaming response parse: {e}")))?;
+    if let Some(err) = parsed.error {
+        let msg = err.message.or(err.kind).unwrap_or_else(|| "provider error".into());
+        return Err(ProviderError::Stream(msg));
+    }
+    let mut out = Vec::new();
+    if let Some(choice) = parsed.choices.into_iter().next() {
+        let msg = choice.message;
+        if let Some(r) = msg.reasoning_content.filter(|s| !s.is_empty()) {
+            out.push(Block::Reasoning(r));
+        }
+        if let Some(c) = msg.content.filter(|s| !s.is_empty()) {
+            // A model that emits `<think>` tags inline (no reasoning_content
+            // field) still gets split into reasoning/text.
+            let mut filter = ThinkTagFilter::default();
+            out.extend(filter.feed(&c));
+            if let Some(b) = filter.flush() {
+                out.push(b);
+            }
+        }
+        for (i, tc) in msg.tool_calls.into_iter().enumerate() {
+            let Some(f) = tc.function else { continue };
+            let Some(name) = f.name.filter(|n| !n.is_empty()) else { continue };
+            let id = tc.id.filter(|s| !s.is_empty()).unwrap_or_else(|| format!("call_{i}"));
+            let parsed_args = match f.arguments {
+                Some(a) if !a.trim().is_empty() => {
+                    serde_json::from_str(&a).unwrap_or_else(|_| serde_json::json!({ "_raw": a }))
+                }
+                _ => serde_json::json!({}),
+            };
+            out.push(Block::ToolIntent(ToolIntent {
+                id,
+                tool: names.get(&name).cloned().unwrap_or(name),
+                args: repair_args(parsed_args),
+            }));
+        }
+    }
+    if let Some(u) = parsed.usage {
+        out.push(Block::Usage(Usage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+        }));
+    }
+    Ok(out)
 }
 
 /// Turn accumulated tool-call fragments into final intents, in issue order.
@@ -1659,6 +1776,50 @@ mod wire_tool_name_tests {
         let map = wire_name_map(&["fs.edit".to_string()]);
         let intents: Vec<ToolIntent> = finalize_tool_calls(accum, &map);
         assert_eq!(intents[0].tool, "fs.edit", "kernel must see the canonical name");
+    }
+
+    #[test]
+    fn parse_completion_yields_reasoning_text_tools_and_usage_in_order() {
+        // The exact shape the Crystal gateway returns non-streamed: separate
+        // reasoning_content, plus a wire-named tool call.
+        let body = r#"{
+          "choices": [{"message": {
+            "content": "The answer is 391.",
+            "reasoning_content": "17*23 = 17*(20+3) = 340+51 = 391",
+            "tool_calls": [{"id":"c1","function":{"name":"fs_read","arguments":"{\"path\":\"a\"}"}}]
+          }}],
+          "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+        }"#;
+        let map = wire_name_map(&["fs.read".to_string()]);
+        let blocks = parse_completion(body, &map).unwrap();
+        // Reasoning first, then any text, then the tool intent, then usage last.
+        assert!(matches!(&blocks[0], Block::Reasoning(r) if r.contains("391")));
+        let text: String = blocks.iter().filter_map(|b| match b {
+            Block::Text(t) => Some(t.clone()),
+            _ => None,
+        }).collect();
+        assert!(text.contains("391"), "text was: {text:?}");
+        let intent = blocks.iter().find_map(|b| match b {
+            Block::ToolIntent(it) => Some(it),
+            _ => None,
+        }).expect("a tool intent");
+        assert_eq!(intent.tool, "fs.read", "wire name mapped back to canonical");
+        assert_eq!(intent.args["path"], "a");
+        assert!(matches!(blocks.last(), Some(Block::Usage(u)) if u.total_tokens == 30));
+    }
+
+    #[test]
+    fn parse_completion_splits_inline_think_tags_when_no_reasoning_field() {
+        let body = r#"{"choices":[{"message":{"content":"<think>weighing it</think>Done."}}]}"#;
+        let blocks = parse_completion(body, &std::collections::HashMap::new()).unwrap();
+        assert!(blocks.iter().any(|b| matches!(b, Block::Reasoning(r) if r.contains("weighing"))));
+        assert!(blocks.iter().any(|b| matches!(b, Block::Text(t) if t.contains("Done"))));
+    }
+
+    #[test]
+    fn parse_completion_surfaces_an_error_body() {
+        let body = r#"{"error":{"message":"rate limited","type":"rate_limit"}}"#;
+        assert!(parse_completion(body, &std::collections::HashMap::new()).is_err());
     }
 
     #[test]

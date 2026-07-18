@@ -66,6 +66,10 @@ pub struct MedhaLock {
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
+    pub memory: MemoryConfig,
+    #[serde(default)]
+    pub context_files: ContextFilesConfig,
+    #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
     pub verify: VerifyConfig,
@@ -81,6 +85,44 @@ pub struct MedhaLock {
     pub pricing: PricingConfig,
     #[serde(default)]
     pub gate: GateConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+    pub k3_budget_tokens: u32,
+    pub write_approval: String,
+    pub stale_after_days: u32,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            k3_budget_tokens: 1_200,
+            write_approval: "user-scope".into(),
+            stale_after_days: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextFilesConfig {
+    pub enabled: bool,
+    pub max_chars: usize,
+    pub progressive_discovery: bool,
+}
+
+impl Default for ContextFilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_chars: 20_000,
+            progressive_discovery: true,
+        }
+    }
 }
 
 /// Eval-gate policy (§4.11–4.12, Vol 5 §5). Thresholds live here so the pass/fail
@@ -540,6 +582,13 @@ mod tests {
             vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]
         );
         assert!(lock.verify.command.is_none());
+        assert!(lock.memory.enabled);
+        assert_eq!(lock.memory.k3_budget_tokens, 1_200);
+        assert_eq!(lock.memory.write_approval, "user-scope");
+        assert_eq!(lock.memory.stale_after_days, 30);
+        assert!(lock.context_files.enabled);
+        assert_eq!(lock.context_files.max_chars, 20_000);
+        assert!(lock.context_files.progressive_discovery);
     }
 
     #[test]
@@ -553,6 +602,13 @@ mod tests {
 
             [verify]
             command = "cargo check"
+
+            [memory]
+            k3_budget_tokens = 900
+            write_approval = "all"
+
+            [context_files]
+            progressive_discovery = false
         "#;
         let lock = MedhaLock::parse(toml).unwrap();
         assert_eq!(lock.budget.max_turns, Some(50));
@@ -560,6 +616,11 @@ mod tests {
         assert_eq!(lock.budget.max_tokens, None);
         assert_eq!(lock.policy.approve, vec!["fs.write", "shell.exec"]);
         assert_eq!(lock.verify.command, Some("cargo check".to_string()));
+        assert_eq!(lock.memory.k3_budget_tokens, 900);
+        assert_eq!(lock.memory.write_approval, "all");
+        assert_eq!(lock.memory.stale_after_days, 30);
+        assert!(!lock.context_files.progressive_discovery);
+        assert_eq!(lock.context_files.max_chars, 20_000);
         // context section wasn't in the TOML at all — full default applies.
         assert_eq!(
             lock.context.trigger_ratio,

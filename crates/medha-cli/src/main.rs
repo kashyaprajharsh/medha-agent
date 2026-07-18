@@ -17,7 +17,7 @@ mod skill_judge;
 mod tui_tea;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use kernel::{EventLog, Kernel, Message, Provider, Session};
 use providers::OpenAiCompat;
 use sandbox::WorkspaceSandbox;
@@ -217,6 +217,283 @@ struct UndoCli {
     list: bool,
 }
 
+#[derive(Parser)]
+#[command(name = "medha memory", about = "Inspect and manage persistent memory")]
+struct MemoryCli {
+    #[command(subcommand)]
+    command: MemoryCommand,
+}
+
+#[derive(Subcommand)]
+enum MemoryCommand {
+    List {
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    Show {
+        name: String,
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    Search {
+        query: Vec<String>,
+    },
+    Edit {
+        name: String,
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    Forget {
+        name: String,
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    Pin {
+        name: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        off: bool,
+    },
+    Pending,
+    Approve {
+        id: String,
+    },
+}
+
+fn memory_scope(raw: Option<&str>) -> Result<memory::Scope> {
+    match raw {
+        None | Some("project") => Ok(memory::Scope::Project),
+        Some("user") => Ok(memory::Scope::User),
+        Some(other) => anyhow::bail!("unknown memory scope '{other}' (project|user)"),
+    }
+}
+
+fn memory_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+async fn append_cli_memory_op(
+    log: &store::SqliteLog,
+    projection: &memory::MemoryProjection,
+    session: &Session,
+    op: memory::MemoryOp,
+) -> Result<()> {
+    log.append(kernel::Event::memory_write(
+        session,
+        serde_json::to_value(&op)?,
+    ))
+    .await?;
+    projection.apply(&op)?;
+    Ok(())
+}
+
+fn find_memory(
+    projection: &memory::MemoryProjection,
+    scope: Option<&str>,
+    name: &str,
+) -> Result<Option<memory::MemoryEntry>> {
+    if let Some(scope) = scope {
+        return Ok(projection.get(memory_scope(Some(scope))?, name)?);
+    }
+    Ok(projection
+        .get(memory::Scope::Project, name)?
+        .or(projection.get(memory::Scope::User, name)?))
+}
+
+async fn run_memory_command(args: Vec<String>) -> Result<()> {
+    let cli = MemoryCli::parse_from(std::iter::once("medha-memory".to_string()).chain(args));
+    let cwd = std::env::current_dir()?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let state = config::state_dir(&cwd)?;
+    let log = store::SqliteLog::open(state.join("events.db"))?;
+    let projection = memory::MemoryProjection::open(
+        state.join("memory.db"),
+        config::medha_home()?.join("memory.db"),
+    )?;
+    projection.rebuild_project(
+        log.all_events()?
+            .into_iter()
+            .filter(|event| event.provenance.source != "fork"),
+    )?;
+
+    match cli.command {
+        MemoryCommand::List { scope } => {
+            let scope = scope.as_deref().map(|value| memory_scope(Some(value))).transpose()?;
+            let now = memory_now();
+            let entries = projection
+                .list()?
+                .into_iter()
+                .filter(|entry| scope.is_none_or(|scope| entry.scope == scope))
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                println!("No memories found.");
+            } else {
+                for entry in entries {
+                    let age = ((now - entry.updated).max(0.0) / 86_400.0).floor() as u64;
+                    println!(
+                        "{}  [{} · {} · {}d{}]  {}",
+                        entry.name,
+                        entry.scope.as_str(),
+                        entry.trust.as_str(),
+                        age,
+                        if entry.pinned { " · pinned" } else { "" },
+                        entry.description
+                    );
+                }
+            }
+        }
+        MemoryCommand::Show { name, scope } => {
+            let entry = find_memory(&projection, scope.as_deref(), &name)?
+                .ok_or_else(|| anyhow::anyhow!("memory '{name}' not found"))?;
+            println!("{} [{}]", entry.name, entry.scope.as_str());
+            println!("kind: {}", entry.kind.as_str());
+            println!("trust: {}", entry.trust.as_str());
+            println!("confidence: {}", entry.confidence.as_str());
+            println!("version: {}", entry.version);
+            println!("pinned: {}", entry.pinned);
+            println!("description: {}", entry.description);
+            println!("claim:\n{}", entry.claim);
+            println!("provenance:");
+            let all_events = log.all_events()?;
+            for event_id in &entry.provenance {
+                if let Some(event) = all_events.iter().find(|event| event.id == *event_id) {
+                    println!(
+                        "  {}  session={}  kind={}",
+                        event.id,
+                        event.session_id,
+                        event.kind.as_str()
+                    );
+                } else {
+                    println!("  {event_id}  (event not found locally)");
+                }
+            }
+        }
+        MemoryCommand::Search { query } => {
+            let query = query.join(" ");
+            if query.trim().is_empty() {
+                anyhow::bail!("memory search needs a non-empty query");
+            }
+            for entry in projection.search(&query, 20)? {
+                println!(
+                    "{}  [{} · {}]  {}\n  {}",
+                    entry.name,
+                    entry.scope.as_str(),
+                    entry.trust.as_str(),
+                    entry.description,
+                    entry.claim.replace('\n', " ")
+                );
+            }
+        }
+        MemoryCommand::Edit { name, scope } => {
+            let mut entry = find_memory(&projection, scope.as_deref(), &name)?
+                .ok_or_else(|| anyhow::anyhow!("memory '{name}' not found"))?;
+            let path = std::env::temp_dir().join(format!("medha-memory-edit-{}.md", ulid::Ulid::new()));
+            std::fs::write(&path, &entry.claim)?;
+            let editor = std::env::var("EDITOR")
+                .map_err(|_| anyhow::anyhow!("$EDITOR is not set"))?;
+            let mut parts = editor.split_whitespace();
+            let program = parts.next().ok_or_else(|| anyhow::anyhow!("$EDITOR is empty"))?;
+            let status = std::process::Command::new(program)
+                .args(parts)
+                .arg(&path)
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("editor exited with {status}");
+            }
+            let edited = std::fs::read_to_string(&path)?;
+            std::fs::remove_file(&path).ok();
+            if edited.trim().is_empty() {
+                anyhow::bail!("edited memory claim is empty");
+            }
+            let session = Session::new();
+            let evidence = log
+                .append(kernel::Event::user_message(
+                    &session,
+                    &format!("CLI memory edit: {name}"),
+                ))
+                .await?;
+            entry.claim = edited.trim_end().to_string();
+            entry.trust = kernel::TrustLabel::User;
+            entry.confidence = memory::ConfidenceRung::UserStated;
+            entry.provenance.push(evidence.id);
+            entry.sessions.push(session.id);
+            entry.version += 1;
+            entry.updated = memory_now();
+            append_cli_memory_op(
+                &log,
+                &projection,
+                &session,
+                memory::MemoryOp::Update { entry },
+            )
+            .await?;
+            println!("Updated '{name}' through the event log.");
+        }
+        MemoryCommand::Forget { name, scope } => {
+            let scope = memory_scope(scope.as_deref())?;
+            if projection.get(scope, &name)?.is_none() {
+                anyhow::bail!("memory '{name}' not found in {} scope", scope.as_str());
+            }
+            append_cli_memory_op(
+                &log,
+                &projection,
+                &Session::new(),
+                memory::MemoryOp::Forget { scope, name: name.clone() },
+            )
+            .await?;
+            println!("Forgot '{name}'.");
+        }
+        MemoryCommand::Pin { name, scope, off } => {
+            let scope = memory_scope(scope.as_deref())?;
+            if projection.get(scope, &name)?.is_none() {
+                anyhow::bail!("memory '{name}' not found in {} scope", scope.as_str());
+            }
+            append_cli_memory_op(
+                &log,
+                &projection,
+                &Session::new(),
+                memory::MemoryOp::Pin {
+                    scope,
+                    name: name.clone(),
+                    pinned: !off,
+                },
+            )
+            .await?;
+            println!("{} '{name}'.", if off { "Unpinned" } else { "Pinned" });
+        }
+        MemoryCommand::Pending => {
+            let dir = state.join("memory-pending");
+            let mut paths = std::fs::read_dir(&dir)
+                .map(|entries| entries.filter_map(Result::ok).map(|entry| entry.path()).collect())
+                .unwrap_or_else(|_| Vec::<std::path::PathBuf>::new());
+            paths.sort();
+            if paths.is_empty() {
+                println!("No pending memory writes.");
+            }
+            for path in paths {
+                if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    println!("{}", path.file_stem().unwrap_or_default().to_string_lossy());
+                }
+            }
+        }
+        MemoryCommand::Approve { id } => {
+            let pending_id = ulid::Ulid::from_string(&id)
+                .map_err(|_| anyhow::anyhow!("pending id must be a ULID"))?;
+            let path = state
+                .join("memory-pending")
+                .join(format!("{pending_id}.json"));
+            let op: memory::MemoryOp = serde_json::from_slice(&std::fs::read(&path)?)?;
+            append_cli_memory_op(&log, &projection, &Session::new(), op).await?;
+            std::fs::remove_file(path)?;
+            println!("Approved pending memory {pending_id}.");
+        }
+    }
+    Ok(())
+}
+
 struct WriteEvent {
     id: ulid::Ulid,
     session: ulid::Ulid,
@@ -341,6 +618,9 @@ async fn main() -> Result<()> {
     }
     if raw.get(1).map(|s| s == "undo").unwrap_or(false) {
         return run_undo_command(raw[2..].to_vec()).await;
+    }
+    if raw.get(1).map(|s| s == "memory").unwrap_or(false) {
+        return run_memory_command(raw[2..].to_vec()).await;
     }
 
     let cli = Cli::parse();
@@ -649,15 +929,27 @@ async fn main() -> Result<()> {
     // (in the store) plus an LLM judge (MEDHA's own model) that reviews the
     // ambiguous Caution cases. See `skill_judge`.
     let security_judge = Arc::new(skill_judge::LlmJudge::new(provider.clone()));
-    let context_file_loader =
-        context::ctxfiles::ContextFileLoader::new().with_judge(security_judge.clone());
+    let context_file_loader = context::ctxfiles::ContextFileLoader::new()
+        .with_judge(security_judge.clone())
+        .with_limits(
+            lock.context_files.max_chars,
+            lock.context_files.max_chars.min(context::ctxfiles::PROGRESSIVE_MAX_CHARS),
+        );
     let medha_home = config::medha_home()?;
-    let startup_context = context_file_loader.discover_startup(&cwd, &medha_home).await;
+    let startup_context = if lock.context_files.enabled {
+        context_file_loader.discover_startup(&cwd, &medha_home).await
+    } else {
+        Vec::new()
+    };
     let persona_file = context_file_loader.load_persona(&medha_home).await?;
-    let progressive_context = Arc::new(context::ctxfiles::ProgressiveContextFiles::new(
-        context_file_loader,
-        cwd.clone(),
-    ));
+    let progressive_context = (lock.context_files.enabled
+        && lock.context_files.progressive_discovery)
+        .then(|| {
+            Arc::new(context::ctxfiles::ProgressiveContextFiles::new(
+                context_file_loader,
+                cwd.clone(),
+            ))
+        });
     let skill_store = Arc::new(
         tools::SkillStore::new(
             workspace.root().join(".medha").join("skills"),
@@ -673,8 +965,15 @@ async fn main() -> Result<()> {
         state.join("memory.db"),
         config::medha_home()?.join("memory.db"),
     )?);
-    let k3_budget_tokens = memory::recall::DEFAULT_K3_BUDGET_TOKENS;
-    registry.register_memory(memory_store.clone());
+    let k3_budget_tokens = lock.memory.k3_budget_tokens;
+    let stale_after_days = lock.memory.stale_after_days;
+    if lock.memory.enabled {
+        registry.register_memory_configured(
+            memory_store.clone(),
+            k3_budget_tokens,
+            stale_after_days,
+        );
+    }
     registry.register_session_search(log.clone(), artifacts.clone());
     let known_tools = registry.tool_names();
     // Live web-search settings, shared with the `web.*` tools. Seed from the
@@ -696,16 +995,25 @@ async fn main() -> Result<()> {
     // so a compacted session keeps a real handoff summary instead of a keyword
     // scrape that invites hallucination.
     let recall_store = memory_store.clone();
+    let memory_enabled = lock.memory.enabled;
     let context_engine = Arc::new(
         context::PipelineEngine::new(lock.context.to_policy())
             .with_summarizer(Arc::new(context::LlmSummarizer::new(provider.clone())))
             .with_artifacts(artifacts.clone())
             .with_full_compaction_refresh(Arc::new(move |system| {
+                if !memory_enabled {
+                    return system.to_string();
+                }
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_secs_f64())
                     .unwrap_or(0.0);
-                match memory::recall::compile_k3(&recall_store, k3_budget_tokens, now) {
+                match memory::recall::compile_k3_configured(
+                    &recall_store,
+                    k3_budget_tokens,
+                    now,
+                    stale_after_days,
+                ) {
                     Ok(block) => memory::recall::replace_k3(system, &block),
                     Err(_) => system.to_string(),
                 }
@@ -715,9 +1023,10 @@ async fn main() -> Result<()> {
     // Deny-first policy + shell command scanner (§4.6). Approval set comes from
     // medha.lock's [policy] approve list, extended by MEDHA_APPROVE (e.g.
     // "writes", "shell", "all").
-    let policy = Arc::new(policy::DefaultPolicy::requiring_approval(approve_list(
-        lock.policy.approve.clone(),
-    )));
+    let policy = Arc::new(
+        policy::DefaultPolicy::requiring_approval(approve_list(lock.policy.approve.clone()))
+            .with_memory_write_approval(&lock.memory.write_approval),
+    );
 
     // Deterministic verifier (§4.7): medha.lock's [verify] command, overridden
     // by MEDHA_VERIFY="cargo check" if set. Empty/absent = no verifier.
@@ -774,7 +1083,7 @@ async fn main() -> Result<()> {
     let max_parallel_tools = env_usize("MEDHA_MAX_PARALLEL_TOOLS")
         .or(lock.budget.max_parallel_tools)
         .unwrap_or(kernel::DEFAULT_MAX_PARALLEL_TOOLS);
-    let kernel = Kernel::new(
+    let mut kernel = Kernel::new(
         provider,
         log.clone(),
         executor,
@@ -785,8 +1094,10 @@ async fn main() -> Result<()> {
         verifier,
     )
     .with_pricing(pricing)
-    .with_progressive_context(progressive_context)
     .with_max_parallel_tools(max_parallel_tools);
+    if let Some(progressive_context) = progressive_context {
+        kernel = kernel.with_progressive_context(progressive_context);
+    }
 
     // K1 Identity sheath is assembled by the context compiler, not hardcoded
     // here; config may override the persona (§4.3).
@@ -833,13 +1144,6 @@ async fn main() -> Result<()> {
         system.push_str("\n\n");
         system.push_str(&skills_manifest);
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or(0.0);
-    let k3 = memory::recall::compile_k3(&memory_store, k3_budget_tokens, now)?;
-    system = memory::recall::replace_k3(&system, &k3);
-
     // Resume (--continue / --resume <id>): rebuild the prior conversation from
     // the event log and continue the SAME session (new events append onward).
     // Empty `resumed` = a fresh session.
@@ -861,6 +1165,32 @@ async fn main() -> Result<()> {
             (Session::new(), Vec::new())
         }
     };
+    if lock.memory.enabled {
+        let session_events = log.events(session.id).await;
+        let forked = session_events
+            .first()
+            .is_some_and(|event| event.provenance.source == "fork");
+        if forked {
+            memory_store.rebuild_project(session_events.into_iter())?;
+        } else {
+            memory_store.rebuild_project(
+                log.all_events()?
+                    .into_iter()
+                    .filter(|event| event.provenance.source != "fork"),
+            )?;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0);
+        let k3 = memory::recall::compile_k3_configured(
+            &memory_store,
+            k3_budget_tokens,
+            now,
+            stale_after_days,
+        )?;
+        system = memory::recall::replace_k3(&system, &k3);
+    }
     // Starting autonomy dial: medha.lock's [policy] autonomy, overridable by
     // MEDHA_MODE. The TUI can change it live via /mode; headless keeps this.
     session.autonomy = kernel::AutonomyLevel::from_id(
@@ -923,6 +1253,10 @@ async fn main() -> Result<()> {
                 workspace.clone(),
                 logs_dir.join("stray-stdout.log"),
                 skill_store.clone(),
+                memory_store.clone(),
+                lock.memory.enabled,
+                k3_budget_tokens,
+                stale_after_days,
                 known_tools.clone(),
                 search_handle.clone(),
                 tx,

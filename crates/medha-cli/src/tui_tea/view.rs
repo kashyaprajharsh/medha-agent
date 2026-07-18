@@ -421,6 +421,9 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
             if tool == "update_plan" && *ok {
                 return render_plan(payload);
             }
+            if let Some(card) = payload.get("reconciliation") {
+                return render_reconciliation(card);
+            }
             if let (Some(old), Some(new)) = (
                 payload.get("old").and_then(|v| v.as_str()),
                 payload.get("new").and_then(|v| v.as_str()),
@@ -516,6 +519,30 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
             lines
         }
     }
+}
+
+fn render_reconciliation(card: &serde_json::Value) -> Vec<Line<'static>> {
+    let name = card.get("name").and_then(|value| value.as_str()).unwrap_or("memory");
+    let previous = card
+        .get("previous")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let proposed = card
+        .get("proposed")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    vec![
+        Line::from(Span::styled(
+            format!("╭─ memory contradiction · {name}"),
+            Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!("│ previous  {previous}")),
+        Line::from(format!("│ proposed  {proposed}")),
+        Line::from(Span::styled(
+            "╰─ keep previous · replace with proposed · merge as a new claim",
+            Style::default().fg(theme::DIM),
+        )),
+    ]
 }
 
 /// Inline approval rendering (PART 3: appended to the transcript stream, not a modal).
@@ -1743,6 +1770,26 @@ mod clarify_view_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn reconciliation_card_shows_both_versions_and_actions() {
+        let lines = render_reconciliation(&serde_json::json!({
+            "name": "cache-key",
+            "previous": "use 'old-key'",
+            "proposed": "use new-key",
+        }));
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("cache-key"));
+        assert!(text.contains("old-key"));
+        assert!(text.contains("new-key"));
+        assert!(text.contains("keep previous"));
+        assert!(text.contains("merge"));
     }
 
     #[test]

@@ -47,22 +47,24 @@ fn assess_with_counter(
     incoming: &MemoryEntry,
     budget_tokens: u32,
     now: f64,
+    stale_after_days: u32,
     counter: &dyn TokenCounter,
 ) -> Result<BudgetAssessment, MemoryError> {
     let mut current = store.list()?;
-    current.retain(|entry| index_eligible(entry, now, DEFAULT_STALE_AFTER_DAYS));
-    let used_tokens = full_index_tokens(&current, budget_tokens, now, counter);
+    current.retain(|entry| index_eligible(entry, now, stale_after_days));
+    let used_tokens = full_index_tokens(&current, budget_tokens, now, stale_after_days, counter);
     let mut projected = current.clone();
-    if index_eligible(incoming, now, DEFAULT_STALE_AFTER_DAYS) {
+    if index_eligible(incoming, now, stale_after_days) {
         projected.push(incoming.clone());
     }
-    let projected_tokens = full_index_tokens(&projected, budget_tokens, now, counter);
+    let projected_tokens =
+        full_index_tokens(&projected, budget_tokens, now, stale_after_days, counter);
     let entries = current
         .into_iter()
         .map(|entry| PressureEntry {
             name: entry.name.clone(),
             preview: preview(&entry.description),
-            size_tokens: entry_index_tokens(&entry, now, counter),
+            size_tokens: entry_index_tokens(&entry, now, stale_after_days, counter),
             age_days: ((now - entry.updated).max(0.0) / 86_400.0).floor() as u32,
             rung: entry.confidence.as_str().to_string(),
         })
@@ -83,7 +85,30 @@ pub fn assess_write(
     budget_tokens: u32,
     now: f64,
 ) -> Result<BudgetAssessment, MemoryError> {
-    assess_with_counter(store, incoming, budget_tokens, now, &BpeCounter::o200k())
+    assess_write_configured(
+        store,
+        incoming,
+        budget_tokens,
+        now,
+        DEFAULT_STALE_AFTER_DAYS,
+    )
+}
+
+pub fn assess_write_configured(
+    store: &MemoryProjection,
+    incoming: &MemoryEntry,
+    budget_tokens: u32,
+    now: f64,
+    stale_after_days: u32,
+) -> Result<BudgetAssessment, MemoryError> {
+    assess_with_counter(
+        store,
+        incoming,
+        budget_tokens,
+        now,
+        stale_after_days,
+        &BpeCounter::o200k(),
+    )
 }
 
 #[cfg(test)]
@@ -124,7 +149,15 @@ mod tests {
         );
         store.apply(&MemoryOp::Write { entry: old }).unwrap();
         let incoming = entry("new-fact", "another substantial index hook", 86_400.0);
-        let assessment = assess_with_counter(&store, &incoming, 35, 86_400.0, &HeuristicCounter).unwrap();
+        let assessment = assess_with_counter(
+            &store,
+            &incoming,
+            35,
+            86_400.0,
+            DEFAULT_STALE_AFTER_DAYS,
+            &HeuristicCounter,
+        )
+        .unwrap();
 
         assert!(assessment.over_budget());
         assert_eq!(assessment.deficit_tokens, assessment.projected_tokens - 35);
@@ -147,6 +180,7 @@ mod tests {
             &incoming,
             1_200,
             40.0 * 86_400.0,
+            DEFAULT_STALE_AFTER_DAYS,
             &HeuristicCounter,
         )
         .unwrap();
@@ -162,5 +196,7 @@ mod tests {
         let assessment = assess_write(&store, &incoming, 1_200, 1_000.0).unwrap();
         assert!(!assessment.over_budget());
         assert!(assessment.projected_tokens > 0);
+        let configured = assess_write_configured(&store, &incoming, 1_200, 1_000.0, 7).unwrap();
+        assert_eq!(configured.projected_tokens, assessment.projected_tokens);
     }
 }

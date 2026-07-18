@@ -226,6 +226,12 @@ impl MemoryProjection {
         Ok(())
     }
 
+    pub fn clear_project(&self) -> Result<(), MemoryError> {
+        let conn = self.project.lock().map_err(|_| MemoryError::Poisoned)?;
+        conn.execute_batch("DELETE FROM entries; DELETE FROM entries_fts;")
+            .map_err(|error| MemoryError::Db(error.to_string()))
+    }
+
     /// Replay every `EventKind::MemoryWrite` in `events` (append order) onto a
     /// freshly cleared projection. Rebuild ≡ the same incremental `apply` calls
     /// — the replay-determinism invariant M1 exists to prove (Vol 3 §9).
@@ -237,6 +243,24 @@ impl MemoryProjection {
             }
             if let Ok(op) = serde_json::from_value::<MemoryOp>(e.payload) {
                 self.apply(&op)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rebuild_project(
+        &self,
+        events: impl Iterator<Item = Event>,
+    ) -> Result<(), MemoryError> {
+        self.clear_project()?;
+        for event in events {
+            if event.kind != EventKind::MemoryWrite {
+                continue;
+            }
+            if let Ok(op) = serde_json::from_value::<MemoryOp>(event.payload) {
+                if op.scope() == Scope::Project {
+                    self.apply(&op)?;
+                }
             }
         }
         Ok(())
@@ -421,6 +445,30 @@ mod tests {
 
         std::fs::remove_dir_all(p1.parent().unwrap()).ok();
         std::fs::remove_dir_all(p2.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn project_only_rebuild_preserves_user_memory_and_drops_branch_future() {
+        let (p, u) = temp_paths("branch-project");
+        let proj = MemoryProjection::open(&p, &u).unwrap();
+        let session = Session::new();
+        let user = entry("global-pref", Scope::User, 1);
+        let before = entry("before-cut", Scope::Project, 1);
+        let after = entry("after-cut", Scope::Project, 1);
+        proj.apply(&MemoryOp::Write { entry: user }).unwrap();
+        proj.apply(&MemoryOp::Write { entry: after }).unwrap();
+
+        proj.rebuild_project(
+            vec![memory_event(&session, MemoryOp::Write { entry: before })].into_iter(),
+        )
+        .unwrap();
+        assert!(proj.get(Scope::Project, "before-cut").unwrap().is_some());
+        assert!(proj.get(Scope::Project, "after-cut").unwrap().is_none());
+        assert!(proj.get(Scope::User, "global-pref").unwrap().is_some());
+
+        proj.clear_project().unwrap();
+        assert!(proj.get(Scope::Project, "before-cut").unwrap().is_none());
+        assert!(proj.get(Scope::User, "global-pref").unwrap().is_some());
     }
 
     #[test]

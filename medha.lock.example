@@ -29,6 +29,17 @@ protect_last_n = 20
 prune_min_tool_tokens = 8000
 emergency_ratio = 0.98
 
+[memory]
+enabled = true
+k3_budget_tokens = 1200
+write_approval = "user-scope" # "none" | "user-scope" | "all"
+stale_after_days = 30
+
+[context_files]
+enabled = true
+max_chars = 20000
+progressive_discovery = true
+
 [policy]
 # Tool classes requiring human approval before execution (§4.7). File writes
 # need a nod by default; shell is instead gated by the deterministic

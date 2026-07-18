@@ -85,6 +85,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "time-travel: branch from an earlier turn (undoes later edits)",
     ),
     ("/tasks", "list background shell tasks (running/finished)"),
+    ("/memory", "list memories · /memory <name> jumps to provenance"),
     (
         "/skill",
         "skill hub — use a skill, or add one (search / paste a link)  ·  /skill <name> to load",
@@ -264,9 +265,10 @@ pub(crate) enum TuiEvent {
         result: Result<Vec<providers::openai_compat::ModelInfo>, String>,
     },
     /// A past session's events were replayed into a transcript; swap to it.
-    Resumed(ulid::Ulid, Vec<Message>),
+    Resumed(ulid::Ulid, Vec<Message>, Vec<kernel::Event>),
     /// `/rewind` completed loading this session's rewind points from the log.
     RewindPointsLoaded(Vec<RewindPoint>),
+    MemoryProvenance(Box<memory::MemoryEntry>, Option<kernel::Event>),
     /// A rewind finished. `new_id` is `Some` for conversation scopes (swap to
     /// the forked branch); `None` for code-only (conversation untouched). `msgs`
     /// is the branch's replayed conversation, `rolled` the files reverted,
@@ -274,6 +276,7 @@ pub(crate) enum TuiEvent {
     Rewound {
         new_id: Option<ulid::Ulid>,
         msgs: Vec<Message>,
+        memory_events: Vec<kernel::Event>,
         rolled: usize,
         scope: RewindScope,
         prefill: Option<String>,
@@ -697,6 +700,7 @@ enum PickerKind {
     /// Step 2 of `/rewind`: having chosen a cut point, pick the scope
     /// (conversation only · conversation + code · cancel).
     RewindMode(RewindPoint),
+    Memory(Vec<memory::MemoryEntry>),
     /// `/skill` with no name: pick an installed skill to force-load. Holds
     /// (name, description) for each effective skill.
     Skill(Vec<(String, String)>),
@@ -796,6 +800,9 @@ impl PickerKind {
                     p.label
                 )
             }
+            PickerKind::Memory(_) => {
+                " memory — ↑↓ select, Enter jump to provenance, Esc cancel ".into()
+            }
             PickerKind::Skill(_) => " skill hub — ↑↓ select · Enter · Esc cancel ".into(),
             PickerKind::RemoveSkill(name) => {
                 format!(" remove user skill '{name}'? — ↑↓ move · Enter confirm · Esc back ")
@@ -870,6 +877,26 @@ impl PickerKind {
                 })
                 .collect(),
             PickerKind::RewindMode(p) => p.scope_options().into_iter().map(|(l, _)| l).collect(),
+            PickerKind::Memory(entries) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs_f64())
+                    .unwrap_or(0.0);
+                entries
+                    .iter()
+                    .map(|entry| {
+                        let age = ((now - entry.updated).max(0.0) / 86_400.0).floor() as u64;
+                        format!(
+                            "[{} · {}d{}] {} — {}",
+                            entry.trust.as_str(),
+                            age,
+                            if entry.pinned { " · pinned" } else { "" },
+                            entry.name,
+                            entry.description
+                        )
+                    })
+                    .collect()
+            }
             PickerKind::Skill(skills) => SKILL_HUB_ACTIONS
                 .iter()
                 .map(|(label, _)| (*label).to_string())
@@ -1282,6 +1309,10 @@ struct Model {
     /// Skill store + the session's registered tool names, so `/skills` can
     /// re-scan live. `None` in tests / when skills aren't wired.
     skills: Option<Arc<tools::SkillStore>>,
+    memory: Option<Arc<memory::MemoryProjection>>,
+    memory_enabled: bool,
+    memory_budget_tokens: u32,
+    memory_stale_after_days: u32,
     known_tools: Arc<std::collections::HashSet<String>>,
 }
 
@@ -1349,6 +1380,10 @@ impl Model {
             compacting: false,
             show_summary: false,
             skills: None,
+            memory: None,
+            memory_enabled: true,
+            memory_budget_tokens: memory::recall::DEFAULT_K3_BUDGET_TOKENS,
+            memory_stale_after_days: memory::recall::DEFAULT_STALE_AFTER_DAYS,
             known_tools: Arc::new(std::collections::HashSet::new()),
         }
     }
@@ -1362,6 +1397,20 @@ impl Model {
     ) -> Self {
         self.skills = Some(store);
         self.known_tools = Arc::new(known_tools);
+        self
+    }
+
+    fn with_memory(
+        mut self,
+        store: Arc<memory::MemoryProjection>,
+        enabled: bool,
+        budget_tokens: u32,
+        stale_after_days: u32,
+    ) -> Self {
+        self.memory = Some(store);
+        self.memory_enabled = enabled;
+        self.memory_budget_tokens = budget_tokens;
+        self.memory_stale_after_days = stale_after_days;
         self
     }
 
@@ -1706,6 +1755,10 @@ pub async fn run_tea<P, L>(
     restore: Arc<WorkspaceSandbox>,
     stray_log: std::path::PathBuf,
     skill_store: Arc<tools::SkillStore>,
+    memory_store: Arc<memory::MemoryProjection>,
+    memory_enabled: bool,
+    memory_budget_tokens: u32,
+    memory_stale_after_days: u32,
     known_tools: std::collections::HashSet<String>,
     search_handle: tools::SearchHandle,
     tx: mpsc::UnboundedSender<TuiEvent>,
@@ -1745,6 +1798,12 @@ where
         restore,
     )
     .with_skills(skill_store, known_tools)
+    .with_memory(
+        memory_store,
+        memory_enabled,
+        memory_budget_tokens,
+        memory_stale_after_days,
+    )
     .with_model_profiles(model_profiles, active_profile)
     .with_search(search_handle);
     // Reflect the session's starting autonomy (from lock/MEDHA_MODE) in the TUI.

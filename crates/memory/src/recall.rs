@@ -23,10 +23,10 @@ fn rung(entry: &MemoryEntry) -> &'static str {
     }
 }
 
-fn line(entry: &MemoryEntry, now: f64, description: &str) -> String {
+fn line(entry: &MemoryEntry, now: f64, description: &str, stale_after_days: u32) -> String {
     let age = age_days(entry, now);
     let pin = if entry.pinned { " · pinned" } else { "" };
-    let stale = if age > DEFAULT_STALE_AFTER_DAYS {
+    let stale = if age > stale_after_days {
         " ⚠ verify before asserting"
     } else {
         ""
@@ -52,15 +52,22 @@ pub(crate) fn index_eligible(entry: &MemoryEntry, now: f64, stale_after_days: u3
 pub(crate) fn entry_index_tokens(
     entry: &MemoryEntry,
     now: f64,
+    stale_after_days: u32,
     counter: &dyn TokenCounter,
 ) -> u32 {
-    counter.count(&line(entry, now, &one_line(&entry.description)))
+    counter.count(&line(
+        entry,
+        now,
+        &one_line(&entry.description),
+        stale_after_days,
+    ))
 }
 
 fn render(
     selected: &[(MemoryEntry, String)],
     budget_tokens: u32,
     now: f64,
+    stale_after_days: u32,
     counter: &dyn TokenCounter,
 ) -> String {
     let project = selected.iter().filter(|(e, _)| e.scope == Scope::Project).count();
@@ -74,7 +81,7 @@ fn render(
         );
         for (entry, description) in selected {
             next.push('\n');
-            next.push_str(&line(entry, now, description));
+            next.push_str(&line(entry, now, description, stale_after_days));
         }
         next.push_str("\n…full entries: memory.search · past sessions: sessions.search");
         let counted = counter.count(&next);
@@ -91,6 +98,7 @@ pub(crate) fn full_index_tokens(
     entries: &[MemoryEntry],
     budget_tokens: u32,
     now: f64,
+    stale_after_days: u32,
     counter: &dyn TokenCounter,
 ) -> u32 {
     let selected = entries
@@ -101,7 +109,13 @@ pub(crate) fn full_index_tokens(
             (entry, description)
         })
         .collect::<Vec<_>>();
-    counter.count(&render(&selected, budget_tokens, now, counter))
+    counter.count(&render(
+        &selected,
+        budget_tokens,
+        now,
+        stale_after_days,
+        counter,
+    ))
 }
 
 fn fit_pinned_description(
@@ -110,6 +124,7 @@ fn fit_pinned_description(
     description: &str,
     budget_tokens: u32,
     now: f64,
+    stale_after_days: u32,
     counter: &dyn TokenCounter,
 ) -> Option<String> {
     let chars: Vec<char> = description.chars().collect();
@@ -124,7 +139,14 @@ fn fit_pinned_description(
         }
         let mut trial = selected.to_vec();
         trial.push((entry.clone(), clipped.clone()));
-        if counter.count(&render(&trial, budget_tokens, now, counter)) <= budget_tokens {
+        if counter.count(&render(
+            &trial,
+            budget_tokens,
+            now,
+            stale_after_days,
+            counter,
+        )) <= budget_tokens
+        {
             best = Some(clipped);
             lo = mid + 1;
         } else if mid == 0 {
@@ -140,13 +162,14 @@ fn compile_with_counter(
     store: &MemoryProjection,
     budget_tokens: u32,
     now: f64,
+    stale_after_days: u32,
     counter: &dyn TokenCounter,
 ) -> Result<String, MemoryError> {
     if budget_tokens == 0 {
         return Ok(String::new());
     }
     let mut entries = store.list()?;
-    entries.retain(|entry| index_eligible(entry, now, DEFAULT_STALE_AFTER_DAYS));
+    entries.retain(|entry| index_eligible(entry, now, stale_after_days));
     entries.sort_by(|a, b| {
         b.pinned
             .cmp(&a.pinned)
@@ -155,7 +178,7 @@ fn compile_with_counter(
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    let empty = render(&[], budget_tokens, now, counter);
+    let empty = render(&[], budget_tokens, now, stale_after_days, counter);
     if counter.count(&empty) > budget_tokens {
         return Ok(String::new());
     }
@@ -165,7 +188,14 @@ fn compile_with_counter(
         let description = one_line(&entry.description);
         let mut trial = selected.clone();
         trial.push((entry.clone(), description.clone()));
-        if counter.count(&render(&trial, budget_tokens, now, counter)) <= budget_tokens {
+        if counter.count(&render(
+            &trial,
+            budget_tokens,
+            now,
+            stale_after_days,
+            counter,
+        )) <= budget_tokens
+        {
             selected = trial;
         } else if entry.pinned {
             if let Some(clipped) = fit_pinned_description(
@@ -174,13 +204,20 @@ fn compile_with_counter(
                 &description,
                 budget_tokens,
                 now,
+                stale_after_days,
                 counter,
             ) {
                 selected.push((entry, clipped));
             }
         }
     }
-    Ok(render(&selected, budget_tokens, now, counter))
+    Ok(render(
+        &selected,
+        budget_tokens,
+        now,
+        stale_after_days,
+        counter,
+    ))
 }
 
 /// Compile the deterministic K3 snapshot. `now` is injected so replay and
@@ -190,7 +227,27 @@ pub fn compile_k3(
     budget_tokens: u32,
     now: f64,
 ) -> Result<String, MemoryError> {
-    compile_with_counter(store, budget_tokens, now, &BpeCounter::o200k())
+    compile_k3_configured(
+        store,
+        budget_tokens,
+        now,
+        DEFAULT_STALE_AFTER_DAYS,
+    )
+}
+
+pub fn compile_k3_configured(
+    store: &MemoryProjection,
+    budget_tokens: u32,
+    now: f64,
+    stale_after_days: u32,
+) -> Result<String, MemoryError> {
+    compile_with_counter(
+        store,
+        budget_tokens,
+        now,
+        stale_after_days,
+        &BpeCounter::o200k(),
+    )
 }
 
 /// Replace the trailing K3 section while preserving the stable system-prefix.
@@ -256,7 +313,14 @@ mod tests {
         store.apply(&MemoryOp::Write { entry: pinned }).unwrap();
 
         let counter = HeuristicCounter;
-        let block = compile_with_counter(&store, 120, now, &counter).unwrap();
+        let block = compile_with_counter(
+            &store,
+            120,
+            now,
+            DEFAULT_STALE_AFTER_DAYS,
+            &counter,
+        )
+        .unwrap();
         assert!(counter.count(&block) <= 120);
         assert!(block.find("pinned-web").unwrap() < block.find("recent-user").unwrap());
         assert!(!block.contains("old-candidate"));
@@ -314,5 +378,25 @@ mod tests {
         let once = replace_k3("persona", "one");
         let twice = replace_k3(&once, "two");
         assert_eq!(twice, "persona\n\n## Memory\n\ntwo");
+    }
+
+    #[test]
+    fn configured_staleness_changes_candidate_eligibility() {
+        let store = store("configured-stale");
+        let now = 40.0 * 86_400.0;
+        store
+            .apply(&MemoryOp::Write {
+                entry: entry(
+                    "old-but-allowed",
+                    Scope::Project,
+                    TrustLabel::User,
+                    ConfidenceRung::Candidate,
+                    0.0,
+                ),
+            })
+            .unwrap();
+        let block = compile_k3_configured(&store, 1_200, now, 90).unwrap();
+        assert!(block.contains("old-but-allowed"));
+        assert!(!block.contains("⚠ verify before asserting"));
     }
 }

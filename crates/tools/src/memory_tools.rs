@@ -133,14 +133,28 @@ fn saved_response(op: MemoryOp, note: &str) -> Value {
 pub struct MemoryWrite {
     pub store: Arc<MemoryProjection>,
     budget_tokens: u32,
+    stale_after_days: u32,
     failures: Mutex<HashMap<(Ulid, Ulid), u8>>,
 }
 
 impl MemoryWrite {
     pub fn new(store: Arc<MemoryProjection>, budget_tokens: u32) -> Self {
+        Self::new_configured(
+            store,
+            budget_tokens,
+            memory::recall::DEFAULT_STALE_AFTER_DAYS,
+        )
+    }
+
+    pub fn new_configured(
+        store: Arc<MemoryProjection>,
+        budget_tokens: u32,
+        stale_after_days: u32,
+    ) -> Self {
         Self {
             store,
             budget_tokens,
+            stale_after_days,
             failures: Mutex::new(HashMap::new()),
         }
     }
@@ -255,11 +269,12 @@ impl Tool for MemoryWrite {
             created: now,
             updated: now,
         };
-        let assessment = memory::consolidate::assess_write(
+        let assessment = memory::consolidate::assess_write_configured(
             &self.store,
             &entry,
             self.budget_tokens,
             now,
+            self.stale_after_days,
         )
         .map_err(store_err)?;
         if assessment.over_budget() {
@@ -332,9 +347,15 @@ impl Tool for MemoryUpdate {
             )));
         };
 
-        let claim = args.get("claim").and_then(Value::as_str).unwrap_or(&existing.claim);
+        let previous_claim = existing.claim.clone();
+        let claim = args
+            .get("claim")
+            .and_then(Value::as_str)
+            .unwrap_or(&existing.claim)
+            .to_string();
+        let contradiction = claim != previous_claim;
         let description = args.get("description").and_then(Value::as_str).unwrap_or(&existing.description);
-        guard_scan(name, claim, description)?;
+        guard_scan(name, &claim, description)?;
 
         // Promotion (D6): user restating wins outright; otherwise corroboration
         // from a session that contributed no prior evidence lifts Candidate →
@@ -357,7 +378,7 @@ impl Tool for MemoryUpdate {
 
         let entry = MemoryEntry {
             name: existing.name.clone(),
-            claim: claim.to_string(),
+            claim: claim.clone(),
             description: description.to_string(),
             kind: existing.kind,
             scope,
@@ -374,7 +395,16 @@ impl Tool for MemoryUpdate {
         };
         let op = MemoryOp::Update { entry };
         self.store.apply(&op).map_err(store_err)?;
-        Ok(saved_response(op, "Updated. This write is complete — do not repeat it."))
+        let mut response = saved_response(op, "Updated. This write is complete — do not repeat it.");
+        if contradiction {
+            response["reconciliation"] = json!({
+                "name": name,
+                "previous": previous_claim,
+                "proposed": claim,
+                "actions": ["keep previous", "replace with proposed", "merge as a new claim"],
+            });
+        }
+        Ok(response)
     }
 }
 
@@ -775,6 +805,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contradictory_update_returns_reconciliation_actions() {
+        let s = store();
+        let write = MemoryWrite::new(s.clone(), 1_200);
+        let update = MemoryUpdate { store: s };
+        write
+            .execute(&enriched(write_args("quoted-fact"), "user", Ulid::new(), true))
+            .await
+            .unwrap();
+        let out = update
+            .execute(&enriched(
+                json!({ "name": "quoted-fact", "claim": "a conflicting 'quoted' value" }),
+                "user",
+                Ulid::new(),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(out["reconciliation"]["previous"], "claim quoted-fact");
+        assert_eq!(out["reconciliation"]["actions"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn update_and_forget_require_an_existing_entry() {
         let s = store();
         let u = MemoryUpdate { store: s.clone() };
@@ -798,7 +850,7 @@ mod tests {
     #[tokio::test]
     async fn success_response_is_terminal_and_carries_the_applied_op() {
         let s = store();
-        let t = MemoryWrite::new(s, 1_200);
+        let t = MemoryWrite::new_configured(s, 1_200, 7);
         let out = t.execute(&enriched(write_args("a"), "user", Ulid::new(), true)).await.unwrap();
         assert!(out["applied"].is_object(), "kernel appends this as the memory.write event");
         assert!(out["note"].as_str().unwrap().contains("do not repeat"));
@@ -952,7 +1004,9 @@ mod tests {
 
         let mut registry = crate::ToolRegistry::new();
         registry.register_session_search(tool.log.clone(), artifacts);
+        registry.register_memory_configured(store(), 900, 7);
         assert!(registry.specs().iter().any(|spec| spec.name == "sessions.search"));
+        assert!(registry.specs().iter().any(|spec| spec.name == "memory.write"));
         assert!(tool.execute(&json!({ "query": "" })).await.is_err());
         assert!(tool.execute(&json!({ "session_id": session.id })).await.is_err());
     }

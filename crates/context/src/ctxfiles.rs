@@ -55,9 +55,21 @@ impl CtxFile {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ContextFileLoader {
     judge: Option<Arc<dyn ContextJudge>>,
+    startup_max_chars: usize,
+    progressive_max_chars: usize,
+}
+
+impl Default for ContextFileLoader {
+    fn default() -> Self {
+        Self {
+            judge: None,
+            startup_max_chars: STARTUP_MAX_CHARS,
+            progressive_max_chars: PROGRESSIVE_MAX_CHARS,
+        }
+    }
 }
 
 impl ContextFileLoader {
@@ -67,6 +79,12 @@ impl ContextFileLoader {
 
     pub fn with_judge(mut self, judge: Arc<dyn ContextJudge>) -> Self {
         self.judge = Some(judge);
+        self
+    }
+
+    pub fn with_limits(mut self, startup_max_chars: usize, progressive_max_chars: usize) -> Self {
+        self.startup_max_chars = startup_max_chars;
+        self.progressive_max_chars = progressive_max_chars;
         self
     }
 
@@ -120,7 +138,7 @@ impl ContextFileLoader {
         let mut current = Some(cwd);
         while let Some(dir) = current {
             if let Some(path) = first_context_file(dir) {
-                files.push(self.read_guarded(path, STARTUP_MAX_CHARS, false).await);
+                files.push(self.read_guarded(path, self.startup_max_chars, false).await);
             }
             if dir == root {
                 break;
@@ -129,7 +147,7 @@ impl ContextFileLoader {
         }
         let global = medha_home.join("MEDHA.md");
         if global.is_file() {
-            files.push(self.read_guarded(global, STARTUP_MAX_CHARS, true).await);
+            files.push(self.read_guarded(global, self.startup_max_chars, true).await);
         }
         files
     }
@@ -142,7 +160,7 @@ impl ContextFileLoader {
     ) -> Option<CtxFile> {
         let candidates = progressive_candidates(seen, touched_path);
         let path = candidates.into_iter().find_map(|dir| first_context_file(&dir))?;
-        Some(self.read_guarded(path, PROGRESSIVE_MAX_CHARS, false).await)
+        Some(self.read_guarded(path, self.progressive_max_chars, false).await)
     }
 
     /// Seed and load the global persona. A comment-only seed keeps the built-in
@@ -157,7 +175,7 @@ impl ContextFileLoader {
             )
             .map_err(|error| CtxFileError::Io(error.to_string()))?;
         }
-        let file = self.read_guarded(path, STARTUP_MAX_CHARS, true).await;
+        let file = self.read_guarded(path, self.startup_max_chars, true).await;
         if !file.blocked()
             && file
                 .content
@@ -217,16 +235,32 @@ fn progressive_candidates(seen: &mut HashSet<PathBuf>, touched_path: &Path) -> V
 }
 
 fn truncate(text: &str, max_chars: usize, path: &Path) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     let chars = text.chars().collect::<Vec<_>>();
     if chars.len() <= max_chars {
         return text.to_string();
     }
-    let head = max_chars.saturating_mul(70) / 100;
-    let tail = max_chars.saturating_mul(20) / 100;
+    let marker = format!(
+        "\n\n[… {} truncated; use file tools to read the omitted middle …]\n\n",
+        path.display()
+    );
+    let marker_chars = marker.chars().count();
+    if marker_chars >= max_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+    let mut head = max_chars.saturating_mul(70) / 100;
+    let mut tail = max_chars.saturating_mul(20) / 100;
+    let available = max_chars - marker_chars;
+    if head + tail > available {
+        head = available.saturating_mul(7) / 9;
+        tail = available - head;
+    }
     format!(
-        "{}\n\n[… {} truncated; use file tools to read the omitted middle …]\n\n{}",
+        "{}{}{}",
         chars[..head].iter().collect::<String>(),
-        path.display(),
+        marker,
         chars[chars.len() - tail..].iter().collect::<String>(),
     )
 }
@@ -290,7 +324,7 @@ impl kernel::ProgressiveContext for ProgressiveContextFiles {
         let context_path = candidates.into_iter().find_map(|dir| first_context_file(&dir))?;
         let file = self
             .loader
-            .read_guarded(context_path, PROGRESSIVE_MAX_CHARS, false)
+            .read_guarded(context_path, self.loader.progressive_max_chars, false)
             .await;
         let blocked = file.blocked();
         Some(kernel::DiscoveredContext {
@@ -365,6 +399,10 @@ mod tests {
         assert!(text.ends_with("TAIL"));
         assert!(text.contains("truncated; use file tools"));
         assert!(text.chars().count() <= STARTUP_MAX_CHARS);
+
+        let tiny = ContextFileLoader::new().with_limits(1_000, 500);
+        let files = tiny.discover_startup(&root, &root.join("home")).await;
+        assert!(files[0].content.chars().count() <= 1_000);
     }
 
     #[tokio::test]

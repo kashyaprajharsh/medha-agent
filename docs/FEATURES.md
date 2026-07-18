@@ -261,6 +261,8 @@ Precedence: **env var > medha.lock > built-in default**.
 | `[routing]` | `executor`, `verifier` | Provider seats. Only `executor` is consulted today; `verifier` is a placeholder for cross-vendor verification (not yet built). |
 | `[budget]` | `max_turns`, `max_tokens`, `max_cost_usd`, `max_wall_s` | Per-task ceilings enforced by the `Governor` before each turn. Default: `max_turns = 200`. |
 | `[context]` | `trigger_ratio`, `microcompact_ratio`, `tail_ratio`, `protect_first_n`, `protect_last_n`, `prune_min_tool_tokens`, `emergency_ratio` | Compaction tuning. |
+| `[memory]` | `enabled`, `k3_budget_tokens`, `write_approval`, `stale_after_days` | Frozen recall budget, write gate, and deterministic staleness. |
+| `[context_files]` | `enabled`, `max_chars`, `progressive_discovery` | Guarded startup and progressive project instructions. |
 | `[policy]` | `approve`, `autonomy` | `approve`: tool classes requiring human approval. `autonomy`: starting dial `careful`/`normal`/`yolo` (default `careful`; live via `/mode`, override `MEDHA_MODE`). |
 | `[sandbox]` | `backend`, `network`, `image`, `runtime`, `memory`, `pids`, `host`, `remote_dir`, `extra_writable` | Execution backend + network posture. Default: `backend = "native"`, `network = "allow"`. |
 | `[verify]` | `command` | Deterministic check run after file-modifying turns (e.g. `cargo check`). Empty = none. |
@@ -416,6 +418,22 @@ heuristic.
 The system prompt is assembled from a config persona override or the built-in
 `system.md`, then grounded with the real current date and workspace path (so the
 model doesn't guess a stale year for time-sensitive queries).
+
+### Typed memory and context files
+**Where:** `crates/memory/`, `crates/context/src/ctxfiles.rs`, and `crates/tools/src/memory_tools.rs`
+
+Memory mutations are hash-chained events projected into SQLite + FTS5. K3 is
+compiled once per session under a hard token budget and refreshed only after a
+Full compaction. `memory.search` retrieves full typed entries;
+`sessions.search` returns verbatim prior exchanges without a model call.
+
+Project instructions use the first available `MEDHA.md`, `AGENTS.md`, or
+`CLAUDE.md` per directory from cwd to git root, plus the global MEDHA file.
+Every file is guard-scanned and bounded; blocked files produce a visible notice.
+`$MEDHA_HOME/PERSONA.md` supplies the global K1 persona.
+
+Human surfaces: `medha memory list|show|search|edit|forget|pin|pending|approve`
+and TUI `/memory` with trust/age chips and provenance lookup.
 
 ---
 

@@ -26,6 +26,14 @@ pub struct DefaultPolicy {
     /// same as a workspace-relative target. `None` = workspace-agnostic scan
     /// (only relative + temp paths count as safe).
     workspace: Option<String>,
+    memory_write_approval: MemoryWriteApproval,
+}
+
+#[derive(Clone, Copy)]
+enum MemoryWriteApproval {
+    None,
+    UserScope,
+    All,
 }
 
 impl DefaultPolicy {
@@ -33,6 +41,7 @@ impl DefaultPolicy {
         Self {
             approve: HashSet::new(),
             workspace: None,
+            memory_write_approval: MemoryWriteApproval::UserScope,
         }
     }
 
@@ -45,6 +54,7 @@ impl DefaultPolicy {
         Self {
             approve: tools.into_iter().map(Into::into).collect(),
             workspace: None,
+            memory_write_approval: MemoryWriteApproval::UserScope,
         }
     }
 
@@ -56,6 +66,25 @@ impl DefaultPolicy {
         let s = s.trim_end_matches('/').to_string();
         self.workspace = (!s.is_empty()).then_some(s);
         self
+    }
+
+    pub fn with_memory_write_approval(mut self, mode: &str) -> Self {
+        self.memory_write_approval = match mode {
+            "none" => MemoryWriteApproval::None,
+            "all" => MemoryWriteApproval::All,
+            _ => MemoryWriteApproval::UserScope,
+        };
+        self
+    }
+
+    fn gates_memory(&self, intent: &ToolIntent) -> bool {
+        match self.memory_write_approval {
+            MemoryWriteApproval::None => false,
+            MemoryWriteApproval::All => true,
+            MemoryWriteApproval::UserScope => {
+                intent.args.get("scope").and_then(|value| value.as_str()) == Some("user")
+            }
+        }
     }
 }
 
@@ -106,9 +135,7 @@ impl Policy for DefaultPolicy {
             "shell.exec" => scan_command(intent, self.workspace.as_deref()),
             "git" => authorize_git(intent),
             "skill.save" => Decision::Human,
-            "memory.write" | "memory.update" | "memory.forget"
-                if intent.args.get("scope").and_then(|v| v.as_str()) == Some("user") =>
-            {
+            "memory.write" | "memory.update" | "memory.forget" if self.gates_memory(intent) => {
                 Decision::Human
             }
 
@@ -446,6 +473,18 @@ mod tests {
             let project = auth(&p, &intent(tool, json!({ "name": "n" })));
             assert!(matches!(project, Decision::Allow), "{tool} project scope rides Read radius");
         }
+    }
+
+    #[test]
+    fn memory_write_approval_mode_supports_none_and_all() {
+        let project = intent("memory.write", json!({ "name": "quoted-name", "scope": "project" }));
+        let user = intent("memory.write", json!({ "name": "quoted-name", "scope": "user" }));
+        let none = DefaultPolicy::default().with_memory_write_approval("none");
+        assert!(matches!(auth(&none, &project), Decision::Allow));
+        assert!(matches!(auth(&none, &user), Decision::Allow));
+        let all = DefaultPolicy::default().with_memory_write_approval("all");
+        assert!(matches!(auth(&all, &project), Decision::Human));
+        assert!(matches!(auth(&all, &user), Decision::Human));
     }
 
     #[test]

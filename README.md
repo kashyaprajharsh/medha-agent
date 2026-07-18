@@ -109,6 +109,14 @@ A **skill** is a reusable workflow (`SKILL.md` + scripts) that MEDHA can load on
 - Governed: `max_parallel_tools` (default 8 in `medha.lock`)
 - Per-tool-family semaphores (e.g., `web.*` ≤ 4 for rate limits)
 
+### 🗂 Typed Memory & Context
+
+- Frozen, token-bounded K3 recall with trust, confidence, age, and pin ranking
+- `memory.search` plus verbatim `sessions.search` over the event log
+- Kernel-owned trust/provenance; memory writes, edits, pins, and forgets remain replayable events
+- `medha memory list|show|search|edit|forget|pin|pending|approve` and TUI `/memory`
+- Guarded `MEDHA.md` → `AGENTS.md` → `CLAUDE.md` discovery, progressive subdirectory context, and global `PERSONA.md`
+
 ### ⏪ Time-Travel & Undo
 
 **`medha undo`** — CLI snapshot restore:
@@ -268,6 +276,8 @@ See [`medha.lock.example`](medha.lock.example) for all options.
 | **Sandbox** | ✅ | Host, Seatbelt, Landlock; container/ssh backends |
 | **Policy** | ✅ | Deny-first, shell scanner, autonomy dial |
 | **Context compaction** | ✅ | Two-phase (prune + LLM summarize) |
+| **Typed memory** | ✅ | Frozen K3 recall, FTS search, provenance, trust, rewind-aware projection |
+| **Context files + persona** | ✅ | Guarded startup/progressive discovery and global persona |
 | **Event log** | ✅ | SQLite WAL, hash-chained, FTS5 |
 | **Permissions** | ✅ | Ask-then-persist for out-of-workspace |
 | **`medha undo`** | ✅ | CLI snapshot restore |
@@ -289,7 +299,6 @@ See [`medha.lock.example`](medha.lock.example) for all options.
 | **Trace → skill distillation** | Phase D | ⬜ Not started | Auto-extract skills from successful traces |
 | **Eval-gated evolution** | Phase D | ⬜ Not started | Canary, win-rate tracking, promote/rollback |
 | **Native Anthropic/Gemini** | Phase 2 | ⬜ Not started | Multi-provider routing beyond OpenAI-compatible |
-| **Long-term memory** | Phase 4 | ⬜ Not started | Vector store, cross-session retrieval |
 | **Gateway server** | Phase 3 | ⬜ Not started | WebSocket + HTTP+SSE fallback, thin clients |
 
 > **Note on the spec:** Code comments reference a multi-volume design spec ("Vol 1-7", "§4.x") that is **not in this repository**. The roadmap here is reconstructed from the code's own phase language and the spec documents (stored separately). See `MEDHA_01_MASTER_SPEC.md` through `MEDHA_07_TERMINAL_UX.md` for the complete blueprint.

@@ -211,9 +211,23 @@ impl ToolRegistry {
     /// Persistent typed memory (D5): write/update/forget over the projection.
     /// Trust fields arrive kernel-injected at dispatch — see `memory_tools`.
     pub fn register_memory(&mut self, store: Arc<memory::MemoryProjection>) -> &mut Self {
-        self.register(Arc::new(memory_tools::MemoryWrite::new(
-            store.clone(),
+        self.register_memory_configured(
+            store,
             memory::recall::DEFAULT_K3_BUDGET_TOKENS,
+            memory::recall::DEFAULT_STALE_AFTER_DAYS,
+        )
+    }
+
+    pub fn register_memory_configured(
+        &mut self,
+        store: Arc<memory::MemoryProjection>,
+        budget_tokens: u32,
+        stale_after_days: u32,
+    ) -> &mut Self {
+        self.register(Arc::new(memory_tools::MemoryWrite::new_configured(
+            store.clone(),
+            budget_tokens,
+            stale_after_days,
         )));
         self.register(Arc::new(memory_tools::MemoryUpdate { store: store.clone() }));
         self.register(Arc::new(memory_tools::MemoryForget { store: store.clone() }));

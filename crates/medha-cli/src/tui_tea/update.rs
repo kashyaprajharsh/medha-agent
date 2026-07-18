@@ -740,7 +740,7 @@ pub(super) fn handle_key<P, L>(
                         tokio::spawn(async move {
                             let events = log.events(id).await;
                             let msgs = kernel::project_messages(&events);
-                            let _ = tx.send(TuiEvent::Resumed(id, msgs));
+                            let _ = tx.send(TuiEvent::Resumed(id, msgs, events));
                         });
                         model.picker = None;
                         model.push_notice(format!("(loading session {id} …)"));
@@ -772,6 +772,15 @@ pub(super) fn handle_key<P, L>(
                             model.push_notice("(rewinding …)");
                         }
                         None => model.picker = None,
+                    }
+                    return;
+                }
+                if let PickerKind::Memory(entries) = &picker.kind {
+                    if let Some(entry) = entries.get(picker.selected).cloned() {
+                        let name = entry.name.clone();
+                        model.picker = None;
+                        spawn_memory_provenance(entry, kernel, tx);
+                        model.push_notice(format!("(opening memory '{name}' provenance …)"));
                     }
                     return;
                 }
@@ -1642,13 +1651,19 @@ pub(super) fn handle_agent_event(
         }
         // A past session's events were replayed — swap session id, rebuild the
         // transcript (keeping the system message at [0]), and repaint the items.
-        TuiEvent::Resumed(id, msgs) => {
+        TuiEvent::Resumed(id, msgs, memory_events) => {
             session.id = id;
             // Preserve transcript[0] (the system prompt); replace the rest.
-            let system = transcript
+            let mut system = transcript
                 .first()
                 .cloned()
                 .unwrap_or_else(|| Message::system(""));
+            if memory_events
+                .first()
+                .is_some_and(|event| event.provenance.source == "fork")
+            {
+                refresh_branch_memory(model, &mut system, memory_events);
+            }
             transcript.clear();
             transcript.push(system);
             transcript.extend(msgs.clone());
@@ -1741,6 +1756,27 @@ pub(super) fn handle_agent_event(
                 model.picker = Some(Picker::new(PickerKind::Rewind(points)));
             }
         }
+        TuiEvent::MemoryProvenance(entry, provenance) => {
+            let mut notice = format!(
+                "memory {}  [{} · {}]\n{}\n\nclaim:\n{}",
+                entry.name,
+                entry.trust.as_str(),
+                entry.confidence.as_str(),
+                entry.description,
+                entry.claim
+            );
+            match provenance {
+                Some(event) => notice.push_str(&format!(
+                    "\n\nprovenance jump:\n  event {} · session {} · {}\n  {}",
+                    event.id,
+                    event.session_id,
+                    event.kind.as_str(),
+                    event.payload
+                )),
+                None => notice.push_str("\n\nprovenance event is not available locally"),
+            }
+            model.push_notice(notice);
+        }
         // A rewind finished. For conversation scopes `new_id` is the forked
         // branch: swap to it, rebuild the transcript (keeping the system message
         // at [0]), and drop the chosen prompt back into the input box to edit or
@@ -1750,6 +1786,7 @@ pub(super) fn handle_agent_event(
         TuiEvent::Rewound {
             new_id,
             msgs,
+            memory_events,
             rolled,
             scope,
             prefill,
@@ -1765,10 +1802,11 @@ pub(super) fn handle_agent_event(
             };
             if let Some(id) = new_id {
                 session.id = id;
-                let system = transcript
+                let mut system = transcript
                     .first()
                     .cloned()
                     .unwrap_or_else(|| Message::system(""));
+                refresh_branch_memory(model, &mut system, memory_events);
                 transcript.clear();
                 transcript.push(system);
                 transcript.extend(msgs.clone());
@@ -1858,6 +1896,7 @@ enum SlashAction {
     Resume,
     Rewind,
     Clear,
+    Memory(String),
     SkillPicker,
     LoadSkill(String),
     SkillInfo(String),
@@ -1898,6 +1937,9 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "resume" => SlashAction::Resume,
         "rewind" => SlashAction::Rewind,
         "clear" => SlashAction::Clear,
+        c if c.strip_prefix("memory").is_some_and(is_cmd_boundary) => {
+            SlashAction::Memory(c.strip_prefix("memory").unwrap_or("").trim().to_string())
+        }
         "skill" => SlashAction::SkillPicker,
         "model" => SlashAction::ModelPicker,
         "model add" => SlashAction::AddModel,
@@ -1995,6 +2037,7 @@ fn dispatch_slash<P, L>(
         SlashAction::Resume => start_resume(model, kernel, tx),
         SlashAction::Rewind => start_rewind(model, kernel, session, tx),
         SlashAction::Clear => do_clear(model, session, transcript),
+        SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
         SlashAction::SkillPicker => open_skill_picker(model),
         SlashAction::LoadSkill(name) => load_skill_by_name(model, &name, transcript),
         SlashAction::SkillInfo(name) => show_skill_info(model, &name),
@@ -2017,6 +2060,87 @@ fn dispatch_slash<P, L>(
         SlashAction::LockSkills => lock_skills(model),
         SlashAction::SyncSkills => sync_skills(model, tx),
         SlashAction::Other => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
+    }
+}
+
+fn open_memory<L: EventLog + 'static>(
+    model: &mut Model,
+    name: &str,
+    kernel: &Arc<Kernel<impl Provider + 'static, L>>,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    let Some(store) = model.memory.as_ref().filter(|_| model.memory_enabled) else {
+        model.push_notice("memory: unavailable");
+        return;
+    };
+    if name.is_empty() {
+        let entries = store.list().unwrap_or_default();
+        if entries.is_empty() {
+            model.push_notice("memory: no entries");
+        } else {
+            model.picker = Some(Picker::new(PickerKind::Memory(entries)));
+        }
+        return;
+    }
+
+    let entry = store
+        .get(memory::Scope::Project, name)
+        .ok()
+        .flatten()
+        .or_else(|| store.get(memory::Scope::User, name).ok().flatten());
+    let Some(entry) = entry else {
+        model.push_notice(format!("memory '{name}' not found"));
+        return;
+    };
+    spawn_memory_provenance(entry, kernel, tx);
+    model.push_notice(format!("(opening memory '{name}' provenance …)"));
+}
+
+fn spawn_memory_provenance<L: EventLog + 'static>(
+    entry: memory::MemoryEntry,
+    kernel: &Arc<Kernel<impl Provider + 'static, L>>,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    let log = kernel.log.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let mut provenance = None;
+        for session_id in &entry.sessions {
+            let events = log.events(*session_id).await;
+            if let Some(event) = events
+                .into_iter()
+                .find(|event| entry.provenance.contains(&event.id))
+            {
+                provenance = Some(event);
+                break;
+            }
+        }
+        let _ = tx.send(TuiEvent::MemoryProvenance(Box::new(entry), provenance));
+    });
+}
+
+fn refresh_branch_memory(
+    model: &Model,
+    system: &mut Message,
+    events: Vec<kernel::Event>,
+) {
+    let Some(store) = model.memory.as_ref().filter(|_| model.memory_enabled) else {
+        return;
+    };
+    if store.rebuild_project(events.into_iter()).is_err() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+    if let Ok(block) = memory::recall::compile_k3_configured(
+        store,
+        model.memory_budget_tokens,
+        now,
+        model.memory_stale_after_days,
+    ) {
+        system.content = memory::recall::replace_k3(&system.content, &block);
     }
 }
 
@@ -2127,7 +2251,7 @@ fn spawn_rewind<L: EventLog + 'static>(
 
         // Conversation rewind: fork before the prompt (non-destructive), replay
         // the kept history, and prefill the prompt for editing/re-sending.
-        let (new_id, msgs, prefill) = if scope.touches_conversation() {
+        let (new_id, msgs, memory_events, prefill) = if scope.touches_conversation() {
             let new_id = match log.fork(session_id, at_event).await {
                 Ok(id) => id,
                 Err(_) => return,
@@ -2137,17 +2261,15 @@ fn spawn_rewind<L: EventLog + 'static>(
                 .and_then(|e| e.payload.get("text"))
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
-            (
-                Some(new_id),
-                kernel::project_messages(&events[..idx]),
-                prefill,
-            )
+            let memory_events = log.events(new_id).await;
+            (Some(new_id), kernel::project_messages(&events[..idx]), memory_events, prefill)
         } else {
-            (None, Vec::new(), None)
+            (None, Vec::new(), Vec::new(), None)
         };
         let _ = tx.send(TuiEvent::Rewound {
             new_id,
             msgs,
+            memory_events,
             rolled,
             scope,
             prefill,
@@ -3357,6 +3479,11 @@ mod fix_tests {
         assert_eq!(classify_slash("skills"), SlashAction::Other);
         assert_eq!(classify_slash("model"), SlashAction::ModelPicker);
         assert_eq!(classify_slash("model add"), SlashAction::AddModel);
+        assert_eq!(classify_slash("memory"), SlashAction::Memory(String::new()));
+        assert_eq!(
+            classify_slash("memory quoted-fact"),
+            SlashAction::Memory("quoted-fact".into())
+        );
         // `/model <name>` switches directly, matching other agent CLIs.
         assert_eq!(
             classify_slash("model fast-local"),
@@ -3415,6 +3542,41 @@ mod fix_tests {
             classify_slash("skill adder"),
             SlashAction::LoadSkill("adder".into())
         );
+    }
+
+    #[test]
+    fn memory_picker_shows_trust_age_and_provenance_action() {
+        let dir = std::env::temp_dir().join(format!("medha-memory-notice-{}", ulid::Ulid::new()));
+        let store = memory::MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        store
+            .apply(&memory::MemoryOp::Write {
+                entry: memory::MemoryEntry {
+                    name: "quoted-fact".into(),
+                    claim: "the 'quoted' claim".into(),
+                    description: "a hyphenated hook".into(),
+                    kind: memory::MemoryKind::Project,
+                    scope: memory::Scope::Project,
+                    trust: kernel::TrustLabel::User,
+                    confidence: memory::ConfidenceRung::UserStated,
+                    provenance: vec![ulid::Ulid::new()],
+                    sessions: vec![ulid::Ulid::new()],
+                    version: 1,
+                    pinned: true,
+                    links: vec![],
+                    created: now - 2.0 * 86_400.0,
+                    updated: now - 2.0 * 86_400.0,
+                },
+            })
+            .unwrap();
+        let picker = PickerKind::Memory(store.list().unwrap());
+        assert!(picker.title().contains("jump to provenance"));
+        let labels = picker.labels();
+        assert!(labels[0].contains("[user · 2d · pinned]"));
+        assert!(labels[0].contains("quoted-fact — a hyphenated hook"));
     }
 
     #[test]

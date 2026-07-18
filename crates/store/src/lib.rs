@@ -349,6 +349,38 @@ impl SqliteLog {
         Ok(out)
     }
 
+    pub fn all_events(&self) -> Result<Vec<Event>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, parent_id, kind, payload, trust, provenance, prev_hash, ts
+                 FROM events ORDER BY rowid ASC",
+            )
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Row {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    parent_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    payload: row.get(4)?,
+                    trust: row.get(5)?,
+                    provenance: row.get(6)?,
+                    prev_hash: row.get(7)?,
+                    ts: row.get(8)?,
+                })
+            })
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        Ok(rows
+            .filter_map(Result::ok)
+            .filter_map(Row::into_event)
+            .collect())
+    }
+
     /// Search text-bearing events. Interactive sessions rank ahead of
     /// automation, which remains searchable rather than disappearing.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SessionSearchHit>, StoreError> {
@@ -727,6 +759,7 @@ mod tests {
         assert_eq!(bookends.len(), 2);
         assert_eq!(bookends[0].id, first.id);
         assert_eq!(bookends[1].payload["text"], "Anything else?");
+        assert_eq!(log.all_events().unwrap().len(), 3);
     }
 
     #[tokio::test]

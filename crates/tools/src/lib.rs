@@ -51,6 +51,8 @@ pub enum ToolError {
     Args(String),
     #[error("{0}")]
     Failed(String),
+    #[error("structured tool error")]
+    Structured(Value),
 }
 
 #[async_trait]
@@ -209,7 +211,10 @@ impl ToolRegistry {
     /// Persistent typed memory (D5): write/update/forget over the projection.
     /// Trust fields arrive kernel-injected at dispatch — see `memory_tools`.
     pub fn register_memory(&mut self, store: Arc<memory::MemoryProjection>) -> &mut Self {
-        self.register(Arc::new(memory_tools::MemoryWrite { store: store.clone() }));
+        self.register(Arc::new(memory_tools::MemoryWrite::new(
+            store.clone(),
+            memory::recall::DEFAULT_K3_BUDGET_TOKENS,
+        )));
         self.register(Arc::new(memory_tools::MemoryUpdate { store: store.clone() }));
         self.register(Arc::new(memory_tools::MemoryForget { store: store.clone() }));
         self.register(Arc::new(memory_tools::MemorySearch { store }));
@@ -372,6 +377,11 @@ impl Executor for ToolRegistry {
         };
         match result {
             Ok(payload) => Observation::ok(&intent.id, payload),
+            Err(ToolError::Structured(payload)) => Observation {
+                intent_id: intent.id.clone(),
+                status: kernel::ObsStatus::Error,
+                payload,
+            },
             Err(e) => Observation::error(&intent.id, e.to_string()),
         }
     }

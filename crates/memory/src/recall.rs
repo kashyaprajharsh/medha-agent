@@ -11,7 +11,7 @@ fn age_days(entry: &MemoryEntry, now: f64) -> u32 {
     ((now - entry.updated).max(0.0) / 86_400.0).floor() as u32
 }
 
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -43,6 +43,20 @@ fn line(entry: &MemoryEntry, now: f64, description: &str) -> String {
     )
 }
 
+pub(crate) fn index_eligible(entry: &MemoryEntry, now: f64, stale_after_days: u32) -> bool {
+    entry.pinned
+        || entry.confidence != ConfidenceRung::Candidate
+        || age_days(entry, now) <= stale_after_days
+}
+
+pub(crate) fn entry_index_tokens(
+    entry: &MemoryEntry,
+    now: f64,
+    counter: &dyn TokenCounter,
+) -> u32 {
+    counter.count(&line(entry, now, &one_line(&entry.description)))
+}
+
 fn render(
     selected: &[(MemoryEntry, String)],
     budget_tokens: u32,
@@ -71,6 +85,23 @@ fn render(
         usage = counted;
     }
     block
+}
+
+pub(crate) fn full_index_tokens(
+    entries: &[MemoryEntry],
+    budget_tokens: u32,
+    now: f64,
+    counter: &dyn TokenCounter,
+) -> u32 {
+    let selected = entries
+        .iter()
+        .cloned()
+        .map(|entry| {
+            let description = one_line(&entry.description);
+            (entry, description)
+        })
+        .collect::<Vec<_>>();
+    counter.count(&render(&selected, budget_tokens, now, counter))
 }
 
 fn fit_pinned_description(
@@ -115,11 +146,7 @@ fn compile_with_counter(
         return Ok(String::new());
     }
     let mut entries = store.list()?;
-    entries.retain(|entry| {
-        entry.pinned
-            || entry.confidence != ConfidenceRung::Candidate
-            || age_days(entry, now) <= DEFAULT_STALE_AFTER_DAYS
-    });
+    entries.retain(|entry| index_eligible(entry, now, DEFAULT_STALE_AFTER_DAYS));
     entries.sort_by(|a, b| {
         b.pinned
             .cmp(&a.pinned)

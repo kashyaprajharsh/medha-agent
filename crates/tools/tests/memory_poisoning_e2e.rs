@@ -212,7 +212,7 @@ async fn clean_user_window_writes_user_stated_memory() {
         vec![Block::Text("noted".into())],
     ]);
     let session = Session::new();
-    k.run_session(&session, vec![Message::user("I prefer pytest, remember that")], Budget::default(), &NoopSink, None)
+    let (messages, _) = k.run_session(&session, vec![Message::user("I prefer pytest, remember that")], Budget::default(), &NoopSink, None)
         .await
         .unwrap();
 
@@ -220,4 +220,10 @@ async fn clean_user_window_writes_user_stated_memory() {
     assert_eq!(e.trust, TrustLabel::User, "nothing below user trust entered the window");
     assert_eq!(e.confidence, ConfidenceRung::UserStated);
     assert!(!e.provenance.is_empty(), "the user message is the evidence");
+    let tool_payload = messages
+        .iter()
+        .find(|message| message.role == kernel::Role::Tool)
+        .expect("memory tool observation reaches the model");
+    assert!(!tool_payload.content.contains("applied"));
+    assert!(!tool_payload.content.contains("The user prefers pytest"));
 }

@@ -510,12 +510,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
             // Append in deterministic (request) order; surface each result to the
             // sink (diffs, errors) and feed it back to the model.
-            for (id, tool, obs) in results {
+            for (id, tool, mut obs) in results {
                 // Label web-tool output as untrusted content (P7): a fetched
                 // page must not be treated like a local file read.
                 let trust = match self.executor.category(&tool) {
                     Some(ToolCategory::Web) => TrustLabel::Web,
                     _ => TrustLabel::Tool,
+                };
+                let applied = if matches!(obs.status, crate::types::ObsStatus::Ok)
+                    && tool.starts_with("memory.")
+                {
+                    obs.payload
+                        .as_object_mut()
+                        .and_then(|payload| payload.remove("applied"))
+                } else {
+                    None
                 };
                 let e = self
                     .log
@@ -533,9 +542,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 // durable record the projection rebuilds from (I1). The tool
                 // echoes the exact op it applied under `applied`; opaque here.
                 if ok && tool.starts_with("memory.") {
-                    if let Some(op) = obs.payload.get("applied").filter(|o| o.is_object()) {
+                    if let Some(op) = applied.filter(|op| op.is_object()) {
                         self.log
-                            .append(Event::memory_write(session, op.clone()))
+                            .append(Event::memory_write(session, op))
                             .await?;
                     }
                 }

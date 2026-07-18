@@ -3,6 +3,7 @@
 //! public seam so the substrate stays swappable (P8) — recall/tools/CLI code
 //! against the trait, not `MemoryProjection` directly.
 
+pub mod consolidate;
 pub mod entry;
 pub mod projection;
 pub mod recall;

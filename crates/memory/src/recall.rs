@@ -3,7 +3,10 @@
 use crate::{ConfidenceRung, MemoryEntry, MemoryError, MemoryProjection, Scope};
 use context::{BpeCounter, TokenCounter};
 
-pub const DEFAULT_K3_BUDGET_TOKENS: u32 = 1_200;
+/// Generous by default so the whole working set stays *in the prompt* (recall
+/// is injection, not a model-initiated search) — overflow to `memory.search`
+/// should be the exception, not the norm. Still tiny against a modern window.
+pub const DEFAULT_K3_BUDGET_TOKENS: u32 = 3_000;
 pub const DEFAULT_STALE_AFTER_DAYS: u32 = 30;
 pub const MEMORY_MARKER: &str = "## Memory";
 

@@ -547,7 +547,7 @@ medha memory search <words> # merged; project wins a same-name collision
 ```toml
 [memory]
 enabled = true
-k3_budget_tokens = 1200
+k3_budget_tokens = 3000
 write_approval = "user-scope" # "none" | "user-scope" | "all"
 stale_after_days = 30
 

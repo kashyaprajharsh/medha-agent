@@ -31,7 +31,10 @@ emergency_ratio = 0.98
 
 [memory]
 enabled = true
-k3_budget_tokens = 1200
+# Token budget for the memory index kept *in the prompt* every turn (recall is
+# injection, not a model-run search). Generous so the working set stays fully
+# in-context; raise it if you keep many memories, lower it to save prompt space.
+k3_budget_tokens = 3000
 write_approval = "user-scope" # "none" | "user-scope" | "all"
 stale_after_days = 30
 

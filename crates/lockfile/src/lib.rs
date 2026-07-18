@@ -100,7 +100,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            k3_budget_tokens: 1_200,
+            k3_budget_tokens: 3_000,
             write_approval: "user-scope".into(),
             stale_after_days: 30,
         }
@@ -583,7 +583,7 @@ mod tests {
         );
         assert!(lock.verify.command.is_none());
         assert!(lock.memory.enabled);
-        assert_eq!(lock.memory.k3_budget_tokens, 1_200);
+        assert_eq!(lock.memory.k3_budget_tokens, 3_000);
         assert_eq!(lock.memory.write_approval, "user-scope");
         assert_eq!(lock.memory.stale_after_days, 30);
         assert!(lock.context_files.enabled);

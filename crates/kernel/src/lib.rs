@@ -26,7 +26,7 @@ pub use context::{CompileResult, ContextEngine, DiscoveredContext, ProgressiveCo
 pub use errors::KernelError;
 pub use events::{
     Event, EventKind, EventLog, FileRollback, InMemoryLog, Provenance, SessionMeta, cut_index,
-    project_messages, rollback_plan,
+    project_messages, project_ordered_messages, rollback_plan,
 };
 pub use executor::{BackgroundTask, Executor};
 pub use gate::{Approval, AutoDeny, HumanGate};
@@ -34,12 +34,15 @@ pub use interrupts::{Interrupt, InterruptHandle, InterruptQueue};
 pub use kernel_loop::{DEFAULT_MAX_PARALLEL_TOOLS, Kernel, StopReason};
 pub use policy::{AllowAll, Policy};
 pub use provider::{
-    Provider, ProviderCaps, ProviderError, ReasoningConfig, ReasoningEffort, ToolCallStrategy,
+    InputTokenCount, ModelLimits, PreparedModelRequest, Protocol, Provider, ProviderCaps,
+    ProviderError, ProviderFailure, ReasoningConfig, ReasoningEffort, ReasoningSupport,
+    TokenAccountingMode, TokenCountError, TokenCountQuality, ToolCallStrategy,
 };
 pub use sink::{NullSink, StreamSink};
 pub use types::{
-    AutonomyLevel, BlastRadius, Block, CompiledContext, Containment, Decision, Message, ObsStatus,
-    Observation, Pricing, Role, Session, ToolCategory, ToolIntent, ToolSpec, TrustLabel,
-    TurnResult, Usage,
+    AutonomyLevel, BlastRadius, Block, CompiledContext, Containment, ContentPart, Decision,
+    LegacyMessageError, MediaPart, MediaSource, Message, ModelMessage, ObsStatus, Observation,
+    Pricing, ProviderState, ReasoningPart, Role, Session, TextPart, ToolCallPart, ToolCategory,
+    ToolIntent, ToolResultPart, ToolSpec, TrustLabel, TurnResult, Usage,
 };
 pub use verify::{NoVerify, Verifier, VerifyReport};

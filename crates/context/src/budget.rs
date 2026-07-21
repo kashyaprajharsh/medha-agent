@@ -1,40 +1,39 @@
-//! Token budget derived from the model's context window (§4.3).
+//! Input budget derived from resolved model limits and count quality (§4.3).
 //!
-//! usable = max_ctx − reserved_output − safety_buffer
-//!
-//! The window must reserve room for the model's own output plus a safety margin
-//! before any input history is allotted. A *fixed* absolute reserve does not
-//! scale: on a small open-weight window (e.g. 8k) a multi-tens-of-thousands
-//! reserve goes negative and zeroes out usable context entirely. We therefore
-//! reserve the *lesser* of an absolute cap or a fraction of the window, so small
-//! windows stay workable while large windows still get generous headroom. This
-//! keeps the harness model-agnostic across the full open-to-frontier range.
+//! Output reservation is handled by `ModelLimits::input_allowance`; this type
+//! never invents a percentage of the total window. Only non-authoritative
+//! preflight sources receive a documented safety margin.
+
+use kernel::TokenCountQuality;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextBudget {
-    pub max_ctx: u32,
-    pub reserved_output: u32,
+    pub input_limit: u32,
     pub safety_buffer: u32,
 }
 
 impl ContextBudget {
-    /// Absolute caps (used for large windows). Below them we scale by fraction.
-    pub const MAX_RESERVED_OUTPUT: u32 = 32_000;
-    pub const MAX_SAFETY_BUFFER: u32 = 20_000;
+    const PROVIDER_ESTIMATE_MARGIN_BPS: u32 = 200; // 2%
+    const LOCAL_ESTIMATE_MARGIN_BPS: u32 = 1_000; // 10%
 
-    /// Derive a budget from a known context window, scaling reservations so a
-    /// small (open-source) window is never reserved into the ground.
-    pub fn from_max_ctx(max_ctx: u32) -> Self {
-        let reserved_output = (max_ctx / 4).min(Self::MAX_RESERVED_OUTPUT); // ≤25% or 32k
-        let safety_buffer = (max_ctx / 10).min(Self::MAX_SAFETY_BUFFER); //   ≤10% or 20k
-        Self { max_ctx, reserved_output, safety_buffer }
+    pub fn from_input_limit(input_limit: u32, quality: TokenCountQuality) -> Self {
+        let basis_points = match quality {
+            TokenCountQuality::Authoritative => 0,
+            TokenCountQuality::ProviderEstimate => Self::PROVIDER_ESTIMATE_MARGIN_BPS,
+            TokenCountQuality::LocalEstimate => Self::LOCAL_ESTIMATE_MARGIN_BPS,
+        };
+        let safety_buffer = input_limit.saturating_mul(basis_points) / 10_000;
+        Self { input_limit, safety_buffer }
+    }
+
+    /// Backward-compatible shorthand for callers doing local estimation.
+    pub fn from_max_ctx(input_limit: u32) -> Self {
+        Self::from_input_limit(input_limit, TokenCountQuality::LocalEstimate)
     }
 
     /// Tokens available for input history after reservations.
     pub fn usable(&self) -> u32 {
-        self.max_ctx
-            .saturating_sub(self.reserved_output)
-            .saturating_sub(self.safety_buffer)
+        self.input_limit.saturating_sub(self.safety_buffer)
     }
 }
 
@@ -43,28 +42,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn large_window_uses_absolute_caps() {
-        let b = ContextBudget::from_max_ctx(200_000);
-        assert_eq!(b.reserved_output, 32_000);
-        assert_eq!(b.safety_buffer, 20_000);
-        assert_eq!(b.usable(), 148_000);
+    fn authoritative_count_uses_the_full_resolved_input_allowance() {
+        let b = ContextBudget::from_input_limit(200_000, TokenCountQuality::Authoritative);
+        assert_eq!(b.safety_buffer, 0);
+        assert_eq!(b.usable(), 200_000);
     }
 
     #[test]
-    fn small_open_window_stays_usable() {
-        // A fixed absolute reserve (tens of thousands) would drive usable
-        // context negative here; fractional scaling must keep it workable.
+    fn local_estimate_uses_a_source_specific_margin() {
         let b = ContextBudget::from_max_ctx(8_000);
-        assert_eq!(b.reserved_output, 2_000); // 8000/4
-        assert_eq!(b.safety_buffer, 800); //    8000/10
-        assert_eq!(b.usable(), 5_200); //        still room to work
+        assert_eq!(b.safety_buffer, 800);
+        assert_eq!(b.usable(), 7_200);
     }
 
     #[test]
-    fn mid_window_scales_proportionally() {
-        let b = ContextBudget::from_max_ctx(32_768);
-        assert_eq!(b.reserved_output, 8_192);
-        assert_eq!(b.safety_buffer, 3_276);
-        assert!(b.usable() > 20_000);
+    fn provider_estimate_has_a_smaller_margin_than_local_tokenization() {
+        let provider =
+            ContextBudget::from_input_limit(100_000, TokenCountQuality::ProviderEstimate);
+        let local = ContextBudget::from_max_ctx(100_000);
+        assert_eq!(provider.usable(), 98_000);
+        assert_eq!(local.usable(), 90_000);
     }
 }

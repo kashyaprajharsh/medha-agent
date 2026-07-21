@@ -40,15 +40,14 @@ impl SkillJudge for LlmJudge {
         let ctx = CompiledContext {
             model: String::new(),
             messages: vec![Message::system(system), Message::user(user)],
+            ordered: None,
             tools: Vec::new(),
         };
-        let text = tokio::time::timeout(
-            JUDGE_TIMEOUT,
-            collect_text(self.provider.as_ref(), &ctx),
-        )
-        .await
-        .map_err(|_| "security review timed out".to_string())??;
-        judge::parse_verdict(&text).ok_or_else(|| "security review gave no clear verdict".to_string())
+        let text = tokio::time::timeout(JUDGE_TIMEOUT, collect_text(self.provider.as_ref(), &ctx))
+            .await
+            .map_err(|_| "security review timed out".to_string())??;
+        judge::parse_verdict(&text)
+            .ok_or_else(|| "security review gave no clear verdict".to_string())
     }
 }
 

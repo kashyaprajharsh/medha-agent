@@ -422,7 +422,8 @@ pub struct UiConfig {
 pub struct ReasoningLockConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// "low" | "medium" | "high" — unrecognized/absent values map to `None`.
+    /// "minimal" | "low" | "medium" | "high" — unrecognized/absent values
+    /// map to `None`.
     #[serde(default)]
     pub effort: Option<String>,
     /// SSE streaming. Absent/true → stream token-by-token (the norm). `false` →
@@ -436,6 +437,7 @@ pub struct ReasoningLockConfig {
 impl ReasoningLockConfig {
     pub fn to_config(&self) -> kernel::ReasoningConfig {
         let effort = match self.effort.as_deref() {
+            Some("minimal") => Some(kernel::ReasoningEffort::Minimal),
             Some("low") => Some(kernel::ReasoningEffort::Low),
             Some("medium") => Some(kernel::ReasoningEffort::Medium),
             Some("high") => Some(kernel::ReasoningEffort::High),
@@ -672,6 +674,12 @@ mod tests {
         let cfg = lock.reasoning.to_config();
         assert_eq!(cfg.enabled, Some(true));
         assert_eq!(cfg.effort, Some(kernel::ReasoningEffort::Medium));
+
+        let minimal = MedhaLock::parse("[reasoning]\neffort = \"minimal\"\n")
+            .unwrap()
+            .reasoning
+            .to_config();
+        assert_eq!(minimal.effort, Some(kernel::ReasoningEffort::Minimal));
 
         // An unrecognized effort string degrades to None, not a panic/guess.
         let toml2 = "[reasoning]\neffort = \"extreme\"\n";

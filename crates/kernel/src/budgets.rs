@@ -68,7 +68,13 @@ pub struct Governor {
 
 impl Governor {
     pub fn new(budget: Budget) -> Self {
-        Self { budget, start: Instant::now(), turns: 0, tokens: 0, cost_usd: 0.0 }
+        Self {
+            budget,
+            start: Instant::now(),
+            turns: 0,
+            tokens: 0,
+            cost_usd: 0.0,
+        }
     }
 
     /// Returns `Some(reason)` if any ceiling is reached — stop before the turn.
@@ -115,7 +121,10 @@ mod tests {
 
     #[test]
     fn turn_cap_trips() {
-        let mut g = Governor::new(Budget { max_turns: Some(2), ..Budget::default() });
+        let mut g = Governor::new(Budget {
+            max_turns: Some(2),
+            ..Budget::default()
+        });
         assert_eq!(g.check(), None);
         g.record_turn();
         assert_eq!(g.check(), None);
@@ -141,7 +150,11 @@ mod tests {
     fn cost_budget_trips_with_real_pricing() {
         // P1-12: with pricing resolved, recorded cost accrues and the cost
         // ceiling actually trips (it could never trip while cost was 0.0).
-        let p = crate::types::Pricing { input_per_mtok: 3.0, output_per_mtok: 15.0, indicative: false };
+        let p = crate::types::Pricing {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            indicative: false,
+        };
         let per_turn = p.cost(100_000, 20_000); // 0.3 + 0.3 = $0.60
         assert!((per_turn - 0.6).abs() < 1e-9);
         let mut g = Governor::new(Budget {

@@ -3,17 +3,26 @@
 //! works with zero new code. Translates to/from the canonical `Block` so the
 //! kernel stays vendor-neutral (§4.4).
 
+use crate::protocol::{gemini_interactions, openai_chat};
+use crate::transport::http;
+use crate::{AuthKind, ProviderProfile};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use kernel::{
-    Block, CompiledContext, Message, Provider, ProviderCaps, ProviderError, ReasoningConfig,
-    ReasoningEffort, Role, ToolCallStrategy, ToolIntent, Usage,
+    Block, CompiledContext, InputTokenCount, ModelLimits, PreparedModelRequest, Protocol, Provider,
+    ProviderCaps, ProviderError, ReasoningConfig, ReasoningEffort, ReasoningSupport,
+    TokenAccountingMode, TokenCountError, TokenCountQuality, ToolCallStrategy,
 };
-use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use kernel::{Message, Role};
+use serde::Deserialize;
 use std::sync::Mutex;
 
-pub struct OpenAiCompat {
+/// Compatibility export retained for existing configuration code.
+pub use crate::profile::TokenCounter as OpenAiTokenCounter;
+
+pub struct ProviderClient {
     /// Active connection is mutable between turns so an interactive surface can
     /// switch a saved model profile without rebuilding the kernel. A stream
     /// snapshots it before its first await, so one request always uses exactly
@@ -29,85 +38,118 @@ pub struct OpenAiCompat {
     /// request, whole response yielded at once. Same interior-mutability reason
     /// as `reasoning`.
     streaming: std::sync::atomic::AtomicBool,
-    /// Which exact-token-count route this host offers, discovered on first use
-    /// (see `count_tokens`). Cached so we probe once, not every turn.
-    count_probe: Mutex<ProbeState>,
 }
+
+/// Compatibility name retained while callers migrate to the protocol/profile
+/// client introduced by the provider refactor.
+pub type OpenAiCompat = ProviderClient;
 
 #[derive(Clone)]
 struct Connection {
-    base_url: String,
-    api_key: String,
-    model: String,
-    max_ctx: Option<u32>,
+    profile: ProviderProfile,
+    credential: String,
 }
 
-/// A host's exact-token-count route, if any. Hosts differ: a direct vLLM serves
-/// `/tokenize`; some gateways expose only an Anthropic-style
-/// `/messages/count_tokens`; Ollama offers neither. So we discover, never assume.
-#[derive(Clone, Copy, PartialEq)]
-enum CountRoute {
-    /// vLLM-native `POST {host}/tokenize` (applies the model's chat template).
-    VllmTokenize,
-    /// Anthropic-style `POST {base_url}/messages/count_tokens`.
-    Anthropic,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum ProbeState {
-    /// Not yet probed.
-    Unknown,
-    /// Probed — no exact-count route on this host (fall back to a local
-    /// estimate). Carries the calls since the failed probe: after
-    /// `REPROBE_AFTER` we probe again (K16 — a transient startup failure must
-    /// not disable exact counting for the whole process).
-    Unavailable(u32),
-    /// Probed — this route works.
-    Route(CountRoute),
-}
-
-/// Re-try a failed count-tokens probe after this many skipped calls (K16).
-const REPROBE_AFTER: u32 = 20;
-
-/// Add Authorization only when a credential exists. Accepting a pasted
-/// `Bearer …` value here also prevents a malformed double scheme at the final
-/// network boundary, regardless of which configuration path supplied it.
-fn with_bearer(request: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
-    let key = api_key.trim();
-    if key.is_empty() || key.eq_ignore_ascii_case("bearer") {
-        return request;
+/// Normalise a reasoning request before validation/storage: an explicit
+/// "reasoning on" with no chosen effort defaults to `Minimal`. This matches
+/// Gemini's own guidance (its latest models can't disable thinking; `minimal`
+/// is the lowest level, mapping to `thinking_level: minimal`) and — critically —
+/// makes the canonical config portable. `open-ai-chat` requires an explicit
+/// effort whenever reasoning is on, so carrying a concrete level lets a
+/// Gemini → openai-chat model switch succeed instead of failing validation.
+/// `Auto` (`enabled: None`) is left untouched: it still omits controls entirely
+/// so the server/model default applies.
+fn normalize_reasoning(mut config: ReasoningConfig) -> ReasoningConfig {
+    if config.enabled == Some(true) && config.effort.is_none() {
+        config.effort = Some(ReasoningEffort::Minimal);
     }
-    let key = match key.split_once(char::is_whitespace) {
-        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
-        _ => key,
-    };
-    if key.is_empty() {
-        request
-    } else {
-        request.bearer_auth(key)
-    }
+    config
 }
 
-impl OpenAiCompat {
+fn validate_reasoning(
+    profile: &ProviderProfile,
+    config: &ReasoningConfig,
+) -> Result<(), ProviderError> {
+    if config == &ReasoningConfig::default() {
+        return Ok(());
+    }
+    if profile.reasoning == ReasoningSupport::Unsupported {
+        return Err(ProviderError::Decode(
+            "reasoning controls are disabled by this model profile".into(),
+        ));
+    }
+    match profile.protocol {
+        Protocol::OpenAiChat => {
+            // Disable is portable here: compatible servers (vLLM/SGLang) accept
+            // `reasoning_effort: "none"` (LLM_REFACTOR translation matrix).
+            // Enabling still needs a concrete level, which normalize supplies.
+            if config.enabled == Some(true) && config.effort.is_none() {
+                return Err(ProviderError::Decode(
+                    "open-ai-chat cannot enable reasoning without an explicit effort".into(),
+                ));
+            }
+        }
+        Protocol::GeminiInteractions => {
+            if config.enabled == Some(false) {
+                return Err(ProviderError::Decode(
+                    "gemini-interactions v1 has no portable thinking-disable control; use server default instead"
+                        .into(),
+                ));
+            }
+        }
+        Protocol::OpenAiResponses | Protocol::AnthropicMessages => {}
+    }
+    Ok(())
+}
+
+fn protocol_is_implemented(protocol: Protocol) -> bool {
+    matches!(
+        protocol,
+        Protocol::OpenAiChat | Protocol::GeminiInteractions
+    )
+}
+
+impl ProviderClient {
+    /// Construct the inert provider used while the interactive first-run model
+    /// setup is open. This is deliberately separate from [`Self::from_profile`]:
+    /// persisted and environment-derived profiles must always pass validation.
+    pub fn unconfigured() -> Self {
+        Self::with_connection(Connection {
+            profile: ProviderProfile::openai_chat("", "", AuthKind::None),
+            credential: String::new(),
+        })
+    }
+
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let base_url = base_url.into();
+        let api_key = api_key.into();
+        let model = model.into();
+        let auth = if api_key.trim().is_empty() {
+            AuthKind::None
+        } else {
+            AuthKind::Bearer
+        };
+        Self::with_connection(Connection {
+            profile: ProviderProfile::openai_chat(base_url, model, auth),
+            credential: api_key,
+        })
+    }
+
+    fn with_connection(connection: Connection) -> Self {
+        let max_ctx = connection.profile.max_ctx;
         Self {
-            connection: Mutex::new(Connection {
-                base_url: base_url.into(),
-                api_key: api_key.into(),
-                model: model.into(),
-                max_ctx: None,
-            }),
+            connection: Mutex::new(connection),
             http: reqwest::Client::new(),
             caps: ProviderCaps {
                 vision: false,
                 caching: false,
                 // Unknown until discovered/configured — never a fabricated
                 // constant (it would mislead the context compiler, §4.3).
-                max_ctx: None,
+                max_ctx,
                 // Initial selection only, not an asserted capability. The
                 // tool-calling ladder (§4.4) owns the runtime contract: it
                 // attempts the selected strategy and downgrades on failure so a
@@ -118,13 +160,54 @@ impl OpenAiCompat {
             },
             reasoning: Mutex::new(ReasoningConfig::default()),
             streaming: std::sync::atomic::AtomicBool::new(true),
-            count_probe: Mutex::new(ProbeState::Unknown),
         }
+    }
+
+    /// Construct the runtime client from an explicit deployment profile while
+    /// keeping its credential outside the serializable profile value.
+    pub fn from_profile(
+        profile: ProviderProfile,
+        credential: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        profile.validate().map_err(ProviderError::Decode)?;
+        if !protocol_is_implemented(profile.protocol) {
+            return Err(ProviderError::Decode(format!(
+                "ProviderClient does not implement {}",
+                profile.protocol.as_str()
+            )));
+        }
+        let credential = credential.into();
+        if profile.auth.requires_credential() && credential.trim().is_empty() {
+            return Err(ProviderError::Decode(format!(
+                "{} authentication requires a credential",
+                profile.protocol.as_str()
+            )));
+        }
+        Ok(Self::with_connection(Connection {
+            profile,
+            credential,
+        }))
     }
 
     /// Set the known context window (from discovery, config, or `medha.lock`).
     pub fn with_max_ctx(mut self, tokens: u32) -> Self {
         self.caps.max_ctx = Some(tokens);
+        self.connection.lock().unwrap().profile.max_ctx = Some(tokens);
+        self
+    }
+
+    pub fn with_max_output_tokens(self, tokens: u64) -> Self {
+        self.connection.lock().unwrap().profile.max_output_tokens = Some(tokens);
+        self
+    }
+
+    pub fn with_token_counter(self, counter: OpenAiTokenCounter) -> Self {
+        self.connection.lock().unwrap().profile.token_counter = counter;
+        self
+    }
+
+    pub fn with_token_accounting(self, mode: TokenAccountingMode) -> Self {
+        self.connection.lock().unwrap().profile.token_accounting = mode;
         self
     }
 
@@ -137,9 +220,9 @@ impl OpenAiCompat {
 
     /// Set the initial reasoning config (from `medha.lock`), before wrapping
     /// in `Arc`. Equivalent to `set_reasoning` but chainable at construction.
-    pub fn with_reasoning(self, config: ReasoningConfig) -> Self {
-        *self.reasoning.lock().unwrap() = config;
-        self
+    pub fn with_reasoning(self, config: ReasoningConfig) -> Result<Self, ProviderError> {
+        self.set_reasoning(config)?;
+        Ok(self)
     }
 
     /// Switch the active OpenAI-compatible connection. Safe callers invoke
@@ -164,441 +247,251 @@ impl OpenAiCompat {
         model: impl Into<String>,
         max_ctx: Option<u32>,
     ) {
-        *self.connection.lock().unwrap() = Connection {
-            base_url: base_url.into(),
-            api_key: api_key.into(),
-            model: model.into(),
+        self.switch_connection_profile(
+            base_url,
+            api_key,
+            model,
             max_ctx,
+            None,
+            OpenAiTokenCounter::None,
+            TokenAccountingMode::Adaptive,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn switch_connection_profile(
+        &self,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        max_ctx: Option<u32>,
+        max_output_tokens: Option<u64>,
+        token_counter: OpenAiTokenCounter,
+        accounting_mode: TokenAccountingMode,
+    ) {
+        let api_key = api_key.into();
+        let auth = if api_key.trim().is_empty() {
+            AuthKind::None
+        } else {
+            AuthKind::Bearer
         };
-        // Exact-token routes are endpoint-specific; discover again after a
-        // profile switch instead of carrying an incompatible cached route.
-        *self.count_probe.lock().unwrap() = ProbeState::Unknown;
+        let mut profile = ProviderProfile::openai_chat(base_url, model, auth);
+        profile.max_ctx = max_ctx;
+        profile.max_output_tokens = max_output_tokens;
+        profile.token_counter = token_counter;
+        profile.token_accounting = accounting_mode;
+        // Compatibility API retains its infallible signature. Values supplied
+        // through current callers are already validated by config resolution.
+        *self.connection.lock().unwrap() = Connection {
+            profile,
+            credential: api_key,
+        };
+    }
+
+    pub fn switch_provider_profile(
+        &self,
+        profile: ProviderProfile,
+        credential: impl Into<String>,
+    ) -> Result<(), ProviderError> {
+        profile.validate().map_err(ProviderError::Decode)?;
+        if !protocol_is_implemented(profile.protocol) {
+            return Err(ProviderError::Decode(format!(
+                "ProviderClient does not implement {}",
+                profile.protocol.as_str()
+            )));
+        }
+        let credential = credential.into();
+        if profile.auth.requires_credential() && credential.trim().is_empty() {
+            return Err(ProviderError::Decode(format!(
+                "{} authentication requires a credential",
+                profile.protocol.as_str()
+            )));
+        }
+        // Normalise the carried-over reasoning before validating against the new
+        // profile: a Gemini session leaves "reasoning on" with no explicit effort,
+        // which openai-chat rejects. Defaulting to Minimal here lets the switch
+        // succeed and keeps the stored config valid for the new protocol.
+        let reasoning = normalize_reasoning(self.reasoning());
+        validate_reasoning(&profile, &reasoning)?;
+        *self.reasoning.lock().unwrap() = reasoning;
+        *self.connection.lock().unwrap() = Connection {
+            profile,
+            credential,
+        };
+        Ok(())
     }
 
     pub fn active_model(&self) -> String {
-        self.connection.lock().unwrap().model.clone()
+        self.connection.lock().unwrap().profile.model.clone()
     }
 
-    /// Build `chat_template_kwargs` from the current reasoning config, for the
-    /// vLLM/SGLang-style extra_body shape this adapter targets (§4.4). `None`
-    /// fields are simply absent — a model/server that doesn't support reasoning
-    /// just ignores unknown template variables. Two knobs, both widely honored
-    /// by open reasoning models (GLM, Qwen, …) and OpenAI-compatible servers:
-    ///   - `enable_thinking` (bool) — turn CoT on/off.
-    ///   - `reasoning_effort` ("low"|"medium"|"high") — how hard to think. This
-    ///     is the standard string knob (verified against GLM: effort=high roughly
-    ///     3× the reasoning tokens of default); an unknown server ignores it.
-    fn chat_template_kwargs(&self, tools_present: bool) -> Option<serde_json::Value> {
+    /// Portable OpenAI Chat reasoning control. Template kwargs are deliberately
+    /// absent: model-template extensions belong to an explicit custom profile,
+    /// never the generic compatible route.
+    fn reasoning_effort_value(&self) -> Option<&'static str> {
+        if self.reasoning_support() == ReasoningSupport::Unsupported {
+            return None;
+        }
         let cfg = self.reasoning.lock().unwrap();
-        let mut obj = serde_json::Map::new();
-        if let Some(enabled) = cfg.enabled {
-            obj.insert("enable_thinking".into(), serde_json::json!(enabled));
+        if cfg.enabled == Some(false) {
+            return Some("none"); // explicit disable for compatible servers
         }
-        if let Some(effort) = cfg.effort {
-            let level = match effort {
-                ReasoningEffort::Low => "low",
-                ReasoningEffort::Medium => "medium",
-                ReasoningEffort::High => "high",
-            };
-            obj.insert("reasoning_effort".into(), serde_json::json!(level));
-        }
-        // Reasoning + tool calls can otherwise yield an empty `content` on some
-        // servers; ask the template to keep it non-empty when both are active.
-        if tools_present && cfg.enabled == Some(true) {
-            obj.insert("force_nonempty_content".into(), serde_json::json!(true));
-        }
-        if obj.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(obj))
-        }
+        cfg.effort.map(|effort| match effort {
+            // Compatible servers (vLLM/SGLang) accept only none/low/medium/high;
+            // "minimal" is OpenAI-only. Floor Minimal to "low" on this route.
+            ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        })
     }
 
-    /// Call one exact-count route and parse its token total. Any failure
-    /// (route absent → 404, bad payload → 4xx, transport error, timeout) returns
-    /// `None` so the probe can move on or the caller can fall back.
-    async fn count_via(&self, route: CountRoute, messages: &[Message]) -> Option<u32> {
+    async fn stream_gemini_prepared(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+        let names = wire_name_map(
+            &request
+                .context
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+        );
         let connection = self.connection.lock().unwrap().clone();
-        let (url, body, field) = match route {
-            CountRoute::VllmTokenize => (
-                vllm_tokenize_url(&connection.base_url),
-                vllm_tokenize_body(&connection.model, messages),
-                "count",
-            ),
-            CountRoute::Anthropic => (
-                format!(
-                    "{}/messages/count_tokens",
-                    connection.base_url.trim_end_matches('/')
-                ),
-                anthropic_count_body(&connection.model, messages),
-                "input_tokens",
-            ),
+        if connection.profile.protocol != request.protocol {
+            return Err(ProviderError::Decode(format!(
+                "prepared {} request cannot be sent through the active {} profile",
+                request.protocol.as_str(),
+                connection.profile.protocol.as_str()
+            )));
+        }
+        let streaming = request
+            .body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let url = format!(
+            "{}/interactions",
+            connection.profile.base_url.trim_end_matches('/')
+        );
+        http::debug_json_request("POST", &url, &request.body);
+
+        let resp = http::with_profile(
+            self.http.post(&url),
+            &connection.profile,
+            &connection.credential,
+        )?
+        .json(&request.body)
+        .send()
+        .await
+        .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        let resp = http::require_success(resp).await?;
+
+        if !streaming {
+            let body = resp
+                .text()
+                .await
+                .map_err(|error| ProviderError::Transport(error.to_string()))?;
+            let blocks = gemini_interactions::parse_interaction(&body, &names)?;
+            return Ok(futures::stream::iter(blocks.into_iter().map(Ok)).boxed());
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let stream = async_stream::stream! {
+            let mut sse = crate::transport::sse::SseDecoder::default();
+            let mut decoder = gemini_interactions::ResponseDecoder::new(names);
+
+            futures::pin_mut!(byte_stream);
+            while let Some(chunk) = byte_stream.next().await {
+                match chunk {
+                    Err(error) => {
+                        yield Err(ProviderError::Transport(error.to_string()));
+                        return;
+                    }
+                    Ok(bytes) => {
+                        for event in sse.push(&bytes) {
+                            match decoder.push(&event) {
+                                Ok(blocks) => {
+                                    for block in blocks {
+                                        yield Ok(block);
+                                    }
+                                }
+                                Err(error) => {
+                                    yield Err(error);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(event) = sse.finish() {
+                match decoder.push(&event) {
+                    Ok(blocks) => {
+                        for block in blocks {
+                            yield Ok(block);
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+
+            if let Err(error) = decoder.finish() {
+                yield Err(error);
+            }
         };
-        let resp = with_bearer(self.http.post(&url), &connection.api_key)
+        Ok(stream.boxed())
+    }
+
+    async fn count_vllm(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<InputTokenCount, TokenCountError> {
+        let connection = self.connection.lock().unwrap().clone();
+        let url = vllm_tokenize_url(&connection.profile.base_url);
+        let body = vllm_tokenize_body_from_prepared(request);
+        let http_request = http::with_profile(
+            self.http.post(&url),
+            &connection.profile,
+            &connection.credential,
+        )
+        .map_err(|error| TokenCountError::Decode(error.to_string()))?;
+        let resp = http_request
             .json(&body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .ok()?;
+            .map_err(|error| TokenCountError::Transport(error.to_string()))?;
         if !resp.status().is_success() {
-            return None;
+            let status = resp.status().as_u16();
+            let body = http::read_error_body(resp).await;
+            return Err(TokenCountError::Status(status, body));
         }
-        let v: serde_json::Value = resp.json().await.ok()?;
-        v.get(field).and_then(|c| c.as_u64()).map(|n| n as u32)
-    }
-}
-
-#[derive(Serialize)]
-struct ChatReq {
-    model: String,
-    messages: Vec<ChatMsg>,
-    stream: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<ToolDef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream_options: Option<StreamOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    chat_template_kwargs: Option<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct StreamOptions {
-    /// Ask the server to emit a final chunk with real token `usage`.
-    include_usage: bool,
-}
-
-#[derive(Serialize)]
-struct ChatMsg {
-    role: &'static str,
-    content: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tool_calls: Vec<OutToolCall>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct OutToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    typ: &'static str, // always "function"
-    function: OutFn,
-}
-
-#[derive(Serialize)]
-struct OutFn {
-    name: String,
-    /// OpenAI requires the arguments to be a JSON *string*, not an object.
-    arguments: String,
-}
-
-#[derive(Serialize)]
-struct ToolDef {
-    #[serde(rename = "type")]
-    typ: &'static str, // always "function"
-    function: FnDef,
-}
-
-#[derive(Serialize)]
-struct FnDef {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-}
-
-// ── streaming (SSE) response shapes ─────────────────────────────────────────
-// Each `data: {…}` frame carries incremental deltas; tool calls arrive in
-// fragments keyed by `index` and must be reassembled.
-
-#[derive(Deserialize)]
-struct StreamChunk {
-    #[serde(default)]
-    choices: Vec<StreamChoice>,
-    /// Present only on the final chunk (when include_usage is set).
-    #[serde(default)]
-    usage: Option<UsageRaw>,
-    /// Some OpenAI-compatible gateways (OpenRouter, vLLM/SGLang proxies) emit a
-    /// mid-stream `data: {"error": {...}}` frame on failure (rate limit,
-    /// moderation, upstream 5xx) instead of a normal delta. Without this field
-    /// it deserializes as an empty chunk and the turn silently truncates.
-    #[serde(default)]
-    error: Option<StreamError>,
-}
-
-#[derive(Deserialize)]
-struct StreamError {
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default, rename = "type")]
-    kind: Option<String>,
-}
-
-#[derive(Default, Clone, Copy, Deserialize)]
-struct UsageRaw {
-    #[serde(default)]
-    prompt_tokens: u32,
-    #[serde(default)]
-    completion_tokens: u32,
-    #[serde(default)]
-    total_tokens: u32,
-}
-
-#[derive(Deserialize)]
-struct StreamChoice {
-    #[serde(default)]
-    delta: Delta,
-}
-
-#[derive(Default, Deserialize)]
-struct Delta {
-    #[serde(default)]
-    content: Option<String>,
-    /// Reasoning/thinking tokens (vLLM `--enable-reasoning` / DeepSeek-R1-style
-    /// servers). Some servers spell this `reasoning` instead of
-    /// `reasoning_content`; accept both.
-    #[serde(default, alias = "reasoning")]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<DeltaToolCall>,
-}
-
-#[derive(Deserialize)]
-struct DeltaToolCall {
-    index: u32,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    function: Option<DeltaFn>,
-}
-
-#[derive(Deserialize)]
-struct DeltaFn {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
-}
-
-// ── non-streaming response shapes ───────────────────────────────────────────
-// One aggregated `message` per choice. Some gateways only populate
-// `reasoning_content` here (not in streamed deltas), so this path is the way to
-// surface reasoning on those hosts.
-
-#[derive(Deserialize)]
-struct ChatCompletion {
-    #[serde(default)]
-    choices: Vec<CompletionChoice>,
-    #[serde(default)]
-    usage: Option<UsageRaw>,
-    #[serde(default)]
-    error: Option<StreamError>,
-}
-
-#[derive(Deserialize)]
-struct CompletionChoice {
-    #[serde(default)]
-    message: CompletionMessage,
-}
-
-#[derive(Default, Deserialize)]
-struct CompletionMessage {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default, alias = "reasoning")]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<CompletionToolCall>,
-}
-
-#[derive(Deserialize)]
-struct CompletionToolCall {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    function: Option<DeltaFn>,
-}
-
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Best-effort extraction of the primary target (file path or shell command) from
-/// a PARTIAL tool-call arguments JSON string, for live "writing <file>…" labels.
-/// Naive on purpose (partial JSON can't be parsed): finds the first known key and
-/// returns its complete quoted value if the closing quote has arrived yet.
-fn sniff_target(args: &str) -> Option<String> {
-    for key in ["\"path\"", "\"file_path\"", "\"command\""] {
-        if let Some(i) = args.find(key) {
-            let rest = args[i + key.len()..].trim_start();
-            let Some(rest) = rest.strip_prefix(':') else {
-                continue;
-            };
-            let rest = rest.trim_start();
-            let Some(rest) = rest.strip_prefix('"') else {
-                continue;
-            };
-            // Scan to the first UNESCAPED quote (K19): a command like
-            // `echo \"hi\"` must not be cut at its inner escaped quote.
-            let mut val = String::new();
-            let mut chars = rest.chars();
-            let mut closed = false;
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' => match chars.next() {
-                        Some('n') | Some('t') => val.push(' '),
-                        Some(e) => val.push(e),
-                        None => break, // escape straddles a chunk boundary — incomplete
-                    },
-                    '"' => {
-                        closed = true;
-                        break;
-                    }
-                    c => val.push(c),
-                }
-            }
-            if closed && !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
-}
-
-/// Strips raw `<think>...</think>` markers out of the `content` stream,
-/// routing the inner text to `Block::Reasoning`. Many self-hosted reasoning
-/// models (Ollama, llama.cpp, DeepSeek-R1 without a server-side reasoning
-/// parser) emit thinking this way instead of a separate `reasoning_content`
-/// field — both conventions are real and this handles the inline-tag one.
-/// A tag counts only at the start of a line (see `line_has_content`); this is
-/// a fallback for servers running without a reasoning parser — when the
-/// server provides `reasoning_content`, that path is preferred and this
-/// filter never fires. Stateful because a tag can straddle two SSE chunks.
-#[derive(Default)]
-struct ThinkTagFilter {
-    buf: String,
-    in_think: bool,
-    /// The current visible output line already carries non-whitespace text.
-    /// Thinking blocks are template-structural: every inline-thinking chat
-    /// template emits `<think>` at the start of its own line (stream start,
-    /// or right after a newline). A tag surfacing MID-line is therefore the
-    /// model *writing about* the tag — docs, code samples — and must stay
-    /// literal. Matching it anywhere used to reroute the rest of a reply
-    /// into hidden reasoning the moment the answer mentioned the tag.
-    line_has_content: bool,
-}
-
-const OPEN_TAG: &str = "<think>";
-const CLOSE_TAG: &str = "</think>";
-
-impl ThinkTagFilter {
-    /// Track whether the visible line still open after emitting `s` has any
-    /// non-whitespace on it (drives the line-start rule for later chunks).
-    fn note_emitted(&mut self, s: &str) {
-        match s.rfind('\n') {
-            Some(i) => self.line_has_content = !s[i + 1..].trim().is_empty(),
-            None => self.line_has_content = self.line_has_content || !s.trim().is_empty(),
-        }
-    }
-
-    /// True when a tag found right after `prefix` sits at a line start —
-    /// everything on its line so far (buffered here or already emitted) is
-    /// whitespace.
-    fn at_line_start(&self, prefix: &str) -> bool {
-        match prefix.rfind('\n') {
-            Some(i) => prefix[i + 1..].trim().is_empty(),
-            None => !self.line_has_content && prefix.trim().is_empty(),
-        }
-    }
-
-    /// Feed newly-arrived content text; returns the blocks safe to emit now.
-    /// A tail that might still be a partial tag is held back in `buf`.
-    fn feed(&mut self, chunk: &str) -> Vec<Block> {
-        self.buf.push_str(chunk);
-        let mut out = Vec::new();
-        loop {
-            if self.in_think {
-                match self.buf.find(CLOSE_TAG) {
-                    Some(pos) => {
-                        let head = self.buf[..pos].to_string();
-                        self.buf = self.buf[pos + CLOSE_TAG.len()..].to_string();
-                        if !head.is_empty() {
-                            out.push(Block::Reasoning(head));
-                        }
-                        self.in_think = false;
-                        // A stripped block leaves its line visibly empty, so a
-                        // back-to-back follow-up block still opens at a line start.
-                        self.line_has_content = false;
-                    }
-                    None => {
-                        self.hold_margin(&mut out);
-                        break;
-                    }
-                }
-            } else {
-                // Open only at a line start; mid-line occurrences are literal
-                // content and are skipped (a later line-start one still opens).
-                let opener = self
-                    .buf
-                    .match_indices(OPEN_TAG)
-                    .map(|(pos, _)| pos)
-                    .find(|&pos| self.at_line_start(&self.buf[..pos]));
-                match opener {
-                    Some(pos) => {
-                        let head = self.buf[..pos].to_string();
-                        self.buf = self.buf[pos + OPEN_TAG.len()..].to_string();
-                        if !head.is_empty() {
-                            self.note_emitted(&head);
-                            out.push(Block::Text(head));
-                        }
-                        self.in_think = true;
-                    }
-                    None => {
-                        self.hold_margin(&mut out);
-                        break;
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// Emit everything except a tail long enough to hide a partial tag —
-    /// "<thi" arriving now and "nk>" next chunk must still match. The split
-    /// lands on a char boundary.
-    fn hold_margin(&mut self, out: &mut Vec<Block>) {
-        let margin = CLOSE_TAG.len().max(OPEN_TAG.len()) - 1;
-        if self.buf.len() > margin {
-            let split = self.buf.len() - margin;
-            let split = (0..=split)
-                .rev()
-                .find(|&i| self.buf.is_char_boundary(i))
-                .unwrap_or(0);
-            let emit = self.buf[..split].to_string();
-            self.buf = self.buf[split..].to_string();
-            if !emit.is_empty() {
-                if self.in_think {
-                    out.push(Block::Reasoning(emit));
-                } else {
-                    self.note_emitted(&emit);
-                    out.push(Block::Text(emit));
-                }
-            }
-        }
-    }
-
-    /// Flush any remaining buffered text at end of stream.
-    fn flush(&mut self) -> Option<Block> {
-        if self.buf.is_empty() {
-            return None;
-        }
-        let rest = std::mem::take(&mut self.buf);
-        Some(if self.in_think {
-            Block::Reasoning(rest)
-        } else {
-            Block::Text(rest)
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|error| TokenCountError::Decode(error.to_string()))?;
+        let tokens = value
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| TokenCountError::Decode("missing integer `count`".into()))?;
+        Ok(InputTokenCount {
+            tokens,
+            quality: TokenCountQuality::Authoritative,
+            request_fingerprint: request.request_fingerprint.clone(),
         })
     }
 }
+
+#[cfg(test)]
+use openai_chat::{
+    ThinkTagFilter, finalize_tool_calls, parse_completion, process_sse_event, repair_args,
+    sniff_target,
+};
 
 /// A model advertised by an endpoint, with whatever capability metadata the
 /// server chose to expose. `context_length` is `None` when the endpoint doesn't
@@ -616,6 +509,56 @@ pub struct ModelInfo {
 /// spellings; absence stays `None`. Errors if the endpoint doesn't implement
 /// `/models` so callers can fall back to manual entry.
 pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>, ProviderError> {
+    let auth = if api_key.trim().is_empty() {
+        AuthKind::None
+    } else {
+        AuthKind::Bearer
+    };
+    let profile = ProviderProfile::openai_chat(base_url, "model-discovery", auth);
+    list_models_for_profile(&profile, api_key).await
+}
+
+pub async fn list_models_for_profile(
+    profile: &ProviderProfile,
+    credential: &str,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    profile.validate().map_err(ProviderError::Decode)?;
+    if !matches!(
+        profile.protocol,
+        Protocol::OpenAiChat | Protocol::GeminiInteractions
+    ) {
+        return Err(ProviderError::Decode(format!(
+            "model discovery is not implemented for {}",
+            profile.protocol.as_str()
+        )));
+    }
+    if profile.auth.requires_credential() && credential.trim().is_empty() {
+        return Err(ProviderError::Decode(
+            "model discovery authentication requires a credential".into(),
+        ));
+    }
+    let url = format!("{}/models", profile.base_url.trim_end_matches('/'));
+    // Bounded timeout: this runs at startup before the UI paints, so a slow or
+    // unreachable endpoint must not hang the launch (it falls back gracefully).
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .map_err(|e| ProviderError::Transport(e.to_string()))?;
+    match profile.protocol {
+        Protocol::OpenAiChat => list_openai_chat_models(&client, &url, profile, credential).await,
+        Protocol::GeminiInteractions => {
+            list_gemini_models(&client, &url, profile, credential).await
+        }
+        Protocol::OpenAiResponses | Protocol::AnthropicMessages => unreachable!(),
+    }
+}
+
+async fn list_openai_chat_models(
+    client: &reqwest::Client,
+    url: &str,
+    profile: &ProviderProfile,
+    credential: &str,
+) -> Result<Vec<ModelInfo>, ProviderError> {
     #[derive(Deserialize)]
     struct ModelsResp {
         data: Vec<ModelEntry>,
@@ -628,99 +571,121 @@ pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>
         context_length: Option<u32>,
     }
 
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    // Bounded timeout: this runs at startup before the UI paints, so a slow or
-    // unreachable endpoint must not hang the launch (it falls back gracefully).
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(6))
-        .build()
-        .map_err(|e| ProviderError::Transport(e.to_string()))?;
-    let resp = with_bearer(client.get(&url), api_key)
+    let resp = http::with_profile(client.get(url), profile, credential)?
         .send()
         .await
-        .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(ProviderError::Status(status.as_u16(), body));
-    }
-
-    let parsed: ModelsResp = resp
+        .map_err(|error| ProviderError::Transport(error.to_string()))?;
+    let parsed: ModelsResp = http::require_success(resp)
+        .await?
         .json()
         .await
-        .map_err(|e| ProviderError::Decode(e.to_string()))?;
+        .map_err(|error| ProviderError::Decode(error.to_string()))?;
     Ok(parsed
         .data
         .into_iter()
-        .map(|m| ModelInfo {
-            id: m.id,
-            context_length: m.context_length,
+        .map(|model| ModelInfo {
+            id: model.id,
+            context_length: model.context_length,
         })
         .collect())
 }
 
-fn role_str(r: &Role) -> &'static str {
-    match r {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::Tool => "tool",
+async fn list_gemini_models(
+    client: &reqwest::Client,
+    url: &str,
+    profile: &ProviderProfile,
+    credential: &str,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ModelsResp {
+        #[serde(default)]
+        models: Vec<ModelEntry>,
+        next_page_token: Option<String>,
     }
-}
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ModelEntry {
+        name: String,
+        base_model_id: Option<String>,
+        input_token_limit: Option<u32>,
+        #[serde(default)]
+        supported_generation_methods: Vec<String>,
+    }
 
-/// Translate canonical messages → OpenAI/vLLM chat shape, hoisting ALL system
-/// content into a single leading message. vLLM/LiteLLM reject a `system` message
-/// that isn't at the very start. Upstream keeps system content at index 0 (the
-/// compactor no longer inserts mid-array system messages), but this enforces the
-/// wire-format invariant at the boundary that owns it — a durable guarantee
-/// against any future upstream regression. Non-system messages keep their exact
-/// order, so tool-call ↔ tool-result pairing is untouched.
-///
-/// Tool-call names in assistant history are also sanitized to the wire form
-/// (`fs.edit` → `fs_edit`): strict OpenAI-compat backends validate names in the
-/// message history, not just the tool defs, so a prior dotted call would 400 on
-/// the next turn.
-fn build_chat_messages(messages: &[Message]) -> Vec<ChatMsg> {
-    let mut system = String::new();
-    let mut rest: Vec<ChatMsg> = Vec::with_capacity(messages.len());
-    for m in messages {
-        if m.role == Role::System {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str(&m.content);
-            continue;
+    let mut page_token: Option<String> = None;
+    let mut models = std::collections::BTreeMap::<String, Option<u32>>::new();
+    // Google currently permits up to 1000 entries per page. Keep pagination
+    // bounded and reject a repeated token instead of looping on a malformed
+    // upstream response.
+    let mut seen_tokens = std::collections::HashSet::new();
+    loop {
+        let mut request = client.get(url).query(&[("pageSize", "1000")]);
+        if let Some(token) = page_token.as_deref() {
+            request = request.query(&[("pageToken", token)]);
         }
-        rest.push(ChatMsg {
-            role: role_str(&m.role),
-            content: m.content.clone(),
-            tool_calls: m
-                .tool_calls
-                .iter()
-                .map(|tc| OutToolCall {
-                    id: tc.id.clone(),
-                    typ: "function",
-                    function: OutFn {
-                        name: wire_tool_name(&tc.tool),
-                        arguments: tc.args.to_string(),
-                    },
-                })
-                .collect(),
-            tool_call_id: m.tool_call_id.clone(),
-        });
+        let resp = http::with_profile(request, profile, credential)?
+            .send()
+            .await
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        let page: ModelsResp = http::require_success(resp)
+            .await?
+            .json()
+            .await
+            .map_err(|error| ProviderError::Decode(error.to_string()))?;
+
+        for model in page.models {
+            // The Models API also returns embedding-only models. When methods
+            // are advertised, exclude entries that have no generative action.
+            // An empty methods list remains visible because absence is unknown,
+            // not proof that Interactions is unsupported.
+            let generative = model.supported_generation_methods.is_empty()
+                || model.supported_generation_methods.iter().any(|method| {
+                    matches!(
+                        method.to_ascii_lowercase().as_str(),
+                        "generatecontent" | "predict" | "interactions" | "createinteraction"
+                    )
+                });
+            if !generative {
+                continue;
+            }
+            let id = model
+                .base_model_id
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| {
+                    model
+                        .name
+                        .strip_prefix("models/")
+                        .unwrap_or(&model.name)
+                        .to_string()
+                });
+            if !id.is_empty() {
+                models
+                    .entry(id)
+                    .and_modify(|limit| {
+                        if limit.is_none() {
+                            *limit = model.input_token_limit;
+                        }
+                    })
+                    .or_insert(model.input_token_limit);
+            }
+        }
+
+        let Some(token) = page.next_page_token.filter(|token| !token.is_empty()) else {
+            break;
+        };
+        if !seen_tokens.insert(token.clone()) {
+            return Err(ProviderError::Decode(
+                "Gemini model discovery returned a repeated page token".into(),
+            ));
+        }
+        page_token = Some(token);
     }
-    let mut out = Vec::with_capacity(rest.len() + 1);
-    if !system.is_empty() {
-        out.push(ChatMsg {
-            role: "system",
-            content: system,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
-    }
-    out.extend(rest);
-    out
+
+    Ok(models
+        .into_iter()
+        .map(|(id, context_length)| ModelInfo { id, context_length })
+        .collect())
 }
 
 /// vLLM's `/tokenize` lives at the server root, a sibling of `/v1` — not under
@@ -735,76 +700,66 @@ fn vllm_tokenize_url(base_url: &str) -> String {
 /// Keeps every role (system/tool/assistant) and mirrors the same system-hoist
 /// as `build_chat_messages`, so the count matches what the chat endpoint would
 /// actually send — and a strict template can't reject a mid-array `system`.
-fn vllm_tokenize_body(model: &str, messages: &[Message]) -> serde_json::Value {
-    let mut system = String::new();
-    let mut msgs: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
-    for m in messages {
-        if m.role == Role::System {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str(&m.content);
-            continue;
-        }
-        msgs.push(serde_json::json!({ "role": role_str(&m.role), "content": m.content }));
-    }
-    if !system.is_empty() {
-        msgs.insert(0, serde_json::json!({ "role": "system", "content": system }));
-    }
-    serde_json::json!({ "model": model, "messages": msgs, "add_generation_prompt": true })
+fn vllm_tokenize_body_from_prepared(request: &PreparedModelRequest) -> serde_json::Value {
+    openai_chat::vllm_tokenize_body(request)
 }
 
-/// Anthropic-style `/messages/count_tokens` body. That API takes `system`
-/// separately and only user/assistant turns, so we hoist system messages out
-/// and fold tool results into user turns — a close (not byte-exact) mapping,
-/// which is fine: it's an estimate the post-turn `usage` later corrects.
-fn anthropic_count_body(model: &str, messages: &[Message]) -> serde_json::Value {
-    let mut system = String::new();
-    let mut msgs: Vec<serde_json::Value> = Vec::new();
-    let non_empty = |c: &str| {
-        if c.is_empty() {
-            " ".to_string()
-        } else {
-            c.to_string()
-        }
-    };
-    for m in messages {
-        match m.role {
-            Role::System => {
-                if !system.is_empty() {
-                    system.push('\n');
-                }
-                system.push_str(&m.content);
-            }
-            Role::Assistant => msgs
-                .push(serde_json::json!({ "role": "assistant", "content": non_empty(&m.content) })),
-            // user + tool results both map to a user turn.
-            _ => msgs.push(serde_json::json!({ "role": "user", "content": non_empty(&m.content) })),
-        }
-    }
-    let mut body = serde_json::json!({ "model": model, "messages": msgs });
-    if !system.is_empty() {
-        body["system"] = serde_json::json!(system);
-    }
-    body
+#[cfg(test)]
+fn build_chat_messages(messages: &[Message]) -> Vec<openai_chat::ChatMessage> {
+    openai_chat::build_chat_messages(messages, &std::collections::HashMap::new())
 }
 
 #[async_trait]
-impl Provider for OpenAiCompat {
+impl Provider for ProviderClient {
     fn capabilities(&self) -> &ProviderCaps {
         &self.caps
     }
 
     fn context_window(&self) -> Option<u32> {
-        self.connection
-            .lock()
-            .unwrap()
-            .max_ctx
-            .or(self.caps.max_ctx)
+        self.connection.lock().unwrap().profile.max_ctx
     }
 
-    fn set_reasoning(&self, config: ReasoningConfig) {
+    fn protocol(&self) -> Protocol {
+        self.connection.lock().unwrap().profile.protocol
+    }
+
+    fn model_limits(&self) -> ModelLimits {
+        // Read both mutable limits under one guard. Calling `context_window()`
+        // from this struct literal used to lock `connection` a second time
+        // while the temporary guard for `max_output_tokens` was still alive,
+        // deadlocking bare `medha` before the TUI could open.
+        let connection = self.connection.lock().unwrap();
+        ModelLimits {
+            max_input_tokens: None,
+            max_output_tokens: connection.profile.max_output_tokens,
+            max_combined_tokens: connection.profile.max_ctx.map(u64::from),
+        }
+    }
+
+    fn requested_output_tokens(&self) -> Option<u64> {
+        self.connection.lock().unwrap().profile.max_output_tokens
+    }
+
+    fn update_context_limit(&self, tokens: u64) {
+        if let Ok(tokens) = u32::try_from(tokens) {
+            self.connection.lock().unwrap().profile.max_ctx = Some(tokens);
+        }
+    }
+
+    fn token_accounting_mode(&self) -> TokenAccountingMode {
+        self.connection.lock().unwrap().profile.token_accounting
+    }
+
+    fn reasoning_support(&self) -> ReasoningSupport {
+        self.connection.lock().unwrap().profile.reasoning
+    }
+
+    fn set_reasoning(&self, config: ReasoningConfig) -> Result<(), ProviderError> {
+        let config = normalize_reasoning(config);
+        let connection = self.connection.lock().unwrap().clone();
+        validate_reasoning(&connection.profile, &config)?;
         *self.reasoning.lock().unwrap() = config;
+        Ok(())
     }
 
     fn reasoning(&self) -> ReasoningConfig {
@@ -812,138 +767,180 @@ impl Provider for OpenAiCompat {
     }
 
     fn set_streaming(&self, on: bool) {
-        self.streaming.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.streaming
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn streaming(&self) -> bool {
         self.streaming.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Exact server-side token count, when the host offers one. Probes the known
-    /// routes once (vLLM `/tokenize`, then Anthropic `/messages/count_tokens`),
-    /// caches the result, and returns `None` if neither works — so the same code
-    /// gives exact counts on hosts that support it and degrades gracefully
-    /// (to the caller's local estimate) on those that don't. No host-specific
-    /// assumptions. Opt out entirely with `MEDHA_EXACT_TOKENS=off`.
-    async fn count_tokens(&self, messages: &[Message]) -> Option<u32> {
-        if std::env::var("MEDHA_EXACT_TOKENS").is_ok_and(|v| v == "off" || v == "0") {
-            return None;
-        }
-        let state = *self.count_probe.lock().unwrap();
-        match state {
-            ProbeState::Unavailable(n) if n < REPROBE_AFTER => {
-                *self.count_probe.lock().unwrap() = ProbeState::Unavailable(n + 1);
-                None
+    fn prepare_request(
+        &self,
+        ctx: &CompiledContext,
+    ) -> Result<PreparedModelRequest, ProviderError> {
+        let connection = self.connection.lock().unwrap().clone();
+        let model = if ctx.model.is_empty() {
+            connection.profile.model.clone()
+        } else {
+            ctx.model.clone()
+        };
+        let streaming = self.streaming();
+        let body = match connection.profile.protocol {
+            Protocol::OpenAiChat => openai_chat::prepare_body(
+                ctx,
+                &model,
+                streaming,
+                self.reasoning_effort_value(),
+                connection.profile.max_output_tokens,
+            )?,
+            Protocol::GeminiInteractions => {
+                gemini_interactions::prepare_body(
+                    ctx,
+                    &model,
+                    streaming,
+                    &self.reasoning(),
+                    connection.profile.max_output_tokens,
+                )?
+                .0
             }
-            ProbeState::Route(route) => self.count_via(route, messages).await,
-            // Unknown, or Unavailable long enough that it's worth re-probing.
-            ProbeState::Unknown | ProbeState::Unavailable(_) => {
-                for route in [CountRoute::VllmTokenize, CountRoute::Anthropic] {
-                    if let Some(n) = self.count_via(route, messages).await {
-                        *self.count_probe.lock().unwrap() = ProbeState::Route(route);
-                        return Some(n);
-                    }
-                }
-                *self.count_probe.lock().unwrap() = ProbeState::Unavailable(0);
-                None
+            protocol => {
+                return Err(ProviderError::Decode(format!(
+                    "ProviderClient does not implement {}",
+                    protocol.as_str()
+                )));
             }
+        };
+        Ok(PreparedModelRequest::new(
+            connection.profile.protocol,
+            model,
+            body,
+            ctx.clone(),
+        ))
+    }
+
+    async fn count_input_tokens(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<Option<InputTokenCount>, TokenCountError> {
+        let counter = self.connection.lock().unwrap().profile.token_counter;
+        match counter {
+            OpenAiTokenCounter::None => Ok(None),
+            OpenAiTokenCounter::Vllm => self.count_vllm(request).await.map(Some),
         }
+    }
+
+    fn with_output_limit(
+        &self,
+        request: &PreparedModelRequest,
+        max_output_tokens: u64,
+    ) -> Result<Option<PreparedModelRequest>, ProviderError> {
+        let mut body = request.body.clone();
+        let object = body.as_object_mut().ok_or_else(|| {
+            ProviderError::Decode("prepared model request is not an object".into())
+        })?;
+        match request.protocol {
+            Protocol::OpenAiChat => {
+                object.insert("max_tokens".into(), serde_json::json!(max_output_tokens));
+            }
+            Protocol::GeminiInteractions => {
+                let generation_config = object
+                    .entry("generation_config")
+                    .or_insert_with(|| serde_json::json!({}));
+                let generation_config = generation_config.as_object_mut().ok_or_else(|| {
+                    ProviderError::Decode(
+                        "prepared Gemini generation_config is not an object".into(),
+                    )
+                })?;
+                generation_config.insert(
+                    "max_output_tokens".into(),
+                    serde_json::json!(max_output_tokens),
+                );
+            }
+            Protocol::OpenAiResponses | Protocol::AnthropicMessages => return Ok(None),
+        }
+        Ok(Some(request.with_body(body)))
     }
 
     async fn stream(
         &self,
         ctx: &CompiledContext,
     ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
-        // Translate canonical messages → OpenAI shape, carrying tool calls and
-        // tool results so the native tool-calling protocol round-trips (§4.4).
-        // System content is hoisted to a single leading message (vLLM requires
-        // `system` at the very beginning; compaction can insert a mid-array one).
-        let messages = build_chat_messages(&ctx.messages);
+        let request = self.prepare_request(ctx)?;
+        self.stream_prepared(&request).await
+    }
 
-        // Expose the K2 capability sheath as OpenAI tool definitions, with names
-        // sanitized to the strict OpenAI contract ([a-zA-Z0-9_-]) — canonical
-        // dotted names (`fs.edit`) 400 on strict backends (NVIDIA NIM, OpenAI,
-        // most hosted OpenAI-compat gateways). `names` maps the wire form back
-        // when the model calls a tool; vLLM (permissive) is unaffected.
-        let names = wire_name_map(&ctx.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>());
-        let tools: Vec<ToolDef> = ctx
-            .tools
-            .iter()
-            .map(|t| ToolDef {
-                typ: "function",
-                function: FnDef {
-                    name: wire_tool_name(&t.name),
-                    description: t.description.clone(),
-                    parameters: t.schema.clone(),
-                },
-            })
-            .collect();
-
+    async fn stream_prepared(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+        if request.protocol == Protocol::GeminiInteractions {
+            return self.stream_gemini_prepared(request).await;
+        }
+        if request.protocol != Protocol::OpenAiChat {
+            return Err(ProviderError::Decode(format!(
+                "ProviderClient cannot send {}",
+                request.protocol.as_str()
+            )));
+        }
+        let names = wire_name_map(
+            &request
+                .context
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+        );
         let connection = self.connection.lock().unwrap().clone();
-        let model = if ctx.model.is_empty() {
-            connection.model.clone()
-        } else {
-            ctx.model.clone()
-        };
-
-        // Real SSE streaming: text deltas surface token-by-token; tool calls
-        // arrive as fragments keyed by index and are reassembled, then emitted
-        // once complete (§4.4).
-        let streaming = self.streaming();
-        let chat_template_kwargs = self.chat_template_kwargs(!tools.is_empty());
-        let req = ChatReq {
-            model,
-            messages,
-            stream: streaming,
-            tools,
-            // `stream_options` is only meaningful with streaming on; some strict
-            // servers reject it on a non-streamed request.
-            stream_options: streaming.then_some(StreamOptions { include_usage: true }),
-            chat_template_kwargs,
-        };
+        if connection.profile.protocol != request.protocol {
+            return Err(ProviderError::Decode(format!(
+                "prepared {} request cannot be sent through the active {} profile",
+                request.protocol.as_str(),
+                connection.profile.protocol.as_str()
+            )));
+        }
+        let streaming = request
+            .body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
         let url = format!(
             "{}/chat/completions",
-            connection.base_url.trim_end_matches('/')
+            connection.profile.base_url.trim_end_matches('/')
         );
 
         // Direct proof of what actually goes over the wire — no guessing, no
         // separate curl experiment needed. Set MEDHA_DEBUG_HTTP=1 to see the
-        // exact outgoing JSON (including chat_template_kwargs) for every call.
-        if std::env::var("MEDHA_DEBUG_HTTP").is_ok_and(|v| v == "1") {
-            let body = serde_json::to_string_pretty(&req).unwrap_or_default();
-            eprintln!("\n[MEDHA_DEBUG_HTTP] POST {url}\n{body}\n");
-        }
+        // exact prepared JSON for every call.
+        http::debug_json_request("POST", &url, &request.body);
 
-        let resp = with_bearer(self.http.post(&url), &connection.api_key)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Status(status.as_u16(), body));
-        }
+        let resp = http::with_profile(
+            self.http.post(&url),
+            &connection.profile,
+            &connection.credential,
+        )?
+        .json(&request.body)
+        .send()
+        .await
+        .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let resp = http::require_success(resp).await?;
 
         // Non-streaming: one blocking body, parsed and yielded as a single batch
         // of blocks (reasoning → text → tool intents → usage). The kernel loop
         // is identical; only the arrival shape differs.
         if !streaming {
-            let body = resp.text().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
-            let blocks = parse_completion(&body, &names)?;
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            let blocks = openai_chat::parse_completion(&body, &names)?;
             return Ok(futures::stream::iter(blocks.into_iter().map(Ok)).boxed());
         }
 
         let byte_stream = resp.bytes_stream();
         let s = async_stream::stream! {
-            use std::collections::BTreeMap;
-            let mut buf: Vec<u8> = Vec::new();
-            // index → (id, name, accumulated-arguments)
-            let mut accum: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
-            // tool-call indices whose target (path/command) we've already surfaced.
-            let mut target_announced: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            let mut think_filter = ThinkTagFilter::default();
+            let mut sse = crate::transport::sse::SseDecoder::default();
+            let mut decoder = openai_chat::ResponseDecoder::new(names);
 
             futures::pin_mut!(byte_stream);
             while let Some(chunk) = byte_stream.next().await {
@@ -951,48 +948,32 @@ impl Provider for OpenAiCompat {
                     Err(e) => {
                         // Surface what the filter is still holding before the
                         // error — otherwise the reply's tail silently vanishes.
-                        if let Some(b) = think_filter.flush() {
+                        if let Some(b) = decoder.flush_pending() {
                             yield Ok(b);
                         }
                         yield Err(ProviderError::Transport(e.to_string()));
                         return;
                     }
-                    Ok(bytes) => buf.extend_from_slice(&bytes),
-                }
-
-                // Drain complete SSE records. A record ends at a blank line —
-                // "\n\n" (LF) or the spec-legal "\r\n\r\n" (CRLF). Handling CRLF
-                // is essential: without it a CRLF server's records never match,
-                // the buffer grows unbounded, and the whole response is silently
-                // dropped.
-                while let Some((pos, sep_len)) = find_record_boundary(&buf) {
-                    let record: Vec<u8> = buf.drain(..pos + sep_len).collect();
-                    let record = String::from_utf8_lossy(&record);
-                    match process_sse_record(&record, &mut accum, &mut think_filter, &mut target_announced) {
+                    Ok(bytes) => for event in sse.push(&bytes) {
+                    match decoder.push(&event) {
                         Ok(blocks) => for b in blocks { yield Ok(b); },
                         Err(e) => { yield Err(e); return; }
                     }
+                    },
                 }
             }
 
-            // Drain any trailing partial record the server never terminated with
-            // a blank line — otherwise its final frame (often the one carrying
-            // the last tool-call args or usage) is thrown away at EOF.
-            if !buf.is_empty() {
-                let record = String::from_utf8_lossy(&buf);
-                match process_sse_record(&record, &mut accum, &mut think_filter, &mut target_announced) {
+            // Preserve tolerant handling for servers that close without the
+            // final SSE blank line.
+            if let Some(event) = sse.finish() {
+                match decoder.push(&event) {
                     Ok(blocks) => for b in blocks { yield Ok(b); },
                     Err(e) => { yield Err(e); return; }
                 }
             }
 
-            if let Some(block) = think_filter.flush() {
+            for block in decoder.finish() {
                 yield Ok(block);
-            }
-
-            // Emit fully-assembled tool calls, in the order the model issued them.
-            for intent in finalize_tool_calls(accum, &names) {
-                yield Ok(Block::ToolIntent(intent));
             }
         };
 
@@ -1000,267 +981,32 @@ impl Provider for OpenAiCompat {
     }
 }
 
-/// The end of the first complete SSE record in `buf`: a blank-line separator,
-/// which is `"\n\n"` on LF servers or `"\r\n\r\n"` on spec-legal CRLF servers.
-/// Returns `(offset of the separator, its length)`, whichever variant appears
-/// earliest. Without the CRLF case a CRLF server's records never drain.
-fn find_record_boundary(buf: &[u8]) -> Option<(usize, usize)> {
-    let lf = find_subslice(buf, b"\n\n").map(|p| (p, 2usize));
-    let crlf = find_subslice(buf, b"\r\n\r\n").map(|p| (p, 4usize));
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
 /// Canonical tool name → the name sent on the wire. Strict OpenAI-compatible
 /// validators (NVIDIA API among them) enforce `[a-zA-Z0-9_-]+` for function
 /// names, so the dotted canonical names (`fs.edit`) are mapped (`fs_edit`) at
 /// this boundary — the rest of the system never sees wire names.
+#[cfg(test)]
 fn wire_tool_name(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect()
+    openai_chat::wire_tool_name(name)
 }
 
 /// Wire→canonical map for the tool names exposed this request. Collisions get a
 /// trailing `_` so two canonical names can never share a wire name.
 fn wire_name_map(canonical: &[String]) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    for name in canonical {
-        let mut wire = wire_tool_name(name);
-        while map.contains_key(&wire) {
-            wire.push('_');
-        }
-        map.insert(wire, name.clone());
-    }
-    map
+    openai_chat::wire_name_map(canonical)
 }
 
-/// Parse a non-streamed chat completion into the same blocks the SSE path
-/// yields, in the same order (reasoning → text → tool intents → usage). Wire
-/// tool names map back to canonical, matching `finalize_tool_calls`.
-fn parse_completion(
-    body: &str,
-    names: &std::collections::HashMap<String, String>,
-) -> Result<Vec<Block>, ProviderError> {
-    let parsed: ChatCompletion = serde_json::from_str(body)
-        .map_err(|e| ProviderError::Stream(format!("non-streaming response parse: {e}")))?;
-    if let Some(err) = parsed.error {
-        let msg = err.message.or(err.kind).unwrap_or_else(|| "provider error".into());
-        return Err(ProviderError::Stream(msg));
-    }
-    let mut out = Vec::new();
-    if let Some(choice) = parsed.choices.into_iter().next() {
-        let msg = choice.message;
-        if let Some(r) = msg.reasoning_content.filter(|s| !s.is_empty()) {
-            out.push(Block::Reasoning(r));
-        }
-        if let Some(c) = msg.content.filter(|s| !s.is_empty()) {
-            // A model that emits `<think>` tags inline (no reasoning_content
-            // field) still gets split into reasoning/text.
-            let mut filter = ThinkTagFilter::default();
-            out.extend(filter.feed(&c));
-            if let Some(b) = filter.flush() {
-                out.push(b);
-            }
-        }
-        for (i, tc) in msg.tool_calls.into_iter().enumerate() {
-            let Some(f) = tc.function else { continue };
-            let Some(name) = f.name.filter(|n| !n.is_empty()) else { continue };
-            let id = tc.id.filter(|s| !s.is_empty()).unwrap_or_else(|| format!("call_{i}"));
-            let parsed_args = match f.arguments {
-                Some(a) if !a.trim().is_empty() => {
-                    serde_json::from_str(&a).unwrap_or_else(|_| serde_json::json!({ "_raw": a }))
-                }
-                _ => serde_json::json!({}),
-            };
-            out.push(Block::ToolIntent(ToolIntent {
-                id,
-                tool: names.get(&name).cloned().unwrap_or(name),
-                args: repair_args(parsed_args),
-            }));
-        }
-    }
-    if let Some(u) = parsed.usage {
-        out.push(Block::Usage(Usage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-        }));
-    }
-    Ok(out)
-}
-
-/// Turn accumulated tool-call fragments into final intents, in issue order.
-/// Synthesizes `call_{idx}` for any call the stream never gave an id — some
-/// gateways (llama.cpp and others) omit it, and an empty `tool_call_id` 400s on
-/// strict backends when the result is sent back. Wire names map back to their
-/// canonical (dotted) form; an unmapped name passes through for the kernel's
-/// deny-first policy to handle.
-fn finalize_tool_calls(
-    accum: std::collections::BTreeMap<u32, (String, String, String)>,
-    names: &std::collections::HashMap<String, String>,
-) -> Vec<ToolIntent> {
-    let mut out = Vec::new();
-    for (idx, (id, name, args)) in accum {
-        if name.is_empty() {
-            continue;
-        }
-        let id = if id.is_empty() {
-            format!("call_{idx}")
-        } else {
-            id
-        };
-        let parsed = if args.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&args).unwrap_or_else(|_| serde_json::json!({ "_raw": args }))
-        };
-        out.push(ToolIntent {
-            id,
-            tool: names.get(&name).cloned().unwrap_or(name),
-            args: repair_args(parsed),
-        });
-    }
-    out
-}
-
-/// Repair the argument shapes models actually emit instead of a plain object.
-/// Two real-world failure modes, both otherwise fatal to the tool call:
-///   1. double-encoded — the whole object arrives as a JSON *string*:
-///      `"{\"path\": \"src/main.rs\"}"`
-///   2. wrapper key — the object is nested under a lone envelope key whose
-///      value is the (possibly stringified) real object:
-///      `{"arguments": "{\"path\": ...}"}`
-///
-/// Anything unrecognized passes through untouched — never guess beyond these.
-fn repair_args(args: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    // Case 1: the entire args value is a stringified JSON object.
-    if let Value::String(s) = &args {
-        if let Ok(inner @ Value::Object(_)) = serde_json::from_str::<Value>(s) {
-            return inner;
-        }
-        return args;
-    }
-    // Case 2: a single envelope key holding the real object (or its string).
-    if let Value::Object(map) = &args {
-        if map.len() == 1 {
-            let (key, val) = map.iter().next().expect("len checked");
-            if matches!(key.as_str(), "arguments" | "input" | "parameters" | "args") {
-                match val {
-                    Value::Object(_) => return val.clone(),
-                    Value::String(s) => {
-                        if let Ok(inner @ Value::Object(_)) = serde_json::from_str::<Value>(s) {
-                            return inner;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    args
-}
-
-/// Parse one SSE record's `data:` lines into the blocks to yield, folding
-/// tool-call deltas into `accum`. Shared by the mid-stream drain loop and the
-/// end-of-stream residual drain so both paths behave identically. Returns
-/// `Err` for a mid-stream error frame (ends the turn with a real error rather
-/// than a silent truncation). `str::lines()` already tolerates `\r\n`, so only
-/// the record *delimiter* needed CRLF handling (see `find_record_boundary`).
+#[cfg(test)]
 fn process_sse_record(
     record: &str,
     accum: &mut std::collections::BTreeMap<u32, (String, String, String)>,
     think_filter: &mut ThinkTagFilter,
     target_announced: &mut std::collections::HashSet<u32>,
 ) -> Result<Vec<Block>, ProviderError> {
-    let mut out = Vec::new();
-    for line in record.lines() {
-        let Some(data) = line.trim_start().strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
-            continue; // tolerate keep-alives / non-JSON frames
-        };
-        if let Some(err) = chunk.error {
-            let msg = match (err.message, err.kind) {
-                (Some(m), Some(k)) => format!("{m} ({k})"),
-                (Some(m), None) => m,
-                (None, Some(k)) => k,
-                (None, None) => "provider returned an error frame".to_string(),
-            };
-            return Err(ProviderError::Stream(msg));
-        }
-        if let Some(u) = chunk.usage {
-            out.push(Block::Usage(Usage {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-            }));
-        }
-        if let Some(choice) = chunk.choices.into_iter().next() {
-            if let Some(r) = choice.delta.reasoning_content {
-                if !r.is_empty() {
-                    out.push(Block::Reasoning(r));
-                }
-            }
-            if let Some(c) = choice.delta.content {
-                if !c.is_empty() {
-                    out.extend(think_filter.feed(&c));
-                }
-            }
-            for tc in choice.delta.tool_calls {
-                let idx = tc.index;
-                let e = accum.entry(idx).or_default();
-                if let Some(id) = tc.id {
-                    if !id.is_empty() {
-                        e.0 = id;
-                    }
-                }
-                if let Some(f) = tc.function {
-                    if let Some(n) = f.name {
-                        if !n.is_empty() {
-                            let first = e.1.is_empty();
-                            e.1 = n.clone();
-                            // Surface the tool name the moment it's known so the UI
-                            // can show "writing…/reading…" while the (possibly huge)
-                            // arguments are still streaming in.
-                            if first {
-                                out.push(Block::ToolStarted {
-                                    name: n,
-                                    target: None,
-                                });
-                            }
-                        }
-                    }
-                    if let Some(a) = f.arguments {
-                        e.2.push_str(&a);
-                        // The path/command usually appears at the START of the args
-                        // JSON (before a huge `content` field), so we can surface
-                        // "writing medha.html…" long before the write finishes.
-                        if !e.1.is_empty() && !target_announced.contains(&idx) {
-                            if let Some(t) = sniff_target(&e.2) {
-                                target_announced.insert(idx);
-                                out.push(Block::ToolStarted {
-                                    name: e.1.clone(),
-                                    target: Some(t),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(out)
+    let Some(event) = crate::transport::sse::decode_record(record.as_bytes()) else {
+        return Ok(Vec::new());
+    };
+    process_sse_event(&event, accum, think_filter, target_announced)
 }
 
 #[cfg(test)]
@@ -1363,16 +1109,6 @@ mod sniff_tests {
 mod sse_tests {
     use super::*;
     use std::collections::{BTreeMap, HashSet};
-
-    // ── K4: record boundary must accept BOTH LF and CRLF blank-line separators ──
-    #[test]
-    fn record_boundary_handles_lf_and_crlf() {
-        assert_eq!(find_record_boundary(b"data: x\n\ndata: y"), Some((7, 2)));
-        // CRLF: "data: x\r\n\r\n..." — the LF-only search would never match here.
-        assert_eq!(find_record_boundary(b"data: x\r\n\r\nrest"), Some((7, 4)));
-        // No blank line yet → no complete record.
-        assert_eq!(find_record_boundary(b"data: partial\r\n"), None);
-    }
 
     fn drive(record: &str) -> Vec<Block> {
         let mut accum = BTreeMap::new();
@@ -1634,6 +1370,22 @@ mod think_tag_tests {
 #[cfg(test)]
 mod count_tokens_tests {
     use super::*;
+    use kernel::{BlastRadius, ToolCategory, ToolSpec};
+
+    fn tool(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: "read a file".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+            blast_radius: BlastRadius::Read,
+            category: ToolCategory::Read,
+            icon: "r".into(),
+        }
+    }
 
     #[test]
     fn tokenize_url_is_server_root_sibling_of_v1() {
@@ -1653,34 +1405,25 @@ mod count_tokens_tests {
     }
 
     #[test]
-    fn anthropic_body_hoists_system_and_folds_tools_into_user() {
-        let msgs = vec![
-            Message::system("be terse"),
-            Message::user("hello"),
-            Message::assistant_calls("", vec![]), // empty assistant content
-            Message::tool_result("c1", "tool output"),
-        ];
-        let body = anthropic_count_body("m", &msgs);
-        assert_eq!(body["system"], serde_json::json!("be terse"));
-        let arr = body["messages"].as_array().unwrap();
-        // system is hoisted out; the other three remain.
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr[0]["role"], "user");
-        assert_eq!(arr[1]["role"], "assistant");
-        assert_eq!(arr[1]["content"], " "); // empty content padded to non-empty
-        assert_eq!(arr[2]["role"], "user"); // tool result folded to user
-        assert_eq!(arr[2]["content"], "tool output");
-    }
-
-    #[test]
-    fn vllm_body_keeps_all_roles_for_the_chat_template() {
+    fn vllm_body_is_derived_from_the_complete_prepared_chat_request() {
         let msgs = vec![
             Message::system("s"),
             Message::user("u"),
             Message::tool_result("c1", "t"),
         ];
-        let body = vllm_tokenize_body("m", &msgs);
+        let provider = OpenAiCompat::new("http://x/v1", "", "m");
+        let prepared = provider
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: msgs,
+                ordered: None,
+                tools: vec![tool("fs.read")],
+            })
+            .unwrap();
+        let body = vllm_tokenize_body_from_prepared(&prepared);
         assert_eq!(body["add_generation_prompt"], serde_json::json!(true));
+        assert!(body.get("stream").is_none());
+        assert_eq!(body["tools"][0]["function"]["name"], "fs_read");
         let arr = body["messages"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["role"], "system");
@@ -1695,13 +1438,128 @@ mod count_tokens_tests {
             Message::system("earlier summary"), // mid-array (compaction)
             Message::new(Role::Assistant, "ok"),
         ];
-        let body = vllm_tokenize_body("m", &msgs);
+        let provider = OpenAiCompat::new("http://x/v1", "", "m");
+        let prepared = provider
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: msgs,
+                ordered: None,
+                tools: Vec::new(),
+            })
+            .unwrap();
+        let body = vllm_tokenize_body_from_prepared(&prepared);
         let arr = body["messages"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["role"], "system");
         assert_eq!(arr[0]["content"], "SYS\n\nearlier summary");
         assert_eq!(arr[1]["role"], "user");
         assert_eq!(arr[2]["role"], "assistant");
+    }
+
+    #[test]
+    fn generic_openai_chat_does_not_probe_a_vendor_count_route() {
+        let provider = OpenAiCompat::new("http://127.0.0.1:1/v1", "", "m");
+        let prepared = provider
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: vec![Message::user("hello")],
+                ordered: None,
+                tools: Vec::new(),
+            })
+            .unwrap();
+        let result = futures::executor::block_on(provider.count_input_tokens(&prepared)).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_the_prepared_tool_schema_changes() {
+        let provider = OpenAiCompat::new("http://x/v1", "", "m");
+        let make = |tools| {
+            provider
+                .prepare_request(&CompiledContext {
+                    model: String::new(),
+                    messages: vec![Message::user("hello")],
+                    ordered: None,
+                    tools,
+                })
+                .unwrap()
+        };
+        let without = make(Vec::new());
+        let with = make(vec![tool("fs.read")]);
+        assert_ne!(without.request_fingerprint, with.request_fingerprint);
+    }
+
+    #[tokio::test]
+    async fn declared_vllm_counter_posts_the_full_prepared_input() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before headers");
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            assert!(headers.starts_with("POST /tokenize HTTP/1.1"), "{headers}");
+            let content_length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .expect("content-length");
+            while bytes.len() - header_end < content_length {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before body");
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
+            tx.send(body).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 13\r\nconnection: close\r\n\r\n{\"count\":321}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let provider = OpenAiCompat::new(format!("http://{address}/v1"), "", "m")
+            .with_token_counter(OpenAiTokenCounter::Vllm);
+        let prepared = provider
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: vec![Message::system("s"), Message::user("hello")],
+                ordered: None,
+                tools: vec![tool("fs.read")],
+            })
+            .unwrap();
+        let count = provider
+            .count_input_tokens(&prepared)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.tokens, 321);
+        assert_eq!(count.quality, TokenCountQuality::Authoritative);
+        assert_eq!(count.request_fingerprint, prepared.request_fingerprint);
+        let body = rx.await.unwrap();
+        assert_eq!(body["tools"][0]["function"]["name"], "fs_read");
+        assert_eq!(body["add_generation_prompt"], true);
+        assert!(body.get("stream").is_none());
+        server.await.unwrap();
     }
 
     #[test]
@@ -1735,7 +1593,9 @@ mod wire_tool_name_tests {
 
     fn is_strict_valid(name: &str) -> bool {
         !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
     #[test]
@@ -1772,10 +1632,20 @@ mod wire_tool_name_tests {
     #[test]
     fn finalize_maps_wire_call_back_to_dotted_tool() {
         let mut accum = std::collections::BTreeMap::new();
-        accum.insert(0u32, ("id".to_string(), "fs_edit".to_string(), r#"{"path":"x"}"#.to_string()));
+        accum.insert(
+            0u32,
+            (
+                "id".to_string(),
+                "fs_edit".to_string(),
+                r#"{"path":"x"}"#.to_string(),
+            ),
+        );
         let map = wire_name_map(&["fs.edit".to_string()]);
         let intents: Vec<ToolIntent> = finalize_tool_calls(accum, &map);
-        assert_eq!(intents[0].tool, "fs.edit", "kernel must see the canonical name");
+        assert_eq!(
+            intents[0].tool, "fs.edit",
+            "kernel must see the canonical name"
+        );
     }
 
     #[test]
@@ -1794,15 +1664,21 @@ mod wire_tool_name_tests {
         let blocks = parse_completion(body, &map).unwrap();
         // Reasoning first, then any text, then the tool intent, then usage last.
         assert!(matches!(&blocks[0], Block::Reasoning(r) if r.contains("391")));
-        let text: String = blocks.iter().filter_map(|b| match b {
-            Block::Text(t) => Some(t.clone()),
-            _ => None,
-        }).collect();
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
         assert!(text.contains("391"), "text was: {text:?}");
-        let intent = blocks.iter().find_map(|b| match b {
-            Block::ToolIntent(it) => Some(it),
-            _ => None,
-        }).expect("a tool intent");
+        let intent = blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::ToolIntent(it) => Some(it),
+                _ => None,
+            })
+            .expect("a tool intent");
         assert_eq!(intent.tool, "fs.read", "wire name mapped back to canonical");
         assert_eq!(intent.args["path"], "a");
         assert!(matches!(blocks.last(), Some(Block::Usage(u)) if u.total_tokens == 30));
@@ -1812,8 +1688,16 @@ mod wire_tool_name_tests {
     fn parse_completion_splits_inline_think_tags_when_no_reasoning_field() {
         let body = r#"{"choices":[{"message":{"content":"<think>weighing it</think>Done."}}]}"#;
         let blocks = parse_completion(body, &std::collections::HashMap::new()).unwrap();
-        assert!(blocks.iter().any(|b| matches!(b, Block::Reasoning(r) if r.contains("weighing"))));
-        assert!(blocks.iter().any(|b| matches!(b, Block::Text(t) if t.contains("Done"))));
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, Block::Reasoning(r) if r.contains("weighing")))
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, Block::Text(t) if t.contains("Done")))
+        );
     }
 
     #[test]
@@ -1824,10 +1708,262 @@ mod wire_tool_name_tests {
 
     #[test]
     fn assistant_history_tool_calls_are_sanitized() {
-        let intent = ToolIntent { id: "c1".into(), tool: "fs.edit".into(), args: serde_json::json!({}) };
+        let intent = ToolIntent {
+            id: "c1".into(),
+            tool: "fs.edit".into(),
+            args: serde_json::json!({}),
+        };
         let msgs = vec![Message::assistant_calls("", vec![intent])];
         let built = build_chat_messages(&msgs);
-        assert_eq!(built[0].tool_calls[0].function.name, "fs_edit", "history name must be wire-valid");
+        assert_eq!(
+            built[0].tool_calls[0].function.name, "fs_edit",
+            "history name must be wire-valid"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gemini_client_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn native_model_discovery_uses_v1_google_auth_and_normalizes_ids() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before headers");
+                bytes.extend_from_slice(&chunk[..read]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&bytes);
+            assert!(
+                headers.starts_with("GET /v1/models?pageSize=1000 HTTP/1.1"),
+                "{headers}"
+            );
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("x-goog-api-key: discovery-secret")),
+                "{headers}"
+            );
+            let body = serde_json::json!({
+                "models": [
+                    {
+                        "name": "models/gemini-3.5-flash",
+                        "baseModelId": "gemini-3.5-flash",
+                        "inputTokenLimit": 1_048_576,
+                        "supportedGenerationMethods": ["generateContent", "countTokens"]
+                    },
+                    {
+                        "name": "models/text-embedding-004",
+                        "baseModelId": "text-embedding-004",
+                        "inputTokenLimit": 2_048,
+                        "supportedGenerationMethods": ["embedContent"]
+                    }
+                ]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut profile = ProviderProfile::openai_chat(
+            format!("http://{address}/v1"),
+            "model-discovery",
+            AuthKind::XGoogApiKey,
+        );
+        profile.protocol = Protocol::GeminiInteractions;
+        let models = list_models_for_profile(&profile, "discovery-secret")
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-3.5-flash");
+        assert_eq!(models[0].context_length, Some(1_048_576));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_stream_posts_v1_interactions_with_google_auth_and_decodes_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before headers");
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+            assert!(
+                headers.starts_with("POST /v1/interactions HTTP/1.1"),
+                "{headers}"
+            );
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("x-goog-api-key: test-secret")),
+                "{headers}"
+            );
+            assert!(
+                !headers
+                    .lines()
+                    .any(|line| line.to_ascii_lowercase().starts_with("authorization:")),
+                "{headers}"
+            );
+            let content_length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .expect("content-length");
+            while bytes.len() - header_end < content_length {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before body");
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
+            tx.send(body).unwrap();
+
+            let events = concat!(
+                "event: step.start\n",
+                "data: {\"event_type\":\"step.start\",\"index\":0,\"step\":{\"type\":\"thought\",\"summary\":[]}}\n\n",
+                "event: step.delta\n",
+                "data: {\"event_type\":\"step.delta\",\"index\":0,\"delta\":{\"type\":\"thought_summary\",\"content\":{\"type\":\"text\",\"text\":\"checking\"}}}\n\n",
+                "event: step.delta\n",
+                "data: {\"event_type\":\"step.delta\",\"index\":0,\"delta\":{\"type\":\"thought_signature\",\"signature\":\"opaque-signed-state\"}}\n\n",
+                "event: step.stop\n",
+                "data: {\"event_type\":\"step.stop\",\"index\":0}\n\n",
+                "event: step.start\n",
+                "data: {\"event_type\":\"step.start\",\"index\":1,\"step\":{\"type\":\"model_output\",\"content\":[]}}\n\n",
+                "event: step.delta\n",
+                "data: {\"event_type\":\"step.delta\",\"index\":1,\"delta\":{\"type\":\"text\",\"text\":\"hello\"}}\n\n",
+                "event: step.stop\n",
+                "data: {\"event_type\":\"step.stop\",\"index\":1}\n\n",
+                "event: interaction.completed\n",
+                "data: {\"event_type\":\"interaction.completed\",\"interaction\":{\"status\":\"completed\",\"usage\":{\"total_input_tokens\":3,\"total_output_tokens\":4,\"total_thought_tokens\":2,\"total_tokens\":9}}}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                events.len(),
+                events
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut profile = ProviderProfile::openai_chat(
+            format!("http://{address}/v1"),
+            "gemini-model",
+            AuthKind::XGoogApiKey,
+        );
+        profile.protocol = Protocol::GeminiInteractions;
+        profile.reasoning = ReasoningSupport::Effort;
+        let provider = ProviderClient::from_profile(profile, "test-secret")
+            .unwrap()
+            .with_reasoning(ReasoningConfig {
+                enabled: Some(true),
+                effort: Some(ReasoningEffort::Minimal),
+            })
+            .unwrap();
+        let request = provider
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: vec![Message::user("hello")],
+                ordered: None,
+                tools: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(request.protocol, Protocol::GeminiInteractions);
+        assert_eq!(request.body["store"], false);
+        assert_eq!(
+            request.body["generation_config"]["thinking_level"],
+            "minimal"
+        );
+
+        let blocks: Vec<Block> = provider
+            .stream_prepared(&request)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text(text) if text == "hello"))
+        );
+        let completed = blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::CompletedMessage(message) => Some(message),
+                _ => None,
+            })
+            .expect("canonical completed message");
+        assert!(completed.parts.iter().any(|part| matches!(
+            part,
+            kernel::ContentPart::Reasoning(reasoning)
+                if reasoning.provider_state.iter().any(|state| {
+                    state.protocol == Protocol::GeminiInteractions
+                        && state.value == serde_json::json!("opaque-signed-state")
+                })
+        )));
+        assert!(matches!(blocks.last(), Some(Block::Usage(usage)) if usage.total_tokens == 9));
+
+        let body = rx.await.unwrap();
+        assert_eq!(body["model"], "gemini-model");
+        assert_eq!(body["store"], false);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn gemini_profile_switch_is_atomic_and_output_retry_rewrites_generation_config() {
+        let provider = OpenAiCompat::new("http://chat.test/v1", "", "chat-model");
+        let mut profile = ProviderProfile::openai_chat(
+            "https://generativelanguage.googleapis.com/v1",
+            "gemini-model",
+            AuthKind::XGoogApiKey,
+        );
+        profile.protocol = Protocol::GeminiInteractions;
+        provider.switch_provider_profile(profile, "secret").unwrap();
+        assert_eq!(provider.protocol(), Protocol::GeminiInteractions);
+        assert_eq!(provider.active_model(), "gemini-model");
+
+        let request = provider
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: vec![Message::user("hello")],
+                ordered: None,
+                tools: Vec::new(),
+            })
+            .unwrap();
+        let retried = provider.with_output_limit(&request, 512).unwrap().unwrap();
+        assert_eq!(retried.body["generation_config"]["max_output_tokens"], 512);
+        assert_ne!(request.request_fingerprint, retried.request_fingerprint);
     }
 }
 
@@ -1835,39 +1971,115 @@ mod wire_tool_name_tests {
 mod reasoning_request_tests {
     use super::*;
 
-    /// Tests the REAL production method (not a standalone copy) — proves the
-    /// actual `OpenAiCompat` the kernel uses builds `chat_template_kwargs`
-    /// correctly. If a request over the wire doesn't carry this field despite
-    /// `/think on`, this test passing means the bug is downstream of us (a
-    /// proxy/gateway stripping the field), not in this construction step.
     #[test]
-    fn think_on_produces_enable_thinking_true() {
-        let p = OpenAiCompat::new("http://x", "", "m").with_reasoning(ReasoningConfig {
-            enabled: Some(true),
-            effort: None,
-        });
-        let kwargs = p
-            .chat_template_kwargs(false)
-            .expect("must be Some when enabled");
-        assert_eq!(kwargs["enable_thinking"], serde_json::json!(true));
+    fn reading_model_limits_never_relocks_the_connection() {
+        let provider = std::sync::Arc::new(
+            OpenAiCompat::new("http://x", "", "m")
+                .with_max_ctx(32_768)
+                .with_max_output_tokens(4_096),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(provider.model_limits()).unwrap());
+
+        let limits = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("model_limits deadlocked while reading the connection");
+        assert_eq!(limits.max_combined_tokens, Some(32_768));
+        assert_eq!(limits.max_output_tokens, Some(4_096));
     }
 
     #[test]
-    fn think_off_produces_enable_thinking_false() {
-        let p = OpenAiCompat::new("http://x", "", "m").with_reasoning(ReasoningConfig {
-            enabled: Some(false),
-            effort: None,
-        });
-        let kwargs = p
-            .chat_template_kwargs(false)
-            .expect("must be Some when explicitly off");
-        assert_eq!(kwargs["enable_thinking"], serde_json::json!(false));
+    fn effort_uses_the_portable_top_level_openai_field() {
+        let p = OpenAiCompat::new("http://x", "", "m")
+            .with_reasoning(ReasoningConfig {
+                enabled: Some(true),
+                effort: Some(ReasoningEffort::High),
+            })
+            .unwrap();
+        assert_eq!(p.reasoning_effort_value(), Some("high"));
     }
 
     #[test]
-    fn untouched_reasoning_sends_no_kwargs_at_all() {
+    fn minimal_floors_to_low_on_the_compatible_route() {
+        // vLLM/SGLang reject "minimal"; only none/low/medium/high are portable.
+        let p = OpenAiCompat::new("http://x", "", "m")
+            .with_reasoning(ReasoningConfig {
+                enabled: Some(true),
+                effort: Some(ReasoningEffort::Minimal),
+            })
+            .unwrap();
+        assert_eq!(p.reasoning_effort_value(), Some("low"));
+    }
+
+    #[test]
+    fn explicit_off_sends_none_not_a_silent_omit() {
+        // Compatible servers disable thinking via reasoning_effort:"none".
+        let p = OpenAiCompat::new("http://x", "", "m")
+            .with_reasoning(ReasoningConfig {
+                enabled: Some(false),
+                effort: None,
+            })
+            .unwrap();
+        assert_eq!(p.reasoning_effort_value(), Some("none"));
+    }
+
+    #[test]
+    fn profile_switch_rejects_carrying_effort_into_an_unsupported_model() {
+        let provider = OpenAiCompat::new("http://one", "", "model")
+            .with_reasoning(ReasoningConfig {
+                enabled: Some(true),
+                effort: Some(ReasoningEffort::Low),
+            })
+            .unwrap();
+        let mut next = ProviderProfile::openai_chat("http://two", "other-model", AuthKind::None);
+        next.reasoning = ReasoningSupport::Unsupported;
+
+        assert!(provider.switch_provider_profile(next, "").is_err());
+        assert_eq!(provider.active_model(), "model");
+    }
+
+    #[test]
+    fn gemini_reasoning_on_defaults_to_minimal_and_survives_switch_to_openai_chat() {
+        // A Gemini session runs with "reasoning on" and no explicit effort —
+        // valid for gemini-interactions. Start a provider in exactly that state.
+        let mut gemini =
+            ProviderProfile::openai_chat("http://gemini/v1", "gemini-3.5-flash", AuthKind::XGoogApiKey);
+        gemini.protocol = Protocol::GeminiInteractions;
+        let provider = ProviderClient::from_profile(gemini, "key").unwrap();
+        provider
+            .set_reasoning(ReasoningConfig {
+                enabled: Some(true),
+                effort: None,
+            })
+            .unwrap();
+        // Normalised to Minimal, so the canonical config is portable across
+        // protocols instead of carrying an effort-less "on".
+        assert_eq!(provider.reasoning().effort, Some(ReasoningEffort::Minimal));
+
+        // Switching to an openai-chat model must now succeed — this previously
+        // failed with "open-ai-chat cannot enable reasoning without an explicit
+        // effort" because the effort-less Gemini config was carried across.
+        let next = ProviderProfile::openai_chat("http://vllm/v1", "qwen", AuthKind::None);
+        assert!(provider.switch_provider_profile(next, "").is_ok());
+        assert_eq!(provider.active_model(), "qwen");
+        assert_eq!(provider.reasoning().effort, Some(ReasoningEffort::Minimal));
+    }
+
+    #[test]
+    fn only_explicit_first_run_constructor_allows_an_empty_profile() {
+        let invalid = ProviderProfile::openai_chat("", "", AuthKind::None);
+        assert!(ProviderClient::from_profile(invalid, "").is_err());
+
+        let provider = ProviderClient::unconfigured();
+        let connection = provider.connection.lock().unwrap();
+        assert!(connection.profile.base_url.is_empty());
+        assert!(connection.profile.model.is_empty());
+    }
+
+    #[test]
+    fn untouched_reasoning_sends_no_effort_field() {
         let p = OpenAiCompat::new("http://x", "", "m");
-        assert!(p.chat_template_kwargs(false).is_none());
+        assert!(p.reasoning_effort_value().is_none());
     }
 
     #[test]
@@ -1884,7 +2096,7 @@ mod reasoning_request_tests {
     #[test]
     fn auth_header_is_omitted_when_empty_and_normalizes_bearer_prefix() {
         let client = reqwest::Client::new();
-        let no_key = with_bearer(client.get("http://localhost"), "")
+        let no_key = http::with_bearer(client.get("http://localhost"), "")
             .build()
             .unwrap();
         assert!(
@@ -1894,7 +2106,7 @@ mod reasoning_request_tests {
                 .is_none()
         );
 
-        let key = with_bearer(client.get("http://localhost"), "Bearer secret")
+        let key = http::with_bearer(client.get("http://localhost"), "Bearer secret")
             .build()
             .unwrap();
         assert_eq!(
@@ -1905,28 +2117,21 @@ mod reasoning_request_tests {
 
     #[test]
     fn full_request_json_actually_contains_the_field() {
-        // End-to-end through serde, exactly as it would serialize onto the wire.
-        let p = OpenAiCompat::new("http://x", "", "m").with_reasoning(ReasoningConfig {
-            enabled: Some(true),
-            effort: Some(ReasoningEffort::Medium),
-        });
-        let req = ChatReq {
-            model: "m".into(),
-            messages: vec![],
-            stream: true,
-            tools: vec![],
-            stream_options: None,
-            chat_template_kwargs: p.chat_template_kwargs(false),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(
-            json.contains("chat_template_kwargs"),
-            "field missing from wire JSON: {json}"
-        );
-        assert!(json.contains("enable_thinking"));
-        // The standard string effort knob (GLM/Qwen/OpenAI-compatible), not a
-        // vendor-specific boolean.
-        assert!(json.contains("reasoning_effort"), "wire JSON: {json}");
-        assert!(json.contains("\"medium\""), "wire JSON: {json}");
+        let p = OpenAiCompat::new("http://x", "", "m")
+            .with_reasoning(ReasoningConfig {
+                enabled: Some(true),
+                effort: Some(ReasoningEffort::Medium),
+            })
+            .unwrap();
+        let req = p
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: vec![Message::user("hello")],
+                ordered: None,
+                tools: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(req.body["reasoning_effort"], "medium");
+        assert!(req.body.get("chat_template_kwargs").is_none());
     }
 }

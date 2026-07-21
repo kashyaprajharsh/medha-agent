@@ -8,10 +8,25 @@ MEDHA runs an autonomous, general-purpose agent on top of **any** OpenAI-compati
 
 The bet: **the frontier of agent reliability has moved from the model to the harness.** The same model behind a stronger harness is a dramatically more reliable agent. MEDHA is that harness — sandboxed, auditable, and able to accumulate memory and skills across sessions.
 
-```sh
-cargo build --release
-./target/release/medha
-```
+---
+
+## 📚 What is MEDHA?
+
+**Quick answer:** MEDHA is a **verification-first AI agent harness** that makes any AI model safer and more reliable by adding validation, sandboxing, and human oversight.
+
+**Want to go deep?** Read the complete architecture reference: **[docs/WHAT_IS_MEDHA.md](docs/WHAT_IS_MEDHA.md)**
+
+It covers:
+- ✅ **Kernel & Agent Loop** — How MEDHA orchestrates every turn
+- ✅ **Security Model** — Sandbox, blast radius, trust flow, policy engine
+- ✅ **Human Gate** — Approval system for consequential actions
+- ✅ **Memory System** — Persistent facts with kernel-computed trust
+- ✅ **Context Management** — 3-stage compaction, context files (MEDHA.md, PERSONA.md)
+- ✅ **Configuration** — Complete `medha.lock` reference with examples
+- ✅ **Eval Gate** — CI for AI behavior testing
+- ✅ **And every other feature** explained in detail
+
+**Start here (README)** for setup and quick commands. **Read [docs/WHAT_IS_MEDHA.md](docs/WHAT_IS_MEDHA.md)** for deep understanding of how everything works.
 
 ---
 
@@ -264,10 +279,13 @@ Twelve crates. `kernel` is the only code that calls a model, writes an event, or
 
 ## Documentation
 
+For deep dives into MEDHA's architecture and features:
+
 | Doc | Covers |
 |---|---|
-| [docs/FEATURES.md](docs/FEATURES.md) | Full feature reference with code locations |
-| [medha.lock.example](medha.lock.example) | Every configuration option, annotated |
+| [**docs/WHAT_IS_MEDHA.md**](docs/WHAT_IS_MEDHA.md) | Complete architecture reference — every feature explained |
+| [docs/FEATURES.md](docs/FEATURES.md) | Feature reference with code locations |
+| [medha.lock.example](medha.lock.example) | Configuration options, annotated |
 
 ---
 

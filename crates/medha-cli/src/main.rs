@@ -16,7 +16,7 @@ mod config;
 mod skill_judge;
 mod tui_tea;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kernel::{EventLog, Kernel, Message, Provider, Session};
 use providers::OpenAiCompat;
@@ -163,8 +163,8 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
     }
 
     let cfg = config::load()?;
-    let resolved = config::resolve(cfg.as_ref(), None, None)
-        .filter(|r| !r.base_url.is_empty())
+    let resolved = config::resolve(cfg.as_ref(), None, None)?
+        .filter(|resolved| !resolved.provider.base_url.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "the gate needs a configured model — add one with `medha`, or set \
@@ -176,14 +176,38 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
     let seeds = gc.seeds.unwrap_or(lock.gate.seeds).max(1);
     let threshold = gc.threshold.unwrap_or(lock.gate.pass_threshold);
 
+    let mut provider_env = vec![
+        (
+            "MEDHA_BASE_URL".to_string(),
+            resolved.provider.base_url.clone(),
+        ),
+        ("MEDHA_MODEL".to_string(), resolved.provider.model.clone()),
+        ("MEDHA_API_KEY".to_string(), resolved.credential.clone()),
+        (
+            "MEDHA_PROTOCOL".to_string(),
+            resolved.provider.protocol.as_str().to_string(),
+        ),
+        (
+            "MEDHA_AUTH".to_string(),
+            resolved.provider.auth.as_str().to_string(),
+        ),
+        (
+            "MEDHA_REASONING_SUPPORT".to_string(),
+            resolved.provider.reasoning.as_str().to_string(),
+        ),
+    ];
+    if !resolved.provider.headers.is_empty() {
+        provider_env.push((
+            "MEDHA_HEADERS_JSON".to_string(),
+            serde_json::to_string(&resolved.provider.headers)
+                .context("serializing provider headers for gate child")?,
+        ));
+    }
+
     let run = gate::RunConfig {
         binary: std::env::current_exe()
             .map_err(|e| anyhow::anyhow!("locating the medha binary: {e}"))?,
-        provider_env: vec![
-            ("MEDHA_BASE_URL".to_string(), resolved.base_url.clone()),
-            ("MEDHA_MODEL".to_string(), resolved.model.clone()),
-            ("MEDHA_API_KEY".to_string(), resolved.api_key.clone()),
-        ],
+        provider_env,
         default_wall_s: 600,
     };
 
@@ -207,7 +231,10 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
 /// Restore file(s) from a snapshot, headlessly — `/rewind` without the TUI
 /// or the conversation fork.
 #[derive(Parser)]
-#[command(name = "medha undo", about = "Restore file(s) from a snapshot (no conversation change)")]
+#[command(
+    name = "medha undo",
+    about = "Restore file(s) from a snapshot (no conversation change)"
+)]
 struct UndoCli {
     /// Undo this event and everything after it, instead of just the last write.
     #[arg(long)]
@@ -322,7 +349,10 @@ async fn run_memory_command(args: Vec<String>) -> Result<()> {
 
     match cli.command {
         MemoryCommand::List { scope } => {
-            let scope = scope.as_deref().map(|value| memory_scope(Some(value))).transpose()?;
+            let scope = scope
+                .as_deref()
+                .map(|value| memory_scope(Some(value)))
+                .transpose()?;
             let now = memory_now();
             let entries = projection
                 .list()?
@@ -391,12 +421,15 @@ async fn run_memory_command(args: Vec<String>) -> Result<()> {
         MemoryCommand::Edit { name, scope } => {
             let mut entry = find_memory(&projection, scope.as_deref(), &name)?
                 .ok_or_else(|| anyhow::anyhow!("memory '{name}' not found"))?;
-            let path = std::env::temp_dir().join(format!("medha-memory-edit-{}.md", ulid::Ulid::new()));
+            let path =
+                std::env::temp_dir().join(format!("medha-memory-edit-{}.md", ulid::Ulid::new()));
             std::fs::write(&path, &entry.claim)?;
-            let editor = std::env::var("EDITOR")
-                .map_err(|_| anyhow::anyhow!("$EDITOR is not set"))?;
+            let editor =
+                std::env::var("EDITOR").map_err(|_| anyhow::anyhow!("$EDITOR is not set"))?;
             let mut parts = editor.split_whitespace();
-            let program = parts.next().ok_or_else(|| anyhow::anyhow!("$EDITOR is empty"))?;
+            let program = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("$EDITOR is empty"))?;
             let status = std::process::Command::new(program)
                 .args(parts)
                 .arg(&path)
@@ -441,7 +474,10 @@ async fn run_memory_command(args: Vec<String>) -> Result<()> {
                 &log,
                 &projection,
                 &Session::new(),
-                memory::MemoryOp::Forget { scope, name: name.clone() },
+                memory::MemoryOp::Forget {
+                    scope,
+                    name: name.clone(),
+                },
             )
             .await?;
             println!("Forgot '{name}'.");
@@ -467,7 +503,12 @@ async fn run_memory_command(args: Vec<String>) -> Result<()> {
         MemoryCommand::Pending => {
             let dir = state.join("memory-pending");
             let mut paths = std::fs::read_dir(&dir)
-                .map(|entries| entries.filter_map(Result::ok).map(|entry| entry.path()).collect())
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .collect()
+                })
                 .unwrap_or_else(|_| Vec::<std::path::PathBuf>::new());
             paths.sort();
             if paths.is_empty() {
@@ -520,7 +561,12 @@ async fn recent_writes(log: &store::SqliteLog, limit: usize) -> Vec<WriteEvent> 
             let Some(path) = result.get("path").and_then(|p| p.as_str()) else {
                 continue;
             };
-            out.push(WriteEvent { id: e.id, session: meta.id, path: path.to_string(), ts: e.ts });
+            out.push(WriteEvent {
+                id: e.id,
+                session: meta.id,
+                path: path.to_string(),
+                ts: e.ts,
+            });
             if out.len() >= limit {
                 return out;
             }
@@ -546,7 +592,11 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
         println!("Recent writes in this workspace (newest first):\n");
         for w in &writes {
             let when = chrono::DateTime::from_timestamp(w.ts as i64, 0)
-                .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                .map(|d| {
+                    d.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string()
+                })
                 .unwrap_or_default();
             println!("  {}  {when}  {}", w.id, w.path);
         }
@@ -580,20 +630,33 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
     let events = kernel::EventLog::events(&log, session_id).await;
     let plan = kernel::events::rollback_plan(&events, target);
     if plan.is_empty() {
-        println!("Nothing to undo at event {target} (not a write, or already at the workspace's HEAD state).");
+        println!(
+            "Nothing to undo at event {target} (not a write, or already at the workspace's HEAD state)."
+        );
         return Ok(());
     }
 
     let trust_path = state.join("trust.lock");
     let audit_path = state.join("logs").join("audit.log");
-    let sandbox = WorkspaceSandbox::new(cwd.clone(), trust_path, audit_path, Some(Arc::new(kernel::AutoDeny)))?
-        .with_snapshots_dir(state.join("snapshots"));
+    let sandbox = WorkspaceSandbox::new(
+        cwd.clone(),
+        trust_path,
+        audit_path,
+        Some(Arc::new(kernel::AutoDeny)),
+    )?
+    .with_snapshots_dir(state.join("snapshots"));
 
-    println!("Restoring {} file(s) to their state at event {target}:", plan.len());
+    println!(
+        "Restoring {} file(s) to their state at event {target}:",
+        plan.len()
+    );
     for f in &plan {
         match &f.snapshot {
             Some(_) => println!("  {} — reverted to the snapshot before that write", f.path),
-            None => println!("  {} — removed (it was created at/after this point)", f.path),
+            None => println!(
+                "  {} — removed (it was created at/after this point)",
+                f.path
+            ),
         }
         sandbox.restore(&f.path, f.snapshot.as_deref()).await?;
     }
@@ -652,14 +715,16 @@ async fn main() -> Result<()> {
     let is_tty_early = std::io::stdin().is_terminal();
     let tui_possible =
         !cli.acp && !cli.plain && cli.prompt.join(" ").trim().is_empty() && is_tty_early;
-    let resolved = match config::resolve(cfg.as_ref(), cli.base_url.clone(), cli.model.clone()) {
+    let resolved = match config::resolve(cfg.as_ref(), cli.base_url.clone(), cli.model.clone())? {
         Some(r) => r,
         None if tui_possible || cli.setup => config::Resolved {
-            profile: String::new(),
-            base_url: String::new(),
-            model: String::new(),
-            api_key: String::new(),
-            max_ctx: None,
+            name: String::new(),
+            provider: providers::ProviderProfile::openai_chat(
+                String::new(),
+                String::new(),
+                providers::AuthKind::None,
+            ),
+            credential: String::new(),
         },
         None => anyhow::bail!(
             "no model configured. Run `medha` to add one in the TUI, \
@@ -667,17 +732,17 @@ async fn main() -> Result<()> {
         ),
     };
     // Open the TUI in model setup on explicit --setup or an unconfigured start.
-    let open_setup = cli.setup || resolved.base_url.is_empty();
+    let open_setup = cli.setup || resolved.provider.base_url.is_empty();
 
     let prompt = cli.prompt.join(" ");
     let use_plain_repl = cli.plain;
 
-    let model_name = resolved.model.clone();
+    let model_name = resolved.provider.model.clone();
     // Keep a mutable, persisted profile registry available to the TUI. A
     // session started purely from flags/environment (or still unconfigured)
     // begins with an empty registry; `/model add` writes the first profile.
     let model_profiles = Arc::new(std::sync::Mutex::new(cfg.unwrap_or_default()));
-    let active_profile = resolved.profile.clone();
+    let active_profile = resolved.name.clone();
 
     // Resolve the context window so compaction sizes itself — without the user
     // ever typing a number, and without fabricating one. Precedence:
@@ -687,12 +752,21 @@ async fn main() -> Result<()> {
     //      locally from a real, externally maintained metadata source — NOT a
     //      hardcoded table baked into this binary)
     //   4. otherwise unknown → compaction off, say so (never guess, §4.3)
-    let (mut max_ctx, mut ctx_source) = (resolved.max_ctx, "config/env");
+    let (mut max_ctx, mut ctx_source) = (resolved.provider.max_ctx, "config/env");
     // Unconfigured first-run start: no endpoint to ask yet — the TUI's model
     // setup captures the context window when the first profile is saved.
-    if max_ctx.is_none() && !resolved.base_url.is_empty() {
-        if let Ok(models) =
-            providers::openai_compat::list_models(&resolved.base_url, &resolved.api_key).await
+    if max_ctx.is_none()
+        && !resolved.provider.base_url.is_empty()
+        && matches!(
+            resolved.provider.protocol,
+            kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
+        )
+    {
+        if let Ok(models) = providers::openai_compat::list_models_for_profile(
+            &resolved.provider,
+            &resolved.credential,
+        )
+        .await
         {
             if let Some(c) = models
                 .iter()
@@ -728,10 +802,29 @@ async fn main() -> Result<()> {
         ),
     }
 
-    let mut provider = OpenAiCompat::new(resolved.base_url, resolved.api_key, resolved.model);
-    if let Some(ctx_window) = max_ctx {
-        provider = provider.with_max_ctx(ctx_window);
+    if !resolved.provider.base_url.is_empty()
+        && !matches!(
+            resolved.provider.protocol,
+            kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
+        )
+    {
+        anyhow::bail!(
+            "protocol '{}' is configured but its native adapter is not implemented yet",
+            resolved.provider.protocol.as_str()
+        );
     }
+    let mut runtime_profile = resolved.provider;
+    runtime_profile.max_ctx = max_ctx;
+    let provider = if open_setup && runtime_profile.base_url.is_empty() {
+        // The first-run TUI needs a provider handle so it can atomically switch
+        // to the profile saved by setup. Keep this explicit inert state out of
+        // `from_profile`, where accepting an empty endpoint would weaken
+        // validation for every real profile.
+        OpenAiCompat::unconfigured()
+    } else {
+        OpenAiCompat::from_profile(runtime_profile, resolved.credential)
+            .map_err(|error| anyhow::anyhow!(error))?
+    };
     let provider = Arc::new(provider);
 
     // medha.lock (§6): the harness artifact. Absent file = built-in defaults
@@ -741,7 +834,16 @@ async fn main() -> Result<()> {
 
     // Reasoning/thinking request-side control (§4.4): config-file default,
     // further adjustable live via /think.
-    provider.set_reasoning(lock.reasoning.to_config());
+    let reasoning = lock.reasoning.to_config();
+    if let Err(error) = provider.set_reasoning(reasoning.clone()) {
+        eprintln!("note: saved reasoning setting was not applied: {error}");
+    } else if reasoning != kernel::ReasoningConfig::default()
+        && provider.reasoning_support() == kernel::ReasoningSupport::Unknown
+    {
+        eprintln!(
+            "note: reasoning effort was requested, but this profile marks model support as unverified"
+        );
+    }
     // Streaming default from the lock; live-toggle via /stream. Absent → on.
     if let Some(stream) = lock.reasoning.stream {
         provider.set_streaming(stream);
@@ -933,18 +1035,21 @@ async fn main() -> Result<()> {
         .with_judge(security_judge.clone())
         .with_limits(
             lock.context_files.max_chars,
-            lock.context_files.max_chars.min(context::ctxfiles::PROGRESSIVE_MAX_CHARS),
+            lock.context_files
+                .max_chars
+                .min(context::ctxfiles::PROGRESSIVE_MAX_CHARS),
         );
     let medha_home = config::medha_home()?;
     let startup_context = if lock.context_files.enabled {
-        context_file_loader.discover_startup(&cwd, &medha_home).await
+        context_file_loader
+            .discover_startup(&cwd, &medha_home)
+            .await
     } else {
         Vec::new()
     };
     let persona_file = context_file_loader.load_persona(&medha_home).await?;
-    let progressive_context = (lock.context_files.enabled
-        && lock.context_files.progressive_discovery)
-        .then(|| {
+    let progressive_context =
+        (lock.context_files.enabled && lock.context_files.progressive_discovery).then(|| {
             Arc::new(context::ctxfiles::ProgressiveContextFiles::new(
                 context_file_loader,
                 cwd.clone(),
@@ -1846,7 +1951,8 @@ fn print_help() {
          /help                        show this\n  \
          /status                      model, context window, current pressure\n  \
          /think [on|off|status]       enable/disable reasoning (§4.4)\n  \
-         /effort [low|medium|high]    set reasoning depth (turns thinking on)\n  \
+         /effort [minimal|low|medium|high]\n\
+                                      set reasoning depth (turns thinking on)\n  \
          /clear                       reset the conversation (keep system prompt)\n  \
          /exit                        quit (also Ctrl-D)\n\
          anything else is sent to the agent."
@@ -1854,11 +1960,11 @@ fn print_help() {
 }
 
 /// Apply a `/think` command against the live provider; returns the notice to
-/// show. Shared by the plain REPL and the full TUI. Not every model/server
-/// has all three effort tiers — an unsupported one is simply not sent
-/// downstream (see `ReasoningLockConfig`/`OpenAiCompat::chat_template_kwargs`).
+/// show. Shared by the plain REPL and the full TUI. Unsupported controls are
+/// returned visibly by the provider rather than being silently ignored.
 pub(crate) fn effort_label(e: Option<kernel::ReasoningEffort>) -> &'static str {
     match e {
+        Some(kernel::ReasoningEffort::Minimal) => "minimal",
         Some(kernel::ReasoningEffort::Low) => "low",
         Some(kernel::ReasoningEffort::Medium) => "medium",
         Some(kernel::ReasoningEffort::High) => "high",
@@ -1874,18 +1980,22 @@ fn apply_think_command<P: kernel::Provider>(provider: &P, args: &str) -> String 
         "" | "status" => think_status(provider),
         "on" => {
             let effort = provider.reasoning().effort;
-            provider.set_reasoning(kernel::ReasoningConfig {
+            match provider.set_reasoning(kernel::ReasoningConfig {
                 enabled: Some(true),
                 effort,
-            });
-            "thinking: on".to_string()
+            }) {
+                Ok(()) => think_status(provider),
+                Err(error) => format!("thinking unchanged: {error}"),
+            }
         }
         "off" => {
-            provider.set_reasoning(kernel::ReasoningConfig {
+            match provider.set_reasoning(kernel::ReasoningConfig {
                 enabled: Some(false),
                 effort: None,
-            });
-            "thinking: off".to_string()
+            }) {
+                Ok(()) => think_status(provider),
+                Err(error) => format!("thinking unchanged: {error}"),
+            }
         }
         other => format!(
             "usage: /think [on|off|status]  (got '{other}') — use /effort for reasoning level"
@@ -1906,30 +2016,33 @@ fn think_status<P: kernel::Provider>(provider: &P) -> String {
     )
 }
 
-/// `/effort [low|medium|high]` — set reasoning depth; also turns thinking on
+/// `/effort [minimal|low|medium|high]` — set reasoning depth; also turns thinking on
 /// (an effort level only means anything once thinking is enabled). In the
 /// full TUI, calling this with no args opens an arrow-key picker instead of
 /// requiring the name to be typed.
 pub(crate) fn apply_effort_command<P: kernel::Provider>(provider: &P, args: &str) -> String {
     match args.trim() {
-        "low" | "medium" | "high" => {
+        "minimal" | "low" | "medium" | "high" => {
             let level = args.trim();
             let effort = match level {
+                "minimal" => kernel::ReasoningEffort::Minimal,
                 "low" => kernel::ReasoningEffort::Low,
                 "medium" => kernel::ReasoningEffort::Medium,
                 _ => kernel::ReasoningEffort::High,
             };
-            provider.set_reasoning(kernel::ReasoningConfig {
+            match provider.set_reasoning(kernel::ReasoningConfig {
                 enabled: Some(true),
                 effort: Some(effort),
-            });
-            format!(
-                "effort: {level} (thinking: on) — sent if this server supports it, \
-                 otherwise silently ignored"
-            )
+            }) {
+                Ok(()) if provider.reasoning_support() == kernel::ReasoningSupport::Unknown => {
+                    format!("effort: {level} — requested; profile support is unverified")
+                }
+                Ok(()) => format!("effort: {level}"),
+                Err(error) => format!("effort unchanged: {error}"),
+            }
         }
-        "" => "usage: /effort [low|medium|high]".to_string(),
-        other => format!("usage: /effort [low|medium|high]  (got '{other}')"),
+        "" => "usage: /effort [minimal|low|medium|high]".to_string(),
+        other => format!("usage: /effort [minimal|low|medium|high]  (got '{other}')"),
     }
 }
 

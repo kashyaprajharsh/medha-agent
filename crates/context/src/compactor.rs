@@ -158,8 +158,7 @@ pub async fn compact(
     let middle: Vec<HistoryItem> = items[head_end..tail_start].to_vec();
 
     // Pinned middle items are never compacted; keep them verbatim.
-    let (pinned_middle, compactable): (Vec<_>, Vec<_>) =
-        middle.into_iter().partition(|i| i.pinned);
+    let (pinned_middle, compactable): (Vec<_>, Vec<_>) = middle.into_iter().partition(|i| i.pinned);
 
     // Phase 1 — prune tool outputs (deterministic, lossless).
     let mut compactable = compactable;
@@ -182,39 +181,49 @@ pub async fn compact(
     }
 
     // Phase 2 — summarize the compactable middle (only on Full).
-    let (mut new_middle, summarized) = if action == CompactionAction::Full && !compactable.is_empty()
-    {
-        let summary_text = summarizer.summarize(previous_summary, &compactable).await?;
-        let source_events: Vec<String> =
-            compactable.iter().flat_map(|i| i.source_events.clone()).collect();
-        // Assistant, not system: the summary sits mid-array (after the head),
-        // and strict providers (vLLM) reject a `system` message that isn't
-        // first. Same invariant as the live engine's summary.
-        let summary = HistoryItem {
-            role: Role::Assistant,
-            content: summary_text,
-            kind: ItemKind::Summary,
-            source_events,
-            artifact: None,
-            pinned: false,
-            pruned: false,
+    let (mut new_middle, summarized) =
+        if action == CompactionAction::Full && !compactable.is_empty() {
+            let summary_text = summarizer.summarize(previous_summary, &compactable).await?;
+            let source_events: Vec<String> = compactable
+                .iter()
+                .flat_map(|i| i.source_events.clone())
+                .collect();
+            // Assistant, not system: the summary sits mid-array (after the head),
+            // and strict providers (vLLM) reject a `system` message that isn't
+            // first. Same invariant as the live engine's summary.
+            let summary = HistoryItem {
+                role: Role::Assistant,
+                content: summary_text,
+                kind: ItemKind::Summary,
+                source_events,
+                artifact: None,
+                pinned: false,
+                pruned: false,
+            };
+            (vec![summary], compactable.len())
+        } else {
+            (compactable, 0)
         };
-        (vec![summary], compactable.len())
-    } else {
-        (compactable, 0)
-    };
 
     // Reassemble: head + [summary | pruned middle] + pinned middle + tail.
     // (Pinned items follow the summary for Phase 1; chronological re-weave of
     // pinned spans is a Phase 2 refinement.)
-    let mut out = Vec::with_capacity(head.len() + new_middle.len() + pinned_middle.len() + tail.len());
+    let mut out =
+        Vec::with_capacity(head.len() + new_middle.len() + pinned_middle.len() + tail.len());
     out.append(&mut head);
     out.append(&mut new_middle);
     out.extend(pinned_middle);
     out.extend(tail);
 
     let after_tokens = total_tokens(&out, counter);
-    Ok(CompactionResult { items: out, action, pruned, summarized, before_tokens, after_tokens })
+    Ok(CompactionResult {
+        items: out,
+        action,
+        pruned,
+        summarized,
+        before_tokens,
+        after_tokens,
+    })
 }
 
 /// Walk back from the end, keeping items until the tail token budget is met,
@@ -292,7 +301,11 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
 
         let ctx = CompiledContext {
             model: String::new(),
-            messages: vec![Message::system(crate::prompts::compaction_summary()), Message::user(body)],
+            messages: vec![
+                Message::system(crate::prompts::compaction_summary()),
+                Message::user(body),
+            ],
+            ordered: None,
             tools: Vec::new(),
         };
         let mut stream = self
@@ -309,7 +322,9 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
             }
         }
         if text.trim().is_empty() {
-            return Err(SummarizeError::Unavailable("model returned empty summary".into()));
+            return Err(SummarizeError::Unavailable(
+                "model returned empty summary".into(),
+            ));
         }
         Ok(text)
     }
@@ -332,7 +347,10 @@ impl Summarizer for ExtractiveSummarizer {
             out.push_str(prev);
             out.push_str("\n---\n");
         }
-        out.push_str(&format!("Summarized {} items. Full detail recoverable via event lineage.\n", items.len()));
+        out.push_str(&format!(
+            "Summarized {} items. Full detail recoverable via event lineage.\n",
+            items.len()
+        ));
 
         let user_gists: Vec<String> = items
             .iter()
@@ -379,7 +397,10 @@ mod tests {
         let budget = ContextBudget::from_max_ctx(32_768);
         let policy = CompactionPolicy::default();
         let counter = HeuristicCounter;
-        assert_eq!(decide(&items, &budget, &policy, &counter), CompactionAction::None);
+        assert_eq!(
+            decide(&items, &budget, &policy, &counter),
+            CompactionAction::None
+        );
     }
 
     #[tokio::test]
@@ -397,15 +418,28 @@ mod tests {
 
         let mut items = vec![HistoryItem::text(Role::System, "SYSTEM PROMPT")];
         for i in 0..10 {
-            items.push(HistoryItem::text(Role::User, format!("question {i} {}", "y".repeat(400))));
-            items.push(HistoryItem::tool_output("z".repeat(800), Some("sha256:abc".into())));
+            items.push(HistoryItem::text(
+                Role::User,
+                format!("question {i} {}", "y".repeat(400)),
+            ));
+            items.push(HistoryItem::tool_output(
+                "z".repeat(800),
+                Some("sha256:abc".into()),
+            ));
         }
         items.push(HistoryItem::text(Role::User, "LAST MESSAGE"));
 
         let before = total_tokens(&items, &counter);
-        let res = compact(items, &budget, &policy, &counter, &ExtractiveSummarizer, None)
-            .await
-            .unwrap();
+        let res = compact(
+            items,
+            &budget,
+            &policy,
+            &counter,
+            &ExtractiveSummarizer,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(res.action, CompactionAction::Full);
         assert!(res.after_tokens < before, "should shrink");

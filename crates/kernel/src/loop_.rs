@@ -6,13 +6,13 @@
 
 use crate::context::ContextEngine;
 use crate::errors::KernelError;
-use crate::events::{Event, EventLog};
+use crate::events::{Event, EventKind, EventLog};
 use crate::executor::Executor;
-use crate::provider::Provider;
+use crate::provider::{InputTokenCount, Provider, TokenAccountingMode, TokenCountQuality};
 use crate::sink::StreamSink;
 use crate::types::{
-    BlastRadius, Block, CompiledContext, Message, Observation, Session, ToolCategory, ToolIntent,
-    TrustLabel,
+    BlastRadius, Block, CompiledContext, ContentPart, Message, ModelMessage, Observation,
+    ReasoningPart, Role, Session, TextPart, ToolCallPart, ToolCategory, ToolIntent, TrustLabel,
 };
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
@@ -76,6 +76,147 @@ fn attach_discovered_context(
     }
 }
 
+fn same_legacy_message(left: &Message, right: &Message) -> bool {
+    left.role == right.role
+        && left.content == right.content
+        && left.tool_call_id == right.tool_call_id
+        && left.tool_calls.len() == right.tool_calls.len()
+        && left
+            .tool_calls
+            .iter()
+            .zip(&right.tool_calls)
+            .all(|(a, b)| a.id == b.id && a.tool == b.tool && a.args == b.args)
+}
+
+/// Deliberately lossy control/UI projection. Exact replay always keeps the
+/// corresponding `ModelMessage`; this view exists only while the context
+/// engine and public session API still accept legacy messages.
+fn legacy_views(message: &ModelMessage) -> Vec<Message> {
+    match message.role {
+        Role::Tool => {
+            let mut results = Vec::new();
+            let mut fallback = String::new();
+            for part in &message.parts {
+                match part {
+                    ContentPart::ToolResult(part) => {
+                        results.push(Message::tool_result(&part.tool_call_id, &part.content))
+                    }
+                    ContentPart::Text(part) => fallback.push_str(&part.text),
+                    _ => {}
+                }
+            }
+            if results.is_empty() {
+                vec![Message::new(Role::Tool, fallback)]
+            } else {
+                results
+            }
+        }
+        _ => {
+            let mut text = String::new();
+            let mut calls = Vec::new();
+            for part in &message.parts {
+                match part {
+                    ContentPart::Text(part) => text.push_str(&part.text),
+                    ContentPart::ToolCall(part) => calls.push(ToolIntent {
+                        id: part.id.clone(),
+                        tool: part.tool.clone(),
+                        args: part.args.clone(),
+                    }),
+                    _ => {}
+                }
+            }
+            vec![if message.role == Role::Assistant {
+                Message::assistant_calls(text, calls)
+            } else {
+                Message::new(message.role.clone(), text)
+            }]
+        }
+    }
+}
+
+/// Reuse exact canonical messages retained by a legacy compaction result.
+/// Summaries or other newly generated messages are bridged, while matched
+/// messages keep their opaque state byte-for-byte in the canonical sidecar.
+fn reconcile_ordered(compiled: &[Message], ordered: &[ModelMessage]) -> Vec<ModelMessage> {
+    let mut candidates = Vec::new();
+    for message in ordered {
+        for legacy in legacy_views(message) {
+            candidates.push((legacy, message.clone()));
+        }
+    }
+
+    let mut cursor = 0usize;
+    compiled
+        .iter()
+        .map(|legacy| {
+            if let Some(relative) = candidates[cursor..]
+                .iter()
+                .position(|(candidate, _)| same_legacy_message(candidate, legacy))
+            {
+                let found = cursor + relative;
+                cursor = found + 1;
+                candidates[found].1.clone()
+            } else {
+                legacy.ordered()
+            }
+        })
+        .collect()
+}
+
+fn message_from_stream_parts(parts: Vec<ContentPart>) -> ModelMessage {
+    ModelMessage {
+        role: Role::Assistant,
+        parts,
+    }
+}
+
+fn strip_tool_calls(message: &ModelMessage) -> ModelMessage {
+    ModelMessage {
+        role: message.role.clone(),
+        parts: message
+            .parts
+            .iter()
+            .filter(|part| !matches!(part, ContentPart::ToolCall(_)))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn completed_control_view(
+    message: &ModelMessage,
+) -> Result<(String, String, Vec<ToolIntent>), crate::provider::ProviderError> {
+    if message.role != Role::Assistant {
+        return Err(crate::provider::ProviderError::Decode(
+            "provider completed message must have the assistant role".into(),
+        ));
+    }
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut intents = Vec::new();
+    for part in &message.parts {
+        match part {
+            ContentPart::Text(part) => text.push_str(&part.text),
+            ContentPart::Reasoning(part) => {
+                if let Some(summary) = &part.text {
+                    reasoning.push_str(summary);
+                }
+            }
+            ContentPart::ToolCall(part) => intents.push(ToolIntent {
+                id: part.id.clone(),
+                tool: part.tool.clone(),
+                args: part.args.clone(),
+            }),
+            ContentPart::ToolResult(_) => {
+                return Err(crate::provider::ProviderError::Decode(
+                    "provider completed assistant message contained a tool result".into(),
+                ));
+            }
+            ContentPart::Media(_) => {}
+        }
+    }
+    Ok((text, reasoning, intents))
+}
+
 /// Why a session loop stopped — so the surface can tell the user (e.g. which
 /// budget ceiling was hit, and that it can be resumed) instead of returning
 /// silently.
@@ -117,6 +258,9 @@ const SPILL_THRESHOLD: usize = 16_000;
 /// How many times a turn's model stream is retried on a transient provider
 /// failure (429 / 5xx / network drop) before giving up (K3).
 const MAX_TURN_RETRIES: u32 = 3;
+/// Bound measure → compact → remeasure so a pathological compressor cannot
+/// rewrite the same turn indefinitely.
+const MAX_COMPACTION_PASSES: u32 = 3;
 
 /// After a cancel, how long an in-flight tool gets to settle before its future
 /// is dropped and an `[interrupted]` observation is synthesized. Dropping is
@@ -236,6 +380,43 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         self
     }
 
+    /// Count and validate the exact prepared request. Adaptive profiles may
+    /// continue when no trustworthy counter is available; strict profiles
+    /// require both an authoritative source and an exact fingerprint match.
+    async fn validated_preflight(
+        &self,
+        prepared: &crate::provider::PreparedModelRequest,
+    ) -> Result<Option<InputTokenCount>, KernelError> {
+        let strict = self.provider.token_accounting_mode() == TokenAccountingMode::Strict;
+        match self.provider.count_input_tokens(prepared).await {
+            Ok(Some(count)) if count.request_fingerprint != prepared.request_fingerprint => {
+                if strict {
+                    Err(KernelError::Provider(
+                        "strict token accounting rejected a stale request fingerprint".into(),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+            Ok(Some(count))
+                if strict && count.quality != TokenCountQuality::Authoritative =>
+            {
+                Err(KernelError::Provider(format!(
+                    "strict token accounting requires an authoritative preflight counter; profile returned {:?}",
+                    count.quality
+                )))
+            }
+            Ok(Some(count)) => Ok(Some(count)),
+            Ok(None) if strict => Err(KernelError::Provider(
+                "strict token accounting requires an authoritative preflight counter for this profile"
+                    .into(),
+            )),
+            Ok(None) => Ok(None),
+            Err(error) if strict => Err(KernelError::Provider(error.to_string())),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Run a session to completion: stream the model, execute any tool calls,
     /// feed results back, and repeat until the model finishes with text only or
     /// `max_turns` is hit. Returns the full message transcript.
@@ -256,7 +437,6 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // Size the tool-def overhead once so token estimates match the real
         // request (tool defs are sent every turn) (P1-9).
         self.context.note_tools(&specs);
-        let max_ctx = self.provider.context_window();
         let mut gov = crate::budgets::Governor::new(budget);
         // Spill oversized tool results already in the working set (K11). The live
         // path spills at execute time (below), but messages rebuilt from the log
@@ -287,6 +467,26 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 window_events.push(e.id);
             }
         }
+        let mut ordered_messages: Vec<ModelMessage> =
+            messages.iter().map(Message::ordered).collect();
+        let logged_events = self.log.events(session.id).await;
+        if logged_events
+            .iter()
+            .any(|event| event.kind == EventKind::ModelMessage)
+        {
+            let projected = crate::events::project_ordered_messages(&logged_events);
+            let mut hydrated: Vec<ModelMessage> = messages
+                .iter()
+                .take_while(|message| message.role == Role::System)
+                .map(Message::ordered)
+                .collect();
+            for message in projected {
+                if !hydrated.last().is_some_and(|existing| existing == &message) {
+                    hydrated.push(message);
+                }
+            }
+            ordered_messages = hydrated;
+        }
         // Trust-flow taint (§4.6): flips true once a web-labeled observation
         // enters this request, so a later consequential action derived from it
         // can be escalated. Scoped to the request (one run_session).
@@ -310,7 +510,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .await
                         .ok();
                     sink.steered(&s);
-                    messages.push(Message::user(s));
+                    let message = Message::user(s);
+                    ordered_messages.push(message.ordered());
+                    messages.push(message);
                 }
             }
 
@@ -323,102 +525,90 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             }
             gov.record_turn();
 
-            // Exact pre-flight token count when the host offers a tokenization
-            // route (else the engine uses its local estimate / last usage).
-            // Only worth it when we know the window; best-effort and never
-            // blocks the turn. Feeds the engine's decision basis via the same
-            // authoritative-count channel the post-turn `usage` uses.
-            if max_ctx.is_some() {
-                if let Some(exact) = self.provider.count_tokens(&messages).await {
-                    // Pre-flight count is tool-blind → estimate channel adds the
-                    // tool-def overhead (P1-9); real usage still uses update_usage.
-                    self.context.update_estimate(exact);
-                }
-            }
+            // Every provider call—including calls after tool results—runs the
+            // full prepare → count → compile loop. If compaction changes the
+            // candidate, the request is rebuilt and re-counted before sending.
+            let mut overflow_retried = false;
+            let mut compaction_passes = 0u32;
+            let (assistant, canonical, intents, usage, turn_interrupted) = 'model_call: loop {
+                let prepared = loop {
+                    let limits = self.provider.model_limits();
+                    let input_limit = limits
+                        .input_allowance(self.provider.requested_output_tokens())
+                        .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32);
+                    let candidate = CompiledContext {
+                        model: String::new(),
+                        messages: messages.clone(),
+                        ordered: Some(ordered_messages.clone()),
+                        tools: specs.clone(),
+                    };
+                    let prepared = self
+                        .provider
+                        .prepare_request(&candidate)
+                        .map_err(|error| KernelError::Provider(error.to_string()))?;
 
-            // Compile a budget-fitted view of the working history (§4.3). Bracket
-            // it with compacting(true/false) so a surface can show a live
-            // "compacting…" indicator while a summarize pass calls the model
-            // (instant for a no-op/prune pass, so no visible flicker).
-            sink.compacting(true);
-            let compiled = self.context.compile(&messages, max_ctx).await;
-            sink.compacting(false);
-            // Hard safety ceiling (independent of the soft trigger): if even the
-            // engine's best effort still overflows, refuse to send this turn
-            // rather than risk a provider context-length error (I4).
-            if compiled.overflow {
-                if let Some(q) = interrupts.as_mut() {
-                    Self::return_unapplied_steers(q, sink);
-                }
-                return Ok((
-                    messages,
-                    StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow),
-                ));
-            }
-            let view = compiled.messages;
-            if compiled.compacted {
-                sink.compaction(
-                    compiled.before_tokens,
-                    compiled.after_tokens,
-                    compiled.summarized,
-                    compiled.summary.as_deref(),
-                );
-                self.log
-                    .append(Event::compaction(
-                        session,
+                    self.context.clear_preflight();
+                    if let Some(count) = self.validated_preflight(&prepared).await? {
+                        self.context.update_preflight(&count);
+                    }
+
+                    sink.compacting(true);
+                    let compiled = self.context.compile(&messages, input_limit).await;
+                    sink.compacting(false);
+                    if compiled.overflow {
+                        if let Some(q) = interrupts.as_mut() {
+                            Self::return_unapplied_steers(q, sink);
+                        }
+                        return Ok((
+                            messages,
+                            StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow),
+                        ));
+                    }
+                    if !compiled.compacted {
+                        break prepared;
+                    }
+
+                    compaction_passes += 1;
+                    if compaction_passes > MAX_COMPACTION_PASSES {
+                        if let Some(q) = interrupts.as_mut() {
+                            Self::return_unapplied_steers(q, sink);
+                        }
+                        return Ok((
+                            messages,
+                            StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow),
+                        ));
+                    }
+                    sink.compaction(
                         compiled.before_tokens,
                         compiled.after_tokens,
+                        compiled.summarized,
                         compiled.summary.as_deref(),
-                    ))
-                    .await?;
-                // Carry-forward: the compacted view becomes the working set, so
-                // history stays bounded and we don't recompact it every turn.
-                // The full originals remain in the durable hash-chained log (P3),
-                // so this is lossless — better than discarding them.
-                messages = view.clone();
-            }
-            let mut ctx = CompiledContext {
-                model: String::new(),
-                messages: view,
-                tools: specs.clone(),
-            };
+                    );
+                    self.log
+                        .append(Event::compaction(
+                            session,
+                            compiled.before_tokens,
+                            compiled.after_tokens,
+                            compiled.summary.as_deref(),
+                        ))
+                        .await?;
+                    // The durable log keeps the originals; this active view is
+                    // now the only candidate that may be prepared and sent.
+                    ordered_messages = reconcile_ordered(&compiled.messages, &ordered_messages);
+                    messages = compiled.messages;
+                };
 
-            // Run the turn; if the provider rejects it as too long despite our
-            // pre-flight budgeting (P0-6 — the local estimate undercounted), do
-            // one emergency compaction with a halved window (forces the engine's
-            // hard path) and retry once, rather than dying with a fatal error.
-            let mut overflow_retried = false;
-            let (assistant, intents, usage, turn_interrupted) = loop {
-                match self.run_turn(session, &ctx, sink, &cancel).await {
+                match self.run_turn(session, &prepared, sink, &cancel).await {
                     Ok(t) => break t,
-                    Err(KernelError::ContextOverflow) if !overflow_retried => {
+                    Err(KernelError::ContextOverflow { reported_limit }) if !overflow_retried => {
                         overflow_retried = true;
-                        let emergency = max_ctx.map(|m| (m / 2).max(1));
-                        sink.compacting(true);
-                        let recompiled = self.context.compile(&messages, emergency).await;
-                        sink.compacting(false);
-                        sink.compaction(
-                            recompiled.before_tokens,
-                            recompiled.after_tokens,
-                            recompiled.summarized,
-                            recompiled.summary.as_deref(),
-                        );
-                        self.log
-                            .append(Event::compaction(
-                                session,
-                                recompiled.before_tokens,
-                                recompiled.after_tokens,
-                                recompiled.summary.as_deref(),
-                            ))
-                            .await?;
-                        messages = recompiled.messages.clone();
-                        ctx = CompiledContext {
-                            model: String::new(),
-                            messages: recompiled.messages,
-                            tools: specs.clone(),
-                        };
+                        if let Some(limit) = reported_limit {
+                            self.provider.update_context_limit(limit);
+                        }
+                        self.context.force_next_compaction();
+                        continue 'model_call;
                     }
-                    Err(KernelError::ContextOverflow) => {
+                    Err(KernelError::ContextOverflow { .. }) => {
                         // Already retried once and still over — stop gracefully.
                         if let Some(q) = interrupts.as_mut() {
                             Self::return_unapplied_steers(q, sink);
@@ -446,16 +636,35 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             }
             // Interrupted mid-stream, or cancelled between the stream ending
-            // and dispatch: keep the partial/complete TEXT (already logged) but
-            // drop un-admitted intents — an intent enters the log and the live
-            // history only once its observation is guaranteed to follow.
+            // and dispatch: keep visible content but drop un-admitted calls.
+            // Persist the exact ordered remainder only after that decision, so
+            // replay can never contain a call which dispatch never admitted.
             if turn_interrupted || cancel.is_cancelled() {
+                let canonical = strip_tool_calls(&canonical);
+                if !assistant.content.is_empty() {
+                    self.log
+                        .append(Event::model_text(session, &assistant.content))
+                        .await?;
+                }
+                self.log
+                    .append(Event::model_message(session, &canonical))
+                    .await?;
+                ordered_messages.push(canonical);
                 messages.push(Message::assistant_calls(assistant.content, Vec::new()));
                 if let Some(q) = interrupts.as_mut() {
                     return self.finish_interrupted(session, messages, q, sink).await;
                 }
                 return Ok((messages, StopReason::Interrupted));
             }
+            if !assistant.content.is_empty() {
+                self.log
+                    .append(Event::model_text(session, &assistant.content))
+                    .await?;
+            }
+            self.log
+                .append(Event::model_message(session, &canonical))
+                .await?;
+            ordered_messages.push(canonical);
             messages.push(assistant);
 
             if intents.is_empty() {
@@ -597,14 +806,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 // echoes the exact op it applied under `applied`; opaque here.
                 if ok && tool.starts_with("memory.") {
                     if let Some(op) = applied.filter(|op| op.is_object()) {
-                        self.log
-                            .append(Event::memory_write(session, op))
-                            .await?;
+                        self.log.append(Event::memory_write(session, op)).await?;
                     }
                 }
                 sink.tool_result(&tool, ok, &obs.payload);
-                let content = serde_json::to_string(&obs.payload).unwrap_or_default();
-                messages.push(Message::tool_result(&id, self.maybe_spill(content)));
+                let content =
+                    self.maybe_spill(serde_json::to_string(&obs.payload).unwrap_or_default());
+                let message = Message::tool_result(&id, content);
+                ordered_messages.push(message.ordered());
+                messages.push(message);
             }
 
             // Cancelled during dispatch: every admitted intent has settled
@@ -639,14 +849,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .append(Event::user_message(session, &feedback))
                         .await
                         .ok();
-                    messages.push(Message::user(feedback));
+                    let message = Message::user(feedback);
+                    ordered_messages.push(message.ordered());
+                    messages.push(message);
                 }
             }
         }
     }
 
-    /// One turn: stream the model (retrying transient failures), log every
-    /// block, and collect text + intents into a single assistant message.
+    /// One turn: stream the model (retrying transient failures) and collect a
+    /// legacy control view plus the exact canonical assistant message.
     ///
     /// Retry policy (K3): a transient provider failure — network drop, 429, 5xx,
     /// mid-stream cutoff — is retried with capped exponential backoff, but ONLY
@@ -657,17 +869,68 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     async fn run_turn(
         &self,
         session: &Session,
-        ctx: &CompiledContext,
+        prepared: &crate::provider::PreparedModelRequest,
         sink: &dyn StreamSink,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(Message, Vec<ToolIntent>, Option<crate::types::Usage>, bool), KernelError> {
+    ) -> Result<
+        (
+            Message,
+            ModelMessage,
+            Vec<ToolIntent>,
+            Option<crate::types::Usage>,
+            bool,
+        ),
+        KernelError,
+    > {
         let mut attempt = 0u32;
-        let (text, reasoning, intents, usage, interrupted) = loop {
-            match self.stream_turn(ctx, sink, cancel).await {
+        let mut output_limit_retried = false;
+        let mut request = prepared.clone();
+        let (text, reasoning, intents, canonical, usage, interrupted) = loop {
+            match self.stream_turn(&request, sink, cancel).await {
                 Ok(data) => break data,
                 Err((e, emitted)) => {
-                    if e.is_context_overflow() {
-                        return Err(KernelError::ContextOverflow);
+                    match e.classify() {
+                        crate::provider::ProviderFailure::InputContextOverflow {
+                            reported_limit,
+                        } => {
+                            return Err(KernelError::ContextOverflow { reported_limit });
+                        }
+                        crate::provider::ProviderFailure::OutputLimit {
+                            available_output: Some(available),
+                        } if !emitted && !output_limit_retried && available > 0 => {
+                            // Keep a tiny margin for providers whose diagnostic
+                            // value is inclusive/rounded. This changes only the
+                            // failed call's output cap; history is untouched.
+                            let safe = available.saturating_sub(64).max(1);
+                            if let Some(adjusted) = self
+                                .provider
+                                .with_output_limit(&request, safe)
+                                .map_err(|error| KernelError::Provider(error.to_string()))?
+                            {
+                                // `max_tokens` participates in the request
+                                // fingerprint. Re-count the adjusted request so
+                                // strict mode never sends a body different from
+                                // the one its counter authorized.
+                                self.validated_preflight(&adjusted).await?;
+                                request = adjusted;
+                                output_limit_retried = true;
+                                continue;
+                            }
+                        }
+                        crate::provider::ProviderFailure::OutputLimit { .. } => {
+                            return Err(KernelError::Provider(
+                                "the provider rejected the requested output-token cap; lower the profile's max_output_tokens (context compaction cannot fix an output-cap error)"
+                                    .into(),
+                            ));
+                        }
+                        crate::provider::ProviderFailure::PayloadTooLarge => {
+                            return Err(KernelError::Provider(
+                                "the provider rejected the HTTP payload size; reduce retained media or byte-heavy tool results"
+                                    .into(),
+                            ));
+                        }
+                        crate::provider::ProviderFailure::Transient
+                        | crate::provider::ProviderFailure::Fatal => {}
                     }
                     if e.is_retryable() && !emitted && attempt < MAX_TURN_RETRIES {
                         attempt += 1;
@@ -677,7 +940,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         tokio::select! {
                             _ = tokio::time::sleep(retry_backoff(attempt)) => continue,
                             _ = cancel.cancelled() => {
-                                break (String::new(), String::new(), Vec::new(), None, true);
+                                break (
+                                    String::new(),
+                                    String::new(),
+                                    Vec::new(),
+                                    message_from_stream_parts(Vec::new()),
+                                    None,
+                                    true,
+                                );
                             }
                         }
                     }
@@ -685,20 +955,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             }
         };
-        // Log (P3/P7) after the stream — including a cancelled one: what
-        // streamed is what the user saw and must survive resume. Intents are
-        // NOT logged here — they're logged at dispatch admission, so a logged
-        // intent always gets an observation (interrupts invariant).
+        // Keep the existing transparent reasoning audit event. The canonical
+        // message is appended by `run_session` only after it decides whether
+        // streamed tool calls reached dispatch admission.
         if !reasoning.is_empty() {
             self.log
                 .append(Event::model_reasoning(session, &reasoning))
                 .await?;
         }
-        if !text.is_empty() {
-            self.log.append(Event::model_text(session, &text)).await?;
-        }
         Ok((
             Message::assistant_calls(text, intents.clone()),
+            canonical,
             intents,
             usage,
             interrupted,
@@ -706,13 +973,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     }
 
     /// Establish and consume one model stream, emitting deltas to the sink as
-    /// they arrive. Returns the accumulated (text, reasoning, intents, usage) on
-    /// success, or `(error, already_emitted)` — the flag tells the caller whether
-    /// retrying is safe (retrying after content was streamed would duplicate it).
+    /// they arrive. Returns the compatibility view and exact completed message.
     #[allow(clippy::type_complexity)]
     async fn stream_turn(
         &self,
-        ctx: &CompiledContext,
+        prepared: &crate::provider::PreparedModelRequest,
         sink: &dyn StreamSink,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<
@@ -720,6 +985,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             String,
             String,
             Vec<ToolIntent>,
+            ModelMessage,
             Option<crate::types::Usage>,
             bool,
         ),
@@ -730,14 +996,23 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // first byte arrives, and an Esc during that window previously did
         // nothing (the select below only covered an already-open stream).
         let mut stream = tokio::select! {
-            s = self.provider.stream(ctx) => s.map_err(|e| (e, false))?,
+            s = self.provider.stream_prepared(prepared) => s.map_err(|e| (e, false))?,
             _ = cancel.cancelled() => {
-                return Ok((String::new(), String::new(), Vec::new(), None, true));
+                return Ok((
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                    message_from_stream_parts(Vec::new()),
+                    None,
+                    true,
+                ));
             }
         };
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut intents: Vec<ToolIntent> = Vec::new();
+        let mut parts: Vec<ContentPart> = Vec::new();
+        let mut completed: Option<ModelMessage> = None;
         let mut usage: Option<crate::types::Usage> = None;
         let mut emitted = false;
         loop {
@@ -747,7 +1022,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // Cancelled mid-stream: keep what streamed (the user saw
                     // it), drop un-dispatched intents — they were never
                     // admitted, so nothing in the log dangles.
-                    return Ok((text, reasoning, Vec::new(), usage, true));
+                    let canonical = completed
+                        .as_ref()
+                        .map(strip_tool_calls)
+                        .unwrap_or_else(|| strip_tool_calls(&message_from_stream_parts(parts)));
+                    return Ok((text, reasoning, Vec::new(), canonical, usage, true));
                 }
             };
             let Some(block) = block else { break };
@@ -756,11 +1035,27 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     emitted = true;
                     sink.text(&t);
                     text.push_str(&t);
+                    match parts.last_mut() {
+                        Some(ContentPart::Text(part)) => part.text.push_str(&t),
+                        _ => parts.push(ContentPart::Text(TextPart {
+                            text: t,
+                            provider_state: Vec::new(),
+                        })),
+                    }
                 }
                 Ok(Block::Reasoning(r)) => {
                     emitted = true;
                     sink.reasoning(&r);
                     reasoning.push_str(&r);
+                    match parts.last_mut() {
+                        Some(ContentPart::Reasoning(part)) => {
+                            part.text.get_or_insert_with(String::new).push_str(&r)
+                        }
+                        _ => parts.push(ContentPart::Reasoning(ReasoningPart {
+                            text: Some(r),
+                            provider_state: Vec::new(),
+                        })),
+                    }
                 }
                 Ok(Block::ToolStarted { name, target }) => {
                     emitted = true;
@@ -768,16 +1063,78 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
                 Ok(Block::ToolIntent(it)) => {
                     emitted = true;
+                    parts.push(ContentPart::ToolCall(ToolCallPart {
+                        id: it.id.clone(),
+                        tool: it.tool.clone(),
+                        args: it.args.clone(),
+                        provider_state: Vec::new(),
+                    }));
                     intents.push(it);
                 }
                 Ok(Block::Usage(u)) => {
                     sink.usage(u.prompt_tokens, u.total_tokens);
                     usage = Some(u);
                 }
+                Ok(Block::CompletedMessage(message)) => {
+                    if completed.is_some() {
+                        return Err((
+                            crate::provider::ProviderError::Decode(
+                                "provider emitted more than one completed message".into(),
+                            ),
+                            emitted,
+                        ));
+                    }
+                    if let Err(error) = completed_control_view(&message) {
+                        return Err((error, emitted));
+                    }
+                    completed = Some(message);
+                }
                 Err(e) => return Err((e, emitted)),
             }
         }
-        Ok((text, reasoning, intents, usage, false))
+        let canonical = completed.unwrap_or_else(|| message_from_stream_parts(parts));
+        let (canonical_text, canonical_reasoning, canonical_intents) =
+            completed_control_view(&canonical).map_err(|error| (error, emitted))?;
+        if !text.is_empty() && text != canonical_text {
+            return Err((
+                crate::provider::ProviderError::Decode(
+                    "provider text deltas disagree with its completed message".into(),
+                ),
+                emitted,
+            ));
+        }
+        if !reasoning.is_empty() && reasoning != canonical_reasoning {
+            return Err((
+                crate::provider::ProviderError::Decode(
+                    "provider reasoning deltas disagree with its completed message".into(),
+                ),
+                emitted,
+            ));
+        }
+        let intents_match = intents.len() == canonical_intents.len()
+            && intents.iter().zip(&canonical_intents).all(|(left, right)| {
+                left.id == right.id && left.tool == right.tool && left.args == right.args
+            });
+        if !intents.is_empty() && !intents_match {
+            return Err((
+                crate::provider::ProviderError::Decode(
+                    "provider tool-call blocks disagree with its completed message".into(),
+                ),
+                emitted,
+            ));
+        }
+        if text.is_empty() && !canonical_text.is_empty() {
+            sink.text(&canonical_text);
+            text = canonical_text;
+        }
+        if reasoning.is_empty() && !canonical_reasoning.is_empty() {
+            sink.reasoning(&canonical_reasoning);
+            reasoning = canonical_reasoning;
+        }
+        if intents.is_empty() {
+            intents = canonical_intents;
+        }
+        Ok((text, reasoning, intents, canonical, usage, false))
     }
 
     /// validate (P1) → police (§4.6) → gate (P5) → execute (§4.8).
@@ -851,8 +1208,14 @@ fn enrich_memory_intent(
     }
     let obj = args.as_object_mut().expect("just ensured object");
     for key in [
-        "trust", "confidence", "provenance", "sessions",
-        "_trust", "_provenance", "_session", "_user_stated",
+        "trust",
+        "confidence",
+        "provenance",
+        "sessions",
+        "_trust",
+        "_provenance",
+        "_session",
+        "_user_stated",
     ] {
         obj.remove(key);
     }
@@ -863,7 +1226,10 @@ fn enrich_memory_intent(
     );
     obj.insert("_session".into(), serde_json::json!(session_id.to_string()));
     // User-stated only when nothing below user trust entered the window.
-    obj.insert("_user_stated".into(), serde_json::json!(taint == TrustLabel::User));
+    obj.insert(
+        "_user_stated".into(),
+        serde_json::json!(taint == TrustLabel::User),
+    );
 }
 
 /// Trust-flow escalation (§4.6): gate a consequential, web-tainted action unless
@@ -970,10 +1336,12 @@ mod progressive_context_tests {
             },
         );
         assert_eq!(blocked.payload["project_context"]["blocked"], true);
-        assert!(blocked.payload["project_context"]["content"]
-            .as_str()
-            .unwrap()
-            .contains("blocked context file"));
+        assert!(
+            blocked.payload["project_context"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("blocked context file")
+        );
     }
 }
 

@@ -110,9 +110,9 @@ pub(super) fn veena_line(frame: u64) -> Line<'static> {
     let bright_gold = Style::default()
         .fg(Color::Rgb(247, 208, 120))
         .add_modifier(Modifier::BOLD);
-    let gold = Style::default().fg(theme::ACCENT);
+    let gold = Style::default().fg(theme::accent());
     let dim = Style::default().fg(Color::Rgb(150, 120, 70));
-    let faint = Style::default().fg(theme::FAINT);
+    let faint = Style::default().fg(theme::faint());
 
     let mut spans = Vec::with_capacity(n);
     for (i, g) in glyphs.iter().enumerate() {
@@ -234,7 +234,7 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
         vec![Span::styled(
             "verification-first · open-first agent harness",
             Style::default()
-                .fg(theme::DIM)
+                .fg(theme::dim())
                 .add_modifier(Modifier::ITALIC),
         )],
         w,
@@ -246,7 +246,7 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
     body.push(center_line(
         vec![Span::styled(
             "type below to begin · /help for commands · Ctrl-D to quit",
-            Style::default().fg(theme::FAINT),
+            Style::default().fg(theme::faint()),
         )],
         w,
     ));
@@ -272,14 +272,14 @@ pub(super) fn cat_color(cat: ToolCategory) -> Color {
     let cyan = Color::Rgb(110, 196, 208);
     match cat {
         ToolCategory::Read => blue,
-        ToolCategory::Write => theme::WARN,
+        ToolCategory::Write => theme::warn(),
         ToolCategory::Search => purple,
         ToolCategory::Web => cyan,
-        ToolCategory::Shell => theme::ERR,
+        ToolCategory::Shell => theme::err(),
         ToolCategory::Vcs => Color::Rgb(226, 142, 90),
-        ToolCategory::Diagnostic => theme::WARN,
-        ToolCategory::Plan => theme::ACCENT,
-        ToolCategory::Other => theme::DIM,
+        ToolCategory::Diagnostic => theme::warn(),
+        ToolCategory::Plan => theme::accent(),
+        ToolCategory::Other => theme::dim(),
     }
 }
 
@@ -301,7 +301,7 @@ pub(super) fn render_plan(payload: &serde_json::Value) -> Vec<Line<'static>> {
     let Some(steps) = steps else {
         return vec![Line::from(Span::styled(
             "  ☰ plan updated",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::dim()),
         ))];
     };
     let total = steps.len();
@@ -321,16 +321,16 @@ pub(super) fn render_plan(payload: &serde_json::Value) -> Vec<Line<'static>> {
         .chain("░".repeat(bar_w - filled).chars())
         .collect();
     let mut lines = vec![Line::from(vec![
-        Span::styled("☰ ", Style::default().fg(theme::ACCENT)),
+        Span::styled("☰ ", Style::default().fg(theme::accent())),
         Span::styled(
             "Plan",
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  {bar} {done}/{total}"),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::dim()),
         ),
     ])];
     // Optional one-line note about this update (Codex-style "explanation", inline).
@@ -339,7 +339,7 @@ pub(super) fn render_plan(payload: &serde_json::Value) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled(
                 format!("  {}", exp.trim()),
                 Style::default()
-                    .fg(theme::FAINT)
+                    .fg(theme::faint())
                     .add_modifier(Modifier::ITALIC),
             )));
         }
@@ -347,16 +347,16 @@ pub(super) fn render_plan(payload: &serde_json::Value) -> Vec<Line<'static>> {
     for s in steps {
         let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let (mark, style) = match s.get("status").and_then(|v| v.as_str()) {
-            Some("completed" | "done") => ("✔", Style::default().fg(theme::OK)),
+            Some("completed" | "done") => ("✔", Style::default().fg(theme::ok())),
             // Active step: accent bar + bold, and an arrow so "what's happening now"
             // is unmistakable even when the list scrolls by.
             Some("in_progress") => (
                 "▶",
                 Style::default()
-                    .fg(theme::ACCENT)
+                    .fg(theme::accent())
                     .add_modifier(Modifier::BOLD),
             ),
-            _ => ("○", Style::default().fg(theme::TEXT)),
+            _ => ("○", Style::default().fg(theme::text())),
         };
         lines.push(Line::from(vec![
             Span::styled(format!("  {mark} "), style),
@@ -380,22 +380,23 @@ pub(super) struct RenderCtx<'a> {
 pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>> {
     match item {
         Item::User(s) => {
+            // Full-height gold bar down the left of every line marks the user turn.
             let mut lines = vec![Line::from("")];
-            for (i, l) in s.lines().enumerate() {
-                let bar = if i == 0 { "▌ " } else { "  " };
+            for l in s.lines() {
                 lines.push(Line::from(vec![
-                    Span::styled(bar, Style::default().fg(theme::ACCENT)),
+                    Span::styled("▌ ", Style::default().fg(theme::accent())),
                     Span::styled(
                         l.to_string(),
                         Style::default()
-                            .fg(theme::TEXT)
+                            .fg(theme::text())
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
             }
+            lines.push(Line::from(""));
             lines
         }
-        Item::Assistant(s) => render_assistant(s),
+        Item::Assistant(s) => render_assistant(s, cx.width),
         Item::ToolCall { tool, .. } if tool == "update_plan" => Vec::new(),
         Item::ToolCall { tool, args } => {
             let v = cx.viz.get(tool);
@@ -407,10 +408,10 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
                 Span::styled(
                     tool_label(tool),
                     Style::default()
-                        .fg(theme::TEXT)
+                        .fg(theme::text())
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(arg, Style::default().fg(theme::DIM)),
+                Span::styled(arg, Style::default().fg(theme::dim())),
             ])];
             if cx.full_transparency {
                 lines.extend(json_block(args, "in"));
@@ -440,12 +441,12 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
                     .and_then(|v| v.as_str())
                     .unwrap_or("error")
                     .to_string();
-                ("╰ ✗", theme::ERR, msg)
+                ("╰ ✗", theme::err(), msg)
             } else {
-                ("╰", theme::DIM, crate::result_summary(tool, payload))
+                ("╰", theme::dim(), crate::result_summary(tool, payload))
             };
             let mut lines = vec![Line::from(vec![
-                Span::styled(format!("  {mark} "), Style::default().fg(theme::FAINT)),
+                Span::styled(format!("  {mark} "), Style::default().fg(theme::faint())),
                 Span::styled(summary, Style::default().fg(color)),
             ])];
             if cx.full_transparency {
@@ -467,14 +468,14 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
             };
             let mut lines = vec![Line::from(Span::styled(
                 format!("  ↯ {how} context · {before} → {after} tokens{hint}"),
-                Style::default().fg(theme::WARN),
+                Style::default().fg(theme::warn()),
             ))];
             if cx.show_summary {
                 if let Some(s) = summary {
                     for l in s.lines() {
                         lines.push(Line::from(Span::styled(
                             format!("    {l}"),
-                            Style::default().fg(theme::DIM),
+                            Style::default().fg(theme::dim()),
                         )));
                     }
                 }
@@ -483,9 +484,9 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
         }
         Item::Verify { ok, summary } => {
             let (mark, color) = if *ok {
-                ("✔", theme::OK)
+                ("✔", theme::ok())
             } else {
-                ("✗", theme::ERR)
+                ("✗", theme::err())
             };
             vec![Line::from(vec![
                 Span::styled(
@@ -497,17 +498,17 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
         }
         Item::Notice(s) => s
             .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme::DIM))))
+            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme::dim()))))
             .collect(),
         Item::Thinking(s) => {
             let style = Style::default()
-                .fg(theme::DIM)
+                .fg(theme::dim())
                 .add_modifier(Modifier::ITALIC);
             if !cx.show_thinking {
                 return vec![Line::from(Span::styled(
                     "  · reasoning (hidden — /reasoning show)",
                     Style::default()
-                        .fg(theme::FAINT)
+                        .fg(theme::faint())
                         .add_modifier(Modifier::ITALIC),
                 ))];
             }
@@ -522,7 +523,10 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
 }
 
 fn render_reconciliation(card: &serde_json::Value) -> Vec<Line<'static>> {
-    let name = card.get("name").and_then(|value| value.as_str()).unwrap_or("memory");
+    let name = card
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("memory");
     let previous = card
         .get("previous")
         .and_then(|value| value.as_str())
@@ -534,13 +538,15 @@ fn render_reconciliation(card: &serde_json::Value) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(
             format!("╭─ memory contradiction · {name}"),
-            Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::warn())
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(format!("│ previous  {previous}")),
         Line::from(format!("│ proposed  {proposed}")),
         Line::from(Span::styled(
             "╰─ keep previous · replace with proposed · merge as a new claim",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::dim()),
         )),
     ]
 }
@@ -556,25 +562,25 @@ pub(super) fn render_approval(
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("Allow ", Style::default().fg(theme::TEXT)),
+            Span::styled("Allow ", Style::default().fg(theme::text())),
             Span::styled(
                 tool_label(action).to_string(),
                 Style::default()
-                    .fg(theme::WARN)
+                    .fg(theme::warn())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("?", Style::default().fg(theme::TEXT)),
+            Span::styled("?", Style::default().fg(theme::text())),
         ]),
     ];
     if let Some(detail) = detail {
         lines.push(Line::from(""));
         for l in detail.lines().take(18) {
             let style = if l.starts_with('+') && !l.starts_with("+++") {
-                Style::default().fg(theme::ADD_FG)
+                Style::default().fg(theme::add_fg())
             } else if l.starts_with('-') && !l.starts_with("---") {
-                Style::default().fg(theme::DEL_FG)
+                Style::default().fg(theme::del_fg())
             } else {
-                Style::default().fg(theme::DIM)
+                Style::default().fg(theme::dim())
             };
             lines.push(Line::from(Span::styled(l.to_string(), style)));
         }
@@ -582,7 +588,7 @@ pub(super) fn render_approval(
         if extra > 0 {
             lines.push(Line::from(Span::styled(
                 format!("… {extra} more lines"),
-                Style::default().fg(theme::FAINT),
+                Style::default().fg(theme::faint()),
             )));
         }
     }
@@ -591,24 +597,24 @@ pub(super) fn render_approval(
     for (i, label) in opts.iter().enumerate() {
         if i == sel {
             lines.push(Line::from(vec![
-                Span::styled("▌ ", Style::default().fg(theme::ACCENT)),
+                Span::styled("▌ ", Style::default().fg(theme::accent())),
                 Span::styled(
                     format!("{}. ", i + 1),
                     Style::default()
-                        .fg(theme::ACCENT)
+                        .fg(theme::accent())
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     label.to_string(),
                     Style::default()
-                        .fg(theme::TEXT)
+                        .fg(theme::text())
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {}. ", i + 1), Style::default().fg(theme::DIM)),
-                Span::styled(label.to_string(), Style::default().fg(theme::DIM)),
+                Span::styled(format!("  {}. ", i + 1), Style::default().fg(theme::dim())),
+                Span::styled(label.to_string(), Style::default().fg(theme::dim())),
             ]));
         }
     }
@@ -618,24 +624,178 @@ pub(super) fn render_approval(
         Span::styled(
             "› ",
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("waiting for your input", Style::default().fg(theme::ACCENT)),
+        Span::styled("waiting for your input", Style::default().fg(theme::accent())),
     ]));
     lines.push(Line::from(Span::styled(
         "↑↓ + enter · or press 1/2/3 · n to deny",
-        Style::default().fg(theme::FAINT),
+        Style::default().fg(theme::faint()),
     )));
     lines
 }
 
-pub(super) fn render_assistant(s: &str) -> Vec<Line<'static>> {
-    s.lines()
-        .map(|l| checklist_line(l).unwrap_or_else(|| Line::from(l.to_string())))
-        .collect()
+#[allow(dead_code)]
+pub(super) fn parse_inline_markdown_spans(line: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut current_text = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut idx = 0;
+    
+    let mut is_bold = false;
+    let mut is_italic = false;
+    let mut is_code = false;
+    
+    let mut push_current = |text: &mut String, bold: bool, italic: bool, code: bool| {
+        if !text.is_empty() {
+            let mut style = base_style;
+            if code {
+                style = style.fg(Color::Rgb(220, 200, 140));
+            } else {
+                if bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+            }
+            spans.push(Span::styled(text.clone(), style));
+            text.clear();
+        }
+    };
+
+    let has_matching = |start_idx: usize, delim: &[char]| -> bool {
+        if start_idx + delim.len() > chars.len() {
+            return false;
+        }
+        let mut i = start_idx;
+        while i + delim.len() <= chars.len() {
+            if chars[i..i + delim.len()] == *delim {
+                return true;
+            }
+            if delim != ['`'] && chars[i] == '`' {
+                i += 1;
+                while i < chars.len() && chars[i] != '`' {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        false
+    };
+
+    while idx < chars.len() {
+        if chars[idx] == '`' {
+            if is_code {
+                push_current(&mut current_text, is_bold, is_italic, is_code);
+                is_code = false;
+                idx += 1;
+            } else if has_matching(idx + 1, &['`']) {
+                push_current(&mut current_text, is_bold, is_italic, is_code);
+                is_code = true;
+                idx += 1;
+            } else {
+                current_text.push('`');
+                idx += 1;
+            }
+        } else if !is_code && chars[idx] == '*' {
+            if idx + 1 < chars.len() && chars[idx + 1] == '*' {
+                if is_bold {
+                    push_current(&mut current_text, is_bold, is_italic, is_code);
+                    is_bold = false;
+                    idx += 2;
+                } else if has_matching(idx + 2, &['*', '*']) {
+                    push_current(&mut current_text, is_bold, is_italic, is_code);
+                    is_bold = true;
+                    idx += 2;
+                } else {
+                    current_text.push('*');
+                    current_text.push('*');
+                    idx += 2;
+                }
+            } else if is_italic {
+                push_current(&mut current_text, is_bold, is_italic, is_code);
+                is_italic = false;
+                idx += 1;
+            } else if has_matching(idx + 1, &['*']) {
+                push_current(&mut current_text, is_bold, is_italic, is_code);
+                is_italic = true;
+                idx += 1;
+            } else {
+                current_text.push('*');
+                idx += 1;
+            }
+        } else if !is_code && chars[idx] == '_' {
+            if idx + 1 < chars.len() && chars[idx + 1] == '_' {
+                if is_bold {
+                    push_current(&mut current_text, is_bold, is_italic, is_code);
+                    is_bold = false;
+                    idx += 2;
+                } else if has_matching(idx + 2, &['_', '_']) {
+                    push_current(&mut current_text, is_bold, is_italic, is_code);
+                    is_bold = true;
+                    idx += 2;
+                } else {
+                    current_text.push('_');
+                    current_text.push('_');
+                    idx += 2;
+                }
+            } else if is_italic {
+                push_current(&mut current_text, is_bold, is_italic, is_code);
+                is_italic = false;
+                idx += 1;
+            } else if has_matching(idx + 1, &['_']) {
+                push_current(&mut current_text, is_bold, is_italic, is_code);
+                is_italic = true;
+                idx += 1;
+            } else {
+                current_text.push('_');
+                idx += 1;
+            }
+        } else {
+            current_text.push(chars[idx]);
+            idx += 1;
+        }
+    }
+
+    push_current(&mut current_text, is_bold, is_italic, is_code);
+
+    if spans.is_empty() {
+        vec![Span::styled(line.to_string(), base_style)]
+    } else {
+        spans
+    }
 }
 
+#[allow(dead_code)]
+pub(super) fn parse_inline_markdown(line: &str) -> Line<'static> {
+    let trimmed = line.trim_start();
+    let num_hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    let rest = &trimmed[num_hashes..];
+    if num_hashes > 0 && num_hashes <= 6 && rest.starts_with(' ') {
+        let header_content = rest.trim_start();
+        let header_style = Style::default()
+            .fg(theme::accent())
+            .add_modifier(Modifier::BOLD);
+        Line::from(parse_inline_markdown_spans(header_content, header_style))
+    } else {
+        Line::from(parse_inline_markdown_spans(line, Style::default().fg(theme::text())))
+    }
+}
+
+/// Render assistant markdown to logical lines at pane `width`. Backed by the
+/// `markdown` module (pulldown-cmark + our themed renderer): tables, code fences,
+/// nested lists, blockquotes, links — all in the active palette.
+pub(super) fn render_assistant(s: &str, width: u16) -> Vec<Line<'static>> {
+    super::markdown::render(s, width)
+}
+
+#[allow(dead_code)]
 pub(super) fn checklist_line(line: &str) -> Option<Line<'static>> {
     let indent_len = line.len() - line.trim_start().len();
     let indent = &line[..indent_len];
@@ -647,42 +807,58 @@ pub(super) fn checklist_line(line: &str) -> Option<Line<'static>> {
         .strip_prefix("[x]")
         .or_else(|| body.strip_prefix("[X]"))
     {
-        ("✔", theme::OK, t.trim_start(), true)
+        ("✔", theme::ok(), t.trim_start(), true)
     } else if let Some(t) = body.strip_prefix("[ ]") {
-        ("○", theme::DIM, t.trim_start(), false)
+        ("○", theme::dim(), t.trim_start(), false)
     } else {
         return None;
     };
     let text_style = if done {
-        Style::default().fg(theme::DIM)
+        Style::default().fg(theme::dim())
     } else {
-        Style::default().fg(theme::TEXT)
+        Style::default().fg(theme::text())
     };
-    Some(Line::from(vec![
+    let mut spans = vec![
         Span::raw(indent.to_string()),
         Span::styled(
             format!("{mark} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(text.to_string(), text_style),
-    ]))
+    ];
+    spans.extend(parse_inline_markdown_spans(text, text_style));
+    Some(Line::from(spans))
 }
 
+/// Tool input/output panel: a framed, syntax-highlighted JSON block matching the
+/// markdown code-fence styling (│ gutter, dim language label). Kept capped so a
+/// huge payload never builds thousands of spans (PART 4).
 pub(super) fn json_block(v: &serde_json::Value, label: &str) -> Vec<Line<'static>> {
     let text = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
-    let style = Style::default().fg(Color::Rgb(110, 120, 130));
-    let mut lines = vec![Line::from(Span::styled(format!("    ┌ {label}"), style))];
-    // Cap lines per tool call so a huge payload never builds thousands of spans (PART 4).
+    let border = Style::default().fg(theme::border());
+    let mut lines = vec![Line::from(vec![
+        Span::styled("    ╭─ ", border),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(theme::dim())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])];
     let total = text.lines().count();
-    for l in text.lines().take(MAX_TOOL_OUTPUT_LINES) {
-        lines.push(Line::from(Span::styled(format!("    │ {l}"), style)));
+    let rows = super::markdown::highlight_lines("json", &text);
+    for spans in rows.into_iter().take(MAX_TOOL_OUTPUT_LINES) {
+        let mut line = vec![Span::styled("    │ ", border)];
+        line.extend(spans);
+        lines.push(Line::from(line));
     }
     if total > MAX_TOOL_OUTPUT_LINES {
         let hidden = total - MAX_TOOL_OUTPUT_LINES;
         lines.push(Line::from(Span::styled(
-            format!("    └ [+{hidden} more lines — toggle /detail]"),
-            Style::default().fg(theme::FAINT),
+            format!("    ╰ [+{hidden} more lines — toggle /detail]"),
+            Style::default().fg(theme::faint()),
         )));
+    } else {
+        lines.push(Line::from(Span::styled("    ╰─", border)));
     }
     lines
 }
@@ -764,7 +940,7 @@ pub(super) fn gap_line(n: usize) -> Line<'static> {
     let plural = if n == 1 { "" } else { "s" };
     Line::from(Span::styled(
         format!("  ⋯ {n} unchanged line{plural}"),
-        Style::default().fg(theme::FAINT),
+        Style::default().fg(theme::faint()),
     ))
 }
 
@@ -773,14 +949,14 @@ pub(super) fn render_diff(old: &str, new: &str, path: &str, width: u16) -> Vec<L
     let mut lines: Vec<Line<'static>> = Vec::new();
     if !path.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("  ✎ ", Style::default().fg(theme::FAINT)),
+            Span::styled("  ✎ ", Style::default().fg(theme::faint())),
             Span::styled(
                 path.to_string(),
-                Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
             ),
         ]));
     }
-    let ctx_num = Style::default().fg(theme::LINENO);
+    let ctx_num = Style::default().fg(theme::lineno());
     let clip = |s: &str, w: usize| -> String {
         let t = s.trim_end_matches(['\n', '\r']);
         let n = t.chars().count();
@@ -806,9 +982,9 @@ pub(super) fn render_diff(old: &str, new: &str, path: &str, width: u16) -> Vec<L
                     lines.push(gap_line(*n));
                     continue;
                 }
-                DiffRow::Del(oi, t) => ("-", theme::DEL_FG, Some(theme::DEL_BG), *oi, t),
-                DiffRow::Ins(ni, t) => ("+", theme::ADD_FG, Some(theme::ADD_BG), *ni, t),
-                DiffRow::Ctx(_, ni, t) => (" ", theme::DIM, None, *ni, t),
+                DiffRow::Del(oi, t) => ("-", theme::del_fg(), Some(theme::del_bg()), *oi, t),
+                DiffRow::Ins(ni, t) => ("+", theme::add_fg(), Some(theme::add_bg()), *ni, t),
+                DiffRow::Ctx(_, ni, t) => (" ", theme::dim(), None, *ni, t),
             };
             let n = format!("{:>4}", num + 1);
             let text = clip(text, body_w);
@@ -833,14 +1009,14 @@ pub(super) fn render_diff(old: &str, new: &str, path: &str, width: u16) -> Vec<L
                     right: Option<&str>,
                     changed: bool| {
         let (lfg, lbg) = if changed && left.is_some() {
-            (theme::DEL_FG, Some(theme::DEL_BG))
+            (theme::del_fg(), Some(theme::del_bg()))
         } else {
-            (theme::DIM, None)
+            (theme::dim(), None)
         };
         let (rfg, rbg) = if changed && right.is_some() {
-            (theme::ADD_FG, Some(theme::ADD_BG))
+            (theme::add_fg(), Some(theme::add_bg()))
         } else {
-            (theme::DIM, None)
+            (theme::dim(), None)
         };
         let mut lst = Style::default().fg(lfg);
         let mut rst = Style::default().fg(rfg);
@@ -861,7 +1037,7 @@ pub(super) fn render_diff(old: &str, new: &str, path: &str, width: u16) -> Vec<L
         lines.push(Line::from(vec![
             Span::styled(format!("  {lnum} "), ctx_num),
             Span::styled(format!("{ltext} "), lst),
-            Span::styled("│ ", Style::default().fg(theme::FAINT)),
+            Span::styled("│ ", Style::default().fg(theme::faint())),
             Span::styled(format!("{rnum} "), ctx_num),
             Span::styled(rtext, rst),
         ]));
@@ -918,7 +1094,7 @@ pub(super) fn cap_diff(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         lines.truncate(MAX_DIFF_LINES);
         lines.push(Line::from(Span::styled(
             format!("  … {hidden} more diff lines"),
-            Style::default().fg(theme::FAINT),
+            Style::default().fg(theme::faint()),
         )));
     }
     lines
@@ -926,27 +1102,27 @@ pub(super) fn cap_diff(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 
 pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     let mut left = vec![
-        Span::styled("▌ ", Style::default().fg(theme::ACCENT)),
+        Span::styled("▌ ", Style::default().fg(theme::accent())),
         Span::styled(
             "medha",
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  {}", model.model),
-            Style::default().fg(theme::DIM),
+            format!("  {} [{}]", model.model, model.protocol.as_str()),
+            Style::default().fg(theme::dim()),
         ),
     ];
     // Autonomy badge — always visible so the user knows how much runs without
     // asking. yolo is loud (bold WARN) since it auto-runs edits + shell.
     let (mode_txt, mode_style) = match model.autonomy {
-        kernel::AutonomyLevel::Careful => ("careful", Style::default().fg(theme::DIM)),
-        kernel::AutonomyLevel::Normal => ("normal", Style::default().fg(theme::DIM)),
+        kernel::AutonomyLevel::Careful => ("careful", Style::default().fg(theme::dim())),
+        kernel::AutonomyLevel::Normal => ("normal", Style::default().fg(theme::dim())),
         kernel::AutonomyLevel::Yolo => (
             "⚠ yolo",
             Style::default()
-                .fg(theme::WARN)
+                .fg(theme::warn())
                 .add_modifier(Modifier::BOLD),
         ),
     };
@@ -964,7 +1140,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         left.push(Span::styled(
             format!("  ⏸ {what}"),
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ));
     } else if model.running {
@@ -975,7 +1151,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 activity_label(model),
                 elapsed_str(model)
             ),
-            Style::default().fg(theme::WARN),
+            Style::default().fg(theme::warn()),
         ));
     }
     // Live "compacting…" indicator while a summarize pass calls the model.
@@ -983,7 +1159,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         left.push(Span::styled(
             format!("  {} compacting context…", spinner_frame(model.anim_frame)),
             Style::default()
-                .fg(theme::WARN)
+                .fg(theme::warn())
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -998,7 +1174,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         left.push(Span::styled(
             format!("  {g} {running_bg} bg {word}"),
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1028,7 +1204,11 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     let reasoning = format!("reasoning {mode} · {visibility} · {effort} · {trace}");
     // Only surface the streaming state when it's OFF — on is the norm and adds
     // noise to the status bar.
-    let stream = if model.streaming { "" } else { " · stream off" };
+    let stream = if model.streaming {
+        ""
+    } else {
+        " · stream off"
+    };
     let hints = if model.running {
         "esc interrupt"
     } else {
@@ -1044,7 +1224,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     let pad = (area.width as usize).saturating_sub(left_w + UnicodeWidthStr::width(right.as_str()));
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(right, Style::default().fg(theme::FAINT)));
+    spans.push(Span::styled(right, Style::default().fg(theme::faint())));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -1103,15 +1283,16 @@ pub(super) fn input_rows(model: &Model, outer_width: u16) -> usize {
 
 pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
     let (accent, glyph) = if model.running {
-        (theme::FAINT, "…")
+        (theme::faint(), "…")
     } else {
-        (theme::ACCENT, "❯")
+        (theme::accent(), "❯")
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(accent))
-        .padding(ratatui::widgets::Padding::horizontal(1));
+        // 1 col each side + 1 blank line top/bottom → a roomier, less cramped box.
+        .padding(ratatui::widgets::Padding::new(1, 1, 1, 1));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if model.input.is_empty() && !model.running {
@@ -1129,7 +1310,7 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
                     format!("{glyph} "),
                     Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(prompt, Style::default().fg(theme::FAINT)),
+                Span::styled(prompt, Style::default().fg(theme::faint())),
             ]);
             f.render_widget(Paragraph::new(line), inner);
             f.set_cursor_position(ratatui::layout::Position::new(inner.x + 2, inner.y));
@@ -1149,7 +1330,7 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
                     format!("{glyph} "),
                     Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(prompt, Style::default().fg(theme::FAINT)),
+                Span::styled(prompt, Style::default().fg(theme::faint())),
             ]);
             f.render_widget(Paragraph::new(line), inner);
             f.set_cursor_position(ratatui::layout::Position::new(inner.x + 2, inner.y));
@@ -1162,7 +1343,7 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
             ),
             Span::styled(
                 "Ask medha to build, fix, or explain something…   ( / for commands · \\ + enter or ctrl+j for newline )",
-                Style::default().fg(theme::FAINT),
+                Style::default().fg(theme::faint()),
             ),
         ]);
         f.render_widget(Paragraph::new(line), inner);
@@ -1202,7 +1383,7 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
             };
             Line::from(vec![
                 gutter,
-                Span::styled(row, Style::default().fg(theme::TEXT)),
+                Span::styled(row, Style::default().fg(theme::text())),
             ])
         })
         .collect();
@@ -1213,6 +1394,15 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
             inner.y + crow as u16,
         ));
     }
+}
+
+/// Repaint a themed panel bg after `Clear` — else an overlay shows the bare
+/// terminal bg (a dark box under a light theme).
+fn fill_panel(f: &mut Frame, area: Rect) {
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::code_bg())),
+        area,
+    );
 }
 
 pub(super) fn draw_autocomplete(f: &mut Frame, model: &Model, input_area: Rect) {
@@ -1239,25 +1429,26 @@ pub(super) fn draw_autocomplete(f: &mut Frame, model: &Model, input_area: Rect) 
     let y = input_area.y.saturating_sub(height + 1);
     let area = Rect::new(input_area.x, y, input_area.width, height + 1);
     f.render_widget(ratatui::widgets::Clear, area);
+    fill_panel(f, area);
     let mut lines: Vec<Line> = Vec::with_capacity(visible + 1);
     for (i, (c, d)) in matches[start..end].iter().enumerate() {
         let idx = start + i;
         if idx == sel {
             lines.push(Line::from(vec![
-                Span::styled("▌ ", Style::default().fg(theme::ACCENT)),
+                Span::styled("▌ ", Style::default().fg(theme::accent())),
                 Span::styled(
                     c.to_string(),
                     Style::default()
-                        .fg(theme::ACCENT)
+                        .fg(theme::accent())
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  {d}"), Style::default().fg(theme::DIM)),
+                Span::styled(format!("  {d}"), Style::default().fg(theme::dim())),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled(c.to_string(), Style::default().fg(theme::TEXT)),
-                Span::styled(format!("  {d}"), Style::default().fg(theme::FAINT)),
+                Span::styled(c.to_string(), Style::default().fg(theme::text())),
+                Span::styled(format!("  {d}"), Style::default().fg(theme::faint())),
             ]));
         }
     }
@@ -1268,7 +1459,10 @@ pub(super) fn draw_autocomplete(f: &mut Frame, model: &Model, input_area: Rect) 
     } else {
         "  ↑↓ select · tab/enter accept · esc dismiss".to_string()
     };
-    lines.push(Line::from(Span::styled(hint, Style::default().fg(theme::FAINT))));
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(theme::faint()),
+    )));
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1292,6 +1486,7 @@ pub(super) fn draw_picker(f: &mut Frame, picker: &Picker, input_area: Rect) {
     let y = input_area.y.saturating_sub(height);
     let area = Rect::new(input_area.x, y, input_area.width, height);
     f.render_widget(ratatui::widgets::Clear, area);
+    fill_panel(f, area);
 
     // Title shows position (e.g. "3/27") when the list is windowed off-screen.
     let mut title = picker.kind.title().trim().to_string();
@@ -1300,24 +1495,24 @@ pub(super) fn draw_picker(f: &mut Frame, picker: &Picker, input_area: Rect) {
     }
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         format!("  {title}"),
-        Style::default().fg(theme::FAINT),
+        Style::default().fg(theme::faint()),
     ))];
     for (offset, label) in labels[start..end].iter().enumerate() {
         let i = start + offset;
         if i == picker.selected {
             lines.push(Line::from(vec![
-                Span::styled("▌ ", Style::default().fg(theme::ACCENT)),
+                Span::styled("▌ ", Style::default().fg(theme::accent())),
                 Span::styled(
                     label.clone(),
                     Style::default()
-                        .fg(theme::ACCENT)
+                        .fg(theme::accent())
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
         } else {
             lines.push(Line::from(Span::styled(
                 format!("  {label}"),
-                Style::default().fg(theme::TEXT),
+                Style::default().fg(theme::text()),
             )));
         }
     }
@@ -1355,20 +1550,20 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
                 (
                     "▸",
                     Style::default()
-                        .fg(theme::ACCENT)
+                        .fg(theme::accent())
                         .add_modifier(Modifier::BOLD),
                 )
             } else if answered {
-                ("✓", Style::default().fg(theme::TEXT))
+                ("✓", Style::default().fg(theme::text()))
             } else {
-                ("○", Style::default().fg(theme::DIM))
+                ("○", Style::default().fg(theme::dim()))
             };
             tabs.push(Span::styled(format!("{mark} {label}   "), style));
         }
         lines.push(Line::from(tabs));
         lines.push(Line::from(Span::styled(
             "  ←→ switch questions",
-            Style::default().fg(theme::FAINT),
+            Style::default().fg(theme::faint()),
         )));
         lines.push(Line::from(""));
     }
@@ -1383,37 +1578,53 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
     lines.push(Line::from(Span::styled(
         format!("{head}{}", q.prompt),
         Style::default()
-            .fg(theme::ACCENT)
+            .fg(theme::accent())
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from("")); // breathing room
 
-    // Options. While editing "Other", dim them so focus is on the text field.
+    // Options — rich per-component styling. While editing "Other", dim them so
+    // focus is on the text field.
     let options_start = lines.len();
     for (i, opt) in q.options.iter().enumerate() {
         let on = draft.selected.contains(&i);
-        let marker = if q.multi_select {
-            if on { "☑" } else { "☐" }
-        } else if on {
-            "◉"
-        } else {
-            "○"
+        let focused = !editing && state.cursor == i;
+        let (mark, mark_color) = match (q.multi_select, on) {
+            (true, true) => ("☑", theme::ok()),
+            (true, false) => ("☐", theme::dim()),
+            (false, true) => ("◉", theme::ok()),
+            (false, false) => ("○", theme::dim()),
         };
-        let star = if opt.recommended { " ★" } else { "" };
-        let desc = if opt.description.trim().is_empty() {
-            String::new()
+        let bar = if focused { "▌ " } else { "  " };
+        let bar_color = if focused { theme::accent() } else { theme::faint() };
+        let label_style = if editing {
+            Style::default().fg(theme::dim())
+        } else if focused {
+            Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
         } else {
-            format!("  — {}", opt.description.trim())
+            Style::default().fg(theme::text())
         };
-        let text = format!("{marker} {}{star}{desc}", opt.label);
-        if editing {
-            lines.push(Line::from(Span::styled(
-                format!("  {text}"),
-                Style::default().fg(theme::DIM),
-            )));
-        } else {
-            lines.push(row_line(&text, state.cursor == i));
+        let mut spans = vec![
+            Span::styled(bar, Style::default().fg(bar_color)),
+            Span::styled(
+                format!("{mark} "),
+                Style::default().fg(if editing { theme::faint() } else { mark_color }),
+            ),
+            Span::styled(opt.label.clone(), label_style),
+        ];
+        if opt.recommended {
+            spans.push(Span::styled(
+                " ★",
+                Style::default().fg(if editing { theme::faint() } else { theme::accent() }),
+            ));
         }
+        if !opt.description.trim().is_empty() {
+            spans.push(Span::styled(
+                format!("  — {}", opt.description.trim()),
+                Style::default().fg(theme::faint()),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     // The "Other" row: an inline editor when active (shows the live buffer + a
@@ -1424,17 +1635,36 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
         debug_assert!(state.other_input.is_char_boundary(cursor));
         let (before, after) = state.other_input.split_at(cursor);
         lines.push(Line::from(vec![
-            Span::styled("▌ ✎ ", Style::default().fg(theme::ACCENT)),
-            Span::styled(before.to_string(), Style::default().fg(theme::TEXT)),
-            Span::styled("▏", Style::default().fg(theme::ACCENT)),
-            Span::styled(after.to_string(), Style::default().fg(theme::TEXT)),
+            Span::styled("▌ ✎ ", Style::default().fg(theme::accent())),
+            Span::styled(before.to_string(), Style::default().fg(theme::text())),
+            Span::styled("▏", Style::default().fg(theme::accent())),
+            Span::styled(after.to_string(), Style::default().fg(theme::text())),
         ]));
     } else {
-        let other_txt = match &draft.other {
-            Some(t) if !t.is_empty() => format!("✎ Other: {t}"),
-            _ => "✎ Other…".to_string(),
-        };
-        lines.push(row_line(&other_txt, state.cursor == state.other_row()));
+        let focused = state.cursor == state.other_row();
+        let bar = if focused { "▌ " } else { "  " };
+        let bar_color = if focused { theme::accent() } else { theme::faint() };
+        let mut spans = vec![
+            Span::styled(bar, Style::default().fg(bar_color)),
+            Span::styled(
+                "✎ ",
+                Style::default().fg(if focused { theme::accent() } else { theme::dim() }),
+            ),
+        ];
+        match draft.other.as_deref().filter(|t| !t.is_empty()) {
+            Some(t) => {
+                spans.push(Span::styled("Other: ", Style::default().fg(theme::dim())));
+                spans.push(Span::styled(
+                    t.to_string(),
+                    Style::default().fg(theme::text()).add_modifier(Modifier::BOLD),
+                ));
+            }
+            None => spans.push(Span::styled(
+                "Other…",
+                Style::default().fg(if focused { theme::text() } else { theme::dim() }),
+            )),
+        }
+        lines.push(Line::from(spans));
     }
 
     if let Some(message) = &state.validation {
@@ -1442,7 +1672,7 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
         lines.push(Line::from(Span::styled(
             format!("  ⚠ {message}"),
             Style::default()
-                .fg(theme::WARN)
+                .fg(theme::warn())
                 .add_modifier(Modifier::BOLD),
         )));
     }
@@ -1456,12 +1686,17 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
         } else {
             "space pick"
         };
-        format!("  ↑↓ options · {pick} · enter submit · esc skip")
+        let last = state.idx + 1 == state.questions.len();
+        if multi_q && !last {
+            format!("  ↑↓ options · {pick} · enter next · ←→ jump · esc skip")
+        } else {
+            format!("  ↑↓ options · {pick} · enter submit · esc skip")
+        }
     };
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         hint,
-        Style::default().fg(theme::FAINT),
+        Style::default().fg(theme::faint()),
     )));
 
     // Card title shows progress across questions.
@@ -1473,11 +1708,11 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(Style::default().fg(theme::accent()))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ))
         .padding(ratatui::widgets::Padding::horizontal(1));
@@ -1510,6 +1745,7 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
     let y = input_area.y - height;
     let area = Rect::new(input_area.x, y, input_area.width, height);
     f.render_widget(ratatui::widgets::Clear, area);
+    fill_panel(f, area);
     let inner = block.inner(area);
     let visible_rows = inner.height.max(1) as usize;
     let scroll = focus_row.saturating_sub(visible_rows.saturating_sub(1));
@@ -1520,33 +1756,32 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
     );
 }
 
-/// One selectable row, highlighted (accent + ▌) when it's the cursor.
-fn row_line(text: &str, selected: bool) -> Line<'static> {
-    if selected {
-        Line::from(vec![
-            Span::styled("▌ ", Style::default().fg(theme::ACCENT)),
-            Span::styled(
-                text.to_string(),
-                Style::default()
-                    .fg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
-    } else {
-        Line::from(Span::styled(
-            format!("  {text}"),
-            Style::default().fg(theme::TEXT),
-        ))
-    }
-}
-
 /// View function — pure rendering from model
 pub(super) fn view(f: &mut Frame, model: &mut Model) {
     let area = f.area();
     model.viewport_height = area.height as usize;
 
-    let text_rows = input_rows(model, area.width.saturating_sub(4)) as u16;
-    let box_h = text_rows.clamp(1, 8) + 2;
+    // Paint the themed canvas first. Dark's bg is `Reset` (a no-op that keeps
+    // the terminal's own background), light paints parchment — so light mode is
+    // readable even on a dark terminal. Text drawn afterwards uses fg-only
+    // styles (bg: None), which inherit this fill.
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::bg())),
+        area,
+    );
+
+    // Horizontal gutter — insets the transcript, input box and status from the
+    // terminal edge so nothing is glued to column 0. Scales gently with width
+    // (a wide terminal gets a touch more breathing room), clamped for narrow ones.
+    let margin = (area.width / 30).clamp(3, 6);
+    let content_w = area.width.saturating_sub(margin * 2);
+
+    // Input box interior width = content minus the rounded border (1 each side)
+    // and its horizontal padding (1 each side) = 4. Height reserves the border
+    // (2) plus one blank line of vertical padding top and bottom (2) so the
+    // prompt sits with breathing room rather than crammed against the border.
+    let text_rows = input_rows(model, content_w.saturating_sub(4)) as u16;
+    let box_h = text_rows.clamp(1, 8) + 4;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1557,8 +1792,8 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
         ])
         .split(area);
 
-    let pad_h = |area: Rect| {
-        let pad = 2.min(area.width / 2);
+    let pad_h = move |area: Rect| {
+        let pad = margin.min(area.width / 2);
         Rect {
             x: area.x + pad,
             width: area.width.saturating_sub(pad * 2),
@@ -1647,7 +1882,7 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
                             ""
                         }
                     ),
-                    Style::default().fg(theme::FAINT),
+                    Style::default().fg(theme::faint()),
                 )));
             }
             rows.iter()
@@ -1701,11 +1936,11 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
         let spinner = vec![Line::from(vec![
             Span::styled(
                 spinner_frame(model.anim_frame),
-                Style::default().fg(theme::ACCENT),
+                Style::default().fg(theme::accent()),
             ),
             Span::styled(
                 format!(" {}…", activity_label(model)),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::dim()),
             ),
         ])];
         push_block(&spinner, &mut off, &mut visible);
@@ -1713,8 +1948,32 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
 
     // Rows are already wrapped to width — render them directly (no ratatui wrap,
     // no full-buffer scroll).
-    let p = Paragraph::new(visible).style(Style::default().fg(theme::TEXT));
+    let p = Paragraph::new(visible).style(Style::default().fg(theme::text()));
     f.render_widget(p, area);
+
+    // A slim scrollbar in the right-hand padding gutter (never overlaps text) —
+    // shows position + how much is off-screen, so scrolling a long session reads
+    // like a normal pane. Only drawn when content actually overflows the viewport.
+    if model.content_height > model.viewport_height && area.right() < f.area().right() {
+        use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+        let gutter = Rect {
+            x: area.right(),
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
+        let mut state = ScrollbarState::new(model.content_height)
+            .viewport_content_length(model.viewport_height)
+            .position(model.scroll_offset);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .track_style(Style::default().fg(theme::faint()))
+            .thumb_style(Style::default().fg(theme::accent()));
+        f.render_stateful_widget(bar, gutter, &mut state);
+    }
 
     // The approval card is now guaranteed on screen — safe to accept selection input.
     if model.pending_approval().is_some() && !model.approval_ready {
@@ -1829,5 +2088,65 @@ mod clarify_view_tests {
                 assert_eq!(buffer[(x, y)].symbol(), " ", "card covered composer/status");
             }
         }
+    }
+
+    #[test]
+    fn test_parse_inline_markdown() {
+        use ratatui::style::{Modifier, Color, Style};
+        use super::parse_inline_markdown;
+        use crate::tui_tea::theme;
+
+        let normal = parse_inline_markdown("hello world");
+        assert_eq!(normal.spans.len(), 1);
+        assert_eq!(normal.spans[0].content, "hello world");
+
+        let bold = parse_inline_markdown("this is **bold** text");
+        assert_eq!(bold.spans.len(), 3);
+        assert_eq!(bold.spans[0].content, "this is ");
+        assert_eq!(bold.spans[1].content, "bold");
+        assert_eq!(
+            bold.spans[1].style,
+            Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(bold.spans[2].content, " text");
+
+        let italic = parse_inline_markdown("this is *italic* text");
+        assert_eq!(italic.spans.len(), 3);
+        assert_eq!(italic.spans[0].content, "this is ");
+        assert_eq!(italic.spans[1].content, "italic");
+        assert_eq!(
+            italic.spans[1].style,
+            Style::default().fg(theme::text()).add_modifier(Modifier::ITALIC)
+        );
+        assert_eq!(italic.spans[2].content, " text");
+
+        let code = parse_inline_markdown("some `code` block");
+        assert_eq!(code.spans.len(), 3);
+        assert_eq!(code.spans[0].content, "some ");
+        assert_eq!(code.spans[1].content, "code");
+        assert_eq!(code.spans[1].style.fg, Some(Color::Rgb(220, 200, 140)));
+        assert_eq!(code.spans[2].content, " block");
+
+        let non_matching = parse_inline_markdown("x * y * z");
+        assert_eq!(non_matching.spans.len(), 3);
+        assert_eq!(non_matching.spans[0].content, "x ");
+        assert_eq!(non_matching.spans[1].content, " y ");
+        assert_eq!(
+            non_matching.spans[1].style,
+            Style::default().fg(theme::text()).add_modifier(Modifier::ITALIC)
+        );
+        assert_eq!(non_matching.spans[2].content, " z");
+
+        let header = parse_inline_markdown("#### This is a heading");
+        assert_eq!(header.spans.len(), 1);
+        assert_eq!(header.spans[0].content, "This is a heading");
+        assert_eq!(
+            header.spans[0].style,
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)
+        );
+
+        let code_hash_header = parse_inline_markdown("#include <stdio.h>");
+        assert_eq!(code_hash_header.spans.len(), 1);
+        assert_eq!(code_hash_header.spans[0].content, "#include <stdio.h>");
     }
 }

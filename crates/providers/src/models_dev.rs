@@ -69,7 +69,10 @@ fn cache_path() -> Option<PathBuf> {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn load_disk_cache() -> Option<Cache> {
@@ -92,7 +95,11 @@ fn save_disk_cache(cache: &Cache) {
 }
 
 async fn fetch_and_flatten(client: &reqwest::Client) -> Result<HashMap<String, ModelMeta>, String> {
-    let resp = client.get(API_URL).send().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .get(API_URL)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("models.dev returned {}", resp.status()));
     }
@@ -118,10 +125,15 @@ async fn entries() -> Option<HashMap<String, ModelMeta>> {
     if let Some(cache) = load_disk_cache() {
         return Some(cache.entries);
     }
-    let client =
-        reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
     let fetched = fetch_and_flatten(&client).await.ok()?;
-    save_disk_cache(&Cache { fetched_at_unix: now_unix(), entries: fetched.clone() });
+    save_disk_cache(&Cache {
+        fetched_at_unix: now_unix(),
+        entries: fetched.clone(),
+    });
     Some(fetched)
 }
 
@@ -166,7 +178,11 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(
             "qwen3-32b".to_string(),
-            ModelMeta { context: Some(131_072), input_per_mtok: None, output_per_mtok: None },
+            ModelMeta {
+                context: Some(131_072),
+                input_per_mtok: None,
+                output_per_mtok: None,
+            },
         );
         m.insert(
             "claude-opus-4".to_string(),
@@ -177,7 +193,10 @@ mod tests {
             },
         );
 
-        assert_eq!(lookup("qwen3-32b", &m).and_then(|x| x.context), Some(131_072));
+        assert_eq!(
+            lookup("qwen3-32b", &m).and_then(|x| x.context),
+            Some(131_072)
+        );
         assert_eq!(
             lookup("nvidia/qwen3-32b-instruct", &m).and_then(|x| x.context),
             Some(131_072)

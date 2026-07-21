@@ -27,6 +27,18 @@ pub struct SessionSearchHit {
 fn search_text(kind: &EventKind, payload: &serde_json::Value) -> Option<String> {
     let text = match kind {
         EventKind::UserMessage | EventKind::ModelText => payload.get("text")?.as_str()?.to_string(),
+        EventKind::ModelMessage => {
+            let message: kernel::ModelMessage = serde_json::from_value(payload.clone()).ok()?;
+            message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    kernel::ContentPart::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        }
         EventKind::ToolObs => match payload.get("payload")? {
             serde_json::Value::String(text) => text.clone(),
             value => serde_json::to_string(value).ok()?,
@@ -67,12 +79,16 @@ fn backfill_event_fts(conn: &mut Connection) -> Result<(), StoreError> {
         return Ok(());
     }
 
-    let tx = conn.transaction().map_err(|error| StoreError::Db(error.to_string()))?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| StoreError::Db(error.to_string()))?;
     tx.execute("DELETE FROM events_fts", [])
         .map_err(|error| StoreError::Db(error.to_string()))?;
     let rows = {
         let mut stmt = tx
-            .prepare("SELECT id, session_id, kind, payload, provenance, ts FROM events ORDER BY rowid")
+            .prepare(
+                "SELECT id, session_id, kind, payload, provenance, ts FROM events ORDER BY rowid",
+            )
             .map_err(|error| StoreError::Db(error.to_string()))?;
         let mapped = stmt
             .query_map([], |row| {
@@ -117,7 +133,8 @@ fn backfill_event_fts(conn: &mut Connection) -> Result<(), StoreError> {
         [],
     )
     .map_err(|error| StoreError::Db(error.to_string()))?;
-    tx.commit().map_err(|error| StoreError::Db(error.to_string()))
+    tx.commit()
+        .map_err(|error| StoreError::Db(error.to_string()))
 }
 
 /// Content-addressed blob store on disk (§4.2/§4.5). Blobs live under a dir,
@@ -464,7 +481,11 @@ impl SqliteLog {
             .map_err(|error| StoreError::Db(error.to_string()))?;
         let rows = stmt
             .query_map(
-                rusqlite::params![session_id.to_string(), anchor, radius.saturating_mul(2).saturating_add(1) as i64],
+                rusqlite::params![
+                    session_id.to_string(),
+                    anchor,
+                    radius.saturating_mul(2).saturating_add(1) as i64
+                ],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -503,24 +524,29 @@ impl SqliteLog {
                  FROM events WHERE session_id = ?1 AND kind IN ('user.message', 'model.text')
                  ORDER BY rowid {direction} LIMIT ?2"
             );
-            let mut stmt = conn.prepare(&sql).map_err(|error| StoreError::Db(error.to_string()))?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|error| StoreError::Db(error.to_string()))?;
             let rows = stmt
-                .query_map(rusqlite::params![session_id.to_string(), count as i64], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        Row {
-                            id: row.get(1)?,
-                            session_id: row.get(2)?,
-                            parent_id: row.get(3)?,
-                            kind: row.get(4)?,
-                            payload: row.get(5)?,
-                            trust: row.get(6)?,
-                            provenance: row.get(7)?,
-                            prev_hash: row.get(8)?,
-                            ts: row.get(9)?,
-                        },
-                    ))
-                })
+                .query_map(
+                    rusqlite::params![session_id.to_string(), count as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            Row {
+                                id: row.get(1)?,
+                                session_id: row.get(2)?,
+                                parent_id: row.get(3)?,
+                                kind: row.get(4)?,
+                                payload: row.get(5)?,
+                                trust: row.get(6)?,
+                                provenance: row.get(7)?,
+                                prev_hash: row.get(8)?,
+                                ts: row.get(9)?,
+                            },
+                        ))
+                    },
+                )
                 .map_err(|error| StoreError::Db(error.to_string()))?;
             Ok(rows
                 .filter_map(Result::ok)
@@ -753,7 +779,10 @@ mod tests {
 
         let window = log.window(session.id, answer.id, 1).unwrap();
         assert_eq!(window.len(), 3);
-        assert_eq!(window[0].payload["text"], "We chose quoted-values for the cache-key.");
+        assert_eq!(
+            window[0].payload["text"],
+            "We chose quoted-values for the cache-key."
+        );
         assert_eq!(window[1].id, answer.id);
         let bookends = log.bookends(session.id, 1).unwrap();
         assert_eq!(bookends.len(), 2);
@@ -859,7 +888,11 @@ mod tests {
     async fn memory_write_kind_round_trips_through_persistence() {
         let dir = std::env::temp_dir().join(format!("medha-memkind-{}", Ulid::new()));
         let db = dir.join("events.db");
-        let s = kernel::Session { id: Ulid::new(), done: false, ..Default::default() };
+        let s = kernel::Session {
+            id: Ulid::new(),
+            done: false,
+            ..Default::default()
+        };
         let payload = serde_json::json!({ "op": "write", "entry": { "name": "e1" } });
 
         let log = SqliteLog::open(&db).unwrap();
@@ -870,7 +903,9 @@ mod tests {
             kind: EventKind::MemoryWrite,
             payload: payload.clone(),
             trust: TrustLabel::Memory,
-            provenance: kernel::Provenance { source: "test".into() },
+            provenance: kernel::Provenance {
+                source: "test".into(),
+            },
             prev_hash: [0u8; 32],
             ts: 0.0,
         })
@@ -879,11 +914,53 @@ mod tests {
 
         let reopened = SqliteLog::open(&db).unwrap();
         let events = reopened.events(s.id).await;
-        assert_eq!(events.len(), 1, "unknown-kind rows are silently dropped by Row::into_event — this must not be one");
+        assert_eq!(
+            events.len(),
+            1,
+            "unknown-kind rows are silently dropped by Row::into_event — this must not be one"
+        );
         assert_eq!(events[0].kind, EventKind::MemoryWrite);
         assert_eq!(events[0].payload, payload);
         reopened.verify().unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordered_provider_state_survives_sqlite_reload() {
+        let dir = std::env::temp_dir().join(format!("medha-state-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let log = SqliteLog::open(&db).unwrap();
+        let session = kernel::Session::new();
+        let message = kernel::ModelMessage {
+            role: kernel::Role::Assistant,
+            parts: vec![kernel::ContentPart::Reasoning(kernel::ReasoningPart {
+                text: Some("visible summary".into()),
+                provider_state: vec![kernel::ProviderState {
+                    protocol: kernel::Protocol::AnthropicMessages,
+                    kind: "thinking-signature".into(),
+                    value: serde_json::json!({"signature": "opaque-value"}),
+                }],
+            })],
+        };
+        log.append(Event::model_message(&session, &message))
+            .await
+            .unwrap();
+        drop(log);
+
+        let reopened = SqliteLog::open(&db).unwrap();
+        let reloaded = reopened.events(session.id).await;
+        assert_eq!(reloaded[0].kind, EventKind::ModelMessage);
+        let projected = kernel::project_ordered_messages(&reloaded);
+        assert_eq!(projected, vec![message]);
+        let kernel::ContentPart::Reasoning(reasoning) = &projected[0].parts[0] else {
+            panic!("reasoning part changed during persistence");
+        };
+        assert_eq!(
+            reasoning.provider_state[0].value["signature"],
+            "opaque-value"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

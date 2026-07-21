@@ -36,6 +36,13 @@ rustyline = "14"
 # Keep crossterm pinned to the same version ratatui re-exports (PART 7) — a mismatch
 # means two crossterm versions in the tree and event types that don't unify.
 ratatui = "0.30"
+# Markdown: rustdoc/mdBook-grade pull parser (industry standard, MIT). We own the
+# ratatui rendering so tables, code fences, and colors match the medha theme and
+# adapt to light/dark — no off-the-shelf renderer fits that + our virtualized scroll.
+pulldown-cmark = { version = "0.13", default-features = false }
+# Code-fence syntax highlighting (same crate bat/delta/mdcat use). `default-fancy`
+# keeps it pure-Rust (fancy-regex, no Oniguruma C dependency).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 similar = "2"
 crossterm = { version = "0.29", features = ["event-stream"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }

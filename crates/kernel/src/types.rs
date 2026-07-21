@@ -58,7 +58,11 @@ impl TrustLabel {
 
     /// The less-trusted of two labels — taint flows toward the floor.
     pub fn min(self, other: Self) -> Self {
-        if other.rank() < self.rank() { other } else { self }
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
+        }
     }
 }
 
@@ -146,6 +150,297 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
         }
+    }
+}
+
+/// Opaque replay metadata returned by one wire protocol. The value is
+/// serialized unchanged but deliberately omitted from `Debug` so signed or
+/// encrypted reasoning state cannot leak into diagnostics.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderState {
+    pub protocol: crate::provider::Protocol,
+    pub kind: String,
+    pub value: serde_json::Value,
+}
+
+impl std::fmt::Debug for ProviderState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderState")
+            .field("protocol", &self.protocol)
+            .field("kind", &self.kind)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextPart {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_state: Vec<ProviderState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallPart {
+    pub id: String,
+    pub tool: String,
+    pub args: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_state: Vec<ProviderState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolResultPart {
+    pub tool_call_id: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_state: Vec<ProviderState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningPart {
+    /// Optional visible summary. Opaque replay-only state remains in
+    /// `provider_state` and is never substituted into this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_state: Vec<ProviderState>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum MediaSource {
+    Url(String),
+    Base64(String),
+}
+
+impl std::fmt::Debug for MediaSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Url(url) => formatter.debug_tuple("Url").field(url).finish(),
+            Self::Base64(_) => formatter
+                .debug_tuple("Base64")
+                .field(&"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaPart {
+    pub mime_type: String,
+    pub source: MediaSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_state: Vec<ProviderState>,
+}
+
+/// Ordered canonical content. Protocol adapters must preserve this order and
+/// may consume provider state only when its protocol tag matches their own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ContentPart {
+    Text(TextPart),
+    ToolCall(ToolCallPart),
+    ToolResult(ToolResultPart),
+    Reasoning(ReasoningPart),
+    Media(MediaPart),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelMessage {
+    pub role: Role,
+    pub parts: Vec<ContentPart>,
+}
+
+impl ModelMessage {
+    /// True when any part carries opaque state which only its owning protocol
+    /// may consume. Used by compatibility bridges to avoid lossy rewrites.
+    pub fn has_provider_state(&self) -> bool {
+        self.parts.iter().any(|part| match part {
+            ContentPart::Text(part) => !part.provider_state.is_empty(),
+            ContentPart::ToolCall(part) => !part.provider_state.is_empty(),
+            ContentPart::ToolResult(part) => !part.provider_state.is_empty(),
+            ContentPart::Reasoning(part) => !part.provider_state.is_empty(),
+            ContentPart::Media(part) => !part.provider_state.is_empty(),
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum LegacyMessageError {
+    #[error("ordered message contains content the legacy Message type cannot represent")]
+    NotRepresentable,
+}
+
+impl From<&Message> for ModelMessage {
+    fn from(message: &Message) -> Self {
+        let mut parts = Vec::new();
+        match message.role {
+            Role::Tool => {
+                if let Some(tool_call_id) = &message.tool_call_id {
+                    parts.push(ContentPart::ToolResult(ToolResultPart {
+                        tool_call_id: tool_call_id.clone(),
+                        content: message.content.clone(),
+                        provider_state: Vec::new(),
+                    }));
+                } else if !message.content.is_empty() {
+                    parts.push(ContentPart::Text(TextPart {
+                        text: message.content.clone(),
+                        provider_state: Vec::new(),
+                    }));
+                }
+            }
+            _ => {
+                if !message.content.is_empty() {
+                    parts.push(ContentPart::Text(TextPart {
+                        text: message.content.clone(),
+                        provider_state: Vec::new(),
+                    }));
+                }
+                parts.extend(message.tool_calls.iter().map(|call| {
+                    ContentPart::ToolCall(ToolCallPart {
+                        id: call.id.clone(),
+                        tool: call.tool.clone(),
+                        args: call.args.clone(),
+                        provider_state: Vec::new(),
+                    })
+                }));
+            }
+        }
+        Self {
+            role: message.role.clone(),
+            parts,
+        }
+    }
+}
+
+impl TryFrom<&ModelMessage> for Message {
+    type Error = LegacyMessageError;
+
+    fn try_from(message: &ModelMessage) -> Result<Self, Self::Error> {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut tool_call_id = None;
+        let mut saw_tool_call = false;
+        for part in &message.parts {
+            match (&message.role, part) {
+                (Role::System | Role::User | Role::Assistant, ContentPart::Text(part))
+                    if part.provider_state.is_empty() && !saw_tool_call =>
+                {
+                    content.push_str(&part.text);
+                }
+                (Role::Assistant, ContentPart::ToolCall(part))
+                    if part.provider_state.is_empty() =>
+                {
+                    saw_tool_call = true;
+                    tool_calls.push(ToolIntent {
+                        id: part.id.clone(),
+                        tool: part.tool.clone(),
+                        args: part.args.clone(),
+                    });
+                }
+                (Role::Tool, ContentPart::ToolResult(part))
+                    if part.provider_state.is_empty() && tool_call_id.is_none() =>
+                {
+                    tool_call_id = Some(part.tool_call_id.clone());
+                    content.push_str(&part.content);
+                }
+                (Role::Tool, ContentPart::Text(part))
+                    if part.provider_state.is_empty() && tool_call_id.is_none() =>
+                {
+                    content.push_str(&part.text);
+                }
+                _ => return Err(LegacyMessageError::NotRepresentable),
+            }
+        }
+        Ok(Message {
+            role: message.role.clone(),
+            content,
+            tool_calls,
+            tool_call_id,
+        })
+    }
+}
+
+impl Message {
+    pub fn ordered(&self) -> ModelMessage {
+        ModelMessage::from(self)
+    }
+}
+
+#[cfg(test)]
+mod ordered_message_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_assistant_bridge_has_one_deterministic_order_and_round_trips() {
+        let legacy = Message::assistant_calls(
+            "before tools",
+            vec![
+                ToolIntent {
+                    id: "one".into(),
+                    tool: "fs.read".into(),
+                    args: serde_json::json!({"path": "a"}),
+                },
+                ToolIntent {
+                    id: "two".into(),
+                    tool: "fs.read".into(),
+                    args: serde_json::json!({"path": "b"}),
+                },
+            ],
+        );
+
+        let ordered = legacy.ordered();
+        assert!(matches!(ordered.parts[0], ContentPart::Text(_)));
+        assert!(matches!(ordered.parts[1], ContentPart::ToolCall(_)));
+        assert!(matches!(ordered.parts[2], ContentPart::ToolCall(_)));
+
+        let restored = Message::try_from(&ordered).unwrap();
+        assert_eq!(restored.role, Role::Assistant);
+        assert_eq!(restored.content, legacy.content);
+        assert_eq!(restored.tool_calls.len(), 2);
+        assert_eq!(restored.tool_calls[1].id, "two");
+    }
+
+    #[test]
+    fn compatibility_bridge_refuses_to_destroy_interleaving_or_provider_state() {
+        let state = ProviderState {
+            protocol: crate::provider::Protocol::GeminiInteractions,
+            kind: "thought-signature".into(),
+            value: serde_json::json!({"signature": "signed-value"}),
+        };
+        let interleaved = ModelMessage {
+            role: Role::Assistant,
+            parts: vec![
+                ContentPart::ToolCall(ToolCallPart {
+                    id: "call".into(),
+                    tool: "tool".into(),
+                    args: serde_json::json!({}),
+                    provider_state: vec![state.clone()],
+                }),
+                ContentPart::Text(TextPart {
+                    text: "after".into(),
+                    provider_state: Vec::new(),
+                }),
+            ],
+        };
+        assert!(matches!(
+            Message::try_from(&interleaved),
+            Err(LegacyMessageError::NotRepresentable)
+        ));
+
+        let encoded = serde_json::to_value(&state).unwrap();
+        let decoded: ProviderState = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, state, "opaque state must round-trip unchanged");
+        assert_eq!(encoded["value"]["signature"], "signed-value");
+        assert!(!format!("{state:?}").contains("signed-value"));
+    }
+
+    #[test]
+    fn embedded_media_is_redacted_from_debug_output() {
+        let source = MediaSource::Base64("private-image-data".into());
+        assert!(!format!("{source:?}").contains("private-image-data"));
     }
 }
 
@@ -244,6 +539,11 @@ pub enum Block {
     /// distinct from `Text`: reasoning is shown live for transparency but is
     /// scratch content, never echoed back into subsequent-turn history.
     Reasoning(String),
+    /// Complete canonical assistant message for replay. Native protocol
+    /// decoders emit ordinary delta blocks for live display and exactly one of
+    /// these at completion so ordered parts and opaque provider state reach the
+    /// kernel without being flattened.
+    CompletedMessage(ModelMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,7 +612,21 @@ pub enum TurnResult {
 pub struct CompiledContext {
     pub model: String,
     pub messages: Vec<Message>,
+    /// Exact ordered history when the caller has it. The flat `messages` view
+    /// remains during migration for context engines and existing surfaces.
+    pub ordered: Option<Vec<ModelMessage>>,
     pub tools: Vec<ToolSpec>,
+}
+
+impl CompiledContext {
+    /// Compatibility view used while the kernel and context compiler still
+    /// store flat messages. Protocol adapters can consume ordered parts now,
+    /// without forcing a flag-day rewrite of every existing caller.
+    pub fn ordered_messages(&self) -> Vec<ModelMessage> {
+        self.ordered
+            .clone()
+            .unwrap_or_else(|| self.messages.iter().map(Message::ordered).collect())
+    }
 }
 
 /// How much the agent may do without asking (§4.6 autonomy dial). This only ever

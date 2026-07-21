@@ -1,6 +1,5 @@
 //! File access permission system with live ask-then-persist flow.
 //!
-//! Implements the exact logic from issues.txt:
 //! 1. RESOLVE target path fully before any check
 //! 2. Allow immediately if inside workspace root
 //! 3. Check medha.lock for trusted paths if outside workspace

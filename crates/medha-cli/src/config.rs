@@ -97,20 +97,10 @@ pub struct AgentConfig {
     pub identity: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    pub base_url: String,
-    pub model: String,
-    /// Whether this endpoint needs an API key (local servers usually don't).
-    /// The key itself is in the keychain, never here.
-    #[serde(default)]
-    pub needs_key: bool,
-    /// Context window, captured at setup from `/v1/models` when the server
-    /// reports it. `None` = unknown (never guessed); the budget falls back
-    /// conservatively in that case.
-    #[serde(default)]
-    pub max_ctx: Option<u32>,
-}
+/// Compatibility name for the provider-owned deployment profile. Keeping one
+/// type prevents config, model switching, and the HTTP client from disagreeing
+/// about protocol, authentication, headers, or limits.
+pub type ProviderConfig = providers::ProviderProfile;
 
 /// A display-safe saved model. API keys remain in the OS keychain and are never
 /// included here or serialized into config.toml.
@@ -124,11 +114,10 @@ pub struct ModelProfile {
 /// What the kernel actually runs with, after resolution + secret lookup.
 #[derive(Debug, Clone)]
 pub struct Resolved {
-    pub profile: String,
-    pub base_url: String,
-    pub model: String,
-    pub api_key: String,
-    pub max_ctx: Option<u32>,
+    pub name: String,
+    pub provider: providers::ProviderProfile,
+    /// Resolved from environment/credential storage; never serialized.
+    pub credential: String,
 }
 
 impl Config {
@@ -172,6 +161,7 @@ impl Config {
         make_default: bool,
     ) -> Result<()> {
         self.validate_new_model_name(&name)?;
+        provider.validate().map_err(anyhow::Error::msg)?;
         // The first saved model is implicitly the startup default.
         if make_default || self.models.is_empty() {
             self.default_model = Some(name.clone());
@@ -471,7 +461,7 @@ pub fn resolve(
     cfg: Option<&Config>,
     flag_base_url: Option<String>,
     flag_model: Option<String>,
-) -> Option<Resolved> {
+) -> Result<Option<Resolved>> {
     // An explicit endpoint/model is a one-session override, even if only one
     // half of the connection came from a saved profile. Do not label that as a
     // persisted profile in the TUI — selecting it again must be unambiguous.
@@ -493,10 +483,13 @@ pub fn resolve(
                 "OPENAI_BASE_URL",
             ])
         })
-        .or_else(|| configured.map(|p| p.base_url.clone()))?;
+        .or_else(|| configured.map(|p| p.base_url.clone()));
     let model = flag_model
         .or_else(|| first_env(&["MEDHA_MODEL", "OPENAI_COMPATIBLE_MODEL", "OPENAI_MODEL"]))
-        .or_else(|| configured.map(|p| p.model.clone()))?;
+        .or_else(|| configured.map(|p| p.model.clone()));
+    let (Some(base_url), Some(model)) = (base_url, model) else {
+        return Ok(None);
+    };
 
     // Environment first: besides honoring documented precedence, this avoids
     // touching macOS Keychain at all during `cargo run` development when a
@@ -509,20 +502,162 @@ pub fn resolve(
     let api_key = normalize_api_key(&env_key.or_else(|| load_key(&base_url)).unwrap_or_default());
 
     let max_ctx = first_env(&["MEDHA_MAX_CTX"])
-        .and_then(|s| s.parse().ok())
+        .map(|value| parse_positive_u32("MEDHA_MAX_CTX", &value))
+        .transpose()?
         .or_else(|| configured.and_then(|p| p.max_ctx));
+    let protocol = first_env(&["MEDHA_PROTOCOL"])
+        .map(|value| parse_protocol(&value))
+        .transpose()?
+        .or_else(|| configured.map(|profile| profile.protocol))
+        .unwrap_or_default();
+    let configured_auth = configured.map(|profile| profile.auth).unwrap_or_default();
+    let auth = first_env(&["MEDHA_AUTH"])
+        .map(|value| parse_auth(&value))
+        .transpose()?
+        .unwrap_or_else(|| {
+            if configured_auth.requires_credential() || api_key.is_empty() {
+                configured_auth
+            } else {
+                default_auth(protocol)
+            }
+        });
+    let headers = first_env(&["MEDHA_HEADERS_JSON"])
+        .map(|value| parse_headers(&value))
+        .transpose()?
+        .or_else(|| configured.map(|profile| profile.headers.clone()))
+        .unwrap_or_default();
+    let max_output_tokens = first_env(&["MEDHA_MAX_OUTPUT_TOKENS"])
+        .map(|value| parse_positive_u64("MEDHA_MAX_OUTPUT_TOKENS", &value))
+        .transpose()?
+        .or_else(|| configured.and_then(|profile| profile.max_output_tokens));
+    let token_counter = first_env(&["MEDHA_TOKEN_COUNTER"])
+        .map(|value| parse_token_counter(&value))
+        .transpose()?
+        .or_else(|| configured.map(|profile| profile.token_counter))
+        .unwrap_or_default();
+    let token_accounting = first_env(&["MEDHA_TOKEN_ACCOUNTING"])
+        .map(|value| parse_token_accounting(&value))
+        .transpose()?
+        .or_else(|| configured.map(|profile| profile.token_accounting))
+        .unwrap_or_default();
+    let reasoning = first_env(&["MEDHA_REASONING_SUPPORT"])
+        .map(|value| parse_reasoning_support(&value))
+        .transpose()?
+        .or_else(|| configured.map(|profile| profile.reasoning))
+        .unwrap_or_default();
 
-    Some(Resolved {
-        profile: if has_override {
+    let provider = providers::ProviderProfile {
+        protocol,
+        base_url,
+        model,
+        auth,
+        headers,
+        max_ctx,
+        max_output_tokens,
+        token_counter,
+        token_accounting,
+        reasoning,
+    };
+    provider.validate().map_err(anyhow::Error::msg)?;
+    if provider.auth.requires_credential() && api_key.is_empty() {
+        anyhow::bail!(
+            "model profile requires a credential for '{}' authentication",
+            auth_label(provider.auth)
+        );
+    }
+
+    Ok(Some(Resolved {
+        name: if has_override {
             "override".to_string()
         } else {
             profile.unwrap_or("override").to_string()
         },
-        base_url,
-        model,
-        api_key,
-        max_ctx,
-    })
+        provider,
+        credential: api_key,
+    }))
+}
+
+fn parse_positive_u32(name: &str, value: &str) -> Result<u32> {
+    let parsed = value
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid {name} '{value}'; expected a positive integer"))?;
+    if parsed == 0 {
+        anyhow::bail!("invalid {name} '0'; expected a positive integer");
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_u64(name: &str, value: &str) -> Result<u64> {
+    let parsed = value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("invalid {name} '{value}'; expected a positive integer"))?;
+    if parsed == 0 {
+        anyhow::bail!("invalid {name} '0'; expected a positive integer");
+    }
+    Ok(parsed)
+}
+
+fn parse_protocol(value: &str) -> Result<kernel::Protocol> {
+    value
+        .parse()
+        .map_err(|error: String| anyhow::anyhow!("invalid MEDHA_PROTOCOL: {error}"))
+}
+
+fn parse_auth(value: &str) -> Result<providers::AuthKind> {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "none" | "off" => Ok(providers::AuthKind::None),
+        "bearer" => Ok(providers::AuthKind::Bearer),
+        "x-api-key" | "anthropic" => Ok(providers::AuthKind::XApiKey),
+        "x-goog-api-key" | "google" | "gemini" => Ok(providers::AuthKind::XGoogApiKey),
+        other => anyhow::bail!(
+            "invalid MEDHA_AUTH '{other}'; expected 'none', 'bearer', 'x-api-key', or 'x-goog-api-key'"
+        ),
+    }
+}
+
+fn parse_headers(value: &str) -> Result<BTreeMap<String, String>> {
+    serde_json::from_str(value).with_context(
+        || "invalid MEDHA_HEADERS_JSON; expected a JSON object of non-secret header strings",
+    )
+}
+
+fn default_auth(protocol: kernel::Protocol) -> providers::AuthKind {
+    providers::AuthKind::for_protocol(protocol)
+}
+
+fn auth_label(auth: providers::AuthKind) -> &'static str {
+    auth.as_str()
+}
+
+fn parse_token_counter(value: &str) -> Result<providers::openai_compat::OpenAiTokenCounter> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "vllm" => Ok(providers::openai_compat::OpenAiTokenCounter::Vllm),
+        "none" | "off" => Ok(providers::openai_compat::OpenAiTokenCounter::None),
+        other => anyhow::bail!("invalid MEDHA_TOKEN_COUNTER '{other}'; expected 'none' or 'vllm'"),
+    }
+}
+
+fn parse_token_accounting(value: &str) -> Result<kernel::TokenAccountingMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "strict" => Ok(kernel::TokenAccountingMode::Strict),
+        "adaptive" => Ok(kernel::TokenAccountingMode::Adaptive),
+        other => anyhow::bail!(
+            "invalid MEDHA_TOKEN_ACCOUNTING '{other}'; expected 'adaptive' or 'strict'"
+        ),
+    }
+}
+
+fn parse_reasoning_support(value: &str) -> Result<kernel::ReasoningSupport> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "unknown" | "unverified" => Ok(kernel::ReasoningSupport::Unknown),
+        "unsupported" | "none" | "off" => Ok(kernel::ReasoningSupport::Unsupported),
+        "effort" => Ok(kernel::ReasoningSupport::Effort),
+        other => anyhow::bail!(
+            "invalid MEDHA_REASONING_SUPPORT '{other}'; expected 'unknown', 'unsupported', or 'effort'"
+        ),
+    }
 }
 
 /// Resolve one saved named model for an in-TUI switch. An environment key keeps
@@ -553,17 +688,16 @@ pub(crate) fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) ->
         .model_profile(name)
         .ok_or_else(|| anyhow::anyhow!("no saved model named '{name}'"))?;
     let api_key = normalize_api_key(api_key);
-    if provider.needs_key && api_key.is_empty() {
+    provider.validate().map_err(anyhow::Error::msg)?;
+    if provider.auth.requires_credential() && api_key.is_empty() {
         anyhow::bail!(
-            "model profile '{name}' requires an API key; choose 'Add or update an API key' in /model"
+            "model profile '{name}' requires a credential; choose 'Add or update an API key' in /model"
         );
     }
     Ok(Resolved {
-        profile: name.to_string(),
-        base_url: provider.base_url.clone(),
-        model: provider.model.clone(),
-        api_key,
-        max_ctx: provider.max_ctx,
+        name: name.to_string(),
+        provider: provider.clone(),
+        credential: api_key,
     })
 }
 
@@ -795,10 +929,16 @@ mod tests {
 
     fn provider(model: &str) -> ProviderConfig {
         ProviderConfig {
+            protocol: kernel::Protocol::OpenAiChat,
             base_url: format!("http://{model}.example/v1"),
             model: model.into(),
-            needs_key: false,
+            auth: providers::AuthKind::None,
+            headers: BTreeMap::new(),
             max_ctx: Some(16_384),
+            max_output_tokens: None,
+            token_counter: providers::openai_compat::OpenAiTokenCounter::None,
+            token_accounting: kernel::TokenAccountingMode::Adaptive,
+            reasoning: kernel::ReasoningSupport::Unknown,
         }
     }
 
@@ -889,6 +1029,7 @@ mod tests {
         let (name, p) = cfg.selected_model().expect("migrated profile selected");
         assert_eq!(name, "qwen3-5-397b-a17b");
         assert_eq!(p.model, "Qwen/Qwen3.5-397B-A17B");
+        assert_eq!(p.auth, providers::AuthKind::Bearer);
         assert_eq!(cfg.default_model.as_deref(), Some("qwen3-5-397b-a17b"));
         // The migrated profile is ordinary: removable like any other.
         assert!(cfg.remove_model("qwen3-5-397b-a17b").is_ok());
@@ -975,6 +1116,45 @@ mod tests {
         assert_eq!(normalize_api_key("  Bearer secret  "), "secret");
         assert_eq!(normalize_api_key("bearer secret"), "secret");
         assert_eq!(normalize_api_key("Bearer   "), "");
+    }
+
+    #[test]
+    fn provider_environment_values_are_validated_instead_of_silently_ignored() {
+        assert_eq!(
+            parse_protocol("open-ai-chat").unwrap(),
+            kernel::Protocol::OpenAiChat
+        );
+        assert!(parse_protocol("made-up-protocol").is_err());
+        assert_eq!(
+            parse_auth("x-api-key").unwrap(),
+            providers::AuthKind::XApiKey
+        );
+        assert!(parse_auth("magic-auth").is_err());
+        assert_eq!(
+            parse_headers(r#"{"X-Provider-Version":"2026-01-01"}"#)
+                .unwrap()
+                .get("X-Provider-Version")
+                .map(String::as_str),
+            Some("2026-01-01")
+        );
+        assert!(parse_headers("not-json").is_err());
+        assert_eq!(
+            parse_token_counter("vllm").unwrap(),
+            providers::openai_compat::OpenAiTokenCounter::Vllm
+        );
+        assert!(parse_token_counter("guess").is_err());
+        assert_eq!(
+            parse_token_accounting("strict").unwrap(),
+            kernel::TokenAccountingMode::Strict
+        );
+        assert!(parse_token_accounting("exact-ish").is_err());
+        assert_eq!(
+            parse_reasoning_support("effort").unwrap(),
+            kernel::ReasoningSupport::Effort
+        );
+        assert!(parse_reasoning_support("all-controls").is_err());
+        assert!(parse_positive_u32("MEDHA_MAX_CTX", "0").is_err());
+        assert!(parse_positive_u64("MEDHA_MAX_OUTPUT_TOKENS", "0").is_err());
     }
 
     #[test]

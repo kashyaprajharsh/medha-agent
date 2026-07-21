@@ -13,5 +13,5 @@ pub enum KernelError {
     /// window. Distinct from `Provider` so the loop can respond by compacting
     /// harder and retrying once (P0-6) instead of surfacing a fatal error.
     #[error("provider context-length exceeded")]
-    ContextOverflow,
+    ContextOverflow { reported_limit: Option<u64> },
 }

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+mod markdown;
 mod tty;
 mod update;
 mod view;
@@ -28,20 +29,200 @@ use update::*;
 use view::*;
 
 /// Shared palette for the TUI's visual identity (amber accent + indigo depth).
+/// Runtime, light/dark-adaptive color palette. Colours are read through the
+/// accessor fns (`theme::text()` …) which return slots from the *current*
+/// palette, so a `/theme` switch or startup background-detection re-colours the
+/// whole UI without threading a palette through every render fn. Reads take an
+/// uncontended `RwLock` read (tens of ns) — negligible at a few hundred per frame.
 pub(crate) mod theme {
     use ratatui::style::Color;
-    pub const ACCENT: Color = Color::Rgb(230, 176, 84);
-    pub const TEXT: Color = Color::Rgb(223, 226, 231);
-    pub const DIM: Color = Color::Rgb(124, 132, 144);
-    pub const FAINT: Color = Color::Rgb(78, 85, 96);
-    pub const OK: Color = Color::Rgb(126, 200, 141);
-    pub const ERR: Color = Color::Rgb(232, 122, 122);
-    pub const WARN: Color = Color::Rgb(226, 188, 112);
-    pub const LINENO: Color = Color::Rgb(86, 94, 108);
-    pub const ADD_BG: Color = Color::Rgb(20, 46, 32);
-    pub const DEL_BG: Color = Color::Rgb(52, 26, 30);
-    pub const ADD_FG: Color = Color::Rgb(150, 214, 165);
-    pub const DEL_FG: Color = Color::Rgb(232, 140, 140);
+    use std::sync::RwLock;
+
+    #[derive(Clone, Copy)]
+    pub struct Palette {
+        pub is_dark: bool,
+        /// Canvas background. Dark uses `Reset` (keep the terminal's own bg, so
+        /// transparency/blur survive); light paints an explicit parchment so the
+        /// theme is readable even on a dark terminal (otherwise dark text lands
+        /// on a dark bg — the "light theme looks weird" bug).
+        pub bg: Color,
+        pub accent: Color,
+        pub text: Color,
+        pub dim: Color,
+        pub faint: Color,
+        pub ok: Color,
+        pub err: Color,
+        pub warn: Color,
+        pub lineno: Color,
+        pub add_bg: Color,
+        pub del_bg: Color,
+        pub add_fg: Color,
+        pub del_fg: Color,
+        // Markdown / UI-polish slots.
+        pub code_fg: Color,
+        pub code_bg: Color,
+        pub border: Color,
+        pub link: Color,
+        pub quote: Color,
+        /// syntect theme name used for code-fence highlighting in this mode.
+        pub syntect_theme: &'static str,
+    }
+
+    impl Palette {
+        /// MEDHA dark — "intellect-gold on warm ink". Medha (मेधा) is Sanskrit for
+        /// intellect/wisdom; the identity is a warm gold accent over warm-neutral
+        /// ink, deliberately free of cool/blue tones. This is medha's signature,
+        /// distinct from Claude's rust or generic terminal blues.
+        pub const fn dark() -> Self {
+            Self {
+                is_dark: true,
+                bg: Color::Reset, // keep the terminal's own (possibly transparent) bg
+                accent: Color::Rgb(233, 181, 92), // intellect gold
+                text: Color::Rgb(230, 226, 216),  // warm parchment-white
+                dim: Color::Rgb(150, 142, 126),    // warm grey
+                faint: Color::Rgb(98, 92, 80),
+                ok: Color::Rgb(150, 196, 128),      // sage (warm-leaning green)
+                err: Color::Rgb(226, 120, 100),     // warm terracotta-red
+                warn: Color::Rgb(228, 178, 98),
+                lineno: Color::Rgb(96, 90, 78),
+                add_bg: Color::Rgb(26, 44, 30),
+                del_bg: Color::Rgb(52, 28, 26),
+                add_fg: Color::Rgb(158, 210, 150),
+                del_fg: Color::Rgb(232, 140, 128),
+                code_fg: Color::Rgb(224, 200, 148), // parchment gold
+                code_bg: Color::Rgb(34, 31, 27),     // warm ink
+                border: Color::Rgb(86, 79, 68),      // warm bronze-grey
+                link: Color::Rgb(240, 206, 138),     // knowledge-light (underlined)
+                quote: Color::Rgb(172, 158, 134),
+                syntect_theme: "base16-ocean.dark",
+            }
+        }
+        /// MEDHA light — "ink on parchment". The same warm identity inverted for
+        /// light terminals: deep amber/bronze accent over warm near-black ink.
+        pub const fn light() -> Self {
+            Self {
+                is_dark: false,
+                bg: Color::Rgb(249, 246, 239), // warm parchment — painted explicitly
+                accent: Color::Rgb(160, 106, 18), // deep amber-bronze
+                text: Color::Rgb(43, 38, 30),      // warm near-black ink
+                dim: Color::Rgb(112, 103, 88),
+                faint: Color::Rgb(158, 150, 136),
+                ok: Color::Rgb(52, 120, 58),
+                err: Color::Rgb(188, 58, 42),
+                warn: Color::Rgb(160, 108, 18),
+                lineno: Color::Rgb(158, 150, 136),
+                add_bg: Color::Rgb(224, 244, 226),
+                del_bg: Color::Rgb(250, 226, 222),
+                add_fg: Color::Rgb(34, 108, 52),
+                del_fg: Color::Rgb(176, 46, 38),
+                code_fg: Color::Rgb(122, 82, 16),
+                code_bg: Color::Rgb(243, 237, 224), // parchment
+                border: Color::Rgb(198, 188, 168),
+                link: Color::Rgb(146, 94, 20), // warm bronze (underlined)
+                quote: Color::Rgb(112, 103, 88),
+                syntect_theme: "InspiredGitHub",
+            }
+        }
+    }
+
+    static CURRENT: RwLock<Palette> = RwLock::new(Palette::dark());
+
+    /// Swap the active palette (startup detection / `/theme`). Cheap; next frame
+    /// re-colours from the new slots.
+    pub fn set(p: Palette) {
+        *CURRENT.write().unwrap() = p;
+    }
+    /// Snapshot the whole palette — use when reading several slots at once
+    /// (e.g. the markdown renderer) to take one lock instead of many.
+    pub fn current() -> Palette {
+        *CURRENT.read().unwrap()
+    }
+
+    /// Pick a palette from the environment at startup. Precedence:
+    /// `MEDHA_THEME=light|dark|auto` (explicit) → the terminal's `COLORFGBG`
+    /// background hint → dark. Detection is best-effort and safe: an unknown
+    /// terminal simply keeps the dark default, and `/theme` always overrides.
+    pub fn detect() -> Palette {
+        if let Ok(v) = std::env::var("MEDHA_THEME") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "light" => return Palette::light(),
+                "dark" => return Palette::dark(),
+                _ => {} // "auto"/anything else falls through to detection
+            }
+        }
+        // COLORFGBG is "fg;bg" (occasionally "fg;def;bg"). The final field is the
+        // background palette index; 7 (light grey) and 15 (white) are the standard
+        // light-background signals — everything else is treated as dark.
+        if let Ok(cfb) = std::env::var("COLORFGBG") {
+            if let Some(bg) = cfb
+                .rsplit(';')
+                .next()
+                .and_then(|s| s.trim().parse::<u8>().ok())
+            {
+                return if matches!(bg, 7 | 15) {
+                    Palette::light()
+                } else {
+                    Palette::dark()
+                };
+            }
+        }
+        Palette::dark()
+    }
+
+    pub fn bg() -> Color {
+        CURRENT.read().unwrap().bg
+    }
+    pub fn accent() -> Color {
+        CURRENT.read().unwrap().accent
+    }
+    pub fn text() -> Color {
+        CURRENT.read().unwrap().text
+    }
+    pub fn dim() -> Color {
+        CURRENT.read().unwrap().dim
+    }
+    pub fn faint() -> Color {
+        CURRENT.read().unwrap().faint
+    }
+    pub fn ok() -> Color {
+        CURRENT.read().unwrap().ok
+    }
+    pub fn err() -> Color {
+        CURRENT.read().unwrap().err
+    }
+    pub fn warn() -> Color {
+        CURRENT.read().unwrap().warn
+    }
+    pub fn lineno() -> Color {
+        CURRENT.read().unwrap().lineno
+    }
+    pub fn add_bg() -> Color {
+        CURRENT.read().unwrap().add_bg
+    }
+    pub fn del_bg() -> Color {
+        CURRENT.read().unwrap().del_bg
+    }
+    pub fn add_fg() -> Color {
+        CURRENT.read().unwrap().add_fg
+    }
+    pub fn del_fg() -> Color {
+        CURRENT.read().unwrap().del_fg
+    }
+    pub fn code_fg() -> Color {
+        CURRENT.read().unwrap().code_fg
+    }
+    pub fn code_bg() -> Color {
+        CURRENT.read().unwrap().code_bg
+    }
+    pub fn border() -> Color {
+        CURRENT.read().unwrap().border
+    }
+    pub fn link() -> Color {
+        CURRENT.read().unwrap().link
+    }
+    pub fn quote() -> Color {
+        CURRENT.read().unwrap().quote
+    }
 }
 
 /// Maximum lines to keep in scrollback buffer
@@ -79,13 +260,17 @@ const COMMANDS: &[(&str, &str)] = &[
         "autonomy: how much runs without asking (careful · normal · yolo)",
     ),
     ("/detail", "expand/collapse full tool input & output"),
+    ("/theme", "light · dark · auto (bare /theme toggles)"),
     ("/resume", "switch to a past session"),
     (
         "/rewind",
         "time-travel: branch from an earlier turn (undoes later edits)",
     ),
     ("/tasks", "list background shell tasks (running/finished)"),
-    ("/memory", "list memories · /memory <name> jumps to provenance"),
+    (
+        "/memory",
+        "list memories · /memory <name> jumps to provenance",
+    ),
     (
         "/skill",
         "skill hub — use a skill, or add one (search / paste a link)  ·  /skill <name> to load",
@@ -98,17 +283,13 @@ const COMMANDS: &[(&str, &str)] = &[
 /// saved profile between turns. The kernel remains provider-neutral; this small
 /// surface exists only because the TUI owns the explicit user action.
 pub(crate) trait ProfileProvider: Provider {
-    fn switch_profile(&self, profile: &config::Resolved);
+    fn switch_profile(&self, profile: &config::Resolved) -> Result<(), String>;
 }
 
 impl ProfileProvider for providers::OpenAiCompat {
-    fn switch_profile(&self, profile: &config::Resolved) {
-        self.switch_connection_with_context(
-            profile.base_url.clone(),
-            profile.api_key.clone(),
-            profile.model.clone(),
-            profile.max_ctx,
-        );
+    fn switch_profile(&self, profile: &config::Resolved) -> Result<(), String> {
+        self.switch_provider_profile(profile.provider.clone(), profile.credential.clone())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -124,8 +305,14 @@ const HIDDEN_COMMANDS: &[&str] = &["/think", "/thinking", "/effort", "/skills"];
 /// palette entries — discoverable in a menu instead of cluttering autocomplete.
 /// The typed forms still work for power users.
 pub(super) const SKILL_HUB_ACTIONS: &[(&str, &str)] = &[
-    ("➕ Add a skill…      search the catalog, or paste a GitHub link", "add"),
-    ("⚙  Manage skills…    updates · sources · lock / sync", "manage"),
+    (
+        "➕ Add a skill…      search the catalog, or paste a GitHub link",
+        "add",
+    ),
+    (
+        "⚙  Manage skills…    updates · sources · lock / sync",
+        "manage",
+    ),
 ];
 
 /// The Manage sub-menu, reached from the hub's "Manage skills…" row. Keeps the
@@ -152,9 +339,7 @@ fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
 /// this" — is chat for the model, not an "unknown command" error.
 fn is_slash_command(line: &str) -> bool {
     match line.split_whitespace().next() {
-        Some(tok) => {
-            COMMANDS.iter().any(|(c, _)| *c == tok) || HIDDEN_COMMANDS.contains(&tok)
-        }
+        Some(tok) => COMMANDS.iter().any(|(c, _)| *c == tok) || HIDDEN_COMMANDS.contains(&tok),
         None => false,
     }
 }
@@ -404,17 +589,6 @@ struct Entry {
     item: Item,
     lines: Option<Vec<Line<'static>>>,
     height: usize,
-    /// K15: streaming-assistant cache — the rendered+wrapped rows of the text
-    /// prefix up to the last '\n', which per-line rendering guarantees can
-    /// never change as more deltas append. Only the tail line re-renders per
-    /// frame (previously the whole message did: quadratic over the stream).
-    stream_cache: Option<StreamCache>,
-}
-
-struct StreamCache {
-    prefix_bytes: usize,
-    width: u16,
-    rows: Vec<Line<'static>>,
 }
 
 impl Entry {
@@ -423,7 +597,6 @@ impl Entry {
             item,
             lines: None,
             height: 0,
-            stream_cache: None,
         }
     }
     fn invalidate(&mut self) {
@@ -433,36 +606,14 @@ impl Entry {
     /// stored line = one screen row). Runs once; reused until invalidated. `height`
     /// is the exact row count — no separate wrap measurement, so scroll math and
     /// the rendered slice can never drift.
+    ///
+    /// Assistant markdown is rendered whole (not per-line): tables and code fences
+    /// span multiple lines, so an earlier line's rendering depends on later
+    /// content — prefix caching would corrupt them. The render only runs on change
+    /// (when `lines` is invalidated by a stream delta) and is throttled to the
+    /// redraw interval, so a growing message re-renders at most once per frame.
     fn ensure(&mut self, cx: &RenderCtx<'_>, width: u16) {
         if self.lines.is_some() {
-            return;
-        }
-        // Incremental path for streaming assistant text (K15): render_assistant
-        // is strictly per-line (no cross-line state), so rows for the prefix up
-        // to the last newline are stable and cached; only the tail re-renders.
-        if let Item::Assistant(s) = &self.item {
-            let split = s.rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let reuse = self
-                .stream_cache
-                .as_ref()
-                .is_some_and(|c| c.prefix_bytes == split && c.width == width);
-            if !reuse {
-                let mut rows: Vec<Line<'static>> = Vec::new();
-                for logical in view::render_assistant(&s[..split]) {
-                    rows.extend(wrap_line(&logical, width as usize));
-                }
-                self.stream_cache = Some(StreamCache {
-                    prefix_bytes: split,
-                    width,
-                    rows,
-                });
-            }
-            let mut rows = self.stream_cache.as_ref().unwrap().rows.clone();
-            for logical in view::render_assistant(&s[split..]) {
-                rows.extend(wrap_line(&logical, width as usize));
-            }
-            self.height = rows.len();
-            self.lines = Some(rows);
             return;
         }
         let mut rows: Vec<Line<'static>> = Vec::new();
@@ -626,6 +777,7 @@ struct ReasoningPanelState {
     enabled: Option<bool>,
     show: bool,
     effort: Option<kernel::ReasoningEffort>,
+    support: kernel::ReasoningSupport,
     last_turn_received: Option<bool>,
 }
 
@@ -635,6 +787,7 @@ impl ReasoningPanelState {
             enabled: model.reasoning.enabled,
             show: model.show_thinking,
             effort: model.reasoning.effort,
+            support: model.reasoning_support,
             last_turn_received: model.last_turn_reasoning_received,
         }
     }
@@ -653,6 +806,7 @@ impl ReasoningPanelState {
 
     fn effort_label(&self) -> &'static str {
         match self.effort {
+            Some(kernel::ReasoningEffort::Minimal) => "Minimal",
             Some(kernel::ReasoningEffort::Low) => "Low",
             Some(kernel::ReasoningEffort::Medium) => "Medium",
             Some(kernel::ReasoningEffort::High) => "High",
@@ -673,16 +827,18 @@ impl ReasoningPanelState {
             format!("Mode:       {}", self.mode_label()),
             format!("Visibility: {}", self.visibility_label()),
             format!("Effort:     {}", self.effort_label()),
+            format!("Support:    {}", self.support.as_str()),
             format!("Last turn:  {}", self.last_turn_label()),
         ]
     }
 
     fn status_block(&self) -> String {
         format!(
-            "reasoning\n  Mode:       {}\n  Visibility: {}\n  Effort:     {}\n  Last turn:  {}",
+            "reasoning\n  Mode:       {}\n  Visibility: {}\n  Effort:     {}\n  Support:    {}\n  Last turn:  {}",
             self.mode_label(),
             self.visibility_label(),
             self.effort_label(),
+            self.support.as_str(),
             self.last_turn_label()
         )
     }
@@ -707,6 +863,9 @@ enum PickerKind {
     /// Destructive user-skill removal always gets explicit confirmation.
     RemoveSkill(String),
     /// Provider presets shared with first-run setup, followed by Custom.
+    ModelProtocol,
+    /// OpenAI-compatible deployment presets shared with first-run setup,
+    /// followed by Custom.
     ProviderPreset,
     /// Models the endpoint reported during setup — pick one instead of typing
     /// an id blind. A trailing row keeps manual entry available.
@@ -744,7 +903,18 @@ enum PickerKind {
     /// `(repo, path, removable)`; built-ins are shown but not removable. Rows are
     /// an "Add a source…" row, one per source, then "Back".
     SkillSources(Vec<(String, String, bool)>),
+    /// `/theme`: pick the colour theme. Rows are [`THEME_MODES`]; choosing one
+    /// re-colours the UI live for the session.
+    Theme,
 }
+
+/// The colour themes offered by the `/theme` picker. `id` drives the switch;
+/// the description is shown verbatim in the menu. Order: dark, light, auto.
+pub(super) const THEME_MODES: &[(&str, &str)] = &[
+    ("dark", "Dark — intellect-gold on warm ink"),
+    ("light", "Light — ink on parchment"),
+    ("auto", "Auto — match the terminal background"),
+];
 
 /// The autonomy levels offered by the `/mode` picker, with self-explanatory
 /// descriptions (the picker shows these verbatim). Order = increasing autonomy.
@@ -801,7 +971,8 @@ impl PickerKind {
                 )
             }
             PickerKind::Memory(_) => {
-                " memory — ↑↓ select · Enter provenance · p pin/unpin · f forget · Esc cancel ".into()
+                " memory — ↑↓ select · Enter provenance · p pin/unpin · f forget · Esc cancel "
+                    .into()
             }
             PickerKind::Skill(_) => " skill hub — ↑↓ select · Enter · Esc cancel ".into(),
             PickerKind::RemoveSkill(name) => {
@@ -809,6 +980,9 @@ impl PickerKind {
             }
             PickerKind::ProviderPreset => {
                 " choose provider — ↑↓ move · Enter/→ continue · Esc/← back ".into()
+            }
+            PickerKind::ModelProtocol => {
+                " choose model protocol — ↑↓ move · Enter/→ continue · Esc/← back ".into()
             }
             PickerKind::ModelDiscovery(_) => {
                 " choose a model — ↑↓ move · Enter/→ select · Esc/← back ".into()
@@ -832,9 +1006,10 @@ impl PickerKind {
                 " web search — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
             }
             PickerKind::SkillSearch(_) => " add a skill — ↑↓ select · Enter · Esc back ".into(),
-        PickerKind::SkillManage => " manage skills — ↑↓ select · Enter · Esc back ".into(),
-        PickerKind::SkillSources(_) => " skill sources — ↑↓ · Enter · Esc back ".into(),
-        PickerKind::AutonomyMode => {
+            PickerKind::SkillManage => " manage skills — ↑↓ select · Enter · Esc back ".into(),
+            PickerKind::SkillSources(_) => " skill sources — ↑↓ · Enter · Esc back ".into(),
+            PickerKind::Theme => " theme — ↑↓ select · Enter apply · Esc done ".into(),
+            PickerKind::AutonomyMode => {
                 " autonomy — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
             }
         }
@@ -905,6 +1080,12 @@ impl PickerKind {
             PickerKind::RemoveSkill(_) => {
                 vec!["Keep skill".to_string(), "Remove user skill".to_string()]
             }
+            PickerKind::ModelProtocol => vec![
+                "OpenAI-compatible Chat — available".into(),
+                "OpenAI Responses — planned (Stage 6)".into(),
+                "Gemini Interactions v1 — available".into(),
+                "Anthropic Messages — planned (Stage 5)".into(),
+            ],
             PickerKind::ProviderPreset => config::provider_presets()
                 .iter()
                 .enumerate()
@@ -945,8 +1126,14 @@ impl PickerKind {
                             .map(|n| format!(" · {n} ctx"))
                             .unwrap_or_default();
                         format!(
-                            "{}{} — {} · {}{}{}",
-                            mark, p.name, p.provider.model, p.provider.base_url, ctx, startup
+                            "{}{} — {} · {} · {}{}{}",
+                            mark,
+                            p.name,
+                            p.provider.model,
+                            p.provider.protocol.as_str(),
+                            p.provider.base_url,
+                            ctx,
+                            startup
                         )
                     })
                     .chain(
@@ -993,6 +1180,10 @@ impl PickerKind {
                 .map(|(_, desc)| (*desc).to_string())
                 .collect(),
             PickerKind::AutonomyMode => AUTONOMY_MODES
+                .iter()
+                .map(|(_, desc)| (*desc).to_string())
+                .collect(),
+            PickerKind::Theme => THEME_MODES
                 .iter()
                 .map(|(_, desc)| (*desc).to_string())
                 .collect(),
@@ -1051,6 +1242,7 @@ enum ModelSetupStep {
 struct ModelSetup {
     mode: ModelSetupMode,
     step: ModelSetupStep,
+    protocol: kernel::Protocol,
     base_url: String,
     api_key: String,
     model: String,
@@ -1068,6 +1260,7 @@ impl ModelSetup {
         Self {
             mode: ModelSetupMode::Add,
             step: ModelSetupStep::BaseUrl,
+            protocol: kernel::Protocol::OpenAiChat,
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
@@ -1075,10 +1268,11 @@ impl ModelSetup {
         }
     }
 
-    fn update_key(profile: String, base_url: String) -> Self {
+    fn update_key(profile: String, protocol: kernel::Protocol, base_url: String) -> Self {
         Self {
             mode: ModelSetupMode::UpdateKey { profile },
             step: ModelSetupStep::ApiKey,
+            protocol,
             base_url,
             api_key: String::new(),
             model: String::new(),
@@ -1088,10 +1282,19 @@ impl ModelSetup {
 
     fn prompt(&self) -> &'static str {
         match self.step {
-            ModelSetupStep::BaseUrl => {
-                "OpenAI-compatible base URL (for example http://localhost:11434/v1):"
-            }
+            ModelSetupStep::BaseUrl => match self.protocol {
+                kernel::Protocol::OpenAiChat => {
+                    "OpenAI-compatible base URL (for example http://localhost:11434/v1):"
+                }
+                kernel::Protocol::GeminiInteractions => {
+                    "Gemini Interactions v1 base URL (normally https://generativelanguage.googleapis.com/v1):"
+                }
+                _ => "Provider base URL:",
+            },
             ModelSetupStep::ApiKey => match &self.mode {
+                ModelSetupMode::Add if self.protocol == kernel::Protocol::GeminiInteractions => {
+                    "Gemini API key (required; stored securely, never in config.toml):"
+                }
                 ModelSetupMode::Add => {
                     "API key (leave blank for a local server; stored securely, never in config.toml):"
                 }
@@ -1214,6 +1417,9 @@ struct Model {
     cost_usd: Option<(f64, bool)>,
     /// Model name
     model: String,
+    /// Active wire contract. Kept distinct from the provider/model label so a
+    /// saved profile never hides which API shape is actually in use.
+    protocol: kernel::Protocol,
     /// Max context
     max_ctx: Option<u32>,
     /// The saved profile currently active for this session. This is distinct
@@ -1263,6 +1469,8 @@ struct Model {
     auto_approve: std::collections::HashSet<String>,
     /// Current reasoning config
     reasoning: kernel::ReasoningConfig,
+    /// Model/profile-level control support; unknown stays visibly unverified.
+    reasoning_support: kernel::ReasoningSupport,
     /// SSE streaming on/off (mirrors the provider; shown in the status bar).
     streaming: bool,
     /// Whether any reasoning delta arrived during the active turn.
@@ -1344,6 +1552,7 @@ impl Model {
             ctx_pct: None,
             cost_usd: None,
             model,
+            protocol: kernel::Protocol::OpenAiChat,
             max_ctx,
             active_profile: String::new(),
             model_config: Arc::new(Mutex::new(config::Config::default())),
@@ -1361,6 +1570,7 @@ impl Model {
             approval_sel: 0,
             auto_approve: std::collections::HashSet::new(),
             reasoning,
+            reasoning_support: kernel::ReasoningSupport::Unknown,
             streaming: true,
             reasoning_received_this_turn: false,
             last_turn_reasoning_received: None,
@@ -1421,6 +1631,16 @@ impl Model {
     ) -> Self {
         self.model_config = profiles;
         self.active_profile = active_profile;
+        self
+    }
+
+    fn with_protocol(mut self, protocol: kernel::Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    fn with_reasoning_support(mut self, support: kernel::ReasoningSupport) -> Self {
+        self.reasoning_support = support;
         self
     }
 
@@ -1789,6 +2009,9 @@ where
             )
         })
         .collect();
+    // Adapt colours to the terminal background before the first frame so light
+    // terminals aren't stuck with an invisible dark palette. `/theme` overrides.
+    theme::set(theme::detect());
     let mut model = Model::new(
         model_name,
         max_ctx,
@@ -1797,6 +2020,8 @@ where
         tool_viz,
         restore,
     )
+    .with_protocol(kernel.provider.protocol())
+    .with_reasoning_support(kernel.provider.reasoning_support())
     .with_skills(skill_store, known_tools)
     .with_memory(
         memory_store,
@@ -2129,7 +2354,7 @@ mod tests {
 
     #[test]
     fn wrap_line_hard_wraps_long_run_and_preserves_text() {
-        let line = Line::from(Span::styled("abcdefghij", Style::default().fg(theme::TEXT)));
+        let line = Line::from(Span::styled("abcdefghij", Style::default().fg(theme::text())));
         let rows = wrap_line(&line, 4);
         assert_eq!(rows.len(), 3, "10 chars / width 4 = 3 rows");
         let joined: String = rows

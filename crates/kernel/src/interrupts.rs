@@ -54,7 +54,13 @@ impl InterruptQueue {
     pub fn pair() -> (InterruptHandle, InterruptQueue) {
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
-        (InterruptHandle { tx, cancel: cancel.clone() }, InterruptQueue { rx, cancel })
+        (
+            InterruptHandle {
+                tx,
+                cancel: cancel.clone(),
+            },
+            InterruptQueue { rx, cancel },
+        )
     }
 
     /// Token the loop selects on; clone freely into tool waits.
@@ -89,12 +95,19 @@ mod tests {
         handle.steer("first");
         handle.steer("second");
         assert!(!queue.cancel_requested());
-        assert_eq!(queue.drain_steers(), vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(
+            queue.drain_steers(),
+            vec!["first".to_string(), "second".to_string()]
+        );
         assert!(queue.drain_steers().is_empty(), "drained once, gone");
 
         handle.steer("late");
         handle.cancel_turn();
         assert!(queue.cancel_requested(), "cancel_turn trips the token");
-        assert_eq!(queue.drain_steers(), vec!["late".to_string()], "cancel entries carry no text");
+        assert_eq!(
+            queue.drain_steers(),
+            vec!["late".to_string()],
+            "cancel entries carry no text"
+        );
     }
 }

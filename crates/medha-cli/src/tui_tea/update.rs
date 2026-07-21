@@ -144,7 +144,9 @@ fn handle_model_setup_key<P: ProfileProvider>(
     // the generic picker handler own navigation while the draft remains alive.
     if matches!(
         model.picker.as_ref().map(|p| &p.kind),
-        Some(PickerKind::ProviderPreset) | Some(PickerKind::ModelDiscovery(_))
+        Some(PickerKind::ModelProtocol)
+            | Some(PickerKind::ProviderPreset)
+            | Some(PickerKind::ModelDiscovery(_))
     ) {
         return false;
     }
@@ -328,10 +330,11 @@ fn commit_search(model: &mut Model, provider: tools::SearchProvider, searxng_url
 /// Open the add-model form without pushing a transcript notice. First-run uses
 /// this so the welcome identity screen stays visible behind the form.
 pub(super) fn open_model_setup_quiet(model: &mut Model) {
-    // Provider choice is the first visible step. Custom continues into the
-    // base-URL input; presets already supply it.
+    // Protocol is explicit and saved. Only adapters available in this build
+    // can continue; planned native routes remain visible without creating an
+    // unusable profile.
     model.model_setup = Some(ModelSetup::new());
-    model.picker = Some(Picker::new(PickerKind::ProviderPreset));
+    model.picker = Some(Picker::new(PickerKind::ModelProtocol));
     model.input.clear();
     model.cursor = 0;
 }
@@ -343,6 +346,7 @@ fn begin_model_key_update(model: &mut Model, profile: config::ModelProfile) {
     }
     model.model_setup = Some(ModelSetup::update_key(
         profile.name.clone(),
+        profile.provider.protocol,
         profile.provider.base_url,
     ));
     model.input.clear();
@@ -390,7 +394,9 @@ fn advance_model_setup<P: ProfileProvider>(
                 let resolved: Result<config::Resolved, String> = match model.model_config.lock() {
                     Ok(mut cfg) => {
                         if let Some(saved) = cfg.models.get_mut(&profile) {
-                            saved.needs_key = true;
+                            if !saved.auth.requires_credential() {
+                                saved.auth = providers::AuthKind::for_protocol(saved.protocol);
+                            }
                         }
                         config::save(&cfg)
                             .map_err(|e| format!("could not write config: {e}"))
@@ -406,11 +412,16 @@ fn advance_model_setup<P: ProfileProvider>(
                         let activate =
                             model.active_profile == profile || model.active_profile == "override";
                         if activate {
-                            provider.switch_profile(&resolved);
-                            model.model = resolved.model;
-                            model.max_ctx = resolved.max_ctx;
+                            if let Err(error) = provider.switch_profile(&resolved) {
+                                model.push_notice(format!("could not switch model: {error}"));
+                                return;
+                            }
+                            model.model = resolved.provider.model;
+                            model.protocol = resolved.provider.protocol;
+                            model.reasoning_support = resolved.provider.reasoning;
+                            model.max_ctx = resolved.provider.max_ctx;
                             model.ctx_pct = None;
-                            model.active_profile = resolved.profile;
+                            model.active_profile = resolved.name;
                         }
                         model.push_notice(if activate {
                             format!("✔ API key updated; switched to '{profile}'")
@@ -422,17 +433,32 @@ fn advance_model_setup<P: ProfileProvider>(
                 }
                 return;
             }
+            if setup.protocol == kernel::Protocol::GeminiInteractions && value.is_empty() {
+                model.push_notice("a Gemini API key is required");
+                return;
+            }
             setup.api_key = value;
             setup.step = ModelSetupStep::Discovering;
             // Ask the endpoint what it serves — picking from a live list beats
             // typing a model id blind (and typos in ids are the #1 setup bug).
             let base_url = setup.base_url.clone();
             let api_key = setup.api_key.clone();
+            let protocol = setup.protocol;
             let tx = tx.clone();
             tokio::spawn(async move {
-                let result = providers::openai_compat::list_models(&base_url, &api_key)
+                let mut profile = providers::ProviderProfile::openai_chat(
+                    &base_url,
+                    "model-discovery",
+                    if api_key.is_empty() {
+                        providers::AuthKind::None
+                    } else {
+                        providers::AuthKind::for_protocol(protocol)
+                    },
+                );
+                profile.protocol = protocol;
+                let result = providers::openai_compat::list_models_for_profile(&profile, &api_key)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|error| error.to_string());
                 let _ = tx.send(TuiEvent::ModelsDiscovered { base_url, result });
             });
         }
@@ -505,10 +531,20 @@ fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
         return;
     };
     let profile = config::ProviderConfig {
+        protocol: completed.protocol,
         base_url: completed.base_url.clone(),
         model: completed.model.clone(),
-        needs_key: !completed.api_key.is_empty(),
+        auth: if completed.api_key.is_empty() {
+            providers::AuthKind::None
+        } else {
+            providers::AuthKind::for_protocol(completed.protocol)
+        },
+        headers: std::collections::BTreeMap::new(),
         max_ctx: completed.max_ctx,
+        max_output_tokens: None,
+        token_counter: providers::openai_compat::OpenAiTokenCounter::None,
+        token_accounting: kernel::TokenAccountingMode::Adaptive,
+        reasoning: kernel::ReasoningSupport::Unknown,
     };
     if !completed.api_key.is_empty() {
         if let Err(e) = config::store_key(&completed.base_url, &completed.api_key) {
@@ -538,11 +574,16 @@ fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
     };
     match saved {
         Ok((name, resolved)) => {
-            provider.switch_profile(&resolved);
-            model.model = resolved.model;
-            model.max_ctx = resolved.max_ctx;
+            if let Err(error) = provider.switch_profile(&resolved) {
+                model.push_notice(format!("saved '{name}' but could not switch: {error}"));
+                return;
+            }
+            model.model = resolved.provider.model;
+            model.protocol = resolved.provider.protocol;
+            model.reasoning_support = resolved.provider.reasoning;
+            model.max_ctx = resolved.provider.max_ctx;
             model.ctx_pct = None;
-            model.active_profile = resolved.profile;
+            model.active_profile = resolved.name;
             model.push_notice(format!("✔ saved '{name}' and switched to it"));
         }
         Err(e) => model.push_notice(e),
@@ -646,6 +687,33 @@ pub(super) fn handle_key<P, L>(
             // → mirrors Enter and ← mirrors Esc, so the pickers navigate like
             // a nested menu: right descends, left backs out one level.
             KeyCode::Enter | KeyCode::Right => {
+                if matches!(picker.kind, PickerKind::ModelProtocol) {
+                    let selected = picker.selected;
+                    match selected {
+                        0 => {
+                            if let Some(setup) = model.model_setup.as_mut() {
+                                setup.protocol = kernel::Protocol::OpenAiChat;
+                            }
+                            model.picker = Some(Picker::new(PickerKind::ProviderPreset));
+                        }
+                        2 => {
+                            model.picker = None;
+                            if let Some(setup) = model.model_setup.as_mut() {
+                                setup.protocol = kernel::Protocol::GeminiInteractions;
+                                setup.base_url =
+                                    "https://generativelanguage.googleapis.com/v1".into();
+                                setup.step = ModelSetupStep::ApiKey;
+                            }
+                            model.push_notice(
+                                "Gemini Interactions v1 — enter the Gemini API key",
+                            );
+                        }
+                        _ => model.push_notice(
+                            "that native protocol is shown for roadmap clarity but its adapter is not implemented yet",
+                        ),
+                    }
+                    return;
+                }
                 if matches!(picker.kind, PickerKind::ProviderPreset) {
                     let selected = picker.selected;
                     let presets = config::provider_presets();
@@ -670,6 +738,15 @@ pub(super) fn handle_key<P, L>(
                     model.picker = None;
                     if let Some((level, _)) = AUTONOMY_MODES.get(selected).copied() {
                         set_autonomy(model, level);
+                    }
+                    return;
+                }
+                // `/theme`: a theme was chosen — apply it live and close.
+                if matches!(picker.kind, PickerKind::Theme) {
+                    let selected = picker.selected;
+                    model.picker = None;
+                    if let Some((id, _)) = THEME_MODES.get(selected).copied() {
+                        set_theme(model, id);
                     }
                     return;
                 }
@@ -794,7 +871,9 @@ pub(super) fn handle_key<P, L>(
                     let sel = picker.selected;
                     let n_actions = SKILL_HUB_ACTIONS.len();
                     let action = (sel < n_actions).then(|| SKILL_HUB_ACTIONS[sel].1);
-                    let skill_name = skills.get(sel.wrapping_sub(n_actions)).map(|(n, _)| n.clone());
+                    let skill_name = skills
+                        .get(sel.wrapping_sub(n_actions))
+                        .map(|(n, _)| n.clone());
                     model.picker = None;
                     match action {
                         // "Add a skill" immediately opens the scrollable catalog
@@ -971,7 +1050,9 @@ pub(super) fn handle_key<P, L>(
             KeyCode::Esc | KeyCode::Left => {
                 if matches!(
                     picker.kind,
-                    PickerKind::ProviderPreset | PickerKind::ModelDiscovery(_)
+                    PickerKind::ModelProtocol
+                        | PickerKind::ProviderPreset
+                        | PickerKind::ModelDiscovery(_)
                 ) {
                     // Back out of "add model" to the model menu, not to nothing —
                     // ← behaves like a menu's back button. On a fresh install
@@ -1316,21 +1397,25 @@ pub(super) fn handle_clarify_key(model: &mut Model, key: KeyEvent) {
                 open_other(model);
             }
         }
-        // Enter submits ALL answers — except on the Other row, where it opens the
-        // editor (so you can type your own answer there).
+        // Enter proceeds: advance to the next question, or submit from the last.
+        // On a radio option it first selects the focused row. Enter never opens
+        // the Other editor (Space does) — so it's never a dead end on the Other
+        // row of a multi-question form.
         KeyCode::Enter => {
-            if cursor == other_row {
-                open_other(model);
-            } else {
-                // For radio questions, Enter means "choose the focused row and
-                // submit". This keeps the visible focus and committed answer in
-                // sync even when the model recommended a different option.
-                if !multi {
-                    if let Some(s) = model.clarify.as_mut() {
-                        toggle_option(s, cursor, false);
-                        s.validation = None;
-                    }
+            if !multi && cursor < other_row {
+                if let Some(s) = model.clarify.as_mut() {
+                    toggle_option(s, cursor, false);
+                    s.validation = None;
                 }
+            }
+            let (idx, last) = model
+                .clarify
+                .as_ref()
+                .map(|s| (s.idx, s.questions.len().saturating_sub(1)))
+                .unwrap_or((0, 0));
+            if idx < last {
+                switch_question(model, 1);
+            } else {
                 submit_clarify(model);
             }
         }
@@ -2168,7 +2253,9 @@ fn apply_tui_memory_op<P, L>(
     let _ = tx;
     tokio::spawn(async move {
         if let Ok(payload) = serde_json::to_value(&event_op) {
-            let _ = log.append(kernel::Event::memory_write(&session, payload)).await;
+            let _ = log
+                .append(kernel::Event::memory_write(&session, payload))
+                .await;
         }
     });
     let _ = store.apply(&op);
@@ -2208,11 +2295,7 @@ fn spawn_memory_provenance<L: EventLog + 'static>(
     });
 }
 
-fn refresh_branch_memory(
-    model: &Model,
-    system: &mut Message,
-    events: Vec<kernel::Event>,
-) {
+fn refresh_branch_memory(model: &Model, system: &mut Message, events: Vec<kernel::Event>) {
     let Some(store) = model.memory.as_ref().filter(|_| model.memory_enabled) else {
         return;
     };
@@ -2351,7 +2434,12 @@ fn spawn_rewind<L: EventLog + 'static>(
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
             let memory_events = log.events(new_id).await;
-            (Some(new_id), kernel::project_messages(&events[..idx]), memory_events, prefill)
+            (
+                Some(new_id),
+                kernel::project_messages(&events[..idx]),
+                memory_events,
+                prefill,
+            )
         } else {
             (None, Vec::new(), Vec::new(), None)
         };
@@ -2510,8 +2598,26 @@ fn is_cmd_boundary(rest: &str) -> bool {
     rest.is_empty() || rest.starts_with(char::is_whitespace)
 }
 
-/// The unified reasoning panel has three editable rows. The fourth row reports
-/// delivery for the previous turn and is deliberately not selectable.
+/// The unified reasoning panel has three editable rows. Capability and prior
+/// delivery are report-only rows and are deliberately not selectable.
+fn set_reasoning_checked<P: kernel::Provider>(
+    model: &mut Model,
+    provider: &P,
+    config: kernel::ReasoningConfig,
+) -> Result<(), String> {
+    provider
+        .set_reasoning(config.clone())
+        .map_err(|error| error.to_string())?;
+    model.reasoning = provider.reasoning();
+    model.reasoning_support = provider.reasoning_support();
+    if config.effort.is_some() && model.reasoning_support == kernel::ReasoningSupport::Unknown {
+        model.push_notice(
+            "reasoning effort requested; this profile marks model support as unverified",
+        );
+    }
+    Ok(())
+}
+
 fn handle_reasoning_picker_key<P: kernel::Provider>(
     model: &mut Model,
     key: KeyEvent,
@@ -2541,11 +2647,16 @@ fn handle_reasoning_picker_key<P: kernel::Provider>(
                 0 => {
                     let cfg = provider.reasoning();
                     let enabled = cfg.enabled != Some(true);
-                    provider.set_reasoning(kernel::ReasoningConfig {
-                        enabled: Some(enabled),
-                        effort: if enabled { cfg.effort } else { None },
-                    });
-                    model.reasoning = provider.reasoning();
+                    if let Err(error) = set_reasoning_checked(
+                        model,
+                        provider,
+                        kernel::ReasoningConfig {
+                            enabled: Some(enabled),
+                            effort: if enabled { cfg.effort } else { None },
+                        },
+                    ) {
+                        model.push_notice(format!("reasoning unchanged: {error}"));
+                    }
                 }
                 1 => {
                     model.show_thinking = !model.show_thinking;
@@ -2554,18 +2665,26 @@ fn handle_reasoning_picker_key<P: kernel::Provider>(
                 2 => {
                     let cfg = provider.reasoning();
                     let effort = match cfg.effort {
-                        None => Some(kernel::ReasoningEffort::Low),
+                        None => Some(kernel::ReasoningEffort::Minimal),
+                        Some(kernel::ReasoningEffort::Minimal) => {
+                            Some(kernel::ReasoningEffort::Low)
+                        }
                         Some(kernel::ReasoningEffort::Low) => Some(kernel::ReasoningEffort::Medium),
                         Some(kernel::ReasoningEffort::Medium) => {
                             Some(kernel::ReasoningEffort::High)
                         }
                         Some(kernel::ReasoningEffort::High) => None,
                     };
-                    provider.set_reasoning(kernel::ReasoningConfig {
-                        enabled: Some(true),
-                        effort,
-                    });
-                    model.reasoning = provider.reasoning();
+                    if let Err(error) = set_reasoning_checked(
+                        model,
+                        provider,
+                        kernel::ReasoningConfig {
+                            enabled: effort.map(|_| true),
+                            effort,
+                        },
+                    ) {
+                        model.push_notice(format!("reasoning unchanged: {error}"));
+                    }
                 }
                 _ => {}
             }
@@ -2705,11 +2824,16 @@ fn switch_saved_model<P: ProfileProvider>(model: &mut Model, provider: &P, name:
     };
     match resolved {
         Ok(resolved) => {
-            provider.switch_profile(&resolved);
-            model.model = resolved.model;
-            model.max_ctx = resolved.max_ctx;
+            if let Err(error) = provider.switch_profile(&resolved) {
+                model.push_notice(format!("could not switch model: {error}"));
+                return;
+            }
+            model.model = resolved.provider.model;
+            model.protocol = resolved.provider.protocol;
+            model.reasoning_support = resolved.provider.reasoning;
+            model.max_ctx = resolved.provider.max_ctx;
             model.ctx_pct = None;
-            model.active_profile = resolved.profile;
+            model.active_profile = resolved.name;
             model.push_notice(format!("switched to model profile '{name}'"));
         }
         Err(e) => model.push_notice(format!("could not switch model: {e}")),
@@ -2912,7 +3036,11 @@ fn skill_sources(model: &mut Model, args: &str) {
                     if defaults.iter().any(|d| d.key() == t.key()) {
                         continue; // don't double-list a source that shadows a default
                     }
-                    let r = t.git_ref.as_deref().map(|r| format!(" @{r}")).unwrap_or_default();
+                    let r = t
+                        .git_ref
+                        .as_deref()
+                        .map(|r| format!(" @{r}"))
+                        .unwrap_or_default();
                     s.push_str(&format!("\n  · {}/{}{r}", t.repo, t.path));
                 }
                 s.push_str(
@@ -3020,9 +3148,9 @@ fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEve
         for name in targets {
             match tools::hub::check_update(&store, &name).await {
                 tools::hub::UpdateStatus::UpToDate => lines.push(format!("✓ {name} — up to date")),
-                tools::hub::UpdateStatus::ModifiedLocally => {
-                    lines.push(format!("✎ {name} — modified locally (protected; not updated)"))
-                }
+                tools::hub::UpdateStatus::ModifiedLocally => lines.push(format!(
+                    "✎ {name} — modified locally (protected; not updated)"
+                )),
                 tools::hub::UpdateStatus::Unmanaged(reason) => {
                     lines.push(format!("· {name} — {reason}"))
                 }
@@ -3415,6 +3543,9 @@ pub(super) fn run_slash<P: kernel::Provider>(
             text.push_str("\n\nshortcuts:\n\n  Esc     interrupt a running turn\n  Ctrl-D  quit\n  ↑/↓     scroll (empty input) · history (while typing)");
             model.push_notice(text);
         }
+        c if c == "theme" || c.starts_with("theme ") => {
+            apply_theme_command(model, c.strip_prefix("theme").unwrap_or("").trim());
+        }
         // `/clear` is handled in `handle_key` (via `do_clear`) where the
         // transcript and session are mutable; this arm is only a fallback.
         "clear" => model.push_notice("(use /clear to reset the conversation)"),
@@ -3433,6 +3564,46 @@ pub(super) fn run_slash<P: kernel::Provider>(
         }
         other => model.push_notice(format!("unknown command: /{other}")),
     }
+}
+
+/// `/theme` opens the picker (↑↓ + Enter). `/theme light|dark|auto|toggle`
+/// applies directly without the menu. `auto` re-detects from the terminal.
+fn apply_theme_command(model: &mut Model, arg: &str) {
+    match arg {
+        "" => open_theme_picker(model),
+        "light" | "dark" | "auto" => set_theme(model, arg),
+        "toggle" => {
+            let id = if super::theme::current().is_dark {
+                "light"
+            } else {
+                "dark"
+            };
+            set_theme(model, id);
+        }
+        _ => model.push_notice(
+            "usage: /theme [light|dark|auto]  (bare /theme opens a picker)".to_string(),
+        ),
+    }
+}
+
+/// Open the `/theme` picker, cursor on the current mode.
+pub(super) fn open_theme_picker(model: &mut Model) {
+    let sel = if super::theme::current().is_dark { 0 } else { 1 };
+    model.picker = Some(Picker::with_selected(PickerKind::Theme, sel));
+}
+
+/// Apply a theme by its [`THEME_MODES`] id and re-colour the UI live.
+fn set_theme(model: &mut Model, id: &str) {
+    use super::theme;
+    let palette = match id {
+        "light" => theme::Palette::light(),
+        "auto" => theme::detect(),
+        _ => theme::Palette::dark(),
+    };
+    let mode = if palette.is_dark { "dark" } else { "light" };
+    theme::set(palette);
+    model.invalidate_all_renders();
+    model.push_notice(format!("theme: {mode}"));
 }
 
 fn open_reasoning_panel(model: &mut Model) {
@@ -3470,49 +3641,56 @@ fn apply_reasoning_command<P: kernel::Provider>(model: &mut Model, provider: &P,
         "status" => Ok(()),
         "on" => {
             let effort = provider.reasoning().effort;
-            provider.set_reasoning(kernel::ReasoningConfig {
-                enabled: Some(true),
-                effort,
-            });
-            model.reasoning = provider.reasoning();
-            Ok(())
+            set_reasoning_checked(
+                model,
+                provider,
+                kernel::ReasoningConfig {
+                    enabled: Some(true),
+                    effort,
+                },
+            )
         }
-        "off" => {
-            provider.set_reasoning(kernel::ReasoningConfig {
+        "off" => set_reasoning_checked(
+            model,
+            provider,
+            kernel::ReasoningConfig {
                 enabled: Some(false),
                 effort: None,
-            });
-            model.reasoning = provider.reasoning();
-            Ok(())
-        }
+            },
+        ),
         "show" | "hide" => {
             model.show_thinking = args == "show";
             model.invalidate_all_renders();
             Ok(())
         }
-        "effort auto" => {
-            let enabled = provider.reasoning().enabled;
-            provider.set_reasoning(kernel::ReasoningConfig {
-                enabled,
+        "effort auto" => set_reasoning_checked(
+            model,
+            provider,
+            kernel::ReasoningConfig {
+                enabled: None,
                 effort: None,
-            });
-            model.reasoning = provider.reasoning();
-            Ok(())
-        }
-        "effort low" | "effort medium" | "effort high" => {
+            },
+        ),
+        "effort minimal" | "effort low" | "effort medium" | "effort high" => {
             let effort = match args.strip_prefix("effort ").unwrap_or("") {
+                "minimal" => kernel::ReasoningEffort::Minimal,
                 "low" => kernel::ReasoningEffort::Low,
                 "medium" => kernel::ReasoningEffort::Medium,
                 _ => kernel::ReasoningEffort::High,
             };
-            provider.set_reasoning(kernel::ReasoningConfig {
-                enabled: Some(true),
-                effort: Some(effort),
-            });
-            model.reasoning = provider.reasoning();
-            Ok(())
+            set_reasoning_checked(
+                model,
+                provider,
+                kernel::ReasoningConfig {
+                    enabled: Some(true),
+                    effort: Some(effort),
+                },
+            )
         }
-        _ => Err("usage: /reasoning [on|off|show|hide|status|effort auto|low|medium|high]"),
+        _ => Err(
+            "usage: /reasoning [on|off|show|hide|status|effort auto|minimal|low|medium|high]"
+                .to_string(),
+        ),
     };
 
     match result {
@@ -3617,15 +3795,24 @@ mod fix_tests {
             classify_slash("skill search pdf"),
             SlashAction::SearchSkills("pdf".into())
         );
-        assert_eq!(classify_slash("skill update"), SlashAction::UpdateSkills(String::new()));
+        assert_eq!(
+            classify_slash("skill update"),
+            SlashAction::UpdateSkills(String::new())
+        );
         assert_eq!(
             classify_slash("skill update --all"),
             SlashAction::UpdateSkills("--all".into())
         );
         assert_eq!(classify_slash("skill lock"), SlashAction::LockSkills);
         assert_eq!(classify_slash("skill sync"), SlashAction::SyncSkills);
-        assert_eq!(classify_slash("skill add pdf"), SlashAction::AddSkill("pdf".into()));
-        assert_eq!(classify_slash("skill add"), SlashAction::AddSkill(String::new()));
+        assert_eq!(
+            classify_slash("skill add pdf"),
+            SlashAction::AddSkill("pdf".into())
+        );
+        assert_eq!(
+            classify_slash("skill add"),
+            SlashAction::AddSkill(String::new())
+        );
         // a name that merely starts with "add" still loads as a skill name
         assert_eq!(
             classify_slash("skill adder"),
@@ -3673,7 +3860,9 @@ mod fix_tests {
     #[test]
     fn add_auto_detects_link_or_path_vs_search_term() {
         // links / paths → install
-        assert!(looks_like_source("https://github.com/anthropics/skills/tree/main/skills/pdf"));
+        assert!(looks_like_source(
+            "https://github.com/anthropics/skills/tree/main/skills/pdf"
+        ));
         assert!(looks_like_source("github.com/owner/repo"));
         assert!(looks_like_source("/tmp/my-skill"));
         assert!(looks_like_source("~/skills/foo"));
@@ -3796,16 +3985,25 @@ mod fix_tests {
         let transcript = vec![Message::system("S")];
 
         run_slash(&mut m, "reasoning on", &transcript, &provider);
+        // "on" with no chosen effort defaults to Minimal — a concrete, portable
+        // level (openai-chat requires an explicit effort; Gemini's lowest is
+        // minimal). Support here is only "unverified", so enabling is permitted
+        // with a warning, not blocked.
         assert_eq!(m.reasoning.enabled, Some(true));
+        assert_eq!(m.reasoning.effort, Some(kernel::ReasoningEffort::Minimal));
 
         run_slash(&mut m, "reasoning show", &transcript, &provider);
         assert!(m.show_thinking);
+
+        run_slash(&mut m, "reasoning effort minimal", &transcript, &provider);
+        assert_eq!(m.reasoning.effort, Some(kernel::ReasoningEffort::Minimal));
 
         run_slash(&mut m, "reasoning effort high", &transcript, &provider);
         assert_eq!(m.reasoning.effort, Some(kernel::ReasoningEffort::High));
 
         run_slash(&mut m, "reasoning effort auto", &transcript, &provider);
         assert_eq!(m.reasoning.effort, None);
+        assert_eq!(m.reasoning.enabled, None);
 
         run_slash(&mut m, "reasoning", &transcript, &provider);
         assert!(matches!(
@@ -3816,10 +4014,11 @@ mod fix_tests {
             })
         ));
         let labels = m.picker.as_ref().unwrap().kind.labels();
-        assert_eq!(labels[0], "Mode:       On");
+        assert_eq!(labels[0], "Mode:       Server default");
         assert_eq!(labels[1], "Visibility: Shown");
         assert_eq!(labels[2], "Effort:     Auto");
-        assert_eq!(labels[3], "Last turn:  No completed turn yet");
+        assert_eq!(labels[3], "Support:    unverified");
+        assert_eq!(labels[4], "Last turn:  No completed turn yet");
     }
 
     #[test]
@@ -4148,7 +4347,7 @@ mod fix_tests {
         state.cursor = state.other_row();
         m.clarify = Some(state);
 
-        handle_clarify_key(&mut m, kc(KeyCode::Enter)); // open Other
+        handle_clarify_key(&mut m, kc(KeyCode::Char(' '))); // Space opens Other
         handle_clarify_key(&mut m, kc(KeyCode::Char('é')));
         handle_clarify_key(&mut m, kc(KeyCode::Char('🙂')));
         handle_clarify_key(&mut m, kc(KeyCode::Enter)); // save Other
@@ -4158,7 +4357,7 @@ mod fix_tests {
         assert_eq!(state.drafts[0].other.as_deref(), Some("é🙂"));
         state.cursor = state.other_row();
 
-        handle_clarify_key(&mut m, kc(KeyCode::Enter)); // reopen saved Unicode
+        handle_clarify_key(&mut m, kc(KeyCode::Char(' '))); // Space reopens saved Unicode
         let state = m.clarify.as_ref().unwrap();
         assert_eq!(state.other_cursor, "é🙂".len(), "cursor is a byte offset");
         assert!(state.other_input.is_char_boundary(state.other_cursor));

@@ -2452,15 +2452,24 @@ impl Clarify {
     /// Bounds mirror a structured-question UI (AskUserQuestion-style): 1–4
     /// questions, 2–5 options each — enough to be useful, few enough to render.
     fn parse_questions(args: &Value) -> Result<Vec<kernel::Question>, ToolError> {
-        let raw = args
-            .get("questions")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ToolError::Args("expected an array 'questions'".into()))?;
+        // Some models double-encode nested JSON, sending `questions` as a string
+        // that contains the array. Accept either the array or a JSON-string of it.
+        let raw: Vec<Value> = match args.get("questions") {
+            Some(Value::Array(a)) => a.clone(),
+            Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+                .ok()
+                .and_then(|v| match v {
+                    Value::Array(a) => Some(a),
+                    _ => None,
+                })
+                .ok_or_else(|| ToolError::Args("expected an array 'questions'".into()))?,
+            _ => return Err(ToolError::Args("expected an array 'questions'".into())),
+        };
         if raw.is_empty() || raw.len() > 4 {
             return Err(ToolError::Args("provide 1–4 questions".into()));
         }
         let mut out = Vec::with_capacity(raw.len());
-        for q in raw {
+        for q in &raw {
             let prompt = q
                 .get("question")
                 .and_then(Value::as_str)
@@ -2482,9 +2491,12 @@ impl Clarify {
                 .get("options")
                 .and_then(Value::as_array)
                 .ok_or_else(|| ToolError::Args("each question needs an 'options' array".into()))?;
-            if opts.len() < 2 || opts.len() > 5 {
-                return Err(ToolError::Args("each question needs 2–5 options".into()));
+            if opts.len() < 2 {
+                return Err(ToolError::Args("each question needs at least 2 options".into()));
             }
+            // Models sometimes overshoot the 5-option UI cap; keep the first 5
+            // rather than failing the whole call.
+            let opts = &opts[..opts.len().min(5)];
             let options = opts
                 .iter()
                 .map(|o| {
@@ -2533,11 +2545,13 @@ impl Tool for Clarify {
     fn description(&self) -> &str {
         "Ask the user one or more multiple-choice questions BEFORE proceeding, when \
          the task is materially ambiguous (missing target, several valid \
-         interpretations, a consequential fork). Each question gives 2–5 options \
-         (mark one `recommended`); set `multi_select` for checkboxes. The user can \
-         also type their own answer. Returns their choices. Don't use it for \
-         trivial decisions you can make yourself — only when guessing wrong would \
-         waste real work."
+         interpretations, a consequential fork). HARD LIMITS: 1–4 questions, and \
+         each question MUST have between 2 and 5 options — never more than 5 (pick \
+         the 5 most useful and let the user type their own for the rest). Mark one \
+         option `recommended`; set `multi_select` for checkboxes. The user can also \
+         type their own answer. Returns their choices. Don't use it for trivial \
+         decisions you can make yourself — only when guessing wrong would waste \
+         real work."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -2554,7 +2568,7 @@ impl Tool for Clarify {
             "properties": {
                 "questions": {
                     "type": "array",
-                    "description": "1–4 questions to ask.",
+                    "description": "1 to 4 questions (maximum 4).",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -2563,7 +2577,7 @@ impl Tool for Clarify {
                             "multi_select": { "type": "boolean", "description": "true = checkboxes (any number); false = pick one" },
                             "options": {
                                 "type": "array",
-                                "description": "2–5 options",
+                                "description": "Between 2 and 5 options — never more than 5.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -5082,6 +5096,25 @@ mod tests {
         // A question with <2 options → rejected (a non-choice).
         let thin = json!({ "questions": [ { "question": "x", "options": [ {"label":"only"} ] } ] });
         assert!(Clarify::parse_questions(&thin).is_err());
+    }
+
+    #[test]
+    fn clarify_truncates_more_than_five_options() {
+        // A model overshooting to 6 options must not fail the call — keep 5.
+        let args = json!({ "questions": [ { "question": "Which?", "options": [
+            {"label":"a"},{"label":"b"},{"label":"c"},{"label":"d"},{"label":"e"},{"label":"f"} ] } ]});
+        let qs = Clarify::parse_questions(&args).expect("6 options truncates, not errors");
+        assert_eq!(qs[0].options.len(), 5);
+    }
+
+    #[test]
+    fn clarify_accepts_double_encoded_questions() {
+        // Some models send `questions` as a JSON *string* of the array. Accept it.
+        let inner = r#"[{"question":"Which DB?","options":[{"label":"Postgres"},{"label":"SQLite"}]}]"#;
+        let args = json!({ "questions": inner });
+        let qs = Clarify::parse_questions(&args).expect("stringified questions parse");
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].options.len(), 2);
     }
 
     #[test]

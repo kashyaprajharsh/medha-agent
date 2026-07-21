@@ -11,8 +11,8 @@ use crate::compactor::{ExtractiveSummarizer, HistoryItem, ItemKind, Summarizer};
 use crate::policy::{CompactionAction, CompactionPolicy};
 use crate::tokens::{BpeCounter, TokenCounter};
 use async_trait::async_trait;
-use kernel::{CompileResult, ContextEngine, Message, Role};
-use std::sync::atomic::{AtomicU32, Ordering};
+use kernel::{CompileResult, ContextEngine, InputTokenCount, Message, Role, TokenCountQuality};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 type SystemRefresh = dyn Fn(&str) -> String + Send + Sync;
@@ -26,6 +26,18 @@ pub struct PipelineEngine {
     /// Real prompt tokens from the provider's last response (0 = unknown). The
     /// authoritative basis for the compaction decision — not an estimate.
     last_prompt_tokens: AtomicU32,
+    /// Count for the exact request candidate currently being compiled. Cleared
+    /// before every prepare/count cycle so it can never leak across a changed
+    /// request body.
+    preflight_tokens: AtomicU32,
+    preflight_quality: AtomicU8,
+    preflight_fingerprint: std::sync::Mutex<Option<String>>,
+    /// Provider overflow asks for one bounded compaction pass. This is a
+    /// one-shot latch, not a guessed replacement context window.
+    force_next: AtomicBool,
+    /// A completed compaction is judged against the next real provider usage.
+    pending_usage_verification: AtomicBool,
+    verification_threshold: AtomicU32,
     /// Consecutive compactions that barely helped; backs off to avoid the
     /// "compact every turn" thrash.
     ineffective: AtomicU32,
@@ -65,6 +77,12 @@ impl PipelineEngine {
             policy,
             counter,
             last_prompt_tokens: AtomicU32::new(0),
+            preflight_tokens: AtomicU32::new(0),
+            preflight_quality: AtomicU8::new(quality_code(TokenCountQuality::LocalEstimate)),
+            preflight_fingerprint: std::sync::Mutex::new(None),
+            force_next: AtomicBool::new(false),
+            pending_usage_verification: AtomicBool::new(false),
+            verification_threshold: AtomicU32::new(0),
             ineffective: AtomicU32::new(0),
             latched_at: AtomicU32::new(0),
             summarizer: Arc::new(ExtractiveSummarizer),
@@ -141,6 +159,22 @@ fn is_overflow(tokens: f32, true_max_ctx: u32, policy: &CompactionPolicy) -> boo
     tokens >= true_max_ctx as f32 * policy.emergency_ratio
 }
 
+const fn quality_code(quality: TokenCountQuality) -> u8 {
+    match quality {
+        TokenCountQuality::Authoritative => 0,
+        TokenCountQuality::ProviderEstimate => 1,
+        TokenCountQuality::LocalEstimate => 2,
+    }
+}
+
+fn quality_from_code(code: u8) -> TokenCountQuality {
+    match code {
+        0 => TokenCountQuality::Authoritative,
+        1 => TokenCountQuality::ProviderEstimate,
+        _ => TokenCountQuality::LocalEstimate,
+    }
+}
+
 /// Extra tokens per tool for chat-template scaffolding (headers/instructions the
 /// serialized schema doesn't capture). Biased safe-high — undercount is the risk.
 const PER_TOOL_SCAFFOLD_TOKENS: u32 = 18;
@@ -150,13 +184,40 @@ impl ContextEngine for PipelineEngine {
     fn update_usage(&self, prompt_tokens: u32, _total_tokens: u32) {
         // Real usage already counts tool defs — store verbatim.
         self.last_prompt_tokens.store(prompt_tokens, Ordering::Relaxed);
+        if self.pending_usage_verification.swap(false, Ordering::AcqRel) {
+            let threshold = self.verification_threshold.load(Ordering::Acquire);
+            if threshold > 0 && prompt_tokens >= threshold {
+                self.ineffective.fetch_add(1, Ordering::Relaxed);
+                self.latched_at.store(prompt_tokens, Ordering::Relaxed);
+            } else {
+                self.ineffective.store(0, Ordering::Relaxed);
+            }
+        }
     }
 
-    fn update_estimate(&self, count: u32) {
-        // Server count omits tool defs — add the overhead so the basis matches
-        // what's actually sent (P1-9).
-        self.last_prompt_tokens
-            .store(count + self.tool_overhead.load(Ordering::Relaxed), Ordering::Relaxed);
+    fn clear_preflight(&self) {
+        self.preflight_tokens.store(0, Ordering::Release);
+        self.preflight_quality
+            .store(quality_code(TokenCountQuality::LocalEstimate), Ordering::Release);
+        if let Ok(mut fingerprint) = self.preflight_fingerprint.lock() {
+            *fingerprint = None;
+        }
+    }
+
+    fn update_preflight(&self, count: &InputTokenCount) {
+        self.preflight_tokens.store(
+            count.tokens.min(u64::from(u32::MAX)) as u32,
+            Ordering::Release,
+        );
+        self.preflight_quality
+            .store(quality_code(count.quality), Ordering::Release);
+        if let Ok(mut fingerprint) = self.preflight_fingerprint.lock() {
+            *fingerprint = Some(count.request_fingerprint.clone());
+        }
+    }
+
+    fn force_next_compaction(&self) {
+        self.force_next.store(true, Ordering::Release);
     }
 
     fn note_tools(&self, tools: &[kernel::ToolSpec]) {
@@ -172,19 +233,34 @@ impl ContextEngine for PipelineEngine {
         self.tool_overhead.store(n, Ordering::Relaxed);
     }
 
-    async fn compile(&self, messages: &[Message], max_ctx: Option<u32>) -> CompileResult {
+    async fn compile(
+        &self,
+        messages: &[Message],
+        max_input_tokens: Option<u32>,
+    ) -> CompileResult {
         let counter: &dyn TokenCounter = self.counter.as_ref();
         // Include the fixed tool-def overhead so the estimate matches the real
         // request size (tool defs are sent every turn but not in `count_all`).
         let overhead = self.tool_overhead.load(Ordering::Relaxed);
         let before = count_all(messages, counter) + overhead;
 
-        // Unknown window → never guess; send as-is (the budget cannot be sized;
-        // overflow is unknowable too, so we can't claim it — false).
-        let Some(mc) = max_ctx else {
-            return passthrough(messages, before, false);
+        let forced = self.force_next.swap(false, Ordering::AcqRel);
+        // An unknown model limit remains unknown. After a real provider overflow
+        // only, a synthetic one-pass target may shrink the rejected request; it
+        // is never cached or presented as the model's context length.
+        let synthetic_limit = max_input_tokens.is_none() && forced;
+        let mc = match max_input_tokens {
+            Some(limit) => limit,
+            None if forced => before.saturating_mul(3).checked_div(4).unwrap_or(1).max(1),
+            None => return passthrough(messages, before, false),
         };
-        let budget = ContextBudget::from_max_ctx(mc);
+        let preflight = self.preflight_tokens.load(Ordering::Acquire);
+        let quality = if preflight > 0 {
+            quality_from_code(self.preflight_quality.load(Ordering::Acquire))
+        } else {
+            TokenCountQuality::LocalEstimate
+        };
+        let budget = ContextBudget::from_input_limit(mc, quality);
         let usable = budget.usable().max(1) as f32;
 
         // Decision basis: the max of the last reported/counted figure and the
@@ -193,7 +269,11 @@ impl ContextEngine for PipelineEngine {
         // results — trusting it alone triggered compaction one turn late (P2).
         // max() biases toward compacting earlier, the safe direction.
         let actual = self.last_prompt_tokens.load(Ordering::Relaxed);
-        let basis = (actual as f32).max(before as f32);
+        let basis = if preflight > 0 {
+            preflight as f32
+        } else {
+            (actual as f32).max(before as f32)
+        };
         let near_hard_ceiling = is_overflow(basis, mc, &self.policy);
 
         // Anti-thrash: if the last couple of compactions barely helped, stop —
@@ -210,7 +290,7 @@ impl ContextEngine for PipelineEngine {
             }
         }
 
-        let action = if basis >= usable * self.policy.trigger_ratio || near_hard_ceiling {
+        let action = if forced || basis >= usable * self.policy.trigger_ratio || near_hard_ceiling {
             CompactionAction::Full
         } else if basis >= usable * self.policy.microcompact_ratio {
             CompactionAction::Prune
@@ -355,7 +435,16 @@ impl ContextEngine for PipelineEngine {
 
         // Even after compaction, check the result against the true hard
         // ceiling — the final guard before this goes to the kernel.
-        let overflow = is_overflow(after as f32, mc, &self.policy);
+        let overflow = if synthetic_limit {
+            // A provider rejected the original and we do not know its limit.
+            // Only a material reduction authorizes the one retry.
+            after >= before.saturating_sub(before / 10)
+        } else {
+            is_overflow(after as f32, mc, &self.policy)
+        };
+        self.pending_usage_verification.store(true, Ordering::Release);
+        self.verification_threshold
+            .store((usable * self.policy.trigger_ratio) as u32, Ordering::Release);
 
         CompileResult {
             messages: out,
@@ -578,6 +667,13 @@ mod tests {
         PipelineEngine::with_counter(policy, Arc::new(HeuristicCounter))
     }
 
+    /// `PipelineEngine::compile` receives an input-only allowance. These tests
+    /// use local estimates, which reserve a 10% quality margin, so derive the
+    /// allowance that produces the requested usable budget.
+    fn local_input_limit(usable_tokens: u32) -> u32 {
+        usable_tokens.saturating_mul(10) / 9
+    }
+
     struct OkSummarizer(&'static str);
     #[async_trait]
     impl Summarizer for OkSummarizer {
@@ -637,7 +733,9 @@ mod tests {
     #[tokio::test]
     async fn full_compaction_uses_injected_summarizer_and_persists_it() {
         let eng = engine(full_policy()).with_summarizer(Arc::new(OkSummarizer("HANDOFF")));
-        let r = eng.compile(&full_compaction_history(), Some(2_000)).await;
+        let r = eng
+            .compile(&full_compaction_history(), Some(local_input_limit(1_300)))
+            .await;
         assert!(r.compacted && r.summarized);
         assert_eq!(r.summary.as_deref(), Some("HANDOFF"), "summary text carried out for K12 persistence");
         assert!(r.messages.iter().any(|m| m.content == "HANDOFF"), "summary is in the compacted view");
@@ -654,11 +752,18 @@ mod tests {
                 format!("{system}\n\n## Memory\n\nrefreshed")
             }));
 
-        let unchanged = eng.compile(&[Message::system("SYSTEM"), user("short")], Some(2_000)).await;
+        let unchanged = eng
+            .compile(
+                &[Message::system("SYSTEM"), user("short")],
+                Some(local_input_limit(1_300)),
+            )
+            .await;
         assert!(!unchanged.compacted);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
-        let compacted = eng.compile(&full_compaction_history(), Some(2_000)).await;
+        let compacted = eng
+            .compile(&full_compaction_history(), Some(local_input_limit(1_300)))
+            .await;
         assert!(compacted.compacted && compacted.summarized);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(compacted.messages[0].content.ends_with("## Memory\n\nrefreshed"));
@@ -667,7 +772,9 @@ mod tests {
     #[tokio::test]
     async fn full_compaction_falls_back_to_extractive_never_unavailable() {
         let eng = engine(full_policy()).with_summarizer(Arc::new(ErrSummarizer));
-        let r = eng.compile(&full_compaction_history(), Some(2_000)).await;
+        let r = eng
+            .compile(&full_compaction_history(), Some(local_input_limit(1_300)))
+            .await;
         assert!(r.summarized);
         let s = r.summary.expect("a summary is always produced");
         assert!(!s.contains("[summary unavailable]"), "must not emit the empty placeholder");
@@ -684,9 +791,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_def_overhead_lifts_the_preflight_basis_over_the_trigger() {
-        use kernel::{BlastRadius, ContextEngine, ToolCategory, ToolSpec};
-        // A big tool set → sizable fixed overhead a tool-blind count ignores.
+    async fn complete_prepared_count_including_tools_drives_the_trigger() {
+        use kernel::{BlastRadius, ContextEngine, InputTokenCount, TokenCountQuality, ToolCategory, ToolSpec};
         let tools: Vec<ToolSpec> = (0..20)
             .map(|i| ToolSpec {
                 name: format!("tool_{i}"),
@@ -700,15 +806,24 @@ mod tests {
         let history = full_compaction_history();
         let msg_tokens = count_all(&history, &HeuristicCounter);
 
-        // Tool-blind pre-flight basis alone stays under the trigger → no compaction.
+        // A count for messages alone stays under the trigger.
         let plain = engine(full_policy());
-        plain.update_estimate(msg_tokens);
+        plain.update_preflight(&InputTokenCount {
+            tokens: u64::from(msg_tokens),
+            quality: TokenCountQuality::Authoritative,
+            request_fingerprint: "messages-only".into(),
+        });
         assert!(!plain.compile(&history, Some(8_000)).await.compacted, "messages alone stay under trigger");
 
-        // Same basis + the noted tool-def overhead crosses the trigger → compaction.
+        // The provider's count of the complete prepared request includes the
+        // large tool schemas and crosses the trigger without guessed overhead.
         let withtools = engine(full_policy());
         withtools.note_tools(&tools);
-        withtools.update_estimate(msg_tokens);
+        withtools.update_preflight(&InputTokenCount {
+            tokens: 7_000,
+            quality: TokenCountQuality::Authoritative,
+            request_fingerprint: "complete-request".into(),
+        });
         assert!(withtools.compile(&history, Some(8_000)).await.compacted, "tool-def overhead pushes it over");
     }
 
@@ -716,8 +831,8 @@ mod tests {
     async fn re_compaction_threads_the_previous_summary() {
         let rec = Arc::new(RecordingSummarizer(std::sync::Mutex::new(Vec::new())));
         let eng = engine(full_policy()).with_summarizer(rec.clone());
-        eng.compile(&full_compaction_history(), Some(2_000)).await; // first Full
-        eng.compile(&full_compaction_history(), Some(2_000)).await; // second Full
+        eng.compile(&full_compaction_history(), Some(local_input_limit(1_300))).await; // first Full
+        eng.compile(&full_compaction_history(), Some(local_input_limit(1_300))).await; // second Full
         let seen = rec.0.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert!(seen[0].is_none(), "first compaction has no previous summary");
@@ -753,21 +868,22 @@ mod tests {
             trigger_ratio: 0.85,
             ..Default::default()
         });
-        // Prune band (~3120..4420 of usable 5200 @8k), but the middle holds no
+        // Prune band (~3120..4420 of a 5200-token usable input allowance), but the middle holds no
         // tool results — pruning frees nothing → "ineffective" twice → latch.
         let mut msgs = vec![Message::system("S")];
         for i in 0..8 {
             msgs.push(user(&format!("ask {i} {}", "y".repeat(1_600))));
         }
-        let r1 = eng.compile(&msgs, Some(8_000)).await;
+        let input_limit = Some(local_input_limit(5_200));
+        let r1 = eng.compile(&msgs, input_limit).await;
         assert!(r1.compacted && r1.before_tokens == r1.after_tokens, "nothing prunable");
-        let r2 = eng.compile(&msgs, Some(8_000)).await;
+        let r2 = eng.compile(&msgs, input_limit).await;
         assert!(r2.compacted);
-        let r3 = eng.compile(&msgs, Some(8_000)).await;
+        let r3 = eng.compile(&msgs, input_limit).await;
         assert!(!r3.compacted, "latched after two ineffective passes");
 
         // Same size again → still latched.
-        let r4 = eng.compile(&msgs, Some(8_000)).await;
+        let r4 = eng.compile(&msgs, input_limit).await;
         assert!(!r4.compacted, "latch holds while nothing changed");
 
         // Growth past 10% of the latch point → released, compaction runs again
@@ -775,7 +891,7 @@ mod tests {
         for i in 0..3 {
             msgs.push(user(&format!("more {i} {}", "z".repeat(1_600))));
         }
-        let r5 = eng.compile(&msgs, Some(8_000)).await;
+        let r5 = eng.compile(&msgs, input_limit).await;
         assert!(r5.compacted, "grown context must release the anti-thrash latch");
         assert!(r5.after_tokens < r5.before_tokens, "and this pass actually shrinks");
     }
@@ -792,7 +908,7 @@ mod tests {
             prune_min_tool_tokens: Some(100),
             ..Default::default()
         });
-        // usable(8k) ≈ 5200; band [3120, 4420). Three 1100-token outputs + one
+        // Usable input is 5200; band [3120, 4420). Three 1100-token outputs + one
         // 50-token one ≈ 3360 → Prune. Pruning the OLDEST (-~1075) lands under
         // target 3120, so the rest must survive.
         let msgs = vec![
@@ -807,7 +923,9 @@ mod tests {
             Message::tool_result("c3", "d".repeat(4_400)),
             user("LAST"),
         ];
-        let r = eng.compile(&msgs, Some(8_000)).await;
+        let r = eng
+            .compile(&msgs, Some(local_input_limit(5_200)))
+            .await;
         assert!(r.compacted && !r.summarized, "expected a Prune pass (compacted={} summarized={} before={} after={})", r.compacted, r.summarized, r.before_tokens, r.after_tokens);
         let pruned: Vec<&Message> =
             r.messages.iter().filter(|m| m.content.contains("pruned to save context")).collect();
@@ -834,14 +952,16 @@ mod tests {
             ..Default::default()
         })
         .with_artifacts(Arc::new(MemStore::default()));
-        // Sized into the Prune band (>=60%, <85% of usable ~5200 for an 8k window).
+        // Sized into the Prune band (>=60%, <85% of a 5200-token usable input).
         let mut msgs = vec![Message::system("S")];
         for i in 0..8 {
             msgs.push(user(&format!("ask {i}")));
             msgs.push(Message::tool_result(format!("c{i}"), format!("{i}{}", "z".repeat(1600))));
         }
         msgs.push(user("LAST"));
-        let r = eng.compile(&msgs, Some(8_000)).await;
+        let r = eng
+            .compile(&msgs, Some(local_input_limit(5_200)))
+            .await;
         assert!(r.compacted && !r.summarized, "expected a Prune pass (summarized={})", r.summarized);
         assert!(
             r.messages.iter().any(|m| m.content.contains("read_artifact hash=")),
@@ -864,7 +984,9 @@ mod tests {
             Message::tool_result("c1", "z".repeat(40_000)), // ~10k tokens alone
         ];
         // True window small enough that this single turn exceeds the 95% ceiling.
-        let r = eng.compile(&msgs, Some(8_000)).await;
+        let r = eng
+            .compile(&msgs, Some(local_input_limit(5_200)))
+            .await;
         assert!(r.overflow, "must flag overflow rather than silently send over budget");
     }
 
@@ -1106,7 +1228,9 @@ mod tests {
         msgs.extend(update_plan_turn("p2", &[("big task", "completed")]));
         msgs.push(user("LAST"));
 
-        let r = eng.compile(&msgs, Some(8_000)).await;
+        let r = eng
+            .compile(&msgs, Some(local_input_limit(5_200)))
+            .await;
         assert!(r.compacted, "expected compaction to fire (before={})", r.before_tokens);
         assert!(r.messages.iter().any(|m| m.content == "✓ big task"));
         assert!(!r.messages.iter().any(|m| m.content.len() > 1_000), "the big output must be gone, not just pruned");

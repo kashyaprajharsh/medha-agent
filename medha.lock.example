@@ -43,6 +43,31 @@ enabled = true
 max_chars = 20000
 progressive_discovery = true
 
+[lsp]
+# Automatic stateful diagnostics/navigation for Rust, TypeScript/JavaScript,
+# Python, Go, and C/C++ when their known language-server binary is installed.
+# Missing binaries are reported and cached; no package is silently downloaded.
+enabled = true
+startup_timeout_ms = 10000
+request_timeout_ms = 8000
+diagnostics_timeout_ms = 4000
+diagnostic_settle_ms = 1000
+idle_timeout_ms = 600000
+restart_backoff_ms = 5000
+max_servers = 8
+max_results = 200
+max_text_chars = 16000
+allow_network = false # local servers are network-denied unless explicitly enabled
+
+# Optional project-defined adapter. Medha previews this command and requires
+# one-time human approval through `lsp.start` before it can execute.
+# [[lsp.servers]]
+# id = "zls"
+# languages = ["zig"]
+# command = ["zls"]
+# root_markers = ["build.zig", ".git"]
+# trust = "workspace"
+
 [policy]
 # Tool classes requiring human approval before execution (§4.7). File writes
 # need a nod by default; shell is instead gated by the deterministic

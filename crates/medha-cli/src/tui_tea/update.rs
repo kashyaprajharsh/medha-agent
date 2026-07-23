@@ -1779,6 +1779,42 @@ pub(super) fn handle_agent_event(
             model.cancelling = false;
             model.deny_pending_approvals();
         }
+        TuiEvent::LspStatus(result) => {
+            let text = match result {
+                Err(error) => format!("LSP: disabled or unavailable\n  {error}"),
+                Ok(payload) => {
+                    let servers = payload.get("servers").and_then(serde_json::Value::as_array);
+                    match servers {
+                        Some(servers) if !servers.is_empty() => {
+                            let mut lines = vec!["LSP sessions:".to_string()];
+                            for server in servers {
+                                let name = server
+                                    .get("server")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("language-server");
+                                let state = server
+                                    .get("state")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("unknown");
+                                let root = server
+                                    .get("root")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("?");
+                                lines.push(format!("  {name} [{state}]  {root}"));
+                                if let Some(detail) =
+                                    server.get("detail").and_then(serde_json::Value::as_str)
+                                {
+                                    lines.push(format!("    {detail}"));
+                                }
+                            }
+                            lines.join("\n")
+                        }
+                        _ => "LSP: enabled; no server has been started yet".to_string(),
+                    }
+                }
+            };
+            model.upsert_notice("LSP", text);
+        }
         // A queued steer reached its turn boundary: promote the "queued"
         // notice to a real user line (that's what the model now sees).
         TuiEvent::Steered(text) => {
@@ -2052,6 +2088,7 @@ enum SlashAction {
     Resume,
     Rewind,
     Clear,
+    Lsp,
     Memory(String),
     SkillPicker,
     LoadSkill(String),
@@ -2093,6 +2130,7 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "resume" => SlashAction::Resume,
         "rewind" => SlashAction::Rewind,
         "clear" => SlashAction::Clear,
+        "lsp" => SlashAction::Lsp,
         c if c.strip_prefix("memory").is_some_and(is_cmd_boundary) => {
             SlashAction::Memory(c.strip_prefix("memory").unwrap_or("").trim().to_string())
         }
@@ -2193,6 +2231,7 @@ fn dispatch_slash<P, L>(
         SlashAction::Resume => start_resume(model, kernel, tx),
         SlashAction::Rewind => start_rewind(model, kernel, session, tx),
         SlashAction::Clear => do_clear(model, session, transcript),
+        SlashAction::Lsp => show_lsp_status(kernel, tx),
         SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
         SlashAction::SkillPicker => open_skill_picker(model),
         SlashAction::LoadSkill(name) => load_skill_by_name(model, &name, transcript),
@@ -2217,6 +2256,34 @@ fn dispatch_slash<P, L>(
         SlashAction::SyncSkills => sync_skills(model, tx),
         SlashAction::Other => run_slash(model, cmd, transcript, kernel.provider.as_ref()),
     }
+}
+
+fn show_lsp_status(
+    kernel: &Arc<Kernel<impl Provider + 'static, impl EventLog + 'static>>,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    let executor = kernel.executor.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let observation = executor
+            .execute(&kernel::ToolIntent {
+                id: "tui-lsp-status".into(),
+                tool: "lsp.status".into(),
+                args: serde_json::json!({}),
+            })
+            .await;
+        let result = if observation.status == kernel::ObsStatus::Ok {
+            Ok(observation.payload)
+        } else {
+            Err(observation
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("LSP is disabled")
+                .to_string())
+        };
+        let _ = tx.send(TuiEvent::LspStatus(result));
+    });
 }
 
 fn open_memory<L: EventLog + 'static>(
@@ -3694,7 +3761,11 @@ fn apply_theme_command(model: &mut Model, arg: &str) {
 
 /// Open the `/theme` picker, cursor on the current mode.
 pub(super) fn open_theme_picker(model: &mut Model) {
-    let sel = if super::theme::current().is_dark { 0 } else { 1 };
+    let sel = if super::theme::current().is_dark {
+        0
+    } else {
+        1
+    };
     model.picker = Some(Picker::with_selected(PickerKind::Theme, sel));
 }
 
@@ -3996,6 +4067,7 @@ mod fix_tests {
         );
         assert_eq!(classify_slash("resume"), SlashAction::Resume);
         assert_eq!(classify_slash("clear"), SlashAction::Clear);
+        assert_eq!(classify_slash("lsp"), SlashAction::Lsp);
         assert_eq!(classify_slash("help"), SlashAction::Other);
         assert_eq!(classify_slash("search"), SlashAction::SearchConfig);
         assert_eq!(classify_slash("mode"), SlashAction::ModePicker);

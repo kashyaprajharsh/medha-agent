@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 kernel.workspace = true
+lsp = { path = "../lsp" }
 sandbox = { path = "../sandbox" }
 policy = { path = "../policy" }
 memory = { path = "../memory" }

@@ -498,7 +498,12 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
         }
         Item::Notice(s) => s
             .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme::dim()))))
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(theme::dim()),
+                ))
+            })
             .collect(),
         Item::Thinking(s) => {
             let style = Style::default()
@@ -627,7 +632,10 @@ pub(super) fn render_approval(
                 .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("waiting for your input", Style::default().fg(theme::accent())),
+        Span::styled(
+            "waiting for your input",
+            Style::default().fg(theme::accent()),
+        ),
     ]));
     lines.push(Line::from(Span::styled(
         "↑↓ + enter · or press 1/2/3 · n to deny",
@@ -642,11 +650,11 @@ pub(super) fn parse_inline_markdown_spans(line: &str, base_style: Style) -> Vec<
     let mut current_text = String::new();
     let chars: Vec<char> = line.chars().collect();
     let mut idx = 0;
-    
+
     let mut is_bold = false;
     let mut is_italic = false;
     let mut is_code = false;
-    
+
     let mut push_current = |text: &mut String, bold: bool, italic: bool, code: bool| {
         if !text.is_empty() {
             let mut style = base_style;
@@ -784,7 +792,10 @@ pub(super) fn parse_inline_markdown(line: &str) -> Line<'static> {
             .add_modifier(Modifier::BOLD);
         Line::from(parse_inline_markdown_spans(header_content, header_style))
     } else {
-        Line::from(parse_inline_markdown_spans(line, Style::default().fg(theme::text())))
+        Line::from(parse_inline_markdown_spans(
+            line,
+            Style::default().fg(theme::text()),
+        ))
     }
 }
 
@@ -952,7 +963,9 @@ pub(super) fn render_diff(old: &str, new: &str, path: &str, width: u16) -> Vec<L
             Span::styled("  ✎ ", Style::default().fg(theme::faint())),
             Span::styled(
                 path.to_string(),
-                Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::dim())
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
     }
@@ -1604,11 +1617,17 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
             (false, false) => ("○", theme::dim()),
         };
         let bar = if focused { "▌ " } else { "  " };
-        let bar_color = if focused { theme::accent() } else { theme::faint() };
+        let bar_color = if focused {
+            theme::accent()
+        } else {
+            theme::faint()
+        };
         let label_style = if editing {
             Style::default().fg(theme::dim())
         } else if focused {
-            Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme::text())
         };
@@ -1623,7 +1642,11 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
         if opt.recommended {
             spans.push(Span::styled(
                 " ★",
-                Style::default().fg(if editing { theme::faint() } else { theme::accent() }),
+                Style::default().fg(if editing {
+                    theme::faint()
+                } else {
+                    theme::accent()
+                }),
             ));
         }
         if !opt.description.trim().is_empty() {
@@ -1651,12 +1674,20 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
     } else {
         let focused = state.cursor == state.other_row();
         let bar = if focused { "▌ " } else { "  " };
-        let bar_color = if focused { theme::accent() } else { theme::faint() };
+        let bar_color = if focused {
+            theme::accent()
+        } else {
+            theme::faint()
+        };
         let mut spans = vec![
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(
                 "✎ ",
-                Style::default().fg(if focused { theme::accent() } else { theme::dim() }),
+                Style::default().fg(if focused {
+                    theme::accent()
+                } else {
+                    theme::dim()
+                }),
             ),
         ];
         match draft.other.as_deref().filter(|t| !t.is_empty()) {
@@ -1664,7 +1695,9 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
                 spans.push(Span::styled("Other: ", Style::default().fg(theme::dim())));
                 spans.push(Span::styled(
                     t.to_string(),
-                    Style::default().fg(theme::text()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::text())
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
             None => spans.push(Span::styled(
@@ -2149,9 +2182,9 @@ mod clarify_view_tests {
 
     #[test]
     fn test_parse_inline_markdown() {
-        use ratatui::style::{Modifier, Color, Style};
         use super::parse_inline_markdown;
         use crate::tui_tea::theme;
+        use ratatui::style::{Color, Modifier, Style};
 
         let normal = parse_inline_markdown("hello world");
         assert_eq!(normal.spans.len(), 1);
@@ -2163,7 +2196,9 @@ mod clarify_view_tests {
         assert_eq!(bold.spans[1].content, "bold");
         assert_eq!(
             bold.spans[1].style,
-            Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD)
         );
         assert_eq!(bold.spans[2].content, " text");
 
@@ -2173,7 +2208,9 @@ mod clarify_view_tests {
         assert_eq!(italic.spans[1].content, "italic");
         assert_eq!(
             italic.spans[1].style,
-            Style::default().fg(theme::text()).add_modifier(Modifier::ITALIC)
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::ITALIC)
         );
         assert_eq!(italic.spans[2].content, " text");
 
@@ -2190,7 +2227,9 @@ mod clarify_view_tests {
         assert_eq!(non_matching.spans[1].content, " y ");
         assert_eq!(
             non_matching.spans[1].style,
-            Style::default().fg(theme::text()).add_modifier(Modifier::ITALIC)
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::ITALIC)
         );
         assert_eq!(non_matching.spans[2].content, " z");
 
@@ -2199,7 +2238,9 @@ mod clarify_view_tests {
         assert_eq!(header.spans[0].content, "This is a heading");
         assert_eq!(
             header.spans[0].style,
-            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD)
         );
 
         let code_hash_header = parse_inline_markdown("#include <stdio.h>");

@@ -79,11 +79,11 @@ pub(crate) mod theme {
                 is_dark: true,
                 bg: Color::Reset, // keep the terminal's own (possibly transparent) bg
                 accent: Color::Rgb(233, 181, 92), // intellect gold
-                text: Color::Rgb(230, 226, 216),  // warm parchment-white
-                dim: Color::Rgb(150, 142, 126),    // warm grey
+                text: Color::Rgb(230, 226, 216), // warm parchment-white
+                dim: Color::Rgb(150, 142, 126), // warm grey
                 faint: Color::Rgb(98, 92, 80),
-                ok: Color::Rgb(150, 196, 128),      // sage (warm-leaning green)
-                err: Color::Rgb(226, 120, 100),     // warm terracotta-red
+                ok: Color::Rgb(150, 196, 128), // sage (warm-leaning green)
+                err: Color::Rgb(226, 120, 100), // warm terracotta-red
                 warn: Color::Rgb(228, 178, 98),
                 lineno: Color::Rgb(96, 90, 78),
                 add_bg: Color::Rgb(26, 44, 30),
@@ -91,9 +91,9 @@ pub(crate) mod theme {
                 add_fg: Color::Rgb(158, 210, 150),
                 del_fg: Color::Rgb(232, 140, 128),
                 code_fg: Color::Rgb(224, 200, 148), // parchment gold
-                code_bg: Color::Rgb(34, 31, 27),     // warm ink
-                border: Color::Rgb(86, 79, 68),      // warm bronze-grey
-                link: Color::Rgb(240, 206, 138),     // knowledge-light (underlined)
+                code_bg: Color::Rgb(34, 31, 27),    // warm ink
+                border: Color::Rgb(86, 79, 68),     // warm bronze-grey
+                link: Color::Rgb(240, 206, 138),    // knowledge-light (underlined)
                 quote: Color::Rgb(172, 158, 134),
                 syntect_theme: "base16-ocean.dark",
             }
@@ -105,7 +105,7 @@ pub(crate) mod theme {
                 is_dark: false,
                 bg: Color::Rgb(249, 246, 239), // warm parchment — painted explicitly
                 accent: Color::Rgb(160, 106, 18), // deep amber-bronze
-                text: Color::Rgb(43, 38, 30),      // warm near-black ink
+                text: Color::Rgb(43, 38, 30),  // warm near-black ink
                 dim: Color::Rgb(112, 103, 88),
                 faint: Color::Rgb(158, 150, 136),
                 ok: Color::Rgb(52, 120, 58),
@@ -272,6 +272,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "time-travel: branch from an earlier turn (undoes later edits)",
     ),
     ("/tasks", "list background shell tasks (running/finished)"),
+    ("/lsp", "language-server sessions and health"),
     (
         "/memory",
         "list memories · /memory <name> jumps to provenance",
@@ -431,6 +432,8 @@ pub(crate) enum TuiEvent {
     ),
     Done(Vec<Message>, StopReason),
     Error(String),
+    /// `/lsp` completed querying the registered LSP status tool.
+    LspStatus(Result<serde_json::Value, String>),
     /// A queued steer was applied at a turn boundary — promote its "queued"
     /// notice to a real user line.
     Steered(String),
@@ -2673,7 +2676,10 @@ mod tests {
 
     #[test]
     fn wrap_line_hard_wraps_long_run_and_preserves_text() {
-        let line = Line::from(Span::styled("abcdefghij", Style::default().fg(theme::text())));
+        let line = Line::from(Span::styled(
+            "abcdefghij",
+            Style::default().fg(theme::text()),
+        ));
         let rows = wrap_line(&line, 4);
         assert_eq!(rows.len(), 3, "10 chars / width 4 = 3 rows");
         let joined: String = rows
@@ -2707,6 +2713,7 @@ mod tests {
     fn slash_parsing_only_fires_on_known_commands() {
         // Known commands, with and without args.
         assert!(is_slash_command("/help"));
+        assert!(is_slash_command("/lsp"));
         assert!(is_slash_command("/reasoning"));
         assert!(is_slash_command("/reasoning effort high"));
         // Legacy names remain accepted even though autocomplete presents only

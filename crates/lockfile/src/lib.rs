@@ -70,6 +70,8 @@ pub struct MedhaLock {
     #[serde(default)]
     pub context_files: ContextFilesConfig,
     #[serde(default)]
+    pub lsp: LspConfig,
+    #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
     pub verify: VerifyConfig,
@@ -85,6 +87,76 @@ pub struct MedhaLock {
     pub pricing: PricingConfig,
     #[serde(default)]
     pub gate: GateConfig,
+}
+
+/// Language-server code intelligence. Built-in adapters start automatically
+/// when their installed executable matches a source file. Project-defined
+/// commands remain inert until Medha previews them at a human gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspConfig {
+    pub enabled: bool,
+    pub startup_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub diagnostics_timeout_ms: u64,
+    pub diagnostic_settle_ms: u64,
+    pub idle_timeout_ms: u64,
+    pub restart_backoff_ms: u64,
+    pub max_restart_attempts: u32,
+    pub max_servers: usize,
+    pub max_results: usize,
+    pub max_text_chars: usize,
+    pub max_open_documents: usize,
+    pub allow_network: bool,
+    pub servers: Vec<LspServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspServerConfig {
+    pub id: String,
+    pub languages: Vec<String>,
+    pub command: Vec<String>,
+    pub root_markers: Vec<String>,
+    pub trust: String,
+    /// Server settings answered to `workspace/configuration`/sent as
+    /// `initializationOptions`. Empty = server defaults. For a built-in `id`
+    /// with no `command`, this tunes that built-in server.
+    pub settings: toml::Table,
+}
+
+impl Default for LspServerConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            languages: Vec::new(),
+            command: Vec::new(),
+            root_markers: vec![".git".into()],
+            trust: "workspace".into(),
+            settings: toml::Table::new(),
+        }
+    }
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            startup_timeout_ms: 10_000,
+            request_timeout_ms: 8_000,
+            diagnostics_timeout_ms: 4_000,
+            diagnostic_settle_ms: 1_000,
+            idle_timeout_ms: 600_000,
+            restart_backoff_ms: 5_000,
+            max_restart_attempts: 5,
+            max_servers: 8,
+            max_results: 200,
+            max_text_chars: 16_000,
+            max_open_documents: 64,
+            allow_network: false,
+            servers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -591,6 +663,23 @@ mod tests {
         assert!(lock.context_files.enabled);
         assert_eq!(lock.context_files.max_chars, 20_000);
         assert!(lock.context_files.progressive_discovery);
+        assert!(
+            lock.lsp.enabled,
+            "LSP code intelligence is automatic unless explicitly disabled"
+        );
+        assert_eq!(lock.lsp.startup_timeout_ms, 10_000);
+        assert_eq!(lock.lsp.request_timeout_ms, 8_000);
+        assert_eq!(lock.lsp.diagnostics_timeout_ms, 4_000);
+        assert_eq!(lock.lsp.diagnostic_settle_ms, 1_000);
+        assert_eq!(lock.lsp.idle_timeout_ms, 600_000);
+        assert_eq!(lock.lsp.restart_backoff_ms, 5_000);
+        assert_eq!(lock.lsp.max_restart_attempts, 5);
+        assert_eq!(lock.lsp.max_servers, 8);
+        assert_eq!(lock.lsp.max_results, 200);
+        assert_eq!(lock.lsp.max_text_chars, 16_000);
+        assert_eq!(lock.lsp.max_open_documents, 64);
+        assert!(!lock.lsp.allow_network);
+        assert!(lock.lsp.servers.is_empty());
     }
 
     #[test]

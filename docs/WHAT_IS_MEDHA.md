@@ -21,13 +21,14 @@
 11. [Event Log](#event-log)
 12. [Memory System](#memory-system)
 13. [Tools](#tools)
-14. [Context Engine](#context-engine)
-15. [Skills](#skills)
-16. [Verify](#verify)
-17. [Permissions](#permissions)
-18. [Artifacts](#artifacts)
-19. [Eval Gate](#eval-gate)
-20. [How It All Works Together](#how-it-all-works-together)
+14. [Code Intelligence (LSP)](#code-intelligence-lsp)
+15. [Context Engine](#context-engine)
+16. [Skills](#skills)
+17. [Verify](#verify)
+18. [Permissions](#permissions)
+19. [Artifacts](#artifacts)
+20. [Eval Gate](#eval-gate)
+21. [How It All Works Together](#how-it-all-works-together)
 
 ---
 
@@ -76,7 +77,7 @@ Humans approve consequential actions. The system asks before executing potential
 
 ## Architecture at a Glance
 
-MEDHA consists of **12 Rust crates**, each responsible for a specific concern:
+MEDHA consists of **13 Rust crates**, each responsible for a specific concern:
 
 | Crate | Responsibility |
 |-------|----------------|
@@ -84,7 +85,8 @@ MEDHA consists of **12 Rust crates**, each responsible for a specific concern:
 | `providers` | OpenAI-compatible streaming and non-streaming APIs |
 | `context` | Prompt assembly, compaction, identity, context files |
 | `memory` | Typed memory with projection, ranked recall, consolidation |
-| `tools` | 23 tools: filesystem, shell, web, git, diagnostics, skills |
+| `tools` | Filesystem, shell, web, git, diagnostics, LSP, skills |
+| `lsp` | Native multi-language LSP client: diagnostics + navigation |
 | `policy` | Deny-first authorization, shell scanner, content guard |
 | `sandbox` | Execution backends: host, Seatbelt/Landlock, container, SSH |
 | `store` | SQLite event log with hash chain and artifact storage |
@@ -813,7 +815,8 @@ Tools are the **capabilities** the AI can use to interact with the world. Each t
 | **Shell** | `shell.exec`, `task.list`, `task.output`, `task.kill` | Run commands |
 | **Web** | `web.fetch`, `web.search`, `web.crawl` | Internet access |
 | **Git** | `git` (status, diff, log, add, commit) | Version control |
-| **Diagnostics** | `diagnostics` | Run linters/tests |
+| **Diagnostics** | `diagnostics` | Run linters/tests (heuristic fallback) |
+| **Code Intelligence** | `lsp.*` | Semantic diagnostics, definitions, references, symbols (see [Code Intelligence](#code-intelligence-lsp)) |
 | **Memory** | `memory.*` | Manage persistent facts |
 | **Skills** | `skill.*` | Load/save procedures |
 | **Meta** | `clarify`, `update_plan` | Human interaction |
@@ -841,6 +844,71 @@ All tools return structured observations:
   "status": "ok" | "error" | "denied",
   "payload": { ... }
 }
+```
+
+---
+
+## Code Intelligence (LSP)
+
+**Location:** `crates/lsp/src/`
+
+### What It Does
+
+MEDHA embeds a **native Language Server Protocol client** so the agent understands code the way a compiler does — real diagnostics, definitions, and references — instead of guessing from text. It is **automatic and opt-out**: the agent does not pick a language, and nothing starts until a supported file is touched.
+
+The headline win is **automatic post-edit diagnostics**: every successful `fs.write` / `fs.edit` / `multi_edit` returns a compact "errors this edit introduced/resolved" delta, so the agent catches its own mistakes on the same turn instead of shipping a broken build.
+
+### Languages (built-in)
+
+| Language | Server |
+|----------|--------|
+| Rust | `rust-analyzer` |
+| TypeScript / JavaScript | `typescript-language-server` |
+| Python | `pyright` |
+| Go | `gopls` |
+| C / C++ | `clangd` |
+
+Servers are **not bundled** — MEDHA only ships the thin JSON-RPC client and uses whatever servers are installed. A missing server produces an actionable status and silently falls back to the heuristic `code_outline` / `references` / `diagnostics` tools. Project-defined servers are approval-gated. Extra languages are added via `[[lsp.servers]]` in `medha.lock`.
+
+### Tools
+
+| Tool | Purpose |
+|------|---------|
+| `lsp.diagnostics` | Fresh diagnostics for a file (a timeout is `no_fresh_data`, never "clean") |
+| `lsp.definition` | Semantic definition at a position |
+| `lsp.references` | All references (incl. declaration) |
+| `lsp.implementation` | Implementations of a symbol |
+| `lsp.hover` | Type / documentation at a position |
+| `lsp.symbols` | Workspace symbol search |
+| `lsp.document_symbols` | Symbol outline of one file |
+| `lsp.call_hierarchy` | Callers (incoming) or callees (outgoing) |
+| `lsp.status` | Live server sessions and health |
+| `lsp.start` | Approve + start an approval-gated server |
+
+### Lifecycle & Safety
+
+- **Lazy, deduplicated** clients keyed by `(server, project root)`; multiple servers per file fan out and merge deterministically.
+- **Bounded recovery:** a crashed server restarts on exponential backoff and **parks** after a cap instead of respawn-looping. Idle servers are reaped.
+- **Fast edits:** the edit never stalls on a cold, still-indexing server — it forwards the change and returns immediately; the full delta arrives once the server is warm.
+- **Correctness:** version-aware freshness (`no_fresh_data` ≠ clean), and pre-existing diagnostics are line-shifted through the edit so they aren't reported as newly introduced.
+- **Bounded output:** results are sorted, deduplicated, capped, and spilled to the artifact store.
+- **Sandboxed:** servers run under MEDHA's filesystem jail with a credential-free environment and network denied by default; each is its own process group, torn down on shutdown (Unix and Windows).
+
+### Configuration
+
+```toml
+[lsp]
+enabled = true              # opt-out
+diagnostics_timeout_ms = 4000
+max_restart_attempts = 5    # park after this many failed (re)starts
+max_open_documents = 64     # LRU cap; least-recently-used doc is closed past this
+allow_network = false
+
+# Define or tune a server (a commandless entry tunes a built-in by id):
+[[lsp.servers]]
+id = "rust-analyzer"
+[lsp.servers.settings.rust-analyzer.check]
+command = "clippy"
 ```
 
 ---

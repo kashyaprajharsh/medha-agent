@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
+
+      # Real language servers so the LSP end-to-end tests exercise the protocol
+      # path instead of silently skipping when a binary is absent.
+      - name: Install language servers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tools
+          # rust-analyzer ships as a rustup component; expose it on PATH.
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$(rustup which rust-analyzer)" "$HOME/.local/bin/rust-analyzer"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify servers are on PATH
+        run: |
+          rust-analyzer --version
+          clangd --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace

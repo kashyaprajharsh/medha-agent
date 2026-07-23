@@ -1933,6 +1933,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lsp"
+version = "0.0.1"
+dependencies = [
+ "futures",
+ "libc",
+ "sandbox",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2011,6 +2029,7 @@ dependencies = [
  "keyring",
  "libc",
  "lockfile",
+ "lsp",
  "memory",
  "policy",
  "providers",
@@ -3804,6 +3823,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -3859,6 +3879,7 @@ dependencies = [
  "html2md",
  "ignore",
  "kernel",
+ "lsp",
  "memory",
  "pdf-extract",
  "policy",

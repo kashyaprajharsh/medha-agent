@@ -129,6 +129,605 @@ fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
         .ok_or_else(|| ToolError::Args(format!("expected string '{key}'")))
 }
 
+async fn pre_edit_lsp(
+    handle: &LspHandle,
+    sbx: &WorkspaceSandbox,
+    path: &str,
+    text: &str,
+) -> Option<lsp::DiagnosticBaseline> {
+    let manager = handle.lock().ok()?.clone()?;
+    if !manager.supports(std::path::Path::new(path)) {
+        return None;
+    }
+    let absolute = sbx.resolve(path).await.ok()?;
+    manager
+        .diagnostic_baseline(absolute, text.to_string())
+        .await
+}
+
+async fn post_edit_lsp(
+    handle: &LspHandle,
+    sbx: &WorkspaceSandbox,
+    artifacts: &Arc<dyn kernel::ArtifactStore>,
+    path: &str,
+    text: &str,
+    baseline: Option<lsp::DiagnosticBaseline>,
+) -> Option<Value> {
+    let manager = handle.lock().ok()?.clone()?;
+    if !manager.supports(std::path::Path::new(path)) {
+        return None;
+    }
+    let absolute = sbx.resolve(path).await.ok()?;
+    lsp_diagnostic_value(
+        manager
+            .diagnostics_after_edit(absolute, text.to_string(), baseline)
+            .await,
+        artifacts,
+    )
+    .ok()
+}
+
+fn attach_artifact(value: &mut Value, bytes: Vec<u8>, store: &dyn kernel::ArtifactStore) {
+    let Ok(hash) = store.put(&bytes) else {
+        return;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("artifact_hash".into(), Value::String(hash));
+        object.insert("artifact_bytes".into(), json!(bytes.len()));
+    }
+}
+
+fn lsp_query_value<T: serde::Serialize>(
+    report: lsp::QueryReport<T>,
+    artifacts: &Arc<dyn kernel::ArtifactStore>,
+) -> Result<Value, ToolError> {
+    let artifact = match &report {
+        lsp::QueryReport::Ready {
+            server,
+            root,
+            sources,
+            warnings,
+            items,
+            overflow,
+            total,
+            truncated: true,
+        } => serde_json::to_vec(&json!({
+            "server": server,
+            "root": root,
+            "sources": sources,
+            "warnings": warnings,
+            "items": items,
+            "overflow": overflow,
+            "total": total
+        }))
+        .ok(),
+        _ => None,
+    };
+    let mut value =
+        serde_json::to_value(report).map_err(|error| ToolError::Failed(error.to_string()))?;
+    if let Some(bytes) = artifact {
+        attach_artifact(&mut value, bytes, artifacts.as_ref());
+    }
+    Ok(value)
+}
+
+fn lsp_diagnostic_value(
+    report: lsp::DiagnosticReport,
+    artifacts: &Arc<dyn kernel::ArtifactStore>,
+) -> Result<Value, ToolError> {
+    let artifact = match &report {
+        lsp::DiagnosticReport::Fresh {
+            server,
+            root,
+            sources,
+            warnings,
+            path,
+            version,
+            diagnostics,
+            overflow,
+            total,
+            introduced,
+            resolved,
+            truncated: true,
+        } => serde_json::to_vec(&json!({
+            "server": server,
+            "root": root,
+            "sources": sources,
+            "warnings": warnings,
+            "path": path,
+            "version": version,
+            "diagnostics": diagnostics,
+            "overflow": overflow,
+            "total": total,
+            "introduced": introduced,
+            "resolved": resolved
+        }))
+        .ok(),
+        _ => None,
+    };
+    let mut value =
+        serde_json::to_value(report).map_err(|error| ToolError::Failed(error.to_string()))?;
+    if let Some(bytes) = artifact {
+        attach_artifact(&mut value, bytes, artifacts.as_ref());
+    }
+    Ok(value)
+}
+
+struct LspStatus {
+    manager: Arc<lsp::LspManager>,
+}
+
+struct LspStart {
+    manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+}
+
+#[async_trait]
+impl Tool for LspStart {
+    fn name(&self) -> &str {
+        "lsp.start"
+    }
+    fn description(&self) -> &str {
+        "Approve and start the configured language server for a source file. Built-in servers start lazily without this; project-defined commands require this human-gated action once per session/root."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::External
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Source file selecting the configured server and project root" },
+                "server": { "type": "string", "description": "Server id; required only when multiple project-defined servers match" }
+            },
+            "required": ["path"]
+        })
+    }
+    async fn preview(&self, args: &Value) -> Option<String> {
+        let path = args.get("path")?.as_str()?;
+        let server = args.get("server").and_then(Value::as_str);
+        let absolute = self.sbx.resolve(path).await.ok()?;
+        let preview = self.manager.start_preview_for(absolute, server).ok()?;
+        Some(format!(
+            "start language server '{}' in {}\ncommand: {}",
+            preview.server,
+            preview.root.display(),
+            preview.command.join(" ")
+        ))
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let server = args.get("server").and_then(Value::as_str);
+        let absolute = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        serde_json::to_value(
+            self.manager
+                .approve_and_start_for(absolute, server)
+                .await
+                .map_err(|error| ToolError::Failed(error.to_string()))?,
+        )
+        .map_err(|error| ToolError::Failed(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl Tool for LspStatus {
+    fn name(&self) -> &str {
+        "lsp.status"
+    }
+
+    fn description(&self) -> &str {
+        "Show language-server sessions and whether each project-root server is starting, ready, or broken."
+    }
+
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: &Value) -> Result<Value, ToolError> {
+        Ok(json!({ "servers": self.manager.status().await }))
+    }
+}
+
+struct LspDiagnostics {
+    manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
+}
+
+#[async_trait]
+impl Tool for LspDiagnostics {
+    fn name(&self) -> &str {
+        "lsp.diagnostics"
+    }
+
+    fn description(&self) -> &str {
+        "Synchronize a supported source file with its language server and return only a fresh diagnostic result. A timeout is no_fresh_data, never clean."
+    }
+
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative supported source file" }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let absolute = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        lsp_diagnostic_value(self.manager.diagnostics(absolute).await, &self.artifacts)
+    }
+}
+
+fn lsp_position(args: &Value) -> Result<lsp::Position, ToolError> {
+    let line = args
+        .get("line")
+        .and_then(Value::as_u64)
+        .filter(|line| *line > 0)
+        .ok_or_else(|| ToolError::Args("expected 1-based integer 'line'".into()))?;
+    let character = args.get("character").and_then(Value::as_u64).unwrap_or(0);
+    Ok(lsp::Position {
+        line: (line - 1)
+            .try_into()
+            .map_err(|_| ToolError::Args("'line' is too large".into()))?,
+        character: character
+            .try_into()
+            .map_err(|_| ToolError::Args("'character' is too large".into()))?,
+    })
+}
+
+fn lsp_position_schema() -> Value {
+    json!({
+        "path": { "type": "string", "description": "Workspace-relative supported source file" },
+        "line": { "type": "integer", "minimum": 1, "description": "1-based source line" },
+        "character": { "type": "integer", "minimum": 0, "description": "0-based UTF-16 character offset (default 0)" }
+    })
+}
+
+struct LspDefinition {
+    manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
+}
+
+#[async_trait]
+impl Tool for LspDefinition {
+    fn name(&self) -> &str {
+        "lsp.definition"
+    }
+    fn description(&self) -> &str {
+        "Resolve the semantic definition at a source position using its long-lived language server."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": lsp_position_schema(),
+            "required": ["path", "line"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let absolute = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        lsp_query_value(
+            self.manager.definition(absolute, lsp_position(args)?).await,
+            &self.artifacts,
+        )
+    }
+}
+
+struct LspReferences {
+    manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
+}
+
+#[async_trait]
+impl Tool for LspReferences {
+    fn name(&self) -> &str {
+        "lsp.references"
+    }
+    fn description(&self) -> &str {
+        "Find semantic references at a source position, including declaration by default."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+    fn schema(&self) -> Value {
+        let mut properties = lsp_position_schema();
+        properties["include_declaration"] = json!({
+            "type": "boolean",
+            "description": "Include the declaration (default true)"
+        });
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["path", "line"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let absolute = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let include = args
+            .get("include_declaration")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        lsp_query_value(
+            self.manager
+                .references(absolute, lsp_position(args)?, include)
+                .await,
+            &self.artifacts,
+        )
+    }
+}
+
+struct LspHover {
+    manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
+}
+
+#[async_trait]
+impl Tool for LspHover {
+    fn name(&self) -> &str {
+        "lsp.hover"
+    }
+    fn description(&self) -> &str {
+        "Return bounded semantic type/documentation hover text at a source position."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": lsp_position_schema(),
+            "required": ["path", "line"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let absolute = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        lsp_query_value(
+            self.manager.hover(absolute, lsp_position(args)?).await,
+            &self.artifacts,
+        )
+    }
+}
+
+struct LspSymbols {
+    manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
+}
+
+#[async_trait]
+impl Tool for LspSymbols {
+    fn name(&self) -> &str {
+        "lsp.symbols"
+    }
+    fn description(&self) -> &str {
+        "Search semantic workspace symbols in the project containing path; results are sorted, deduplicated, and bounded."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Symbol-name query" },
+                "path": { "type": "string", "description": "Source file selecting the language server and project root" }
+            },
+            "required": ["query", "path"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let query = arg_str(args, "query")?;
+        let path = arg_str(args, "path")?;
+        let absolute = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        lsp_query_value(
+            self.manager.workspace_symbols(absolute, &query).await,
+            &self.artifacts,
+        )
+    }
+}
+
+struct LspImplementation {
+    manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
+}
+
+#[async_trait]
+impl Tool for LspImplementation {
+    fn name(&self) -> &str {
+        "lsp.implementation"
+    }
+    fn description(&self) -> &str {
+        "Resolve implementations of the symbol at a source position (trait/interface methods, abstract definitions)."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": lsp_position_schema(),
+            "required": ["path", "line"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let absolute = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        lsp_query_value(
+            self.manager
+                .implementations(absolute, lsp_position(args)?)
+                .await,
+            &self.artifacts,
+        )
+    }
+}
+
+struct LspDocumentSymbols {
+    manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
+}
+
+#[async_trait]
+impl Tool for LspDocumentSymbols {
+    fn name(&self) -> &str {
+        "lsp.document_symbols"
+    }
+    fn description(&self) -> &str {
+        "List the semantic symbol outline of a single source file, sorted, deduplicated, and bounded."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative supported source file" }
+            },
+            "required": ["path"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let absolute = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        lsp_query_value(
+            self.manager.document_symbols(absolute).await,
+            &self.artifacts,
+        )
+    }
+}
+
+struct LspCallHierarchy {
+    manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
+}
+
+#[async_trait]
+impl Tool for LspCallHierarchy {
+    fn name(&self) -> &str {
+        "lsp.call_hierarchy"
+    }
+    fn description(&self) -> &str {
+        "List callers (direction=incoming, default) or callees (direction=outgoing) of the symbol at a source position."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
+    fn schema(&self) -> Value {
+        let mut properties = lsp_position_schema();
+        properties["direction"] = json!({
+            "type": "string",
+            "enum": ["incoming", "outgoing"],
+            "description": "incoming = callers (default), outgoing = callees"
+        });
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["path", "line"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let absolute = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let outgoing = args.get("direction").and_then(Value::as_str) == Some("outgoing");
+        lsp_query_value(
+            self.manager
+                .call_hierarchy(absolute, lsp_position(args)?, outgoing)
+                .await,
+            &self.artifacts,
+        )
+    }
+}
+
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// The workspace sandbox, kept so the executor can report its containment
@@ -145,11 +744,16 @@ pub struct ToolRegistry {
     /// The surface's question-asker, populated by `main` per surface (TUI vs
     /// headless). `None` inside = no interactive user → `clarify` reports skipped.
     clarify: ClarifyHandle,
+    /// Shared optional LSP manager. File mutation tools retain this handle so
+    /// registering LSP after the default registry is built updates all of them.
+    lsp: LspHandle,
+    artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
 }
 
 /// Shared handle to the surface's question-asker. `main` sets it after building
 /// the registry (TUI → an interactive asker; headless → left `None`).
 pub type ClarifyHandle = Arc<Mutex<Option<Arc<dyn kernel::Asker>>>>;
+type LspHandle = Arc<Mutex<Option<Arc<lsp::LspManager>>>>;
 
 impl ToolRegistry {
     pub fn new() -> Self {
@@ -159,6 +763,8 @@ impl ToolRegistry {
             tasks: None,
             search: Arc::new(Mutex::new(SearchSettings::default())),
             clarify: Arc::new(Mutex::new(None)),
+            lsp: Arc::new(Mutex::new(None)),
+            artifacts: None,
         }
     }
 
@@ -177,6 +783,66 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
         self.tools.insert(tool.name().to_string(), tool);
+        self
+    }
+
+    /// Enable code intelligence and expose its explicit status/diagnostic
+    /// tools. Existing file mutation tools immediately begin attaching fresh
+    /// post-edit diagnostic reports through the shared handle.
+    pub fn register_lsp(&mut self, manager: Arc<lsp::LspManager>) -> &mut Self {
+        *self.lsp.lock().expect("LSP handle lock poisoned") = Some(manager.clone());
+        self.register(Arc::new(LspStatus {
+            manager: manager.clone(),
+        }));
+        if let Some(sbx) = self.sandbox.clone() {
+            let Some(artifacts) = self.artifacts.clone() else {
+                return self;
+            };
+            self.register(Arc::new(LspStart {
+                manager: manager.clone(),
+                sbx: sbx.clone(),
+            }));
+            self.register(Arc::new(LspDiagnostics {
+                manager: manager.clone(),
+                sbx: sbx.clone(),
+                artifacts: artifacts.clone(),
+            }));
+            self.register(Arc::new(LspDefinition {
+                manager: manager.clone(),
+                sbx: sbx.clone(),
+                artifacts: artifacts.clone(),
+            }));
+            self.register(Arc::new(LspReferences {
+                manager: manager.clone(),
+                sbx: sbx.clone(),
+                artifacts: artifacts.clone(),
+            }));
+            self.register(Arc::new(LspHover {
+                manager: manager.clone(),
+                sbx: sbx.clone(),
+                artifacts: artifacts.clone(),
+            }));
+            self.register(Arc::new(LspImplementation {
+                manager: manager.clone(),
+                sbx: sbx.clone(),
+                artifacts: artifacts.clone(),
+            }));
+            self.register(Arc::new(LspDocumentSymbols {
+                manager: manager.clone(),
+                sbx: sbx.clone(),
+                artifacts: artifacts.clone(),
+            }));
+            self.register(Arc::new(LspCallHierarchy {
+                manager: manager.clone(),
+                sbx: sbx.clone(),
+                artifacts: artifacts.clone(),
+            }));
+            self.register(Arc::new(LspSymbols {
+                manager,
+                sbx,
+                artifacts,
+            }));
+        }
         self
     }
 
@@ -257,11 +923,14 @@ impl ToolRegistry {
     ) -> Self {
         let mut r = Self::new();
         r.sandbox = Some(sandbox.clone());
+        r.artifacts = Some(artifacts.clone());
         r.register(Arc::new(FsRead {
             sbx: sandbox.clone(),
         }));
         r.register(Arc::new(FsWrite {
             sbx: sandbox.clone(),
+            lsp: r.lsp.clone(),
+            artifacts: artifacts.clone(),
         }));
         r.register(Arc::new(FsList {
             sbx: sandbox.clone(),
@@ -269,6 +938,8 @@ impl ToolRegistry {
         r.register(Arc::new(FsEdit {
             sbx: sandbox.clone(),
             pins: Default::default(),
+            lsp: r.lsp.clone(),
+            artifacts: artifacts.clone(),
         }));
         r.register(Arc::new(WordCount {
             sbx: sandbox.clone(),
@@ -291,6 +962,8 @@ impl ToolRegistry {
         r.register(Arc::new(MultiEdit {
             sbx: sandbox.clone(),
             pins: Default::default(),
+            lsp: r.lsp.clone(),
+            artifacts: artifacts.clone(),
         }));
         r.register(Arc::new(Git {
             sbx: sandbox.clone(),
@@ -519,6 +1192,8 @@ impl Tool for FsRead {
 
 struct FsWrite {
     sbx: Arc<WorkspaceSandbox>,
+    lsp: LspHandle,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
 }
 #[async_trait]
 impl Tool for FsWrite {
@@ -553,6 +1228,11 @@ impl Tool for FsWrite {
         // a proper diff: a new file shows as all-additions (empty left column),
         // an overwrite shows the real before/after — same view as fs.edit.
         let (old, unreadable) = read_or_flag_unreadable(&self.sbx, &path).await;
+        let baseline = if unreadable {
+            None
+        } else {
+            pre_edit_lsp(&self.lsp, &self.sbx, &path, &old).await
+        };
         let snapshot = self
             .sbx
             .write(&path, &content)
@@ -563,6 +1243,18 @@ impl Tool for FsWrite {
             out["note"] = json!(
                 "prior file existed but was unreadable (non-UTF-8 or permission denied); diff shows it as empty"
             );
+        }
+        if let Some(report) = post_edit_lsp(
+            &self.lsp,
+            &self.sbx,
+            &self.artifacts,
+            &path,
+            &content,
+            baseline,
+        )
+        .await
+        {
+            out["lsp"] = report;
         }
         Ok(out)
     }
@@ -683,6 +1375,8 @@ fn content_hash(s: &str) -> u64 {
 struct FsEdit {
     sbx: Arc<WorkspaceSandbox>,
     pins: PreviewPins,
+    lsp: LspHandle,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
 }
 #[async_trait]
 impl Tool for FsEdit {
@@ -741,13 +1435,14 @@ impl Tool for FsEdit {
         } else {
             content.replacen(&old_s, &new_s, 1)
         };
+        let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
         let snapshot = self
             .sbx
             .write(&path, &updated)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
         let diff = make_diff(&path, &content, &updated);
-        Ok(json!({
+        let mut out = json!({
             "path": path,
             "diff": diff,
             // Raw before/after content too, so a richer surface (e.g. a TUI)
@@ -757,7 +1452,20 @@ impl Tool for FsEdit {
             "new": updated,
             "replacements": if replace_all { count } else { 1 },
             "snapshot": snapshot
-        }))
+        });
+        if let Some(report) = post_edit_lsp(
+            &self.lsp,
+            &self.sbx,
+            &self.artifacts,
+            &path,
+            &updated,
+            baseline,
+        )
+        .await
+        {
+            out["lsp"] = report;
+        }
+        Ok(out)
     }
 
     /// Compute the diff without writing — the real preview for the gate. Mirrors
@@ -3140,6 +3848,8 @@ impl Tool for TaskList {
 struct MultiEdit {
     sbx: Arc<WorkspaceSandbox>,
     pins: PreviewPins,
+    lsp: LspHandle,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
 }
 
 /// Apply a sequence of exact-substring replacements to `content`, in order (each
@@ -3285,20 +3995,34 @@ impl Tool for MultiEdit {
         // Refuse if the file changed since the approved preview (P1-1).
         self.pins.check(args, &path, &content)?;
         let updated = apply_edits(&content, edits)?;
+        let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
         let snapshot = self
             .sbx
             .write(&path, &updated)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
         let diff = make_diff(&path, &content, &updated);
-        Ok(json!({
+        let mut out = json!({
             "path": path,
             "edits_applied": edits.len(),
             "diff": diff,
             "old": content,
             "new": updated,
             "snapshot": snapshot
-        }))
+        });
+        if let Some(report) = post_edit_lsp(
+            &self.lsp,
+            &self.sbx,
+            &self.artifacts,
+            &path,
+            &updated,
+            baseline,
+        )
+        .await
+        {
+            out["lsp"] = report;
+        }
+        Ok(out)
     }
 
     async fn preview(&self, args: &Value) -> Option<String> {
@@ -4275,6 +4999,40 @@ mod tests {
         assert_eq!(obs.payload["content"], "hi");
     }
 
+    #[tokio::test]
+    async fn lsp_registration_exposes_tools_and_annotates_rust_writes() {
+        let dir = std::env::temp_dir().join(format!("medha-lsp-tools-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let mut reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+        reg.register_lsp(Arc::new(lsp::LspManager::new(
+            dir,
+            lsp::Config {
+                enabled: false,
+                ..lsp::Config::default()
+            },
+        )));
+
+        let names: Vec<String> = reg.specs().into_iter().map(|spec| spec.name).collect();
+        assert!(names.contains(&"lsp.status".to_string()));
+        assert!(names.contains(&"lsp.start".to_string()));
+        assert!(names.contains(&"lsp.diagnostics".to_string()));
+        assert!(names.contains(&"lsp.definition".to_string()));
+        assert!(names.contains(&"lsp.references".to_string()));
+        assert!(names.contains(&"lsp.hover".to_string()));
+        assert!(names.contains(&"lsp.symbols".to_string()));
+
+        let observation = reg
+            .execute(&ToolIntent {
+                id: "lsp-write".into(),
+                tool: "fs.write".into(),
+                args: json!({ "path": "main.rs", "content": "fn main() {}" }),
+            })
+            .await;
+        assert_eq!(observation.status, kernel::ObsStatus::Ok);
+        assert_eq!(observation.payload["lsp"]["status"], "unavailable");
+    }
+
     /// End-to-end proof that `shell.exec`, routed through a native-backed
     /// workspace, is actually confined: an in-workspace write succeeds, a write
     /// to $HOME is blocked by the OS jail.
@@ -4948,6 +5706,36 @@ mod tests {
     }
     fn mem_artifacts() -> Arc<dyn kernel::ArtifactStore> {
         Arc::new(MemArtifacts::default())
+    }
+
+    #[test]
+    fn truncated_lsp_results_spill_losslessly_to_artifacts() {
+        let artifacts = mem_artifacts();
+        let location = |line| lsp::Location {
+            path: std::path::PathBuf::from("src/lib.rs"),
+            range: lsp::Range {
+                start: lsp::Position { line, character: 0 },
+                end: lsp::Position { line, character: 1 },
+            },
+        };
+        let value = lsp_query_value(
+            lsp::QueryReport::Ready {
+                server: "fake".into(),
+                root: std::path::PathBuf::from("."),
+                sources: vec!["fake".into()],
+                warnings: Vec::new(),
+                items: vec![location(0)],
+                overflow: vec![location(1)],
+                total: 2,
+                truncated: true,
+            },
+            &artifacts,
+        )
+        .unwrap();
+        let hash = value["artifact_hash"].as_str().expect("artifact hash");
+        assert!(artifacts.size(hash).unwrap() > 0);
+        assert_eq!(value["items"].as_array().unwrap().len(), 1);
+        assert!(value.get("overflow").is_none());
     }
 
     /// A registry over a fresh jailed workspace, for exercising tools end-to-end.

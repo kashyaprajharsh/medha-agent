@@ -544,8 +544,11 @@ fn resolve_inner(
         "MEDHA_BASE_URL",
         configured.map(|p| p.base_url.clone()),
     );
-    let (model, model_source) =
-        pick_source(flag_model, "MEDHA_MODEL", configured.map(|p| p.model.clone()));
+    let (model, model_source) = pick_source(
+        flag_model,
+        "MEDHA_MODEL",
+        configured.map(|p| p.model.clone()),
+    );
     let (Some(base_url), Some(model)) = (base_url, model) else {
         return Ok(None);
     };
@@ -806,7 +809,15 @@ fn diagnose_checks(
                 checks.push(Check {
                     health: Health::Ok,
                     title: "Credential resolves".into(),
-                    detail: format!("{} auth, key {}", r.provider.auth.as_str(), if r.credential.is_empty() { "not required" } else { "present" }),
+                    detail: format!(
+                        "{} auth, key {}",
+                        r.provider.auth.as_str(),
+                        if r.credential.is_empty() {
+                            "not required"
+                        } else {
+                            "present"
+                        }
+                    ),
                     auto_fixable: false,
                 });
             }
@@ -857,7 +868,8 @@ fn diagnose_checks(
         Ok(None) => checks.push(Check {
             health: Health::Error,
             title: "No model configured".into(),
-            detail: "run `medha` and add one in /model, or set MEDHA_MODEL + MEDHA_BASE_URL.".into(),
+            detail: "run `medha` and add one in /model, or set MEDHA_MODEL + MEDHA_BASE_URL."
+                .into(),
             auto_fixable: false,
         }),
         Err(e) => checks.push(Check {
@@ -1021,7 +1033,10 @@ impl Pulse {
                 let _ = writeln!(o, "  credential   {cred}");
             }
             Ok(None) => {
-                let _ = writeln!(o, "  none configured yet — run `medha` and add one in /model");
+                let _ = writeln!(
+                    o,
+                    "  none configured yet — run `medha` and add one in /model"
+                );
             }
             Err(e) => {
                 let _ = writeln!(o, "  resolution error: {e}");

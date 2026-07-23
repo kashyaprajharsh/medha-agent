@@ -35,6 +35,7 @@ It covers:
 - **Runs anywhere OpenAI's API shape is spoken** — strict-compliant wire format, so it works on vLLM, NIM, Together, Fireworks, OpenRouter, Groq, Ollama, and OpenAI itself. Live streaming *or* whole-response mode (`/stream`).
 - **Deny-first by construction** — unregistered tools are denied; `shell.exec` is scanned for dangerous patterns; consequential actions gate for human approval.
 - **OS-native sandbox, no Docker required** — filesystem jail via macOS Seatbelt / Linux Landlock by default; Host, Container, and SSH backends available.
+- **Automatic semantic code intelligence** — Medha detects Rust, TypeScript/JavaScript, Python, Go, and C/C++ files, lazily reuses installed language servers, and feeds post-edit diagnostic deltas back into the agent without asking the user to select a language.
 - **Tamper-evident memory** — every fact the agent learns is an event in a SHA-256 hash-chained log, with kernel-computed trust and provenance the model cannot forge.
 - **Time travel** — rewind to any past turn and branch a new session; the original is never destroyed.
 - **Skills** — reusable, security-scanned workflows the agent loads on demand and can author with your approval.
@@ -210,6 +211,9 @@ stale_after_days = 30
 enabled = true
 max_chars = 20000
 progressive_discovery = true
+
+[lsp]
+enabled = true                  # automatic; set false only to disable semantic code intelligence
 
 [reasoning]
 # stream = false              # whole reply at once; surfaces reasoning on some gateways

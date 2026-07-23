@@ -1103,6 +1103,64 @@ async fn main() -> Result<()> {
         .with_judge(security_judge),
     );
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
+    if lock.lsp.enabled {
+        let mut lsp_config = lsp::Config {
+            enabled: true,
+            startup_timeout: std::time::Duration::from_millis(lock.lsp.startup_timeout_ms),
+            request_timeout: std::time::Duration::from_millis(lock.lsp.request_timeout_ms),
+            diagnostics_timeout: std::time::Duration::from_millis(lock.lsp.diagnostics_timeout_ms),
+            diagnostic_settle: std::time::Duration::from_millis(lock.lsp.diagnostic_settle_ms),
+            idle_timeout: std::time::Duration::from_millis(lock.lsp.idle_timeout_ms),
+            restart_backoff: std::time::Duration::from_millis(lock.lsp.restart_backoff_ms),
+            max_restart_attempts: lock.lsp.max_restart_attempts,
+            max_servers: lock.lsp.max_servers,
+            max_results: lock.lsp.max_results,
+            max_text_chars: lock.lsp.max_text_chars,
+            max_open_documents: lock.lsp.max_open_documents,
+            allow_network: lock.lsp.allow_network,
+            ..lsp::Config::default()
+        };
+        for configured in &lock.lsp.servers {
+            let id = configured.id.trim();
+            if id.is_empty() || configured.trust != "workspace" {
+                eprintln!(
+                    "note: ignored invalid LSP server '{}' (id and trust = \"workspace\" are required)",
+                    configured.id
+                );
+                continue;
+            }
+            let settings = toml_table_to_json(&configured.settings);
+            // A commandless entry only tunes a built-in server of the same id.
+            if configured.command.is_empty() && configured.languages.is_empty() {
+                match lsp_config.servers.iter_mut().find(|server| server.id == id) {
+                    Some(server) => server.settings = settings,
+                    None => eprintln!(
+                        "note: ignored LSP settings for unknown server '{id}' (add a command to define it)"
+                    ),
+                }
+                continue;
+            }
+            if configured.command.is_empty() || configured.languages.is_empty() {
+                eprintln!(
+                    "note: ignored invalid LSP server '{id}' (command and languages are required to define one)"
+                );
+                continue;
+            }
+            let adapter = lsp::ServerAdapter {
+                id: id.to_string(),
+                command: configured.command.clone(),
+                languages: lsp::language_mappings(&configured.languages),
+                root_markers: configured.root_markers.clone(),
+                requires_approval: true,
+                settings,
+            };
+            lsp_config
+                .servers
+                .retain(|existing| existing.id != adapter.id);
+            lsp_config.servers.push(adapter);
+        }
+        registry.register_lsp(Arc::new(lsp::LspManager::new(cwd.clone(), lsp_config)));
+    }
     registry.register_skills(skill_store.clone());
     // Typed memory (D9): project entries in the workspace state dir, user
     // entries in the user-global store — recall merges both.
@@ -1463,6 +1521,15 @@ async fn main() -> Result<()> {
 /// `MEDHA_APPROVE=none` (or `[policy] autonomous = true` intent) to opt out for
 /// CI/headless autonomy, where the gate is `AutoDeny` and shell would otherwise
 /// be blocked entirely.
+/// Convert a lockfile LSP `settings` table to JSON; empty = server defaults.
+fn toml_table_to_json(table: &toml::Table) -> serde_json::Value {
+    if table.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::to_value(table).unwrap_or(serde_json::Value::Null)
+    }
+}
+
 fn approve_list(base: Vec<String>) -> Vec<String> {
     let raw = std::env::var("MEDHA_APPROVE").unwrap_or_default();
     let parts: Vec<&str> = raw

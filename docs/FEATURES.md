@@ -263,6 +263,7 @@ Precedence: **env var > medha.lock > built-in default**.
 | `[context]` | `trigger_ratio`, `microcompact_ratio`, `tail_ratio`, `protect_first_n`, `protect_last_n`, `prune_min_tool_tokens`, `emergency_ratio` | Compaction tuning. |
 | `[memory]` | `enabled`, `k3_budget_tokens`, `write_approval`, `stale_after_days` | Frozen recall budget, write gate, and deterministic staleness. |
 | `[context_files]` | `enabled`, `max_chars`, `progressive_discovery` | Guarded startup and progressive project instructions. |
+| `[lsp]` | `enabled`, timeout/backoff fields, `max_results`, `max_text_chars`, `allow_network` | Automatic stateful Rust/TS/JS/Python/Go/C/C++ diagnostics, navigation, bounded artifact-backed output, recovery, and status; network is denied by default and `enabled = false` disables LSP. |
 | `[policy]` | `approve`, `autonomy` | `approve`: tool classes requiring human approval. `autonomy`: starting dial `careful`/`normal`/`yolo` (default `careful`; live via `/mode`, override `MEDHA_MODE`). |
 | `[sandbox]` | `backend`, `network`, `image`, `runtime`, `memory`, `pids`, `host`, `remote_dir`, `extra_writable` | Execution backend + network posture. Default: `backend = "native"`, `network = "allow"`. |
 | `[verify]` | `command` | Deterministic check run after file-modifying turns (e.g. `cargo check`). Empty = none. |

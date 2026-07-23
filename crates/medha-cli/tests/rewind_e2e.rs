@@ -26,7 +26,9 @@ async fn log_write(
     let snapshot = sbx.write(path, content).await.unwrap();
     let payload = json!({ "path": path, "written": true, "snapshot": snapshot });
     let obs = Observation::ok(Ulid::new().to_string(), payload);
-    log.append(Event::tool_obs(s, &obs, TrustLabel::Tool)).await.unwrap();
+    log.append(Event::tool_obs(s, &obs, TrustLabel::Tool))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -38,11 +40,16 @@ async fn rewind_branches_the_session_and_rolls_files_back_to_the_cut() {
     let s = Session::new();
 
     // Turn 1: create lib.rs = v1.
-    log.append(Event::user_message(&s, "create lib.rs")).await.unwrap();
+    log.append(Event::user_message(&s, "create lib.rs"))
+        .await
+        .unwrap();
     log_write(&log, &sbx, &s, "lib.rs", "v1").await;
 
     // Turn 2 (the point we'll rewind to): edit lib.rs to v2, create main.rs.
-    let cut = log.append(Event::user_message(&s, "add main.rs and bump lib")).await.unwrap();
+    let cut = log
+        .append(Event::user_message(&s, "add main.rs and bump lib"))
+        .await
+        .unwrap();
     log_write(&log, &sbx, &s, "lib.rs", "v2").await;
     log_write(&log, &sbx, &s, "main.rs", "fn main() {}").await;
 
@@ -65,20 +72,41 @@ async fn rewind_branches_the_session_and_rolls_files_back_to_the_cut() {
 
     // Files rolled back to the turn-1 state: lib.rs back to v1, main.rs gone.
     assert_eq!(rolled, 2, "both post-cut files rolled back");
-    assert_eq!(sbx.read("lib.rs").await.unwrap(), "v1", "lib.rs restored to pre-turn-2");
-    assert!(sbx.read("main.rs").await.is_err(), "main.rs (created after cut) removed");
+    assert_eq!(
+        sbx.read("lib.rs").await.unwrap(),
+        "v1",
+        "lib.rs restored to pre-turn-2"
+    );
+    assert!(
+        sbx.read("main.rs").await.is_err(),
+        "main.rs (created after cut) removed"
+    );
 
     // The branch keeps turn 1's conversation and nothing from turn 2 onward.
-    assert_eq!(msgs.first().map(|m| m.content.as_str()), Some("create lib.rs"));
+    assert_eq!(
+        msgs.first().map(|m| m.content.as_str()),
+        Some("create lib.rs")
+    );
     assert!(
         !msgs.iter().any(|m| m.content.contains("add main.rs")),
         "the rewound-to turn and everything after it are excluded from the branch"
     );
     assert_ne!(branch, s.id);
     let branch_events = log.events(branch).await;
-    assert_eq!(branch_events.len(), 2, "branch = prefix before the cut (turn-1 user msg + its write)");
-    assert!(branch_events.iter().all(|e| e.session_id == branch), "events re-homed onto the branch");
-    assert_eq!(log.events(s.id).await.len(), 5, "original session preserved intact");
+    assert_eq!(
+        branch_events.len(),
+        2,
+        "branch = prefix before the cut (turn-1 user msg + its write)"
+    );
+    assert!(
+        branch_events.iter().all(|e| e.session_id == branch),
+        "events re-homed onto the branch"
+    );
+    assert_eq!(
+        log.events(s.id).await.len(),
+        5,
+        "original session preserved intact"
+    );
 
     // The tamper-evident chain still verifies after the fork appended events.
     log.verify().unwrap();

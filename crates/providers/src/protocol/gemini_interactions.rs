@@ -139,15 +139,6 @@ fn lower_messages(
                 steps.push(json!({"type": "user_input", "content": content}));
             }
             Role::Assistant => {
-                // Thought signatures are replayed only to keep a function-call
-                // loop coherent. A thought from a completed text turn is orphaned
-                // history — replaying it makes Gemini reject the request with
-                // "invalid argument", so only emit thoughts when this turn also
-                // makes a tool call.
-                let has_tool_call = message
-                    .parts
-                    .iter()
-                    .any(|part| matches!(part, ContentPart::ToolCall(_)));
                 for part in &message.parts {
                     match part {
                         ContentPart::Text(part) => {
@@ -163,9 +154,6 @@ fn lower_messages(
                                 // Gemini replay semantics and is display-only.
                                 continue;
                             };
-                            if !has_tool_call {
-                                continue;
-                            }
                             let summary = part.text.as_ref().map_or_else(Vec::new, |text| {
                                 vec![json!({"type": "text", "text": text})]
                             });
@@ -176,23 +164,22 @@ fn lower_messages(
                             }));
                         }
                         ContentPart::ToolCall(part) => {
+                            // In Interactions v1, signatures belong to dedicated
+                            // thought steps (or built-in tool steps), never a
+                            // standard function_call.
+                            reject_gemini_state(&part.provider_state, "standard function call")?;
                             let name = canonical_to_wire
                                 .get(part.tool.as_str())
                                 .copied()
                                 .map(str::to_string)
                                 .unwrap_or_else(|| wire_tool_name(&part.tool));
                             function_names.insert(part.id.clone(), name.clone());
-                            let mut step = json!({
+                            let step = json!({
                                 "type": "function_call",
                                 "id": part.id,
                                 "name": name,
                                 "arguments": part.args,
                             });
-                            // Gemini 3+ requires the call's opaque signature to be
-                            // replayed, or it rejects the request as invalid.
-                            if let Some(signature) = thought_signature(&part.provider_state)? {
-                                step["signature"] = Value::String(signature);
-                            }
                             steps.push(step);
                         }
                         ContentPart::ToolResult(part) => {
@@ -404,7 +391,7 @@ fn decode_steps(
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| {
                         ProviderError::Decode(
-                            "Gemini thought step omitted its required signature".into(),
+                            "Gemini thought omitted its required signature".into(),
                         )
                     })?;
                 let summary = content_text(step.get("summary").unwrap_or(&Value::Null));
@@ -425,17 +412,16 @@ fn decode_steps(
             "function_call" => {
                 let id = required_string(step, "id", "Gemini function call")?;
                 let wire = required_string(step, "name", "Gemini function call")?;
-                let signature = step
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| provider_state(value.to_string()))
-                    .unwrap_or_default();
+                if step.get("signature").is_some() {
+                    return Err(ProviderError::Decode(
+                        "Gemini standard function call unexpectedly contained a signature".into(),
+                    ));
+                }
                 parts.push(ContentPart::ToolCall(kernel::ToolCallPart {
                     id,
                     tool: names.get(&wire).cloned().unwrap_or(wire),
                     args: step.get("arguments").cloned().unwrap_or_else(|| json!({})),
-                    provider_state: signature,
+                    provider_state: Vec::new(),
                 }));
             }
             _ => {}
@@ -519,9 +505,6 @@ enum StepAccum {
         name: String,
         initial_arguments: Option<Value>,
         argument_deltas: String,
-        /// Gemini 3+ attaches an opaque signature to each function call; it must
-        /// be replayed with the call or the next request is rejected.
-        signature: Option<String>,
     },
     #[default]
     Unknown,
@@ -614,19 +597,23 @@ impl ResponseDecoder {
             "model_output" => StepAccum::ModelOutput {
                 text: content_text(step.get("content").unwrap_or(&Value::Null)),
             },
-            "function_call" => StepAccum::FunctionCall {
-                id: required_string(step, "id", "Gemini function-call step.start")?,
-                name: required_string(step, "name", "Gemini function-call step.start")?,
-                initial_arguments: step
-                    .get("arguments")
-                    .filter(|arguments| !arguments.is_null())
-                    .cloned(),
-                argument_deltas: String::new(),
-                signature: step
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            },
+            "function_call" => {
+                if step.get("signature").is_some() {
+                    return Err(ProviderError::Stream(
+                        "Gemini standard function-call step unexpectedly contained a signature"
+                            .into(),
+                    ));
+                }
+                StepAccum::FunctionCall {
+                    id: required_string(step, "id", "Gemini function-call step.start")?,
+                    name: required_string(step, "name", "Gemini function-call step.start")?,
+                    initial_arguments: step
+                        .get("arguments")
+                        .filter(|arguments| !arguments.is_null())
+                        .cloned(),
+                    argument_deltas: String::new(),
+                }
+            }
             _ => StepAccum::Unknown,
         };
         let initial_blocks = match &accum {
@@ -701,13 +688,6 @@ impl ResponseDecoder {
                     .map(str::to_string);
                 Ok(Vec::new())
             }
-            (StepAccum::FunctionCall { signature, .. }, "thought_signature" | "signature") => {
-                *signature = delta
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                Ok(Vec::new())
-            }
             (
                 StepAccum::FunctionCall {
                     initial_arguments,
@@ -746,7 +726,9 @@ impl ResponseDecoder {
         let parts = match accum {
             StepAccum::Thought { summary, signature } => {
                 let signature = signature.filter(|value| !value.is_empty()).ok_or_else(|| {
-                    ProviderError::Decode("Gemini thought step stopped without a signature".into())
+                    ProviderError::Stream(format!(
+                        "Gemini thought step {index} omitted its required signature"
+                    ))
                 })?;
                 vec![ContentPart::Reasoning(kernel::ReasoningPart {
                     text: (!summary.is_empty()).then_some(summary),
@@ -767,7 +749,6 @@ impl ResponseDecoder {
                 name,
                 initial_arguments,
                 argument_deltas,
-                signature,
             } => {
                 let args = if argument_deltas.trim().is_empty() {
                     initial_arguments.unwrap_or_else(|| json!({}))
@@ -781,10 +762,7 @@ impl ResponseDecoder {
                     id,
                     tool: canonical,
                     args,
-                    provider_state: signature
-                        .filter(|value| !value.is_empty())
-                        .map(provider_state)
-                        .unwrap_or_default(),
+                    provider_state: Vec::new(),
                 })]
             }
             StepAccum::Unknown => Vec::new(),
@@ -798,11 +776,13 @@ impl ResponseDecoder {
     }
 
     fn complete(&mut self, value: &Value) -> Result<Vec<Block>, ProviderError> {
-        let pending: Vec<u32> = self.active.keys().copied().collect();
-        let mut blocks = Vec::new();
-        for index in pending {
-            blocks.extend(self.finalize_step(index)?);
+        if !self.active.is_empty() {
+            return Err(ProviderError::Stream(format!(
+                "Gemini terminal interaction arrived before step.stop for indices {:?}",
+                self.active.keys().collect::<Vec<_>>()
+            )));
         }
+        let mut blocks = Vec::new();
         let parts = std::mem::take(&mut self.finished_parts)
             .into_values()
             .flatten()
@@ -858,8 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn function_call_signature_is_replayed() {
-        // Gemini 3+ rejects a replayed function_call without its opaque signature.
+    fn standard_function_call_rejects_misplaced_signature() {
         let sig = ProviderState {
             protocol: Protocol::GeminiInteractions,
             kind: THOUGHT_SIGNATURE.into(),
@@ -891,7 +870,7 @@ mod tests {
             ordered: Some(ordered),
             tools: vec![tool("fs.read")],
         };
-        let (body, _) = prepare_body(
+        let error = prepare_body(
             &context,
             "gemini-model",
             true,
@@ -901,20 +880,12 @@ mod tests {
             },
             Some(4096),
         )
-        .unwrap();
-        let call = body["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|s| s["type"] == "function_call")
-            .unwrap();
-        assert_eq!(call["signature"], "fc-sig");
+        .unwrap_err();
+        assert!(error.to_string().contains("standard function call"));
     }
 
     #[test]
-    fn completed_text_turn_thought_is_not_replayed() {
-        // A thought attached to a plain text response is orphaned history; replaying
-        // it makes Gemini 400 the next request. Only tool-loop thoughts are kept.
+    fn completed_text_turn_thought_is_replayed_exactly() {
         let signature = ProviderState {
             protocol: Protocol::GeminiInteractions,
             kind: THOUGHT_SIGNATURE.into(),
@@ -954,12 +925,14 @@ mod tests {
             Some(4096),
         )
         .unwrap();
-        let has_thought = body["input"]
+        let thought = body["input"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|step| step["type"] == "thought");
-        assert!(!has_thought, "no thought step for a completed text turn");
+            .find(|step| step["type"] == "thought")
+            .expect("stateless mode must replay every thought");
+        assert_eq!(thought["signature"], "stale-sig");
+        assert_eq!(thought["summary"], json!([]));
     }
 
     #[test]
@@ -1085,6 +1058,20 @@ mod tests {
     }
 
     #[test]
+    fn nonstream_thought_without_signature_fails_closed() {
+        let body = json!({
+            "status": "completed",
+            "steps": [
+                {"type":"thought","summary":[{"type":"text","text":"plan"}]},
+                {"type":"model_output","content":[{"type":"text","text":"done"}]}
+            ]
+        })
+        .to_string();
+        let error = parse_interaction(&body, &HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("required signature"));
+    }
+
+    #[test]
     fn streaming_reassembles_arguments_and_signature_before_completion() {
         let mut decoder =
             ResponseDecoder::new(HashMap::from([("fs_read".into(), "fs.read".into())]));
@@ -1149,6 +1136,39 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn thought_without_signature_and_missing_step_stop_fail_closed() {
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        decoder
+            .push(&SseEvent {
+                event: Some("step.start".into()),
+                data: json!({"event_type":"step.start","index":0,"step":{"type":"thought","signature":"","summary":[]}}).to_string(),
+            })
+            .unwrap();
+        let stop_error = decoder
+            .push(&SseEvent {
+                event: Some("step.stop".into()),
+                data: json!({"event_type":"step.stop","index":0}).to_string(),
+            })
+            .unwrap_err();
+        assert!(stop_error.to_string().contains("required signature"));
+
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        decoder
+            .push(&SseEvent {
+                event: Some("step.start".into()),
+                data: json!({"event_type":"step.start","index":0,"step":{"type":"model_output","content":[{"type":"text","text":"done"}]}}).to_string(),
+            })
+            .unwrap();
+        let terminal_error = decoder
+            .push(&SseEvent {
+                event: Some("interaction.completed".into()),
+                data: json!({"event_type":"interaction.completed","interaction":{"status":"completed"}}).to_string(),
+            })
+            .unwrap_err();
+        assert!(terminal_error.to_string().contains("before step.stop"));
     }
 
     #[test]

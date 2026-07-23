@@ -31,7 +31,6 @@ async-trait.workspace = true
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
-dotenvy = "0.15"
 rustyline = "14"
 # Keep crossterm pinned to the same version ratatui re-exports (PART 7) — a mismatch
 # means two crossterm versions in the tree and event types that don't unify.
@@ -52,6 +51,8 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Terminal cells, not chars: CJK/emoji are 2 columns (K14). Same crate ratatui uses.
 unicode-width = "0.2"
+# OSC 52 terminal clipboard transport for transcript selection.
+base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 # TUI stdout-corruption fix: dup/dup2 the real tty so the terminal draws on a

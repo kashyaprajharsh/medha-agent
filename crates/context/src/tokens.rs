@@ -37,7 +37,9 @@ impl BpeCounter {
     /// effectively infallible at runtime; a load failure is a build/packaging
     /// bug, not a recoverable condition.
     pub fn o200k() -> Self {
-        Self { bpe: tiktoken_rs::o200k_base().expect("embedded o200k_base vocabulary loads") }
+        Self {
+            bpe: tiktoken_rs::o200k_base().expect("embedded o200k_base vocabulary loads"),
+        }
     }
 }
 

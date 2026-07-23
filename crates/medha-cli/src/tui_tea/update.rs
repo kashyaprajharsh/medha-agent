@@ -19,10 +19,12 @@ pub(super) fn update<P, L>(
     match msg {
         Msg::KeyPress(key) => handle_key(model, key, kernel, session, transcript, budget, tx),
         Msg::MouseScroll(delta) => model.scroll_by(delta),
+        Msg::Mouse(event) => handle_mouse(model, event),
         Msg::Paste(data) => handle_paste(model, data),
         Msg::Resize(height) => {
             model.viewport_height = height as usize;
             model.auto_scroll = model.scroll_offset >= model.max_scroll();
+            model.text_selection = None;
         }
         Msg::AgentEvent(ev) => handle_agent_event(model, ev, session, transcript),
         Msg::Tick => {
@@ -36,6 +38,72 @@ pub(super) fn update<P, L>(
                 model.bg_tasks = kernel.executor.background_tasks();
             }
         }
+    }
+}
+
+fn handle_mouse(model: &mut Model, event: MouseEvent) {
+    const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(450);
+
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(point) = model.transcript_point(event.column, event.row) else {
+                model.text_selection = None;
+                model.mouse_selecting = false;
+                return;
+            };
+            let now = Instant::now();
+            let count = model
+                .last_click
+                .filter(|last| {
+                    now.duration_since(last.at) <= MULTI_CLICK_WINDOW
+                        && last.point.row == point.row
+                        && last.point.column.abs_diff(point.column) <= 1
+                })
+                .map_or(1, |last| (last.count % 3) + 1);
+            model.last_click = Some(LastClick {
+                point,
+                at: now,
+                count,
+            });
+
+            match count {
+                1 => {
+                    model.text_selection = Some(TextSelection {
+                        anchor: point,
+                        focus: point,
+                        non_empty: false,
+                    });
+                    model.mouse_selecting = true;
+                }
+                2 => {
+                    model.mouse_selecting = false;
+                    model.select_word(point);
+                }
+                _ => {
+                    model.mouse_selecting = false;
+                    model.select_line(point);
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) if model.mouse_selecting => {
+            if let Some(point) = model.transcript_point(event.column, event.row)
+                && let Some(selection) = &mut model.text_selection
+            {
+                selection.focus = point;
+                selection.non_empty = selection.anchor != point;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) if model.mouse_selecting => {
+            if let Some(point) = model.transcript_point(event.column, event.row)
+                && let Some(selection) = &mut model.text_selection
+            {
+                selection.focus = point;
+                selection.non_empty = selection.anchor != point;
+            }
+            model.mouse_selecting = false;
+            model.queue_selection_copy();
+        }
+        _ => {}
     }
 }
 
@@ -3540,7 +3608,9 @@ pub(super) fn run_slash<P: kernel::Provider>(
                 .map(|(c, d)| format!("{c}  {d}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            text.push_str("\n\nshortcuts:\n\n  Esc     interrupt a running turn\n  Ctrl-D  quit\n  ↑/↓     scroll (empty input) · history (while typing)");
+            text.push_str(
+                "\n\nshortcuts:\n\n  Esc     interrupt a running turn\n  Ctrl-D  quit\n  ↑/↓     scroll (empty input) · history (while typing)\n  Mouse   drag copies · double-click word · triple-click line",
+            );
             model.push_notice(text);
         }
         c if c == "theme" || c.starts_with("theme ") => {
@@ -3561,6 +3631,42 @@ pub(super) fn run_slash<P: kernel::Provider>(
                 model.active_profile,
                 model.reasoning_status_block()
             ));
+        }
+        c if c == "pulse" || c.strip_prefix("pulse").is_some_and(is_cmd_boundary) => {
+            let fix = c.strip_prefix("pulse").unwrap_or("").trim() == "fix";
+            // Snapshot the live profile registry for a prompt-free config read.
+            let snapshot = model.model_config.lock().ok().map(|g| g.clone());
+            let report = config::pulse(snapshot.as_ref(), None, None);
+            let mut text = report.render();
+            if fix {
+                if let Ok(mut guard) = model.model_config.lock() {
+                    let applied = config::apply_safe_fixes(&mut guard);
+                    if applied.is_empty() {
+                        text.push_str("\nfix: nothing to repair.");
+                    } else {
+                        match config::save(&guard) {
+                            Ok(()) => {
+                                text.push_str(&format!(
+                                    "\nfix: applied {} repair(s):",
+                                    applied.len()
+                                ));
+                                for line in applied {
+                                    text.push_str(&format!("\n  ✔ {line}"));
+                                }
+                            }
+                            Err(error) => {
+                                text.push_str(&format!(
+                                    "\nfix: could not persist repairs: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else if report.has_fixes() {
+                text.push_str("\n(run `/pulse fix` to apply the fixable items)");
+            }
+            // Live health: refresh the previous /pulse block instead of stacking.
+            model.upsert_notice("pulse", text);
         }
         other => model.push_notice(format!("unknown command: /{other}")),
     }
@@ -3985,12 +4091,12 @@ mod fix_tests {
         let transcript = vec![Message::system("S")];
 
         run_slash(&mut m, "reasoning on", &transcript, &provider);
-        // "on" with no chosen effort defaults to Minimal — a concrete, portable
-        // level (openai-chat requires an explicit effort; Gemini's lowest is
-        // minimal). Support here is only "unverified", so enabling is permitted
-        // with a warning, not blocked.
-        assert_eq!(m.reasoning.enabled, Some(true));
-        assert_eq!(m.reasoning.effort, Some(kernel::ReasoningEffort::Minimal));
+        assert_eq!(m.reasoning.enabled, None);
+        assert_eq!(m.reasoning.effort, None);
+        assert!(matches!(
+            m.items.back().map(|entry| &entry.item),
+            Some(Item::Notice(message)) if message.contains("explicit effort")
+        ));
 
         run_slash(&mut m, "reasoning show", &transcript, &provider);
         assert!(m.show_thinking);

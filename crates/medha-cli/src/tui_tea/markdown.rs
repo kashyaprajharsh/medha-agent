@@ -29,6 +29,10 @@ pub(super) fn render(src: &str, width: u16) -> Vec<Line<'static>> {
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
+    // Recognize `$…$` / `$$…$$` so LaTeX math becomes InlineMath/DisplayMath
+    // events we can transliterate, instead of the raw `$$\text{…}$$` leaking
+    // through as literal text (a terminal can't typeset real math).
+    opts.insert(Options::ENABLE_MATH);
     let parser = Parser::new_ext(src, opts);
     let mut r = Renderer::new(width);
     for ev in parser {
@@ -141,10 +145,7 @@ impl Renderer {
     fn indent_spans(&self) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
         for _ in 0..self.quote_depth {
-            spans.push(Span::styled(
-                "▏ ",
-                Style::default().fg(theme::border()),
-            ));
+            spans.push(Span::styled("▏ ", Style::default().fg(theme::border())));
         }
         // Two columns of indent per nested list level (the marker for the
         // deepest level is added separately).
@@ -175,14 +176,16 @@ impl Renderer {
                 Some(n) => {
                     let label = format!("{n}. ");
                     *n += 1;
-                    self.cur.push(Span::styled(
-                        label,
-                        Style::default().fg(theme::accent()),
-                    ));
+                    self.cur
+                        .push(Span::styled(label, Style::default().fg(theme::accent())));
                 }
                 None => {
                     // Alternate bullet glyph by depth for visual nesting.
-                    let glyph = if self.lists.len() % 2 == 0 { "◦ " } else { "• " };
+                    let glyph = if self.lists.len() % 2 == 0 {
+                        "◦ "
+                    } else {
+                        "• "
+                    };
                     self.cur.push(Span::styled(
                         glyph.to_string(),
                         Style::default().fg(theme::accent()),
@@ -208,12 +211,7 @@ impl Renderer {
     /// Ensure a blank separator before a new block, but never two in a row and
     /// never as the very first line.
     fn blank(&mut self) {
-        if self
-            .out
-            .last()
-            .map(|l| line_is_blank(l))
-            .unwrap_or(true)
-        {
+        if self.out.last().map(|l| line_is_blank(l)).unwrap_or(true) {
             return;
         }
         self.out.push(Line::default());
@@ -268,7 +266,10 @@ impl Renderer {
                 self.write_inline(&format!("[^{name}]"), false);
             }
             Event::InlineMath(t) | Event::DisplayMath(t) => {
-                self.write_inline(&t, false);
+                // Terminals can't typeset math; transliterate LaTeX to readable
+                // Unicode so a flow like `$$\text{A}\longrightarrow\text{B}$$`
+                // reads as `A ⟶ B` instead of raw markup.
+                self.write_inline(&math_to_unicode(&t), false);
             }
         }
     }
@@ -311,10 +312,8 @@ impl Renderer {
                 self.heading = Some(level);
                 // A leading bar makes H1/H2 unmistakable when scrolling.
                 if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
-                    self.cur.push(Span::styled(
-                        "▌ ",
-                        Style::default().fg(theme::accent()),
-                    ));
+                    self.cur
+                        .push(Span::styled("▌ ", Style::default().fg(theme::accent())));
                 }
             }
             Tag::BlockQuote(_) => {
@@ -471,7 +470,9 @@ impl Renderer {
             Span::styled("╭─ ", border),
             Span::styled(
                 label.to_string(),
-                Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::dim())
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         let highlighted = highlight(lang, src);
@@ -488,10 +489,7 @@ impl Renderer {
                 for raw in src_no_trailing.split('\n') {
                     self.out.push(Line::from(vec![
                         Span::styled("│ ", border),
-                        Span::styled(
-                            raw.to_string(),
-                            Style::default().fg(theme::code_fg()),
-                        ),
+                        Span::styled(raw.to_string(), Style::default().fg(theme::code_fg())),
                     ]));
                 }
             }
@@ -739,7 +737,10 @@ fn highlight(lang: &str, src: &str) -> Option<Vec<Vec<Span<'static>>>> {
     use syntect::easy::HighlightLines;
     use syntect::util::LinesWithEndings;
 
-    if lang.trim().is_empty() {
+    // Syntax definitions may backtrack heavily on adversarial/generated input.
+    // Large fences still render as plain code; they simply skip highlighting.
+    const MAX_HIGHLIGHT_BYTES: usize = 256 * 1024;
+    if lang.trim().is_empty() || src.len() > MAX_HIGHLIGHT_BYTES {
         return None;
     }
     let h = highlighter();
@@ -769,6 +770,334 @@ fn highlight(lang: &str, src: &str) -> Option<Vec<Vec<Span<'static>>>> {
         out.push(spans);
     }
     Some(out)
+}
+
+// ── math transliteration ─────────────────────────────────────────────────────
+
+/// LaTeX-ish math → readable Unicode for a terminal (which has no math
+/// typesetting). Not a real renderer: it strips formatting wrappers (`\text{}`,
+/// grouping braces), maps common commands to Unicode symbols, and turns simple
+/// super/subscripts into Unicode, so `\text{A}\longrightarrow\text{B}` reads as
+/// `A ⟶ B` instead of raw markup. Unknown commands degrade to their bare name.
+fn math_to_unicode(src: &str) -> String {
+    const MAX_MATH_CHARS: usize = 32 * 1024;
+    let chars: Vec<char> = src.chars().take(MAX_MATH_CHARS).collect();
+    let mut i = 0;
+    let raw = convert_math(&chars, &mut i, false, 0);
+    // Collapse the whitespace that stripped commands/braces leave behind.
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Formatting-only wrappers whose braces are dropped but content kept.
+const MATH_WRAPPERS: &[&str] = &[
+    "text",
+    "textrm",
+    "textbf",
+    "textit",
+    "texttt",
+    "mathrm",
+    "mathbf",
+    "mathit",
+    "mathsf",
+    "mathtt",
+    "mathcal",
+    "mathbb",
+    "mathfrak",
+    "boldsymbol",
+    "operatorname",
+];
+
+/// `\command` (without the backslash) → Unicode symbol.
+fn math_symbol(name: &str) -> Option<&'static str> {
+    Some(match name {
+        // arrows
+        "longrightarrow" | "implies" => "⟶",
+        "rightarrow" | "to" => "→",
+        "Rightarrow" => "⇒",
+        "longleftarrow" => "⟵",
+        "leftarrow" | "gets" => "←",
+        "Leftarrow" => "⇐",
+        "leftrightarrow" => "↔",
+        "Leftrightarrow" | "iff" => "⇔",
+        "longleftrightarrow" => "⟷",
+        "mapsto" => "↦",
+        "uparrow" => "↑",
+        "downarrow" => "↓",
+        // operators
+        "times" => "×",
+        "cdot" => "·",
+        "div" => "÷",
+        "pm" => "±",
+        "mp" => "∓",
+        "ast" => "∗",
+        "star" => "⋆",
+        "circ" => "∘",
+        "bullet" => "•",
+        "oplus" => "⊕",
+        "otimes" => "⊗",
+        // relations
+        "leq" | "le" => "≤",
+        "geq" | "ge" => "≥",
+        "neq" | "ne" => "≠",
+        "approx" => "≈",
+        "equiv" => "≡",
+        "cong" => "≅",
+        "sim" => "∼",
+        "simeq" => "≃",
+        "propto" => "∝",
+        "ll" => "≪",
+        "gg" => "≫",
+        "ratio" => "∶",
+        // sets & logic
+        "in" => "∈",
+        "notin" => "∉",
+        "subset" => "⊂",
+        "subseteq" => "⊆",
+        "supset" => "⊃",
+        "supseteq" => "⊇",
+        "cup" => "∪",
+        "cap" => "∩",
+        "setminus" => "∖",
+        "emptyset" | "varnothing" => "∅",
+        "forall" => "∀",
+        "exists" => "∃",
+        "nexists" => "∄",
+        "neg" | "lnot" => "¬",
+        "land" | "wedge" => "∧",
+        "lor" | "vee" => "∨",
+        // misc
+        "infty" => "∞",
+        "partial" => "∂",
+        "nabla" => "∇",
+        "sum" => "∑",
+        "prod" => "∏",
+        "int" => "∫",
+        "oint" => "∮",
+        "cdots" => "⋯",
+        "ldots" | "dots" => "…",
+        "vdots" => "⋮",
+        "angle" => "∠",
+        "perp" => "⊥",
+        "parallel" => "∥",
+        "hbar" => "ℏ",
+        "ell" => "ℓ",
+        "aleph" => "ℵ",
+        "degree" => "°",
+        "prime" => "′",
+        "quad" | "qquad" | "," | ";" | ":" | "!" => " ",
+        // lowercase Greek
+        "alpha" => "α",
+        "beta" => "β",
+        "gamma" => "γ",
+        "delta" => "δ",
+        "epsilon" | "varepsilon" => "ε",
+        "zeta" => "ζ",
+        "eta" => "η",
+        "theta" | "vartheta" => "θ",
+        "iota" => "ι",
+        "kappa" => "κ",
+        "lambda" => "λ",
+        "mu" => "μ",
+        "nu" => "ν",
+        "xi" => "ξ",
+        "pi" | "varpi" => "π",
+        "rho" | "varrho" => "ρ",
+        "sigma" | "varsigma" => "σ",
+        "tau" => "τ",
+        "upsilon" => "υ",
+        "phi" | "varphi" => "φ",
+        "chi" => "χ",
+        "psi" => "ψ",
+        "omega" => "ω",
+        // uppercase Greek
+        "Gamma" => "Γ",
+        "Delta" => "Δ",
+        "Theta" => "Θ",
+        "Lambda" => "Λ",
+        "Xi" => "Ξ",
+        "Pi" => "Π",
+        "Sigma" => "Σ",
+        "Upsilon" => "Υ",
+        "Phi" => "Φ",
+        "Psi" => "Ψ",
+        "Omega" => "Ω",
+        _ => return None,
+    })
+}
+
+/// Convert until end of input, or (when `in_group`) until the matching `}`,
+/// which is consumed. Grouping braces are dropped; their content is kept.
+const MAX_MATH_DEPTH: usize = 128;
+
+fn convert_math(chars: &[char], i: &mut usize, in_group: bool, depth: usize) -> String {
+    if depth >= MAX_MATH_DEPTH {
+        let remainder = chars[*i..].iter().collect();
+        *i = chars.len();
+        return remainder;
+    }
+    let mut out = String::new();
+    while *i < chars.len() {
+        match chars[*i] {
+            '}' if in_group => {
+                *i += 1;
+                break;
+            }
+            '{' => {
+                *i += 1;
+                out.push_str(&convert_math(chars, i, true, depth + 1));
+            }
+            '\\' => {
+                *i += 1;
+                out.push_str(&math_command(chars, i, depth));
+            }
+            '^' => {
+                *i += 1;
+                out.push_str(&math_script(chars, i, true, depth));
+            }
+            '_' => {
+                *i += 1;
+                out.push_str(&math_script(chars, i, false, depth));
+            }
+            '$' => *i += 1, // stray delimiter
+            c => {
+                out.push(c);
+                *i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Handle one `\…` control sequence. `i` points just past the backslash.
+fn math_command(chars: &[char], i: &mut usize, depth: usize) -> String {
+    // Control symbol (non-letter): `\\` line break, escaped `{`/`}`/`$`/`%`/`#`,
+    // or thin-space punctuation like `\,`.
+    if *i < chars.len() && !chars[*i].is_ascii_alphabetic() {
+        let c = chars[*i];
+        *i += 1;
+        return match c {
+            '\\' => " ".into(),
+            '{' | '}' | '$' | '%' | '#' | '&' | '_' => c.to_string(),
+            ',' | ';' | ':' | '!' | ' ' => " ".into(),
+            _ => c.to_string(),
+        };
+    }
+    // Control word: a run of letters.
+    let start = *i;
+    while *i < chars.len() && chars[*i].is_ascii_alphabetic() {
+        *i += 1;
+    }
+    let name: String = chars[start..*i].iter().collect();
+
+    if MATH_WRAPPERS.contains(&name.as_str()) {
+        skip_spaces(chars, i);
+        if *i < chars.len() && chars[*i] == '{' {
+            *i += 1;
+            return convert_math(chars, i, true, depth + 1);
+        }
+        return String::new();
+    }
+    if matches!(name.as_str(), "frac" | "dfrac" | "tfrac") {
+        let a = take_group(chars, i, depth);
+        let b = take_group(chars, i, depth);
+        return format!("({a})/({b})");
+    }
+    if name == "sqrt" {
+        return format!("√({})", take_group(chars, i, depth));
+    }
+    if let Some(sym) = math_symbol(&name) {
+        return sym.to_string();
+    }
+    // Unknown command → its bare name. Keep the following space (readability
+    // beats LaTeX's space-eating rule here); doubles collapse at the end.
+    name
+}
+
+/// Read a `{…}` group's converted content; if the next token isn't a brace,
+/// take a single following character (LaTeX's single-token argument rule).
+fn take_group(chars: &[char], i: &mut usize, depth: usize) -> String {
+    skip_spaces(chars, i);
+    if *i < chars.len() && chars[*i] == '{' {
+        *i += 1;
+        return convert_math(chars, i, true, depth + 1);
+    }
+    if *i < chars.len() {
+        let c = chars[*i];
+        *i += 1;
+        return c.to_string();
+    }
+    String::new()
+}
+
+/// Convert a `^`/`_` argument to Unicode super/subscript when every character
+/// maps; otherwise fall back to `^(…)` / `_(…)` so nothing is lost.
+fn math_script(chars: &[char], i: &mut usize, sup: bool, depth: usize) -> String {
+    let arg = take_group(chars, i, depth);
+    let mapped: Option<String> = arg
+        .chars()
+        .map(|c| if sup { super_char(c) } else { sub_char(c) })
+        .collect();
+    match mapped {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            let mark = if sup { '^' } else { '_' };
+            if arg.chars().count() <= 1 {
+                format!("{mark}{arg}")
+            } else {
+                format!("{mark}({arg})")
+            }
+        }
+    }
+}
+
+fn super_char(c: char) -> Option<char> {
+    Some(match c {
+        '0' => '⁰',
+        '1' => '¹',
+        '2' => '²',
+        '3' => '³',
+        '4' => '⁴',
+        '5' => '⁵',
+        '6' => '⁶',
+        '7' => '⁷',
+        '8' => '⁸',
+        '9' => '⁹',
+        '+' => '⁺',
+        '-' => '⁻',
+        '=' => '⁼',
+        '(' => '⁽',
+        ')' => '⁾',
+        'n' => 'ⁿ',
+        'i' => 'ⁱ',
+        _ => return None,
+    })
+}
+
+fn sub_char(c: char) -> Option<char> {
+    Some(match c {
+        '0' => '₀',
+        '1' => '₁',
+        '2' => '₂',
+        '3' => '₃',
+        '4' => '₄',
+        '5' => '₅',
+        '6' => '₆',
+        '7' => '₇',
+        '8' => '₈',
+        '9' => '₉',
+        '+' => '₊',
+        '-' => '₋',
+        '=' => '₌',
+        '(' => '₍',
+        ')' => '₎',
+        _ => return None,
+    })
+}
+
+fn skip_spaces(chars: &[char], i: &mut usize) {
+    while *i < chars.len() && chars[*i] == ' ' {
+        *i += 1;
+    }
 }
 
 #[cfg(test)]
@@ -814,6 +1143,46 @@ mod tests {
         // pulldown-cmark follows CommonMark: intraword underscores are literal.
         let out = render("call foo_bar_baz please", 80);
         assert!(plain(&out).contains("foo_bar_baz"));
+    }
+
+    #[test]
+    fn math_transliterates_to_unicode() {
+        // The screenshot case: a flow diagram in display math.
+        assert_eq!(
+            math_to_unicode(
+                r"\text{Task Trajectory} \longrightarrow \text{Reflection/Diagnosis} \longrightarrow \text{Eval Gate}"
+            ),
+            "Task Trajectory ⟶ Reflection/Diagnosis ⟶ Eval Gate"
+        );
+        // Wrappers stripped, symbols mapped, super/subscripts, fractions.
+        assert_eq!(
+            math_to_unicode(r"\alpha \times \beta \leq \gamma"),
+            "α × β ≤ γ"
+        );
+        assert_eq!(math_to_unicode(r"x^2 + y_1"), "x² + y₁");
+        assert_eq!(math_to_unicode(r"\frac{a}{b}"), "(a)/(b)");
+        assert_eq!(math_to_unicode(r"\sqrt{x+1}"), "√(x+1)");
+        // Unknown command degrades to its bare name — never a raw backslash.
+        assert_eq!(math_to_unicode(r"\weirdcmd x"), "weirdcmd x");
+        assert!(!math_to_unicode(r"\foo^{bar}").contains('\\'));
+    }
+
+    #[test]
+    fn math_renders_through_the_markdown_pipeline_no_dollars() {
+        // `$$...$$` must be parsed as math (ENABLE_MATH) and transliterated, not
+        // leaked as literal `$$` / raw LaTeX.
+        let out = render(r"$$\text{A} \longrightarrow \text{B}$$", 80);
+        let text = plain(&out);
+        assert!(text.contains("A ⟶ B"), "got: {text:?}");
+        assert!(!text.contains('$'), "dollar delimiters must be consumed");
+        assert!(!text.contains("\\text"), "raw LaTeX must not leak");
+    }
+
+    #[test]
+    fn adversarial_math_depth_and_large_highlight_are_bounded() {
+        let nested = format!("{}x{}", "{".repeat(1_000), "}".repeat(1_000));
+        assert!(!math_to_unicode(&nested).is_empty());
+        assert!(highlight("rust", &"x".repeat(256 * 1024 + 1)).is_none());
     }
 
     #[test]

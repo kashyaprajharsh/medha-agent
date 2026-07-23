@@ -11,13 +11,13 @@ pub mod hub;
 pub mod judge;
 pub mod memory_tools;
 pub mod skills;
+pub use hub::{LockEntry, SearchResults, SkillHit, SkillLock, Tap, TapStore};
+pub use judge::{JudgeOutcome, JudgeRequest, JudgeVerdict, SkillJudge};
 use regex::{Regex, RegexBuilder};
 use sandbox::WorkspaceSandbox;
 use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
-pub use hub::{LockEntry, SearchResults, SkillHit, SkillLock, Tap, TapStore};
-pub use judge::{JudgeOutcome, JudgeRequest, JudgeVerdict, SkillJudge};
 pub use skills::{InstallReport, SkillScope, SkillStore};
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
@@ -229,8 +229,12 @@ impl ToolRegistry {
             budget_tokens,
             stale_after_days,
         )));
-        self.register(Arc::new(memory_tools::MemoryUpdate { store: store.clone() }));
-        self.register(Arc::new(memory_tools::MemoryForget { store: store.clone() }));
+        self.register(Arc::new(memory_tools::MemoryUpdate {
+            store: store.clone(),
+        }));
+        self.register(Arc::new(memory_tools::MemoryForget {
+            store: store.clone(),
+        }));
         self.register(Arc::new(memory_tools::MemorySearch { store }));
         self
     }
@@ -2492,7 +2496,9 @@ impl Clarify {
                 .and_then(Value::as_array)
                 .ok_or_else(|| ToolError::Args("each question needs an 'options' array".into()))?;
             if opts.len() < 2 {
-                return Err(ToolError::Args("each question needs at least 2 options".into()));
+                return Err(ToolError::Args(
+                    "each question needs at least 2 options".into(),
+                ));
             }
             // Models sometimes overshoot the 5-option UI cap; keep the first 5
             // rather than failing the whole call.
@@ -3474,10 +3480,15 @@ struct Diagnostics {
     sbx: Arc<WorkspaceSandbox>,
 }
 
-/// Parse `cargo check --message-format=json` stdout into structured diagnostics.
-/// Each stdout line is one JSON object; we keep `compiler-message` errors and
-/// warnings, pulling the primary span for file/line/column.
-fn cargo_diagnostics(stdout: &str) -> Vec<Value> {
+/// A parser turning a checker's `(stdout, stderr)` into structured diagnostics.
+/// Uniform signature so every toolchain plugs into the same runner.
+type DiagParse = fn(&str, &str) -> Vec<Value>;
+
+/// Parse `cargo check`/`cargo clippy --message-format=json` stdout into
+/// structured diagnostics. Each stdout line is one JSON object; we keep
+/// `compiler-message` errors and warnings, pulling the primary span for
+/// file/line/column. Clippy reuses this — it emits the identical JSON shape.
+fn cargo_diagnostics(stdout: &str, _stderr: &str) -> Vec<Value> {
     let mut out = Vec::new();
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -3531,35 +3542,298 @@ fn cargo_diagnostics(stdout: &str) -> Vec<Value> {
     out
 }
 
-/// The toolchains `diagnostics` knows how to check. Each maps to ONE fixed,
-/// argument-free command — no user-supplied command string ever runs (that would
-/// be an ungated `shell.exec` bypass).
+/// The toolchains `diagnostics` knows how to check. Each maps to a FIXED set of
+/// argument-free commands (see [`plan_checkers`]) — no user-supplied command
+/// string ever runs (that would be an ungated `shell.exec` bypass).
 #[derive(Clone, Copy, PartialEq)]
 enum DiagLang {
     Rust,
-    TypeScript,
+    Go,
     Python,
+    TypeScript,
+    JavaScript,
+    Cpp,
+    JavaMaven,
+    JavaGradle,
 }
 
-/// Detect the toolchain from marker files at the workspace root. First match wins.
+impl DiagLang {
+    /// Stable id reported back to the model.
+    fn id(self) -> &'static str {
+        match self {
+            DiagLang::Rust => "rust",
+            DiagLang::Go => "go",
+            DiagLang::Python => "python",
+            DiagLang::TypeScript => "typescript",
+            DiagLang::JavaScript => "javascript",
+            DiagLang::Cpp => "cpp",
+            DiagLang::JavaMaven | DiagLang::JavaGradle => "java",
+        }
+    }
+}
+
+/// True if any file directly under `root` has one of `exts` (shallow, no walk).
+fn has_source_ext(root: &std::path::Path, exts: &[&str]) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| exts.contains(&x))
+            .unwrap_or(false)
+    })
+}
+
+/// Detect the toolchain from marker files at the workspace root. First match
+/// wins, most-specific first (tsconfig before package.json; build files before a
+/// bare source-extension scan).
 fn detect_lang(root: &std::path::Path) -> Option<DiagLang> {
-    if root.join("Cargo.toml").exists() {
+    let has = |f: &str| root.join(f).exists();
+    if has("Cargo.toml") {
         Some(DiagLang::Rust)
-    } else if root.join("tsconfig.json").exists() {
+    } else if has("go.mod") {
+        Some(DiagLang::Go)
+    } else if has("tsconfig.json") {
         Some(DiagLang::TypeScript)
-    } else if root.join("pyproject.toml").exists()
-        || root.join("ruff.toml").exists()
-        || root.join(".ruff.toml").exists()
+    } else if has("package.json") {
+        Some(DiagLang::JavaScript)
+    } else if has("pom.xml") {
+        Some(DiagLang::JavaMaven)
+    } else if has("build.gradle") || has("build.gradle.kts") {
+        Some(DiagLang::JavaGradle)
+    } else if has("pyproject.toml")
+        || has("ruff.toml")
+        || has(".ruff.toml")
+        || has("setup.py")
+        || has("requirements.txt")
     {
         Some(DiagLang::Python)
+    } else if has("CMakeLists.txt")
+        || has_source_ext(root, &["cpp", "cc", "cxx", "hpp", "hh", "c", "h"])
+    {
+        Some(DiagLang::Cpp)
     } else {
         None
     }
 }
 
+/// One fixed checker invocation: a program, fixed args, a label, and a parser.
+struct Checker {
+    program: &'static str,
+    args: &'static [&'static str],
+    label: &'static str,
+    parse: DiagParse,
+}
+
+/// The fixed command(s) to run for a language. Multiple entries run in sequence
+/// and their diagnostics merge — e.g. Rust prefers `cargo clippy` (a superset of
+/// `cargo check`) and falls back to `cargo check` when the clippy component is
+/// absent; Go runs `go build` (compile errors) then `go vet` (lint warnings).
+fn plan_checkers(lang: DiagLang) -> Vec<Checker> {
+    match lang {
+        DiagLang::Rust => {
+            if program_on_path("cargo-clippy") {
+                vec![Checker {
+                    program: "cargo",
+                    args: &["clippy", "--message-format=json", "--quiet"],
+                    label: "cargo clippy",
+                    parse: cargo_diagnostics,
+                }]
+            } else {
+                vec![Checker {
+                    program: "cargo",
+                    args: &["check", "--message-format=json", "--quiet"],
+                    label: "cargo check",
+                    parse: cargo_diagnostics,
+                }]
+            }
+        }
+        DiagLang::Go => vec![
+            Checker {
+                program: "go",
+                args: &["build", "./..."],
+                label: "go build",
+                parse: gobuild_diagnostics,
+            },
+            Checker {
+                program: "go",
+                args: &["vet", "./..."],
+                label: "go vet",
+                parse: govet_diagnostics,
+            },
+        ],
+        DiagLang::Python => vec![Checker {
+            program: "ruff",
+            args: &["check", "--output-format=json", "."],
+            label: "ruff",
+            parse: ruff_diagnostics,
+        }],
+        DiagLang::TypeScript => vec![Checker {
+            program: "npx",
+            args: &["--no-install", "tsc", "--noEmit", "--pretty", "false"],
+            label: "tsc",
+            parse: tsc_diagnostics,
+        }],
+        DiagLang::JavaScript => vec![Checker {
+            program: "npx",
+            args: &["--no-install", "eslint", "--format", "json", "."],
+            label: "eslint",
+            parse: eslint_diagnostics,
+        }],
+        DiagLang::Cpp => vec![Checker {
+            program: "cppcheck",
+            args: &[
+                "--enable=warning,style,performance,portability",
+                "--quiet",
+                "--template={file}:{line}:{column}:{severity}:{id}:{message}",
+                ".",
+            ],
+            label: "cppcheck",
+            parse: cppcheck_diagnostics,
+        }],
+        DiagLang::JavaMaven => vec![Checker {
+            program: "mvn",
+            args: &["-q", "-DskipTests", "compile"],
+            label: "mvn compile",
+            parse: java_diagnostics,
+        }],
+        DiagLang::JavaGradle => vec![Checker {
+            program: "gradle",
+            args: &["-q", "compileJava"],
+            label: "gradle compileJava",
+            parse: java_diagnostics,
+        }],
+    }
+}
+
+/// Shared Go parser: `file.go:line[:col]: message`, skipping `# package` headers.
+/// `severity` is fixed per checker (build → error, vet → warning).
+fn parse_go_stream(text: &str, severity: &str) -> Vec<Value> {
+    let re = Regex::new(r"^(.+?\.go):(\d+):(?:(\d+):)?\s*(.*)$").unwrap();
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.starts_with('#') {
+                return None;
+            }
+            let c = re.captures(l)?;
+            Some(json!({
+                "severity": severity,
+                "file": &c[1],
+                "line": c[2].parse::<u64>().unwrap_or(0),
+                "column": c.get(3).and_then(|m| m.as_str().parse::<u64>().ok()).unwrap_or(0),
+                "code": Value::Null,
+                "message": &c[4],
+            }))
+        })
+        .collect()
+}
+
+/// `go build ./...` compile errors (to stderr) → severity `error`.
+fn gobuild_diagnostics(_stdout: &str, stderr: &str) -> Vec<Value> {
+    parse_go_stream(stderr, "error")
+}
+
+/// `go vet ./...` findings (to stderr) → severity `warning`.
+fn govet_diagnostics(_stdout: &str, stderr: &str) -> Vec<Value> {
+    parse_go_stream(stderr, "warning")
+}
+
+/// Parse `eslint --format json`: `[{filePath, messages:[{line,column,severity,
+/// ruleId,message}]}]`. ESLint severity 2 = error, 1 = warning.
+fn eslint_diagnostics(stdout: &str, _stderr: &str) -> Vec<Value> {
+    let Ok(files) = serde_json::from_str::<Vec<Value>>(stdout) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for f in &files {
+        let path = f.get("filePath").and_then(Value::as_str).unwrap_or("");
+        let Some(msgs) = f.get("messages").and_then(Value::as_array) else {
+            continue;
+        };
+        for m in msgs {
+            let severity = if m.get("severity").and_then(Value::as_u64) == Some(2) {
+                "error"
+            } else {
+                "warning"
+            };
+            out.push(json!({
+                "severity": severity,
+                "file": path,
+                "line": m.get("line").and_then(Value::as_u64).unwrap_or(0),
+                "column": m.get("column").and_then(Value::as_u64).unwrap_or(0),
+                "code": m.get("ruleId").and_then(Value::as_str),
+                "message": m.get("message").and_then(Value::as_str).unwrap_or(""),
+            }));
+        }
+    }
+    out
+}
+
+/// Parse cppcheck's `{file}:{line}:{column}:{severity}:{id}:{message}` template
+/// (emitted to stderr). cppcheck `error` → error; everything else → warning.
+fn cppcheck_diagnostics(_stdout: &str, stderr: &str) -> Vec<Value> {
+    stderr
+        .lines()
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.splitn(6, ':').collect();
+            if parts.len() < 6 {
+                return None;
+            }
+            let severity = if parts[3] == "error" {
+                "error"
+            } else {
+                "warning"
+            };
+            Some(json!({
+                "severity": severity,
+                "file": parts[0],
+                "line": parts[1].parse::<u64>().unwrap_or(0),
+                "column": parts[2].parse::<u64>().unwrap_or(0),
+                "code": parts[4],
+                "message": parts[5].trim(),
+            }))
+        })
+        .collect()
+}
+
+/// Parse javac-style diagnostics from Maven and Gradle output (either stream):
+/// Maven `[ERROR] /path/File.java:[12,5] msg` and javac `/path/File.java:12:
+/// error: msg`.
+fn java_diagnostics(stdout: &str, stderr: &str) -> Vec<Value> {
+    let mvn = Regex::new(r"^\[ERROR\]\s+(.+?\.java):\[(\d+),(\d+)\]\s+(.*)$").unwrap();
+    let javac = Regex::new(r"^(.+?\.java):(\d+):\s*(error|warning):\s*(.*)$").unwrap();
+    let mut out = Vec::new();
+    for l in stdout.lines().chain(stderr.lines()) {
+        let l = l.trim();
+        if let Some(c) = mvn.captures(l) {
+            out.push(json!({
+                "severity": "error",
+                "file": &c[1],
+                "line": c[2].parse::<u64>().unwrap_or(0),
+                "column": c[3].parse::<u64>().unwrap_or(0),
+                "code": Value::Null,
+                "message": &c[4],
+            }));
+        } else if let Some(c) = javac.captures(l) {
+            out.push(json!({
+                "severity": &c[3],
+                "file": &c[1],
+                "line": c[2].parse::<u64>().unwrap_or(0),
+                "column": 0,
+                "code": Value::Null,
+                "message": &c[4],
+            }));
+        }
+    }
+    out
+}
+
 /// Parse `tsc --noEmit --pretty false` output lines:
 /// `src/x.ts(12,5): error TS2322: Type '...' is not assignable ...`
-fn tsc_diagnostics(stdout: &str) -> Vec<Value> {
+fn tsc_diagnostics(stdout: &str, _stderr: &str) -> Vec<Value> {
     let re = Regex::new(r"^(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(TS\d+):\s*(.*)$").unwrap();
     stdout
         .lines()
@@ -3580,7 +3854,7 @@ fn tsc_diagnostics(stdout: &str) -> Vec<Value> {
 /// Parse `ruff check --output-format=json`: an array of
 /// `{filename, location:{row,column}, code, message}`. Ruff emits lint findings
 /// (no per-item severity), so all are reported as `warning`.
-fn ruff_diagnostics(stdout: &str) -> Vec<Value> {
+fn ruff_diagnostics(stdout: &str, _stderr: &str) -> Vec<Value> {
     let Ok(items) = serde_json::from_str::<Vec<Value>>(stdout) else {
         return vec![];
     };
@@ -3611,37 +3885,64 @@ impl Tool for Diagnostics {
     fn description(&self) -> &str {
         "Get STRUCTURED compiler/linter diagnostics — {file, line, column, severity, \
          code, message} — for the workspace, instead of scraping raw build output. \
-         Auto-detects the toolchain (Rust→`cargo check`, TypeScript→`tsc --noEmit`, \
-         Python→`ruff check`) or pass `language` to force one. Use after edits to find \
-         exactly what broke and where."
+         Auto-detects the toolchain from project markers and runs the right checker(s): \
+         Rust→`cargo clippy` (or `cargo check`), Go→`go build`+`go vet`, \
+         Python→`ruff`, TypeScript→`tsc`, JavaScript→`eslint`, C/C++→`cppcheck`, \
+         Java→`mvn`/`gradle` compile. Pass `language` to force one. Checkers not \
+         installed are reported as skipped, never as a clean run. Build tools may \
+         execute project-defined build scripts/plugins, so this action requires \
+         approval. Use after edits to find exactly what broke and where."
     }
     fn blast_radius(&self) -> BlastRadius {
-        // Analysis only: it inspects the code and reports problems; it doesn't
-        // touch source (build artifacts aside), like the verifier.
-        BlastRadius::Read
+        // Cargo/npm/Maven/Gradle and language plugins execute repository-owned
+        // code and write caches/artifacts. Treating this as Read would bypass the
+        // human gate and let an untrusted checkout exfiltrate secrets.
+        BlastRadius::IrreversibleLocal
     }
     fn timeout(&self) -> Option<std::time::Duration> {
-        // A cold `cargo check`/`tsc` on a large workspace easily exceeds 60s.
+        // A cold `cargo check`/`tsc`/`mvn` on a large workspace easily exceeds 60s.
         Some(std::time::Duration::from_secs(600)) // 10 min
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "language": { "type": "string", "enum": ["rust","typescript","python"], "description": "Force a toolchain; omit to auto-detect from the workspace" }
+                "language": {
+                    "type": "string",
+                    "enum": ["rust","go","python","typescript","javascript","cpp","java"],
+                    "description": "Force a toolchain; omit to auto-detect from the workspace"
+                }
             }
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let root = self.sbx.root();
         // Language is an ENUM, never a free command string — no shell.exec bypass.
+        // Each variant maps to a FIXED command set (see `plan_checkers`).
         let lang = match args.get("language").and_then(Value::as_str) {
-            Some("rust") => Some(DiagLang::Rust),
-            Some("typescript") | Some("ts") => Some(DiagLang::TypeScript),
+            Some("rust") | Some("rs") => Some(DiagLang::Rust),
+            Some("go") | Some("golang") => Some(DiagLang::Go),
             Some("python") | Some("py") => Some(DiagLang::Python),
+            Some("typescript") | Some("ts") => Some(DiagLang::TypeScript),
+            Some("javascript") | Some("js") | Some("node") => Some(DiagLang::JavaScript),
+            Some("cpp") | Some("c++") | Some("c") | Some("cc") => Some(DiagLang::Cpp),
+            // Forced Java needs a build tool — pick whichever marker is present.
+            Some("java") => {
+                if root.join("pom.xml").exists() {
+                    Some(DiagLang::JavaMaven)
+                } else if root.join("build.gradle").exists()
+                    || root.join("build.gradle.kts").exists()
+                {
+                    Some(DiagLang::JavaGradle)
+                } else {
+                    return Err(ToolError::Args(
+                        "java forced but no pom.xml or build.gradle found".into(),
+                    ));
+                }
+            }
             Some(other) => {
                 return Err(ToolError::Args(format!(
-                    "unknown language '{other}' (rust|typescript|python)"
+                    "unknown language '{other}' (rust|go|python|typescript|javascript|cpp|java)"
                 )));
             }
             None => detect_lang(root),
@@ -3649,71 +3950,87 @@ impl Tool for Diagnostics {
         let Some(lang) = lang else {
             return Ok(json!({
                 "supported": false,
-                "note": "no supported project detected (looked for Cargo.toml, tsconfig.json, pyproject.toml/ruff.toml). Pass `language`, or use shell.exec for another checker."
+                "note": "no supported project detected (looked for Cargo.toml, go.mod, tsconfig.json, package.json, pom.xml, build.gradle, pyproject.toml/ruff.toml/setup.py/requirements.txt, CMakeLists.txt or C/C++ sources). Pass `language`, or use shell.exec for another checker."
             }));
         };
-        // Each language → ONE fixed command with fixed args.
-        let (program, cmd_args, checker): (&str, &[&str], &str) = match lang {
-            DiagLang::Rust => (
-                "cargo",
-                &["check", "--message-format=json", "--quiet"],
-                "cargo check",
-            ),
-            DiagLang::TypeScript => (
-                "npx",
-                &["--no-install", "tsc", "--noEmit", "--pretty", "false"],
-                "tsc",
-            ),
-            DiagLang::Python => ("ruff", &["check", "--output-format=json", "."], "ruff"),
-        };
-        // Under a sandbox wrapper a missing checker no longer surfaces as a
-        // spawn error on our side (the wrapper spawns fine, then fails to exec
-        // the target), so check PATH up front to keep the honest "not installed"
-        // report instead of a confusing non-zero exit.
-        if !program_on_path(program) {
+
+        let mut diags: Vec<Value> = Vec::new();
+        let mut ran: Vec<&str> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+
+        for c in plan_checkers(lang) {
+            // Under a sandbox wrapper a missing checker surfaces as a wrapper
+            // exec failure, not our spawn error — so check PATH up front to keep
+            // the honest "not installed → skipped" report.
+            if !program_on_path(c.program) {
+                skipped.push(format!("{} ('{}' not on PATH)", c.label, c.program));
+                continue;
+            }
+            let owned: Vec<String> = c.args.iter().map(|s| s.to_string()).collect();
+            let output = match self.sbx.exec(c.program, &owned, shell_env(), true).await {
+                Ok(o) => o,
+                Err(e) => {
+                    skipped.push(format!("{} ({e})", c.label));
+                    continue;
+                }
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut found = (c.parse)(&stdout, &stderr);
+            // A non-zero exit with nothing parsed usually means the checker itself
+            // failed (bad config, a missing sub-tool via npx) — surface stderr
+            // rather than silently reporting a clean run.
+            if found.is_empty() && output.status != Some(0) {
+                let tail: Vec<&str> = stderr.lines().rev().take(6).collect();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                notes.push(format!(
+                    "{} exited non-zero with no parsed diagnostics — stderr: {}",
+                    c.label,
+                    tail.join(" | ")
+                ));
+            }
+            ran.push(c.label);
+            diags.append(&mut found);
+        }
+
+        // Merge across checkers (clippy + check, build + vet) — drop exact dupes.
+        let mut seen = std::collections::HashSet::new();
+        diags.retain(|d| {
+            let key = format!(
+                "{}|{}|{}|{}",
+                d["file"], d["line"], d["column"], d["message"]
+            );
+            seen.insert(key)
+        });
+
+        if ran.is_empty() {
             return Ok(json!({
                 "supported": false,
-                "checker": checker,
-                "note": format!("could not run {checker}: '{program}' not found on PATH. Is it installed?")
+                "language": lang.id(),
+                "note": format!(
+                    "detected {} but no checker could run. Skipped: {}",
+                    lang.id(),
+                    if skipped.is_empty() { "(none)".into() } else { skipped.join("; ") }
+                ),
             }));
         }
-        let cmd_args_owned: Vec<String> = cmd_args.iter().map(|s| s.to_string()).collect();
-        let output = match self.sbx.exec(program, &cmd_args_owned, vec![], false).await {
-            Ok(o) => o,
-            Err(e) => {
-                return Ok(json!({
-                    "supported": false,
-                    "checker": checker,
-                    "note": format!("could not run {checker}: {e}. Is it installed and on PATH?")
-                }));
-            }
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let diags = match lang {
-            DiagLang::Rust => cargo_diagnostics(&stdout),
-            DiagLang::TypeScript => tsc_diagnostics(&stdout),
-            DiagLang::Python => ruff_diagnostics(&stdout),
-        };
+
         let errors = diags.iter().filter(|d| d["severity"] == "error").count();
         let warnings = diags.iter().filter(|d| d["severity"] == "warning").count();
         let mut result = json!({
             "supported": true,
-            "checker": checker,
+            "language": lang.id(),
+            "checkers_ran": ran,
             "errors": errors,
             "warnings": warnings,
             "diagnostics": diags,
         });
-        // If the checker itself failed (config error, missing sub-tool via npx)
-        // and produced no parseable diagnostics, surface stderr rather than
-        // silently reporting a clean run.
-        if errors == 0 && warnings == 0 && output.status != Some(0) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            result["note"] = json!(format!(
-                "{checker} exited non-zero with no parsed diagnostics — stderr: {}",
-                tail.join(" | ")
-            ));
+        if !skipped.is_empty() {
+            result["checkers_skipped"] = json!(skipped);
+        }
+        if !notes.is_empty() {
+            result["notes"] = json!(notes);
         }
         Ok(result)
     }
@@ -4375,7 +4692,7 @@ mod tests {
             "\n",
             r#"{"reason":"compiler-message","message":{"level":"note","message":"just a note","spans":[]}}"#,
         );
-        let diags = cargo_diagnostics(stdout);
+        let diags = cargo_diagnostics(stdout, "");
         assert_eq!(
             diags.len(),
             1,
@@ -4391,7 +4708,7 @@ mod tests {
     fn tsc_and_ruff_parsers_extract_structured_diagnostics() {
         // tsc --pretty false
         let tsc = "src/app.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'.\nnot a diagnostic line";
-        let d = tsc_diagnostics(tsc);
+        let d = tsc_diagnostics(tsc, "");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0]["file"], "src/app.ts");
         assert_eq!(d[0]["line"], 12);
@@ -4401,14 +4718,65 @@ mod tests {
 
         // ruff --output-format=json
         let ruff = r#"[{"filename":"m.py","location":{"row":3,"column":1},"code":"F401","message":"unused import"}]"#;
-        let r = ruff_diagnostics(ruff);
+        let r = ruff_diagnostics(ruff, "");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0]["file"], "m.py");
         assert_eq!(r[0]["line"], 3);
         assert_eq!(r[0]["code"], "F401");
         assert_eq!(r[0]["severity"], "warning");
         // Non-JSON (e.g. ruff not installed / crashed) → no diagnostics, no panic.
-        assert!(ruff_diagnostics("error: ruff not found").is_empty());
+        assert!(ruff_diagnostics("error: ruff not found", "").is_empty());
+    }
+
+    #[test]
+    fn go_parsers_split_build_errors_from_vet_warnings() {
+        // go build → stderr, severity error; skips `# package` header lines.
+        let build = "# example.com/m\n./main.go:10:6: undefined: Foo\n";
+        let b = gobuild_diagnostics("", build);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0]["severity"], "error");
+        assert_eq!(b[0]["file"], "./main.go");
+        assert_eq!(b[0]["line"], 10);
+        assert_eq!(b[0]["column"], 6);
+
+        // go vet → stderr, severity warning; column optional.
+        let vet = "./main.go:7: Printf format %d has arg s of wrong type string\n";
+        let v = govet_diagnostics("", vet);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["severity"], "warning");
+        assert_eq!(v[0]["line"], 7);
+    }
+
+    #[test]
+    fn eslint_and_cppcheck_and_java_parsers() {
+        // eslint --format json: severity 2=error, 1=warning.
+        let eslint = r#"[{"filePath":"/a/app.js","messages":[{"line":3,"column":5,"severity":2,"ruleId":"no-undef","message":"'x' is not defined"},{"line":9,"column":1,"severity":1,"ruleId":"semi","message":"Missing semicolon"}]}]"#;
+        let e = eslint_diagnostics(eslint, "");
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0]["severity"], "error");
+        assert_eq!(e[0]["file"], "/a/app.js");
+        assert_eq!(e[0]["code"], "no-undef");
+        assert_eq!(e[1]["severity"], "warning");
+
+        // cppcheck template on stderr: file:line:col:severity:id:message
+        let cpp = "src/x.cpp:12:3:error:nullPointer:Null pointer dereference\nsrc/x.cpp:20:1:style:unusedVariable:Unused variable 'k'\n";
+        let c = cppcheck_diagnostics("", cpp);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0]["severity"], "error");
+        assert_eq!(c[0]["line"], 12);
+        assert_eq!(c[0]["code"], "nullPointer");
+        assert_eq!(c[1]["severity"], "warning"); // style → warning
+
+        // java: Maven [ERROR] path:[l,c] and javac path:l: error:
+        let mvn = "[ERROR] /s/App.java:[8,17] cannot find symbol";
+        let javac = "/s/App.java:15: error: ';' expected";
+        let j = java_diagnostics(&format!("{mvn}\n{javac}"), "");
+        assert_eq!(j.len(), 2);
+        assert_eq!(j[0]["file"], "/s/App.java");
+        assert_eq!(j[0]["line"], 8);
+        assert_eq!(j[0]["column"], 17);
+        assert_eq!(j[1]["line"], 15);
+        assert_eq!(j[1]["severity"], "error");
     }
 
     #[tokio::test]
@@ -4958,6 +5326,11 @@ mod tests {
             Diagnostics { sbx: mk_sbx() }.timeout().unwrap() > default,
             "diagnostics must exceed 60s"
         );
+        assert_eq!(
+            Diagnostics { sbx: mk_sbx() }.blast_radius(),
+            BlastRadius::IrreversibleLocal,
+            "project build scripts must never bypass the human gate as a read"
+        );
     }
 
     fn mk_sbx() -> Arc<WorkspaceSandbox> {
@@ -5110,7 +5483,8 @@ mod tests {
     #[test]
     fn clarify_accepts_double_encoded_questions() {
         // Some models send `questions` as a JSON *string* of the array. Accept it.
-        let inner = r#"[{"question":"Which DB?","options":[{"label":"Postgres"},{"label":"SQLite"}]}]"#;
+        let inner =
+            r#"[{"question":"Which DB?","options":[{"label":"Postgres"},{"label":"SQLite"}]}]"#;
         let args = json!({ "questions": inner });
         let qs = Clarify::parse_questions(&args).expect("stringified questions parse");
         assert_eq!(qs.len(), 1);

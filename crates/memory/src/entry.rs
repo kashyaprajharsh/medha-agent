@@ -162,7 +162,11 @@ mod tests {
         for s in [Scope::Project, Scope::User] {
             assert_eq!(Scope::parse(s.as_str()), Some(s));
         }
-        for c in [ConfidenceRung::Candidate, ConfidenceRung::Confirmed, ConfidenceRung::UserStated] {
+        for c in [
+            ConfidenceRung::Candidate,
+            ConfidenceRung::Confirmed,
+            ConfidenceRung::UserStated,
+        ] {
             assert_eq!(ConfidenceRung::parse(c.as_str()), Some(c));
         }
     }

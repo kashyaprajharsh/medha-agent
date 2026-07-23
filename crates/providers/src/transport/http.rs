@@ -125,6 +125,8 @@ pub(crate) fn debug_json_request(method: &str, url: &str, body: &serde_json::Val
         .map(|mut parsed| {
             parsed.set_query(None);
             parsed.set_fragment(None);
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
             parsed.to_string()
         })
         .unwrap_or_else(|_| "<invalid provider URL>".to_string());

@@ -75,7 +75,11 @@ impl Tap {
         };
         Ok(Tap {
             repo: format!("{owner}/{}", repo.trim_end_matches(".git")),
-            path: if path.is_empty() { DEFAULT_TAP_PATH.to_string() } else { path },
+            path: if path.is_empty() {
+                DEFAULT_TAP_PATH.to_string()
+            } else {
+                path
+            },
             git_ref,
         })
     }
@@ -93,7 +97,8 @@ fn is_github_segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// On-disk `taps.toml` shape.
@@ -161,8 +166,10 @@ impl TapStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let body = toml::to_string_pretty(&TapsFile { taps: taps.to_vec() })
-            .map_err(|e| format!("serializing taps: {e}"))?;
+        let body = toml::to_string_pretty(&TapsFile {
+            taps: taps.to_vec(),
+        })
+        .map_err(|e| format!("serializing taps: {e}"))?;
         atomic_write(&self.path, body.as_bytes())
     }
 }
@@ -222,7 +229,8 @@ pub async fn search(taps: &[Tap], query: &str) -> Result<SearchResults, String> 
             Err(e) => out.errors.push(format!("{}: {e}", tap.key())),
         }
     }
-    out.hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
+    out.hits
+        .sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
 }
 
@@ -281,11 +289,21 @@ async fn fetch_hit(
         encode_path(path),
         urlencoding::encode(dir),
     );
-    let bytes = crate::skills::fetch_limited(client, &raw, 128 * 1024).await.ok()?;
-    let (name, description, version) = crate::skills::skill_meta(std::str::from_utf8(&bytes).ok()?).ok()?;
+    let bytes = crate::skills::fetch_limited(client, &raw, 128 * 1024)
+        .await
+        .ok()?;
+    let (name, description, version) =
+        crate::skills::skill_meta(std::str::from_utf8(&bytes).ok()?).ok()?;
     // Browser-style tree URL (unencoded segments); the installer re-resolves it.
     let install_url = format!("https://github.com/{repo}/tree/{r}/{path}/{dir}");
-    Some(SkillHit { name, description, version, repo: repo.to_string(), install_url, score: 0 })
+    Some(SkillHit {
+        name,
+        description,
+        version,
+        repo: repo.to_string(),
+        install_url,
+        score: 0,
+    })
 }
 
 /// Attach a match score, or drop the hit when the (non-empty) query matches
@@ -345,7 +363,8 @@ pub async fn check_update(store: &crate::skills::SkillStore, name: &str) -> Upda
     let Some(prov) = store.provenance(name) else {
         return UpdateStatus::Unmanaged("no recorded source");
     };
-    if let (Some(recorded), Some(disk)) = (prov.content_hash.as_deref(), store.installed_hash(name)) {
+    if let (Some(recorded), Some(disk)) = (prov.content_hash.as_deref(), store.installed_hash(name))
+    {
         if recorded != disk {
             return UpdateStatus::ModifiedLocally;
         }
@@ -355,7 +374,10 @@ pub async fn check_update(store: &crate::skills::SkillStore, name: &str) -> Upda
     }
     match crate::skills::current_revision(&prov.source).await {
         Some(cur) if Some(cur.as_str()) == prov.revision.as_deref() => UpdateStatus::UpToDate,
-        Some(cur) => UpdateStatus::Available { from: prov.revision, to: cur },
+        Some(cur) => UpdateStatus::Available {
+            from: prov.revision,
+            to: cur,
+        },
         None => UpdateStatus::Unmanaged("source is not a resolvable GitHub folder"),
     }
 }
@@ -452,7 +474,11 @@ mod tests {
     fn parses_repo_forms() {
         assert_eq!(
             Tap::parse("anthropics/skills", None).unwrap(),
-            Tap { repo: "anthropics/skills".into(), path: "skills".into(), git_ref: None }
+            Tap {
+                repo: "anthropics/skills".into(),
+                path: "skills".into(),
+                git_ref: None
+            }
         );
         // inline subpath
         let t = Tap::parse("myorg/tools/internal/skills", None).unwrap();
@@ -479,8 +505,16 @@ mod tests {
         let store = TapStore::new(dir.join("taps.toml"));
         assert!(store.list().unwrap().is_empty()); // absent file is empty, not an error
 
-        assert!(store.add(Tap::parse("anthropics/skills", None).unwrap()).unwrap());
-        assert!(store.add(Tap::parse("myorg/tools", Some("catalog")).unwrap()).unwrap());
+        assert!(
+            store
+                .add(Tap::parse("anthropics/skills", None).unwrap())
+                .unwrap()
+        );
+        assert!(
+            store
+                .add(Tap::parse("myorg/tools", Some("catalog")).unwrap())
+                .unwrap()
+        );
         assert_eq!(store.list().unwrap().len(), 2);
 
         // A fresh store reads the same file back (persistence).
@@ -488,10 +522,21 @@ mod tests {
         assert_eq!(reopened.list().unwrap().len(), 2);
 
         // Re-adding same repo+path is an update, not a duplicate.
-        assert!(!store.add(Tap::parse("anthropics/skills@v2", None).unwrap()).unwrap());
+        assert!(
+            !store
+                .add(Tap::parse("anthropics/skills@v2", None).unwrap())
+                .unwrap()
+        );
         assert_eq!(store.list().unwrap().len(), 2);
         assert_eq!(
-            store.list().unwrap().iter().find(|t| t.repo == "anthropics/skills").unwrap().git_ref.as_deref(),
+            store
+                .list()
+                .unwrap()
+                .iter()
+                .find(|t| t.repo == "anthropics/skills")
+                .unwrap()
+                .git_ref
+                .as_deref(),
             Some("v2")
         );
 
@@ -538,7 +583,11 @@ mod tests {
 
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("SKILL.md"), "---\nname: demo\ndescription: d\n---\n\nbody\n").unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\n\nbody\n",
+        )
+        .unwrap();
         futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
 
         // Installed from a local folder → nothing remote to update from.
@@ -573,18 +622,31 @@ mod tests {
 
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("SKILL.md"), "---\nname: demo\ndescription: d\n---\n\nbody\n").unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\n\nbody\n",
+        )
+        .unwrap();
         futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
 
         let entries = lock_entries(&store, &["demo".to_string(), "missing".to_string()]);
         assert_eq!(entries.len(), 1); // 'missing' has no provenance → skipped
         assert_eq!(entries[0].name, "demo");
-        assert!(entries[0].content_hash.as_deref().unwrap().starts_with("sha256:"));
+        assert!(
+            entries[0]
+                .content_hash
+                .as_deref()
+                .unwrap()
+                .starts_with("sha256:")
+        );
 
         let lock = SkillLock::new(dir.join("skills.lock"));
         assert!(lock.read().unwrap().is_empty()); // absent = empty, not error
         lock.write(entries.clone()).unwrap();
-        assert_eq!(SkillLock::new(dir.join("skills.lock")).read().unwrap(), entries);
+        assert_eq!(
+            SkillLock::new(dir.join("skills.lock")).read().unwrap(),
+            entries
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

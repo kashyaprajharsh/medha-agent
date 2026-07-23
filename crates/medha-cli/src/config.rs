@@ -1,7 +1,12 @@
 //! Provider configuration. The CLI *resolves* config; it never defines it.
 //!
 //! Resolution order (highest wins):
-//!   CLI flag  >  env override  >  ~/.medha/config.toml  >  TUI first-run model setup
+//!   CLI flag  >  MEDHA_* env  >  ~/.medha/config.toml  >  TUI first-run model setup
+//!
+//! Only the `MEDHA_*` env namespace is read — never generic `OPENAI_*` /
+//! `OPENAI_COMPATIBLE_*` names, and never a project `.env`. Those belong to the
+//! app that owns the working directory; reading them let a repo's environment
+//! silently hijack medha's model/credentials. `medha nadi` reports provenance.
 //!
 //! Nothing is hardcoded as a product default — a value first comes to exist
 //! when the user saves a model profile in the TUI (the single interactive
@@ -111,6 +116,51 @@ pub struct ModelProfile {
     pub is_default: bool,
 }
 
+/// Where a resolved configuration value came from. Tracked so `medha nadi` and
+/// the startup line can answer "why this model?" without guesswork — the exact
+/// class of question that the `.env` hijack made impossible to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A `--model` / `--base-url` CLI flag (one-session override).
+    Flag,
+    /// A `MEDHA_*` environment variable.
+    Env,
+    /// A saved profile in `~/.medha/config.toml`.
+    Config,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Flag => "CLI flag",
+            Source::Env => "MEDHA_* env",
+            Source::Config => "~/.medha/config.toml",
+        }
+    }
+}
+
+/// Where the API key resolved from. Distinct from [`Source`] because credentials
+/// have their own layered store (env → credentials file → keychain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredSource {
+    /// `MEDHA_API_KEY` environment variable.
+    Env,
+    /// `~/.medha/credentials.toml` (owner-only file store).
+    CredentialsFile,
+    /// The OS keychain (or nowhere — resolved lazily at connect time).
+    KeychainOrNone,
+}
+
+impl CredSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            CredSource::Env => "MEDHA_API_KEY env",
+            CredSource::CredentialsFile => "~/.medha/credentials.toml",
+            CredSource::KeychainOrNone => "OS keychain (or unset)",
+        }
+    }
+}
+
 /// What the kernel actually runs with, after resolution + secret lookup.
 #[derive(Debug, Clone)]
 pub struct Resolved {
@@ -118,6 +168,12 @@ pub struct Resolved {
     pub provider: providers::ProviderProfile,
     /// Resolved from environment/credential storage; never serialized.
     pub credential: String,
+    /// Where the model id resolved from (provenance for diagnostics).
+    pub model_source: Source,
+    /// Where the base URL resolved from.
+    pub base_url_source: Source,
+    /// Where the credential resolved from.
+    pub credential_source: CredSource,
 }
 
 impl Config {
@@ -455,51 +511,68 @@ pub fn save(cfg: &Config) -> Result<()> {
 /// or model can't be determined from any source — the TUI then opens its
 /// first-run model setup (headless callers get an actionable error instead).
 ///
-/// Env var names accept MEDHA_* plus the common `OPENAI_COMPATIBLE_*` / `OPENAI_*`
-/// spellings, so an existing environment works without renaming anything.
+/// Only the `MEDHA_*` env namespace is honored. Generic third-party spellings
+/// (`OPENAI_*`, `OPENAI_COMPATIBLE_*`) are deliberately NOT read: they belong to
+/// whatever app owns the working directory, and reading them let a project's
+/// `.env`/environment silently hijack medha's model and credentials. medha's
+/// config is a function of medha's own state only.
 pub fn resolve(
     cfg: Option<&Config>,
     flag_base_url: Option<String>,
     flag_model: Option<String>,
+) -> Result<Option<Resolved>> {
+    resolve_inner(cfg, flag_base_url, flag_model, true)
+}
+
+fn resolve_inner(
+    cfg: Option<&Config>,
+    flag_base_url: Option<String>,
+    flag_model: Option<String>,
+    allow_keychain: bool,
 ) -> Result<Option<Resolved>> {
     // An explicit endpoint/model is a one-session override, even if only one
     // half of the connection came from a saved profile. Do not label that as a
     // persisted profile in the TUI — selecting it again must be unambiguous.
     let has_override = flag_base_url.is_some()
         || flag_model.is_some()
-        || first_env(&[
-            "MEDHA_BASE_URL",
-            "OPENAI_COMPATIBLE_BASE_URL",
-            "OPENAI_BASE_URL",
-        ])
-        .is_some()
-        || first_env(&["MEDHA_MODEL", "OPENAI_COMPATIBLE_MODEL", "OPENAI_MODEL"]).is_some();
+        || first_env(&["MEDHA_BASE_URL"]).is_some()
+        || first_env(&["MEDHA_MODEL"]).is_some();
     let (profile, configured) = cfg.and_then(|c| c.selected_model()).unzip();
-    let base_url = flag_base_url
-        .or_else(|| {
-            first_env(&[
-                "MEDHA_BASE_URL",
-                "OPENAI_COMPATIBLE_BASE_URL",
-                "OPENAI_BASE_URL",
-            ])
-        })
-        .or_else(|| configured.map(|p| p.base_url.clone()));
-    let model = flag_model
-        .or_else(|| first_env(&["MEDHA_MODEL", "OPENAI_COMPATIBLE_MODEL", "OPENAI_MODEL"]))
-        .or_else(|| configured.map(|p| p.model.clone()));
+    // flag > MEDHA_* env > saved profile — each layer also records its provenance.
+    let (base_url, base_url_source) = pick_source(
+        flag_base_url,
+        "MEDHA_BASE_URL",
+        configured.map(|p| p.base_url.clone()),
+    );
+    let (model, model_source) =
+        pick_source(flag_model, "MEDHA_MODEL", configured.map(|p| p.model.clone()));
     let (Some(base_url), Some(model)) = (base_url, model) else {
         return Ok(None);
     };
+    let base_url_source = base_url_source.unwrap_or(Source::Config);
+    let model_source = model_source.unwrap_or(Source::Config);
 
-    // Environment first: besides honoring documented precedence, this avoids
-    // touching macOS Keychain at all during `cargo run` development when a
-    // `.env` credential already exists.
-    let env_key = first_env(&[
-        "MEDHA_API_KEY",
-        "OPENAI_COMPATIBLE_API_KEY",
-        "OPENAI_API_KEY",
-    ]);
-    let api_key = normalize_api_key(&env_key.or_else(|| load_key(&base_url)).unwrap_or_default());
+    // Environment first, then the layered credential store. The short circuit
+    // avoids touching the macOS keychain when a `MEDHA_API_KEY` is present.
+    let env_key = first_env(&["MEDHA_API_KEY"]);
+    let file_key = if env_key.is_none() {
+        file_load_key(&base_url)
+    } else {
+        None
+    };
+    let credential_source = if env_key.is_some() {
+        CredSource::Env
+    } else if file_key.is_some() {
+        CredSource::CredentialsFile
+    } else {
+        CredSource::KeychainOrNone
+    };
+    let api_key = normalize_api_key(
+        &env_key
+            .or(file_key)
+            .or_else(|| allow_keychain.then(|| load_key(&base_url)).flatten())
+            .unwrap_or_default(),
+    );
 
     let max_ctx = first_env(&["MEDHA_MAX_CTX"])
         .map(|value| parse_positive_u32("MEDHA_MAX_CTX", &value))
@@ -574,7 +647,421 @@ pub fn resolve(
         },
         provider,
         credential: api_key,
+        model_source,
+        base_url_source,
+        credential_source,
     }))
+}
+
+/// flag → `MEDHA_*` env → configured value, returning the chosen value with its
+/// provenance. The configured tier reports no `Source` (the caller maps a bare
+/// configured value to [`Source::Config`]) so a missing value stays `None`.
+fn pick_source(
+    flag: Option<String>,
+    env_name: &str,
+    configured: Option<String>,
+) -> (Option<String>, Option<Source>) {
+    if let Some(v) = flag {
+        return (Some(v), Some(Source::Flag));
+    }
+    if let Some(v) = first_env(&[env_name]) {
+        return (Some(v), Some(Source::Env));
+    }
+    (configured, None)
+}
+
+/// Generic third-party env prefixes medha intentionally IGNORES. Surfaced by
+/// `/pulse` so a stray `OPENAI_MODEL` (e.g. from a project this shell was set up
+/// for) is visibly acknowledged-and-ignored rather than a silent mystery.
+const IGNORED_ENV_PREFIXES: &[&str] = &[
+    "OPENAI_",
+    "GOOGLE_",
+    "GEMINI_",
+    "ANTHROPIC_",
+    "AZURE_OPENAI_",
+];
+
+/// Severity of a [`Check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    Ok,
+    Warn,
+    Error,
+}
+
+impl Health {
+    fn icon(self) -> &'static str {
+        match self {
+            Health::Ok => "✔",
+            Health::Warn => "⚠",
+            Health::Error => "✗",
+        }
+    }
+}
+
+/// One diagnosed condition. `auto_fixable` marks the ones `/pulse fix` /
+/// `medha pulse --fix` can repair without asking (all are non-destructive).
+pub struct Check {
+    pub health: Health,
+    pub title: String,
+    pub detail: String,
+    pub auto_fixable: bool,
+}
+
+/// A prompt-free snapshot of how medha resolves its configuration right now,
+/// with the provenance of every value and a list of health checks — the data
+/// behind `medha pulse` / `/pulse`. (Distinct from the agent's `diagnostics`
+/// tool, which reports compiler/linter errors about the user's code.)
+pub struct Pulse {
+    pub medha_home: String,
+    pub config_path: String,
+    pub config_exists: bool,
+    /// `Ok(Some)` = a model resolved; `Ok(None)` = nothing configured yet;
+    /// `Err` = a resolution error (e.g. a bad `MEDHA_*` value).
+    pub resolved: std::result::Result<Option<Resolved>, String>,
+    /// Names (only) of `MEDHA_*` env vars currently set — never their values.
+    pub medha_env: Vec<String>,
+    /// Names of generic third-party LLM env vars present but ignored by medha.
+    pub ignored_env: Vec<String>,
+    /// Path to a project `medha.lock` if one exists in the cwd.
+    pub project_lock: Option<String>,
+    /// `[routing] executor` from that lock, if set.
+    pub lock_executor: Option<String>,
+    /// Diagnosed conditions, most-severe first.
+    pub checks: Vec<Check>,
+}
+
+/// Build the pulse snapshot. Prompt-free: credential provenance is derived from
+/// env + the credentials file only (the keychain is never probed here, so
+/// running `pulse` can't trigger an OS auth dialog or spend API budget).
+pub fn pulse(
+    cfg: Option<&Config>,
+    flag_base_url: Option<String>,
+    flag_model: Option<String>,
+) -> Pulse {
+    let scan_prefixed = |prefixes: &[&str]| -> Vec<String> {
+        let mut names: Vec<String> = std::env::vars()
+            .map(|(k, _)| k)
+            .filter(|k| prefixes.iter().any(|p| k.starts_with(p)))
+            .collect();
+        names.sort();
+        names
+    };
+    let medha_env = scan_prefixed(&["MEDHA_"]);
+    let ignored_env = scan_prefixed(IGNORED_ENV_PREFIXES);
+
+    let cwd_lock = std::env::current_dir().ok().map(|d| d.join("medha.lock"));
+    let (project_lock, lock_executor) = match cwd_lock {
+        Some(p) if p.exists() => {
+            let executor = lockfile::MedhaLock::load(&p).and_then(|l| l.routing.executor);
+            (Some(p.display().to_string()), executor)
+        }
+        _ => (None, None),
+    };
+
+    let resolved = resolve_inner(cfg, flag_base_url, flag_model, false).map_err(|e| e.to_string());
+    let checks = diagnose_checks(cfg, &resolved, &ignored_env);
+
+    Pulse {
+        medha_home: medha_home()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| format!("<unresolved: {e}>")),
+        config_path: config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| format!("<unresolved: {e}>")),
+        config_exists: config_path().map(|p| p.exists()).unwrap_or(false),
+        resolved,
+        medha_env,
+        ignored_env,
+        project_lock,
+        lock_executor,
+        checks,
+    }
+}
+
+/// Compute the health checks. Ordered most-severe-first for display.
+fn diagnose_checks(
+    cfg: Option<&Config>,
+    resolved: &std::result::Result<Option<Resolved>, String>,
+    ignored_env: &[String],
+) -> Vec<Check> {
+    let mut checks = Vec::new();
+
+    match resolved {
+        Ok(Some(r)) => {
+            // Credential required by the profile but none resolvable.
+            if r.provider.auth.requires_credential() && r.credential.is_empty() {
+                checks.push(Check {
+                    health: Health::Error,
+                    title: "Credential missing".into(),
+                    detail: format!(
+                        "'{}' uses {} auth but no key was found (env MEDHA_API_KEY or credentials file). \
+                         Add one via /model, or export MEDHA_API_KEY.",
+                        r.provider.model,
+                        r.provider.auth.as_str()
+                    ),
+                    auto_fixable: false,
+                });
+            } else {
+                checks.push(Check {
+                    health: Health::Ok,
+                    title: "Credential resolves".into(),
+                    detail: format!("{} auth, key {}", r.provider.auth.as_str(), if r.credential.is_empty() { "not required" } else { "present" }),
+                    auto_fixable: false,
+                });
+            }
+
+            // Endpoint/protocol mismatch — the exact class that produced the 404 /
+            // API_KEY_INVALID confusion (a Gemini endpoint spoken over OpenAI, or
+            // vice-versa).
+            let url = r.provider.base_url.to_ascii_lowercase();
+            let proto = r.provider.protocol.as_str();
+            let proto_is_gemini = proto.contains("gemini");
+            let url_is_gemini = url.contains("generativelanguage.googleapis.com");
+            if url_is_gemini && !proto_is_gemini {
+                checks.push(Check {
+                    health: Health::Warn,
+                    title: "Endpoint/protocol mismatch".into(),
+                    detail: format!(
+                        "base_url looks like Google Gemini but protocol is '{proto}'. \
+                         Requests will likely 404 or reject the key. Expected a gemini protocol."
+                    ),
+                    auto_fixable: false,
+                });
+            } else if !url_is_gemini && proto_is_gemini && url.contains("/v1") {
+                checks.push(Check {
+                    health: Health::Warn,
+                    title: "Endpoint/protocol mismatch".into(),
+                    detail: format!(
+                        "protocol is '{proto}' (Gemini-style) but base_url looks OpenAI-compatible. \
+                         Consider an open-ai-chat protocol for this endpoint."
+                    ),
+                    auto_fixable: false,
+                });
+            }
+
+            // Compaction needs a context window.
+            if r.provider.max_ctx.is_none() {
+                checks.push(Check {
+                    health: Health::Warn,
+                    title: "Context window unknown".into(),
+                    detail: format!(
+                        "no max_ctx for '{}'. Compaction stays off until it's found on models.dev \
+                         or you set MEDHA_MAX_CTX=<tokens>.",
+                        r.provider.model
+                    ),
+                    auto_fixable: false,
+                });
+            }
+        }
+        Ok(None) => checks.push(Check {
+            health: Health::Error,
+            title: "No model configured".into(),
+            detail: "run `medha` and add one in /model, or set MEDHA_MODEL + MEDHA_BASE_URL.".into(),
+            auto_fixable: false,
+        }),
+        Err(e) => checks.push(Check {
+            health: Health::Error,
+            title: "Resolution error".into(),
+            detail: e.clone(),
+            auto_fixable: false,
+        }),
+    }
+
+    // Stale default_model — auto-fixable (promote the first saved profile).
+    if let Some(cfg) = cfg {
+        if let Some(def) = &cfg.default_model {
+            if !cfg.models.contains_key(def) {
+                let has_others = !cfg.models.is_empty();
+                checks.push(Check {
+                    health: Health::Warn,
+                    title: "Stale default model".into(),
+                    detail: format!(
+                        "default_model = '{def}' but no such profile exists.{}",
+                        if has_others {
+                            " `pulse --fix` will promote the first saved profile."
+                        } else {
+                            " Add a model to fix."
+                        }
+                    ),
+                    auto_fixable: has_others,
+                });
+            }
+        }
+    }
+
+    // Reassurance: foreign LLM env is present but ignored (acknowledged, not silent).
+    if !ignored_env.is_empty() {
+        checks.push(Check {
+            health: Health::Ok,
+            title: "Foreign LLM env ignored".into(),
+            detail: format!(
+                "{} present but not read by medha (they belong to this directory's app).",
+                ignored_env.join(", ")
+            ),
+            auto_fixable: false,
+        });
+    }
+
+    // Most severe first: Error, then Warn, then Ok.
+    let rank = |h: Health| match h {
+        Health::Error => 0,
+        Health::Warn => 1,
+        Health::Ok => 2,
+    };
+    checks.sort_by_key(|c| rank(c.health));
+    checks
+}
+
+/// Apply the non-destructive fixes `/pulse fix` / `medha pulse --fix` offers,
+/// mutating `cfg` in place. Returns a human-readable line per applied fix; an
+/// empty vec means nothing needed fixing. The caller persists with [`save`].
+pub fn apply_safe_fixes(cfg: &mut Config) -> Vec<String> {
+    let mut fixed = Vec::new();
+
+    // Repair a default_model pointing at a removed/renamed profile.
+    if let Some(def) = cfg.default_model.clone() {
+        if !cfg.models.contains_key(&def) {
+            match cfg.models.keys().next().cloned() {
+                Some(first) => {
+                    cfg.default_model = Some(first.clone());
+                    fixed.push(format!("stale default model '{def}' → promoted '{first}'"));
+                }
+                None => {
+                    cfg.default_model = None;
+                    fixed.push(format!(
+                        "stale default model '{def}' cleared (no saved profiles)"
+                    ));
+                }
+            }
+        }
+    }
+
+    fixed
+}
+
+impl Pulse {
+    /// True when at least one check is auto-fixable.
+    pub fn has_fixes(&self) -> bool {
+        self.checks.iter().any(|c| c.auto_fixable)
+    }
+
+    /// Overall verdict icon+word for the summary line.
+    fn verdict(&self) -> (&'static str, &'static str) {
+        if self.checks.iter().any(|c| c.health == Health::Error) {
+            ("✗", "needs attention")
+        } else if self.checks.iter().any(|c| c.health == Health::Warn) {
+            ("⚠", "ok with warnings")
+        } else {
+            ("✔", "healthy")
+        }
+    }
+
+    /// Render a human-readable report for `medha pulse` (stdout) and the `/pulse`
+    /// TUI message. No secrets ever appear — only sources and non-secret ids.
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut o = String::new();
+        let (icon, word) = self.verdict();
+        let _ = writeln!(o, "medha pulse — {icon} {word}\n");
+
+        let _ = writeln!(o, "checks");
+        for c in &self.checks {
+            let _ = writeln!(o, "  {} {}", c.health.icon(), c.title);
+            let _ = writeln!(o, "      {}", c.detail);
+        }
+        if self.has_fixes() {
+            let _ = writeln!(
+                o,
+                "\n  → run `medha pulse --fix` (or `/pulse fix`) to auto-repair the fixable items."
+            );
+        }
+
+        let _ = writeln!(o, "\npaths");
+        let _ = writeln!(o, "  MEDHA_HOME   {}", self.medha_home);
+        let _ = writeln!(
+            o,
+            "  config.toml  {} {}",
+            self.config_path,
+            if self.config_exists {
+                "(present)"
+            } else {
+                "(absent — first-run setup will open)"
+            }
+        );
+
+        let _ = writeln!(o, "\nactive model");
+        match &self.resolved {
+            Ok(Some(r)) => {
+                let profile = if r.name == "override" {
+                    "(one-session override)".to_string()
+                } else {
+                    format!("'{}'", r.name)
+                };
+                let _ = writeln!(o, "  profile      {profile}");
+                let _ = writeln!(
+                    o,
+                    "  model        {}   [source: {}]",
+                    r.provider.model,
+                    r.model_source.label()
+                );
+                let _ = writeln!(
+                    o,
+                    "  base_url     {}   [source: {}]",
+                    r.provider.base_url,
+                    r.base_url_source.label()
+                );
+                let _ = writeln!(o, "  protocol     {}", r.provider.protocol.as_str());
+                let _ = writeln!(o, "  auth         {}", r.provider.auth.as_str());
+                let cred = if r.credential.is_empty() {
+                    "none found".to_string()
+                } else {
+                    format!("present [source: {}]", r.credential_source.label())
+                };
+                let _ = writeln!(o, "  credential   {cred}");
+            }
+            Ok(None) => {
+                let _ = writeln!(o, "  none configured yet — run `medha` and add one in /model");
+            }
+            Err(e) => {
+                let _ = writeln!(o, "  resolution error: {e}");
+            }
+        }
+
+        let _ = writeln!(o, "\nenvironment");
+        if self.medha_env.is_empty() {
+            let _ = writeln!(o, "  MEDHA_* set   (none)");
+        } else {
+            let _ = writeln!(o, "  MEDHA_* set   {}", self.medha_env.join(", "));
+        }
+        if !self.ignored_env.is_empty() {
+            let _ = writeln!(
+                o,
+                "  ignored      {}  ← present but NOT read by medha (they belong to the",
+                self.ignored_env.join(", ")
+            );
+            let _ = writeln!(o, "               app that owns this directory, not medha)");
+        }
+        let _ = writeln!(
+            o,
+            "  .env         never read by medha (a project's .env cannot change medha's model/key)"
+        );
+
+        let _ = writeln!(o, "\nproject medha.lock");
+        match (&self.project_lock, &self.lock_executor) {
+            (Some(path), Some(exec)) => {
+                let _ = writeln!(o, "  {path}");
+                let _ = writeln!(o, "  [routing] executor = {exec}");
+            }
+            (Some(path), None) => {
+                let _ = writeln!(o, "  {path} (no [routing] executor set)");
+            }
+            _ => {
+                let _ = writeln!(o, "  (none in this directory)");
+            }
+        }
+        o
+    }
 }
 
 fn parse_positive_u32(name: &str, value: &str) -> Result<u32> {
@@ -667,15 +1154,12 @@ pub fn resolve_model(cfg: &Config, name: &str) -> Result<Resolved> {
         .model_profile(name)
         .ok_or_else(|| anyhow::anyhow!("no saved model named '{name}'"))?;
     // Environment first, then keychain. The short circuit matters on macOS:
-    // merely reading a keychain item can show an authorization dialog.
+    // merely reading a keychain item can show an authorization dialog. Only the
+    // `MEDHA_API_KEY` namespace is read — never generic third-party key names.
     let api_key = normalize_api_key(
-        &first_env(&[
-            "MEDHA_API_KEY",
-            "OPENAI_COMPATIBLE_API_KEY",
-            "OPENAI_API_KEY",
-        ])
-        .or_else(|| load_key(&provider.base_url))
-        .unwrap_or_default(),
+        &first_env(&["MEDHA_API_KEY"])
+            .or_else(|| load_key(&provider.base_url))
+            .unwrap_or_default(),
     );
     resolve_model_with_key(cfg, name, &api_key)
 }
@@ -694,10 +1178,22 @@ pub(crate) fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) ->
             "model profile '{name}' requires a credential; choose 'Add or update an API key' in /model"
         );
     }
+    // A named-profile switch: model and endpoint both come from config.toml. The
+    // credential source is reported prompt-free (env → file → keychain/none).
+    let credential_source = if first_env(&["MEDHA_API_KEY"]).is_some() {
+        CredSource::Env
+    } else if file_load_key(&provider.base_url).is_some() {
+        CredSource::CredentialsFile
+    } else {
+        CredSource::KeychainOrNone
+    };
     Ok(Resolved {
         name: name.to_string(),
         provider: provider.clone(),
         credential: api_key,
+        model_source: Source::Config,
+        base_url_source: Source::Config,
+        credential_source,
     })
 }
 

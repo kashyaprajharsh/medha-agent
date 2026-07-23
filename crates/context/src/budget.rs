@@ -23,7 +23,10 @@ impl ContextBudget {
             TokenCountQuality::LocalEstimate => Self::LOCAL_ESTIMATE_MARGIN_BPS,
         };
         let safety_buffer = input_limit.saturating_mul(basis_points) / 10_000;
-        Self { input_limit, safety_buffer }
+        Self {
+            input_limit,
+            safety_buffer,
+        }
     }
 
     /// Backward-compatible shorthand for callers doing local estimation.

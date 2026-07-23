@@ -6,7 +6,13 @@ use ulid::Ulid;
 fn encoded_workspace(path: &std::path::Path) -> String {
     path.to_string_lossy()
         .chars()
-        .map(|ch| if matches!(ch, '/' | '\\' | ':') { '-' } else { ch })
+        .map(|ch| {
+            if matches!(ch, '/' | '\\' | ':') {
+                '-'
+            } else {
+                ch
+            }
+        })
         .collect()
 }
 
@@ -38,7 +44,8 @@ async fn write_recall_show_and_fork_excludes_post_cut_memory() {
     std::fs::create_dir_all(&state).unwrap();
 
     let log = store::SqliteLog::open(state.join("events.db")).unwrap();
-    let projection = MemoryProjection::open(state.join("memory.db"), home.join("memory.db")).unwrap();
+    let projection =
+        MemoryProjection::open(state.join("memory.db"), home.join("memory.db")).unwrap();
     let session = Session::new();
     let evidence = log
         .append(Event::user_message(
@@ -63,9 +70,14 @@ async fn write_recall_show_and_fork_excludes_post_cut_memory() {
         created: evidence.ts,
         updated: evidence.ts,
     };
-    let op = MemoryOp::Write { entry: entry.clone() };
+    let op = MemoryOp::Write {
+        entry: entry.clone(),
+    };
     let write = log
-        .append(Event::memory_write(&session, serde_json::to_value(&op).unwrap()))
+        .append(Event::memory_write(
+            &session,
+            serde_json::to_value(&op).unwrap(),
+        ))
         .await
         .unwrap();
     projection.apply(&op).unwrap();
@@ -99,18 +111,15 @@ async fn write_recall_show_and_fork_excludes_post_cut_memory() {
     )
     .unwrap();
     assert!(run_memory(&workspace, &home, &["pending"]).contains(&pending_id.to_string()));
-    run_memory(
-        &workspace,
-        &home,
-        &["approve", &pending_id.to_string()],
-    );
+    run_memory(&workspace, &home, &["approve", &pending_id.to_string()]);
     assert!(!pending_dir.join(format!("{pending_id}.json")).exists());
     let unpinned = run_memory(&workspace, &home, &["show", "cache-decision"]);
     assert!(unpinned.contains("pinned: false"));
 
     let branch_id = log.fork(session.id, write.id).await.unwrap();
     let branch_events = log.events(branch_id).await;
-    let branch = MemoryProjection::open(state.join("branch-memory.db"), home.join("memory.db")).unwrap();
+    let branch =
+        MemoryProjection::open(state.join("branch-memory.db"), home.join("memory.db")).unwrap();
     branch.rebuild_project(branch_events.into_iter()).unwrap();
     let branch_k3 = memory::recall::compile_k3(&branch, 1_200, evidence.ts).unwrap();
     assert!(!branch_k3.contains("cache-decision"));
@@ -120,11 +129,12 @@ async fn write_recall_show_and_fork_excludes_post_cut_memory() {
         .await
         .unwrap();
     let copied_branch = log.fork(session.id, after_write.id).await.unwrap();
-    assert!(log
-        .events(copied_branch)
-        .await
-        .iter()
-        .any(|event| event.kind == kernel::EventKind::MemoryWrite));
+    assert!(
+        log.events(copied_branch)
+            .await
+            .iter()
+            .any(|event| event.kind == kernel::EventKind::MemoryWrite)
+    );
     run_memory(&workspace, &home, &["forget", "cache-decision"]);
     assert!(!run_memory(&workspace, &home, &["list"]).contains("cache-decision"));
 }
@@ -143,7 +153,8 @@ async fn cli_edit_appends_a_user_trust_update_before_projection() {
     let state = home.join("projects").join(encoded_workspace(&workspace));
     std::fs::create_dir_all(&state).unwrap();
     let log = store::SqliteLog::open(state.join("events.db")).unwrap();
-    let projection = MemoryProjection::open(state.join("memory.db"), home.join("memory.db")).unwrap();
+    let projection =
+        MemoryProjection::open(state.join("memory.db"), home.join("memory.db")).unwrap();
     let session = Session::new();
     let entry = MemoryEntry {
         name: "editable-fact".into(),
@@ -162,13 +173,20 @@ async fn cli_edit_appends_a_user_trust_update_before_projection() {
         updated: 1.0,
     };
     let op = MemoryOp::Write { entry };
-    log.append(Event::memory_write(&session, serde_json::to_value(&op).unwrap()))
-        .await
-        .unwrap();
+    log.append(Event::memory_write(
+        &session,
+        serde_json::to_value(&op).unwrap(),
+    ))
+    .await
+    .unwrap();
     projection.apply(&op).unwrap();
 
     let editor = root.join("editor.sh");
-    std::fs::write(&editor, "#!/bin/sh\nprintf \"edited claim with 'quotes'\" > \"$1\"\n").unwrap();
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nprintf \"edited claim with 'quotes'\" > \"$1\"\n",
+    )
+    .unwrap();
     let mut permissions = std::fs::metadata(&editor).unwrap().permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(&editor, permissions).unwrap();
@@ -179,7 +197,11 @@ async fn cli_edit_appends_a_user_trust_update_before_projection() {
         .env("EDITOR", &editor)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let reopened_log = store::SqliteLog::open(state.join("events.db")).unwrap();
     let events = reopened_log.all_events().unwrap();

@@ -73,7 +73,10 @@ fn render(
     stale_after_days: u32,
     counter: &dyn TokenCounter,
 ) -> String {
-    let project = selected.iter().filter(|(e, _)| e.scope == Scope::Project).count();
+    let project = selected
+        .iter()
+        .filter(|(e, _)| e.scope == Scope::Project)
+        .count();
     let user = selected.len() - project;
     let mut usage = 0;
     let mut block = String::new();
@@ -230,12 +233,7 @@ pub fn compile_k3(
     budget_tokens: u32,
     now: f64,
 ) -> Result<String, MemoryError> {
-    compile_k3_configured(
-        store,
-        budget_tokens,
-        now,
-        DEFAULT_STALE_AFTER_DAYS,
-    )
+    compile_k3_configured(store, budget_tokens, now, DEFAULT_STALE_AFTER_DAYS)
 }
 
 pub fn compile_k3_configured(
@@ -307,23 +305,35 @@ mod tests {
     fn compiles_ranked_budgeted_index_and_demotes_stale_candidate() {
         let store = store("rank");
         let now = 40.0 * 86_400.0;
-        let stale = entry("old-candidate", Scope::Project, TrustLabel::User, ConfidenceRung::Candidate, 0.0);
+        let stale = entry(
+            "old-candidate",
+            Scope::Project,
+            TrustLabel::User,
+            ConfidenceRung::Candidate,
+            0.0,
+        );
         store.apply(&MemoryOp::Write { entry: stale }).unwrap();
-        let recent = entry("recent-user", Scope::User, TrustLabel::User, ConfidenceRung::UserStated, now - 86_400.0);
+        let recent = entry(
+            "recent-user",
+            Scope::User,
+            TrustLabel::User,
+            ConfidenceRung::UserStated,
+            now - 86_400.0,
+        );
         store.apply(&MemoryOp::Write { entry: recent }).unwrap();
-        let mut pinned = entry("pinned-web", Scope::Project, TrustLabel::Web, ConfidenceRung::Candidate, 0.0);
+        let mut pinned = entry(
+            "pinned-web",
+            Scope::Project,
+            TrustLabel::Web,
+            ConfidenceRung::Candidate,
+            0.0,
+        );
         pinned.pinned = true;
         store.apply(&MemoryOp::Write { entry: pinned }).unwrap();
 
         let counter = HeuristicCounter;
-        let block = compile_with_counter(
-            &store,
-            120,
-            now,
-            DEFAULT_STALE_AFTER_DAYS,
-            &counter,
-        )
-        .unwrap();
+        let block =
+            compile_with_counter(&store, 120, now, DEFAULT_STALE_AFTER_DAYS, &counter).unwrap();
         assert!(counter.count(&block) <= 120);
         assert!(block.find("pinned-web").unwrap() < block.find("recent-user").unwrap());
         assert!(!block.contains("old-candidate"));
@@ -336,7 +346,13 @@ mod tests {
         let now = 10_000.0;
         store
             .apply(&MemoryOp::Write {
-                entry: entry("session-a", Scope::Project, TrustLabel::User, ConfidenceRung::UserStated, now),
+                entry: entry(
+                    "session-a",
+                    Scope::Project,
+                    TrustLabel::User,
+                    ConfidenceRung::UserStated,
+                    now,
+                ),
             })
             .unwrap();
         let frozen = compile_k3(&store, 1_200, now).unwrap();
@@ -344,7 +360,13 @@ mod tests {
 
         store
             .apply(&MemoryOp::Write {
-                entry: entry("mid-session", Scope::Project, TrustLabel::User, ConfidenceRung::UserStated, now),
+                entry: entry(
+                    "mid-session",
+                    Scope::Project,
+                    TrustLabel::User,
+                    ConfidenceRung::UserStated,
+                    now,
+                ),
             })
             .unwrap();
         assert_eq!(system, replace_k3("persona", &frozen));
@@ -366,7 +388,13 @@ mod tests {
             let session_a = MemoryProjection::open(&project, &user).unwrap();
             session_a
                 .apply(&MemoryOp::Write {
-                    entry: entry("quoted-fact", Scope::Project, TrustLabel::User, ConfidenceRung::UserStated, now),
+                    entry: entry(
+                        "quoted-fact",
+                        Scope::Project,
+                        TrustLabel::User,
+                        ConfidenceRung::UserStated,
+                        now,
+                    ),
                 })
                 .unwrap();
         }

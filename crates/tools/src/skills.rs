@@ -688,7 +688,14 @@ impl SkillStore {
             // hash covers only real content and never itself. Provenance is
             // written after the scan (below) so it can record the verdict.
             let content_hash = hash_package(&stage);
-            Ok::<_, String>((fm.name, fm.description, kind, revision, content_hash, budget))
+            Ok::<_, String>((
+                fm.name,
+                fm.description,
+                kind,
+                revision,
+                content_hash,
+                budget,
+            ))
         }
         .await;
 
@@ -1838,10 +1845,13 @@ mod tests {
             "---\nname: danger\ndescription: d\n---\n\n```sh\nrm -rf /\n```\n",
         )
         .unwrap();
-        let err = futures::executor::block_on(store.install_from(danger.to_str().unwrap()))
-            .unwrap_err();
+        let err =
+            futures::executor::block_on(store.install_from(danger.to_str().unwrap())).unwrap_err();
         assert!(err.contains("dangerous"), "unexpected error: {err}");
-        assert!(!user.join("danger").exists(), "dangerous package must not be committed");
+        assert!(
+            !user.join("danger").exists(),
+            "dangerous package must not be committed"
+        );
 
         // A dual-use package installs, but the caution rides back in the report.
         let caut = root.join("caut-src");
@@ -1867,9 +1877,10 @@ mod tests {
         #[async_trait]
         impl SkillJudge for Fake {
             async fn judge(&self, _r: JudgeRequest) -> Result<JudgeOutcome, String> {
-                self.0
-                    .clone()
-                    .map(|v| JudgeOutcome { verdict: v, reason: "t".into() })
+                self.0.clone().map(|v| JudgeOutcome {
+                    verdict: v,
+                    reason: "t".into(),
+                })
             }
         }
         // Install a package the regex flags as Caution (reads ~/.ssh), through a
@@ -1898,19 +1909,25 @@ mod tests {
         assert_eq!(run(None).unwrap().scan_verdict, "caution");
         // Judge clears it → Safe.
         assert_eq!(
-            run(Some(Arc::new(Fake(Ok(JudgeVerdict::Safe))))).unwrap().scan_verdict,
+            run(Some(Arc::new(Fake(Ok(JudgeVerdict::Safe)))))
+                .unwrap()
+                .scan_verdict,
             "safe"
         );
         // Judge keeps it → Caution.
         assert_eq!(
-            run(Some(Arc::new(Fake(Ok(JudgeVerdict::Caution))))).unwrap().scan_verdict,
+            run(Some(Arc::new(Fake(Ok(JudgeVerdict::Caution)))))
+                .unwrap()
+                .scan_verdict,
             "caution"
         );
         // Judge blocks it → install refused.
         assert!(run(Some(Arc::new(Fake(Ok(JudgeVerdict::Dangerous))))).is_err());
         // Judge errors → fail-safe: keep the regex Caution, never block.
         assert_eq!(
-            run(Some(Arc::new(Fake(Err("model down".into()))))).unwrap().scan_verdict,
+            run(Some(Arc::new(Fake(Err("model down".into())))))
+                .unwrap()
+                .scan_verdict,
             "caution"
         );
     }
@@ -1928,16 +1945,34 @@ mod tests {
         std::fs::create_dir_all(src.join("scripts")).unwrap();
         std::fs::write(src.join("scripts").join("go.sh"), "echo hi\n").unwrap();
 
-        let report = futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
+        let report =
+            futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
         assert!(report.content_hash.starts_with("sha256:"));
         // Recorded in provenance and reproducible from disk (hash excludes the
         // provenance sidecar, so it matches the install-time hash exactly).
-        assert_eq!(store.provenance("deploy-fly").unwrap().content_hash.as_deref(), Some(report.content_hash.as_str()));
-        assert_eq!(store.installed_hash("deploy-fly").as_deref(), Some(report.content_hash.as_str()));
+        assert_eq!(
+            store
+                .provenance("deploy-fly")
+                .unwrap()
+                .content_hash
+                .as_deref(),
+            Some(report.content_hash.as_str())
+        );
+        assert_eq!(
+            store.installed_hash("deploy-fly").as_deref(),
+            Some(report.content_hash.as_str())
+        );
 
         // A local edit changes the on-disk hash → drift is detectable.
-        std::fs::write(user.join("deploy-fly").join("scripts").join("go.sh"), "echo edited\n").unwrap();
-        assert_ne!(store.installed_hash("deploy-fly").as_deref(), Some(report.content_hash.as_str()));
+        std::fs::write(
+            user.join("deploy-fly").join("scripts").join("go.sh"),
+            "echo edited\n",
+        )
+        .unwrap();
+        assert_ne!(
+            store.installed_hash("deploy-fly").as_deref(),
+            Some(report.content_hash.as_str())
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2027,7 +2062,12 @@ mod tests {
         let v = futures::executor::block_on(tool.execute(&json!({"name": "deploy-fly"}))).unwrap();
         assert!(v["procedure"].as_str().unwrap().contains("flyctl launch"));
         assert_eq!(v["bundled_files"][0]["file"], "references/checklist.md");
-        assert!(v["bundled_files"][0]["abs_path"].as_str().unwrap().ends_with("references/checklist.md"));
+        assert!(
+            v["bundled_files"][0]["abs_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("references/checklist.md")
+        );
         let page = futures::executor::block_on(tool.execute(&json!({
             "name": "deploy-fly",
             "file": "references/checklist.md",

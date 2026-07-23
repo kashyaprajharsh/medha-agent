@@ -25,10 +25,21 @@ pub enum MemoryError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "op")]
 pub enum MemoryOp {
-    Write { entry: MemoryEntry },
-    Update { entry: MemoryEntry },
-    Forget { scope: Scope, name: String },
-    Pin { scope: Scope, name: String, pinned: bool },
+    Write {
+        entry: MemoryEntry,
+    },
+    Update {
+        entry: MemoryEntry,
+    },
+    Forget {
+        scope: Scope,
+        name: String,
+    },
+    Pin {
+        scope: Scope,
+        name: String,
+        pinned: bool,
+    },
 }
 
 impl MemoryOp {
@@ -136,7 +147,12 @@ fn upsert(conn: &Connection, entry: &MemoryEntry) -> Result<(), MemoryError> {
     .map_err(|e| MemoryError::Db(e.to_string()))?;
     conn.execute(
         "INSERT INTO entries_fts (scope, name, description, claim) VALUES (?1,?2,?3,?4)",
-        rusqlite::params![entry.scope.as_str(), entry.name, entry.description, entry.claim],
+        rusqlite::params![
+            entry.scope.as_str(),
+            entry.name,
+            entry.description,
+            entry.claim
+        ],
     )
     .map_err(|e| MemoryError::Db(e.to_string()))?;
     Ok(())
@@ -150,7 +166,11 @@ fn fts_match_expr(raw: &str) -> Option<String> {
         .split_whitespace()
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect();
-    if terms.is_empty() { None } else { Some(terms.join(" ")) }
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
 }
 
 fn forget(conn: &Connection, scope: Scope, name: &str) -> Result<(), MemoryError> {
@@ -184,7 +204,10 @@ pub struct MemoryProjection {
 }
 
 impl MemoryProjection {
-    pub fn open(project_path: impl AsRef<Path>, user_path: impl AsRef<Path>) -> Result<Self, MemoryError> {
+    pub fn open(
+        project_path: impl AsRef<Path>,
+        user_path: impl AsRef<Path>,
+    ) -> Result<Self, MemoryError> {
         let open_one = |path: &Path| -> Result<Connection, MemoryError> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| MemoryError::Io(e.to_string()))?;
@@ -208,11 +231,18 @@ impl MemoryProjection {
     }
 
     pub fn apply(&self, op: &MemoryOp) -> Result<(), MemoryError> {
-        let conn = self.conn_for(op.scope()).lock().map_err(|_| MemoryError::Poisoned)?;
+        let conn = self
+            .conn_for(op.scope())
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?;
         match op {
             MemoryOp::Write { entry } | MemoryOp::Update { entry } => upsert(&conn, entry),
             MemoryOp::Forget { scope, name } => forget(&conn, *scope, name),
-            MemoryOp::Pin { scope, name, pinned } => pin(&conn, *scope, name, *pinned),
+            MemoryOp::Pin {
+                scope,
+                name,
+                pinned,
+            } => pin(&conn, *scope, name, *pinned),
         }
     }
 
@@ -248,10 +278,7 @@ impl MemoryProjection {
         Ok(())
     }
 
-    pub fn rebuild_project(
-        &self,
-        events: impl Iterator<Item = Event>,
-    ) -> Result<(), MemoryError> {
+    pub fn rebuild_project(&self, events: impl Iterator<Item = Event>) -> Result<(), MemoryError> {
         self.clear_project()?;
         for event in events {
             if event.kind != EventKind::MemoryWrite {
@@ -267,38 +294,63 @@ impl MemoryProjection {
     }
 
     pub fn get(&self, scope: Scope, name: &str) -> Result<Option<MemoryEntry>, MemoryError> {
-        let conn = self.conn_for(scope).lock().map_err(|_| MemoryError::Poisoned)?;
+        let conn = self
+            .conn_for(scope)
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?;
         conn.query_row(
             "SELECT * FROM entries WHERE scope = ?1 AND name = ?2 AND tombstoned = 0",
             rusqlite::params![scope.as_str(), name],
             row_to_entry,
         )
         .map(Some)
-        .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })
+        .or_else(|e| {
+            if e == rusqlite::Error::QueryReturnedNoRows {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        })
         .map_err(|e| MemoryError::Db(e.to_string()))
     }
 
     fn list_scope(&self, scope: Scope) -> Result<Vec<MemoryEntry>, MemoryError> {
-        let conn = self.conn_for(scope).lock().map_err(|_| MemoryError::Poisoned)?;
+        let conn = self
+            .conn_for(scope)
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?;
         let mut stmt = conn
             .prepare("SELECT * FROM entries WHERE scope = ?1 AND tombstoned = 0")
             .map_err(|e| MemoryError::Db(e.to_string()))?;
         let rows = stmt
             .query_map(rusqlite::params![scope.as_str()], row_to_entry)
             .map_err(|e| MemoryError::Db(e.to_string()))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| MemoryError::Db(e.to_string()))
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MemoryError::Db(e.to_string()))
     }
 
     /// Merged read across both scopes — project wins on name collision (D9).
     pub fn list(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
         let mut out = self.list_scope(Scope::Project)?;
         let seen: std::collections::HashSet<String> = out.iter().map(|e| e.name.clone()).collect();
-        out.extend(self.list_scope(Scope::User)?.into_iter().filter(|e| !seen.contains(&e.name)));
+        out.extend(
+            self.list_scope(Scope::User)?
+                .into_iter()
+                .filter(|e| !seen.contains(&e.name)),
+        );
         Ok(out)
     }
 
-    fn search_scope(&self, scope: Scope, match_expr: &str, limit: usize) -> Result<Vec<MemoryEntry>, MemoryError> {
-        let conn = self.conn_for(scope).lock().map_err(|_| MemoryError::Poisoned)?;
+    fn search_scope(
+        &self,
+        scope: Scope,
+        match_expr: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>, MemoryError> {
+        let conn = self
+            .conn_for(scope)
+            .lock()
+            .map_err(|_| MemoryError::Poisoned)?;
         let mut stmt = conn
             .prepare(
                 "SELECT e.* FROM entries e
@@ -310,7 +362,8 @@ impl MemoryProjection {
         let rows = stmt
             .query_map(rusqlite::params![match_expr, limit as i64], row_to_entry)
             .map_err(|e| MemoryError::Db(e.to_string()))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| MemoryError::Db(e.to_string()))
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MemoryError::Db(e.to_string()))
     }
 
     /// FTS5 search merged across both scopes — project wins on name collision.
@@ -375,7 +428,9 @@ mod tests {
             kind: EventKind::MemoryWrite,
             payload: serde_json::to_value(&op).unwrap(),
             trust: TrustLabel::Memory,
-            provenance: kernel::Provenance { source: "test".into() },
+            provenance: kernel::Provenance {
+                source: "test".into(),
+            },
             prev_hash: [0u8; 32],
             ts: 0.0,
         }
@@ -386,18 +441,39 @@ mod tests {
         let (p, u) = temp_paths("ops");
         let proj = MemoryProjection::open(&p, &u).unwrap();
 
-        proj.apply(&MemoryOp::Write { entry: entry("e1", Scope::Project, 1) }).unwrap();
+        proj.apply(&MemoryOp::Write {
+            entry: entry("e1", Scope::Project, 1),
+        })
+        .unwrap();
         assert!(proj.get(Scope::Project, "e1").unwrap().is_some());
 
-        proj.apply(&MemoryOp::Update { entry: entry("e1", Scope::Project, 2) }).unwrap();
+        proj.apply(&MemoryOp::Update {
+            entry: entry("e1", Scope::Project, 2),
+        })
+        .unwrap();
         assert_eq!(proj.get(Scope::Project, "e1").unwrap().unwrap().version, 2);
 
-        proj.apply(&MemoryOp::Pin { scope: Scope::Project, name: "e1".into(), pinned: true }).unwrap();
+        proj.apply(&MemoryOp::Pin {
+            scope: Scope::Project,
+            name: "e1".into(),
+            pinned: true,
+        })
+        .unwrap();
         assert!(proj.get(Scope::Project, "e1").unwrap().unwrap().pinned);
 
-        proj.apply(&MemoryOp::Forget { scope: Scope::Project, name: "e1".into() }).unwrap();
-        assert!(proj.get(Scope::Project, "e1").unwrap().is_none(), "forget hides from get");
-        assert!(!proj.list().unwrap().iter().any(|e| e.name == "e1"), "forget hides from list");
+        proj.apply(&MemoryOp::Forget {
+            scope: Scope::Project,
+            name: "e1".into(),
+        })
+        .unwrap();
+        assert!(
+            proj.get(Scope::Project, "e1").unwrap().is_none(),
+            "forget hides from get"
+        );
+        assert!(
+            !proj.list().unwrap().iter().any(|e| e.name == "e1"),
+            "forget hides from list"
+        );
 
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
@@ -407,8 +483,19 @@ mod tests {
         let (p, u) = temp_paths("tombstone");
         let s = Session::new();
         let events = vec![
-            memory_event(&s, MemoryOp::Write { entry: entry("e1", Scope::Project, 1) }),
-            memory_event(&s, MemoryOp::Forget { scope: Scope::Project, name: "e1".into() }),
+            memory_event(
+                &s,
+                MemoryOp::Write {
+                    entry: entry("e1", Scope::Project, 1),
+                },
+            ),
+            memory_event(
+                &s,
+                MemoryOp::Forget {
+                    scope: Scope::Project,
+                    name: "e1".into(),
+                },
+            ),
         ];
         let proj = MemoryProjection::open(&p, &u).unwrap();
         proj.rebuild(events.into_iter()).unwrap();
@@ -422,10 +509,32 @@ mod tests {
         let (p2, u2) = temp_paths("rebuild");
         let s = Session::new();
         let events = vec![
-            memory_event(&s, MemoryOp::Write { entry: entry("a", Scope::Project, 1) }),
-            memory_event(&s, MemoryOp::Write { entry: entry("b", Scope::User, 1) }),
-            memory_event(&s, MemoryOp::Update { entry: entry("a", Scope::Project, 2) }),
-            memory_event(&s, MemoryOp::Pin { scope: Scope::User, name: "b".into(), pinned: true }),
+            memory_event(
+                &s,
+                MemoryOp::Write {
+                    entry: entry("a", Scope::Project, 1),
+                },
+            ),
+            memory_event(
+                &s,
+                MemoryOp::Write {
+                    entry: entry("b", Scope::User, 1),
+                },
+            ),
+            memory_event(
+                &s,
+                MemoryOp::Update {
+                    entry: entry("a", Scope::Project, 2),
+                },
+            ),
+            memory_event(
+                &s,
+                MemoryOp::Pin {
+                    scope: Scope::User,
+                    name: "b".into(),
+                    pinned: true,
+                },
+            ),
         ];
 
         let incremental = MemoryProjection::open(&p1, &u1).unwrap();
@@ -478,18 +587,26 @@ mod tests {
         let s = Session::new();
         let before = block_on(log.append(memory_event(
             &s,
-            MemoryOp::Write { entry: entry("before-fork", Scope::Project, 1) },
+            MemoryOp::Write {
+                entry: entry("before-fork", Scope::Project, 1),
+            },
         )))
         .unwrap();
         block_on(log.append(memory_event(
             &s,
-            MemoryOp::Write { entry: entry("after-fork", Scope::Project, 1) },
+            MemoryOp::Write {
+                entry: entry("after-fork", Scope::Project, 1),
+            },
         )))
         .unwrap();
 
         // Fork *before* "after-fork" was written — the branch should only ever
         // have learned "before-fork" (§18.4 time-travel applies to memory too).
-        let cut = block_on(log.events(s.id)).into_iter().find(|e| e.id != before.id).unwrap().id;
+        let cut = block_on(log.events(s.id))
+            .into_iter()
+            .find(|e| e.id != before.id)
+            .unwrap()
+            .id;
         let branch_id = block_on(log.fork(s.id, cut)).unwrap();
         let branch_events = block_on(log.events(branch_id));
 
@@ -498,7 +615,10 @@ mod tests {
         proj.rebuild(branch_events.into_iter()).unwrap();
 
         assert!(proj.get(Scope::Project, "before-fork").unwrap().is_some());
-        assert!(proj.get(Scope::Project, "after-fork").unwrap().is_none(), "fork must not see post-cut memories");
+        assert!(
+            proj.get(Scope::Project, "after-fork").unwrap().is_none(),
+            "fork must not see post-cut memories"
+        );
 
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
@@ -522,7 +642,11 @@ mod tests {
         // Empty/whitespace query is a no-op, not a syntax error.
         assert_eq!(proj.search("   ", 5).unwrap().len(), 0);
         // Tombstoned entries never surface.
-        proj.apply(&MemoryOp::Forget { scope: Scope::Project, name: "no-coauthored-by".into() }).unwrap();
+        proj.apply(&MemoryOp::Forget {
+            scope: Scope::Project,
+            name: "no-coauthored-by".into(),
+        })
+        .unwrap();
         assert_eq!(proj.search("trailer", 5).unwrap().len(), 0);
 
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
@@ -532,8 +656,14 @@ mod tests {
     fn scope_routing_and_project_wins_collision() {
         let (p, u) = temp_paths("scope");
         let proj = MemoryProjection::open(&p, &u).unwrap();
-        proj.apply(&MemoryOp::Write { entry: entry("shared-name", Scope::Project, 1) }).unwrap();
-        proj.apply(&MemoryOp::Write { entry: entry("shared-name", Scope::User, 1) }).unwrap();
+        proj.apply(&MemoryOp::Write {
+            entry: entry("shared-name", Scope::Project, 1),
+        })
+        .unwrap();
+        proj.apply(&MemoryOp::Write {
+            entry: entry("shared-name", Scope::User, 1),
+        })
+        .unwrap();
 
         // Each landed in its own DB.
         assert!(proj.get(Scope::Project, "shared-name").unwrap().is_some());
@@ -547,5 +677,4 @@ mod tests {
 
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
-
 }

@@ -35,11 +35,18 @@ impl MemoryStore for MemoryProjection {
     }
 
     async fn forget(&self, scope: Scope, name: &str) -> Result<(), MemoryError> {
-        self.apply(&MemoryOp::Forget { scope, name: name.to_string() })
+        self.apply(&MemoryOp::Forget {
+            scope,
+            name: name.to_string(),
+        })
     }
 
     async fn pin(&self, scope: Scope, name: &str, pinned: bool) -> Result<(), MemoryError> {
-        self.apply(&MemoryOp::Pin { scope, name: name.to_string(), pinned })
+        self.apply(&MemoryOp::Pin {
+            scope,
+            name: name.to_string(),
+            pinned,
+        })
     }
 
     async fn get(&self, scope: Scope, name: &str) -> Result<Option<MemoryEntry>, MemoryError> {
@@ -88,10 +95,25 @@ mod tests {
             updated: 0.0,
         };
         store.write(e.clone()).await.unwrap();
-        assert_eq!(store.get(Scope::Project, "e1").await.unwrap().unwrap().claim, "claim");
+        assert_eq!(
+            store
+                .get(Scope::Project, "e1")
+                .await
+                .unwrap()
+                .unwrap()
+                .claim,
+            "claim"
+        );
 
         store.pin(Scope::Project, "e1", true).await.unwrap();
-        assert!(store.get(Scope::Project, "e1").await.unwrap().unwrap().pinned);
+        assert!(
+            store
+                .get(Scope::Project, "e1")
+                .await
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
 
         store.forget(Scope::Project, "e1").await.unwrap();
         assert!(store.get(Scope::Project, "e1").await.unwrap().is_none());

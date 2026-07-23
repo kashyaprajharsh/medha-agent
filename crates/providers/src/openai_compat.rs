@@ -50,22 +50,6 @@ struct Connection {
     credential: String,
 }
 
-/// Normalise a reasoning request before validation/storage: an explicit
-/// "reasoning on" with no chosen effort defaults to `Minimal`. This matches
-/// Gemini's own guidance (its latest models can't disable thinking; `minimal`
-/// is the lowest level, mapping to `thinking_level: minimal`) and — critically —
-/// makes the canonical config portable. `open-ai-chat` requires an explicit
-/// effort whenever reasoning is on, so carrying a concrete level lets a
-/// Gemini → openai-chat model switch succeed instead of failing validation.
-/// `Auto` (`enabled: None`) is left untouched: it still omits controls entirely
-/// so the server/model default applies.
-fn normalize_reasoning(mut config: ReasoningConfig) -> ReasoningConfig {
-    if config.enabled == Some(true) && config.effort.is_none() {
-        config.effort = Some(ReasoningEffort::Minimal);
-    }
-    config
-}
-
 fn validate_reasoning(
     profile: &ProviderProfile,
     config: &ReasoningConfig,
@@ -307,11 +291,10 @@ impl ProviderClient {
                 profile.protocol.as_str()
             )));
         }
-        // Normalise the carried-over reasoning before validating against the new
-        // profile: a Gemini session leaves "reasoning on" with no explicit effort,
-        // which openai-chat rejects. Defaulting to Minimal here lets the switch
-        // succeed and keeps the stored config valid for the new protocol.
-        let reasoning = normalize_reasoning(self.reasoning());
+        // Validate the exact canonical setting. Never invent `minimal` while
+        // switching protocols: effort support is model-specific, and `None`
+        // deliberately means "let this server/model choose its default".
+        let reasoning = self.reasoning();
         validate_reasoning(&profile, &reasoning)?;
         *self.reasoning.lock().unwrap() = reasoning;
         *self.connection.lock().unwrap() = Connection {
@@ -337,9 +320,11 @@ impl ProviderClient {
             return Some("none"); // explicit disable for compatible servers
         }
         cfg.effort.map(|effort| match effort {
-            // Compatible servers (vLLM/SGLang) accept only none/low/medium/high;
-            // "minimal" is OpenAI-only. Floor Minimal to "low" on this route.
-            ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
+            // Preserve the user's exact canonical level. Current compatible
+            // servers may support `minimal`; silently raising it to `low`
+            // changes cost/latency and can violate a model's contract.
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
         })
@@ -502,6 +487,27 @@ pub struct ModelInfo {
     pub context_length: Option<u32>,
 }
 
+/// Build a sibling OpenAI-compatible endpoint from either an API root
+/// (`…/v1`) or the full chat-completions URL copied from provider examples.
+/// Exact `/chat/completions` tails are removed before selecting a sibling such
+/// as `/models`, preventing duplicated paths like
+/// `/chat/completions/chat/completions`.
+fn openai_endpoint_url(base_url: &str, endpoint: &str) -> Result<String, ProviderError> {
+    let mut url = reqwest::Url::parse(base_url)
+        .map_err(|error| ProviderError::Decode(format!("invalid provider base URL: {error}")))?;
+    let original = url.path().trim_end_matches('/');
+    let root = original
+        .strip_suffix("/chat/completions")
+        .unwrap_or(original);
+    let path = if endpoint == "/chat/completions" && root != original {
+        original.to_string()
+    } else {
+        format!("{}{}", root.trim_end_matches('/'), endpoint)
+    };
+    url.set_path(&path);
+    Ok(url.to_string())
+}
+
 /// Discover the models an OpenAI-compatible endpoint serves via `GET /v1/models`
 /// (§4.4). Lets the setup wizard show a *picker* instead of asking the user to
 /// type a model id blind, and captures the context window when the server
@@ -537,7 +543,13 @@ pub async fn list_models_for_profile(
             "model discovery authentication requires a credential".into(),
         ));
     }
-    let url = format!("{}/models", profile.base_url.trim_end_matches('/'));
+    let url = match profile.protocol {
+        Protocol::OpenAiChat => openai_endpoint_url(&profile.base_url, "/models")?,
+        Protocol::GeminiInteractions => {
+            format!("{}/models", profile.base_url.trim_end_matches('/'))
+        }
+        Protocol::OpenAiResponses | Protocol::AnthropicMessages => unreachable!(),
+    };
     // Bounded timeout: this runs at startup before the UI paints, so a slow or
     // unreachable endpoint must not hang the launch (it falls back gracefully).
     let client = reqwest::Client::builder()
@@ -691,9 +703,14 @@ async fn list_gemini_models(
 /// vLLM's `/tokenize` lives at the server root, a sibling of `/v1` — not under
 /// it. Derive the root from the (usually `…/v1`) chat base URL.
 fn vllm_tokenize_url(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
-    format!("{root}/tokenize")
+    let Ok(mut url) = reqwest::Url::parse(base_url) else {
+        return format!("{}/tokenize", base_url.trim_end_matches('/'));
+    };
+    let path = url.path().trim_end_matches('/');
+    let api_root = path.strip_suffix("/chat/completions").unwrap_or(path);
+    let server_root = api_root.strip_suffix("/v1").unwrap_or(api_root);
+    url.set_path(&format!("{server_root}/tokenize"));
+    url.to_string()
 }
 
 /// vLLM `/tokenize` body: messages rendered through the model's chat template.
@@ -755,7 +772,6 @@ impl Provider for ProviderClient {
     }
 
     fn set_reasoning(&self, config: ReasoningConfig) -> Result<(), ProviderError> {
-        let config = normalize_reasoning(config);
         let connection = self.connection.lock().unwrap().clone();
         validate_reasoning(&connection.profile, &config)?;
         *self.reasoning.lock().unwrap() = config;
@@ -904,10 +920,7 @@ impl Provider for ProviderClient {
             .get("stream")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
-        let url = format!(
-            "{}/chat/completions",
-            connection.profile.base_url.trim_end_matches('/')
-        );
+        let url = openai_endpoint_url(&connection.profile.base_url, "/chat/completions")?;
 
         // Direct proof of what actually goes over the wire — no guessing, no
         // separate curl experiment needed. Set MEDHA_DEBUG_HTTP=1 to see the
@@ -1401,6 +1414,35 @@ mod count_tokens_tests {
         assert_eq!(
             vllm_tokenize_url("https://h.example"),
             "https://h.example/tokenize"
+        );
+        assert_eq!(
+            vllm_tokenize_url("https://h.example/v1/chat/completions"),
+            "https://h.example/tokenize"
+        );
+    }
+
+    #[test]
+    fn openai_endpoint_accepts_api_root_or_full_chat_url() {
+        assert_eq!(
+            openai_endpoint_url("https://integrate.api.nvidia.com/v1", "/chat/completions")
+                .unwrap(),
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+        );
+        assert_eq!(
+            openai_endpoint_url(
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                "/chat/completions",
+            )
+            .unwrap(),
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+        );
+        assert_eq!(
+            openai_endpoint_url(
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                "/models",
+            )
+            .unwrap(),
+            "https://integrate.api.nvidia.com/v1/models"
         );
     }
 
@@ -2000,15 +2042,14 @@ mod reasoning_request_tests {
     }
 
     #[test]
-    fn minimal_floors_to_low_on_the_compatible_route() {
-        // vLLM/SGLang reject "minimal"; only none/low/medium/high are portable.
+    fn minimal_is_not_silently_raised_on_the_compatible_route() {
         let p = OpenAiCompat::new("http://x", "", "m")
             .with_reasoning(ReasoningConfig {
                 enabled: Some(true),
                 effort: Some(ReasoningEffort::Minimal),
             })
             .unwrap();
-        assert_eq!(p.reasoning_effort_value(), Some("low"));
+        assert_eq!(p.reasoning_effort_value(), Some("minimal"));
     }
 
     #[test]
@@ -2039,7 +2080,7 @@ mod reasoning_request_tests {
     }
 
     #[test]
-    fn gemini_reasoning_on_defaults_to_minimal_and_survives_switch_to_openai_chat() {
+    fn gemini_server_default_is_preserved_and_openai_switch_rejects_ambiguity() {
         // A Gemini session runs with "reasoning on" and no explicit effort —
         // valid for gemini-interactions. Start a provider in exactly that state.
         let mut gemini =
@@ -2052,17 +2093,16 @@ mod reasoning_request_tests {
                 effort: None,
             })
             .unwrap();
-        // Normalised to Minimal, so the canonical config is portable across
-        // protocols instead of carrying an effort-less "on".
-        assert_eq!(provider.reasoning().effort, Some(ReasoningEffort::Minimal));
+        // Gemini may choose its model default; the client must not invent an
+        // effort that has different support/cost semantics.
+        assert_eq!(provider.reasoning().effort, None);
 
-        // Switching to an openai-chat model must now succeed — this previously
-        // failed with "open-ai-chat cannot enable reasoning without an explicit
-        // effort" because the effort-less Gemini config was carried across.
+        // OpenAI Chat needs an explicit effort in this canonical profile. The
+        // switch fails atomically instead of silently choosing one.
         let next = ProviderProfile::openai_chat("http://vllm/v1", "qwen", AuthKind::None);
-        assert!(provider.switch_provider_profile(next, "").is_ok());
-        assert_eq!(provider.active_model(), "qwen");
-        assert_eq!(provider.reasoning().effort, Some(ReasoningEffort::Minimal));
+        assert!(provider.switch_provider_profile(next, "").is_err());
+        assert_eq!(provider.active_model(), "gemini-3.5-flash");
+        assert_eq!(provider.reasoning().effort, None);
     }
 
     #[test]

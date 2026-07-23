@@ -16,7 +16,9 @@ async fn log_write(
     let snapshot = sbx.write(path, content).await.unwrap();
     let payload = json!({ "path": path, "written": true, "snapshot": snapshot });
     let obs = Observation::ok(Ulid::new().to_string(), payload);
-    log.append(Event::tool_obs(s, &obs, TrustLabel::Tool)).await.unwrap()
+    log.append(Event::tool_obs(s, &obs, TrustLabel::Tool))
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -40,7 +42,11 @@ async fn undo_reverts_only_the_single_most_recent_write() {
     for fr in &plan {
         sbx.restore(&fr.path, fr.snapshot.as_deref()).await.unwrap();
     }
-    assert_eq!(sbx.read("a.txt").await.unwrap(), "v1", "reverted to the pre-second-write snapshot");
+    assert_eq!(
+        sbx.read("a.txt").await.unwrap(),
+        "v1",
+        "reverted to the pre-second-write snapshot"
+    );
 
     log.verify().unwrap();
     std::fs::remove_dir_all(&dir).ok();
@@ -69,8 +75,15 @@ async fn undo_by_event_id_reverts_everything_from_that_point_forward() {
     for fr in &plan {
         sbx.restore(&fr.path, fr.snapshot.as_deref()).await.unwrap();
     }
-    assert_eq!(sbx.read("lib.rs").await.unwrap(), "v1", "lib.rs rolled back to pre-target");
-    assert!(sbx.read("main.rs").await.is_err(), "main.rs (created after target) removed");
+    assert_eq!(
+        sbx.read("lib.rs").await.unwrap(),
+        "v1",
+        "lib.rs rolled back to pre-target"
+    );
+    assert!(
+        sbx.read("main.rs").await.is_err(),
+        "main.rs (created after target) removed"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -84,7 +97,10 @@ async fn undo_at_an_event_with_no_writes_after_it_is_a_no_op() {
     let s = Session::new();
 
     log_write(&log, &sbx, &s, "a.txt", "v1").await;
-    let last = log.append(Event::user_message(&s, "just chatting, no more writes")).await.unwrap();
+    let last = log
+        .append(Event::user_message(&s, "just chatting, no more writes"))
+        .await
+        .unwrap();
 
     let events = log.events(s.id).await;
     let plan = kernel::rollback_plan(&events, last.id);

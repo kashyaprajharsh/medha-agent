@@ -45,9 +45,12 @@ impl Provider for ScriptedProvider {
         &self,
         _ctx: &CompiledContext,
     ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
-        let blocks = self.turns.lock().unwrap().pop_front().unwrap_or_else(|| {
-            vec![Block::Text("(script exhausted)".into())]
-        });
+        let blocks = self
+            .turns
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![Block::Text("(script exhausted)".into())]);
         Ok(stream::iter(blocks.into_iter().map(Ok)).boxed())
     }
 }
@@ -112,7 +115,11 @@ struct NoopSink;
 impl StreamSink for NoopSink {}
 
 fn intent(id: &str, tool: &str, args: Value) -> Block {
-    Block::ToolIntent(ToolIntent { id: id.into(), tool: tool.into(), args })
+    Block::ToolIntent(ToolIntent {
+        id: id.into(),
+        tool: tool.into(),
+        args,
+    })
 }
 
 fn memory_write_args() -> Value {
@@ -132,7 +139,11 @@ fn memory_write_args() -> Value {
 
 fn harness(
     turns: Vec<Vec<Block>>,
-) -> (Kernel<ScriptedProvider, InMemoryLog>, Arc<InMemoryLog>, Arc<MemoryProjection>) {
+) -> (
+    Kernel<ScriptedProvider, InMemoryLog>,
+    Arc<InMemoryLog>,
+    Arc<MemoryProjection>,
+) {
     let dir = std::env::temp_dir().join(format!("medha-poison-e2e-{}", Ulid::new()));
     let store = Arc::new(MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap());
     let mut registry = ToolRegistry::new();
@@ -160,19 +171,44 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
         vec![Block::Text("done".into())],
     ]);
     let session = Session::new();
-    k.run_session(&session, vec![Message::user("check the gateway docs")], Budget::default(), &NoopSink, None)
-        .await
-        .unwrap();
+    k.run_session(
+        &session,
+        vec![Message::user("check the gateway docs")],
+        Budget::default(),
+        &NoopSink,
+        None,
+    )
+    .await
+    .unwrap();
 
     // The stored entry carries the kernel's taint, not the smuggled values.
-    let e = store.get(Scope::Project, "gateway-turbo").unwrap().expect("entry stored");
-    assert_eq!(e.trust, TrustLabel::Web, "web content entered the window — trust is floored");
-    assert_eq!(e.confidence, ConfidenceRung::Candidate, "smuggled 'confirmed' ignored");
+    let e = store
+        .get(Scope::Project, "gateway-turbo")
+        .unwrap()
+        .expect("entry stored");
+    assert_eq!(
+        e.trust,
+        TrustLabel::Web,
+        "web content entered the window — trust is floored"
+    );
+    assert_eq!(
+        e.confidence,
+        ConfidenceRung::Candidate,
+        "smuggled 'confirmed' ignored"
+    );
     assert_eq!(e.sessions, vec![session.id]);
     // Provenance = the kernel's window (user message + web observation), not
     // the model's fake id.
-    assert!(e.provenance.len() >= 2, "user msg + web obs, got {:?}", e.provenance);
-    assert!(!e.provenance.iter().any(|u| u.to_string().starts_with("01FAKE")));
+    assert!(
+        e.provenance.len() >= 2,
+        "user msg + web obs, got {:?}",
+        e.provenance
+    );
+    assert!(
+        !e.provenance
+            .iter()
+            .any(|u| u.to_string().starts_with("01FAKE"))
+    );
 
     let events = log.events(session.id).await;
 
@@ -181,13 +217,19 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
         .iter()
         .find(|e| e.kind == EventKind::ModelIntent && e.payload["tool"] == "memory.write")
         .expect("memory.write intent logged");
-    assert!(logged.payload["args"].get("trust").is_none(), "smuggled key survived into the log");
+    assert!(
+        logged.payload["args"].get("trust").is_none(),
+        "smuggled key survived into the log"
+    );
     assert_eq!(logged.payload["args"]["_trust"], "web");
     assert_eq!(logged.payload["args"]["_user_stated"], false);
 
     // Exactly one durable memory.write event, and rebuilding from the log
     // reproduces the same tainted entry (D1 round-trip through the real loop).
-    let mem_events: Vec<_> = events.iter().filter(|e| e.kind == EventKind::MemoryWrite).collect();
+    let mem_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::MemoryWrite)
+        .collect();
     assert_eq!(mem_events.len(), 1);
     let op: MemoryOp = serde_json::from_value(mem_events[0].payload.clone()).unwrap();
     match &op {
@@ -197,27 +239,52 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
     let dir = std::env::temp_dir().join(format!("medha-poison-rebuild-{}", Ulid::new()));
     let rebuilt = MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap();
     rebuilt.rebuild(events.into_iter()).unwrap();
-    assert_eq!(rebuilt.get(Scope::Project, "gateway-turbo").unwrap().unwrap().trust, TrustLabel::Web);
+    assert_eq!(
+        rebuilt
+            .get(Scope::Project, "gateway-turbo")
+            .unwrap()
+            .unwrap()
+            .trust,
+        TrustLabel::Web
+    );
 }
 
 #[tokio::test]
 async fn clean_user_window_writes_user_stated_memory() {
     let (k, _log, store) = harness(vec![
-        vec![intent("c1", "memory.write", json!({
-            "name": "prefers-pytest",
-            "claim": "The user prefers pytest over unittest.",
-            "description": "test framework preference",
-            "kind": "preference",
-        }))],
+        vec![intent(
+            "c1",
+            "memory.write",
+            json!({
+                "name": "prefers-pytest",
+                "claim": "The user prefers pytest over unittest.",
+                "description": "test framework preference",
+                "kind": "preference",
+            }),
+        )],
         vec![Block::Text("noted".into())],
     ]);
     let session = Session::new();
-    let (messages, _) = k.run_session(&session, vec![Message::user("I prefer pytest, remember that")], Budget::default(), &NoopSink, None)
+    let (messages, _) = k
+        .run_session(
+            &session,
+            vec![Message::user("I prefer pytest, remember that")],
+            Budget::default(),
+            &NoopSink,
+            None,
+        )
         .await
         .unwrap();
 
-    let e = store.get(Scope::Project, "prefers-pytest").unwrap().expect("entry stored");
-    assert_eq!(e.trust, TrustLabel::User, "nothing below user trust entered the window");
+    let e = store
+        .get(Scope::Project, "prefers-pytest")
+        .unwrap()
+        .expect("entry stored");
+    assert_eq!(
+        e.trust,
+        TrustLabel::User,
+        "nothing below user trust entered the window"
+    );
     assert_eq!(e.confidence, ConfidenceRung::UserStated);
     assert!(!e.provenance.is_empty(), "the user message is the evidence");
     let tool_payload = messages

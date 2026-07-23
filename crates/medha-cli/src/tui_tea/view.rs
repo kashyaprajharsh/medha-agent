@@ -1178,6 +1178,14 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    if let Some((message, until)) = &model.clipboard_status
+        && *until > Instant::now()
+    {
+        left.push(Span::styled(
+            format!("  ✓ {message}"),
+            Style::default().fg(theme::ok()),
+        ));
+    }
     let ctx = match model.ctx_pct {
         Some(pct) => format!("ctx {pct}%"),
         None => "ctx —".to_string(),
@@ -1827,11 +1835,51 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     }
 }
 
+fn highlight_cell_range(line: &Line<'static>, start: usize, end: usize) -> Line<'static> {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut spans = Vec::new();
+    let mut buffer = String::new();
+    let mut current_style = None;
+    let mut column = 0usize;
+    let mut previous_selected = false;
+
+    for span in &line.spans {
+        for character in span.content.chars() {
+            let width = character.width().unwrap_or(0);
+            let selected = if width == 0 {
+                previous_selected
+            } else {
+                column < end && column.saturating_add(width) > start
+            };
+            let style = if selected {
+                span.style.add_modifier(Modifier::REVERSED)
+            } else {
+                span.style
+            };
+            if current_style != Some(style) {
+                if let Some(previous) = current_style {
+                    spans.push(Span::styled(std::mem::take(&mut buffer), previous));
+                }
+                current_style = Some(style);
+            }
+            buffer.push(character);
+            previous_selected = selected;
+            column = column.saturating_add(width);
+        }
+    }
+    if let Some(style) = current_style {
+        spans.push(Span::styled(buffer, style));
+    }
+    Line::from(spans)
+}
+
 pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
     // Scroll math must use the TRANSCRIPT pane height, not the full frame height
     // (set in view()), or the last lines — e.g. the approval options — get clipped
     // off the bottom even when auto-scrolled.
     model.viewport_height = area.height as usize;
+    model.transcript_area = area;
     // Show the welcome splash only while the transcript is truly empty. Guarding
     // on `items.is_empty()` too means any pushed content (e.g. a `/skills` notice
     // run as the first action) always wins — the splash can never hide it.
@@ -1944,6 +1992,15 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
             ),
         ])];
         push_block(&spinner, &mut off, &mut visible);
+    }
+
+    if let Some(selection) = model.text_selection {
+        for (index, line) in visible.iter_mut().enumerate() {
+            let global_row = top + index;
+            if let Some((start, end)) = selection_cell_range(selection, global_row) {
+                *line = highlight_cell_range(line, start, end);
+            }
+        }
     }
 
     // Rows are already wrapped to width — render them directly (no ratatui wrap,

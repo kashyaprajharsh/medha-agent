@@ -12,13 +12,16 @@
 //! from anywhere lands in the log instead of on screen. Restored on exit and via
 //! a panic hook.
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use std::io::Write;
 use std::path::Path;
 
 #[cfg(unix)]
@@ -57,7 +60,20 @@ pub fn init(stray_log: &Path) -> anyhow::Result<(TuiTerminal, StrayRedirect)> {
         install_panic_hook(redirect.saved_out, redirect.saved_err);
 
         enable_raw_mode()?;
-        execute!(tty, EnterAlternateScreen, EnableBracketedPaste)?;
+        // Mouse capture is required for wheel scrolling to reach us uniformly: the
+        // event loop drives scroll from `Mouse` events, which crossterm only emits
+        // when tracking is on. Without it, scroll works only in emulators that
+        // translate the wheel to arrow keys themselves (VS Code / xterm.js alternate
+        // scroll mode) — macOS Terminal.app doesn't, so the wheel there scrolls the
+        // terminal's own scrollback instead of the app. Click-drag selection is
+        // handled by the TUI and copied through OSC 52; terminal-native selection
+        // remains available through the emulator's usual override modifier.
+        execute!(
+            tty,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
         let terminal = Terminal::new(CrosstermBackend::new(tty))?;
         Ok((terminal, redirect))
     }
@@ -69,7 +85,8 @@ pub fn init(stray_log: &Path) -> anyhow::Result<(TuiTerminal, StrayRedirect)> {
         execute!(
             std::io::stdout(),
             EnterAlternateScreen,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            EnableMouseCapture
         )?;
         let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
         Ok((terminal, StrayRedirect {}))
@@ -82,10 +99,22 @@ pub fn restore(terminal: &mut TuiTerminal, redirect: &mut StrayRedirect) {
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         LeaveAlternateScreen,
         DisableBracketedPaste
     );
     redirect.restore();
+}
+
+/// Copy through OSC 52 on the same private tty used for rendering. This keeps
+/// clipboard selection functional with mouse capture enabled and also works
+/// through forwarded terminal sessions when the emulator permits OSC 52.
+pub fn copy_to_clipboard(terminal: &mut TuiTerminal, text: &str) -> std::io::Result<()> {
+    use base64::Engine as _;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    write!(terminal.backend_mut(), "\x1b]52;c;{encoded}\x07")?;
+    terminal.backend_mut().flush()
 }
 
 #[cfg(unix)]
@@ -156,6 +185,7 @@ fn install_panic_hook(saved_out: std::os::fd::RawFd, saved_err: std::os::fd::Raw
         let _ = disable_raw_mode();
         let _ = execute!(
             std::io::stdout(),
+            DisableMouseCapture,
             LeaveAlternateScreen,
             DisableBracketedPaste
         );
@@ -171,6 +201,7 @@ fn set_panic_hook_plain() {
         let _ = disable_raw_mode();
         let _ = execute!(
             std::io::stdout(),
+            DisableMouseCapture,
             LeaveAlternateScreen,
             DisableBracketedPaste
         );

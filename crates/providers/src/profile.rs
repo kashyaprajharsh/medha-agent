@@ -104,12 +104,24 @@ impl ProviderProfile {
             return Err("provider base URL cannot be empty".into());
         }
         let parsed = reqwest::Url::parse(base_url)
-            .map_err(|error| format!("invalid provider base URL '{base_url}': {error}"))?;
+            .map_err(|error| format!("invalid provider base URL: {error}"))?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(format!(
                 "provider base URL must use http or https, not '{}'",
                 parsed.scheme()
             ));
+        }
+        if parsed.host_str().is_none() {
+            return Err("provider base URL must include a host".into());
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(
+                "provider base URL must not contain credentials; select an auth kind instead"
+                    .into(),
+            );
+        }
+        if parsed.fragment().is_some() {
+            return Err("provider base URL must not contain a URL fragment".into());
         }
         if self.model.trim().is_empty() {
             return Err("provider model cannot be empty".into());
@@ -228,6 +240,16 @@ mod tests {
         profile.headers.clear();
         profile.protocol = Protocol::GeminiInteractions;
         profile.token_counter = TokenCounter::Vllm;
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_credentials_embedded_in_base_url() {
+        let profile = ProviderProfile::openai_chat(
+            "https://user:secret@example.test/v1",
+            "model",
+            AuthKind::None,
+        );
         assert!(profile.validate().is_err());
     }
 }

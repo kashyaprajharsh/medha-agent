@@ -1,7 +1,7 @@
 //! Deterministic working-set pressure checks (D3/D10).
 
 use crate::recall::{
-    entry_index_tokens, full_index_tokens, index_eligible, one_line, DEFAULT_STALE_AFTER_DAYS,
+    DEFAULT_STALE_AFTER_DAYS, entry_index_tokens, full_index_tokens, index_eligible, one_line,
 };
 use crate::{MemoryEntry, MemoryError, MemoryProjection};
 use context::{BpeCounter, TokenCounter};

@@ -316,10 +316,26 @@ fn is_system_path(p: &str) -> bool {
         return true;
     }
     const SYS: &[&str] = &[
-        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/boot", "/dev", "/sys",
-        "/proc", "/var", "/system", "/library", "/applications", "/private/etc", "/private/var",
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/opt",
+        "/boot",
+        "/dev",
+        "/sys",
+        "/proc",
+        "/var",
+        "/system",
+        "/library",
+        "/applications",
+        "/private/etc",
+        "/private/var",
     ];
-    SYS.iter().any(|s| p == *s || p.starts_with(&format!("{s}/")))
+    SYS.iter()
+        .any(|s| p == *s || p.starts_with(&format!("{s}/")))
 }
 
 /// Patterns that are refused outright. This is intentionally best-effort — the
@@ -469,16 +485,28 @@ mod tests {
         let p = DefaultPolicy::default();
         for tool in ["memory.write", "memory.update", "memory.forget"] {
             let user = auth(&p, &intent(tool, json!({ "name": "n", "scope": "user" })));
-            assert!(matches!(user, Decision::Human), "{tool} user scope must gate");
+            assert!(
+                matches!(user, Decision::Human),
+                "{tool} user scope must gate"
+            );
             let project = auth(&p, &intent(tool, json!({ "name": "n" })));
-            assert!(matches!(project, Decision::Allow), "{tool} project scope rides Read radius");
+            assert!(
+                matches!(project, Decision::Allow),
+                "{tool} project scope rides Read radius"
+            );
         }
     }
 
     #[test]
     fn memory_write_approval_mode_supports_none_and_all() {
-        let project = intent("memory.write", json!({ "name": "quoted-name", "scope": "project" }));
-        let user = intent("memory.write", json!({ "name": "quoted-name", "scope": "user" }));
+        let project = intent(
+            "memory.write",
+            json!({ "name": "quoted-name", "scope": "project" }),
+        );
+        let user = intent(
+            "memory.write",
+            json!({ "name": "quoted-name", "scope": "user" }),
+        );
         let none = DefaultPolicy::default().with_memory_write_approval("none");
         assert!(matches!(auth(&none, &project), Decision::Allow));
         assert!(matches!(auth(&none, &user), Decision::Allow));
@@ -594,7 +622,10 @@ mod tests {
             "rm -rf /tmp/pptx-env /tmp/md-env",
             "rm -rf /var/folders/5q/abc/T/medha-gate-01",
         ] {
-            assert!(matches!(auth(&p, &shell(ok)), Decision::Allow), "should allow temp cleanup: {ok}");
+            assert!(
+                matches!(auth(&p, &shell(ok)), Decision::Allow),
+                "should allow temp cleanup: {ok}"
+            );
         }
         // …but a temp prefix must not be a traversal escape to the real fs.
         assert!(matches!(
@@ -617,7 +648,10 @@ mod tests {
             "rm -rf /var/log",
             "rm -rf /tmp/../etc", // traversal escape
         ] {
-            assert!(matches!(auth(&p, &shell(deny)), Decision::Deny { .. }), "must deny: {deny}");
+            assert!(
+                matches!(auth(&p, &shell(deny)), Decision::Deny { .. }),
+                "must deny: {deny}"
+            );
         }
         // Tier 2 — your files outside the workspace: ASK (human approval).
         for ask in [
@@ -625,11 +659,21 @@ mod tests {
             "rm -rf /Users/reeturajharsh/scratch/tmp",
             "rm -rf ~/Downloads/build",
         ] {
-            assert!(matches!(auth(&p, &shell(ask)), Decision::Human), "must ask: {ask}");
+            assert!(
+                matches!(auth(&p, &shell(ask)), Decision::Human),
+                "must ask: {ask}"
+            );
         }
         // Tier 1 — temp + workspace-relative: allowed (no approval needed here).
-        for ok in ["rm -rf /tmp/pptx-env", "rm -rf ./build", "rm -rf target/debug"] {
-            assert!(matches!(auth(&p, &shell(ok)), Decision::Allow), "must allow: {ok}");
+        for ok in [
+            "rm -rf /tmp/pptx-env",
+            "rm -rf ./build",
+            "rm -rf target/debug",
+        ] {
+            assert!(
+                matches!(auth(&p, &shell(ok)), Decision::Allow),
+                "must allow: {ok}"
+            );
         }
     }
 
@@ -638,16 +682,32 @@ mod tests {
         let p = DefaultPolicy::new();
         // `$HOME`/`${HOME}` is the home root → the same hard deny as `~`.
         for deny in ["rm -rf $HOME", "rm -rf ${HOME}", "rm -rf $HOME/"] {
-            assert!(matches!(auth(&p, &shell(deny)), Decision::Deny { .. }), "must deny: {deny}");
+            assert!(
+                matches!(auth(&p, &shell(deny)), Decision::Deny { .. }),
+                "must deny: {deny}"
+            );
         }
         // A path *under* $HOME is your files outside the workspace → ask.
-        for ask in ["rm -rf $HOME/Documents/old", "rm -rf ${HOME}/Downloads/build"] {
-            assert!(matches!(auth(&p, &shell(ask)), Decision::Human), "must ask: {ask}");
+        for ask in [
+            "rm -rf $HOME/Documents/old",
+            "rm -rf ${HOME}/Downloads/build",
+        ] {
+            assert!(
+                matches!(auth(&p, &shell(ask)), Decision::Human),
+                "must ask: {ask}"
+            );
         }
         // Any other variable can't be resolved statically → never silently
         // allowed; it fails closed to human approval (deny under a no-human policy).
-        for ask in ["rm -rf $TMPDIR/x", "rm -rf $HOMEDIR", "rm -rf ${SOMEDIR}/nested"] {
-            assert!(matches!(auth(&p, &shell(ask)), Decision::Human), "must ask: {ask}");
+        for ask in [
+            "rm -rf $TMPDIR/x",
+            "rm -rf $HOMEDIR",
+            "rm -rf ${SOMEDIR}/nested",
+        ] {
+            assert!(
+                matches!(auth(&p, &shell(ask)), Decision::Human),
+                "must ask: {ask}"
+            );
         }
     }
 

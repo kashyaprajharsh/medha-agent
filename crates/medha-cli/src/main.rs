@@ -228,6 +228,34 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
     std::process::exit(gate::report::exit_code(&results));
 }
 
+/// `medha pulse [--fix]` — the configuration health check (the `/pulse` command
+/// outside the TUI). Reports which model/endpoint/credential medha resolves and
+/// from where, flags mismatches, and — with `--fix` — applies the safe repairs.
+/// Static and offline: no keychain prompt, no network, no API spend.
+fn run_pulse_command(args: &[String]) -> Result<()> {
+    let fix = args.iter().any(|a| a == "--fix" || a == "fix");
+    let cfg = config::load()?;
+    let report = config::pulse(cfg.as_ref(), None, None);
+    print!("{}", report.render());
+
+    if fix {
+        let mut cfg = cfg.unwrap_or_default();
+        let applied = config::apply_safe_fixes(&mut cfg);
+        if applied.is_empty() {
+            println!("\nfix: nothing to repair.");
+        } else {
+            config::save(&cfg)?;
+            println!("\nfix: applied {} repair(s):", applied.len());
+            for line in applied {
+                println!("  ✔ {line}");
+            }
+        }
+    } else if report.has_fixes() {
+        println!("\n(run `medha pulse --fix` to apply the fixable items)");
+    }
+    Ok(())
+}
+
 /// Restore file(s) from a snapshot, headlessly — `/rewind` without the TUI
 /// or the conversation fork.
 #[derive(Parser)]
@@ -665,10 +693,16 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load a .env from the current dir or any ancestor (industry-standard BYOK
-    // convenience). Real shell env vars take precedence — dotenvy never
-    // overrides values already set in the environment.
-    let _ = dotenvy::dotenv();
+    // medha deliberately does NOT auto-load a project `.env`. As a roaming
+    // harness it runs inside repos it doesn't own, and dotenv walks up ancestors
+    // — so a project's own `.env` (its `OPENAI_*` / `OPENAI_COMPATIBLE_*` LLM
+    // settings) silently hijacked medha's model and credentials, and could send
+    // one program's secrets through another. medha's configuration is a function
+    // of medha's own state only: `~/.medha/config.toml`, the OS keychain /
+    // credentials file, `medha.lock [routing]`, and the `MEDHA_*` env namespace.
+    // The workspace's `.env` still reaches child tool processes through normal
+    // inheritance — medha simply never reads it for its own config. `medha nadi`
+    // (or `/nadi` in the TUI) shows exactly where each value resolved from.
 
     // `medha gate <scenario>` is an operator subcommand (the Eval Gate, §4.11–4.12).
     // It's dispatched by hand *before* the main clap parse: the interactive/headless
@@ -684,6 +718,9 @@ async fn main() -> Result<()> {
     }
     if raw.get(1).map(|s| s == "memory").unwrap_or(false) {
         return run_memory_command(raw[2..].to_vec()).await;
+    }
+    if raw.get(1).map(|s| s == "pulse").unwrap_or(false) {
+        return run_pulse_command(&raw[2..]);
     }
 
     let cli = Cli::parse();
@@ -725,6 +762,9 @@ async fn main() -> Result<()> {
                 providers::AuthKind::None,
             ),
             credential: String::new(),
+            model_source: config::Source::Config,
+            base_url_source: config::Source::Config,
+            credential_source: config::CredSource::KeychainOrNone,
         },
         None => anyhow::bail!(
             "no model configured. Run `medha` to add one in the TUI, \

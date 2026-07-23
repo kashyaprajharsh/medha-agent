@@ -58,6 +58,8 @@ export MEDHA_MODEL="qwen3-coder"
 export MEDHA_API_KEY="…"                            # if the endpoint needs one
 ```
 
+> **Only the `MEDHA_*` namespace configures MEDHA.** As a harness that runs inside repos it doesn't own, MEDHA deliberately **never reads a project's `.env`** and **never reads generic `OPENAI_*` / `GOOGLE_*` names** — those belong to the app that owns the directory, and reading them would let one project's environment silently hijack MEDHA's model or credentials. MEDHA's config comes only from `MEDHA_*`, `~/.medha/config.toml`, the OS keychain, and `medha.lock [routing]`. Run **`medha pulse`** (or **`/pulse`** in the TUI) to see exactly which model/key resolved and from where; **`medha pulse --fix`** auto-repairs safe issues.
+
 Then work interactively or headless:
 
 ```sh
@@ -227,6 +229,7 @@ Type `/` for the palette (Tab completes, ↑↓ navigate menus).
 | Command | Does |
 |---|---|
 | `/help` · `/status` | Commands · model, context window, pressure |
+| `/pulse` | Config health: which model/key resolves & from where; `/pulse fix` auto-repairs |
 | `/reasoning` | Thinking mode, effort, visibility |
 | `/stream` | Toggle live token streaming |
 | `/model` · `/search` | Switch model/profile · web-search provider |
@@ -263,7 +266,7 @@ Twelve crates. `kernel` is the only code that calls a model, writes an event, or
 | [`providers`](crates/providers/) | OpenAI-compatible streaming + non-streaming, model discovery |
 | [`context`](crates/context/) | Prompt assembly (the five context layers), compaction, identity, context files |
 | [`memory`](crates/memory/) | Typed memory: projection, ranked recall, consolidation |
-| [`tools`](crates/tools/) | 23 tools: fs, shell, web, git, search, diagnostics, skills, memory |
+| [`tools`](crates/tools/) | 23 tools: fs, shell, web, git, search, diagnostics (multi-language), skills, memory |
 | [`policy`](crates/policy/) | Deny-first authorization, shell scanner, content guard |
 | [`sandbox`](crates/sandbox/) | Exec backends: host · Seatbelt/Landlock · container · ssh |
 | [`store`](crates/store/) | SQLite (WAL) hash-chained event log + FTS5 + artifact store |
@@ -272,8 +275,8 @@ Twelve crates. `kernel` is the only code that calls a model, writes an event, or
 | [`gate`](crates/gate/) | Eval Gate: scenario runner, deterministic checks |
 | [`medha-cli`](crates/medha-cli/) | TUI (ratatui), REPL, headless, ACP bridge |
 
-**Provider config precedence:** CLI flag → env var → `~/.medha/config.toml` → first-run setup.
-**API keys:** env var → `~/.medha/credentials.toml` (0600) → OS keychain (optional). Keys are never written to `medha.lock`.
+**Provider config precedence:** CLI flag → `MEDHA_*` env → `~/.medha/config.toml` → first-run setup. Only the `MEDHA_*` namespace is read — never a project `.env` or generic `OPENAI_*`/`GOOGLE_*` names. `medha pulse` shows the resolved provenance.
+**API keys:** `MEDHA_API_KEY` env → `~/.medha/credentials.toml` (0600) → OS keychain (optional). Keys are never written to `medha.lock`.
 
 ---
 

@@ -103,7 +103,13 @@ Reply with ONLY a JSON object: {\"verdict\":\"safe\"|\"caution\"|\"dangerous\",\
 pub fn parse_verdict(text: &str) -> Option<JudgeOutcome> {
     let obj = extract_json_object(text)?;
     let value: Value = serde_json::from_str(&obj).ok()?;
-    let verdict = match value.get("verdict")?.as_str()?.trim().to_ascii_lowercase().as_str() {
+    let verdict = match value
+        .get("verdict")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "safe" => JudgeVerdict::Safe,
         "dangerous" => JudgeVerdict::Dangerous,
         "caution" => JudgeVerdict::Caution,

@@ -6,7 +6,8 @@
 
 use crate::config;
 use crossterm::event::{
-    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
 use kernel::{Budget, EventLog, Kernel, Message, Provider, Session, StopReason, ToolCategory};
@@ -239,6 +240,10 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
     ("/status", "model, context window, current pressure"),
+    (
+        "/pulse",
+        "config health: which model/key resolves & from where; /pulse fix auto-repairs",
+    ),
     (
         "/reasoning",
         "configure mode, visibility, effort, and inspect delivery",
@@ -591,6 +596,29 @@ struct Entry {
     height: usize,
 }
 
+/// A position in the virtualized transcript. Rows remain stable while the user
+/// scrolls; columns are terminal cells rather than bytes/chars so wide glyphs
+/// remain selectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPoint {
+    row: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextSelection {
+    anchor: TextPoint,
+    focus: TextPoint,
+    non_empty: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastClick {
+    point: TextPoint,
+    at: Instant,
+    count: u8,
+}
+
 impl Entry {
     fn new(item: Item) -> Self {
         Self {
@@ -700,6 +728,110 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+fn ordered_selection(selection: TextSelection) -> Option<(TextPoint, TextPoint)> {
+    if !selection.non_empty {
+        return None;
+    }
+    Some(if selection.anchor <= selection.focus {
+        (selection.anchor, selection.focus)
+    } else {
+        (selection.focus, selection.anchor)
+    })
+}
+
+fn selection_cell_range(selection: TextSelection, row: usize) -> Option<(usize, usize)> {
+    let (start, end) = ordered_selection(selection)?;
+    if row < start.row || row > end.row {
+        return None;
+    }
+    let from = if row == start.row { start.column } else { 0 };
+    let to = if row == end.row {
+        end.column.saturating_add(1)
+    } else {
+        usize::MAX
+    };
+    Some((from, to))
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn text_cell_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    text.chars()
+        .map(|character| character.width().unwrap_or(0))
+        .sum()
+}
+
+/// Return the characters whose terminal cells intersect `[start, end)`.
+fn slice_cells(text: &str, start: usize, end: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    if start >= end {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut column = 0usize;
+    let mut previous_selected = false;
+    for character in text.chars() {
+        let width = character.width().unwrap_or(0);
+        let selected = if width == 0 {
+            previous_selected
+        } else {
+            column < end && column.saturating_add(width) > start
+        };
+        if selected {
+            result.push(character);
+        }
+        previous_selected = selected;
+        column = column.saturating_add(width);
+    }
+    result
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Double-click word semantics favor source-code identifiers: letters, digits,
+/// and `_` form a word. Punctuation remains independently selectable.
+fn word_cell_range(text: &str, target: usize) -> Option<(usize, usize)> {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut column = 0usize;
+    let mut chars = Vec::new();
+    for character in text.chars() {
+        let width = character.width().unwrap_or(0);
+        let start = column;
+        column = column.saturating_add(width);
+        chars.push((character, start, column));
+    }
+    let index = chars.iter().position(|(_, start, end)| {
+        (*start <= target && target < *end) || (*start == target && *start == *end)
+    })?;
+    let is_word = |character: char| character.is_alphanumeric() || character == '_';
+    if !is_word(chars[index].0) {
+        return Some((chars[index].1, chars[index].2.max(chars[index].1 + 1)));
+    }
+    let mut first = index;
+    while first > 0 && is_word(chars[first - 1].0) {
+        first -= 1;
+    }
+    let mut last = index + 1;
+    while last < chars.len() && is_word(chars[last].0) {
+        last += 1;
+    }
+    Some((chars[first].1, chars[last - 1].2))
 }
 
 /// Pending approval for inline rendering
@@ -1284,7 +1416,7 @@ impl ModelSetup {
         match self.step {
             ModelSetupStep::BaseUrl => match self.protocol {
                 kernel::Protocol::OpenAiChat => {
-                    "OpenAI-compatible base URL (for example http://localhost:11434/v1):"
+                    "OpenAI-compatible API root or full /chat/completions URL (for example http://localhost:11434/v1):"
                 }
                 kernel::Protocol::GeminiInteractions => {
                     "Gemini Interactions v1 base URL (normally https://generativelanguage.googleapis.com/v1):"
@@ -1408,6 +1540,18 @@ struct Model {
     approval_rows: Vec<Line<'static>>,
     /// Terminal width the caches were laid out for (re-wrap on resize).
     cached_width: u16,
+    /// Last rendered transcript rectangle, used to translate mouse coordinates
+    /// into virtual transcript rows.
+    transcript_area: Rect,
+    /// Application-owned transcript selection. Mouse capture stays enabled so
+    /// wheel scrolling works consistently across terminal emulators.
+    text_selection: Option<TextSelection>,
+    mouse_selecting: bool,
+    last_click: Option<LastClick>,
+    /// Text waiting for the event loop to send to the terminal clipboard.
+    pending_clipboard: Option<String>,
+    /// Brief copy result shown without mutating the transcript.
+    clipboard_status: Option<(String, Instant)>,
     /// The pending approval card has been rendered at least once, so its options
     /// are on screen and selection input is safe to accept (blocks blind-Enter).
     approval_ready: bool,
@@ -1548,6 +1692,12 @@ impl Model {
             total_rows: 0,
             approval_rows: Vec::new(),
             cached_width: 0,
+            transcript_area: Rect::default(),
+            text_selection: None,
+            mouse_selecting: false,
+            last_click: None,
+            pending_clipboard: None,
+            clipboard_status: None,
             approval_ready: false,
             ctx_pct: None,
             cost_usd: None,
@@ -1795,6 +1945,108 @@ impl Model {
         self.auto_scroll = true;
     }
 
+    fn transcript_point(&self, column: u16, row: u16) -> Option<TextPoint> {
+        let area = self.transcript_area;
+        if column < area.x || column >= area.right() || row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let point = TextPoint {
+            row: self.scroll_offset + usize::from(row - area.y),
+            column: usize::from(column - area.x),
+        };
+        (point.row < self.total_rows).then_some(point)
+    }
+
+    fn transcript_line(&self, row: usize) -> Option<&Line<'static>> {
+        let mut offset = 0usize;
+        for entry in &self.items {
+            let lines = entry.lines.as_ref()?;
+            if row < offset + lines.len() {
+                return lines.get(row - offset);
+            }
+            offset += lines.len();
+        }
+        self.approval_rows.get(row.checked_sub(offset)?)
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+
+        let (start, end) = ordered_selection(self.text_selection?)?;
+        let mut output = String::new();
+        for row in start.row..=end.row {
+            let line = self.transcript_line(row)?;
+            let plain = line_text(line);
+            let width = text_cell_width(&plain);
+            let from = if row == start.row {
+                start.column.min(width)
+            } else {
+                0
+            };
+            let to = if row == end.row {
+                end.column.saturating_add(1).min(width)
+            } else {
+                width
+            };
+            if row > start.row {
+                output.push('\n');
+            }
+            output.push_str(&slice_cells(&plain, from, to));
+            if output.len() > MAX_CLIPBOARD_BYTES {
+                output.truncate(floor_char_boundary(&output, MAX_CLIPBOARD_BYTES));
+                break;
+            }
+        }
+        (!output.is_empty()).then_some(output)
+    }
+
+    fn select_word(&mut self, point: TextPoint) {
+        let Some(line) = self.transcript_line(point.row) else {
+            return;
+        };
+        let Some((start, end_exclusive)) = word_cell_range(&line_text(line), point.column) else {
+            return;
+        };
+        self.text_selection = Some(TextSelection {
+            anchor: TextPoint {
+                row: point.row,
+                column: start,
+            },
+            focus: TextPoint {
+                row: point.row,
+                column: end_exclusive.saturating_sub(1),
+            },
+            non_empty: true,
+        });
+        self.queue_selection_copy();
+    }
+
+    fn select_line(&mut self, point: TextPoint) {
+        let Some(line) = self.transcript_line(point.row) else {
+            return;
+        };
+        let width = text_cell_width(&line_text(line));
+        if width == 0 {
+            return;
+        }
+        self.text_selection = Some(TextSelection {
+            anchor: TextPoint {
+                row: point.row,
+                column: 0,
+            },
+            focus: TextPoint {
+                row: point.row,
+                column: width - 1,
+            },
+            non_empty: true,
+        });
+        self.queue_selection_copy();
+    }
+
+    fn queue_selection_copy(&mut self) {
+        self.pending_clipboard = self.selected_text();
+    }
+
     fn push_notice(&mut self, s: impl Into<String>) {
         self.push_item(Item::Notice(s.into()));
     }
@@ -1833,8 +2085,13 @@ impl Model {
     fn push_item(&mut self, item: Item) {
         self.items.push_back(Entry::new(item));
         // Cap scrollback
+        let mut dropped = false;
         while self.items.len() > MAX_SCROLLBACK_LINES {
             self.items.pop_front();
+            dropped = true;
+        }
+        if dropped {
+            self.text_selection = None;
         }
         self.dirty = true;
         if self.auto_scroll {
@@ -1903,6 +2160,7 @@ impl Model {
         for e in self.items.iter_mut() {
             e.invalidate();
         }
+        self.text_selection = None;
         self.dirty = true;
     }
 
@@ -1945,6 +2203,7 @@ enum Msg {
     // Input events
     KeyPress(KeyEvent),
     MouseScroll(i32),
+    Mouse(MouseEvent),
     Paste(String),
     Resize(u16),
     // Agent events
@@ -2070,6 +2329,13 @@ where
                     Some(Ok(CtEvent::Mouse(m))) => match m.kind {
                         MouseEventKind::ScrollUp => { update(&mut model, Msg::MouseScroll(-2), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
                         MouseEventKind::ScrollDown => { update(&mut model, Msg::MouseScroll(2), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
+                        MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Drag(MouseButton::Left)
+                        | MouseEventKind::Up(MouseButton::Left) => {
+                            update(&mut model, Msg::Mouse(m), &kernel, &mut session, &mut transcript, &budget, &tx);
+                            redraw_needed = true;
+                            immediate = true;
+                        }
                         _ => {}
                     },
                     Some(Ok(CtEvent::Paste(data))) => { update(&mut model, Msg::Paste(data), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
@@ -2102,11 +2368,29 @@ where
                 if model.running || model.welcome || model.intro_frame.is_some() || model.dirty
                     || running > 0
                     || running != model.bg_shown_running
+                    || model
+                        .clipboard_status
+                        .as_ref()
+                        .is_some_and(|(_, until)| *until > Instant::now())
                 {
                     redraw_needed = true;
                 }
                 model.bg_shown_running = running;
             }
+        }
+
+        if let Some(text) = model.pending_clipboard.take() {
+            let count = text.chars().count();
+            let status = match tty::copy_to_clipboard(&mut terminal, &text) {
+                Ok(()) => format!("copied {count} chars"),
+                Err(error) => {
+                    tracing::warn!(%error, "could not copy transcript selection");
+                    "clipboard unavailable".to_string()
+                }
+            };
+            model.clipboard_status = Some((status, Instant::now() + Duration::from_secs(2)));
+            redraw_needed = true;
+            immediate = true;
         }
 
         // Redraw when: a user input just happened (immediate — snappy scroll/typing),
@@ -2143,6 +2427,41 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-tui-test-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap())
+    }
+
+    #[test]
+    fn transcript_selection_uses_terminal_cells_for_wide_text() {
+        assert_eq!(text_cell_width("a界b"), 4);
+        assert_eq!(slice_cells("a界b", 1, 3), "界");
+        assert_eq!(slice_cells("a界b", 2, 3), "界");
+    }
+
+    #[test]
+    fn double_click_word_range_includes_source_identifiers() {
+        assert_eq!(word_cell_range("call memory_search now", 8), Some((5, 18)));
+        assert_eq!(word_cell_range("ok!", 2), Some((2, 3)));
+    }
+
+    #[test]
+    fn an_unmoved_click_is_not_a_copy_selection() {
+        let point = TextPoint { row: 4, column: 2 };
+        assert!(
+            ordered_selection(TextSelection {
+                anchor: point,
+                focus: point,
+                non_empty: false,
+            })
+            .is_none()
+        );
+        assert!(
+            ordered_selection(TextSelection {
+                anchor: point,
+                focus: point,
+                non_empty: true,
+            })
+            .is_some(),
+            "double-clicking a one-cell word is still a real selection"
+        );
     }
 
     // ---- mid-session skill manifest refresh ----

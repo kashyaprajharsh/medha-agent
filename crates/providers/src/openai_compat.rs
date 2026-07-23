@@ -86,6 +86,32 @@ fn validate_reasoning(
     Ok(())
 }
 
+/// Neutralize a carried reasoning setting that the target profile can't accept,
+/// so a model switch never hard-fails on a protocol/support mismatch. Returns
+/// the default ("untouched" — let the server decide) in those cases; otherwise
+/// keeps the setting unchanged. An explicit `set_reasoning` stays strict.
+fn reconcile_reasoning_for_switch(
+    profile: &ProviderProfile,
+    config: ReasoningConfig,
+) -> ReasoningConfig {
+    if config == ReasoningConfig::default() {
+        return config;
+    }
+    match profile.protocol {
+        // open-ai-chat can't enable reasoning without a concrete effort; a
+        // carried "on, no effort" (valid on Gemini) becomes server-default here.
+        Protocol::OpenAiChat if config.enabled == Some(true) && config.effort.is_none() => {
+            ReasoningConfig::default()
+        }
+        // gemini-interactions has no portable disable; a carried "off" becomes
+        // server-default rather than blocking the switch.
+        Protocol::GeminiInteractions if config.enabled == Some(false) => {
+            ReasoningConfig::default()
+        }
+        _ => config,
+    }
+}
+
 fn protocol_is_implemented(protocol: Protocol) -> bool {
     matches!(
         protocol,
@@ -291,10 +317,13 @@ impl ProviderClient {
                 profile.protocol.as_str()
             )));
         }
-        // Validate the exact canonical setting. Never invent `minimal` while
-        // switching protocols: effort support is model-specific, and `None`
-        // deliberately means "let this server/model choose its default".
-        let reasoning = self.reasoning();
+        // A model switch carries the session's reasoning setting into the new
+        // profile. When that carried setting is meaningless for the target
+        // protocol (e.g. Gemini's "on, no explicit effort" reaching open-ai-chat,
+        // which needs a concrete level), fall back to "untouched" — the server's
+        // own default — rather than failing the switch. We never fabricate an
+        // effort, so cost/latency semantics are never silently changed.
+        let reasoning = reconcile_reasoning_for_switch(&profile, self.reasoning());
         validate_reasoning(&profile, &reasoning)?;
         *self.reasoning.lock().unwrap() = reasoning;
         *self.connection.lock().unwrap() = Connection {
@@ -575,29 +604,46 @@ async fn list_openai_chat_models(
     struct ModelsResp {
         data: Vec<ModelEntry>,
     }
+    // Servers spell the context window differently, and some (e.g. Groq) report
+    // MORE than one of these keys at once. A serde field with `alias`es treats
+    // them as one field and errors on "duplicate field" when several are present,
+    // so read each independently and coalesce.
     #[derive(Deserialize)]
     struct ModelEntry {
         id: String,
-        // Different servers expose the window under different keys; map them all.
-        #[serde(default, alias = "max_model_len", alias = "context_window")]
+        #[serde(default)]
         context_length: Option<u32>,
+        #[serde(default)]
+        context_window: Option<u32>,
+        #[serde(default)]
+        max_model_len: Option<u32>,
     }
 
     let resp = http::with_profile(client.get(url), profile, credential)?
         .send()
         .await
         .map_err(|error| ProviderError::Transport(error.to_string()))?;
-    let parsed: ModelsResp = http::require_success(resp)
+    // Read the body as text first so a parse failure can report the actual serde
+    // reason and a snippet — reqwest's `.json()` error is just the opaque
+    // "error decoding response body".
+    let body = http::require_success(resp)
         .await?
-        .json()
+        .text()
         .await
-        .map_err(|error| ProviderError::Decode(error.to_string()))?;
+        .map_err(|error| ProviderError::Transport(error.to_string()))?;
+    let parsed: ModelsResp = serde_json::from_str(&body).map_err(|error| {
+        let snippet: String = body.chars().take(200).collect();
+        ProviderError::Decode(format!("model list parse failed: {error} (body: {snippet})"))
+    })?;
     Ok(parsed
         .data
         .into_iter()
         .map(|model| ModelInfo {
             id: model.id,
-            context_length: model.context_length,
+            context_length: model
+                .context_length
+                .or(model.context_window)
+                .or(model.max_model_len),
         })
         .collect())
 }
@@ -1839,6 +1885,58 @@ mod gemini_client_tests {
     }
 
     #[tokio::test]
+    async fn openai_chat_discovery_handles_groq_dual_context_keys() {
+        // Groq reports BOTH `context_length` and `context_window` on each model.
+        // Aliasing them to one field made serde raise "duplicate field" and the
+        // whole discovery failed with an opaque decode error. It must now parse,
+        // preferring `context_length`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before headers");
+                bytes.extend_from_slice(&chunk[..read]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = serde_json::json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "openai/gpt-oss-120b",
+                        "object": "model",
+                        "owned_by": "OpenAI",
+                        "active": true,
+                        "context_window": 131_072,
+                        "context_length": 131_072,
+                        "max_completion_tokens": 8_192
+                    }
+                ]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let models = list_models(&format!("http://{address}/openai/v1"), "gsk_test")
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "openai/gpt-oss-120b");
+        assert_eq!(models[0].context_length, Some(131_072));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_stream_posts_v1_interactions_with_google_auth_and_decodes_state() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2080,7 +2178,7 @@ mod reasoning_request_tests {
     }
 
     #[test]
-    fn gemini_server_default_is_preserved_and_openai_switch_rejects_ambiguity() {
+    fn gemini_reasoning_reconciles_on_switch_to_openai() {
         // A Gemini session runs with "reasoning on" and no explicit effort —
         // valid for gemini-interactions. Start a provider in exactly that state.
         let mut gemini =
@@ -2093,16 +2191,17 @@ mod reasoning_request_tests {
                 effort: None,
             })
             .unwrap();
-        // Gemini may choose its model default; the client must not invent an
-        // effort that has different support/cost semantics.
         assert_eq!(provider.reasoning().effort, None);
 
-        // OpenAI Chat needs an explicit effort in this canonical profile. The
-        // switch fails atomically instead of silently choosing one.
+        // open-ai-chat can't enable reasoning without a concrete effort. The
+        // switch must NOT fail: the carried "on, no effort" is reconciled to
+        // untouched (server default), never a fabricated level.
         let next = ProviderProfile::openai_chat("http://vllm/v1", "qwen", AuthKind::None);
-        assert!(provider.switch_provider_profile(next, "").is_err());
-        assert_eq!(provider.active_model(), "gemini-3.5-flash");
-        assert_eq!(provider.reasoning().effort, None);
+        provider
+            .switch_provider_profile(next, "")
+            .expect("switch reconciles instead of erroring");
+        assert_eq!(provider.active_model(), "qwen");
+        assert_eq!(provider.reasoning(), ReasoningConfig::default());
     }
 
     #[test]

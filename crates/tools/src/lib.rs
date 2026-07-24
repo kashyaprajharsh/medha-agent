@@ -728,6 +728,80 @@ impl Tool for LspCallHierarchy {
     }
 }
 
+struct McpStatus {
+    manager: Arc<mcp::McpManager>,
+}
+
+#[async_trait]
+impl Tool for McpStatus {
+    fn name(&self) -> &str {
+        "mcp.status"
+    }
+    fn description(&self) -> &str {
+        "Show configured MCP servers and whether each is needs_approval, connecting, ready, or failed, with tool counts."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: &Value) -> Result<Value, ToolError> {
+        Ok(json!({ "servers": self.manager.status().await }))
+    }
+}
+
+struct McpStart {
+    manager: Arc<mcp::McpManager>,
+}
+
+#[async_trait]
+impl Tool for McpStart {
+    fn name(&self) -> &str {
+        "mcp.start"
+    }
+    fn description(&self) -> &str {
+        "Approve and start a configured MCP server so its tools become callable. Project-defined servers require this once per session."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::External
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "Configured MCP server id" }
+            },
+            "required": ["server"]
+        })
+    }
+    async fn preview(&self, args: &Value) -> Option<String> {
+        let server = args.get("server")?.as_str()?;
+        let preview = self.manager.start_preview(server).await.ok()?;
+        Some(format!(
+            "start MCP server '{}'\ncommand: {}",
+            preview.server,
+            preview.command.join(" ")
+        ))
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let server = arg_str(args, "server")?;
+        serde_json::to_value(
+            self.manager
+                .approve_and_connect(&server)
+                .await
+                .map_err(|error| ToolError::Failed(error.to_string()))?,
+        )
+        .map_err(|error| ToolError::Failed(error.to_string()))
+    }
+}
+
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// The workspace sandbox, kept so the executor can report its containment
@@ -747,6 +821,9 @@ pub struct ToolRegistry {
     /// Shared optional LSP manager. File mutation tools retain this handle so
     /// registering LSP after the default registry is built updates all of them.
     lsp: LspHandle,
+    /// Optional MCP host. Its tools are projected dynamically each turn (so a
+    /// server that connects mid-session appears without rebuilding the registry).
+    mcp: Option<Arc<mcp::McpManager>>,
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
 }
 
@@ -764,6 +841,7 @@ impl ToolRegistry {
             search: Arc::new(Mutex::new(SearchSettings::default())),
             clarify: Arc::new(Mutex::new(None)),
             lsp: Arc::new(Mutex::new(None)),
+            mcp: None,
             artifacts: None,
         }
     }
@@ -843,6 +921,17 @@ impl ToolRegistry {
                 artifacts,
             }));
         }
+        self
+    }
+
+    /// Enable the MCP host. Its discovered tools are projected via `specs()` and
+    /// dispatched via `execute()`; `mcp.status`/`mcp.start` control the servers.
+    pub fn register_mcp(&mut self, manager: Arc<mcp::McpManager>) -> &mut Self {
+        self.mcp = Some(manager.clone());
+        self.register(Arc::new(McpStatus {
+            manager: manager.clone(),
+        }));
+        self.register(Arc::new(McpStart { manager }));
         self
     }
 
@@ -1026,15 +1115,33 @@ impl Executor for ToolRegistry {
                 icon: t.icon().to_string(),
             })
             .collect();
+        // MCP tools are dynamic (a server may connect mid-session) and untrusted:
+        // exposed as External so every call routes through the human gate.
+        if let Some(mcp) = &self.mcp {
+            specs.extend(mcp.tool_specs().into_iter().map(|t| ToolSpec {
+                name: t.name,
+                description: t.description,
+                schema: t.schema,
+                blast_radius: BlastRadius::External,
+                category: ToolCategory::Other,
+                icon: "•".to_string(),
+            }));
+        }
         specs.sort_by(|a, b| a.name.cmp(&b.name)); // stable exposure order
         specs
     }
 
     fn blast_radius(&self, tool: &str) -> Option<BlastRadius> {
+        if mcp::McpManager::is_mcp_tool(tool) {
+            return Some(BlastRadius::External);
+        }
         self.tools.get(tool).map(|t| t.blast_radius())
     }
 
     fn category(&self, tool: &str) -> Option<ToolCategory> {
+        if mcp::McpManager::is_mcp_tool(tool) {
+            return Some(ToolCategory::Other);
+        }
         self.tools.get(tool).map(|t| t.category())
     }
 
@@ -1050,6 +1157,31 @@ impl Executor for ToolRegistry {
     }
 
     async fn execute(&self, intent: &ToolIntent) -> Observation {
+        if mcp::McpManager::is_mcp_tool(&intent.tool) {
+            let Some(mcp) = &self.mcp else {
+                return Observation::denial(&intent.id, format!("unknown tool '{}'", intent.tool));
+            };
+            return match mcp.call(&intent.tool, &intent.args).await {
+                Ok(out) => {
+                    let payload = json!({
+                        "server": out.server,
+                        "tool": out.tool,
+                        "content": out.text,
+                        "truncated": out.truncated,
+                    });
+                    if out.is_error {
+                        Observation {
+                            intent_id: intent.id.clone(),
+                            status: kernel::ObsStatus::Error,
+                            payload,
+                        }
+                    } else {
+                        Observation::ok(&intent.id, payload)
+                    }
+                }
+                Err(e) => Observation::error(&intent.id, e.to_string()),
+            };
+        }
         let Some(tool) = self.tools.get(&intent.tool) else {
             return Observation::denial(&intent.id, format!("unknown tool '{}'", intent.tool));
         };

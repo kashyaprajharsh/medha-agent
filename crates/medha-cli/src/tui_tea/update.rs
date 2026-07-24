@@ -752,6 +752,20 @@ pub(super) fn handle_key<P, L>(
                     .unwrap_or(labels.len().saturating_sub(1))
             }
             KeyCode::Down => picker.selected = (picker.selected + 1) % labels.len().max(1),
+            // `d` removes the selected server in the /mcp picker (row 0 is Add).
+            KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Mcp(_)) => {
+                let id = if let PickerKind::Mcp(rows) = &picker.kind {
+                    (picker.selected > 0)
+                        .then(|| rows.get(picker.selected - 1).map(|row| row.id.clone()))
+                        .flatten()
+                } else {
+                    None
+                };
+                if let Some(id) = id {
+                    mcp_remove(model, &id, tx);
+                }
+                return;
+            }
             // → mirrors Enter and ← mirrors Esc, so the pickers navigate like
             // a nested menu: right descends, left backs out one level.
             KeyCode::Enter | KeyCode::Right => {
@@ -929,6 +943,33 @@ pub(super) fn handle_key<P, L>(
                         model.picker = None;
                         spawn_memory_provenance(entry, kernel, tx);
                         model.push_notice(format!("(opening memory '{name}' provenance …)"));
+                    }
+                    return;
+                }
+                // `/mcp` picker: row 0 adds a server; any other row connects it.
+                if let PickerKind::Mcp(rows) = &picker.kind {
+                    let sel = picker.selected;
+                    if sel == 0 {
+                        model.picker = None;
+                        prefill_command(
+                            model,
+                            "/mcp add ",
+                            "type: <id> -- <command>   e.g.  github -- npx -y @modelcontextprotocol/server-github",
+                        );
+                        return;
+                    }
+                    let id = rows.get(sel - 1).map(|row| row.id.clone());
+                    model.picker = None;
+                    if let (Some(id), Some(manager)) = (id, model.mcp.clone()) {
+                        model.push_notice(format!("(connecting MCP server '{id}' …)"));
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let result = match manager.approve_and_connect(&id).await {
+                                Ok(_) => Ok(serde_json::json!({ "servers": manager.status().await })),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            let _ = tx.send(TuiEvent::McpStatus(result));
+                        });
                     }
                     return;
                 }
@@ -1815,6 +1856,43 @@ pub(super) fn handle_agent_event(
             };
             model.upsert_notice("LSP", text);
         }
+        TuiEvent::McpStatus(result) => {
+            let text = match result {
+                Err(error) => format!("MCP: disabled or unavailable\n  {error}"),
+                Ok(payload) => {
+                    let servers = payload.get("servers").and_then(serde_json::Value::as_array);
+                    match servers {
+                        Some(servers) if !servers.is_empty() => {
+                            let mut lines = vec!["MCP servers:".to_string()];
+                            for server in servers {
+                                let name = server
+                                    .get("server")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("server");
+                                let state = server
+                                    .get("state")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("unknown");
+                                let tools = server
+                                    .get("tools")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0);
+                                lines.push(format!("  {name} [{state}]  {tools} tool(s)"));
+                                if let Some(detail) =
+                                    server.get("detail").and_then(serde_json::Value::as_str)
+                                {
+                                    lines.push(format!("    {detail}"));
+                                }
+                            }
+                            lines.push("  · /mcp start <id> to connect · medha mcp add … to add".into());
+                            lines.join("\n")
+                        }
+                        _ => "MCP: no servers configured — add one with `medha mcp add <id> -- <command>`".to_string(),
+                    }
+                }
+            };
+            model.upsert_notice("MCP", text);
+        }
         // A queued steer reached its turn boundary: promote the "queued"
         // notice to a real user line (that's what the model now sees).
         TuiEvent::Steered(text) => {
@@ -2089,6 +2167,12 @@ enum SlashAction {
     Rewind,
     Clear,
     Lsp,
+    /// `/mcp` — open the MCP management picker.
+    Mcp,
+    /// `/mcp start <id>` — approve and connect a configured MCP server.
+    McpStart(String),
+    /// `/mcp add <id> [--trust trusted] [--env K=V] -- <command>` — add + connect.
+    McpAdd(String),
     Memory(String),
     SkillPicker,
     LoadSkill(String),
@@ -2131,6 +2215,13 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "rewind" => SlashAction::Rewind,
         "clear" => SlashAction::Clear,
         "lsp" => SlashAction::Lsp,
+        "mcp" => SlashAction::Mcp,
+        c if c.strip_prefix("mcp start").is_some_and(is_cmd_boundary) => {
+            SlashAction::McpStart(c.strip_prefix("mcp start").unwrap_or("").trim().to_string())
+        }
+        c if c.strip_prefix("mcp add").is_some_and(is_cmd_boundary) => {
+            SlashAction::McpAdd(c.strip_prefix("mcp add").unwrap_or("").trim().to_string())
+        }
         c if c.strip_prefix("memory").is_some_and(is_cmd_boundary) => {
             SlashAction::Memory(c.strip_prefix("memory").unwrap_or("").trim().to_string())
         }
@@ -2232,6 +2323,9 @@ fn dispatch_slash<P, L>(
         SlashAction::Rewind => start_rewind(model, kernel, session, tx),
         SlashAction::Clear => do_clear(model, session, transcript),
         SlashAction::Lsp => show_lsp_status(kernel, tx),
+        SlashAction::Mcp => open_mcp_picker(model),
+        SlashAction::McpStart(id) => start_mcp_server(kernel, &id, tx),
+        SlashAction::McpAdd(args) => mcp_add(model, &args, tx),
         SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
         SlashAction::SkillPicker => open_skill_picker(model),
         SlashAction::LoadSkill(name) => load_skill_by_name(model, &name, transcript),
@@ -2284,6 +2378,158 @@ fn show_lsp_status(
         };
         let _ = tx.send(TuiEvent::LspStatus(result));
     });
+}
+
+/// Approve + connect a configured MCP server, then refresh status.
+fn start_mcp_server(
+    kernel: &Arc<Kernel<impl Provider + 'static, impl EventLog + 'static>>,
+    id: &str,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    let executor = kernel.executor.clone();
+    let id = id.to_string();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let started = executor
+            .execute(&kernel::ToolIntent {
+                id: "tui-mcp-start".into(),
+                tool: "mcp.start".into(),
+                args: serde_json::json!({ "server": id }),
+            })
+            .await;
+        let result = if started.status == kernel::ObsStatus::Ok {
+            mcp_status_via(&executor).await
+        } else {
+            Err(started
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("failed to start MCP server")
+                .to_string())
+        };
+        let _ = tx.send(TuiEvent::McpStatus(result));
+    });
+}
+
+/// Open the `/mcp` management picker: row 0 adds a server, the rest are the
+/// user-config servers (`~/.medha/config.toml`).
+fn open_mcp_picker(model: &mut Model) {
+    let servers = config::load().ok().flatten().map(|c| c.mcp).unwrap_or_default();
+    let rows: Vec<McpRow> = servers
+        .into_iter()
+        .map(|(id, server)| McpRow {
+            id,
+            command: server.command.join(" "),
+        })
+        .collect();
+    model.picker = Some(Picker::new(PickerKind::Mcp(rows)));
+}
+
+/// `/mcp add <id> [--key K] [--trust trusted] [--env K=V] -- <command>` — save to
+/// `~/.medha/config.toml` (key → credential store), then connect live.
+fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let mut id = None;
+    let mut trust = "workspace".to_string();
+    let mut key: Option<String> = None;
+    let mut env = std::collections::BTreeMap::new();
+    let mut command: Vec<String> = Vec::new();
+    let mut it = args.split_whitespace();
+    while let Some(token) = it.next() {
+        match token {
+            "--key" => key = it.next().map(str::to_string),
+            "--trust" => trust = it.next().unwrap_or("workspace").to_string(),
+            "--env" => {
+                if let Some((k, v)) = it.next().and_then(|kv| kv.split_once('=')) {
+                    env.insert(k.to_string(), v.to_string());
+                }
+            }
+            "--" => command.extend(it.by_ref().map(str::to_string)),
+            _ if id.is_none() => id = Some(token.to_string()),
+            _ => command.push(token.to_string()),
+        }
+    }
+    let (Some(id), false) = (id, command.is_empty()) else {
+        model.push_notice(
+            "usage: /mcp add <id> [--key K] -- <command>   e.g.  github --key ghp_… -- npx -y @modelcontextprotocol/server-github",
+        );
+        return;
+    };
+    if let Some(k) = &key
+        && let Err(error) = config::store_mcp_key(&id, k)
+    {
+        model.push_notice(format!("mcp add: could not store key: {error}"));
+        return;
+    }
+    let server = config::McpServer {
+        command,
+        env,
+        trust,
+    };
+    let mut cfg = config::load().ok().flatten().unwrap_or_default();
+    cfg.mcp.insert(id.clone(), server.clone());
+    if let Err(error) = config::save(&cfg) {
+        model.push_notice(format!("mcp add: could not save config.toml: {error}"));
+        return;
+    }
+    if let Some(manager) = model.mcp.clone() {
+        model.push_notice(format!("(adding MCP server '{id}' …)"));
+        let resolved = config::resolve_mcp_server(&id, &server);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let result = match manager.add_server(resolved).await {
+                Ok(_) => Ok(serde_json::json!({ "servers": manager.status().await })),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = tx.send(TuiEvent::McpStatus(result));
+        });
+    } else {
+        model.push_notice(format!("added '{id}' to config.toml (restart to use)"));
+    }
+    open_mcp_picker(model);
+}
+
+/// Remove a server from the `/mcp` picker: drop it from `config.toml` and the
+/// live host, then reopen the picker.
+fn mcp_remove(model: &mut Model, id: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let mut cfg = config::load().ok().flatten().unwrap_or_default();
+    if cfg.mcp.remove(id).is_some() {
+        let _ = config::save(&cfg);
+        config::delete_mcp_key(id);
+    }
+    if let Some(manager) = model.mcp.clone() {
+        let id = id.to_string();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = manager.remove_server(&id).await;
+            let _ = tx.send(TuiEvent::McpStatus(Ok(
+                serde_json::json!({ "servers": manager.status().await }),
+            )));
+        });
+    }
+    model.push_notice(format!("removed MCP server '{id}'"));
+    open_mcp_picker(model);
+}
+
+async fn mcp_status_via<E: kernel::Executor + ?Sized>(
+    executor: &Arc<E>,
+) -> Result<serde_json::Value, String> {
+    let observation = executor
+        .execute(&kernel::ToolIntent {
+            id: "tui-mcp-status".into(),
+            tool: "mcp.status".into(),
+            args: serde_json::json!({}),
+        })
+        .await;
+    if observation.status == kernel::ObsStatus::Ok {
+        Ok(observation.payload)
+    } else {
+        Err(observation
+            .payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("MCP is disabled")
+            .to_string())
+    }
 }
 
 fn open_memory<L: EventLog + 'static>(

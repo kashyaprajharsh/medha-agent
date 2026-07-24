@@ -21,6 +21,7 @@ ulid.workspace = true
 policy = { path = "../policy" }
 lockfile = { path = "../lockfile" }
 lsp = { path = "../lsp" }
+mcp = { path = "../mcp" }
 gate = { path = "../gate" }
 tokio = { workspace = true, features = ["process", "io-std", "io-util"] }
 tokio-util = { version = "0.7" }

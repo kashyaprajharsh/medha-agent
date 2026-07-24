@@ -274,6 +274,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tasks", "list background shell tasks (running/finished)"),
     ("/lsp", "language-server sessions and health"),
     (
+        "/mcp",
+        "MCP servers — manage · connect · remove · add  ·  /mcp start <id> to connect",
+    ),
+    (
         "/memory",
         "list memories · /memory <name> jumps to provenance",
     ),
@@ -434,6 +438,7 @@ pub(crate) enum TuiEvent {
     Error(String),
     /// `/lsp` completed querying the registered LSP status tool.
     LspStatus(Result<serde_json::Value, String>),
+    McpStatus(Result<serde_json::Value, String>),
     /// A queued steer was applied at a turn boundary — promote its "queued"
     /// notice to a real user line.
     Steered(String),
@@ -1041,6 +1046,16 @@ enum PickerKind {
     /// `/theme`: pick the colour theme. Rows are [`THEME_MODES`]; choosing one
     /// re-colours the UI live for the session.
     Theme,
+    /// `/mcp`: manage MCP servers. Row 0 is "＋ Add a server"; the rest are the
+    /// configured servers. Enter connects (or opens add); `d` removes.
+    Mcp(Vec<McpRow>),
+}
+
+/// One configured MCP server row in the `/mcp` picker.
+#[derive(Clone)]
+pub(super) struct McpRow {
+    pub id: String,
+    pub command: String,
 }
 
 /// The colour themes offered by the `/theme` picker. `id` drives the switch;
@@ -1144,6 +1159,9 @@ impl PickerKind {
             PickerKind::SkillManage => " manage skills — ↑↓ select · Enter · Esc back ".into(),
             PickerKind::SkillSources(_) => " skill sources — ↑↓ · Enter · Esc back ".into(),
             PickerKind::Theme => " theme — ↑↓ select · Enter apply · Esc done ".into(),
+            PickerKind::Mcp(_) => {
+                " MCP — ↑↓ select · Enter connect/add · d remove · Esc close ".into()
+            }
             PickerKind::AutonomyMode => {
                 " autonomy — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
             }
@@ -1321,6 +1339,9 @@ impl PickerKind {
             PickerKind::Theme => THEME_MODES
                 .iter()
                 .map(|(_, desc)| (*desc).to_string())
+                .collect(),
+            PickerKind::Mcp(rows) => std::iter::once("＋ Add a server".to_string())
+                .chain(rows.iter().map(|row| format!("{}   {}", row.id, row.command)))
                 .collect(),
             // Row 0 is always "install from a link" (never a dead end); the rest
             // are the browsable catalog, one row per skill.
@@ -1669,6 +1690,9 @@ struct Model {
     memory_budget_tokens: u32,
     memory_stale_after_days: u32,
     known_tools: Arc<std::collections::HashSet<String>>,
+    /// MCP host handle, so `/mcp` can list/connect/remove/add live. `None` when
+    /// MCP is disabled or unwired (tests).
+    mcp: Option<Arc<mcp::McpManager>>,
 }
 
 impl Model {
@@ -1747,6 +1771,7 @@ impl Model {
             memory_enabled: true,
             memory_budget_tokens: memory::recall::DEFAULT_K3_BUDGET_TOKENS,
             memory_stale_after_days: memory::recall::DEFAULT_STALE_AFTER_DAYS,
+            mcp: None,
             known_tools: Arc::new(std::collections::HashSet::new()),
         }
     }
@@ -2243,6 +2268,7 @@ pub async fn run_tea<P, L>(
     memory_stale_after_days: u32,
     known_tools: std::collections::HashSet<String>,
     search_handle: tools::SearchHandle,
+    mcp: Option<Arc<mcp::McpManager>>,
     tx: mpsc::UnboundedSender<TuiEvent>,
     mut rx: mpsc::UnboundedReceiver<TuiEvent>,
 ) -> anyhow::Result<()>
@@ -2293,6 +2319,7 @@ where
     )
     .with_model_profiles(model_profiles, active_profile)
     .with_search(search_handle);
+    model.mcp = mcp;
     // Reflect the session's starting autonomy (from lock/MEDHA_MODE) in the TUI.
     model.autonomy = session.autonomy;
     // Mirror the provider's streaming state (lock default) into the status bar.

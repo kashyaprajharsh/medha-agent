@@ -722,6 +722,9 @@ async fn main() -> Result<()> {
     if raw.get(1).map(|s| s == "pulse").unwrap_or(false) {
         return run_pulse_command(&raw[2..]);
     }
+    if raw.get(1).map(|s| s == "mcp").unwrap_or(false) {
+        return run_mcp_command(raw[2..].to_vec()).await;
+    }
 
     let cli = Cli::parse();
 
@@ -1161,6 +1164,35 @@ async fn main() -> Result<()> {
         }
         registry.register_lsp(Arc::new(lsp::LspManager::new(cwd.clone(), lsp_config)));
     }
+    // MCP servers live in the user config (~/.medha/config.toml); their keys live
+    // in the credential store and are substituted into the command at spawn. The
+    // lockfile only carries runtime tuning (timeouts, allow_network) + the switch.
+    let mut mcp_manager: Option<Arc<mcp::McpManager>> = None;
+    let mcp_servers: Vec<mcp::ServerConfig> = model_profiles
+        .lock()
+        .ok()
+        .map(|cfg| {
+            cfg.mcp
+                .iter()
+                .filter(|(id, server)| !id.trim().is_empty() && !server.command.is_empty())
+                .map(|(id, server)| config::resolve_mcp_server(id, server))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !mcp_servers.is_empty() {
+        let mcp_config = mcp::Config {
+            enabled: true,
+            servers: mcp_servers,
+            startup_timeout: std::time::Duration::from_millis(lock.mcp.startup_timeout_ms),
+            request_timeout: std::time::Duration::from_millis(lock.mcp.request_timeout_ms),
+            max_text_chars: lock.mcp.max_text_chars,
+            allow_network: lock.mcp.allow_network,
+        };
+        let manager = Arc::new(mcp::McpManager::new(cwd.clone(), mcp_config));
+        manager.connect_startup().await; // bounded; a slow server never stalls startup
+        registry.register_mcp(manager.clone());
+        mcp_manager = Some(manager);
+    }
     registry.register_skills(skill_store.clone());
     // Typed memory (D9): project entries in the workspace state dir, user
     // entries in the user-global store — recall merges both.
@@ -1462,6 +1494,7 @@ async fn main() -> Result<()> {
                 stale_after_days,
                 known_tools.clone(),
                 search_handle.clone(),
+                mcp_manager.clone(),
                 tx,
                 rx,
             )
@@ -1521,6 +1554,132 @@ async fn main() -> Result<()> {
 /// `MEDHA_APPROVE=none` (or `[policy] autonomous = true` intent) to opt out for
 /// CI/headless autonomy, where the gate is `AutoDeny` and shell would otherwise
 /// be blocked entirely.
+/// `medha mcp add|list|remove` — manage MCP servers in the user config
+/// (`~/.medha/config.toml`). Secrets never touch a file: `--key` goes to the
+/// credential store and the command references it as `${key}`.
+async fn run_mcp_command(args: Vec<String>) -> Result<()> {
+    let mut cfg = config::load()?.unwrap_or_default();
+    match args.first().map(String::as_str).unwrap_or("list") {
+        "list" => {
+            if cfg.mcp.is_empty() {
+                println!("no MCP servers configured (~/.medha/config.toml)");
+            } else {
+                println!("MCP servers ({}):", cfg.mcp.len());
+                for (id, server) in &cfg.mcp {
+                    let trust = if server.trust.is_empty() {
+                        "workspace"
+                    } else {
+                        &server.trust
+                    };
+                    let key = if config::mcp_key_present(id) {
+                        "  · key stored"
+                    } else {
+                        ""
+                    };
+                    println!("  {id}  [{trust}]  {}{key}", server.command.join(" "));
+                }
+            }
+        }
+        "remove" => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: medha mcp remove <id>"))?;
+            if cfg.mcp.remove(id).is_some() {
+                config::save(&cfg)?;
+                config::delete_mcp_key(id);
+                println!("removed MCP server '{id}' (config + stored key)");
+            } else {
+                println!("no MCP server '{id}'");
+            }
+        }
+        "add" => {
+            // medha mcp add <id> [--key K] [--trust trusted] [--env K=V]... [--] <command>
+            let mut id = None;
+            let mut trust = "workspace".to_string();
+            let mut key: Option<String> = None;
+            let mut env = std::collections::BTreeMap::new();
+            let mut command: Vec<String> = Vec::new();
+            let mut it = args[1..].iter();
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--key" => key = it.next().cloned(),
+                    "--trust" => trust = it.next().cloned().unwrap_or(trust),
+                    "--env" => {
+                        if let Some((k, v)) = it.next().and_then(|kv| kv.split_once('=')) {
+                            env.insert(k.to_string(), v.to_string());
+                        }
+                    }
+                    "--" => command.extend(it.by_ref().cloned()),
+                    _ if id.is_none() => id = Some(arg.clone()),
+                    _ => command.push(arg.clone()),
+                }
+            }
+            let id = id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "usage: medha mcp add <id> [--key K] [--trust trusted] [--env K=V] -- <command>"
+                )
+            })?;
+            if command.is_empty() {
+                return Err(anyhow::anyhow!("no command given for server '{id}'"));
+            }
+            if let Some(k) = &key {
+                config::store_mcp_key(&id, k)?;
+            }
+            cfg.mcp.insert(
+                id.clone(),
+                config::McpServer {
+                    command,
+                    env,
+                    trust,
+                },
+            );
+            config::save(&cfg)?;
+            println!(
+                "added MCP server '{id}'{}",
+                if key.is_some() {
+                    " (key stored in credential store)"
+                } else {
+                    ""
+                }
+            );
+
+            // Connect once for immediate ready/failed feedback.
+            print!("connecting… ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let cwd = std::env::current_dir()?;
+            let server = config::resolve_mcp_server(&id, &cfg.mcp[&id]);
+            let manager = mcp::McpManager::new(
+                cwd,
+                mcp::Config {
+                    enabled: true,
+                    servers: vec![server],
+                    startup_timeout: std::time::Duration::from_secs(15),
+                    request_timeout: std::time::Duration::from_secs(10),
+                    max_text_chars: 16_000,
+                    allow_network: true,
+                },
+            );
+            manager.connect_startup().await;
+            for status in manager.status().await {
+                match status.state {
+                    mcp::ServerState::Ready => println!("ready — {} tool(s)", status.tools),
+                    state => println!(
+                        "{state:?}{}",
+                        status.detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                    ),
+                }
+            }
+            manager.shutdown().await;
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown mcp subcommand '{other}' (use add|list|remove)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Convert a lockfile LSP `settings` table to JSON; empty = server defaults.
 fn toml_table_to_json(table: &toml::Table) -> serde_json::Value {
     if table.is_empty() {

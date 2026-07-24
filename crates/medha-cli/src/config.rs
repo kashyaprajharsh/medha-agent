@@ -80,6 +80,25 @@ pub struct Config {
     /// configs without a `[search]` section still parse.
     #[serde(default)]
     pub search: SearchConfig,
+    /// User-scoped MCP servers (machine-local, never committed). The API key is
+    /// NOT stored here — it lives in the credential store (`mcp://<id>`), and the
+    /// command references it as `${key}`, substituted at spawn.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, McpServer>,
+}
+
+/// A user-scoped MCP server definition. Secret-free: any API key is referenced
+/// as the literal `${key}` in `command` and resolved from the credential store.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpServer {
+    pub command: Vec<String>,
+    /// Extra environment for the server. Values may reference `${key}` (resolved
+    /// from the credential store) — e.g. `GITHUB_TOKEN = "${key}"`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// `workspace` (default) requires approval to start; `trusted` auto-connects.
+    #[serde(default)]
+    pub trust: String,
 }
 
 /// Persisted web-search choice. API keys are secrets and live in the credential
@@ -1350,6 +1369,60 @@ pub(crate) fn store_key(base_url: &str, key: &str) -> Result<()> {
         cache.insert(base_url.to_string(), key);
     }
     Ok(())
+}
+
+/// Credential-store id holding an MCP server's API key.
+fn mcp_key_id(id: &str) -> String {
+    format!("mcp://{id}")
+}
+
+/// Store an MCP server's API key in the credential store — never in `config.toml`
+/// or `medha.lock`. Empty key is a no-op (server needs no secret).
+pub fn store_mcp_key(id: &str, key: &str) -> Result<()> {
+    if key.trim().is_empty() {
+        return Ok(());
+    }
+    store_key(&mcp_key_id(id), key)
+}
+
+/// True when a stored key exists for this server (display only — never returns
+/// the secret itself).
+pub fn mcp_key_present(id: &str) -> bool {
+    load_key(&mcp_key_id(id)).is_some()
+}
+
+/// Best-effort purge of an MCP server's key from every layer (cache, credentials
+/// file, keychain) — so `mcp remove` leaves no orphaned secret behind.
+pub fn delete_mcp_key(id: &str) {
+    let cred_id = mcp_key_id(id);
+    if let Ok(mut cache) = key_cache().lock() {
+        cache.remove(&cred_id);
+    }
+    if let Ok(path) = credentials_path() {
+        let mut creds = read_credentials_file(&path);
+        if creds.keys.remove(&cred_id).is_some() {
+            let _ = write_credentials_file(&path, &creds);
+        }
+    }
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &cred_id) {
+        let _ = entry.delete_credential();
+    }
+}
+
+/// Resolve a user-scoped server into a spawnable definition, substituting the
+/// literal `${key}` in the command/env with the stored secret at spawn time.
+pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
+    let key = load_key(&mcp_key_id(id));
+    let sub = |value: &str| match &key {
+        Some(secret) => value.replace("${key}", secret),
+        None => value.to_string(),
+    };
+    mcp::ServerConfig {
+        id: id.to_string(),
+        command: server.command.iter().map(|arg| sub(arg)).collect(),
+        env: server.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect(),
+        requires_approval: server.trust != "trusted",
+    }
 }
 
 /// Users sometimes paste the entire Authorization value. Reqwest adds the

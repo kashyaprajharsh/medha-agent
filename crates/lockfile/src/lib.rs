@@ -72,6 +72,8 @@ pub struct MedhaLock {
     #[serde(default)]
     pub lsp: LspConfig,
     #[serde(default)]
+    pub mcp: McpConfig,
+    #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
     pub verify: VerifyConfig,
@@ -155,6 +157,29 @@ impl Default for LspConfig {
             max_open_documents: 64,
             allow_network: false,
             servers: Vec::new(),
+        }
+    }
+}
+
+/// MCP host runtime tuning. The servers themselves live in the user config
+/// (`~/.medha/config.toml`) and their API keys in the credential store — never
+/// in this committable lockfile — so `[mcp]` only carries connection settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub startup_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub max_text_chars: usize,
+    pub allow_network: bool,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            startup_timeout_ms: 10_000,
+            request_timeout_ms: 60_000,
+            max_text_chars: 16_000,
+            allow_network: true,
         }
     }
 }

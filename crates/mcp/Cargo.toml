@@ -1,0 +1,21 @@
+[package]
+name = "mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sandbox = { path = "../sandbox" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+# Official MCP SDK: stdio child-process transport + client lifecycle. Pinned to a
+# crates.io release (not git) so the static build is reproducible.
+rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

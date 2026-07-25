@@ -280,7 +280,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/agents",
-        "what Medha delegated — running · patches · finished  ·  d stop · Enter view · a apply",
+        "what Medha delegated — running · patches · finished  ·  Enter watch · d stop · a apply",
+    ),
+    (
+        "/steer",
+        "correct a running agent without killing it — /steer <message>, or /steer <agent> <message>",
     ),
     (
         "/memory",
@@ -443,6 +447,11 @@ pub(crate) enum TuiEvent {
     Error(String),
     /// `/lsp` completed querying the registered LSP status tool.
     LspStatus(Result<serde_json::Value, String>),
+    /// A background agent's report is durably recorded and collectable.
+    ///
+    /// Sent from the orchestrator *after* the outbox write, so acting on it can
+    /// never read a report that is not there yet.
+    AgentReportReady,
     /// The `/agents` panel's rows, resolved off the UI thread. Patches live in
     /// the event log so they survive a restart, and reading the log is not
     /// something a keystroke handler may block on.
@@ -1103,7 +1112,13 @@ enum PickerKind {
 /// something to forget.
 #[derive(Debug, Clone)]
 pub(super) enum AgentRow {
-    Running(orchestrator::AgentHandle),
+    Running {
+        handle: orchestrator::AgentHandle,
+        /// How long it has been silent. `None` means it has recorded nothing
+        /// yet — starting up, not stalled. Elapsed-since-start cannot answer
+        /// "is this moving?", which is the question a spinner prompts.
+        idle_ms: Option<u64>,
+    },
     /// A writer's patch, waiting for the user to accept or ignore it.
     Patch {
         agent: String,
@@ -1248,7 +1263,7 @@ impl PickerKind {
             PickerKind::Agents(rows) => {
                 let running = rows
                     .iter()
-                    .filter(|row| matches!(row, AgentRow::Running(_)))
+                    .filter(|row| matches!(row, AgentRow::Running { .. }))
                     .count();
                 let patches = rows
                     .iter()
@@ -1268,11 +1283,13 @@ impl PickerKind {
                 if done > 0 {
                     parts.push(format!("{done} finished"));
                 }
+                // Enter reads any row — a diff for a patch, the live transcript
+                // for anything else — so it is always offered.
                 let keys = match (running > 0, patches > 0) {
-                    (true, true) => "d stop · Enter view · a apply",
-                    (true, false) => "d stop",
+                    (true, true) => "Enter watch/view · d stop · a apply",
+                    (true, false) => "Enter watch · d stop",
                     (false, true) => "Enter view · a apply",
-                    (false, false) => "Esc close",
+                    (false, false) => "Enter view",
                 };
                 format!(" {} — {keys} · Esc close ", parts.join(" · "))
             }
@@ -1478,9 +1495,25 @@ impl PickerKind {
                 .map(|row| match row {
                     // The objective is what distinguishes two agents at a glance;
                     // the name is a label and the session id is unreadable.
-                    AgentRow::Running(run) => {
-                        let objective: String = run.objective.chars().take(64).collect();
-                        format!("⚇ {}   {objective}", run.agent)
+                    AgentRow::Running { handle, idle_ms } => {
+                        let objective: String = handle.objective.chars().take(52).collect();
+                        // Silence is a weak signal and the threshold has to
+                        // respect that: nothing is recorded while a model
+                        // composes an answer, so an agent mid-generation looks
+                        // exactly like a wedged one. On a large model a single
+                        // step can run past a minute, and a marker that fires
+                        // there brands healthy agents as broken — which is
+                        // worse than staying quiet, because it invites killing
+                        // work that was nearly done.
+                        //
+                        // Only multi-minute silence is worth remarking on, and
+                        // even then it is reported as silence, not as a fault.
+                        let quiet = match idle_ms {
+                            Some(ms) if *ms >= 180_000 => format!("  quiet {}m", ms / 60_000),
+                            Some(_) => String::new(),
+                            None => "  starting".to_string(),
+                        };
+                        format!("⚇ {}   {objective}{quiet}", handle.agent)
                     }
                     // Verification status is on the row, not one level down: a
                     // patch that failed its build is a draft, and that is
@@ -1788,6 +1821,12 @@ struct Model {
     autonomy: kernel::AutonomyLevel,
     /// Whether agent turn is running
     running: bool,
+    /// A background report is collectable but a turn is already in flight.
+    ///
+    /// Injecting mid-turn is not an option — the model is part-way through a
+    /// response and the transcript is behoing mutated by the running task — so
+    /// the signal is held and the turn is started the moment this one settles.
+    agent_report_deferred: bool,
     /// Tool whose call is currently streaming: (name, optional target file/command).
     /// Drives the "writing medha.html…" activity label instead of a vague "thinking".
     current_tool: Option<(String, Option<String>)>,
@@ -1921,6 +1960,7 @@ impl Model {
             search_setup: None,
             autonomy: kernel::AutonomyLevel::Careful,
             running: false,
+            agent_report_deferred: false,
             current_tool: None,
             turn_started: None,
             interrupt: None,
@@ -2261,6 +2301,26 @@ impl Model {
     }
 
     fn push_notice(&mut self, s: impl Into<String>) {
+        // Mid-stream the trailing item is a reply still being appended to, and
+        // `push_text_delta` only continues an item that is *at the back*. A
+        // notice pushed behind it therefore makes the next delta open a new
+        // item, splitting one reply into two fragments with an unrelated line
+        // wedged between them — mid-sentence, since deltas arrive mid-word.
+        //
+        // Slotting it in front of the live reply keeps the message whole. The
+        // notice reads slightly early rather than the reply reading broken.
+        if matches!(self.items.back().map(|e| &e.item), Some(Item::Assistant(_))) {
+            let live = self.items.pop_back();
+            self.push_item(Item::Notice(s.into()));
+            if let Some(live) = live {
+                self.items.push_back(live);
+                self.dirty = true;
+                if self.auto_scroll {
+                    self.scroll_to_bottom();
+                }
+            }
+            return;
+        }
         self.push_item(Item::Notice(s.into()));
     }
 
@@ -2462,6 +2522,19 @@ where
     P: ProfileProvider + 'static,
     L: EventLog + 'static,
 {
+    // A finished background agent wakes the UI itself. Installed here because
+    // the channel does not exist until now; the control plane holds only the
+    // slot. Sending on an unbounded channel cannot block, so the orchestrator
+    // task that fires this is never held up by the UI.
+    if let Some(control) = &agents
+        && let Ok(mut slot) = control.notifier_handle().lock()
+    {
+        let ready = tx.clone();
+        *slot = Some(Arc::new(move || {
+            let _ = ready.send(TuiEvent::AgentReportReady);
+        }));
+    }
+
     // Terminal setup with panic-safe restore hook (PART 0/2). Draws on a private
     // tty handle; a dependency's stray stdout is redirected to `stray_log` so it
     // can't corrupt the alternate screen. See tty.rs.

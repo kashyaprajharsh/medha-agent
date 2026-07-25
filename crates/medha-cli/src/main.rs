@@ -1496,6 +1496,19 @@ async fn main() -> Result<()> {
     if let Ok(mut slot) = agent_session.lock() {
         *slot = Some(session.id);
     }
+    // Close out any child abandoned by a previous run. A dispatch is written
+    // before the child starts, so a process that died mid-run leaves one with
+    // no terminal event — and nothing else in the fold ever looks at those, so
+    // without this the parent waits forever on a child that cannot report.
+    if let Some(control) = &agent_control {
+        match control.reap_abandoned(session.id).await {
+            0 => {}
+            n => eprintln!(
+                "note: {n} background agent(s) from a previous run never recorded a result — \
+                 reported as unknown; their transcripts are still readable"
+            ),
+        }
+    }
     if lock.memory.enabled {
         let session_events = log.events(session.id).await;
         let forked = session_events

@@ -166,6 +166,10 @@ pub struct ChildRun {
     /// points at the parent would resolve relative paths into the tree the
     /// isolation exists to protect.
     pub workspace: Option<std::path::PathBuf>,
+    /// Steer queue for this child. The runner must hand it to the session loop
+    /// — text queued against a child whose runner drops this is accepted and
+    /// then silently lost, which is worse than refusing it.
+    pub interrupts: kernel::InterruptQueue,
 }
 
 /// An isolated checkout, together with the tools rooted at it.
@@ -223,11 +227,21 @@ pub struct Dispatch {
     pub objective: String,
 }
 
-/// Durable delivery for background agents: `pending → claimed → delivered`.
+/// Durable delivery for background agents: `dispatched → finished → delivered`.
 ///
 /// A background child outlives the turn that asked for it, so its result has to
 /// survive the process. Implemented over Medha's event log, which is append-only
 /// and already per-session, so the outbox is a fold rather than new storage.
+///
+/// Delivery is at-least-once, not exactly-once: [`Self::undelivered`] reads and
+/// the caller then marks, so a crash in between replays a report rather than
+/// dropping one. That is the safe direction to fail in, and a lease would buy
+/// exactly-once only against a second concurrent reader of the same session —
+/// which is not a configuration Medha has.
+///
+/// The state machine has a fourth path that is easy to miss: a dispatch whose
+/// owning process died leaves no terminal event at all, and would otherwise sit
+/// unresolved forever. [`Self::reap_abandoned`] is what closes it.
 #[async_trait::async_trait]
 pub trait Outbox: Send + Sync {
     /// Persist the dispatch *before* the child starts. A crash between here and
@@ -264,6 +278,28 @@ pub trait Outbox: Send + Sync {
     /// Patches owned by `parent` that have not been applied, oldest first, as
     /// `(agent, child session, patch)`.
     async fn unapplied(&self, parent: Ulid) -> Vec<(String, String, Patch)>;
+
+    /// When `child` last recorded anything, as epoch seconds.
+    ///
+    /// A child appends an event per step, so the newest one *is* its heartbeat —
+    /// no separate signal to keep in sync with the work. Without it a running
+    /// agent that is thinking, one stuck in a retry loop, and one wedged on a
+    /// tool that will never return all look identical: a name and a spinner.
+    async fn last_activity(&self, child: Ulid) -> Option<f64>;
+
+    /// Resolve children whose owning process died before they could report.
+    ///
+    /// A dispatch is written before the child starts, so a crash in between
+    /// leaves a dispatch with no terminal event. Nothing else in the fold looks
+    /// at those: `undelivered` only returns rows that *have* a terminal event,
+    /// so without this the parent waits on a child that will never report —
+    /// silently, and forever.
+    ///
+    /// Records a terminal result of unknown outcome, which is the honest one:
+    /// the child may have finished its work, may have half-finished it, and
+    /// nothing survived to say which. Returns how many it closed. Idempotent —
+    /// the terminal event it writes is what stops a second pass re-reaping.
+    async fn reap_abandoned(&self, parent: Ulid) -> usize;
 }
 
 /// A runner installed after construction. The kernel owns the executor that
@@ -317,6 +353,8 @@ pub struct AgentControl {
     /// by the surface once the session id exists — the same deferred-handle
     /// shape the parent executor uses, for the same reason.
     owner: OwnerHandle,
+    /// Signalled when a background report becomes collectable.
+    notifier: NotifierHandle,
     /// Children that have finished, newest last and bounded. The live roster
     /// drops an entry the moment its child settles, which is correct for "what
     /// is running" and useless for "what happened" — §6.6 asks the TUI for both.
@@ -340,6 +378,17 @@ pub const MAX_HISTORY: usize = 32;
 
 /// Shared slot for the session that owns a tree of children.
 pub type OwnerHandle = Arc<std::sync::Mutex<Option<Ulid>>>;
+
+/// Told that a background child's report is durably recorded and collectable.
+///
+/// Fired *after* the outbox write, never off the roster: a child leaves the
+/// roster inside its own execution, before its report is persisted, so anything
+/// keyed on the roster emptying would race the record it is trying to read.
+pub type Notifier = Arc<dyn Fn() + Send + Sync>;
+
+/// Deferred slot for [`Notifier`] — the surface that wants the signal is built
+/// after the control plane that emits it.
+pub type NotifierHandle = Arc<std::sync::Mutex<Option<Notifier>>>;
 
 /// Settled children, shared across a tree so the panel sees one record.
 type History = Arc<std::sync::Mutex<Vec<Finished>>>;
@@ -369,11 +418,16 @@ pub struct Finished {
 /// registration guard clean up from `Drop`.
 type Roster = Arc<std::sync::Mutex<Vec<Running>>>;
 
-/// A child currently executing, with the handle to stop it. Cancelling one agent
-/// must not touch its siblings, so the token is per-child rather than the tree's.
+/// A child currently executing, with the handles to stop or steer it.
+/// Cancelling one agent must not touch its siblings, so both are per-child
+/// rather than the tree's.
 struct Running {
     handle: AgentHandle,
     cancel: CancellationToken,
+    /// Queues text for the child to receive at its next turn boundary. A child
+    /// cannot ask a question, so without this a run that started on a wrong
+    /// assumption can only be killed and paid for again.
+    steer: kernel::InterruptHandle,
 }
 
 impl AgentControl {
@@ -390,6 +444,7 @@ impl AgentControl {
             workspaces: None,
             patches: Arc::new(std::sync::Mutex::new(Vec::new())),
             owner: Arc::new(std::sync::Mutex::new(None)),
+            notifier: Arc::new(std::sync::Mutex::new(None)),
             history: Arc::new(std::sync::Mutex::new(Vec::new())),
             tasks: tokio_util::task::TaskTracker::new(),
         }
@@ -403,6 +458,13 @@ impl AgentControl {
     pub fn with_owner(mut self, owner: OwnerHandle) -> Self {
         self.owner = owner;
         self
+    }
+
+    /// The slot for the collectable-report signal. The surface installs its
+    /// side once it exists; until then background reports simply wait, which is
+    /// the pre-existing behaviour rather than a failure.
+    pub fn notifier_handle(&self) -> NotifierHandle {
+        Arc::clone(&self.notifier)
     }
 
     fn owner(&self) -> Option<Ulid> {
@@ -627,9 +689,72 @@ impl AgentControl {
             .collect()
     }
 
+    /// Close out children abandoned by a process that died mid-run, so their
+    /// dispatches resolve instead of hanging. Call once when a session opens;
+    /// the results then arrive through [`Self::collect`] like any other.
+    pub async fn reap_abandoned(&self, parent: Ulid) -> usize {
+        match &self.outbox {
+            Some(outbox) => outbox.reap_abandoned(parent).await,
+            None => 0,
+        }
+    }
+
+    /// How long each running child has been silent, in milliseconds, keyed by
+    /// session id. Absent means it has recorded nothing at all yet.
+    ///
+    /// Answers "is this moving?", which elapsed-since-start cannot: a child
+    /// ninety seconds in may have worked for all ninety or stalled after one.
+    pub async fn idle_times(&self) -> std::collections::HashMap<String, Option<u64>> {
+        let Some(outbox) = &self.outbox else {
+            return std::collections::HashMap::new();
+        };
+        let now = epoch_ms();
+        let mut idle = std::collections::HashMap::new();
+        for run in self.active() {
+            let Ok(id) = run.session.parse() else {
+                continue;
+            };
+            let since = outbox.last_activity(id).await.map(|ts| {
+                // Saturating: clock adjustment must not read as a child that
+                // has been idle since before the epoch.
+                now.saturating_sub((ts * 1000.0) as u64)
+            });
+            idle.insert(run.session, since);
+        }
+        idle
+    }
+
+    /// Send further instruction to a running child, by name or session id.
+    ///
+    /// The text lands as a user message at the child's next turn boundary — it
+    /// never interrupts a tool call mid-flight, and it does not restart the
+    /// child or discard what it has already found. Returns the agents actually
+    /// reached, empty if none matched.
+    ///
+    /// This is the alternative to the only other correction available: killing
+    /// the child and paying for the whole run again. A child cannot ask a
+    /// question, so a run that began on a wrong assumption is otherwise
+    /// unrecoverable.
+    pub fn steer(&self, id: &str, text: &str) -> Vec<String> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        let Ok(active) = self.active.lock() else {
+            return Vec::new();
+        };
+        active
+            .iter()
+            .filter(|run| run.handle.agent == id || run.handle.session == id)
+            .map(|run| {
+                run.steer.steer(text);
+                run.handle.agent.clone()
+            })
+            .collect()
+    }
+
     /// Results finished but not yet handed to `parent`, marked delivered as they
-    /// are taken. Idempotent by construction: a delivered result is never
-    /// returned twice, so a replayed log cannot duplicate a report.
+    /// are taken. A delivered result is never returned twice, so a replayed log
+    /// cannot duplicate a report.
     pub async fn collect(&self, parent: Ulid) -> Vec<AgentResult> {
         let Some(outbox) = &self.outbox else {
             return Vec::new();
@@ -648,10 +773,38 @@ impl AgentControl {
     /// running one.
     pub async fn transcript(&self, child: &str) -> Result<Vec<String>, Error> {
         let outbox = self.outbox.as_ref().ok_or(Error::Unavailable)?;
-        let id = child
-            .parse()
-            .map_err(|_| Error::UnknownAgent(child.to_string()))?;
+        // By name as well as id, like `cancel` and `steer`. The name is what is
+        // on screen and in the model's own previous message; requiring the id
+        // only here made the one tool you reach for when something looks wrong
+        // the one that rejects the identifier you have.
+        let id = match child.parse() {
+            Ok(id) => id,
+            Err(_) => self
+                .resolve(child)
+                .ok_or_else(|| Error::UnknownAgent(child.to_string()))?,
+        };
         Ok(outbox.transcript(id).await)
+    }
+
+    /// The session id of a live or recently finished agent, by display name.
+    /// History as well as the roster: a name is most often typed *after* the
+    /// agent finished, which is exactly when it has left the roster.
+    fn resolve(&self, name: &str) -> Option<Ulid> {
+        let live = self.active.lock().ok().and_then(|active| {
+            active
+                .iter()
+                .find(|run| run.handle.agent == name)
+                .and_then(|run| run.handle.session.parse().ok())
+        });
+        live.or_else(|| {
+            self.history.lock().ok().and_then(|history| {
+                history
+                    .iter()
+                    .rev()
+                    .find(|done| done.agent == name)
+                    .and_then(|done| done.session.parse().ok())
+            })
+        })
     }
 
     /// Reserve capacity before anything is published. Returns `AtCapacity`
@@ -719,14 +872,26 @@ impl AgentControl {
                     .collect(),
                 None => parent_tools,
             };
-            let narrowed: Arc<dyn Executor> =
-                Arc::new(NarrowedExecutor::new(executor, Some(&requested)));
+            // No delegation: a writer keeps its mutating tools, so unlike a
+            // read-only child it would otherwise retain `agent.spawn` and be
+            // able to nest indefinitely.
+            let narrowed: Arc<dyn Executor> = Arc::new(
+                NarrowedExecutor::new(executor, Some(&requested))
+                    .no_delegation()
+                    .no_clarifying_questions(),
+            );
             (narrowed, Some(worktree))
         } else {
             // Read-only children may share the parent's tree safely; that is
             // precisely what makes them safe to run in parallel.
-            let narrowed: Arc<dyn Executor> =
-                Arc::new(NarrowedExecutor::new(parent_executor, spec.tools.as_deref()).read_only());
+            // `read_only` already removes `agent.spawn`; saying it outright
+            // means the invariant does not depend on a blast-radius accident.
+            let narrowed: Arc<dyn Executor> = Arc::new(
+                NarrowedExecutor::new(parent_executor, spec.tools.as_deref())
+                    .read_only()
+                    .no_delegation()
+                    .no_clarifying_questions(),
+            );
             (narrowed, None)
         };
         // A child's budget is a slice of what the parent has left, never more.
@@ -739,6 +904,9 @@ impl AgentControl {
         // Per-child token, so cancelling one agent leaves its siblings alone;
         // it is a child of the tree's, so cancelling the tree still settles all.
         let cancel = self.cancel.child_token();
+        // Per-child steer queue. The handle stays on the roster so the child
+        // stays addressable while it runs; the queue moves into its session.
+        let (steer, interrupts) = kernel::InterruptQueue::pair();
         {
             // The session id is the identity; the name is display only. Two
             // children with the same objective must still be distinguishable,
@@ -756,11 +924,13 @@ impl AgentControl {
                     background,
                 },
                 cancel: cancel.clone(),
+                steer: steer.clone(),
             });
         }
         Ok(Admitted {
             session,
             cancel,
+            interrupts,
             executor,
             workspace,
             max_turns,
@@ -823,9 +993,25 @@ impl AgentControl {
         // current value: a background child can finish after the surface has
         // moved on, and its patch belongs to whoever asked for it.
         let shared = self.shared(Some(parent));
+        let notifier = Arc::clone(&self.notifier);
         self.tasks.spawn(async move {
             let result = execute(shared, spec, admitted).await;
             outbox.finished(&dispatch, &result).await;
+            // Only now is the report collectable. Signalling any earlier — off
+            // the roster, or before this write — would hand the surface a
+            // completion it cannot yet read.
+            //
+            // Cloned out with the guard dropped before the call: a notifier
+            // that re-entered this control plane while the lock was held would
+            // deadlock on a non-reentrant mutex, and that is the class of bug
+            // that only shows up under timing nobody can reproduce.
+            let ready = notifier
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(Arc::clone));
+            if let Some(ready) = ready {
+                ready();
+            }
         });
         Ok(handle)
     }
@@ -861,6 +1047,7 @@ impl AgentControl {
             workspaces: self.workspaces.clone(),
             patches: Arc::clone(&self.patches),
             owner: Arc::clone(&self.owner),
+            notifier: Arc::clone(&self.notifier),
             history: Arc::clone(&self.history),
             tasks: self.tasks.clone(),
         }
@@ -879,6 +1066,10 @@ fn epoch_ms() -> u64 {
 struct Admitted {
     session: Ulid,
     cancel: CancellationToken,
+    /// The child's steer queue, moved into its run. Not cloneable: exactly one
+    /// session loop may own it, which is what makes "who receives this text"
+    /// unambiguous.
+    interrupts: kernel::InterruptQueue,
     executor: Arc<dyn Executor>,
     /// A writer's checkout, held here so it is reaped on exactly one path
     /// regardless of how the child ends.
@@ -921,6 +1112,7 @@ async fn execute(shared: Shared, spec: AgentSpec, admitted: Admitted) -> AgentRe
         max_turns,
         permit,
         registration,
+        interrupts,
     } = admitted;
     let started = Instant::now();
     let run = runner.run(ChildRun {
@@ -929,6 +1121,7 @@ async fn execute(shared: Shared, spec: AgentSpec, admitted: Admitted) -> AgentRe
         executor,
         max_turns,
         cancel: cancel.clone(),
+        interrupts,
         workspace: workspace.as_ref().map(|tree| tree.path().to_path_buf()),
     });
     // Race the run against the token. A cooperative runner honours it itself,
@@ -1303,6 +1496,7 @@ mod tests {
                 background: false,
             },
             cancel: CancellationToken::new(),
+            steer: kernel::InterruptQueue::pair().0,
         });
         let result = control
             .spawn(spec("audit the crate"), Arc::new(Tools), 5)
@@ -1347,6 +1541,8 @@ mod tests {
         /// The durable patch record, with the same `recorded → applied` fold
         /// the log implements.
         patches: std::sync::Mutex<Vec<Recorded>>,
+        /// Stand-in for "newest event on the child's chain".
+        activity: std::sync::Mutex<std::collections::HashMap<Ulid, f64>>,
     }
 
     struct Recorded {
@@ -1419,6 +1615,33 @@ mod tests {
                 .map(|row| (row.agent.clone(), row.child.clone(), row.patch.clone()))
                 .collect()
         }
+        async fn last_activity(&self, child: Ulid) -> Option<f64> {
+            self.activity.lock().unwrap().get(&child).copied()
+        }
+        async fn reap_abandoned(&self, parent: Ulid) -> usize {
+            // A row dispatched but never finished is the in-memory shape of the
+            // same abandonment the log implementation detects by instance.
+            let mut rows = self.rows.lock().unwrap();
+            let mut reaped = 0;
+            for (dispatch, result, _) in rows.iter_mut() {
+                if dispatch.parent == parent && result.is_none() {
+                    *result = Some(AgentResult {
+                        agent: dispatch.agent.clone(),
+                        session: dispatch.child.to_string(),
+                        status: AgentStatus::Failed,
+                        summary: "[outcome unknown — abandoned]".into(),
+                        artifact: None,
+                        turns: 0,
+                        tool_calls: 0,
+                        duration_ms: 0,
+                        trust: TrustLabel::Tool,
+                        patch: None,
+                    });
+                    reaped += 1;
+                }
+            }
+            reaped
+        }
         async fn undelivered(&self, parent: Ulid) -> Vec<AgentResult> {
             self.rows
                 .lock()
@@ -1462,6 +1685,42 @@ mod tests {
         let mine = control.collect(asked).await;
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].status, AgentStatus::Completed);
+    }
+
+    /// The signal must arrive only once the report can actually be read.
+    ///
+    /// A child leaves the roster inside its own execution, *before* its report
+    /// is persisted, so anything keyed on the roster emptying races the record
+    /// it is trying to read — and the loser is a turn spent on nothing.
+    #[tokio::test]
+    async fn the_ready_signal_never_arrives_before_the_report_is_collectable() {
+        let (_outbox, control) = background_control();
+        let parent = Ulid::new();
+        // Captures what `collect` would have returned at the instant of the
+        // signal, from inside the callback itself.
+        let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe = Arc::clone(&seen);
+        let reader = Arc::new(control);
+        let watched = Arc::clone(&reader);
+        if let Ok(mut slot) = reader.notifier_handle().lock() {
+            *slot = Some(Arc::new(move || {
+                let ready = futures::executor::block_on(watched.collect(parent));
+                probe.lock().unwrap().push(ready.len());
+            }));
+        }
+
+        reader
+            .spawn_background(spec("survey"), Arc::new(Tools), 5, parent)
+            .await
+            .unwrap();
+        reader.drain().await;
+
+        let observed = seen.lock().unwrap();
+        assert_eq!(observed.len(), 1, "the signal fires once per child");
+        assert_eq!(
+            observed[0], 1,
+            "the report must be collectable at the moment the signal fires"
+        );
     }
 
     #[tokio::test]
@@ -1508,6 +1767,141 @@ mod tests {
         let reported = control.collect(parent).await;
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].status, AgentStatus::Cancelled);
+    }
+
+    /// Drains its steer queue and reports what it was told, so steering is
+    /// asserted on what the *session loop* received — not on the roster having
+    /// a handle. A queue the runner drops would pass the second check and fail
+    /// this one, and that is exactly the bug worth catching: text accepted and
+    /// silently lost is worse than text refused.
+    struct Listens;
+
+    #[async_trait]
+    impl ChildRunner for Listens {
+        async fn run(&self, mut run: ChildRun) -> Result<ChildOutcome, String> {
+            let mut heard: Vec<String> = Vec::new();
+            // Wait for the parent's steer, then report it back as the summary.
+            while heard.is_empty() {
+                if run.cancel.is_cancelled() {
+                    break;
+                }
+                heard.extend(run.interrupts.drain_steers());
+                tokio::task::yield_now().await;
+            }
+            Ok(ChildOutcome {
+                status: AgentStatus::Completed,
+                summary: heard.join("|"),
+                turns: 1,
+                tool_calls: 0,
+                trust: TrustLabel::Tool,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_reaches_the_running_child() {
+        let control = Arc::new(AgentControl::new(
+            Arc::new(Listens),
+            CancellationToken::new(),
+        ));
+        let steering = Arc::clone(&control);
+        // Steer from outside while the child runs, which is the only way this
+        // is ever used.
+        tokio::spawn(async move {
+            loop {
+                // Address it the way a caller would: by the id the roster
+                // reports, once the child is actually up.
+                if let Some(run) = steering.active().first()
+                    && !steering
+                        .steer(&run.session, "only the parser, skip the lexer")
+                        .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let result = control
+            .spawn(spec("survey the compiler"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        assert_eq!(result.summary, "only the parser, skip the lexer");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_child_is_distinguishable_from_a_working_one() {
+        let outbox = Arc::new(MemoryOutbox::default());
+        let control = AgentControl::new(Arc::new(Hangs), CancellationToken::new())
+            .with_outbox(outbox.clone())
+            .with_limits(4, 1);
+        let parent = Ulid::new();
+        let busy = control
+            .spawn_background(spec("busy worker"), Arc::new(Tools), 5, parent)
+            .await
+            .unwrap();
+        let stalled = control
+            .spawn_background(spec("stalled worker"), Arc::new(Tools), 5, parent)
+            .await
+            .unwrap();
+
+        let now = epoch_ms() as f64 / 1000.0;
+        {
+            let mut activity = outbox.activity.lock().unwrap();
+            activity.insert(busy.session.parse().unwrap(), now - 1.0);
+            activity.insert(stalled.session.parse().unwrap(), now - 300.0);
+        }
+
+        let idle = control.idle_times().await;
+        // Both started at the same moment, so elapsed-since-start says they are
+        // identical. Only last-activity separates them.
+        assert!(idle[&busy.session].unwrap() < 5_000);
+        assert!(idle[&stalled.session].unwrap() > 250_000);
+        control.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_child_that_has_recorded_nothing_reads_as_unknown_not_stalled() {
+        let control = AgentControl::new(Arc::new(Hangs), CancellationToken::new())
+            .with_outbox(Arc::new(MemoryOutbox::default()));
+        let parent = Ulid::new();
+        let starting = control
+            .spawn_background(spec("just started"), Arc::new(Tools), 5, parent)
+            .await
+            .unwrap();
+        // Starting up is not stalling. Reporting a huge idle time for a child
+        // that simply has not written its first event yet would flag every
+        // healthy agent as stuck in its opening moments.
+        assert_eq!(control.idle_times().await[&starting.session], None);
+        control.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn steering_an_agent_that_is_not_running_reaches_nobody() {
+        let (_, control) = control();
+        // Must be visible to the caller: silently accepting text for a finished
+        // agent would let the model believe it had corrected a run.
+        assert!(control.steer("no-such-agent", "hello").is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_steer_text_is_refused_before_it_reaches_anyone() {
+        let control = AgentControl::new(Arc::new(Hangs), CancellationToken::new());
+        control.active.lock().unwrap().push(Running {
+            handle: AgentHandle {
+                agent: "worker".into(),
+                session: Ulid::new().to_string(),
+                objective: "work".into(),
+                started_ms: epoch_ms(),
+                background: false,
+            },
+            cancel: CancellationToken::new(),
+            steer: kernel::InterruptQueue::pair().0,
+        });
+        // Whitespace would arrive as an empty user message and cost the child a
+        // turn to read nothing.
+        assert!(control.steer("worker", "   ").is_empty());
+        assert_eq!(control.steer("worker", "narrow it").len(), 1);
     }
 
     #[tokio::test]

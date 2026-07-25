@@ -885,10 +885,25 @@ impl Tool for AgentSpawn {
          · a side investigation would otherwise crowd out the context you need for the real task;\n\
          · you want background gathered while you keep working — set `background`.\n\
          \n\
-         Do not delegate work you can finish in a couple of tool calls, or anything you already \
-         have the context for: a child starts cold and pays to rediscover what you know. Never hand \
-         your entire task to one child — that is pass-through, and it doubles the cost for nothing. \
-         Split off a *part*, or do it yourself.\n\
+         Do NOT delegate these — the direct tool is faster and cheaper every time:\n\
+         · reading a file you can already name → `fs.read`;\n\
+         · finding a definition or a usage → `grep`, `glob`, `references`, `code_outline`;\n\
+         · anything spanning two or three known files → read them;\n\
+         · work you already have the context for — a child starts cold and pays to rediscover \
+         what you know;\n\
+         · your entire task handed to one child — that is pass-through, and it doubles the cost \
+         for nothing. Split off a *part*, or do it yourself.\n\
+         \n\
+         To run several at once, pass `tasks` — one call, N children, all concurrent. That is \
+         strictly better than spawning them one at a time and waiting for each.\n\
+         \n\
+         Once you have sent something to a background child, leave it alone. Its report reaches \
+         you on its own the moment it is ready — you do not need to check, and there is nothing to \
+         wait for. Specifically: do not call agent.list repeatedly to watch it, do not read its \
+         transcript to see whether it is progressing, do not cancel it for being quiet, and do not \
+         start doing its task yourself in the meantime. A child that looks idle is almost always \
+         composing its answer; killing it there throws away work that was nearly finished and \
+         charges you twice for it. Cancel only when you no longer want the result at all.\n\
          \n\
          Children are read-only by default. Set `write` for a child that must change code: it gets \
          its own private checkout of the repository, and hands back a patch plus the result of \
@@ -897,9 +912,17 @@ impl Tool for AgentSpawn {
          they cannot see each other's changes.\n\
          \n\
          State the objective in full: the child cannot see this conversation and cannot ask you \
-         anything. Give `contract` when the answer must have a particular shape. A child can never \
-         use a tool you do not already have. Its report comes back to you, not to the user — relay \
-         what matters."
+         anything — put every path, error message and constraint it needs in the objective itself. \
+         If the user asked for a particular language, tone or format, say so there too, or the \
+         child's summary will come back in the wrong one and contaminate your reply. Give \
+         `contract` when the answer must have a particular shape. A child can never use a tool you \
+         do not already have, and cannot delegate further.\n\
+         \n\
+         A child's report is its own account of what it did, not an established fact. For anything \
+         with an effect outside its own reasoning — a file written, a request sent, a test claimed \
+         to pass — get the verifiable handle (path, URL, status, command output) and check it \
+         yourself before you tell the user it happened. Its report comes back to you, not to the \
+         user — relay what matters."
     }
     fn blast_radius(&self) -> BlastRadius {
         // Read-only children: no mutation, but real model spend, so it stays
@@ -1138,6 +1161,7 @@ enum AgentAction {
     List,
     Cancel,
     Transcript,
+    Steer,
 }
 
 struct AgentControlTool {
@@ -1152,6 +1176,7 @@ impl Tool for AgentControlTool {
             AgentAction::List => "agent.list",
             AgentAction::Cancel => "agent.cancel",
             AgentAction::Transcript => "agent.transcript",
+            AgentAction::Steer => "agent.steer",
         }
     }
     fn icon(&self) -> &'static str {
@@ -1164,12 +1189,29 @@ impl Tool for AgentControlTool {
                  whatever it had found is still reported."
             }
             AgentAction::List => {
-                "List the agents running right now, with what each was asked to do."
+                "List the agents running right now, with what each was asked to do.\n\
+                 \n\
+                 `idle_ms` is time since the agent last *recorded* a step, and a model writes \
+                 nothing while it is composing a long answer — so a large value usually means it \
+                 is mid-generation, not stuck. Minutes of silence on a big model is ordinary. Do \
+                 not treat this as a fault signal, do not poll it, and do not cancel an agent \
+                 because it is quiet: you would be throwing away work that was nearly done and \
+                 paying for it twice."
             }
             AgentAction::Transcript => {
                 "Read what an agent actually did, by its session id. A report is a summary; when \
                  one looks thin, wrong, or was cut short, read the work behind it instead of \
                  guessing or re-running the search yourself."
+            }
+            AgentAction::Steer => {
+                "Send further instruction to an agent that is still running — a correction, a \
+                 constraint you forgot, or a narrowing of scope. It arrives as a message at the \
+                 agent's next step; it does not restart the agent or discard what it has already \
+                 found.\n\
+                 \n\
+                 Use this the moment you realise a running agent is working from something wrong. \
+                 The only alternative is cancelling it and paying for the whole run again, and an \
+                 agent cannot ask you a question when it gets stuck."
             }
         }
     }
@@ -1197,11 +1239,37 @@ impl Tool for AgentControlTool {
                 },
                 "required": ["agent"]
             }),
+            AgentAction::Steer => json!({
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "description": "Agent name or session id" },
+                    "text": { "type": "string", "description": "What to tell it. Stands alone — the agent cannot see this conversation." }
+                },
+                "required": ["agent", "text"]
+            }),
         }
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         match self.action {
-            AgentAction::List => Ok(json!({ "agents": self.control.active() })),
+            AgentAction::List => {
+                // Elapsed-since-start cannot answer "is it moving?", which is
+                // the only question worth asking about a long-running agent.
+                let idle = self.control.idle_times().await;
+                let agents: Vec<Value> = self
+                    .control
+                    .active()
+                    .into_iter()
+                    .map(|handle| {
+                        let quiet = idle.get(&handle.session).copied().flatten();
+                        let mut row = serde_json::to_value(&handle).unwrap_or_default();
+                        if let Some(object) = row.as_object_mut() {
+                            object.insert("idle_ms".into(), json!(quiet));
+                        }
+                        row
+                    })
+                    .collect();
+                Ok(json!({ "agents": agents }))
+            }
             AgentAction::Cancel => {
                 let id = arg_str(args, "agent")?;
                 let stopped = self.control.cancel(&id);
@@ -1209,6 +1277,24 @@ impl Tool for AgentControlTool {
                     return Err(ToolError::Failed(format!("no running agent '{id}'")));
                 }
                 Ok(json!({ "cancelled": stopped }))
+            }
+            AgentAction::Steer => {
+                let id = arg_str(args, "agent")?;
+                let text = arg_str(args, "text")?;
+                if text.trim().is_empty() {
+                    return Err(ToolError::Args("nothing to send".into()));
+                }
+                let steered = self.control.steer(&id, &text);
+                // Reporting success for text nobody received would be the worst
+                // outcome here: the caller would carry on believing it had
+                // corrected a run that is still going the wrong way.
+                if steered.is_empty() {
+                    return Err(ToolError::Failed(format!(
+                        "no running agent '{id}' — it may have already finished, in which case \
+                         read its report or spawn a new agent"
+                    )));
+                }
+                Ok(json!({ "steered": steered, "delivers": "at the agent's next step" }))
             }
             AgentAction::Transcript => {
                 let id = arg_str(args, "agent")?;
@@ -1533,6 +1619,7 @@ impl ToolRegistry {
             AgentAction::List,
             AgentAction::Cancel,
             AgentAction::Transcript,
+            AgentAction::Steer,
         ] {
             self.register(Arc::new(AgentControlTool {
                 control: control.clone(),

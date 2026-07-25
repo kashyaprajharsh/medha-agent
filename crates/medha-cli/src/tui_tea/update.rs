@@ -29,6 +29,17 @@ pub(super) fn update<P, L>(
         Msg::AgentEvent(ev) => handle_agent_event(model, ev, session, transcript),
         Msg::Tick => {
             model.anim_frame = model.anim_frame.wrapping_add(1);
+            // A background agent's report is durably recorded and no turn is in
+            // flight — so run one. The answer to a question the user already
+            // asked should not wait on them sending an unrelated message.
+            //
+            // The flag is cleared *before* the turn starts: `spawn_turn` sets
+            // `running`, and leaving it set would arm a second turn the instant
+            // this one settles, on a report that has already been delivered.
+            if model.agent_report_deferred && !model.running && model.picker.is_none() {
+                model.agent_report_deferred = false;
+                spawn_turn(model, kernel, session, transcript, budget, tx, None);
+            }
             if let Some(f) = model.intro_frame {
                 model.intro_frame = if f >= 40 { None } else { Some(f + 1) };
             }
@@ -83,7 +94,7 @@ pub(super) fn update<P, L>(
                             }
                         )),
                         _ => model.push_notice(format!(
-                            "⚇ agent '{agent}' finished — its report arrives with your next message"
+                            "⚇ agent '{agent}' finished — reading its report"
                         )),
                     }
                 }
@@ -982,7 +993,7 @@ pub(super) fn handle_key<P, L>(
             KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Agents(_)) => {
                 let session = match &picker.kind {
                     PickerKind::Agents(rows) => match rows.get(picker.selected) {
-                        Some(AgentRow::Running(run)) => Some(run.session.clone()),
+                        Some(AgentRow::Running { handle, .. }) => Some(handle.session.clone()),
                         _ => None,
                     },
                     _ => None,
@@ -1006,7 +1017,12 @@ pub(super) fn handle_key<P, L>(
                 };
                 match session {
                     Some(session) => agents_apply_patch(model, &session, key == 'A', tx),
-                    None => model.push_notice("that row has no patch to apply"),
+                    // Say what this row *can* do rather than only what it
+                    // cannot — a running agent has a transcript to watch, which
+                    // is usually what someone reaching for a key here wants.
+                    None => model.push_notice(
+                        "nothing to apply on this row — press Enter to watch what it is doing",
+                    ),
                 }
                 return;
             }
@@ -1022,9 +1038,26 @@ pub(super) fn handle_key<P, L>(
                 };
                 match session {
                     Some(session) => agents_view_patch(model, &session, tx),
-                    // Running agents have no diff yet; closing is the only
-                    // sensible thing Enter can mean on one.
-                    None => model.picker = None,
+                    // No diff on this row — but a running or finished child has
+                    // a live transcript, and "what is it actually doing" is the
+                    // question the panel gets asked most. Stop-or-nothing was
+                    // the wrong answer to it.
+                    None => {
+                        let watching = match &picker.kind {
+                            PickerKind::Agents(rows) => match rows.get(picker.selected) {
+                                Some(AgentRow::Running { handle, .. }) => {
+                                    Some(handle.session.clone())
+                                }
+                                Some(AgentRow::Done(done)) => Some(done.session.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        match watching {
+                            Some(session) => agents_view_transcript(model, &session, tx),
+                            None => model.picker = None,
+                        }
+                    }
                 }
                 return;
             }
@@ -1599,7 +1632,7 @@ pub(super) fn handle_key<P, L>(
                     model.push_notice("(turn is finishing — try again in a moment)");
                 }
             } else {
-                spawn_turn(model, kernel, session, transcript, budget, tx, line);
+                spawn_turn(model, kernel, session, transcript, budget, tx, Some(line));
             }
         }
         KeyCode::Backspace => model.backspace(),
@@ -1973,6 +2006,10 @@ pub(super) fn handle_agent_event(
     transcript: &mut Vec<Message>,
 ) {
     match ev {
+        // Record only. Starting the turn needs the kernel, which this handler
+        // does not have; the tick drives it. Both run on the UI thread, so the
+        // flag cannot be read between being set and being acted on.
+        TuiEvent::AgentReportReady => model.agent_report_deferred = true,
         TuiEvent::ToolStarted(tool, target) => model.current_tool = Some((tool, target)),
         TuiEvent::Text(delta) => {
             model.current_tool = None;
@@ -2510,6 +2547,8 @@ enum SlashAction {
     /// `/mcp` — open the MCP management picker.
     Mcp,
     Agents,
+    /// `/steer <agent> <text>` — send further instruction to a running agent.
+    Steer(String),
     /// `/mcp start <id>` — approve and connect a configured MCP server.
     McpStart(String),
     /// `/mcp add <id> [--trust trusted] [--env K=V] -- <command>` — add + connect.
@@ -2558,6 +2597,9 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "lsp" => SlashAction::Lsp,
         "mcp" => SlashAction::Mcp,
         "agents" => SlashAction::Agents,
+        c if c.strip_prefix("steer").is_some_and(is_cmd_boundary) => {
+            SlashAction::Steer(c.strip_prefix("steer").unwrap_or("").trim().to_string())
+        }
         c if c.strip_prefix("mcp start").is_some_and(is_cmd_boundary) => {
             SlashAction::McpStart(c.strip_prefix("mcp start").unwrap_or("").trim().to_string())
         }
@@ -2667,6 +2709,7 @@ fn dispatch_slash<P, L>(
         SlashAction::Lsp => show_lsp_status(kernel, tx),
         SlashAction::Mcp => open_mcp_picker(model),
         SlashAction::Agents => open_agents_picker(model, tx),
+        SlashAction::Steer(rest) => agents_steer(model, &rest),
         SlashAction::McpStart(id) => start_mcp_server(kernel, &id, tx),
         SlashAction::McpAdd(args) => mcp_add(model, &args, tx),
         SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
@@ -2900,14 +2943,23 @@ fn open_agents_picker(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
         model.picker = Some(Picker::new(PickerKind::Agents(Vec::new())));
         return;
     };
+    // Opens on what this process already knows, then fills in from the log.
+    // Idle times need a read per child, which is not something a keystroke may
+    // block on — so the first paint carries none and the refresh supplies them.
     model.picker = Some(Picker::new(PickerKind::Agents(agent_rows(
         &control,
         control.cached_unmerged_patches(),
+        &std::collections::HashMap::new(),
     ))));
     let tx = tx.clone();
     tokio::spawn(async move {
         let outstanding = control.outstanding().await;
-        let _ = tx.send(TuiEvent::AgentRows(agent_rows(&control, outstanding)));
+        let idle = control.idle_times().await;
+        let _ = tx.send(TuiEvent::AgentRows(agent_rows(
+            &control,
+            outstanding,
+            &idle,
+        )));
     });
 }
 
@@ -2916,11 +2968,18 @@ fn open_agents_picker(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
 fn agent_rows(
     control: &orchestrator::AgentControl,
     outstanding: Vec<(String, String, orchestrator::Patch)>,
+    idle: &std::collections::HashMap<String, Option<u64>>,
 ) -> Vec<AgentRow> {
     let mut rows: Vec<AgentRow> = control
         .active()
         .into_iter()
-        .map(AgentRow::Running)
+        .map(|handle| AgentRow::Running {
+            // Absent from the map means it was not measured this pass, which
+            // reads the same as "nothing recorded yet" — both mean no answer,
+            // and neither should be shown as a stall.
+            idle_ms: idle.get(&handle.session).copied().flatten(),
+            handle,
+        })
         .collect();
     let waiting: Vec<String> = outstanding
         .iter()
@@ -2990,6 +3049,97 @@ fn agents_view_patch(model: &mut Model, session: &str, tx: &mpsc::UnboundedSende
     });
 }
 
+/// `/steer <agent> <text>` — correct a running agent without killing it.
+///
+/// With one agent running the id may be omitted, because that is the case where
+/// having to look one up is pure friction. With several it is required: sending
+/// a correction to the wrong agent is worse than being asked which.
+fn agents_steer(model: &mut Model, rest: &str) {
+    let Some(control) = model.agents.clone() else {
+        model.push_notice("sub-agents are not enabled in this session");
+        return;
+    };
+    let running = control.active();
+    if running.is_empty() {
+        model.push_notice("no agent is running — /agents shows what has finished");
+        return;
+    }
+    let (id, text) = match rest.split_once(char::is_whitespace) {
+        Some((first, tail))
+            if running
+                .iter()
+                .any(|run| run.agent == first || run.session == first) =>
+        {
+            (first.to_string(), tail.trim().to_string())
+        }
+        // No recognised id in front: the whole thing is the message, which is
+        // only unambiguous with exactly one agent running.
+        _ if running.len() == 1 => (running[0].session.clone(), rest.trim().to_string()),
+        _ => {
+            let names: Vec<&str> = running.iter().map(|run| run.agent.as_str()).collect();
+            model.push_notice(format!(
+                "several agents are running — say which: /steer <agent> <message>  ({})",
+                names.join(", ")
+            ));
+            return;
+        }
+    };
+    if text.is_empty() {
+        model.push_notice("nothing to send — /steer <agent> <message>");
+        return;
+    }
+    match control.steer(&id, &text).first() {
+        Some(agent) => model.push_notice(format!(
+            "sent to '{agent}' — it arrives at the agent's next step"
+        )),
+        // Between listing and sending it can finish; saying so beats implying
+        // the message landed.
+        None => model.push_notice(format!("'{id}' is no longer running — nothing was sent")),
+    }
+}
+
+/// Show what a child has actually been doing.
+///
+/// A child's chain is appended as it works, so this answers for a *running*
+/// agent as well as a finished one. Without it the panel offers stop-or-nothing
+/// on a running child, and the only way to see inside is to ask the model to
+/// fetch it — which spends a turn to read something already on disk.
+fn agents_view_transcript(model: &mut Model, session: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let Some(control) = model.agents.clone() else {
+        return;
+    };
+    model.picker = None;
+    let (session, tx) = (session.to_string(), tx.clone());
+    tokio::spawn(async move {
+        let outcome = match control.transcript(&session).await {
+            Ok(lines) if lines.is_empty() => Err(format!(
+                "'{session}' has not recorded anything yet — it may still be on its first step"
+            )),
+            Ok(lines) => {
+                // Bounded, newest last: a long-running child accumulates more
+                // than belongs in the scrollback, and the recent end is the
+                // part that says what it is doing *now*.
+                const MAX_LINES: usize = 120;
+                let dropped = lines.len().saturating_sub(MAX_LINES);
+                let body = lines
+                    .into_iter()
+                    .skip(dropped)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(format!(
+                    "transcript of '{session}'{}\n\n{body}",
+                    match dropped {
+                        0 => String::new(),
+                        n => format!(" — earliest {n} step(s) omitted"),
+                    }
+                ))
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = tx.send(TuiEvent::AgentPatchAction(outcome));
+    });
+}
+
 /// Apply a writer's patch by hand. The user pressing `a` *is* the human gate —
 /// this is not the model deciding to change the user's files.
 ///
@@ -3038,9 +3188,11 @@ fn agents_apply_patch(
         };
         let _ = tx.send(TuiEvent::AgentPatchAction(outcome));
         // Refresh the panel from the record, so an applied patch leaves it.
+        let idle = control.idle_times().await;
         let _ = tx.send(TuiEvent::AgentRows(agent_rows(
             &control,
             control.outstanding().await,
+            &idle,
         )));
     });
 }
@@ -3706,7 +3858,13 @@ fn spawn_sessions_fetch<L: EventLog + 'static>(
     });
 }
 
-/// Spawn agent turn as background task
+/// Spawn agent turn as background task.
+///
+/// `line` is `None` for a turn nobody typed: a background agent finished, and
+/// its report is picked up at the head of this turn like any other. Without
+/// that path a finished agent's work sits in the outbox until the user happens
+/// to send something, so the answer to a question they already asked waits on
+/// an unrelated message.
 pub(super) fn spawn_turn<P, L>(
     model: &mut Model,
     kernel: &Arc<Kernel<P, L>>,
@@ -3714,13 +3872,16 @@ pub(super) fn spawn_turn<P, L>(
     transcript: &mut Vec<Message>,
     budget: &Budget,
     tx: &mpsc::UnboundedSender<TuiEvent>,
-    line: String,
+    line: Option<String>,
 ) where
     P: Provider + 'static,
     L: EventLog + 'static,
 {
     model.welcome = false;
-    model.push_item(Item::User(line.clone()));
+    let unprompted = line.is_none();
+    if let Some(line) = &line {
+        model.push_item(Item::User(line.clone()));
+    }
     model.auto_scroll = true;
     model.running = true;
     model.reasoning_received_this_turn = false;
@@ -3728,7 +3889,9 @@ pub(super) fn spawn_turn<P, L>(
     // Pick up any skill saved/edited since startup so the model's manifest is
     // current this turn (not just next session).
     model.refresh_skill_manifest(transcript);
-    transcript.push(Message::user(line));
+    if let Some(line) = line {
+        transcript.push(Message::user(line));
+    }
 
     // Graceful interruption: the kernel owns cancellation now. Esc trips the
     // handle; run_session ALWAYS returns (settled history + StopReason), so
@@ -3745,6 +3908,12 @@ pub(super) fn spawn_turn<P, L>(
     let budget = budget.clone();
     let tx = tx.clone();
     let agents = model.agents.clone();
+    // A turn nobody typed exists only to deliver reports. If none are left by
+    // the time it runs, there is nothing to say and the model must not be
+    // called: two agents finishing together can arm this twice while the first
+    // turn collects both, leaving the second with an empty inbox.
+    let needs_a_report = unprompted;
+    let mut collected = 0usize;
 
     tokio::spawn(async move {
         // Reports from background agents, delivered at the head of the turn.
@@ -3752,6 +3921,7 @@ pub(super) fn spawn_turn<P, L>(
         // survive a restart: the outbox holds them until their owner next runs.
         if let Some(control) = &agents {
             for result in control.collect(session.id).await {
+                collected += 1;
                 // Bound it: a background report reaches context directly, without
                 // the tool layer's cap, so a long one would otherwise arrive
                 // whole and crowd out the conversation it was meant to serve.
@@ -3776,6 +3946,13 @@ pub(super) fn spawn_turn<P, L>(
                     ),
                 ));
             }
+        }
+        if needs_a_report && collected == 0 {
+            // Nothing to deliver and nothing was asked: end the turn without
+            // spending a request. `Done` restores the input and clears
+            // `running`, so the UI settles exactly as it would after any turn.
+            let _ = tx.send(TuiEvent::Done(messages, kernel::StopReason::Finished));
+            return;
         }
         let sink = TuiSink { tx: tx.clone() };
         match kernel
@@ -5046,6 +5223,23 @@ mod fix_tests {
     // ── slash ROUTING (the bug that shipped: `/skill` reached only one of the
     //    two Enter paths and fell through to "unknown command"). Both paths now
     //    route through classify_slash; this pins that routing. ──────────────────
+    #[test]
+    fn classify_slash_routes_steer_with_its_whole_message() {
+        // The message is free text and must survive intact — splitting it or
+        // trimming inside it would silently alter what the agent is told.
+        assert_eq!(
+            classify_slash("steer only the parser, skip the lexer"),
+            SlashAction::Steer("only the parser, skip the lexer".into())
+        );
+        assert_eq!(classify_slash("steer"), SlashAction::Steer(String::new()));
+        // `/steering` is not `/steer` — a prefix match without a boundary would
+        // hijack any future command starting with these letters.
+        assert_ne!(
+            classify_slash("steering"),
+            SlashAction::Steer(String::new())
+        );
+    }
+
     #[test]
     fn classify_slash_routes_skill_commands() {
         assert_eq!(classify_slash("skill"), SlashAction::SkillPicker);

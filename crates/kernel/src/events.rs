@@ -199,11 +199,28 @@ impl Event {
     /// A background agent dispatched, recorded on the *dispatching* session's
     /// chain. This is the outbox row: its presence without a terminal event is
     /// what makes an orphaned child visible after a crash.
-    pub fn agent_dispatched(s: &Session, name: &str, child: Ulid, objective: &str) -> Self {
+    /// `instance` identifies the process that owns the run. A dispatch bearing
+    /// a *different* instance than the one now reading it belongs to a process
+    /// that is gone: a live owner writes its own terminal event, so a foreign
+    /// dispatch with no terminal event is an abandoned child. Identity rather
+    /// than a pid liveness check, because pids are reused and a recycled one
+    /// reads as "still running" forever.
+    pub fn agent_dispatched(
+        s: &Session,
+        name: &str,
+        child: Ulid,
+        objective: &str,
+        instance: Ulid,
+    ) -> Self {
         Self::new(
             s,
             EventKind::AgentSpawned,
-            json!({ "agent": name, "child": child.to_string(), "objective": objective }),
+            json!({
+                "agent": name,
+                "child": child.to_string(),
+                "objective": objective,
+                "instance": instance.to_string(),
+            }),
             TrustLabel::System,
         )
     }

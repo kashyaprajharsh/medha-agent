@@ -49,6 +49,21 @@ fn child_prompt(run: &ChildRun) -> String {
              finish with your findings as your final message.\n",
         ),
     }
+    // Stated literally, because a model asked to reason about its own limits
+    // will otherwise invent them — planning a handoff to a worker it cannot
+    // spawn, or asking a question nobody will read.
+    prompt.push_str(
+        "\nYou work alone: you cannot delegate to another agent, and you cannot \
+         ask a question and wait for an answer. Where the task is ambiguous, \
+         choose the most reasonable reading, say which you chose, and continue.\n\
+         \n\
+         A further message may arrive from whoever sent you here — a correction, \
+         a constraint, a narrowing of scope. Treat it as authoritative and \
+         current: it supersedes the task above where the two conflict, and it \
+         was sent because something you were doing was wrong or unnecessary. \
+         Adjust and carry on with what you have already found; do not start \
+         over.\n",
+    );
     prompt.push_str(&format!(
         "\nYou have {} turns. That is a hard stop — when it runs out you are cut \
          off wherever you are, and whatever you had said last is what gets \
@@ -228,11 +243,19 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
 /// cannot disagree with the audit trail.
 pub struct LogOutbox<L: EventLog> {
     log: Arc<L>,
+    /// Identifies this process for the lifetime of the run. Stamped on every
+    /// dispatch: a dispatch carrying a different instance belongs to a process
+    /// that is no longer here, which is what makes an abandoned child
+    /// recognisable without asking the OS about a pid it may have recycled.
+    instance: ulid::Ulid,
 }
 
 impl<L: EventLog> LogOutbox<L> {
     pub fn new(log: Arc<L>) -> Self {
-        Self { log }
+        Self {
+            log,
+            instance: ulid::Ulid::new(),
+        }
     }
 }
 
@@ -259,6 +282,7 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                 &dispatch.agent,
                 dispatch.child,
                 &dispatch.objective,
+                self.instance,
             ))
             .await;
     }
@@ -297,15 +321,22 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
         // The child's own chain, rendered as readable lines. A report is a
         // summary by design; when one looks thin the work behind it has to be
         // reachable, or the only recourse is guessing.
+        // The child's chain opens with its objective; every later user message
+        // is a steer. Labelling both "objective" made a correction read as a
+        // second task — misleading to anyone reading back, and actively wrong
+        // for the model, which uses this to work out what an agent was told.
+        let mut objective_seen = false;
         self.log
             .events(child)
             .await
             .into_iter()
             .filter_map(|event| match event.kind {
-                EventKind::UserMessage => Some(format!(
-                    "objective: {}",
-                    event.payload["text"].as_str().unwrap_or_default()
-                )),
+                EventKind::UserMessage => {
+                    let text = event.payload["text"].as_str().unwrap_or_default();
+                    let label = if objective_seen { "steer" } else { "objective" };
+                    objective_seen = true;
+                    Some(format!("{label}: {text}"))
+                }
                 EventKind::ModelText => Some(format!(
                     "said: {}",
                     event.payload["text"].as_str().unwrap_or_default()
@@ -382,6 +413,91 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
             .collect()
     }
 
+    async fn last_activity(&self, child: ulid::Ulid) -> Option<f64> {
+        // The chain is ordered, so the newest event is the last one. Reading
+        // the whole chain to take its tail is more work than the answer needs;
+        // it is bounded by one child's own transcript and only runs when the
+        // panel is opened, which is what keeps that acceptable.
+        self.log.events(child).await.last().map(|event| event.ts)
+    }
+
+    async fn reap_abandoned(&self, parent: ulid::Ulid) -> usize {
+        // One pass over the owner's chain: every dispatch, every terminal event.
+        // A dispatch with no terminal event and a foreign instance is a child
+        // whose process died — nobody is going to report for it.
+        let mut open: Vec<(String, String, String)> = Vec::new();
+        let mut closed: Vec<String> = Vec::new();
+        for event in self.log.events(parent).await {
+            let child = event
+                .payload
+                .get("child")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if child.is_empty() {
+                continue;
+            }
+            match event.kind {
+                EventKind::AgentSpawned => {
+                    let instance = event.payload["instance"].as_str().unwrap_or_default();
+                    // Ours means the child is still running in this process —
+                    // it will write its own terminal event. Only a dispatch
+                    // from a process that is gone can be abandoned.
+                    if instance != self.instance.to_string() {
+                        let agent = event.payload["agent"].as_str().unwrap_or("agent");
+                        let objective = event.payload["objective"].as_str().unwrap_or_default();
+                        open.push((child, agent.to_string(), objective.to_string()));
+                    }
+                }
+                EventKind::AgentCompleted | EventKind::AgentFailed | EventKind::AgentCancelled => {
+                    closed.push(child)
+                }
+                _ => {}
+            }
+        }
+        open.retain(|(child, _, _)| !closed.contains(child));
+
+        for (child, agent, objective) in &open {
+            let Ok(id) = child.parse::<ulid::Ulid>() else {
+                continue;
+            };
+            // "Unknown", not "failed": the child may have completed its work
+            // and died before recording it. Claiming it failed would be a
+            // guess, and the parent would act on it as if it were a finding.
+            let result = orchestrator::AgentResult {
+                agent: agent.clone(),
+                session: child.clone(),
+                status: orchestrator::AgentStatus::Failed,
+                summary: format!(
+                    "[outcome unknown — Medha exited while this agent was running, so it never \
+                     recorded a result. It may have finished its work, or none of it. Its \
+                     objective was: {objective}]\n\nRead what it actually did with \
+                     agent.transcript('{child}'), or re-run it."
+                ),
+                artifact: None,
+                turns: 0,
+                tool_calls: 0,
+                duration_ms: 0,
+                trust: kernel::TrustLabel::Tool,
+                patch: None,
+            };
+            let payload = serde_json::to_value(&result).unwrap_or_default();
+            // Writing the terminal event is what makes this idempotent: the
+            // next pass sees the dispatch as closed.
+            let _ = self
+                .log
+                .append(Event::agent_report(
+                    &chain(parent),
+                    EventKind::AgentFailed,
+                    id,
+                    payload,
+                    kernel::TrustLabel::Tool,
+                ))
+                .await;
+        }
+        open.len()
+    }
+
     async fn undelivered(&self, parent: ulid::Ulid) -> Vec<orchestrator::AgentResult> {
         let mut ready: Vec<(ulid::Ulid, orchestrator::AgentResult)> = Vec::new();
         let mut delivered: Vec<String> = Vec::new();
@@ -415,6 +531,40 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
     }
 }
 
+/// Attributes an approval request to the child that raised it (§6.3).
+///
+/// A child shares its parent's gate, so without this a writer's `shell.exec`
+/// produces a card indistinguishable from the main session asking — for work
+/// the user never directly requested, possibly long after they stopped thinking
+/// about it. "Approve this command?" is a different question depending on who
+/// is asking, and the user cannot answer it well without knowing.
+///
+/// The name is prepended to `action`, which is also the auto-approve scope key.
+/// That is deliberate: "always allow" granted to one agent should not silently
+/// widen to the whole session.
+struct AttributedGate {
+    inner: Arc<dyn kernel::HumanGate>,
+    agent: String,
+}
+
+#[async_trait::async_trait]
+impl kernel::HumanGate for AttributedGate {
+    async fn confirm(
+        &self,
+        action: &str,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::Approval {
+        self.inner
+            .confirm(
+                &format!("agent '{}' · {action}", self.agent),
+                detail,
+                escalated,
+            )
+            .await
+    }
+}
+
 pub struct KernelRunner<P: Provider, L: EventLog> {
     /// Weak on purpose: the kernel owns the executor that hosts `agent.spawn`,
     /// which owns the control plane that owns this runner. A strong handle would
@@ -445,7 +595,12 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             Arc::clone(&kernel.context),
             Arc::clone(&kernel.artifacts),
             Arc::clone(&kernel.policy),
-            Arc::clone(&kernel.gate),
+            // Attributed: the approval card names the agent, so an unexpected
+            // prompt is answerable. Everything else is shared with the parent.
+            Arc::new(AttributedGate {
+                inner: Arc::clone(&kernel.gate),
+                agent: run.spec.name.clone(),
+            }),
             Arc::clone(&kernel.verifier),
         );
 
@@ -476,7 +631,10 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         let outcome = tokio::select! {
             biased;
             _ = run.cancel.cancelled() => None,
-            outcome = child.run_session(&session, messages, budget, &NullSink, None) => Some(outcome),
+            // The child's steer queue goes to the loop that runs it, so text
+            // queued against this agent is injected at its next turn boundary.
+            // Dropping it here would make `agent.steer` accept text and lose it.
+            outcome = child.run_session(&session, messages, budget, &NullSink, Some(run.interrupts)) => Some(outcome),
         };
         let (transcript, stop) = match outcome {
             None => {
@@ -586,5 +744,139 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             tool_calls,
             trust,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestrator::{Dispatch, Outbox};
+    use ulid::Ulid;
+
+    fn log_at(name: &str) -> (Arc<store::SqliteLog>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("medha-{name}-{}", Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = store::SqliteLog::open(dir.join("events.db")).unwrap();
+        (Arc::new(log), dir)
+    }
+
+    fn dispatch(parent: Ulid, agent: &str) -> Dispatch {
+        Dispatch {
+            agent: agent.into(),
+            child: Ulid::new(),
+            parent,
+            objective: format!("{agent}'s objective"),
+        }
+    }
+
+    fn report(child: Ulid, summary: &str) -> orchestrator::AgentResult {
+        orchestrator::AgentResult {
+            agent: "reporter".into(),
+            session: child.to_string(),
+            status: orchestrator::AgentStatus::Completed,
+            summary: summary.into(),
+            artifact: None,
+            turns: 3,
+            tool_calls: 2,
+            duration_ms: 10,
+            trust: TrustLabel::Tool,
+            patch: None,
+        }
+    }
+
+    /// A second `LogOutbox` over the same log is a restart: new process
+    /// instance, same durable record.
+    #[tokio::test]
+    async fn a_child_abandoned_by_a_dead_process_is_reported_not_forgotten() {
+        let (log, _dir) = log_at("orphan");
+        let parent = Ulid::new();
+
+        // The process that dispatched this one never came back.
+        let died = LogOutbox::new(log.clone());
+        let abandoned = dispatch(parent, "surveyor");
+        died.dispatched(&abandoned).await;
+        // Nothing resolves it while only the dispatch exists — this is exactly
+        // the state in which the parent would wait forever.
+        assert!(died.undelivered(parent).await.is_empty());
+
+        let restarted = LogOutbox::new(log.clone());
+        assert_eq!(restarted.reap_abandoned(parent).await, 1);
+
+        let reported = restarted.undelivered(parent).await;
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].session, abandoned.child.to_string());
+        // "Unknown", not "failed": the child may have finished its work and
+        // died before recording it. Asserting failure would be a guess the
+        // parent then acts on as though it were a finding.
+        assert!(
+            reported[0].summary.contains("outcome unknown"),
+            "must not claim to know the child failed: {}",
+            reported[0].summary
+        );
+    }
+
+    #[tokio::test]
+    async fn reaping_is_idempotent_and_leaves_live_children_alone() {
+        let (log, _dir) = log_at("orphan-idem");
+        let parent = Ulid::new();
+
+        let died = LogOutbox::new(log.clone());
+        died.dispatched(&dispatch(parent, "abandoned")).await;
+
+        let live = LogOutbox::new(log.clone());
+        // This one belongs to the *current* instance: it is still running and
+        // will write its own terminal event. Reaping it would report a running
+        // agent as dead.
+        live.dispatched(&dispatch(parent, "still-running")).await;
+
+        assert_eq!(live.reap_abandoned(parent).await, 1);
+        // The terminal event the first pass wrote is what closes the record, so
+        // a second pass must find nothing to do.
+        assert_eq!(live.reap_abandoned(parent).await, 0);
+
+        let reported = live.undelivered(parent).await;
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].agent, "abandoned");
+    }
+
+    #[tokio::test]
+    async fn a_child_that_did_report_is_never_reaped() {
+        let (log, _dir) = log_at("orphan-finished");
+        let parent = Ulid::new();
+
+        let first = LogOutbox::new(log.clone());
+        let finished = dispatch(parent, "reporter");
+        first.dispatched(&finished).await;
+        first
+            .finished(&finished, &report(finished.child, "the real answer"))
+            .await;
+
+        // Across a restart a completed child keeps its real report: reaping
+        // must never overwrite an outcome that was genuinely recorded.
+        let restarted = LogOutbox::new(log.clone());
+        assert_eq!(restarted.reap_abandoned(parent).await, 0);
+        let reported = restarted.undelivered(parent).await;
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].summary, "the real answer");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_child_is_delivered_once_like_any_other() {
+        let (log, _dir) = log_at("orphan-once");
+        let parent = Ulid::new();
+        LogOutbox::new(log.clone())
+            .dispatched(&dispatch(parent, "surveyor"))
+            .await;
+
+        let restarted = LogOutbox::new(log.clone());
+        restarted.reap_abandoned(parent).await;
+        let child: Ulid = restarted.undelivered(parent).await[0]
+            .session
+            .parse()
+            .unwrap();
+        restarted.delivered(parent, child).await;
+        // A recovered report joins the same delivery fold, so it cannot be
+        // re-injected on the next turn.
+        assert!(restarted.undelivered(parent).await.is_empty());
     }
 }

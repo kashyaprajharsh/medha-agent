@@ -170,8 +170,13 @@ pub struct AgentControl {
     max_depth: usize,
     depth: usize,
     cancel: CancellationToken,
-    active: Arc<futures::lock::Mutex<Vec<AgentHandle>>>,
+    active: Roster,
 }
+
+/// The live roster. Critical sections are a push, a retain and a clone, none of
+/// them across an await, so a plain mutex is both correct and what lets the
+/// registration guard clean up from `Drop`.
+type Roster = Arc<std::sync::Mutex<Vec<AgentHandle>>>;
 
 impl AgentControl {
     pub fn new(runner: Arc<dyn ChildRunner>, cancel: CancellationToken) -> Self {
@@ -182,7 +187,7 @@ impl AgentControl {
             max_depth: DEFAULT_MAX_DEPTH,
             depth: 0,
             cancel,
-            active: Arc::new(futures::lock::Mutex::new(Vec::new())),
+            active: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -198,8 +203,11 @@ impl AgentControl {
     }
 
     /// Currently running children, for the UI.
-    pub async fn active(&self) -> Vec<AgentHandle> {
-        self.active.lock().await.clone()
+    pub fn active(&self) -> Vec<AgentHandle> {
+        self.active
+            .lock()
+            .map(|active| active.clone())
+            .unwrap_or_default()
     }
 
     /// Reserve capacity before anything is published. Returns `AtCapacity`
@@ -249,7 +257,7 @@ impl AgentControl {
             // The session id is the identity; the name is display only. Two
             // children with the same objective must still be distinguishable,
             // so a collision gets a suffix rather than silently aliasing (§6.2).
-            let mut active = self.active.lock().await;
+            let mut active = self.active.lock().map_err(|_| Error::Unavailable)?;
             if active.iter().any(|entry| entry.agent == spec.name) {
                 spec.name = format!("{}-{}", spec.name, &session.to_string()[..4].to_lowercase());
             }
@@ -331,43 +339,31 @@ fn epoch_ms() -> u64 {
 /// rather than a pair of calls because the run future can be dropped mid-flight
 /// on cancellation, which would otherwise strand the entry forever.
 struct Registration {
-    active: Arc<futures::lock::Mutex<Vec<AgentHandle>>>,
+    active: Roster,
     session: String,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        // Drop is sync; the roster is only ever held briefly, so a blocking
-        // try-lock succeeds in practice and a miss costs one stale row, not a
-        // deadlock.
-        if let Some(mut active) = self.active.try_lock() {
+        // A plain mutex, not an async one: `Drop` cannot await, and a `try_lock`
+        // that loses a race would strand the row permanently. The roster is
+        // never held across an await, so locking here cannot block meaningfully.
+        if let Ok(mut active) = self.active.lock() {
             active.retain(|entry| entry.session != self.session);
         }
     }
 }
 
-/// Trim a child's summary to something a parent can hold in context. The caller
-/// spills the remainder to the artifact store and fills in `artifact`.
+/// Assemble the parent-facing record. The summary is returned **whole**: the
+/// caller owns the artifact store, so it caps for context and spills the
+/// remainder there. Truncating here would discard the tail before anyone could
+/// persist it.
 fn bound(name: String, session: Ulid, outcome: ChildOutcome, elapsed: Duration) -> AgentResult {
-    let truncated = outcome.summary.chars().count() > MAX_SUMMARY_CHARS;
-    let summary = if truncated {
-        let cut = outcome
-            .summary
-            .char_indices()
-            .nth(MAX_SUMMARY_CHARS)
-            .map_or(outcome.summary.len(), |(index, _)| index);
-        format!(
-            "{}\n… [full result in the artifact store]",
-            &outcome.summary[..cut]
-        )
-    } else {
-        outcome.summary
-    };
     AgentResult {
         agent: name,
         session: session.to_string(),
         status: outcome.status,
-        summary,
+        summary: outcome.summary,
         artifact: None,
         turns: outcome.turns,
         tool_calls: outcome.tool_calls,
@@ -580,7 +576,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, AgentStatus::Cancelled);
         // The run future was dropped mid-flight; the roster must still be clean.
-        assert!(control.active().await.is_empty());
+        assert!(control.active().is_empty());
     }
 
     #[tokio::test]
@@ -605,7 +601,7 @@ mod tests {
     async fn concurrent_agents_never_share_a_display_name() {
         let (_, control) = control();
         // Occupy the roster with the name the next spawn would pick.
-        control.active.lock().await.push(AgentHandle {
+        control.active.lock().unwrap().push(AgentHandle {
             agent: "audit-the-crate".into(),
             session: Ulid::new().to_string(),
             objective: "audit the crate".into(),
@@ -617,6 +613,34 @@ mod tests {
             .unwrap();
         assert_ne!(result.agent, "audit-the-crate");
         assert!(result.agent.starts_with("audit-the-crate-"));
+    }
+
+    /// Reports a summary far past the context cap.
+    struct Verbose;
+
+    #[async_trait]
+    impl ChildRunner for Verbose {
+        async fn run(&self, _run: ChildRun) -> Result<ChildOutcome, String> {
+            Ok(ChildOutcome {
+                status: AgentStatus::Completed,
+                summary: "x".repeat(MAX_SUMMARY_CHARS * 2),
+                turns: 1,
+                tool_calls: 0,
+                trust: TrustLabel::Tool,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_report_reaches_the_caller_whole() {
+        let control = AgentControl::new(Arc::new(Verbose), CancellationToken::new());
+        let result = control
+            .spawn(spec("write at length"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        // The runtime must not truncate: the caller owns the artifact store, so
+        // trimming here would discard the tail before anything could persist it.
+        assert_eq!(result.summary.len(), MAX_SUMMARY_CHARS * 2);
     }
 
     #[test]

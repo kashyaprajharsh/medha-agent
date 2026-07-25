@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use kernel::{
-    EventLog, Kernel, Message, NullSink, Provider, Role, Session, StopReason, TrustLabel,
+    Event, EventKind, EventLog, Kernel, Message, NullSink, Provider, Role, Session, StopReason,
+    TrustLabel,
 };
 use orchestrator::{AgentStatus, ChildOutcome, ChildRun, ChildRunner};
 
@@ -79,6 +80,19 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         };
         let messages = vec![Message::new(Role::User, child_prompt(&run))];
 
+        // The child's chain opens with what it was asked to do, so its session
+        // stands on its own when read back later.
+        let tools: Vec<String> = run.executor.specs().into_iter().map(|s| s.name).collect();
+        let _ = kernel
+            .log
+            .append(Event::agent_spawned(
+                &session,
+                &run.spec.name,
+                &run.spec.objective,
+                &tools,
+            ))
+            .await;
+
         let outcome = tokio::select! {
             biased;
             _ = run.cancel.cancelled() => None,
@@ -86,6 +100,16 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         };
         let (transcript, stop) = match outcome {
             None => {
+                let _ = kernel
+                    .log
+                    .append(Event::agent_finished(
+                        &session,
+                        EventKind::AgentCancelled,
+                        &run.spec.name,
+                        "cancelled by the parent",
+                        TrustLabel::Tool,
+                    ))
+                    .await;
                 return Ok(ChildOutcome {
                     status: AgentStatus::Cancelled,
                     summary: "cancelled before the agent reported".into(),
@@ -95,7 +119,19 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
                 });
             }
             Some(Ok(result)) => result,
-            Some(Err(error)) => return Err(error.to_string()),
+            Some(Err(error)) => {
+                let _ = kernel
+                    .log
+                    .append(Event::agent_finished(
+                        &session,
+                        EventKind::AgentFailed,
+                        &run.spec.name,
+                        &error.to_string(),
+                        TrustLabel::Tool,
+                    ))
+                    .await;
+                return Err(error.to_string());
+            }
         };
 
         // The child's last assistant message is its report; the rest of the
@@ -115,28 +151,45 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             .filter(|message| message.role == Role::Assistant)
             .count() as u32;
 
+        // Every observation the child made is already labelled, so the weakest
+        // one is what its summary is worth. A child that read the web hands back
+        // a web-labelled result and the kernel's trust-flow escalation still
+        // applies to whatever the parent does next.
+        let trust = orchestrator::least_trusted(
+            kernel
+                .log
+                .events(run.session)
+                .await
+                .into_iter()
+                .filter(|event| event.kind == EventKind::ToolObs)
+                .map(|event| event.trust),
+        );
+        let status = match stop {
+            StopReason::Finished => AgentStatus::Completed,
+            StopReason::Budget(_) => AgentStatus::Exhausted,
+            StopReason::Interrupted => AgentStatus::Cancelled,
+        };
+        let _ = kernel
+            .log
+            .append(Event::agent_finished(
+                &session,
+                match status {
+                    AgentStatus::Cancelled => EventKind::AgentCancelled,
+                    AgentStatus::Failed => EventKind::AgentFailed,
+                    _ => EventKind::AgentCompleted,
+                },
+                &run.spec.name,
+                &format!("{turns} turn(s), {tool_calls} tool call(s)"),
+                trust,
+            ))
+            .await;
+
         Ok(ChildOutcome {
-            status: match stop {
-                StopReason::Finished => AgentStatus::Completed,
-                StopReason::Budget(_) => AgentStatus::Exhausted,
-                StopReason::Interrupted => AgentStatus::Cancelled,
-            },
+            status,
             summary,
             turns,
             tool_calls,
-            // Every observation the child made is already labelled, so the
-            // weakest one is what its summary is worth. A child that read the
-            // web hands back a web-labelled result and the kernel's trust-flow
-            // escalation still applies to whatever the parent does next.
-            trust: orchestrator::least_trusted(
-                kernel
-                    .log
-                    .events(run.session)
-                    .await
-                    .into_iter()
-                    .filter(|event| event.kind == kernel::EventKind::ToolObs)
-                    .map(|event| event.trust),
-            ),
+            trust,
         })
     }
 }

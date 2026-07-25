@@ -1241,11 +1241,14 @@ async fn main() -> Result<()> {
     // because the kernel owns the registry that hosts `agent.spawn`; the runner
     // and the parent executor are installed once the kernel is built.
     let agent_runner = Arc::new(orchestrator::DeferredRunner::default());
-    let agent_control = Arc::new(orchestrator::AgentControl::new(
-        agent_runner.clone(),
-        tokio_util::sync::CancellationToken::new(),
-    ));
-    registry.register_agents(agent_control);
+    if lock.agents.enabled {
+        let control = orchestrator::AgentControl::new(
+            agent_runner.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_limits(lock.agents.max_active, lock.agents.max_depth);
+        registry.register_agents(Arc::new(control), lock.agents.max_turns);
+    }
     let agent_parent = registry.agent_parent_handle();
     let executor = Arc::new(registry);
 

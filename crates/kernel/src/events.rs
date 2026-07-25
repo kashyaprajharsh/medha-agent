@@ -165,6 +165,32 @@ impl Event {
         )
     }
 
+    /// A sub-agent starting, recorded on the child's own chain so its session is
+    /// self-describing: the objective it was given is the first thing in it. The
+    /// parent's chain already carries the `agent.spawn` intent and its result, so
+    /// the two link both ways without threading a parent id through the runtime.
+    pub fn agent_spawned(s: &Session, name: &str, objective: &str, tools: &[String]) -> Self {
+        Self::new(
+            s,
+            EventKind::AgentSpawned,
+            json!({ "agent": name, "objective": objective, "tools": tools }),
+            // The objective is authored by the model, not the user.
+            TrustLabel::System,
+        )
+    }
+
+    /// A sub-agent reaching a terminal state. `trust` is the weakest label the
+    /// child touched, so the audit trail records what its report is worth.
+    pub fn agent_finished(
+        s: &Session,
+        kind: EventKind,
+        name: &str,
+        detail: &str,
+        trust: TrustLabel,
+    ) -> Self {
+        Self::new(s, kind, json!({ "agent": name, "detail": detail }), trust)
+    }
+
     pub fn model_text(s: &Session, text: &str) -> Self {
         Self::new(
             s,

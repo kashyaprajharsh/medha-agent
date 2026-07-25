@@ -810,6 +810,8 @@ struct AgentSpawn {
     control: Arc<orchestrator::AgentControl>,
     executor: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
+    /// Operator ceiling on one child's turns, from `[agents] max_turns`.
+    max_turns: u32,
 }
 
 #[async_trait]
@@ -895,27 +897,37 @@ impl Tool for AgentSpawn {
                 .and_then(Value::as_u64)
                 .map(|turns| turns as u32),
         };
-        // The parent's remaining turns are not visible here; the kernel clamps
-        // the child again when it runs, so this is an upper bound, not the cap.
+        // The parent's live turn counter is not visible at the tool boundary, so
+        // the operator's ceiling is the bound. A child's turns are its own
+        // session's anyway; the tokens are the shared cost, which this caps.
         let mut result = self
             .control
-            .spawn(spec, parent, AGENT_TURN_CEILING)
+            .spawn(spec, parent, self.max_turns)
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?;
-        // A long summary is bounded for context but never discarded.
-        if let Some(store) = &self.artifacts
-            && result.summary.len() >= orchestrator::MAX_SUMMARY_CHARS
-            && let Ok(hash) = store.put(result.summary.as_bytes())
+        // Bound what reaches the model, but persist the whole report first —
+        // truncating before spilling would lose exactly the part worth keeping.
+        let cap = orchestrator::MAX_SUMMARY_CHARS;
+        if let Some(cut) = result
+            .summary
+            .char_indices()
+            .nth(cap)
+            .map(|(index, _)| index)
         {
-            result.artifact = Some(hash);
+            if let Some(store) = &self.artifacts
+                && let Ok(hash) = store.put(result.summary.as_bytes())
+            {
+                result.artifact = Some(hash);
+            }
+            result.summary.truncate(cut);
+            result.summary.push_str(match &result.artifact {
+                Some(_) => "\n… truncated; read the rest with `read_artifact`",
+                None => "\n… truncated",
+            });
         }
         serde_json::to_value(result).map_err(|error| ToolError::Failed(error.to_string()))
     }
 }
-
-/// Upper bound on a child's turns when the parent's remaining budget is not
-/// visible at the tool boundary.
-const AGENT_TURN_CEILING: u32 = 24;
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -1057,11 +1069,16 @@ impl ToolRegistry {
     /// Enable `agent.spawn`. The control plane is built before the kernel (the
     /// kernel owns this registry), so the parent executor is installed later via
     /// the returned handle — see [`Self::agent_parent_handle`].
-    pub fn register_agents(&mut self, control: Arc<orchestrator::AgentControl>) -> &mut Self {
+    pub fn register_agents(
+        &mut self,
+        control: Arc<orchestrator::AgentControl>,
+        max_turns: u32,
+    ) -> &mut Self {
         self.register(Arc::new(AgentSpawn {
             control,
             executor: Arc::clone(&self.agent_parent),
             artifacts: self.artifacts.clone(),
+            max_turns: max_turns.max(1),
         }));
         self
     }
@@ -6610,7 +6627,7 @@ mod tests {
             Arc::new(EchoRunner),
             tokio_util::sync::CancellationToken::new(),
         ));
-        registry.register_agents(control);
+        registry.register_agents(control, 8);
         let parent = registry.agent_parent_handle();
         let registry = Arc::new(registry);
         // What `main` does once the kernel exists: children narrow from the

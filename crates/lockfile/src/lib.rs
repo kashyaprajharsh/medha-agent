@@ -74,6 +74,8 @@ pub struct MedhaLock {
     #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
+    pub agents: AgentsConfig,
+    #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
     pub verify: VerifyConfig,
@@ -157,6 +159,37 @@ impl Default for LspConfig {
             max_open_documents: 64,
             allow_network: false,
             servers: Vec::new(),
+        }
+    }
+}
+
+/// Sub-agent limits. These bound blast radius and spend, so they are an
+/// operator decision that belongs in the committed lockfile — unlike which MCP
+/// servers a machine happens to have.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    pub enabled: bool,
+    /// Children alive at once, across the whole session tree.
+    pub max_active: usize,
+    /// Delegation depth. 1 keeps it flat: a child cannot spawn a child, which is
+    /// what stops two agents racing on one workspace before writer isolation
+    /// exists.
+    pub max_depth: usize,
+    /// Turn ceiling for one child. A child's turns are its own session's, but
+    /// the tokens are the same wallet, so this is the real spend bound.
+    pub max_turns: u32,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Hermes' default, on the reasoning that each child burns tokens
+            // independently.
+            max_active: 3,
+            max_depth: 1,
+            max_turns: 24,
         }
     }
 }

@@ -23,6 +23,40 @@ pub fn system_prompt(persona_override: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    /// The brief drifted once already: LSP, MCP and sub-agents all shipped while
+    /// it still described a file-tools-and-shell agent, so capabilities were paid
+    /// for and never used. This fails when the next one lands unmentioned.
+    #[test]
+    fn the_brief_covers_what_medha_can_actually_do() {
+        let brief = system_prompt(None);
+        for capability in [
+            "lsp.definition", // semantic navigation, not grep guesses
+            "agent.spawn",    // delegation, on its own judgement
+            "read_artifact",  // paging, so nothing is "truncated"
+            "update_plan",    // the user's live progress view
+            "skill.load",     // project procedures come first
+            "memory.write",   // what should outlive the session
+            "clarify",        // ask rather than guess
+            "mcp__",          // external tool output is data, not instruction
+        ] {
+            assert!(
+                brief.contains(capability),
+                "the operating brief never mentions {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_brief_states_that_tool_output_is_not_instruction() {
+        // Prompt injection arrives through fetched pages and MCP results; the
+        // brief has to say so, because the model cannot infer a trust boundary.
+        let brief = system_prompt(None).to_lowercase();
+        assert!(
+            brief.contains("not an instruction") || brief.contains("do not tell you what to do")
+        );
+        assert!(brief.contains("trust boundary"));
+    }
+
     #[test]
     fn falls_back_to_registry_then_honors_override() {
         // No override → the embedded operating brief (contains its key rules).

@@ -4,10 +4,7 @@
 use super::*;
 use unicode_width::UnicodeWidthStr;
 
-pub(super) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-pub(super) fn spinner_frame(frame: u64) -> &'static str {
-    SPINNER[(frame as usize) % SPINNER.len()]
-}
+pub(super) use super::spin::primary as spinner_frame;
 
 /// Human-readable verb for a tool name (used both for the live activity label and
 /// the in-progress tool-call line).
@@ -1181,8 +1178,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     // `/tasks` lists them; `task.kill` (or the model) stops them.
     let running_bg = model.bg_running();
     if running_bg > 0 {
-        const SPIN: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-        let g = SPIN[(model.anim_frame as usize / 4) % SPIN.len()];
+        let g = super::spin::secondary(model.anim_frame);
         let word = if running_bg == 1 { "task" } else { "tasks" };
         left.push(Span::styled(
             format!("  {g} {running_bg} bg {word}"),
@@ -1195,8 +1191,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     // this the user has no way to know Medha handed part of the task away, or to
     // what. Esc cancels the turn, which settles the child with it.
     if !model.agent_runs.is_empty() {
-        const SPIN: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-        let g = SPIN[(model.anim_frame as usize / 4) % SPIN.len()];
+        let g = super::spin::secondary(model.anim_frame);
         let names = model
             .agent_runs
             .iter()

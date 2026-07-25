@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 mod markdown;
+mod spin;
 mod tty;
 mod update;
 mod view;

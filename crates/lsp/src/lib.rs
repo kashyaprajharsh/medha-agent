@@ -430,7 +430,9 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(10 * 60),
             restart_backoff: Duration::from_secs(5),
             max_restart_attempts: 5,
-            max_servers: 8,
+            // Above the number of built-in adapters, so a polyglot repo does not
+            // thrash the LRU just by touching each of its languages once.
+            max_servers: 16,
             max_results: 200,
             max_text_chars: 16_000,
             max_open_documents: 64,
@@ -1218,6 +1220,7 @@ impl LspManager {
             });
         }
         let now = Instant::now();
+        let mut evicted = None;
         let (cell, retired) = {
             let mut clients = self.inner.clients.lock().await;
             let config = &self.inner.config;
@@ -1241,8 +1244,25 @@ impl LspManager {
             let next_failures = retired
                 .as_ref()
                 .map_or(0, |entry| entry.failures.saturating_add(1));
+            // At capacity, retire the least recently used server rather than
+            // refusing. A polyglot repo can easily touch more languages than the
+            // ceiling, and denying code intelligence for the ninth one — while
+            // some server nobody has queried in an hour holds its slot — is the
+            // wrong trade. Only an idle server is evicted; one in use keeps its
+            // slot because `last_used` was just bumped.
             if !clients.contains_key(&key) && clients.len() >= config.max_servers {
-                return Err(Error::Capacity(config.max_servers));
+                let victim = clients
+                    .iter()
+                    .filter(|(_, entry)| entry.cell.get().is_some())
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(key, _)| key.clone());
+                match victim.and_then(|key| clients.remove(&key)) {
+                    Some(entry) => evicted = Some(entry),
+                    // Every slot is held by a server still starting up; refusing
+                    // is right here, since evicting one would abort a spawn the
+                    // caller is waiting on.
+                    None => return Err(Error::Capacity(config.max_servers)),
+                }
             }
             let entry = clients.entry(key).or_insert_with(|| ClientEntry {
                 cell: Arc::new(OnceCell::new()),
@@ -1253,10 +1273,12 @@ impl LspManager {
             entry.last_used = now;
             (Arc::clone(&entry.cell), retired)
         };
-        if let Some(entry) = retired
-            && let Some(Ok(client)) = entry.cell.get()
-        {
-            client.shutdown().await;
+        // Shut the outgoing servers down outside the map lock — both the broken
+        // one being replaced and any evicted to make room.
+        for entry in [retired, evicted].into_iter().flatten() {
+            if let Some(Ok(client)) = entry.cell.get() {
+                client.shutdown().await;
+            }
         }
         let config = self.inner.config.clone();
         let result = cell
@@ -1818,7 +1840,7 @@ impl LspClient {
                 program.clone()
             }
         };
-        if !sandbox::program_on_path(&resolved_program) {
+        if !server_on_path(&resolved_program) {
             return Err(Error::ServerUnavailable {
                 server: adapter.id.clone(),
                 command: program.clone(),
@@ -3297,6 +3319,35 @@ fn adapter_language_id<'a>(adapter: &'a ServerAdapter, path: &Path) -> Option<&'
         .map(|language| language.language_id.as_str())
 }
 
+/// Where Medha keeps language servers it installed for the user. Nothing is
+/// written to `/usr/local`, the global npm root, or any other shared location —
+/// an agent installing a package should not alter the machine outside its own
+/// directory, and removing this one directory undoes all of it.
+pub fn server_install_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("MEDHA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".medha")))?;
+    Some(base.join("lsp"))
+}
+
+/// The directories holding Medha-installed server binaries, in PATH order.
+pub fn server_bin_dirs() -> Vec<PathBuf> {
+    server_install_dir()
+        .map(|dir| vec![dir.join("bin"), dir.join("node_modules/.bin")])
+        .unwrap_or_default()
+}
+
+/// True when `program` is runnable, counting Medha's own install directory as
+/// well as the inherited PATH.
+pub fn server_on_path(program: &str) -> bool {
+    if sandbox::program_on_path(program) {
+        return true;
+    }
+    server_bin_dirs()
+        .into_iter()
+        .any(|dir| dir.join(program).exists())
+}
+
 /// Language servers need local toolchain discovery, but they should not inherit
 /// API keys, cloud credentials, or arbitrary session secrets from Medha.
 fn language_server_environment() -> Vec<(String, String)> {
@@ -3321,13 +3372,33 @@ fn language_server_environment() -> Vec<(String, String)> {
         "SystemRoot",
         "PATHEXT",
     ];
-    ALLOWED
+    let mut environment: Vec<(String, String)> = ALLOWED
         .iter()
         .filter_map(|name| {
             std::env::var_os(name)
                 .map(|value| ((*name).to_string(), value.to_string_lossy().into_owned()))
         })
-        .collect()
+        .collect();
+    // Prepend Medha's own install directory so a server installed through
+    // `medha lsp install` is found without the user editing their shell PATH.
+    let extra = server_bin_dirs();
+    if !extra.is_empty() {
+        let inherited = environment
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        let joined = extra
+            .iter()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .chain(std::iter::once(inherited))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(":");
+        environment.retain(|(key, _)| key != "PATH");
+        environment.push(("PATH".into(), joined));
+    }
+    environment
 }
 
 #[allow(unused_variables)]

@@ -24,6 +24,10 @@ impl NarrowedExecutor {
     /// everything the parent has — which is still only the parent's set, never
     /// more. Unknown names are dropped rather than erroring: a child asking for
     /// a tool that does not exist gets a smaller set, not a wider one.
+    ///
+    /// The set is snapshotted here. Tools can appear later (an MCP server
+    /// connecting mid-session), and the child will not see them — the stale
+    /// direction is the closed one, which is the direction to be stale in.
     pub fn new(inner: Arc<dyn Executor>, requested: Option<&[String]>) -> Self {
         let available: BTreeSet<String> = inner.specs().into_iter().map(|spec| spec.name).collect();
         let allowed = match requested {
@@ -67,11 +71,17 @@ impl Executor for NarrowedExecutor {
     }
 
     fn blast_radius(&self, tool: &str) -> Option<BlastRadius> {
-        self.allows(tool).then(|| self.inner.blast_radius(tool))?
+        if !self.allows(tool) {
+            return None;
+        }
+        self.inner.blast_radius(tool)
     }
 
     fn category(&self, tool: &str) -> Option<ToolCategory> {
-        self.allows(tool).then(|| self.inner.category(tool))?
+        if !self.allows(tool) {
+            return None;
+        }
+        self.inner.category(tool)
     }
 
     fn containment(&self) -> Containment {
@@ -91,9 +101,10 @@ impl Executor for NarrowedExecutor {
     }
 
     async fn preview(&self, intent: &ToolIntent) -> Option<String> {
-        self.allows(&intent.tool)
-            .then(|| self.inner.preview(intent))?
-            .await
+        if !self.allows(&intent.tool) {
+            return None;
+        }
+        self.inner.preview(intent).await
     }
 }
 

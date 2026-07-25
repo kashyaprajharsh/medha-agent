@@ -35,16 +35,12 @@ pub const MAX_SUMMARY_CHARS: usize = 16_000;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("sub-agents are not available in this session")]
-    Unavailable,
     #[error("agent objective is empty")]
     NoObjective,
     #[error("delegation depth {depth} exceeds the limit of {max}")]
     TooDeep { depth: usize, max: usize },
     #[error("too many agents already running (limit {0}); wait for one to finish")]
     AtCapacity(usize),
-    #[error("no agent named '{0}'")]
-    UnknownAgent(String),
     #[error("agent failed: {0}")]
     Failed(String),
 }
@@ -75,12 +71,6 @@ pub enum AgentStatus {
     Exhausted,
     Failed,
     Cancelled,
-}
-
-impl AgentStatus {
-    pub fn is_final(self) -> bool {
-        true
-    }
 }
 
 /// What the parent sees. Never the child's transcript — that stays in the event
@@ -228,35 +218,103 @@ impl AgentControl {
             .max(1);
 
         let session = Ulid::new();
-        let handle = AgentHandle {
-            agent: spec.name.clone(),
+        {
+            // The session id is the identity; the name is display only. Two
+            // children with the same objective must still be distinguishable,
+            // so a collision gets a suffix rather than silently aliasing (§6.2).
+            let mut active = self.active.lock().await;
+            if active.iter().any(|entry| entry.agent == spec.name) {
+                spec.name = format!("{}-{}", spec.name, &session.to_string()[..4].to_lowercase());
+            }
+            active.push(AgentHandle {
+                agent: spec.name.clone(),
+                session: session.to_string(),
+                objective: spec.objective.clone(),
+                started_ms: epoch_ms(),
+            });
+        }
+        let _registered = Registration {
+            active: Arc::clone(&self.active),
             session: session.to_string(),
-            objective: spec.objective.clone(),
-            started_ms: 0,
         };
-        self.active.lock().await.push(handle.clone());
 
         let started = Instant::now();
-        let outcome = self
-            .runner
-            .run(ChildRun {
-                session,
-                spec: spec.clone(),
-                executor,
-                max_turns,
-                // Child token: cancelling the parent settles every descendant.
-                cancel: self.cancel.child_token(),
-            })
-            .await;
-        self.active
-            .lock()
-            .await
-            .retain(|entry| entry.session != session.to_string());
+        let cancel = self.cancel.child_token();
+        let run = self.runner.run(ChildRun {
+            session,
+            spec: spec.clone(),
+            executor,
+            max_turns,
+            // Child token: cancelling the parent settles every descendant.
+            cancel: cancel.clone(),
+        });
+        // Race the run against the token. A cooperative runner honours it
+        // itself, but a runner that ignores it must not be able to outlive a
+        // cancelled parent, so dropping the future here is the backstop.
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Ok(bound(
+                    spec.name,
+                    session,
+                    ChildOutcome {
+                        status: AgentStatus::Cancelled,
+                        summary: "cancelled before the agent reported".into(),
+                        turns: 0,
+                        tool_calls: 0,
+                        trust: TrustLabel::Tool,
+                    },
+                    started.elapsed(),
+                ));
+            }
+            outcome = run => outcome,
+        };
 
         let elapsed = started.elapsed();
         match outcome {
             Ok(outcome) => Ok(bound(spec.name, session, outcome, elapsed)),
             Err(error) => Err(Error::Failed(error)),
+        }
+    }
+
+    /// A control for a child of this one: one deeper, sharing the tree's
+    /// capacity, roster and cancellation. Caps are tree-scoped (§2.1), so a
+    /// descendant cannot escape them by holding its own control.
+    pub fn for_child(&self) -> Self {
+        Self {
+            runner: Arc::clone(&self.runner),
+            capacity: Arc::clone(&self.capacity),
+            max_active: self.max_active,
+            max_depth: self.max_depth,
+            depth: self.depth + 1,
+            cancel: self.cancel.child_token(),
+            active: Arc::clone(&self.active),
+        }
+    }
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Keeps a child in the visible roster for exactly as long as it runs. A guard
+/// rather than a pair of calls because the run future can be dropped mid-flight
+/// on cancellation, which would otherwise strand the entry forever.
+struct Registration {
+    active: Arc<futures::lock::Mutex<Vec<AgentHandle>>>,
+    session: String,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        // Drop is sync; the roster is only ever held briefly, so a blocking
+        // try-lock succeeds in practice and a miss costs one stale row, not a
+        // deadlock.
+        if let Some(mut active) = self.active.try_lock() {
+            active.retain(|entry| entry.session != self.session);
         }
     }
 }
@@ -469,6 +527,69 @@ mod tests {
             control.spawn(spec("   "), Arc::new(Tools), 5).await,
             Err(Error::NoObjective)
         ));
+    }
+
+    /// Blocks until cancelled, so the roster/cancellation behaviour is testable
+    /// without depending on a runner that cooperates.
+    struct Hangs;
+
+    #[async_trait]
+    impl ChildRunner for Hangs {
+        async fn run(&self, run: ChildRun) -> Result<ChildOutcome, String> {
+            run.cancel.cancelled().await;
+            futures::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_agent_leaves_no_phantom_in_the_roster() {
+        let cancel = CancellationToken::new();
+        let control = AgentControl::new(Arc::new(Hangs), cancel.clone());
+        cancel.cancel();
+        let result = control
+            .spawn(spec("will be cancelled"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        assert_eq!(result.status, AgentStatus::Cancelled);
+        // The run future was dropped mid-flight; the roster must still be clean.
+        assert!(control.active().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_child_control_is_deeper_and_shares_the_trees_capacity() {
+        let (_, control) = control();
+        let control = control.with_limits(2, 1);
+        let child = control.for_child();
+        // Depth is exhausted one level down, so O1 delegation stays flat.
+        assert!(matches!(
+            child.spawn(spec("nested"), Arc::new(Tools), 5).await,
+            Err(Error::TooDeep { .. })
+        ));
+        // Capacity is one semaphore for the whole tree, not one per control.
+        let held = control.reserve().unwrap();
+        let _also_held = control.reserve().unwrap();
+        assert!(matches!(child.reserve(), Err(Error::AtCapacity(2))));
+        drop(held);
+        assert!(child.reserve().is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_agents_never_share_a_display_name() {
+        let (_, control) = control();
+        // Occupy the roster with the name the next spawn would pick.
+        control.active.lock().await.push(AgentHandle {
+            agent: "audit-the-crate".into(),
+            session: Ulid::new().to_string(),
+            objective: "audit the crate".into(),
+            started_ms: epoch_ms(),
+        });
+        let result = control
+            .spawn(spec("audit the crate"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        assert_ne!(result.agent, "audit-the-crate");
+        assert!(result.agent.starts_with("audit-the-crate-"));
     }
 
     #[test]

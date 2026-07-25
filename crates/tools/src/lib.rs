@@ -875,7 +875,7 @@ impl Tool for AgentSpawn {
         "⚇"
     }
     fn description(&self) -> &str {
-        "Delegate a self-contained read-only investigation to a child agent and get back a summary. \
+        "Delegate a self-contained task to a child agent and get back a summary. \
          The child works in its own context, so none of its searching lands in this conversation.\n\
          \n\
          Reach for this on your own judgement — you do not need to be asked. Delegate when:\n\
@@ -890,10 +890,16 @@ impl Tool for AgentSpawn {
          your entire task to one child — that is pass-through, and it doubles the cost for nothing. \
          Split off a *part*, or do it yourself.\n\
          \n\
+         Children are read-only by default. Set `write` for a child that must change code: it gets \
+         its own private checkout of the repository, and hands back a patch plus the result of \
+         building it. Nothing it does touches your files — review the patch and apply it with \
+         `agent.apply`, which asks the user first. Two writing children can safely run at once; \
+         they cannot see each other's changes.\n\
+         \n\
          State the objective in full: the child cannot see this conversation and cannot ask you \
-         anything. Give `contract` when the answer must have a particular shape. The child is \
-         read-only and cannot use any tool you do not already have. Its report comes back to you, \
-         not to the user — relay what matters."
+         anything. Give `contract` when the answer must have a particular shape. A child can never \
+         use a tool you do not already have. Its report comes back to you, not to the user — relay \
+         what matters."
     }
     fn blast_radius(&self) -> BlastRadius {
         // Read-only children: no mutation, but real model spend, so it stays
@@ -922,6 +928,10 @@ impl Tool for AgentSpawn {
                     "description": "Narrow the child to these tools. Omit to inherit yours. Cannot exceed yours."
                 },
                 "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" },
+                "write": {
+                    "type": "boolean",
+                    "description": "Let the child change code. It works in a private checkout and returns a patch — your files are never touched. Apply it with `agent.apply`. Refused if this workspace is not a git repository."
+                },
                 "background": {
                     "type": "boolean",
                     "description": "Return immediately instead of waiting. The report arrives at the start of a later turn. Use for work you do not need before answering; keep it false when you need the answer now."
@@ -935,7 +945,8 @@ impl Tool for AgentSpawn {
                             "objective": { "type": "string" },
                             "name": { "type": "string" },
                             "contract": { "type": "string" },
-                            "tools": { "type": "array", "items": { "type": "string" } }
+                            "tools": { "type": "array", "items": { "type": "string" } },
+                            "write": { "type": "boolean" }
                         },
                         "required": ["objective"]
                     }
@@ -944,8 +955,12 @@ impl Tool for AgentSpawn {
         })
     }
     async fn preview(&self, args: &Value) -> Option<String> {
+        let kind = match args.get("write").and_then(Value::as_bool).unwrap_or(false) {
+            true => "a writing agent (private checkout, returns a patch)",
+            false => "a read-only agent",
+        };
         Some(format!(
-            "delegate to a read-only agent:\n{}",
+            "delegate to {kind}:\n{}",
             args.get("objective")?.as_str()?
         ))
     }
@@ -986,6 +1001,7 @@ impl Tool for AgentSpawn {
                             .collect()
                     }),
                     max_turns: None,
+                    write: task.get("write").and_then(Value::as_bool).unwrap_or(false),
                 };
                 self.control.spawn(spec, parent.clone(), self.max_turns)
             });
@@ -1029,6 +1045,7 @@ impl Tool for AgentSpawn {
                 .get("max_turns")
                 .and_then(Value::as_u64)
                 .map(|turns| turns as u32),
+            write: args.get("write").and_then(Value::as_bool).unwrap_or(false),
         };
         // Background: hand back the handle now, report arrives on a later turn.
         if args
@@ -1079,7 +1096,26 @@ impl Tool for AgentSpawn {
                 None => "\n… truncated",
             });
         }
-        serde_json::to_value(result).map_err(|error| ToolError::Failed(error.to_string()))
+        let mut value =
+            serde_json::to_value(&result).map_err(|error| ToolError::Failed(error.to_string()))?;
+        // A writer's patch is the point of the call but not something the model
+        // needs to read in full — a large refactor would spend the context
+        // window on a diff nobody is going to review by eye. The patch itself
+        // stays whole in the artifact store, and `agent.apply` works from the
+        // agent's id, so bounding what is *shown* costs no capability.
+        if let Some(patch) = &result.patch
+            && patch.is_large()
+            && let Some(store) = &self.artifacts
+            && let Ok(hash) = store.put(patch.diff.as_bytes())
+        {
+            value["patch"]["diff"] = json!(format!(
+                "[{} bytes across {} file(s); read it with `read_artifact` {hash}]",
+                patch.diff.len(),
+                patch.files.len()
+            ));
+            value["patch"]["artifact"] = json!(hash);
+        }
+        Ok(value)
     }
 }
 
@@ -1187,6 +1223,145 @@ impl Tool for AgentControlTool {
                 }
                 Ok(json!({ "agent": id, "steps": steps, "total": total }))
             }
+        }
+    }
+}
+
+/// Merge a writing child's patch into the user's working tree (§6.4).
+///
+/// Separate from `agent.spawn` on purpose. A child finishing is not consent to
+/// change the user's files, so the patch waits until someone asks for it — and
+/// because this is a consequential action, the ask goes through the human gate
+/// with the diff on screen.
+struct AgentApply {
+    control: Arc<orchestrator::AgentControl>,
+}
+
+#[async_trait]
+impl Tool for AgentApply {
+    fn name(&self) -> &str {
+        "agent.apply"
+    }
+    fn icon(&self) -> &'static str {
+        "⚇"
+    }
+    fn description(&self) -> &str {
+        "Apply a writing agent's patch to the working tree, by its session id or name. Until you \
+         call this, the agent's work exists only as a diff and nothing in the workspace has \
+         changed.\n\
+         \n\
+         A patch whose verification failed is refused: it does not build, so it is a draft, not a \
+         fix. Read the failure and fix it, or re-run the agent. `force` overrides that and should \
+         be used only once you have established the failure was already there and is unrelated — \
+         never as a way past an error you have not read.\n\
+         \n\
+         If the agent's changes overlap edits made since it started, this reports a conflict and \
+         applies nothing — resolve it yourself rather than retrying. With no arguments it lists \
+         the patches still waiting."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        // It rewrites files the user owns. Reversible — the tree is a git repo
+        // by construction here — but never something to do unasked.
+        BlastRadius::ReversibleLocal
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Vcs
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "The writing agent's session id (or name). Omit to list the patches waiting to be applied."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Apply even though verification failed. Only after you have read the failure and established it is pre-existing and unrelated to this patch."
+                }
+            }
+        })
+    }
+    async fn preview(&self, args: &Value) -> Option<String> {
+        let id = args.get("agent").and_then(Value::as_str)?;
+        let patch = self.control.patch(id).await?;
+        // The gate shows the diff itself. Approving "apply agent-3's patch"
+        // without seeing what it does is not a decision, it is a formality.
+        let files = patch.files.join(", ");
+        let evidence = match &patch.verification {
+            Some(v) if v.passed => format!("verified: `{}` passed", v.command),
+            Some(v) => format!("NOT VERIFIED: `{}` failed", v.command),
+            None => "NOT VERIFIED: nothing was run against this patch".to_string(),
+        };
+        let body: String = patch.diff.lines().take(200).collect::<Vec<_>>().join("\n");
+        let elided = patch.diff.lines().count().saturating_sub(200);
+        Some(format!(
+            "apply {id}'s patch to {files}\n{evidence}\n\n{body}{}",
+            match elided {
+                0 => String::new(),
+                n => format!("\n… {n} more line(s)"),
+            }
+        ))
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let Some(id) = args.get("agent").and_then(Value::as_str) else {
+            let waiting: Vec<Value> = self
+                .control
+                .outstanding()
+                .await
+                .into_iter()
+                .map(|(agent, session, patch)| {
+                    json!({
+                        "agent": agent,
+                        "session": session,
+                        "files": patch.files,
+                        "verified": patch.verified(),
+                    })
+                })
+                .collect();
+            return Ok(json!({ "unmerged": waiting, "count": waiting.len() }));
+        };
+        let patch = self.control.patch(id).await.ok_or_else(|| {
+            ToolError::Failed(format!(
+                "no patch from '{id}' — it may have changed nothing, or been a read-only agent"
+            ))
+        })?;
+        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+        match self.control.merge(&patch, force).await {
+            Ok(check) => {
+                // Applied, so it is no longer outstanding. Leaving it listed
+                // would invite a second apply, which would either fail
+                // confusingly or double-apply.
+                self.control.forget(id).await;
+                Ok(json!({
+                    "applied": true,
+                    "files": patch.files,
+                    "merge": check,
+                    "verified": patch.verified(),
+                    "forced": force,
+                }))
+            }
+            // A patch that does not build does not merge (§6.4). The failure
+            // output travels with the refusal, so the next step is reading it
+            // rather than guessing or reaching for `force`.
+            Err(orchestrator::Error::Unverified(command)) => Err(ToolError::Failed(format!(
+                "{} — nothing was applied.\n\n{}",
+                orchestrator::Error::Unverified(command),
+                patch
+                    .verification
+                    .as_ref()
+                    .map(|evidence| evidence.output.clone())
+                    .unwrap_or_default()
+            ))),
+            // §6.4: conflicting patches go to reconciliation, never
+            // last-writer-wins. Nothing was applied, and saying so precisely is
+            // what stops the model from "fixing" it by force.
+            Err(error) => Err(ToolError::Failed(format!(
+                "{error} — nothing was applied. The files {} changed since this agent started; \
+                 read the patch and make the edits yourself, or re-run the agent from the \
+                 current state.",
+                patch.files.join(", ")
+            ))),
         }
     }
 }
@@ -1354,6 +1529,11 @@ impl ToolRegistry {
                 control: control.clone(),
                 action,
             }));
+        }
+        // Only where writers are possible. Offering a merge tool in a session
+        // that can never produce a patch is a tool that can only ever fail.
+        if control.can_write() {
+            self.register(Arc::new(AgentApply { control }));
         }
         self
     }
@@ -1528,6 +1708,52 @@ impl ToolRegistry {
         }));
         r.register(Arc::new(UpdatePlan));
         r
+    }
+
+    /// The same capabilities, rooted at a different workspace (§6.4).
+    ///
+    /// This is what makes writer isolation real rather than nominal. Every
+    /// file and shell tool binds its `WorkspaceSandbox` at registration, so a
+    /// child handed a worktree but the parent's registry would still resolve
+    /// every path against the parent's root — isolated in name, editing the
+    /// parent's files in fact, and nothing would say so until something was
+    /// overwritten.
+    ///
+    /// Sandbox-bound tools are rebuilt against `sandbox`; everything else —
+    /// MCP, skills, memory, session search, the agent tools — is carried over
+    /// as-is, because those are session services rather than workspace ones.
+    /// The result can only ever be a subset of this registry's tool names, so
+    /// rebasing cannot widen a child's capabilities.
+    pub fn rebase(&self, sandbox: Arc<WorkspaceSandbox>) -> Option<Self> {
+        // A registry with no workspace has nothing to rebase, and inventing an
+        // artifact store here would give the child a place to write that the
+        // parent cannot read.
+        let artifacts = self.artifacts.clone()?;
+        let mut fresh = Self::with_workspace(sandbox, artifacts);
+        // Re-registered rather than copied: the `lsp.*` tools hold a sandbox
+        // too, so carrying them over would reintroduce the parent's root
+        // through the back door. The manager itself is shared — it keys clients
+        // by project root, so the worktree gets its own without being told to.
+        if let Some(manager) = self.lsp.lock().ok().and_then(|slot| slot.clone()) {
+            fresh.register_lsp(manager);
+        }
+        fresh.mcp = self.mcp.clone();
+        // Shared handles, not clones of their contents: `/search` and the
+        // surface's asker must keep working for a child, and a snapshot would
+        // silently stop tracking the moment the user changed either.
+        fresh.search = Arc::clone(&self.search);
+        fresh.clarify = Arc::clone(&self.clarify);
+        fresh.agent_parent = Arc::clone(&self.agent_parent);
+        fresh.agent_session = Arc::clone(&self.agent_session);
+        for (name, tool) in &self.tools {
+            // Never overwrite: anything the fresh registry already built is
+            // bound to the new root, and the parent's version of that same
+            // name is bound to the old one.
+            if !fresh.tools.contains_key(name) {
+                fresh.tools.insert(name.clone(), Arc::clone(tool));
+            }
+        }
+        Some(fresh)
     }
 }
 

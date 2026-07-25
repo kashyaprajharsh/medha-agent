@@ -8,9 +8,12 @@
 //! [`NarrowedExecutor`], capacity is reserved before a spawn is published, and
 //! cancellation cascades from the parent's token.
 //!
-//! O1 children are read-only and depth-limited: writer isolation (§6.4) does not
-//! exist yet, so two children must not be able to touch one workspace.
+//! Children are read-only by default. A child that must modify code (O3) is
+//! given its own git worktree and returns a patch; §6.4 forbids two writers
+//! sharing one workspace, so a writer without isolation is refused outright
+//! rather than quietly downgraded to editing the parent's tree.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 mod narrow;
+pub mod worktree;
 pub use narrow::NarrowedExecutor;
+pub use worktree::{MergeCheck, Patch, Verification, Worktree, WorktreePool};
 
 /// Ceiling on children alive at once. Each child burns tokens independently, so
 /// this is a spend bound as much as a concurrency one.
@@ -46,6 +51,17 @@ pub enum Error {
     UnknownAgent(String),
     #[error("agent failed: {0}")]
     Failed(String),
+    #[error(
+        "a writing agent needs an isolated worktree, which is unavailable here: {0}. \
+         Delegate the investigation read-only and make the edits yourself."
+    )]
+    NoIsolation(String),
+    #[error(
+        "this patch does not build — `{0}` failed against it, so it was not applied. \
+         Read the failure and fix it, or re-run the agent; apply it unchanged only if \
+         you have established the failure is pre-existing and unrelated."
+    )]
+    Unverified(String),
 }
 
 /// What the parent asked a child to do. Built at spawn time — the objective and
@@ -64,6 +80,10 @@ pub struct AgentSpec {
     pub tools: Option<Vec<String>>,
     /// Turn ceiling for this child, clamped to the parent's remaining budget.
     pub max_turns: Option<u32>,
+    /// Whether this child may modify code (O3). A writer runs in its own git
+    /// worktree and hands back a patch; it never edits the parent's tree, and
+    /// if isolation cannot be arranged the spawn is refused.
+    pub write: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -98,6 +118,16 @@ pub struct AgentResult {
     /// result and the kernel's existing trust-flow escalation still applies —
     /// delegation cannot launder taint into a trusted-looking summary.
     pub trust: TrustLabel,
+    /// What a writer changed, as a diff against the commit it started from,
+    /// with whatever evidence it has that the change works. `None` for a
+    /// read-only child. Present but empty when a writer changed nothing —
+    /// which is a result, not a failure.
+    ///
+    /// This is deliberately not a prose account of the edits: a summary of a
+    /// change cannot be reviewed, verified or applied, and the merge gate needs
+    /// all three.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<Patch>,
 }
 
 /// One live child.
@@ -127,9 +157,46 @@ pub struct ChildRun {
     pub session: Ulid,
     pub spec: AgentSpec,
     /// Already narrowed — the runner must use exactly this, never the parent's.
+    /// For a writer it is also already *rooted at the worktree*.
     pub executor: Arc<dyn Executor>,
     pub max_turns: u32,
     pub cancel: CancellationToken,
+    /// A writer's isolated checkout. The runner must make this the child's cwd:
+    /// the executor is rooted here, and a child whose working directory still
+    /// points at the parent would resolve relative paths into the tree the
+    /// isolation exists to protect.
+    pub workspace: Option<std::path::PathBuf>,
+}
+
+/// An isolated checkout, together with the tools rooted at it.
+///
+/// Both halves have to come from one place. Handing a child a worktree but the
+/// parent's executor would isolate nothing — the tools would still resolve
+/// paths against the parent's root — and that failure is invisible until
+/// something is already overwritten.
+pub struct Workspace {
+    pub worktree: Worktree,
+    /// The parent's tools, rebased onto the worktree. Same capabilities, a
+    /// different root; never a wider set.
+    pub executor: Arc<dyn Executor>,
+}
+
+/// Supplies writer isolation. Implemented outside this crate, because building
+/// an executor over a new sandbox root needs the tool registry — which depends
+/// on this crate.
+#[async_trait::async_trait]
+pub trait Workspaces: Send + Sync {
+    /// Cut an isolated checkout for `session`, with tools rooted at it.
+    async fn checkout(&self, session: Ulid) -> Result<Workspace, String>;
+
+    /// Run the project's verification command inside `root`, if one is
+    /// configured. The orchestrator runs this itself rather than trusting the
+    /// child's account: "I ran the tests and they passed" is exactly the claim
+    /// a merge gate cannot afford to take on faith.
+    async fn verify(&self, root: &Path) -> Option<Verification>;
+
+    /// Where a patch merges back to — the repository root.
+    fn repo(&self) -> std::path::PathBuf;
 }
 
 /// Raw result of a child run, before it is bounded and labelled.
@@ -180,6 +247,23 @@ pub trait Outbox: Send + Sync {
     /// work — without this the caller is left guessing at a transcript that
     /// exists but is unreachable.
     async fn transcript(&self, child: Ulid) -> Vec<String>;
+
+    /// Persist a writer's patch against `parent`.
+    ///
+    /// The child's worktree is reaped as soon as the diff is taken, so this
+    /// record is the only surviving copy of the work. An in-memory registry
+    /// alone would mean a background writer finishing, the process exiting, and
+    /// the patch being silently lost while its report survived — the worst
+    /// shape of failure, because the transcript says the work was done.
+    async fn recorded(&self, parent: Ulid, agent: &str, child: Ulid, patch: &Patch);
+
+    /// Mark a patch merged. `pending → applied`, mirroring delivery, so a
+    /// restart does not offer already-applied work as outstanding.
+    async fn applied(&self, parent: Ulid, child: Ulid);
+
+    /// Patches owned by `parent` that have not been applied, oldest first, as
+    /// `(agent, child session, patch)`.
+    async fn unapplied(&self, parent: Ulid) -> Vec<(String, String, Patch)>;
 }
 
 /// A runner installed after construction. The kernel owns the executor that
@@ -220,9 +304,64 @@ pub struct AgentControl {
     cancel: CancellationToken,
     active: Roster,
     outbox: Option<Arc<dyn Outbox>>,
+    /// Writer isolation. `None` means writers are refused: without it a writing
+    /// child would edit the parent's tree, which is the one thing §6.4 exists
+    /// to prevent.
+    workspaces: Option<Arc<dyn Workspaces>>,
+    /// Patches from writers that have finished, so a merge can be asked for by
+    /// agent id instead of by pasting a diff back through the model — which
+    /// would put a whitespace-sensitive artifact through a lossy channel.
+    /// A cache over the log, not the record: [`Self::outstanding`] reads both.
+    patches: Patches,
+    /// The session that owns this tree, for addressing durable records. Filled
+    /// by the surface once the session id exists — the same deferred-handle
+    /// shape the parent executor uses, for the same reason.
+    owner: OwnerHandle,
+    /// Children that have finished, newest last and bounded. The live roster
+    /// drops an entry the moment its child settles, which is correct for "what
+    /// is running" and useless for "what happened" — §6.6 asks the TUI for both.
+    history: History,
     /// Owns every backgrounded child, so shutdown can wait for them instead of
     /// leaving detached tasks running (§2.1: no untracked `tokio::spawn`).
     tasks: tokio_util::task::TaskTracker,
+}
+
+/// Finished writers' patches, newest last, bounded. Shared with descendants so
+/// a patch can be applied from anywhere in the tree.
+type Patches = Arc<std::sync::Mutex<Vec<Delivered>>>;
+
+/// How many finished writers stay cached in memory. Not a bound on how many
+/// survive: the log is the record, and this is only the fast path.
+const MAX_RETAINED_PATCHES: usize = 16;
+
+/// How much finished-child history the panel keeps. Enough to answer "what did
+/// that agent do", short enough that the list stays readable.
+pub const MAX_HISTORY: usize = 32;
+
+/// Shared slot for the session that owns a tree of children.
+pub type OwnerHandle = Arc<std::sync::Mutex<Option<Ulid>>>;
+
+/// Settled children, shared across a tree so the panel sees one record.
+type History = Arc<std::sync::Mutex<Vec<Finished>>>;
+
+#[derive(Clone)]
+struct Delivered {
+    agent: String,
+    session: String,
+    patch: Patch,
+}
+
+/// A child that has settled, for the `/agents` panel.
+#[derive(Debug, Clone, Serialize)]
+pub struct Finished {
+    pub agent: String,
+    pub session: String,
+    pub objective: String,
+    pub status: AgentStatus,
+    pub duration_ms: u64,
+    /// Whether it left a patch — the difference between "done" and "waiting on
+    /// you", which the panel has to be able to show.
+    pub patched: bool,
 }
 
 /// The live roster. Critical sections are a push, a retain and a clone, none of
@@ -248,8 +387,49 @@ impl AgentControl {
             cancel,
             active: Arc::new(std::sync::Mutex::new(Vec::new())),
             outbox: None,
+            workspaces: None,
+            patches: Arc::new(std::sync::Mutex::new(Vec::new())),
+            owner: Arc::new(std::sync::Mutex::new(None)),
+            history: Arc::new(std::sync::Mutex::new(Vec::new())),
             tasks: tokio_util::task::TaskTracker::new(),
         }
+    }
+
+    /// Share the slot naming the session these children belong to.
+    ///
+    /// The handle, not its value: the session id does not exist yet when the
+    /// control plane is built, and a snapshot taken here would be `None`
+    /// forever — patches would then be written to no chain at all.
+    pub fn with_owner(mut self, owner: OwnerHandle) -> Self {
+        self.owner = owner;
+        self
+    }
+
+    fn owner(&self) -> Option<Ulid> {
+        self.owner.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// What a run borrows from this control plane. `owner` overrides the shared
+    /// handle for a background child, whose owner is fixed at dispatch.
+    fn shared(&self, owner: Option<Ulid>) -> Shared {
+        Shared {
+            runner: Arc::clone(&self.runner),
+            workspaces: self.workspaces.clone(),
+            outbox: self.outbox.clone(),
+            owner: owner.or_else(|| self.owner()),
+            patches: Arc::clone(&self.patches),
+            history: Arc::clone(&self.history),
+        }
+    }
+
+    /// Children that have finished, newest last. The live roster answers "what
+    /// is running"; this answers "what happened", which is a different question
+    /// and the one a user asks after the fact.
+    pub fn history(&self) -> Vec<Finished> {
+        self.history
+            .lock()
+            .map(|history| history.clone())
+            .unwrap_or_default()
     }
 
     pub fn with_limits(mut self, max_active: usize, max_depth: usize) -> Self {
@@ -268,6 +448,158 @@ impl AgentControl {
     pub fn with_outbox(mut self, outbox: Arc<dyn Outbox>) -> Self {
         self.outbox = Some(outbox);
         self
+    }
+
+    /// Enable writing children by supplying isolation. Without this every child
+    /// stays read-only — a writer is refused, never degraded.
+    pub fn with_workspaces(mut self, workspaces: Arc<dyn Workspaces>) -> Self {
+        self.workspaces = Some(workspaces);
+        self
+    }
+
+    /// Whether this session can run writing children at all, so a surface can
+    /// say why rather than only that it failed.
+    pub fn can_write(&self) -> bool {
+        self.workspaces.is_some()
+    }
+
+    /// Test a child's patch against the current tree without touching it, for
+    /// the merge preview.
+    pub async fn check(&self, patch: &Patch) -> Option<MergeCheck> {
+        let workspaces = self.workspaces.as_ref()?;
+        Some(worktree::check(&workspaces.repo(), patch).await)
+    }
+
+    /// Apply a child's patch to the parent's tree.
+    ///
+    /// Two gates, in order. **Verification** (§6.4: a patch that does not build
+    /// does not merge) — a patch whose verification *failed* is refused unless
+    /// `force`. A patch with no verification at all is allowed: `None` means the
+    /// project configured no verify command, and refusing on evidence the
+    /// project cannot produce would make delegation unusable rather than safe.
+    /// Then **conflict**, which `worktree::merge` refuses outright — never
+    /// last-writer-wins.
+    ///
+    /// The *caller* is still responsible for the human gate: merging delegated
+    /// work is a consequential action on files the user owns.
+    pub async fn merge(&self, patch: &Patch, force: bool) -> Result<MergeCheck, Error> {
+        let workspaces = self
+            .workspaces
+            .as_ref()
+            .ok_or_else(|| Error::NoIsolation("no repository is configured".into()))?;
+        if !force
+            && let Some(evidence) = &patch.verification
+            && !evidence.passed
+        {
+            return Err(Error::Unverified(evidence.command.clone()));
+        }
+        let outcome = worktree::merge(&workspaces.repo(), patch)
+            .await
+            .map_err(|error| Error::Failed(error.to_string()))?;
+        Ok(outcome)
+    }
+
+    /// A finished writer's patch, by session id or display name.
+    ///
+    /// Memory first, then the durable record — so a patch outlives the process
+    /// that produced it. Session id wins over name: it is the identity, and a
+    /// name can be reused across sessions.
+    pub async fn patch(&self, id: &str) -> Option<Patch> {
+        if let Some(found) = self.cached_patch(id) {
+            return Some(found);
+        }
+        let (outbox, owner) = (self.outbox.as_ref()?, self.owner()?);
+        outbox
+            .unapplied(owner)
+            .await
+            .into_iter()
+            .rev()
+            .find(|(agent, session, _)| session == id || agent == id)
+            .map(|(_, _, patch)| patch)
+    }
+
+    /// How many patches this process is holding. The render-pass counterpart to
+    /// [`Self::outstanding`]: a status bar redraws constantly and must not read
+    /// the log to do it.
+    pub fn cached_unmerged(&self) -> usize {
+        self.patches
+            .lock()
+            .map(|patches| patches.iter().filter(|e| !e.patch.is_empty()).count())
+            .unwrap_or(0)
+    }
+
+    /// Patches this process is holding, for a surface that must render before
+    /// it can await. Correct for everything produced in this session — the
+    /// durable [`Self::outstanding`] adds what survived a restart.
+    pub fn cached_unmerged_patches(&self) -> Vec<(String, String, Patch)> {
+        self.patches
+            .lock()
+            .map(|patches| {
+                patches
+                    .iter()
+                    .filter(|entry| !entry.patch.is_empty())
+                    .map(|entry| {
+                        (
+                            entry.agent.clone(),
+                            entry.session.clone(),
+                            entry.patch.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The in-memory fast path, for callers that cannot await — the TUI's
+    /// render pass among them.
+    pub fn cached_patch(&self, id: &str) -> Option<Patch> {
+        let patches = self.patches.lock().ok()?;
+        patches
+            .iter()
+            .rev()
+            .find(|entry| entry.session == id)
+            .or_else(|| patches.iter().rev().find(|entry| entry.agent == id))
+            .map(|entry| entry.patch.clone())
+    }
+
+    /// Patches still waiting to be applied, oldest first, from the durable
+    /// record so a restart does not hide finished work.
+    pub async fn outstanding(&self) -> Vec<(String, String, Patch)> {
+        let mut found: Vec<(String, String, Patch)> = match (&self.outbox, self.owner()) {
+            (Some(outbox), Some(owner)) => outbox.unapplied(owner).await,
+            _ => Vec::new(),
+        };
+        // Union with memory: a *foreground* writer's patch is recorded on the
+        // owner's chain too, but a control with no owner yet — or no outbox —
+        // still has to report what it holds.
+        if let Ok(patches) = self.patches.lock() {
+            for entry in patches.iter().filter(|entry| !entry.patch.is_empty()) {
+                if !found
+                    .iter()
+                    .any(|(_, session, _)| *session == entry.session)
+                {
+                    found.push((
+                        entry.agent.clone(),
+                        entry.session.clone(),
+                        entry.patch.clone(),
+                    ));
+                }
+            }
+        }
+        found
+    }
+
+    /// Close a patch out once it has been applied: dropped from memory and
+    /// marked in the log, so neither this process nor the next offers it again.
+    pub async fn forget(&self, session: &str) {
+        if let Ok(mut patches) = self.patches.lock() {
+            patches.retain(|entry| entry.session != session);
+        }
+        if let (Some(outbox), Some(owner), Ok(child)) =
+            (&self.outbox, self.owner(), session.parse())
+        {
+            outbox.applied(owner, child).await;
+        }
     }
 
     /// Currently running children, for the UI and `agent.list`.
@@ -333,7 +665,7 @@ impl AgentControl {
 
     /// Everything both spawn paths need before any work starts: the checks, a
     /// capacity permit, the narrowed executor and the roster entry.
-    fn admit(
+    async fn admit(
         &self,
         spec: &mut AgentSpec,
         parent_executor: Arc<dyn Executor>,
@@ -354,10 +686,49 @@ impl AgentControl {
         if spec.name.trim().is_empty() {
             spec.name = default_name(&spec.objective);
         }
-        // Read-only: writer isolation does not exist yet (§6.4), so a child that
-        // could mutate the workspace could corrupt its parent's.
-        let executor: Arc<dyn Executor> =
-            Arc::new(NarrowedExecutor::new(parent_executor, spec.tools.as_deref()).read_only());
+        let session = Ulid::new();
+        // The two paths differ only in *where* the child works and whether it
+        // keeps its mutating tools. A writer without a worktree is refused
+        // (§6.4) rather than degraded: silently running it read-only would fail
+        // its objective, and silently running it un-isolated would corrupt the
+        // parent's tree.
+        let (executor, workspace) = if spec.write {
+            let workspaces = self
+                .workspaces
+                .as_ref()
+                .ok_or_else(|| Error::NoIsolation("this session has no git repository".into()))?;
+            let Workspace { worktree, executor } = workspaces
+                .checkout(session)
+                .await
+                .map_err(Error::NoIsolation)?;
+            // Narrowed against the *parent's* names as well as the rebased
+            // executor's. The rebase is a re-registration of the same tools, so
+            // the sets already match — but "already match" is an assumption
+            // about another crate, and "cannot widen" is not something to hold
+            // by assumption.
+            let parent_tools: Vec<String> = parent_executor
+                .specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect();
+            let requested: Vec<String> = match spec.tools.as_deref() {
+                Some(asked) => asked
+                    .iter()
+                    .filter(|name| parent_tools.contains(name))
+                    .cloned()
+                    .collect(),
+                None => parent_tools,
+            };
+            let narrowed: Arc<dyn Executor> =
+                Arc::new(NarrowedExecutor::new(executor, Some(&requested)));
+            (narrowed, Some(worktree))
+        } else {
+            // Read-only children may share the parent's tree safely; that is
+            // precisely what makes them safe to run in parallel.
+            let narrowed: Arc<dyn Executor> =
+                Arc::new(NarrowedExecutor::new(parent_executor, spec.tools.as_deref()).read_only());
+            (narrowed, None)
+        };
         // A child's budget is a slice of what the parent has left, never more.
         let max_turns = spec
             .max_turns
@@ -365,7 +736,6 @@ impl AgentControl {
             .min(remaining_turns)
             .max(1);
 
-        let session = Ulid::new();
         // Per-child token, so cancelling one agent leaves its siblings alone;
         // it is a child of the tree's, so cancelling the tree still settles all.
         let cancel = self.cancel.child_token();
@@ -392,6 +762,7 @@ impl AgentControl {
             session,
             cancel,
             executor,
+            workspace,
             max_turns,
             permit,
             registration: Registration {
@@ -409,8 +780,10 @@ impl AgentControl {
         parent_executor: Arc<dyn Executor>,
         remaining_turns: u32,
     ) -> Result<AgentResult, Error> {
-        let admitted = self.admit(&mut spec, parent_executor, remaining_turns, false)?;
-        Ok(execute(Arc::clone(&self.runner), spec, admitted).await)
+        let admitted = self
+            .admit(&mut spec, parent_executor, remaining_turns, false)
+            .await?;
+        Ok(execute(self.shared(None), spec, admitted).await)
     }
 
     /// Dispatch a child that outlives this turn and return its handle at once.
@@ -428,7 +801,9 @@ impl AgentControl {
         // No durable delivery means no background: a result that cannot outlive
         // the process is not a background result, it is a lost one.
         let outbox = Arc::clone(self.outbox.as_ref().ok_or(Error::Unavailable)?);
-        let admitted = self.admit(&mut spec, parent_executor, remaining_turns, true)?;
+        let admitted = self
+            .admit(&mut spec, parent_executor, remaining_turns, true)
+            .await?;
         let handle = AgentHandle {
             agent: spec.name.clone(),
             session: admitted.session.to_string(),
@@ -444,9 +819,12 @@ impl AgentControl {
         };
         outbox.dispatched(&dispatch).await;
 
-        let runner = Arc::clone(&self.runner);
+        // The owner is the dispatching session as given, not the handle's
+        // current value: a background child can finish after the surface has
+        // moved on, and its patch belongs to whoever asked for it.
+        let shared = self.shared(Some(parent));
         self.tasks.spawn(async move {
-            let result = execute(runner, spec, admitted).await;
+            let result = execute(shared, spec, admitted).await;
             outbox.finished(&dispatch, &result).await;
         });
         Ok(handle)
@@ -480,6 +858,10 @@ impl AgentControl {
             cancel: self.cancel.child_token(),
             active: Arc::clone(&self.active),
             outbox: self.outbox.clone(),
+            workspaces: self.workspaces.clone(),
+            patches: Arc::clone(&self.patches),
+            owner: Arc::clone(&self.owner),
+            history: Arc::clone(&self.history),
             tasks: self.tasks.clone(),
         }
     }
@@ -492,24 +874,50 @@ fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A child cleared to run: capacity held, executor narrowed, roster entry made.
+/// A child cleared to run: capacity held, executor narrowed, roster entry made,
+/// and — for a writer — an isolated checkout leased.
 struct Admitted {
     session: Ulid,
     cancel: CancellationToken,
     executor: Arc<dyn Executor>,
+    /// A writer's checkout, held here so it is reaped on exactly one path
+    /// regardless of how the child ends.
+    workspace: Option<Worktree>,
     max_turns: u32,
     /// Held for the child's lifetime; dropping it frees a slot in the tree.
     permit: OwnedSemaphorePermit,
     registration: Registration,
 }
 
+/// The collaborators a run needs from its control plane. Bundled so foreground
+/// and background spawn hand over the same set — a signature they both spell out
+/// is one they can drift apart on.
+struct Shared {
+    runner: Arc<dyn ChildRunner>,
+    workspaces: Option<Arc<dyn Workspaces>>,
+    outbox: Option<Arc<dyn Outbox>>,
+    owner: Option<Ulid>,
+    patches: Patches,
+    history: History,
+}
+
 /// The one execution path, shared by foreground and background spawn so they
 /// cannot drift in how they cancel, time or bound a child.
-async fn execute(runner: Arc<dyn ChildRunner>, spec: AgentSpec, admitted: Admitted) -> AgentResult {
+async fn execute(shared: Shared, spec: AgentSpec, admitted: Admitted) -> AgentResult {
+    let Shared {
+        runner,
+        workspaces,
+        outbox,
+        owner,
+        patches,
+        history,
+    } = shared;
+    let objective = spec.objective.clone();
     let Admitted {
         session,
         cancel,
         executor,
+        workspace,
         max_turns,
         permit,
         registration,
@@ -521,6 +929,7 @@ async fn execute(runner: Arc<dyn ChildRunner>, spec: AgentSpec, admitted: Admitt
         executor,
         max_turns,
         cancel: cancel.clone(),
+        workspace: workspace.as_ref().map(|tree| tree.path().to_path_buf()),
     });
     // Race the run against the token. A cooperative runner honours it itself,
     // but one that ignores it must not outlive a cancellation, so dropping the
@@ -535,8 +944,33 @@ async fn execute(runner: Arc<dyn ChildRunner>, spec: AgentSpec, admitted: Admitt
     drop(registration);
     drop(permit);
 
+    // The patch is taken on *every* exit path, cancellation and failure
+    // included. A writer killed halfway has usually still changed something,
+    // and throwing that away is the same partial-output loss §6.5 forbids for
+    // summaries — only more expensive, because it was real work on real files.
+    let patch = match (&workspace, &workspaces) {
+        (Some(tree), Some(workspaces)) => {
+            let mut patch = tree.patch().await.unwrap_or_default();
+            // Verification runs here rather than being reported by the child:
+            // "I ran the tests and they passed" is exactly the claim a merge
+            // gate cannot take on faith. Skipped for an empty patch — there is
+            // nothing to verify, and a build is not free.
+            if !patch.is_empty() {
+                patch.verification = workspaces.verify(tree.path()).await;
+            }
+            Some(patch)
+        }
+        _ => None,
+    };
+    // Only now: the diff is out, so the checkout has nothing left to protect.
+    // Reaping before this would discard the child's work; not reaping at all
+    // wedges the next `git worktree add` on that path.
+    if let Some(tree) = &workspace {
+        tree.reap().await;
+    }
+
     let elapsed = started.elapsed();
-    match outcome {
+    let mut result = match outcome {
         Ok(outcome) => bound(spec.name, session, outcome, elapsed),
         // Partial-result preservation (§6.5): a cancelled or failed child still
         // reports, so the parent learns what happened rather than nothing.
@@ -555,7 +989,42 @@ async fn execute(runner: Arc<dyn ChildRunner>, spec: AgentSpec, admitted: Admitt
             },
             elapsed,
         ),
+    };
+    // Retained so the merge can be asked for by agent id. Round-tripping a diff
+    // back through the model to apply it would put a whitespace-exact artifact
+    // through a channel that does not preserve whitespace exactly.
+    if let Some(patch) = &patch
+        && !patch.is_empty()
+    {
+        if let Ok(mut patches) = patches.lock() {
+            patches.push(Delivered {
+                agent: result.agent.clone(),
+                session: result.session.clone(),
+                patch: patch.clone(),
+            });
+            let excess = patches.len().saturating_sub(MAX_RETAINED_PATCHES);
+            patches.drain(..excess);
+        }
+        // And durably. The worktree is already gone, so if this is the process
+        // that dies next, the log is the only place the work still exists.
+        if let (Some(outbox), Some(owner)) = (&outbox, owner) {
+            outbox.recorded(owner, &result.agent, session, patch).await;
+        }
     }
+    if let Ok(mut history) = history.lock() {
+        history.push(Finished {
+            agent: result.agent.clone(),
+            session: result.session.clone(),
+            objective,
+            status: result.status,
+            duration_ms: result.duration_ms,
+            patched: patch.as_ref().is_some_and(|patch| !patch.is_empty()),
+        });
+        let excess = history.len().saturating_sub(MAX_HISTORY);
+        history.drain(..excess);
+    }
+    result.patch = patch;
+    result
 }
 
 /// Keeps a child in the visible roster for exactly as long as it runs. A guard
@@ -592,6 +1061,7 @@ fn bound(name: String, session: Ulid, outcome: ChildOutcome, elapsed: Duration) 
         tool_calls: outcome.tool_calls,
         duration_ms: elapsed.as_millis() as u64,
         trust: outcome.trust,
+        patch: None,
     }
 }
 
@@ -874,6 +1344,17 @@ mod tests {
     #[derive(Default)]
     struct MemoryOutbox {
         rows: std::sync::Mutex<Vec<(Dispatch, Option<AgentResult>, bool)>>,
+        /// The durable patch record, with the same `recorded → applied` fold
+        /// the log implements.
+        patches: std::sync::Mutex<Vec<Recorded>>,
+    }
+
+    struct Recorded {
+        parent: Ulid,
+        agent: String,
+        child: String,
+        patch: Patch,
+        applied: bool,
     }
 
     #[async_trait]
@@ -908,6 +1389,35 @@ mod tests {
         }
         async fn transcript(&self, _child: Ulid) -> Vec<String> {
             Vec::new()
+        }
+        async fn recorded(&self, parent: Ulid, agent: &str, child: Ulid, patch: &Patch) {
+            self.patches.lock().unwrap().push(Recorded {
+                parent,
+                agent: agent.to_string(),
+                child: child.to_string(),
+                patch: patch.clone(),
+                applied: false,
+            });
+        }
+        async fn applied(&self, _parent: Ulid, child: Ulid) {
+            if let Some(row) = self
+                .patches
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row.child == child.to_string())
+            {
+                row.applied = true;
+            }
+        }
+        async fn unapplied(&self, parent: Ulid) -> Vec<(String, String, Patch)> {
+            self.patches
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.parent == parent && !row.applied)
+                .map(|row| (row.agent.clone(), row.child.clone(), row.patch.clone()))
+                .collect()
         }
         async fn undelivered(&self, parent: Ulid) -> Vec<AgentResult> {
             self.rows
@@ -1021,6 +1531,415 @@ mod tests {
         let still_running = control.active();
         assert!(still_running.iter().any(|run| run.agent != first.agent));
         control.shutdown().await;
+    }
+
+    // ── writer isolation (O3) ────────────────────────────────────────────────
+
+    /// A repository with one commit, plus a pool cutting worktrees outside it.
+    async fn writable() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let run = |args: Vec<&str>| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+        };
+        run(vec!["init", "--initial-branch=main"]);
+        run(vec!["config", "user.email", "t@example.com"]);
+        run(vec!["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "original\n").unwrap();
+        run(vec!["add", "."]);
+        run(vec!["commit", "-m", "base"]);
+        let state = tempfile::tempdir().unwrap();
+        (repo, state, root)
+    }
+
+    /// Isolation over a real repository. The executor is deliberately *not*
+    /// rebased here — this crate cannot build one — so the tests assert on
+    /// worktree lifecycle, patch return and the refusal path, and the rebasing
+    /// itself is covered where it lives, in the tool registry.
+    struct Isolation {
+        pool: WorktreePool,
+        repo: std::path::PathBuf,
+        verification: Option<Verification>,
+    }
+
+    #[async_trait]
+    impl Workspaces for Isolation {
+        async fn checkout(&self, session: Ulid) -> Result<Workspace, String> {
+            let worktree = self
+                .pool
+                .checkout(session)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Workspace {
+                worktree,
+                executor: Arc::new(Tools),
+            })
+        }
+        async fn verify(&self, _root: &Path) -> Option<Verification> {
+            self.verification.clone()
+        }
+        fn repo(&self) -> std::path::PathBuf {
+            self.repo.clone()
+        }
+    }
+
+    fn isolation(root: &Path, state: &tempfile::TempDir) -> Arc<Isolation> {
+        Arc::new(Isolation {
+            pool: WorktreePool::new(root, state.path().join("worktrees")),
+            repo: root.to_path_buf(),
+            verification: None,
+        })
+    }
+
+    fn writer(objective: &str) -> AgentSpec {
+        AgentSpec {
+            objective: objective.into(),
+            write: true,
+            ..Default::default()
+        }
+    }
+
+    /// Edits a file inside whatever workspace it was given, so the tests can
+    /// assert on where a writer's changes actually land.
+    struct Edits;
+
+    #[async_trait]
+    impl ChildRunner for Edits {
+        async fn run(&self, run: ChildRun) -> Result<ChildOutcome, String> {
+            let root = run.workspace.ok_or("no workspace")?;
+            std::fs::write(root.join("a.txt"), "rewritten by the child\n")
+                .map_err(|e| e.to_string())?;
+            std::fs::write(root.join("added.txt"), "new file\n").map_err(|e| e.to_string())?;
+            Ok(ChildOutcome {
+                status: AgentStatus::Completed,
+                summary: "edited".into(),
+                turns: 1,
+                tool_calls: 2,
+                trust: TrustLabel::Tool,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_without_isolation_is_refused_not_downgraded() {
+        let (_, control) = control();
+        // Running it read-only would fail the objective; running it un-isolated
+        // would corrupt the parent's tree. Neither is a safe default, so the
+        // spawn is refused and the model is told to make the edits itself.
+        assert!(matches!(
+            control
+                .spawn(writer("fix the bug"), Arc::new(Tools), 5)
+                .await,
+            Err(Error::NoIsolation(_))
+        ));
+        assert!(!control.can_write());
+    }
+
+    #[tokio::test]
+    async fn a_writer_edits_its_own_checkout_and_never_the_parents() {
+        let (_repo, state, root) = writable().await;
+        let control = AgentControl::new(Arc::new(Edits), CancellationToken::new())
+            .with_workspaces(isolation(&root, &state));
+
+        let result = control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        assert_eq!(result.status, AgentStatus::Completed);
+        // The parent's working tree is exactly as it was.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(!root.join("added.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_writer_returns_a_patch_rather_than_an_account_of_its_edits() {
+        let (_repo, state, root) = writable().await;
+        let control = AgentControl::new(Arc::new(Edits), CancellationToken::new())
+            .with_workspaces(isolation(&root, &state));
+
+        let result = control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        let patch = result.patch.expect("a writer reports a patch");
+        assert!(patch.diff.contains("rewritten by the child"));
+        assert!(patch.files.contains(&"a.txt".to_string()));
+        assert!(patch.files.contains(&"added.txt".to_string()));
+        // Which is reviewable *and* applicable — the point of a diff over prose.
+        assert_eq!(control.check(&patch).await, Some(MergeCheck::Clean));
+        control.merge(&patch, false).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "rewritten by the child\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_merged_until_someone_asks_for_it() {
+        let (_repo, state, root) = writable().await;
+        let control = AgentControl::new(Arc::new(Edits), CancellationToken::new())
+            .with_workspaces(isolation(&root, &state));
+
+        let result = control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        // Merging is a consequential action on the user's files. Finishing a
+        // child must never be what triggers it.
+        assert!(result.patch.is_some());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_patch_carries_the_verification_the_runtime_ran_itself() {
+        let (_repo, state, root) = writable().await;
+        let workspaces = Arc::new(Isolation {
+            pool: WorktreePool::new(&root, state.path().join("worktrees")),
+            repo: root.clone(),
+            verification: Some(Verification {
+                command: "cargo test".into(),
+                passed: false,
+                output: "2 failed".into(),
+            }),
+        });
+        let control = AgentControl::new(Arc::new(Edits), CancellationToken::new())
+            .with_workspaces(workspaces);
+
+        let result = control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        // The child said it succeeded; the build says otherwise, and the build
+        // is what the merge gate reads.
+        assert_eq!(result.status, AgentStatus::Completed);
+        let patch = result.patch.unwrap();
+        assert!(!patch.verified());
+        assert_eq!(patch.verification.unwrap().output, "2 failed");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_writer_still_hands_back_what_it_changed() {
+        let (_repo, state, root) = writable().await;
+        let control = AgentControl::new(Arc::new(Hangs), CancellationToken::new())
+            .with_outbox(Arc::new(MemoryOutbox::default()))
+            .with_workspaces(isolation(&root, &state));
+        let parent = Ulid::new();
+        control
+            .spawn_background(writer("never finishes"), Arc::new(Tools), 5, parent)
+            .await
+            .unwrap();
+        control.shutdown().await;
+
+        let reported = control.collect(parent).await;
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].status, AgentStatus::Cancelled);
+        // Empty here because `Hangs` never writes — but the patch was still
+        // taken, which is what keeps a killed writer's real work from being
+        // thrown away with its checkout.
+        assert!(reported[0].patch.as_ref().is_some_and(Patch::is_empty));
+    }
+
+    #[tokio::test]
+    async fn a_writers_checkout_does_not_outlive_it() {
+        let (_repo, state, root) = writable().await;
+        let worktrees = state.path().join("worktrees");
+        let control = AgentControl::new(Arc::new(Edits), CancellationToken::new()).with_workspaces(
+            Arc::new(Isolation {
+                pool: WorktreePool::new(&root, worktrees.clone()),
+                repo: root.clone(),
+                verification: None,
+            }),
+        );
+
+        control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        // An orphaned worktree wedges the next `git worktree add` on that path,
+        // so this is a correctness property, not tidiness.
+        let left: Vec<_> = std::fs::read_dir(&worktrees)
+            .map(|entries| entries.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "a checkout was left behind");
+    }
+
+    /// Isolation whose verifier reports whatever the test needs it to.
+    fn judged(
+        root: &Path,
+        state: &tempfile::TempDir,
+        verification: Option<Verification>,
+    ) -> Arc<Isolation> {
+        Arc::new(Isolation {
+            pool: WorktreePool::new(root, state.path().join("worktrees")),
+            repo: root.to_path_buf(),
+            verification,
+        })
+    }
+
+    fn failed_build() -> Option<Verification> {
+        Some(Verification {
+            command: "cargo test".into(),
+            passed: false,
+            output: "error[E0308]: mismatched types".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_patch_that_does_not_build_does_not_merge() {
+        let (_repo, state, root) = writable().await;
+        let control = AgentControl::new(Arc::new(Edits), CancellationToken::new())
+            .with_workspaces(judged(&root, &state, failed_build()));
+        let result = control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        let patch = result.patch.unwrap();
+
+        // §6.4. The child said it succeeded and the diff applies cleanly — the
+        // only thing standing between a broken change and the user's tree is
+        // this refusal.
+        assert_eq!(control.check(&patch).await, Some(MergeCheck::Clean));
+        assert!(matches!(
+            control.merge(&patch, false).await,
+            Err(Error::Unverified(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_patch_can_still_be_forced_deliberately() {
+        let (_repo, state, root) = writable().await;
+        let control = AgentControl::new(Arc::new(Edits), CancellationToken::new())
+            .with_workspaces(judged(&root, &state, failed_build()));
+        let patch = control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap()
+            .patch
+            .unwrap();
+
+        // A pre-existing unrelated build failure must not make delegation
+        // permanently unusable — but getting past it has to be an explicit act.
+        control.merge(&patch, true).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "rewritten by the child\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_with_no_verifier_is_not_blocked_by_the_gate() {
+        let (_repo, state, root) = writable().await;
+        let control = AgentControl::new(Arc::new(Edits), CancellationToken::new())
+            .with_workspaces(judged(&root, &state, None));
+        let patch = control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap()
+            .patch
+            .unwrap();
+
+        // No verification is not failed verification. Refusing on evidence the
+        // project cannot produce would make writers useless rather than safe.
+        assert!(!patch.verified());
+        control.merge(&patch, false).await.unwrap();
+    }
+
+    /// A control sharing one outbox and owner with another — what a restart
+    /// looks like from the patch registry's point of view.
+    fn restarted(
+        outbox: Arc<MemoryOutbox>,
+        owner: OwnerHandle,
+        workspaces: Arc<Isolation>,
+    ) -> AgentControl {
+        AgentControl::new(Arc::new(Edits), CancellationToken::new())
+            .with_outbox(outbox)
+            .with_owner(owner)
+            .with_workspaces(workspaces)
+    }
+
+    #[tokio::test]
+    async fn a_patch_outlives_the_process_that_produced_it() {
+        let (_repo, state, root) = writable().await;
+        let outbox = Arc::new(MemoryOutbox::default());
+        let owner: OwnerHandle = Arc::new(std::sync::Mutex::new(Some(Ulid::new())));
+        let control = restarted(
+            outbox.clone(),
+            Arc::clone(&owner),
+            judged(&root, &state, None),
+        );
+        let session = control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap()
+            .session;
+
+        // A fresh control plane: same log, no in-memory registry. The worktree
+        // is long gone, so if the patch is not in the record it is not anywhere.
+        let after = restarted(
+            outbox.clone(),
+            Arc::clone(&owner),
+            judged(&root, &state, None),
+        );
+        assert!(after.cached_patch(&session).is_none());
+        let recovered = after.patch(&session).await.expect("patch survived");
+        assert!(recovered.diff.contains("rewritten by the child"));
+        assert_eq!(after.outstanding().await.len(), 1);
+
+        after.merge(&recovered, false).await.unwrap();
+        after.forget(&session).await;
+        // And once applied it stays applied — a later run must not offer it
+        // again, or the same patch lands twice.
+        let later = restarted(outbox, owner, judged(&root, &state, None));
+        assert!(later.outstanding().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finished_children_stay_visible_after_they_leave_the_roster() {
+        let (_repo, state, root) = writable().await;
+        let control = AgentControl::new(Arc::new(Edits), CancellationToken::new())
+            .with_workspaces(judged(&root, &state, None));
+        control
+            .spawn(writer("rewrite a.txt"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+
+        // The roster is empty the instant a child settles — correct for "what
+        // is running", useless for "what happened" (§6.6 asks for both).
+        assert!(control.active().is_empty());
+        let history = control.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, AgentStatus::Completed);
+        assert!(history[0].patched);
+        assert_eq!(history[0].objective, "rewrite a.txt");
+    }
+
+    #[tokio::test]
+    async fn a_failed_child_is_recorded_not_forgotten() {
+        let (_, control) = control();
+        let control = AgentControl::new(Arc::new(Hangs), control.cancel.clone());
+        control.cancel.cancel();
+        control
+            .spawn(spec("will be cancelled"), Arc::new(Tools), 5)
+            .await
+            .unwrap();
+        let history = control.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, AgentStatus::Cancelled);
+        assert!(!history[0].patched);
     }
 
     #[test]

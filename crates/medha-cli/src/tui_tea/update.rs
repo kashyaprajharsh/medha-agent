@@ -51,20 +51,41 @@ pub(super) fn update<P, L>(
                 // Background children only: a foreground result is returned
                 // inline, so announcing one would be both redundant and wrong —
                 // it would promise a report later that has already arrived.
-                let finished: Vec<String> = model
+                let finished: Vec<(String, String)> = model
                     .agent_runs
                     .iter()
                     .filter(|previous| {
                         previous.background
                             && !running.iter().any(|run| run.session == previous.session)
                     })
-                    .map(|previous| previous.agent.clone())
+                    .map(|previous| (previous.agent.clone(), previous.session.clone()))
                     .collect();
                 model.agent_runs = running;
-                for agent in finished {
-                    model.push_notice(format!(
-                        "⚇ agent '{agent}' finished — its report arrives with your next message"
-                    ));
+                for (agent, session) in finished {
+                    // A writer that produced a patch is not just "finished" —
+                    // there is something waiting on the user, and saying only
+                    // that a report is coming would bury it. The cached lookup
+                    // is deliberate: this runs on the UI thread, and the patch
+                    // was written by this process moments ago.
+                    let patch = model
+                        .agents
+                        .as_ref()
+                        .and_then(|control| control.cached_patch(&session));
+                    match patch {
+                        Some(patch) if !patch.is_empty() => model.push_notice(format!(
+                            "⎇ agent '{agent}' finished with a patch to {} file(s), {} — \
+                             review it with /agents",
+                            patch.files.len(),
+                            match patch.verification.as_ref().map(|e| e.passed) {
+                                Some(true) => "verified",
+                                Some(false) => "BUILD FAILED",
+                                None => "not verified",
+                            }
+                        )),
+                        _ => model.push_notice(format!(
+                            "⚇ agent '{agent}' finished — its report arrives with your next message"
+                        )),
+                    }
                 }
             }
         }
@@ -956,15 +977,54 @@ pub(super) fn handle_key<P, L>(
                 }
                 return;
             }
-            // `d` stops the selected sub-agent.
+            // `d` stops the selected sub-agent. Only a running one — a finished
+            // writer's patch is not something you can cancel.
             KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Agents(_)) => {
-                let session = if let PickerKind::Agents(runs) = &picker.kind {
-                    runs.get(picker.selected).map(|run| run.session.clone())
-                } else {
-                    None
+                let session = match &picker.kind {
+                    PickerKind::Agents(rows) => match rows.get(picker.selected) {
+                        Some(AgentRow::Running(run)) => Some(run.session.clone()),
+                        _ => None,
+                    },
+                    _ => None,
                 };
-                if let Some(session) = session {
-                    agents_stop(model, &session);
+                match session {
+                    Some(session) => agents_stop(model, &session, tx),
+                    None => model.push_notice("that agent has already finished"),
+                }
+                return;
+            }
+            // `a` applies the selected patch; `A` applies one whose build
+            // failed. Two keys rather than a prompt, so the override is a
+            // deliberate act and never a reflex Enter on a confirmation.
+            KeyCode::Char(key @ ('a' | 'A')) if matches!(&picker.kind, PickerKind::Agents(_)) => {
+                let session = match &picker.kind {
+                    PickerKind::Agents(rows) => match rows.get(picker.selected) {
+                        Some(AgentRow::Patch { session, .. }) => Some(session.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match session {
+                    Some(session) => agents_apply_patch(model, &session, key == 'A', tx),
+                    None => model.push_notice("that row has no patch to apply"),
+                }
+                return;
+            }
+            // Enter on a patch row shows the diff, so applying is never a blind
+            // choice between two words on a row.
+            KeyCode::Enter | KeyCode::Right if matches!(&picker.kind, PickerKind::Agents(_)) => {
+                let session = match &picker.kind {
+                    PickerKind::Agents(rows) => match rows.get(picker.selected) {
+                        Some(AgentRow::Patch { session, .. }) => Some(session.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match session {
+                    Some(session) => agents_view_patch(model, &session, tx),
+                    // Running agents have no diff yet; closing is the only
+                    // sensible thing Enter can mean on one.
+                    None => model.picker = None,
                 }
                 return;
             }
@@ -2089,6 +2149,24 @@ pub(super) fn handle_agent_event(
             };
             model.upsert_notice("LSP", text);
         }
+        // The durable read finished. Only applied if the panel is still the one
+        // that asked — the user may have moved on, and replacing a picker they
+        // opened since would yank the list out from under them.
+        TuiEvent::AgentRows(rows) => {
+            if let Some(picker) = model.picker.as_mut()
+                && matches!(picker.kind, PickerKind::Agents(_))
+            {
+                // Keep the cursor where the user put it, clamped to the new
+                // list — a refresh that jumps the selection back to the top can
+                // turn a considered `a` into one on the wrong row.
+                picker.selected = picker.selected.min(rows.len().saturating_sub(1));
+                picker.kind = PickerKind::Agents(rows);
+                model.dirty = true;
+            }
+        }
+        TuiEvent::AgentPatchAction(outcome) => match outcome {
+            Ok(text) | Err(text) => model.push_notice(text),
+        },
         TuiEvent::McpStatus(result) => {
             let text = match result {
                 Err(error) => format!("MCP: {error}"),
@@ -2588,7 +2666,7 @@ fn dispatch_slash<P, L>(
         SlashAction::Clear => do_clear(model, session, transcript),
         SlashAction::Lsp => show_lsp_status(kernel, tx),
         SlashAction::Mcp => open_mcp_picker(model),
-        SlashAction::Agents => open_agents_picker(model),
+        SlashAction::Agents => open_agents_picker(model, tx),
         SlashAction::McpStart(id) => start_mcp_server(kernel, &id, tx),
         SlashAction::McpAdd(args) => mcp_add(model, &args, tx),
         SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
@@ -2809,18 +2887,167 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
 /// `/agents` — what Medha has delegated and is still waiting on. A child's work
 /// never enters the transcript, so without this the only sign one exists is a
 /// name in the status bar.
-fn open_agents_picker(model: &mut Model) {
-    let runs = model
-        .agents
-        .as_ref()
-        .map(|control| control.active())
-        .unwrap_or_default();
-    model.picker = Some(Picker::new(PickerKind::Agents(runs)));
+/// Open the panel on what this process knows, then refresh from the durable
+/// record.
+///
+/// Two steps because the panel must appear on the keystroke: outstanding
+/// patches live in the event log so they outlive the process that made them,
+/// and reading the log is not something a key handler may block on. The
+/// cached view is correct for everything produced in this session, which is the
+/// common case; the refresh adds what survived a restart.
+fn open_agents_picker(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let Some(control) = model.agents.clone() else {
+        model.picker = Some(Picker::new(PickerKind::Agents(Vec::new())));
+        return;
+    };
+    model.picker = Some(Picker::new(PickerKind::Agents(agent_rows(
+        &control,
+        control.cached_unmerged_patches(),
+    ))));
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let outstanding = control.outstanding().await;
+        let _ = tx.send(TuiEvent::AgentRows(agent_rows(&control, outstanding)));
+    });
+}
+
+/// Assemble the panel: running first, then patches, then history. Reading down
+/// the list goes from "act now" to "waiting on you" to "for reference".
+fn agent_rows(
+    control: &orchestrator::AgentControl,
+    outstanding: Vec<(String, String, orchestrator::Patch)>,
+) -> Vec<AgentRow> {
+    let mut rows: Vec<AgentRow> = control
+        .active()
+        .into_iter()
+        .map(AgentRow::Running)
+        .collect();
+    let waiting: Vec<String> = outstanding
+        .iter()
+        .map(|(_, session, _)| session.clone())
+        .collect();
+    for (agent, session, patch) in outstanding {
+        rows.push(AgentRow::Patch {
+            agent,
+            session,
+            files: patch.files.len(),
+            verified: patch.verification.as_ref().map(|evidence| evidence.passed),
+        });
+    }
+    rows.extend(
+        control
+            .history()
+            .into_iter()
+            .rev()
+            // A finished writer whose patch is still waiting is already above
+            // as a patch row; listing it twice would read as two separate
+            // pieces of work.
+            .filter(|done| !waiting.contains(&done.session))
+            .map(AgentRow::Done),
+    );
+    rows
+}
+
+/// Show a writer's patch in the transcript.
+///
+/// Applying without reading is the failure this panel exists to prevent, so
+/// viewing is one keystroke and never requires asking the model to fetch it.
+fn agents_view_patch(model: &mut Model, session: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let Some(control) = model.agents.clone() else {
+        return;
+    };
+    model.picker = None;
+    let (session, tx) = (session.to_string(), tx.clone());
+    tokio::spawn(async move {
+        let Some(patch) = control.patch(&session).await else {
+            let _ = tx.send(TuiEvent::AgentPatchAction(Err(
+                "that patch is no longer available".into(),
+            )));
+            return;
+        };
+        let evidence = match &patch.verification {
+            Some(v) if v.passed => format!("`{}` passed", v.command),
+            Some(v) => format!("`{}` FAILED\n{}", v.command, v.output),
+            None => "nothing was run against this patch".to_string(),
+        };
+        // Bounded: a large refactor's diff would otherwise push the
+        // conversation out of the scrollback it is meant to sit beside.
+        const MAX_LINES: usize = 400;
+        let total = patch.diff.lines().count();
+        let body: String = patch
+            .diff
+            .lines()
+            .take(MAX_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = tx.send(TuiEvent::AgentPatchAction(Ok(format!(
+            "patch from '{session}' — {evidence}\n\n{body}{}",
+            match total.saturating_sub(MAX_LINES) {
+                0 => String::new(),
+                n => format!("\n… {n} more line(s)"),
+            }
+        ))));
+    });
+}
+
+/// Apply a writer's patch by hand. The user pressing `a` *is* the human gate —
+/// this is not the model deciding to change the user's files.
+///
+/// `force` comes from `A` (shift), and only bypasses the verification refusal.
+/// A conflict is never forceable from here: §6.4 sends conflicting patches to
+/// reconciliation, and no keystroke should be able to override that.
+fn agents_apply_patch(
+    model: &mut Model,
+    session: &str,
+    force: bool,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    let Some(control) = model.agents.clone() else {
+        return;
+    };
+    let (session, tx) = (session.to_string(), tx.clone());
+    // Off the UI thread: applying runs git, and a keystroke handler that waits
+    // on a subprocess freezes the interface at best.
+    tokio::spawn(async move {
+        let Some(patch) = control.patch(&session).await else {
+            let _ = tx.send(TuiEvent::AgentPatchAction(Err(
+                "that patch is no longer available".into(),
+            )));
+            return;
+        };
+        let files = patch.files.join(", ");
+        let outcome = match control.merge(&patch, force).await {
+            Ok(_) => {
+                control.forget(&session).await;
+                let caveat = match (patch.verification.is_some(), force) {
+                    (_, true) => " — applied over a failing build",
+                    (false, _) => " — nothing was run against this patch",
+                    (true, _) => "",
+                };
+                Ok(format!("applied {files}{caveat}"))
+            }
+            // The refusal is the feature, so it says what to do next rather
+            // than only what went wrong.
+            Err(orchestrator::Error::Unverified(command)) => Err(format!(
+                "not applied — `{command}` fails against this patch. Enter to read the \
+                 failure, or shift+A to apply anyway."
+            )),
+            // §6.4: never last-writer-wins. Nothing was applied, and the
+            // message says so plainly rather than leaving the user to check.
+            Err(error) => Err(format!("nothing applied — {error}")),
+        };
+        let _ = tx.send(TuiEvent::AgentPatchAction(outcome));
+        // Refresh the panel from the record, so an applied patch leaves it.
+        let _ = tx.send(TuiEvent::AgentRows(agent_rows(
+            &control,
+            control.outstanding().await,
+        )));
+    });
 }
 
 /// Stop one agent by hand. `agent.cancel` gives the model this; the user needs
 /// it too, and for the same reason — work that is no longer worth paying for.
-fn agents_stop(model: &mut Model, session: &str) {
+fn agents_stop(model: &mut Model, session: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let Some(control) = model.agents.clone() else {
         return;
     };
@@ -2832,7 +3059,7 @@ fn agents_stop(model: &mut Model, session: &str) {
         )),
         None => model.push_notice("that agent already finished"),
     }
-    open_agents_picker(model);
+    open_agents_picker(model, tx);
 }
 
 /// Which language servers this machine can actually run, and what to do about

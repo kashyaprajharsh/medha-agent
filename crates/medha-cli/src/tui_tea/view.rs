@@ -1288,6 +1288,25 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // Patches a writing child produced and nobody has applied. Unlike a running
+    // agent this waits indefinitely and costs nothing to ignore, which is
+    // exactly why it needs saying — the work is done and sitting there.
+    // The cached count, not the durable one: this runs every frame, and a log
+    // read per frame would be absurd. A patch from a previous process shows up
+    // in `/agents`, which is where acting on one happens anyway.
+    let unmerged = model
+        .agents
+        .as_ref()
+        .map(|control| control.cached_unmerged())
+        .unwrap_or(0);
+    if unmerged > 0 {
+        left.push(Span::styled(
+            format!("  ⎇ {unmerged} patch(es) — /agents"),
+            Style::default()
+                .fg(theme::warn())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some((message, until)) = &model.clipboard_status
         && *until > Instant::now()
     {

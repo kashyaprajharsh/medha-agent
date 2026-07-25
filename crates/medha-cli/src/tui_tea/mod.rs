@@ -278,7 +278,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "/mcp",
         "MCP servers — manage · connect · remove · add  ·  /mcp start <id> to connect",
     ),
-    ("/agents", "sub-agents running now · d stops one"),
+    (
+        "/agents",
+        "what Medha delegated — running · patches · finished  ·  d stop · Enter view · a apply",
+    ),
     (
         "/memory",
         "list memories · /memory <name> jumps to provenance",
@@ -440,6 +443,13 @@ pub(crate) enum TuiEvent {
     Error(String),
     /// `/lsp` completed querying the registered LSP status tool.
     LspStatus(Result<serde_json::Value, String>),
+    /// The `/agents` panel's rows, resolved off the UI thread. Patches live in
+    /// the event log so they survive a restart, and reading the log is not
+    /// something a keystroke handler may block on.
+    AgentRows(Vec<AgentRow>),
+    /// A patch was viewed or applied. `Err` carries the refusal — an unverified
+    /// patch or a conflict — which is the outcome that matters most.
+    AgentPatchAction(Result<String, String>),
     McpStatus(Result<serde_json::Value, String>),
     /// A remote MCP server's browser sign-in is waiting on this URL.
     McpAuthUrl {
@@ -1072,9 +1082,9 @@ enum PickerKind {
         id: String,
         tools: Vec<(String, bool)>,
     },
-    /// `/agents`: the sub-agents running right now. `d` stops one; the work it
-    /// had already done is still reported.
-    Agents(Vec<orchestrator::AgentHandle>),
+    /// `/agents`: what has been delegated. `d` stops a running child; `a`
+    /// applies a finished writer's patch.
+    Agents(Vec<AgentRow>),
     /// How to authenticate a remote MCP server the probe could not classify.
     /// Only shown when the server is ambiguous — a server advertising OAuth
     /// signs in without asking.
@@ -1082,6 +1092,31 @@ enum PickerKind {
         id: String,
         url: String,
     },
+}
+
+/// One row of the `/agents` panel.
+///
+/// Running children and finished writers share a list because they are one
+/// question — "what did Medha delegate, and what is outstanding?" A patch that
+/// nobody applied is unfinished delegated work just as much as a child still
+/// thinking, and splitting them into two panels would hide the one that costs
+/// something to forget.
+#[derive(Debug, Clone)]
+pub(super) enum AgentRow {
+    Running(orchestrator::AgentHandle),
+    /// A writer's patch, waiting for the user to accept or ignore it.
+    Patch {
+        agent: String,
+        session: String,
+        files: usize,
+        /// `None` when the project has no verify command — which is not the
+        /// same as a patch that failed, and must not be shown as if it were.
+        verified: Option<bool>,
+    },
+    /// A child that has settled. §6.6 asks for completed and failed children,
+    /// not only active ones: the roster drops an entry the instant its child
+    /// finishes, so without this a run that ended badly leaves no trace here.
+    Done(orchestrator::Finished),
 }
 
 /// Rows of [`PickerKind::McpAuth`], in order.
@@ -1210,10 +1245,37 @@ impl PickerKind {
                     tools.len()
                 )
             }
-            PickerKind::Agents(runs) => match runs.len() {
-                0 => " agents — none running · Esc close ".into(),
-                n => format!(" {n} agent(s) running — ↑↓ select · d stop · Esc close "),
-            },
+            PickerKind::Agents(rows) => {
+                let running = rows
+                    .iter()
+                    .filter(|row| matches!(row, AgentRow::Running(_)))
+                    .count();
+                let patches = rows
+                    .iter()
+                    .filter(|row| matches!(row, AgentRow::Patch { .. }))
+                    .count();
+                let done = rows.len() - running - patches;
+                if rows.is_empty() {
+                    return " agents — nothing delegated · Esc close ".into();
+                }
+                let mut parts = Vec::new();
+                if running > 0 {
+                    parts.push(format!("{running} running"));
+                }
+                if patches > 0 {
+                    parts.push(format!("{patches} patch(es) waiting"));
+                }
+                if done > 0 {
+                    parts.push(format!("{done} finished"));
+                }
+                let keys = match (running > 0, patches > 0) {
+                    (true, true) => "d stop · Enter view · a apply",
+                    (true, false) => "d stop",
+                    (false, true) => "Enter view · a apply",
+                    (false, false) => "Esc close",
+                };
+                format!(" {} — {keys} · Esc close ", parts.join(" · "))
+            }
             PickerKind::McpAuth { id, .. } => {
                 format!(" {id} needs credentials — ↑↓ select · Enter · Esc cancel ")
             }
@@ -1408,16 +1470,50 @@ impl PickerKind {
                     )
                 }))
                 .collect(),
-            PickerKind::Agents(runs) if runs.is_empty() => {
-                vec!["no sub-agents running".to_string()]
+            PickerKind::Agents(rows) if rows.is_empty() => {
+                vec!["no sub-agents running, no patches waiting".to_string()]
             }
-            PickerKind::Agents(runs) => runs
+            PickerKind::Agents(rows) => rows
                 .iter()
-                .map(|run| {
+                .map(|row| match row {
                     // The objective is what distinguishes two agents at a glance;
                     // the name is a label and the session id is unreadable.
-                    let objective: String = run.objective.chars().take(64).collect();
-                    format!("⚇ {}   {objective}", run.agent)
+                    AgentRow::Running(run) => {
+                        let objective: String = run.objective.chars().take(64).collect();
+                        format!("⚇ {}   {objective}", run.agent)
+                    }
+                    // Verification status is on the row, not one level down: a
+                    // patch that failed its build is a draft, and that is
+                    // exactly the thing a user should not have to go looking
+                    // for before applying.
+                    AgentRow::Patch {
+                        agent,
+                        files,
+                        verified,
+                        ..
+                    } => format!(
+                        "⎇ {agent}   {files} file(s) · {}",
+                        match verified {
+                            Some(true) => "verified",
+                            Some(false) => "BUILD FAILED",
+                            None => "not verified",
+                        }
+                    ),
+                    AgentRow::Done(done) => format!(
+                        "{} {}   {}{}",
+                        match done.status {
+                            orchestrator::AgentStatus::Completed => "✓",
+                            orchestrator::AgentStatus::Exhausted => "◐",
+                            orchestrator::AgentStatus::Cancelled => "⊘",
+                            orchestrator::AgentStatus::Failed => "✗",
+                        },
+                        done.agent,
+                        done.objective.chars().take(52).collect::<String>(),
+                        match done.duration_ms {
+                            0 => String::new(),
+                            ms => format!("  ({}s)", ms / 1000),
+                        }
+                    ),
                 })
                 .collect(),
             PickerKind::McpTools { tools, .. } => tools

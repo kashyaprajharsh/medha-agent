@@ -1061,6 +1061,17 @@ async fn main() -> Result<()> {
     }
     let exec_backend = sandbox::select_backend(&sbx_cfg, extra_writable);
 
+    // Kept so a writing sub-agent's sandbox can be rebuilt at its own worktree
+    // root with exactly these settings — same permissions, same audit log, same
+    // execution backend. Anything reconstructed by hand would drift.
+    let sandbox_template = agents::SandboxTemplate {
+        trust: trust_path.clone(),
+        audit: audit_path.clone(),
+        gate: gate.clone(),
+        exec: Arc::clone(&exec_backend),
+        snapshots: state.join("snapshots"),
+        readable: vec![config::user_skills_dir()?],
+    };
     let workspace = Arc::new(
         WorkspaceSandbox::new(cwd.clone(), trust_path, audit_path, Some(gate.clone()))?
             .with_exec_backend(exec_backend)
@@ -1240,27 +1251,68 @@ async fn main() -> Result<()> {
     if let Ok(mut slot) = registry.clarify_handle().lock() {
         *slot = Some(asker);
     }
-    // Sub-agents (Stage 3, O1). The control plane must exist before the kernel,
-    // because the kernel owns the registry that hosts `agent.spawn`; the runner
-    // and the parent executor are installed once the kernel is built.
+    // Deterministic verifier (§4.7): medha.lock's [verify] command, overridden
+    // by MEDHA_VERIFY="cargo check" if set. Empty/absent = no verifier. Resolved
+    // here rather than with the kernel's verifier because a writing sub-agent
+    // runs the same command inside its own checkout — one source of truth for
+    // "does this build", whether the edit was made here or delegated.
+    let verify_cmd = std::env::var("MEDHA_VERIFY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or(lock.verify.command.clone());
+
+    // Sub-agents (Stage 3). The control plane must exist before the kernel,
+    // because the kernel owns the registry that hosts `agent.spawn`; the runner,
+    // the parent executor and the registry children rebase from are installed
+    // once the kernel is built.
     let agent_runner = Arc::new(orchestrator::DeferredRunner::default());
+    let agent_registry = agents::WorktreeWorkspaces::registry_handle();
+    // Writer isolation (O3). `None` outside a git repository — writers are then
+    // refused rather than silently allowed to edit the user's tree. Checkouts
+    // live in Medha's state dir: one inside the repo would show up in the
+    // user's own status, greps and builds.
+    let agent_workspaces = if lock.agents.enabled && lock.agents.write {
+        agents::WorktreeWorkspaces::discover(
+            &cwd,
+            state.join("worktrees"),
+            Arc::clone(&agent_registry),
+            sandbox_template,
+            verify_cmd.clone(),
+        )
+        .await
+        .map(|workspaces| Arc::new(workspaces) as Arc<dyn orchestrator::Workspaces>)
+    } else {
+        None
+    };
     let agent_control = lock.agents.enabled.then(|| {
-        let control = Arc::new(
-            orchestrator::AgentControl::new(
-                agent_runner.clone(),
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .with_limits(lock.agents.max_active, lock.agents.max_depth)
-            // Delivery rides the event log, so a background report survives a
-            // restart and reaches the session that dispatched it.
-            .with_outbox(Arc::new(agents::LogOutbox::new(log.clone()))),
-        );
+        let mut control = orchestrator::AgentControl::new(
+            agent_runner.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_limits(lock.agents.max_active, lock.agents.max_depth)
+        // Delivery rides the event log, so a background report survives a
+        // restart and reaches the session that dispatched it.
+        .with_outbox(Arc::new(agents::LogOutbox::new(log.clone())))
+        // Durable patch records live on the owning session's chain, so the
+        // control plane shares the same session slot the agent tools use —
+        // filled once the session id exists.
+        .with_owner(registry.agent_session_handle());
+        if let Some(workspaces) = agent_workspaces {
+            control = control.with_workspaces(workspaces);
+        }
+        let control = Arc::new(control);
         registry.register_agents(control.clone(), lock.agents.max_turns);
         control
     });
     let agent_parent = registry.agent_parent_handle();
     let agent_session = registry.agent_session_handle();
     let executor = Arc::new(registry);
+    // The concrete registry, kept for rebasing a writer's tools onto its
+    // worktree. `agent_parent` cannot serve: it is type-erased to
+    // `dyn Executor`, and re-rooting the workspace tools needs the registry.
+    if let Ok(mut slot) = agent_registry.lock() {
+        *slot = Some(Arc::clone(&executor));
+    }
 
     // Context engine: budget-aware two-phase compaction (§4.3), tuned from
     // medha.lock's [context] section (or its built-in-matching default).
@@ -1301,13 +1353,7 @@ async fn main() -> Result<()> {
             .with_memory_write_approval(&lock.memory.write_approval),
     );
 
-    // Deterministic verifier (§4.7): medha.lock's [verify] command, overridden
-    // by MEDHA_VERIFY="cargo check" if set. Empty/absent = no verifier.
-    let verify_cmd = std::env::var("MEDHA_VERIFY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or(lock.verify.command.clone());
-    let verifier: Arc<dyn kernel::Verifier> = match verify_cmd {
+    let verifier: Arc<dyn kernel::Verifier> = match verify_cmd.clone() {
         Some(cmd) => Arc::new(CommandVerifier {
             command: cmd,
             dir: cwd.clone(),

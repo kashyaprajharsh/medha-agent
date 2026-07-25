@@ -172,10 +172,14 @@ pub struct AgentsConfig {
     pub enabled: bool,
     /// Children alive at once, across the whole session tree.
     pub max_active: usize,
-    /// Delegation depth. 1 keeps it flat: a child cannot spawn a child, which is
-    /// what stops two agents racing on one workspace before writer isolation
-    /// exists.
+    /// Delegation depth. 1 keeps it flat: a child cannot spawn a child, which
+    /// bounds how far a single request can fan out.
     pub max_depth: usize,
+    /// Whether children may modify code (§6.4). A writing child works in its
+    /// own git worktree and returns a patch that only lands once a human
+    /// approves it — the parent's tree is never touched by the child itself.
+    /// Off means writers are refused, not downgraded to editing in place.
+    pub write: bool,
     /// Turn ceiling for one child. A child's turns are its own session's, but
     /// the tokens are the same wallet, so this is the real spend bound. Set it
     /// generously: a child cut off before it reports has spent everything and
@@ -191,6 +195,10 @@ impl Default for AgentsConfig {
             // independently.
             max_active: 3,
             max_depth: 1,
+            // On: the isolation is what makes it safe, and it is structural
+            // rather than advisory. Nothing a writing child does reaches the
+            // user's files without the merge passing the human gate.
+            write: true,
             // A real survey burned all 24 on exploration and was cut off before
             // writing anything; the whole run was wasted. The child is told its
             // budget and to wrap up early, but the ceiling has to leave room to.

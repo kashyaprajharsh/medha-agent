@@ -11,10 +11,16 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "rt"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "process", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 ulid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+# Liveness test for a worktree's owning process, so a second Medha in the same
+# repository cannot remove a checkout that is still being written to.
+libc = "0.2"

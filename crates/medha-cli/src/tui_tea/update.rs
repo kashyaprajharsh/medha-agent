@@ -887,6 +887,45 @@ pub(super) fn handle_key<P, L>(
                     .unwrap_or(labels.len().saturating_sub(1))
             }
             KeyCode::Down => picker.selected = (picker.selected + 1) % labels.len().max(1),
+            // Space switches the selected server on or off without removing it,
+            // so a parked server keeps its definition and credentials.
+            KeyCode::Char(' ') if matches!(&picker.kind, PickerKind::Mcp(_)) => {
+                let row = if let PickerKind::Mcp(rows) = &picker.kind {
+                    (picker.selected > 0)
+                        .then(|| rows.get(picker.selected - 1).cloned())
+                        .flatten()
+                } else {
+                    None
+                };
+                if let Some(row) = row {
+                    mcp_set_disabled(model, &row.id, !row.disabled, tx);
+                }
+                return;
+            }
+            // Space toggles one tool's exposure inside the tool browser.
+            KeyCode::Char(' ') if matches!(&picker.kind, PickerKind::McpTools { .. }) => {
+                if let PickerKind::McpTools { id, tools } = &picker.kind
+                    && let Some((name, on)) = tools.get(picker.selected)
+                {
+                    let (id, name, on) = (id.clone(), name.clone(), *on);
+                    mcp_set_tool(model, &id, &name, !on);
+                }
+                return;
+            }
+            // `t` opens the selected server's catalogue.
+            KeyCode::Char('t') if matches!(&picker.kind, PickerKind::Mcp(_)) => {
+                let id = if let PickerKind::Mcp(rows) = &picker.kind {
+                    (picker.selected > 0)
+                        .then(|| rows.get(picker.selected - 1).map(|row| row.id.clone()))
+                        .flatten()
+                } else {
+                    None
+                };
+                if let Some(id) = id {
+                    open_mcp_tools(model, &id);
+                }
+                return;
+            }
             // `d` removes the selected server in the /mcp picker (row 0 is Add).
             KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Mcp(_)) => {
                 let id = if let PickerKind::Mcp(rows) = &picker.kind {
@@ -1078,6 +1117,15 @@ pub(super) fn handle_key<P, L>(
                         model.picker = None;
                         spawn_memory_provenance(entry, kernel, tx);
                         model.push_notice(format!("(opening memory '{name}' provenance …)"));
+                    }
+                    return;
+                }
+                // Tool browser: the last row goes back, every other row toggles.
+                if let PickerKind::McpTools { id, tools } = &picker.kind {
+                    let (id, sel) = (id.clone(), picker.selected);
+                    match tools.get(sel).cloned() {
+                        Some((name, on)) => mcp_set_tool(model, &id, &name, !on),
+                        None => open_mcp_picker(model),
                     }
                     return;
                 }
@@ -2581,6 +2629,7 @@ fn open_mcp_picker(model: &mut Model) {
         .map(|(id, server)| McpRow {
             id,
             command: server.target(),
+            disabled: server.disabled,
         })
         .collect();
     model.picker = Some(Picker::new(PickerKind::Mcp(rows)));
@@ -2653,6 +2702,7 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
     }
     let server = config::McpServer {
         command,
+        disabled: false,
         url: url.clone(),
         auth,
         env,
@@ -2802,6 +2852,96 @@ fn authorize_mcp_server(
             Err(error) => Err(format!("'{id}': {error}")),
         }));
     });
+}
+
+/// Switch a server on or off. Disabling drops it from the live host so its
+/// tools leave the model's context at once, but keeps its definition and
+/// credentials so enabling costs nothing but a reconnect.
+fn mcp_set_disabled(
+    model: &mut Model,
+    id: &str,
+    disabled: bool,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    let mut cfg = config::load().ok().flatten().unwrap_or_default();
+    let Some(server) = cfg.mcp.get_mut(id) else {
+        return model.push_notice(format!("no MCP server '{id}'"));
+    };
+    server.disabled = disabled;
+    let server = server.clone();
+    if let Err(error) = config::save(&cfg) {
+        return model.push_notice(format!("mcp: could not save config.toml: {error}"));
+    }
+    if let Some(manager) = model.mcp.clone() {
+        let (id, tx) = (id.to_string(), tx.clone());
+        let resolved = config::resolve_mcp_server(&id, &server);
+        tokio::spawn(async move {
+            if disabled {
+                let _ = manager.remove_server(&id).await;
+            } else {
+                let _ = manager.add_server(resolved).await;
+            }
+            let _ = tx.send(TuiEvent::McpStatus(Ok(
+                serde_json::json!({ "servers": manager.status().await }),
+            )));
+        });
+    }
+    model.push_notice(format!(
+        "MCP server '{id}' {}",
+        if disabled { "off" } else { "on" }
+    ));
+    open_mcp_picker(model);
+}
+
+/// Open one server's catalogue so individual tools can be switched off. A large
+/// server injects every schema into every request, so this is real context cost.
+fn open_mcp_tools(model: &mut Model, id: &str) {
+    let Some(manager) = model.mcp.clone() else {
+        return model.push_notice("MCP host unavailable");
+    };
+    let tools = manager.server_tools(id);
+    if tools.is_empty() {
+        return model.push_notice(format!(
+            "'{id}' has no listed tools — connect it first (Enter on its row)"
+        ));
+    }
+    model.picker = Some(Picker::new(PickerKind::McpTools {
+        id: id.to_string(),
+        tools,
+    }));
+}
+
+/// Switch one tool's exposure, persisting it as a `deny_tools` entry.
+fn mcp_set_tool(model: &mut Model, id: &str, tool: &str, expose: bool) {
+    let mut cfg = config::load().ok().flatten().unwrap_or_default();
+    let Some(server) = cfg.mcp.get_mut(id) else {
+        return model.push_notice(format!("no MCP server '{id}'"));
+    };
+    if expose {
+        server.deny_tools.retain(|denied| denied != tool);
+    } else if !server.deny_tools.iter().any(|denied| denied == tool) {
+        server.deny_tools.push(tool.to_string());
+    }
+    let server = server.clone();
+    if let Err(error) = config::save(&cfg) {
+        return model.push_notice(format!("mcp: could not save config.toml: {error}"));
+    }
+    // Reflect the choice in the open picker immediately, then reconnect in the
+    // background so the filter takes effect this turn rather than next launch.
+    if let Some(Picker {
+        kind: PickerKind::McpTools { tools, .. },
+        ..
+    }) = &mut model.picker
+        && let Some(entry) = tools.iter_mut().find(|(name, _)| name == tool)
+    {
+        entry.1 = expose;
+    }
+    if let Some(manager) = model.mcp.clone() {
+        let resolved = config::resolve_mcp_server(id, &server);
+        tokio::spawn(async move {
+            let _ = manager.add_server(resolved).await;
+        });
+    }
 }
 
 /// Remove a server from the `/mcp` picker: drop it from `config.toml` and the

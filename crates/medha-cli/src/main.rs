@@ -1578,7 +1578,15 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             if cfg.mcp.is_empty() {
                 println!("no MCP servers configured (~/.medha/config.toml)");
             } else {
-                println!("MCP servers ({}):", cfg.mcp.len());
+                let off = cfg.mcp.values().filter(|s| s.disabled).count();
+                println!(
+                    "MCP servers ({}{}):",
+                    cfg.mcp.len(),
+                    match off {
+                        0 => String::new(),
+                        n => format!(", {n} disabled"),
+                    }
+                );
                 for (id, server) in &cfg.mcp {
                     let trust = if server.trust.is_empty() {
                         "workspace"
@@ -1611,8 +1619,9 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                         "" => "http",
                         other => other,
                     };
+                    let state = if server.disabled { "○" } else { "●" };
                     println!(
-                        "  {id}  [{trust}/{scheme}]  {}{key}{filter}",
+                        "  {state} {id}  [{trust}/{scheme}]  {}{key}{filter}",
                         server.target()
                     );
                 }
@@ -1697,6 +1706,7 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                 id.clone(),
                 config::McpServer {
                     command,
+                    disabled: false,
                     url,
                     auth: auth.clone(),
                     env,
@@ -1768,9 +1778,74 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             }
             manager.shutdown().await;
         }
+        // Park a server without losing its definition or credentials.
+        subcommand @ ("enable" | "disable") => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: medha mcp {subcommand} <id>"))?;
+            let server = cfg
+                .mcp
+                .get_mut(id)
+                .ok_or_else(|| anyhow::anyhow!("no MCP server '{id}'"))?;
+            server.disabled = subcommand == "disable";
+            config::save(&cfg)?;
+            println!(
+                "MCP server '{id}' {}",
+                if subcommand == "disable" {
+                    "disabled — its tools no longer reach the model"
+                } else {
+                    "enabled"
+                }
+            );
+        }
+        // Inspect and filter a server's catalogue: 52 tool schemas in every
+        // request is real context cost, so switching some off matters.
+        "tools" => {
+            let id = args.get(1).ok_or_else(|| {
+                anyhow::anyhow!("usage: medha mcp tools <id> [--on <tool>] [--off <tool>]")
+            })?;
+            let mut on: Vec<String> = Vec::new();
+            let mut off: Vec<String> = Vec::new();
+            let mut it = args[2..].iter();
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--on" => on.extend(it.next().cloned()),
+                    "--off" => off.extend(it.next().cloned()),
+                    other => return Err(anyhow::anyhow!("unknown flag '{other}'")),
+                }
+            }
+            if !on.is_empty() || !off.is_empty() {
+                let server = cfg
+                    .mcp
+                    .get_mut(id)
+                    .ok_or_else(|| anyhow::anyhow!("no MCP server '{id}'"))?;
+                server.deny_tools.retain(|tool| !on.contains(tool));
+                for tool in off {
+                    if !server.deny_tools.contains(&tool) {
+                        server.deny_tools.push(tool);
+                    }
+                }
+                config::save(&cfg)?;
+            }
+            // Connect to read the live catalogue; the filter is applied to it.
+            let manager = one_shot_mcp(id, &cfg)?;
+            manager.connect_startup().await;
+            let tools = manager.server_tools(id);
+            if tools.is_empty() {
+                println!("no tools listed for '{id}' (is it connected?)");
+            } else {
+                let exposed = tools.iter().filter(|(_, on)| *on).count();
+                println!("{id} — {exposed}/{} tool(s) exposed:", tools.len());
+                for (name, on) in tools {
+                    println!("  {} {name}", if on { "●" } else { "○" });
+                }
+                println!("  · medha mcp tools {id} --off <tool> to hide one");
+            }
+            manager.shutdown().await;
+        }
         other => {
             return Err(anyhow::anyhow!(
-                "unknown mcp subcommand '{other}' (use add|list|remove|auth)"
+                "unknown mcp subcommand '{other}' (use add|list|remove|auth|enable|disable|tools)"
             ));
         }
     }

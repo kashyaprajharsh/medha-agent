@@ -1059,6 +1059,12 @@ enum PickerKind {
     /// `/mcp`: manage MCP servers. Row 0 is "＋ Add a server"; the rest are the
     /// configured servers. Enter connects (or opens add); `d` removes.
     Mcp(Vec<McpRow>),
+    /// One server's catalogue, each tool switched on or off. Space toggles;
+    /// the choice is saved to that server's `deny_tools`.
+    McpTools {
+        id: String,
+        tools: Vec<(String, bool)>,
+    },
     /// How to authenticate a remote MCP server the probe could not classify.
     /// Only shown when the server is ambiguous — a server advertising OAuth
     /// signs in without asking.
@@ -1080,6 +1086,7 @@ pub(super) const MCP_AUTH_CHOICES: &[&str] = &[
 pub(super) struct McpRow {
     pub id: String,
     pub command: String,
+    pub disabled: bool,
 }
 
 /// The colour themes offered by the `/theme` picker. `id` drives the switch;
@@ -1184,7 +1191,14 @@ impl PickerKind {
             PickerKind::SkillSources(_) => " skill sources — ↑↓ · Enter · Esc back ".into(),
             PickerKind::Theme => " theme — ↑↓ select · Enter apply · Esc done ".into(),
             PickerKind::Mcp(_) => {
-                " MCP — ↑↓ select · Enter connect/add · d remove · Esc close ".into()
+                " MCP — Enter connect · space on/off · t tools · d remove · Esc close ".into()
+            }
+            PickerKind::McpTools { id, tools } => {
+                let on = tools.iter().filter(|(_, on)| *on).count();
+                format!(
+                    " {id} — {on}/{} tools in context · space toggle · Esc back ",
+                    tools.len()
+                )
             }
             PickerKind::McpAuth { id, .. } => {
                 format!(" {id} needs credentials — ↑↓ select · Enter · Esc cancel ")
@@ -1371,10 +1385,19 @@ impl PickerKind {
                 MCP_AUTH_CHOICES.iter().map(|c| (*c).to_string()).collect()
             }
             PickerKind::Mcp(rows) => std::iter::once("＋ Add a server".to_string())
-                .chain(
-                    rows.iter()
-                        .map(|row| format!("{}   {}", row.id, row.command)),
-                )
+                .chain(rows.iter().map(|row| {
+                    format!(
+                        "{} {}   {}",
+                        if row.disabled { "○" } else { "●" },
+                        row.id,
+                        row.command
+                    )
+                }))
+                .collect(),
+            PickerKind::McpTools { tools, .. } => tools
+                .iter()
+                .map(|(name, on)| format!("{} {name}", if *on { "●" } else { "○" }))
+                .chain(std::iter::once("← Back".to_string()))
                 .collect(),
             // Row 0 is always "install from a link" (never a dead end); the rest
             // are the browsable catalog, one row per skill.

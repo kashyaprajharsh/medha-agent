@@ -224,6 +224,9 @@ pub struct ServerConfig {
     pub id: String,
     pub transport: Transport,
     pub requires_approval: bool,
+    /// Configured but switched off: kept in the config, never connected. Lets a
+    /// server be parked without losing its definition or credentials.
+    pub disabled: bool,
     /// Per-server network override; `None` falls back to the host default.
     pub allow_network: Option<bool>,
     /// Which of the server's tools reach the model. Unfiltered by default.
@@ -278,6 +281,8 @@ impl Default for Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerState {
+    /// Switched off in the config; nothing is spawned or connected.
+    Disabled,
     NeedsApproval,
     /// Remote server with no usable credentials; waiting on an interactive sign-in.
     NeedsAuth,
@@ -306,6 +311,7 @@ impl ServerState {
 impl fmt::Display for ServerState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Disabled => "disabled",
             Self::NeedsApproval => "awaiting approval",
             Self::NeedsAuth => "needs sign-in",
             Self::NeedsToken => "needs an API token",
@@ -364,11 +370,12 @@ pub struct CallOutput {
     pub is_error: bool,
 }
 
-/// A server's exposed tools plus how many were withheld.
+/// A server's exposed tools plus the raw names its filter withheld, so the tool
+/// browser can show the whole catalogue with the filtered ones switched off.
 #[derive(Default)]
 struct Catalog {
     exposed: Vec<McpToolSpec>,
-    hidden: usize,
+    hidden: Vec<String>,
 }
 
 /// A live connection taken out of its slot, awaiting shutdown and process reap.
@@ -413,7 +420,9 @@ struct Slot {
 
 impl Slot {
     fn new(config: ServerConfig) -> Self {
-        let state = if config.requires_approval {
+        let state = if config.disabled {
+            ServerState::Disabled
+        } else if config.requires_approval {
             ServerState::NeedsApproval
         } else {
             ServerState::Connecting
@@ -547,7 +556,7 @@ impl McpManager {
         self.ensure_supervisor();
         let mut set = JoinSet::new();
         for server in &self.inner.config.servers {
-            if server.requires_approval {
+            if server.requires_approval || server.disabled {
                 continue;
             }
             let this = self.clone();
@@ -705,6 +714,26 @@ impl McpManager {
 
     pub fn is_mcp_tool(name: &str) -> bool {
         name.starts_with(TOOL_PREFIX)
+    }
+
+    /// Every tool a server offers, paired with whether it currently reaches the
+    /// model. Drives the tool browser, so a filtered tool is still listed —
+    /// switched off rather than invisible.
+    pub fn server_tools(&self, server_id: &str) -> Vec<(String, bool)> {
+        let catalogs = self.catalogs();
+        let Some(catalog) = catalogs.get(server_id) else {
+            return Vec::new();
+        };
+        let prefix = format!("{TOOL_PREFIX}{server_id}__");
+        let mut tools: Vec<(String, bool)> = catalog
+            .exposed
+            .iter()
+            .filter_map(|spec| spec.name.strip_prefix(&prefix))
+            .map(|name| (name.to_string(), true))
+            .chain(catalog.hidden.iter().map(|name| (name.clone(), false)))
+            .collect();
+        tools.sort_by(|a, b| a.0.cmp(&b.0));
+        tools
     }
 
     /// Whether this server's credentials must be obtained interactively before
@@ -1291,7 +1320,7 @@ fn status_of(id: &str, slot: &Slot, catalog: Option<&Catalog>) -> ServerStatus {
         server: id.to_string(),
         state: slot.state,
         tools: catalog.map_or(0, |c| c.exposed.len()),
-        hidden: catalog.map_or(0, |c| c.hidden),
+        hidden: catalog.map_or(0, |c| c.hidden.len()),
         detail: slot.detail.clone(),
     }
 }
@@ -1306,12 +1335,12 @@ fn backoff(failures: u32) -> Duration {
 /// Project a server's tools, dropping the ones the filter or name rules withhold.
 fn build_catalog(server: &str, filter: &ToolFilter, tools: Vec<Tool>) -> Catalog {
     let mut exposed = Vec::with_capacity(tools.len());
-    let mut hidden = 0;
+    let mut hidden = Vec::new();
     for tool in tools {
         // A malformed name would mis-route a later call; a filtered one is
         // deliberate. Neither reaches the model's context.
         if !valid_tool_name(&tool.name) || !filter.admits(&tool.name) {
-            hidden += 1;
+            hidden.push(tool.name.to_string());
             continue;
         }
         exposed.push(McpToolSpec {
@@ -1321,6 +1350,7 @@ fn build_catalog(server: &str, filter: &ToolFilter, tools: Vec<Tool>) -> Catalog
         });
     }
     exposed.sort_by(|a, b| a.name.cmp(&b.name));
+    hidden.sort();
     Catalog { exposed, hidden }
 }
 
@@ -1580,7 +1610,8 @@ mod tests {
         );
         assert_eq!(catalog.exposed.len(), 1);
         assert_eq!(catalog.exposed[0].name, "mcp__srv__visible");
-        assert_eq!(catalog.hidden, 2);
+        // Withheld names are kept so the tool browser can list them switched off.
+        assert_eq!(catalog.hidden, vec!["bad__name", "hidden"]);
     }
 
     #[test]

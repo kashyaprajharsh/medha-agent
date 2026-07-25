@@ -429,3 +429,43 @@ async fn dropping_the_manager_leaves_no_orphan() {
     drop(manager);
     wait_for("orphan reap", async || !alive(grandchild)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_server_is_never_connected() {
+    let Some(fake) = Fake::new() else { return };
+    let mut definition = server("fake", fake.command("normal", None));
+    definition.disabled = true;
+    let manager = McpManager::new(fake.path().to_path_buf(), config(definition));
+    manager.connect_startup().await;
+
+    // Kept in the config, but nothing spawned and nothing in the model's context.
+    assert_eq!(manager.status().await[0].state, ServerState::Disabled);
+    assert!(manager.tool_specs().is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tool_browser_lists_filtered_tools_as_switched_off() {
+    let Some(fake) = Fake::new() else { return };
+    let mut definition = server("fake", fake.command("normal", None));
+    definition.tools = ToolFilter {
+        allow: Vec::new(),
+        deny: vec!["big".into(), "slow".into()],
+    };
+    let manager = McpManager::new(fake.path().to_path_buf(), config(definition));
+    manager.connect_startup().await;
+
+    let tools = manager.server_tools("fake");
+    // Every tool the server offers is listed; the filtered ones are just off.
+    assert_eq!(tools.len(), 5);
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|(_, on)| !on)
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["big", "slow"]
+    );
+    assert!(tools.iter().any(|(name, on)| name == "echo" && *on));
+    manager.shutdown().await;
+}

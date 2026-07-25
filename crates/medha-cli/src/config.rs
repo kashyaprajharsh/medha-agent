@@ -120,6 +120,10 @@ pub struct McpServer {
     /// `workspace` (default) requires approval to start; `trusted` auto-connects.
     #[serde(default)]
     pub trust: String,
+    /// Switched off: kept here with its credentials, but never connected. Lets a
+    /// server be parked without losing its definition.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
     /// Tools exposed to the model. `allow` (when set) whitelists, then `deny`
     /// subtracts; entries are exact names or a `prefix*` glob. A big server can
     /// publish 100+ schemas — filtering keeps them out of every model request.
@@ -1512,6 +1516,7 @@ pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
         id: id.to_string(),
         transport,
         requires_approval: server.trust != "trusted",
+        disabled: server.disabled,
         allow_network: server.network,
         tools: mcp::ToolFilter {
             allow: server.allow_tools.clone(),

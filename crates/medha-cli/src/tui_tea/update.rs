@@ -1081,6 +1081,13 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
+                // Credential choice for a server the probe could not classify.
+                if let PickerKind::McpAuth { id, url } = &picker.kind {
+                    let (id, url, sel) = (id.clone(), url.clone(), picker.selected);
+                    model.picker = None;
+                    mcp_choose_auth(model, &id, &url, sel, tx);
+                    return;
+                }
                 // `/mcp` picker: row 0 adds a server; any other row connects it.
                 if let PickerKind::Mcp(rows) = &picker.kind {
                     let sel = picker.selected;
@@ -1089,7 +1096,7 @@ pub(super) fn handle_key<P, L>(
                         prefill_command(
                             model,
                             "/mcp add ",
-                            "<id> [--key K] [--deny-tool P] -- <command>   e.g.  github --key ghp_… -- npx -y @modelcontextprotocol/server-github   (--key goes to the OS keychain, never a file)",
+                            "paste a server URL — e.g.  https://mcp.linear.app/mcp   (sign-in is automatic)   ·   or:  <id> -- npx -y @modelcontextprotocol/server-github",
                         );
                         return;
                     }
@@ -2031,6 +2038,9 @@ pub(super) fn handle_agent_event(
             };
             model.upsert_notice("MCP", text);
         }
+        TuiEvent::McpNeedsAuth { server, url } => {
+            model.picker = Some(Picker::new(PickerKind::McpAuth { id: server, url }));
+        }
         TuiEvent::McpAuthUrl { server, url } => {
             model.upsert_notice(
                 "MCP",
@@ -2613,13 +2623,19 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
             "--no-network" => network = Some(false),
             "--parallel" => parallel_calls = true,
             "--" => command.extend(it.by_ref().map(str::to_string)),
+            // A pasted URL is the server, wherever it appears — the id is
+            // derived from it when not given.
+            _ if mcp::is_url(token) => url = token.to_string(),
             _ if id.is_none() => id = Some(token.to_string()),
             _ => command.push(token.to_string()),
         }
     }
-    let (Some(id), false) = (id, url.is_empty() && command.is_empty()) else {
+    let (Some(id), false) = (
+        id.or_else(|| mcp::id_from_url(&url)),
+        url.is_empty() && command.is_empty(),
+    ) else {
         model.push_notice(
-            "usage: /mcp add <id> --url https://… [--oauth]   ·   /mcp add <id> [--key K] -- <command>",
+            "usage: /mcp add https://…   ·   /mcp add <id> https://…   ·   /mcp add <id> -- <command>",
         );
         return;
     };
@@ -2637,7 +2653,7 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
     }
     let server = config::McpServer {
         command,
-        url,
+        url: url.clone(),
         auth,
         env,
         trust,
@@ -2659,12 +2675,15 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
         tokio::spawn(async move {
             // Report the status list either way: a failed server shows up as a
             // row with its state and reason, which beats a bare error string.
-            let _ = manager.add_server(resolved).await;
-            // A remote OAuth server lands in needs-sign-in; carry straight on
-            // into the browser flow rather than making the user pick it again.
-            if manager.needs_sign_in(&id).await {
-                authorize_mcp_server(manager, id, tx);
-                return;
+            // The server decides what happens next: an OAuth challenge goes
+            // straight to the browser, an ambiguous one asks how to authenticate.
+            match manager.add_server(resolved).await {
+                Err(mcp::Error::NeedsAuth(_)) => return authorize_mcp_server(manager, id, tx),
+                Err(mcp::Error::NeedsToken(_)) => {
+                    let _ = tx.send(TuiEvent::McpNeedsAuth { server: id, url });
+                    return;
+                }
+                _ => {}
             }
             let servers = serde_json::json!({ "servers": manager.status().await });
             let _ = tx.send(TuiEvent::McpStatus(Ok(servers)));
@@ -2677,8 +2696,8 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
     open_mcp_picker(model);
 }
 
-/// Connect a configured server, falling through to the interactive sign-in when
-/// it is a remote OAuth server without usable credentials.
+/// Connect a configured server. The server itself decides what happens next: an
+/// OAuth challenge goes straight to the browser, an ambiguous one asks the user.
 fn connect_mcp_server(
     manager: Arc<mcp::McpManager>,
     id: String,
@@ -2687,6 +2706,14 @@ fn connect_mcp_server(
     tokio::spawn(async move {
         match manager.approve_and_connect(&id, None).await {
             Err(mcp::Error::NeedsAuth(_)) => authorize_mcp_server(manager, id, tx),
+            Err(mcp::Error::NeedsToken(_)) => {
+                let url = manager
+                    .start_preview(&id)
+                    .await
+                    .map(|preview| preview.target)
+                    .unwrap_or_default();
+                let _ = tx.send(TuiEvent::McpNeedsAuth { server: id, url });
+            }
             outcome => {
                 if let Err(error) = outcome {
                     let _ = tx.send(TuiEvent::McpStatus(Err(format!("'{id}': {error}"))));
@@ -2696,6 +2723,53 @@ fn connect_mcp_server(
                 let _ = tx.send(TuiEvent::McpStatus(Ok(servers)));
             }
         }
+    });
+}
+
+/// Apply the credential choice made in the [`PickerKind::McpAuth`] picker.
+fn mcp_choose_auth(
+    model: &mut Model,
+    id: &str,
+    url: &str,
+    choice: usize,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    // 1 = paste a token: the value is a secret, so route it back through
+    // `/mcp add`, which stores it in the keychain rather than config.toml.
+    if choice == 1 {
+        prefill_command(
+            model,
+            &format!("/mcp add {id} {url} --bearer "),
+            "paste the API token after --bearer (it goes to the OS keychain, never a file)",
+        );
+        return;
+    }
+    let auth = if choice == 0 { "oauth" } else { "none" };
+    let mut cfg = config::load().ok().flatten().unwrap_or_default();
+    let Some(server) = cfg.mcp.get_mut(id) else {
+        model.push_notice(format!("no MCP server '{id}'"));
+        return;
+    };
+    server.auth = auth.to_string();
+    let server = server.clone();
+    if let Err(error) = config::save(&cfg) {
+        model.push_notice(format!("mcp: could not save config.toml: {error}"));
+        return;
+    }
+    let Some(manager) = model.mcp.clone() else {
+        return;
+    };
+    model.push_notice(format!("(connecting MCP server '{id}' …)"));
+    let resolved = config::resolve_mcp_server(id, &server);
+    let (id, tx) = (id.to_string(), tx.clone());
+    tokio::spawn(async move {
+        let _ = manager.add_server(resolved).await;
+        if manager.needs_sign_in(&id).await {
+            authorize_mcp_server(manager, id, tx);
+            return;
+        }
+        let servers = serde_json::json!({ "servers": manager.status().await });
+        let _ = tx.send(TuiEvent::McpStatus(Ok(servers)));
     });
 }
 

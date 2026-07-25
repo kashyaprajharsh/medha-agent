@@ -57,6 +57,44 @@ fn auth_failed(error: impl std::fmt::Display) -> Error {
     Error::Auth(error.to_string())
 }
 
+/// What a remote server asks for when approached without credentials.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Challenge {
+    /// Nothing — the server is open, or is not answering an auth challenge.
+    Open,
+    /// 401 advertising protected-resource metadata: full OAuth discovery works.
+    OAuth,
+    /// Credentials are required but the scheme is not discoverable OAuth, so a
+    /// token has to come from the user.
+    Token,
+}
+
+/// Ask the server what it wants, so pasting a URL is enough to configure it.
+/// Per the MCP spec an unauthorized endpoint answers 401 with
+/// `WWW-Authenticate`; a `resource_metadata` parameter means OAuth discovery
+/// is available and the browser flow can run unattended.
+pub(crate) async fn probe(url: &str) -> Challenge {
+    let Ok(response) = http_client().get(url).send().await else {
+        // Unreachable hosts are a connection problem, not an auth one; let the
+        // real connect attempt report it properly.
+        return Challenge::Open;
+    };
+    if !matches!(response.status().as_u16(), 401 | 403) {
+        return Challenge::Open;
+    }
+    let advertises_discovery = response
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.to_ascii_lowercase().contains("resource_metadata"));
+    if advertises_discovery {
+        Challenge::OAuth
+    } else {
+        Challenge::Token
+    }
+}
+
 /// Rebuild an authorized HTTP client from persisted credentials, so a session
 /// reconnects — and silently refreshes — without user interaction.
 pub(crate) async fn client_from_stored(

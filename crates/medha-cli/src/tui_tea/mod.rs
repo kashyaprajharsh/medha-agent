@@ -444,6 +444,11 @@ pub(crate) enum TuiEvent {
         server: String,
         url: String,
     },
+    /// A remote MCP server wants credentials Medha could not classify — ask.
+    McpNeedsAuth {
+        server: String,
+        url: String,
+    },
     /// A queued steer was applied at a turn boundary — promote its "queued"
     /// notice to a real user line.
     Steered(String),
@@ -1054,7 +1059,21 @@ enum PickerKind {
     /// `/mcp`: manage MCP servers. Row 0 is "＋ Add a server"; the rest are the
     /// configured servers. Enter connects (or opens add); `d` removes.
     Mcp(Vec<McpRow>),
+    /// How to authenticate a remote MCP server the probe could not classify.
+    /// Only shown when the server is ambiguous — a server advertising OAuth
+    /// signs in without asking.
+    McpAuth {
+        id: String,
+        url: String,
+    },
 }
+
+/// Rows of [`PickerKind::McpAuth`], in order.
+pub(super) const MCP_AUTH_CHOICES: &[&str] = &[
+    "Sign in with OAuth (opens a browser)",
+    "Paste an API token",
+    "Connect without authentication",
+];
 
 /// One configured MCP server row in the `/mcp` picker.
 #[derive(Clone)]
@@ -1166,6 +1185,9 @@ impl PickerKind {
             PickerKind::Theme => " theme — ↑↓ select · Enter apply · Esc done ".into(),
             PickerKind::Mcp(_) => {
                 " MCP — ↑↓ select · Enter connect/add · d remove · Esc close ".into()
+            }
+            PickerKind::McpAuth { id, .. } => {
+                format!(" {id} needs credentials — ↑↓ select · Enter · Esc cancel ")
             }
             PickerKind::AutonomyMode => {
                 " autonomy — ↑↓ move · Enter/→ choose · Esc/← cancel ".into()
@@ -1345,6 +1367,9 @@ impl PickerKind {
                 .iter()
                 .map(|(_, desc)| (*desc).to_string())
                 .collect(),
+            PickerKind::McpAuth { .. } => {
+                MCP_AUTH_CHOICES.iter().map(|c| (*c).to_string()).collect()
+            }
             PickerKind::Mcp(rows) => std::iter::once("＋ Add a server".to_string())
                 .chain(
                     rows.iter()

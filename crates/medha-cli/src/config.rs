@@ -1502,7 +1502,9 @@ pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
                 // a secret-free server: keep it explicit rather than silently
                 // connecting unauthenticated.
                 "bearer" => mcp::RemoteAuth::Bearer(key.clone().unwrap_or_default()),
-                _ => mcp::RemoteAuth::None,
+                "none" => mcp::RemoteAuth::None,
+                // Unset: let the server say what it wants on first connect.
+                _ => mcp::RemoteAuth::Auto,
             },
         }
     };

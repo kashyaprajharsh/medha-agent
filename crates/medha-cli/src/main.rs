@@ -1666,15 +1666,19 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                     "--no-network" => network = Some(false),
                     "--parallel" => parallel_calls = true,
                     "--" => command.extend(it.by_ref().cloned()),
+                    // A pasted URL is the server, wherever it appears — the id
+                    // is derived from it when not given.
+                    _ if mcp::is_url(arg) => url = arg.clone(),
                     _ if id.is_none() => id = Some(arg.clone()),
                     _ => command.push(arg.clone()),
                 }
             }
-            let id = id.ok_or_else(|| {
+            let id = id.or_else(|| mcp::id_from_url(&url)).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "usage: medha mcp add <id> --url <https://…> [--oauth | --bearer T]\n   \
-                     or: medha mcp add <id> [--key K] [--trust trusted] [--env K=V] \
-                     [--allow-tool P] [--deny-tool P] [--no-network] [--parallel] -- <command>"
+                    "usage: medha mcp add <https://…>            (id derived from the URL)\n   \
+                         or: medha mcp add <id> <https://…>       (explicit id)\n   \
+                         or: medha mcp add <id> [--key K] [--trust trusted] [--env K=V] \
+                         [--allow-tool P] [--deny-tool P] -- <command>"
                 )
             })?;
             if url.is_empty() && command.is_empty() {
@@ -1713,16 +1717,16 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                 }
             );
 
-            // Connect once for immediate ready/failed feedback; an OAuth server
-            // runs the browser flow here, which is the one place a CLI can.
+            // Connect once for immediate feedback. When the server answers with
+            // an OAuth challenge, run the browser flow right here rather than
+            // making the user discover a second command.
             print!("connecting… ");
             let _ = std::io::Write::flush(&mut std::io::stdout());
             let manager = one_shot_mcp(&id, &cfg)?;
-            if auth == "oauth" {
+            manager.connect_startup().await;
+            if manager.needs_sign_in(&id).await {
                 println!();
                 authorize_mcp(&manager, &id).await;
-            } else {
-                manager.connect_startup().await;
             }
             for status in manager.status().await {
                 match status.state {

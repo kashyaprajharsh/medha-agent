@@ -105,9 +105,7 @@ fn reconcile_reasoning_for_switch(
         }
         // gemini-interactions has no portable disable; a carried "off" becomes
         // server-default rather than blocking the switch.
-        Protocol::GeminiInteractions if config.enabled == Some(false) => {
-            ReasoningConfig::default()
-        }
+        Protocol::GeminiInteractions if config.enabled == Some(false) => ReasoningConfig::default(),
         _ => config,
     }
 }
@@ -633,7 +631,9 @@ async fn list_openai_chat_models(
         .map_err(|error| ProviderError::Transport(error.to_string()))?;
     let parsed: ModelsResp = serde_json::from_str(&body).map_err(|error| {
         let snippet: String = body.chars().take(200).collect();
-        ProviderError::Decode(format!("model list parse failed: {error} (body: {snippet})"))
+        ProviderError::Decode(format!(
+            "model list parse failed: {error} (body: {snippet})"
+        ))
     })?;
     Ok(parsed
         .data
@@ -2181,8 +2181,11 @@ mod reasoning_request_tests {
     fn gemini_reasoning_reconciles_on_switch_to_openai() {
         // A Gemini session runs with "reasoning on" and no explicit effort —
         // valid for gemini-interactions. Start a provider in exactly that state.
-        let mut gemini =
-            ProviderProfile::openai_chat("http://gemini/v1", "gemini-3.5-flash", AuthKind::XGoogApiKey);
+        let mut gemini = ProviderProfile::openai_chat(
+            "http://gemini/v1",
+            "gemini-3.5-flash",
+            AuthKind::XGoogApiKey,
+        );
         gemini.protocol = Protocol::GeminiInteractions;
         let provider = ProviderClient::from_profile(gemini, "key").unwrap();
         provider

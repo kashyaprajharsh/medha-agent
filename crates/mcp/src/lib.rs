@@ -87,6 +87,10 @@ pub enum Error {
         "MCP server '{0}' needs authorization — connect it from /mcp or run `medha mcp auth {0}`"
     )]
     NeedsAuth(String),
+    #[error(
+        "MCP server '{0}' needs an API token — add one with `medha mcp add {0} --url <url> --bearer <token>`"
+    )]
+    NeedsToken(String),
     #[error("MCP authorization failed: {0}")]
     Auth(String),
     #[error("invalid MCP server URL: {0}")]
@@ -188,7 +192,11 @@ impl Transport {
 /// Credential scheme for a remote server.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RemoteAuth {
+    /// Ask the server what it needs on first connect. The default, so pasting a
+    /// URL is enough — no flags to remember.
     #[default]
+    Auto,
+    /// Explicitly unauthenticated.
     None,
     /// Static token sent as `Authorization: Bearer …`.
     Bearer(String),
@@ -273,6 +281,9 @@ pub enum ServerState {
     NeedsApproval,
     /// Remote server with no usable credentials; waiting on an interactive sign-in.
     NeedsAuth,
+    /// Remote server wanting credentials Medha cannot obtain on its own — the
+    /// user has to supply a token.
+    NeedsToken,
     Connecting,
     Ready,
     /// Was ready, lost its transport; a reconnect is scheduled.
@@ -297,6 +308,7 @@ impl fmt::Display for ServerState {
         f.write_str(match self {
             Self::NeedsApproval => "awaiting approval",
             Self::NeedsAuth => "needs sign-in",
+            Self::NeedsToken => "needs an API token",
             Self::Connecting => "connecting",
             Self::Ready => "ready",
             Self::Degraded => "degraded",
@@ -633,13 +645,15 @@ impl McpManager {
         announce: &UrlSink,
     ) -> Result<ServerStatus, Error> {
         let server = self.server_config(server_id).await?;
+        // `Auto` reaches here once the probe found an OAuth challenge, so both
+        // it and an explicit `OAuth` are valid sign-in targets.
         let Transport::Remote {
             url,
-            auth: RemoteAuth::OAuth,
+            auth: RemoteAuth::OAuth | RemoteAuth::Auto,
         } = &server.transport
         else {
             return Err(Error::Auth(format!(
-                "'{server_id}' is not an OAuth server; nothing to sign in to"
+                "'{server_id}' is not a remote server; nothing to sign in to"
             )));
         };
         let store = self
@@ -958,10 +972,18 @@ impl McpManager {
         slot.detail = Some(error.to_string());
         // Missing credentials are not a fault to retry — only a human can clear
         // it, so park the slot in a state the UI can act on.
-        if matches!(error, Error::NeedsAuth(_)) {
-            slot.state = ServerState::NeedsAuth;
-            slot.retry_at = None;
-            return;
+        match error {
+            Error::NeedsAuth(_) => {
+                slot.state = ServerState::NeedsAuth;
+                slot.retry_at = None;
+                return;
+            }
+            Error::NeedsToken(_) => {
+                slot.state = ServerState::NeedsToken;
+                slot.retry_at = None;
+                return;
+            }
+            _ => {}
         }
         slot.failures = slot.failures.saturating_add(1);
         if error.is_terminal() {
@@ -1061,11 +1083,7 @@ impl McpManager {
             }
             RemoteAuth::OAuth => {
                 let stored = self
-                    .inner
-                    .config
-                    .tokens
-                    .as_ref()
-                    .and_then(|store| store.load(&server.id))
+                    .stored_token(&server.id)
                     .ok_or_else(|| Error::NeedsAuth(server.id.clone()))?;
                 let client = oauth::client_from_stored(url, &stored).await?;
                 self.handshake(
@@ -1074,7 +1092,28 @@ impl McpManager {
                 )
                 .await
             }
+            // Let the server decide, so configuring one is just a pasted URL.
+            RemoteAuth::Auto => {
+                if self.stored_token(&server.id).is_some() {
+                    return Box::pin(self.connect_remote(server, url, &RemoteAuth::OAuth)).await;
+                }
+                match oauth::probe(url).await {
+                    oauth::Challenge::Open => {
+                        Box::pin(self.connect_remote(server, url, &RemoteAuth::None)).await
+                    }
+                    oauth::Challenge::OAuth => Err(Error::NeedsAuth(server.id.clone())),
+                    oauth::Challenge::Token => Err(Error::NeedsToken(server.id.clone())),
+                }
+            }
         }
+    }
+
+    fn stored_token(&self, server_id: &str) -> Option<String> {
+        self.inner
+            .config
+            .tokens
+            .as_ref()
+            .and_then(|store| store.load(server_id))
     }
 
     /// Protocol handshake plus the first catalogue listing, under one deadline.
@@ -1446,6 +1485,24 @@ fn sanitized_environment() -> Vec<(String, String)> {
 /// Exposed so configuration is validated when it is written, not at connect time.
 pub fn validate_remote_url(url: &str) -> Result<(), Error> {
     oauth::require_secure(url)
+}
+
+pub fn is_url(token: &str) -> bool {
+    token.starts_with("https://") || token.starts_with("http://")
+}
+
+/// A short server id from a URL, so pasting one is enough to configure it:
+/// `https://mcp.linear.app/mcp` → `linear`. Common service prefixes are dropped
+/// and the public suffix ignored, which is what a user would have typed anyway.
+pub fn id_from_url(url: &str) -> Option<String> {
+    let host = url::Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
+    let labels: Vec<&str> = host
+        .split('.')
+        .filter(|label| !matches!(*label, "mcp" | "api" | "www" | "server"))
+        .collect();
+    // Take the registrable name, not the TLD: `linear.app` → `linear`.
+    let name = labels.first()?;
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn normalize(path: &std::path::Path) -> PathBuf {

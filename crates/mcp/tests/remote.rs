@@ -16,6 +16,15 @@ use tokio::{
 /// A minimal Streamable HTTP MCP endpoint: one JSON-RPC POST in, one JSON
 /// response out. Enough to exercise the transport, not to reimplement a server.
 async fn spawn_server(required_bearer: Option<&'static str>) -> String {
+    spawn_with_challenge(required_bearer, None).await
+}
+
+/// `challenge` is the `WWW-Authenticate` value returned with a 401 when the
+/// request carries no credentials — the signal Medha probes for.
+async fn spawn_with_challenge(
+    required_bearer: Option<&'static str>,
+    challenge: Option<&'static str>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -37,8 +46,16 @@ async fn spawn_server(required_bearer: Option<&'static str>) -> String {
                     None => true,
                 };
                 if !authorized {
+                    let header = challenge
+                        .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+                        .unwrap_or_default();
                     let _ = stream
-                        .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 401 Unauthorized\r\n{header}Content-Length: 0\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
                         .await;
                     return;
                 }
@@ -195,4 +212,79 @@ async fn plaintext_remote_servers_are_refused() {
     assert!(mcp::validate_remote_url("http://mcp.example.com/mcp").is_err());
     assert!(mcp::validate_remote_url("https://mcp.linear.app/mcp").is_ok());
     manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_server_needs_no_configuration() {
+    let url = spawn_server(None).await;
+    let manager = McpManager::new(
+        std::env::temp_dir(),
+        remote("hosted", url, RemoteAuth::Auto),
+    );
+    manager.connect_startup().await;
+
+    // Auto is the default: pasting a URL is enough for an unauthenticated server.
+    let status = &manager.status().await[0];
+    assert_eq!(
+        status.state,
+        ServerState::Ready,
+        "detail: {:?}",
+        status.detail
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oauth_challenge_routes_to_sign_in() {
+    // A 401 advertising protected-resource metadata means discovery works, so
+    // the browser flow can run without asking the user anything.
+    let url = spawn_with_challenge(
+        Some("never-sent"),
+        Some(r#"Bearer resource_metadata="https://example.test/.well-known/oauth-protected-resource""#),
+    )
+    .await;
+    let manager = McpManager::new(
+        std::env::temp_dir(),
+        remote("hosted", url, RemoteAuth::Auto),
+    );
+    manager.connect_startup().await;
+
+    assert_eq!(manager.status().await[0].state, ServerState::NeedsAuth);
+    assert!(manager.needs_sign_in("hosted").await);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bare_challenge_asks_for_a_token() {
+    // 401 with no discovery metadata: Medha cannot obtain this on its own, so
+    // it must ask rather than guess.
+    let url = spawn_with_challenge(Some("never-sent"), Some("Bearer")).await;
+    let manager = McpManager::new(
+        std::env::temp_dir(),
+        remote("hosted", url, RemoteAuth::Auto),
+    );
+    manager.connect_startup().await;
+
+    assert_eq!(manager.status().await[0].state, ServerState::NeedsToken);
+    assert!(!manager.needs_sign_in("hosted").await);
+    manager.shutdown().await;
+}
+
+#[test]
+fn a_pasted_url_is_enough_to_name_a_server() {
+    assert_eq!(
+        mcp::id_from_url("https://mcp.linear.app/mcp").as_deref(),
+        Some("linear")
+    );
+    assert_eq!(
+        mcp::id_from_url("https://mcp.alphavantage.co/mcp").as_deref(),
+        Some("alphavantage")
+    );
+    assert_eq!(
+        mcp::id_from_url("https://api.github.com/mcp").as_deref(),
+        Some("github")
+    );
+    assert!(mcp::is_url("https://x.dev"));
+    assert!(!mcp::is_url("npx"));
+    assert_eq!(mcp::id_from_url("not a url"), None);
 }

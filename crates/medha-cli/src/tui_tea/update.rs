@@ -48,10 +48,16 @@ pub(super) fn update<P, L>(
                 // terminal state, so the difference is the finish notification —
                 // no extra channel needed, and the user is not left watching a
                 // spinner for work that already landed.
+                // Background children only: a foreground result is returned
+                // inline, so announcing one would be both redundant and wrong —
+                // it would promise a report later that has already arrived.
                 let finished: Vec<String> = model
                     .agent_runs
                     .iter()
-                    .filter(|previous| !running.iter().any(|run| run.session == previous.session))
+                    .filter(|previous| {
+                        previous.background
+                            && !running.iter().any(|run| run.session == previous.session)
+                    })
                     .map(|previous| previous.agent.clone())
                     .collect();
                 model.agent_runs = running;

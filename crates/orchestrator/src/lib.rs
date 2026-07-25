@@ -107,6 +107,10 @@ pub struct AgentHandle {
     pub session: String,
     pub objective: String,
     pub started_ms: u64,
+    /// Whether the caller is waiting on this one. A foreground result is
+    /// returned inline, so announcing its completion separately would be both
+    /// redundant and wrong about where the report went.
+    pub background: bool,
 }
 
 /// How the runtime actually runs a child. Implemented outside this crate by
@@ -334,6 +338,7 @@ impl AgentControl {
         spec: &mut AgentSpec,
         parent_executor: Arc<dyn Executor>,
         remaining_turns: u32,
+        background: bool,
     ) -> Result<Admitted, Error> {
         if spec.objective.trim().is_empty() {
             return Err(Error::NoObjective);
@@ -378,6 +383,7 @@ impl AgentControl {
                     session: session.to_string(),
                     objective: spec.objective.clone(),
                     started_ms: epoch_ms(),
+                    background,
                 },
                 cancel: cancel.clone(),
             });
@@ -403,7 +409,7 @@ impl AgentControl {
         parent_executor: Arc<dyn Executor>,
         remaining_turns: u32,
     ) -> Result<AgentResult, Error> {
-        let admitted = self.admit(&mut spec, parent_executor, remaining_turns)?;
+        let admitted = self.admit(&mut spec, parent_executor, remaining_turns, false)?;
         Ok(execute(Arc::clone(&self.runner), spec, admitted).await)
     }
 
@@ -422,12 +428,13 @@ impl AgentControl {
         // No durable delivery means no background: a result that cannot outlive
         // the process is not a background result, it is a lost one.
         let outbox = Arc::clone(self.outbox.as_ref().ok_or(Error::Unavailable)?);
-        let admitted = self.admit(&mut spec, parent_executor, remaining_turns)?;
+        let admitted = self.admit(&mut spec, parent_executor, remaining_turns, true)?;
         let handle = AgentHandle {
             agent: spec.name.clone(),
             session: admitted.session.to_string(),
             objective: spec.objective.clone(),
             started_ms: epoch_ms(),
+            background: true,
         };
         let dispatch = Dispatch {
             agent: spec.name.clone(),
@@ -823,6 +830,7 @@ mod tests {
                 session: Ulid::new().to_string(),
                 objective: "audit the crate".into(),
                 started_ms: epoch_ms(),
+                background: false,
             },
             cancel: CancellationToken::new(),
         });

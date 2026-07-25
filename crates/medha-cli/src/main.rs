@@ -2291,6 +2291,11 @@ fn salient_arg(tool: &str, args: &serde_json::Value) -> String {
         // Skill rows read by their name; the description is prose and makes
         // an unreadable label ("Save(Guidance for distinctive, intent…)").
         t if t.starts_with("skill.") => "name",
+        // What the agent was asked to do, not the shape its answer must take —
+        // without this the row labels itself with whichever string happens to
+        // come first, which was the contract.
+        "agent.spawn" => "objective",
+        "agent.cancel" | "agent.transcript" => "agent",
         _ => "",
     };
     // Preferred key, else the first string argument as a fallback.

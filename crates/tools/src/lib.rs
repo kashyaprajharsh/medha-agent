@@ -823,12 +823,22 @@ impl Tool for AgentSpawn {
         "⚇"
     }
     fn description(&self) -> &str {
-        "Delegate a self-contained read-only investigation to a child agent and get back a summary. \
-         Use it when a question needs many searches or file reads whose intermediate output you do \
-         not want in this conversation — surveying a codebase, checking how something is used \
-         everywhere, gathering background. State the objective fully: the child cannot see this \
-         conversation. Give `contract` when the answer must have a particular shape. The child \
-         cannot write, and cannot use any tool you do not already have."
+        "Delegate a self-contained read-only investigation to a child agent and get back a summary.\n\
+         \n\
+         Delegate when a sub-question is reasoning-heavy and would flood this conversation with \
+         intermediate output you will not need again — surveying an unfamiliar area of the \
+         codebase, tracing how something is used everywhere, gathering background before a \
+         decision.\n\
+         \n\
+         Do NOT delegate: work you can finish in a few tool calls — just do it; anything where you \
+         already have the context, because a child starts cold and pays to rediscover it; or your \
+         whole task handed to one child, which is pass-through that adds nothing and doubles the \
+         cost. Delegation is the expensive path. Prefer grep/read directly.\n\
+         \n\
+         State the objective in full: the child cannot see this conversation and cannot ask you \
+         anything. Give `contract` when the answer must have a particular shape. The child is \
+         read-only and cannot use any tool you do not already have. Its report comes back to you, \
+         not to the user — relay what matters."
     }
     fn blast_radius(&self) -> BlastRadius {
         // Read-only children: no mutation, but real model spend, so it stays

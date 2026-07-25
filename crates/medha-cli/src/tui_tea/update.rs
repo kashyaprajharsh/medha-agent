@@ -36,6 +36,14 @@ pub(super) fn update<P, L>(
             // mutex read) so the status-line indicator tracks reality.
             if model.anim_frame % 16 == 0 {
                 model.bg_tasks = kernel.executor.background_tasks();
+                // Delegation is invisible otherwise: the child's work never
+                // enters the transcript, so without this the user cannot tell
+                // Medha handed part of the task to an agent.
+                model.agent_runs = model
+                    .agents
+                    .as_ref()
+                    .map(|control| control.active())
+                    .unwrap_or_default();
             }
         }
     }

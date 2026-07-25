@@ -28,9 +28,13 @@ fn child_prompt(run: &ChildRun) -> String {
     }
     prompt.push_str(
         "\nYou are read-only: you cannot modify anything. Investigate, then \
-         finish with your findings as your final message. That message is the \
-         only thing returned, so make it complete and self-contained — cite \
-         concrete file paths and line numbers where they apply.",
+         finish with your findings as your final message.\n\n\
+         That message is the only thing returned, and it lands in the parent's \
+         context window — so keep it tight. Lead with the answer, use bullets \
+         over paragraphs, cite concrete file paths and line numbers, and do not \
+         replay how you got there. An overlong report crowds out the context the \
+         parent needs to act on it. If you could not answer, say so plainly and \
+         say what you ruled out.",
     );
     prompt
 }

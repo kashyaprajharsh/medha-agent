@@ -1191,6 +1191,25 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // Delegated agents. A child's work never reaches the transcript, so without
+    // this the user has no way to know Medha handed part of the task away, or to
+    // what. Esc cancels the turn, which settles the child with it.
+    if !model.agent_runs.is_empty() {
+        const SPIN: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+        let g = SPIN[(model.anim_frame as usize / 4) % SPIN.len()];
+        let names = model
+            .agent_runs
+            .iter()
+            .map(|run| run.agent.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        left.push(Span::styled(
+            format!("  {g} agent: {names}"),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some((message, until)) = &model.clipboard_status
         && *until > Instant::now()
     {

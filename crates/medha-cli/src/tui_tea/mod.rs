@@ -1754,6 +1754,11 @@ struct Model {
     /// MCP host handle, so `/mcp` can list/connect/remove/add live. `None` when
     /// MCP is disabled or unwired (tests).
     mcp: Option<Arc<mcp::McpManager>>,
+    /// Sub-agent control plane, so the user can see that Medha delegated and to
+    /// what. `None` when sub-agents are disabled.
+    agents: Option<Arc<orchestrator::AgentControl>>,
+    /// Children running right now, refreshed on the animation tick.
+    agent_runs: Vec<orchestrator::AgentHandle>,
 }
 
 impl Model {
@@ -1833,6 +1838,8 @@ impl Model {
             memory_budget_tokens: memory::recall::DEFAULT_K3_BUDGET_TOKENS,
             memory_stale_after_days: memory::recall::DEFAULT_STALE_AFTER_DAYS,
             mcp: None,
+            agents: None,
+            agent_runs: Vec::new(),
             known_tools: Arc::new(std::collections::HashSet::new()),
         }
     }
@@ -2330,6 +2337,7 @@ pub async fn run_tea<P, L>(
     known_tools: std::collections::HashSet<String>,
     search_handle: tools::SearchHandle,
     mcp: Option<Arc<mcp::McpManager>>,
+    agents: Option<Arc<orchestrator::AgentControl>>,
     tx: mpsc::UnboundedSender<TuiEvent>,
     mut rx: mpsc::UnboundedReceiver<TuiEvent>,
 ) -> anyhow::Result<()>
@@ -2381,6 +2389,7 @@ where
     .with_model_profiles(model_profiles, active_profile)
     .with_search(search_handle);
     model.mcp = mcp;
+    model.agents = agents;
     // Reflect the session's starting autonomy (from lock/MEDHA_MODE) in the TUI.
     model.autonomy = session.autonomy;
     // Mirror the provider's streaming state (lock default) into the status bar.

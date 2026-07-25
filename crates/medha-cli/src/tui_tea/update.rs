@@ -39,11 +39,27 @@ pub(super) fn update<P, L>(
                 // Delegation is invisible otherwise: the child's work never
                 // enters the transcript, so without this the user cannot tell
                 // Medha handed part of the task to an agent.
-                model.agent_runs = model
+                let running = model
                     .agents
                     .as_ref()
                     .map(|control| control.active())
                     .unwrap_or_default();
+                // An entry leaves the roster exactly when its child reaches a
+                // terminal state, so the difference is the finish notification —
+                // no extra channel needed, and the user is not left watching a
+                // spinner for work that already landed.
+                let finished: Vec<String> = model
+                    .agent_runs
+                    .iter()
+                    .filter(|previous| !running.iter().any(|run| run.session == previous.session))
+                    .map(|previous| previous.agent.clone())
+                    .collect();
+                model.agent_runs = running;
+                for agent in finished {
+                    model.push_notice(format!(
+                        "⚇ agent '{agent}' finished — its report arrives with your next message"
+                    ));
+                }
             }
         }
     }

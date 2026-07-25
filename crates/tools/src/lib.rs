@@ -1412,6 +1412,7 @@ impl ToolRegistry {
         }));
         r.register(Arc::new(CodeOutline {
             sbx: sandbox.clone(),
+            lsp: Arc::clone(&r.lsp),
         }));
         r.register(Arc::new(References {
             sbx: sandbox.clone(),
@@ -2285,9 +2286,37 @@ impl Tool for Glob {
 
 struct CodeOutline {
     sbx: Arc<WorkspaceSandbox>,
+    /// Answers from the language server when one can serve the file. The regex
+    /// rules below only recognise declarations they have a pattern for, and only
+    /// where the formatting matches; a server knows the file's real structure.
+    lsp: LspHandle,
 }
 
-/// Language-aware, line-based symbol patterns. Each rule has a `kind` label and a
+/// Map an LSP symbol kind number to a readable label. The numbers are fixed by
+/// the protocol, so this is a lookup rather than a heuristic.
+fn symbol_kind_label(kind: u8) -> &'static str {
+    match kind {
+        1 => "file",
+        2 => "module",
+        3 => "namespace",
+        4 => "package",
+        5 => "class",
+        6 => "method",
+        7 => "property",
+        8 => "field",
+        9 => "constructor",
+        10 => "enum",
+        11 => "interface",
+        12 => "fn",
+        13 => "var",
+        14 => "const",
+        23 => "struct",
+        26 => "type",
+        _ => "symbol",
+    }
+}
+
+/// Text fallback. Language-aware, line-based symbol patterns. Each rule has a `kind` label and a
 /// regex with a named `name` capture. Deliberately heuristic (no full parse): a
 /// fast, dependency-light table of contents, not a compiler front-end.
 fn outline_rules(path: &str) -> Vec<(&'static str, Regex)> {
@@ -2396,8 +2425,10 @@ impl Tool for CodeOutline {
         "Extract a symbol map — functions, classes, structs, traits, methods, etc., \
          each with its line number — from a source file. A fast table of contents so \
          you can jump straight to a symbol with `fs.read` (offset/limit) instead of \
-         reading the whole file. Supports Rust, Python, JS/TS, Go, Ruby, Java/Kotlin, \
-         C/C++. Heuristic (line-based), so it's cheap but not a full parse."
+         reading the whole file. When a language server can serve the file you get the \
+         file's real structure and `backend` names the server; otherwise it falls back \
+         to line-based patterns (Rust, Python, JS/TS, Go, Ruby, Java/Kotlin, C/C++) and \
+         `backend` says \"text\"."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -2411,6 +2442,32 @@ impl Tool for CodeOutline {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
+        // Prefer the server: the regex rules below only find declarations they
+        // have a pattern for, formatted the way the pattern expects. A server
+        // reports the file's actual structure, including what the rules miss.
+        if let Some(manager) = self.lsp.lock().ok().and_then(|slot| slot.clone())
+            && let Ok(absolute) = self.sbx.resolve(&path).await
+            && let lsp::QueryReport::Ready { server, items, .. } =
+                manager.document_symbols(absolute).await
+            && !items.is_empty()
+        {
+            let symbols: Vec<Value> = items
+                .iter()
+                .map(|symbol| {
+                    json!({
+                        "kind": symbol_kind_label(symbol.kind),
+                        "name": symbol.name,
+                        "line": symbol.location.range.start.line + 1,
+                    })
+                })
+                .collect();
+            return Ok(json!({
+                "path": path,
+                "backend": server,
+                "symbols": symbols,
+                "count": symbols.len(),
+            }));
+        }
         let content = self
             .sbx
             .read(&path)
@@ -2434,7 +2491,7 @@ impl Tool for CodeOutline {
             }
         }
         let count = symbols.len();
-        Ok(json!({ "path": path, "symbols": symbols, "count": count }))
+        Ok(json!({ "path": path, "backend": "text", "symbols": symbols, "count": count }))
     }
 }
 
@@ -5206,7 +5263,12 @@ impl Tool for Diagnostics {
          Java→`mvn`/`gradle` compile. Pass `language` to force one. Checkers not \
          installed are reported as skipped, never as a clean run. Build tools may \
          execute project-defined build scripts/plugins, so this action requires \
-         approval. Use after edits to find exactly what broke and where."
+         approval.\n\
+         \n\
+         This is the whole-project, authoritative check — use it to verify work before \
+         calling it done. For 'what did my edit just break in this file', prefer \
+         `lsp.diagnostics`: it is per-file, instant, needs no approval, and already \
+         runs automatically after every edit."
     }
     fn blast_radius(&self) -> BlastRadius {
         // Cargo/npm/Maven/Gradle and language plugins execute repository-owned

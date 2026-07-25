@@ -2702,6 +2702,21 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Slash commands are dispatched before the mid-turn steer path, so they
+    /// work while a turn is running — which is the only time `/steer` is any
+    /// use, since a foreground batch blocks the parent for as long as its
+    /// children run. A command missing from `COMMANDS` silently stops being a
+    /// command and becomes chat: it would be swallowed into the parent's steer
+    /// queue with a "queued for this task" notice, looking like it worked.
+    #[test]
+    fn agent_commands_are_recognised_so_they_survive_a_running_turn() {
+        assert!(super::is_slash_command("/steer tokio-research narrow it"));
+        assert!(super::is_slash_command("/agents"));
+        // Not a command: real prose must still reach the model as a steer.
+        assert!(!super::is_slash_command("why is it stuck here"));
+        assert!(!super::is_slash_command("/Users/me/notes.txt read this"));
+    }
+
     use super::*;
 
     /// Flatten a rendered line to its plain text (drops styling) for assertions.

@@ -135,6 +135,14 @@ impl Policy for DefaultPolicy {
             "shell.exec" => scan_command(intent, self.workspace.as_deref()),
             "git" => authorize_git(intent),
             "skill.save" => Decision::Human,
+            // agent.apply writes a sub-agent's diff into the user's working
+            // tree. Its blast radius is `ReversibleLocal` — accurate, since git
+            // can undo it — but radius alone would let it through unprompted,
+            // and that is the wrong reading of this action: the content is
+            // model-authored, was produced where the user could not see it, and
+            // the whole point of holding it as a patch is that a human decides
+            // whether it lands. Reviewing the diff *is* the feature.
+            "agent.apply" => Decision::Human,
             "memory.write" | "memory.update" | "memory.forget" if self.gates_memory(intent) => {
                 Decision::Human
             }
@@ -464,13 +472,35 @@ mod tests {
     /// declared radii. Unknown tools return `None` (unregistered → deny).
     fn radius_of(tool: &str) -> Option<BlastRadius> {
         Some(match tool {
-            "fs.write" | "fs.edit" | "multi_edit" | "git" => BlastRadius::ReversibleLocal,
+            "fs.write" | "fs.edit" | "multi_edit" | "git" | "agent.apply" => {
+                BlastRadius::ReversibleLocal
+            }
             "shell.exec" => BlastRadius::IrreversibleLocal,
             "deploy" => BlastRadius::External, // registered but externally-consequential
             "email.send" | "payment.charge" => return None, // unregistered
             _ => BlastRadius::Read,
         })
     }
+    /// Merging a sub-agent's diff is a human decision at every autonomy level.
+    ///
+    /// Its radius is `ReversibleLocal`, which on radius alone means Allow — so
+    /// without the explicit rule the model could write an agent's changes into
+    /// the user's tree with no card shown. The content is model-authored and
+    /// was produced where the user could not watch; holding it as a patch is
+    /// pointless if applying it needs no consent.
+    #[test]
+    fn applying_a_sub_agents_patch_always_asks_a_human() {
+        let p = DefaultPolicy::requiring_approval(Vec::<String>::new());
+        let apply = intent("agent.apply", json!({ "agent": "worker" }));
+        assert!(matches!(auth(&p, &apply), Decision::Human));
+        // Not merely a `careful` nicety: a looser dial must not turn merging
+        // someone else's unreviewed diff into a silent write.
+        assert!(
+            matches!(auth_at(&p, AutonomyLevel::Normal, &apply), Decision::Human),
+            "raising autonomy must not remove the review step"
+        );
+    }
+
     /// Authorize using the tool's declared radius, like the kernel does. Defaults
     /// to the safest dial so existing assertions pin `careful` behavior.
     fn auth(p: &DefaultPolicy, i: &ToolIntent) -> Decision {

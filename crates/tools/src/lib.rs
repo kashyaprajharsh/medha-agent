@@ -906,6 +906,15 @@ impl Tool for AgentSpawn {
         // above a plain read.
         BlastRadius::ReversibleLocal
     }
+    fn timeout(&self) -> Option<std::time::Duration> {
+        // No tool-level cap. A child is a whole session — it runs to its own
+        // turn budget, which is the bound that means anything here. The default
+        // 60s killed any child that did real work, and killed it *silently* from
+        // the parent's side: the report was lost even though the child had been
+        // making progress. Cancellation still settles it, through the parent's
+        // own interrupt and the child's token.
+        None
+    }
     fn category(&self) -> ToolCategory {
         ToolCategory::Other
     }
@@ -1937,6 +1946,17 @@ impl Tool for FsRead {
         // (only model context was protected by the 16KB spill). Ranged reads
         // stay allowed; point the model at them.
         const MAX_WHOLE_READ: u64 = 2_000_000;
+        // A directory reaches the OS as "Is a directory (os error 21)", which
+        // says nothing about what to do instead. Name the tools that answer the
+        // question actually being asked.
+        if let Ok(resolved) = self.sbx.resolve(&path).await
+            && resolved.is_dir()
+        {
+            return Err(ToolError::Args(format!(
+                "{path} is a directory — use `fs.list` for its entries, `tree` for a nested view, \
+                 or `glob`/`grep` to find files inside it"
+            )));
+        }
         if offset.is_none() && limit.is_none() {
             if let Ok(p) = self.sbx.resolve(&path).await {
                 if let Ok(md) = std::fs::metadata(&p) {
@@ -7329,6 +7349,40 @@ mod tests {
             "child got a write tool: {summary}"
         );
         assert_eq!(observation.payload["status"], "completed");
+    }
+
+    /// A child is a whole session and routinely outlives any per-tool cap. The
+    /// default 60s killed every agent that did real work — and killed it from
+    /// the parent's side, so the report was lost even though the child had been
+    /// making progress.
+    #[test]
+    fn delegation_is_not_subject_to_the_per_tool_timeout() {
+        let registry = registry_with_agents();
+        let spawn = registry
+            .tools
+            .get("agent.spawn")
+            .expect("agent.spawn is registered");
+        assert_eq!(
+            spawn.timeout(),
+            None,
+            "a sub-agent must be bounded by its turn budget, not a tool timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_a_directory_says_what_to_use_instead() {
+        let dir = std::env::temp_dir().join(format!("medha-dirread-{}", ulid_like()));
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let tool = FsRead { sbx };
+        // "Is a directory (os error 21)" names the problem and no remedy.
+        let error = tool
+            .execute(&json!({ "path": "inner" }))
+            .await
+            .expect_err("a directory is not readable as a file");
+        let message = error.to_string();
+        assert!(message.contains("fs.list"), "unhelpful: {message}");
+        assert!(message.contains("tree"), "unhelpful: {message}");
     }
 
     #[tokio::test]

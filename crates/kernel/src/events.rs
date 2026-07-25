@@ -37,6 +37,13 @@ pub enum EventKind {
     MemoryWrite,
     ContextFileLoaded,
     ContextFileBlocked,
+    /// A sub-agent's lifecycle (§6.2). The child's own transcript lives under
+    /// its own session id; these record the delegation itself, on the parent's
+    /// chain, so a run is auditable without reading the child.
+    AgentSpawned,
+    AgentCompleted,
+    AgentFailed,
+    AgentCancelled,
 }
 
 impl EventKind {
@@ -56,6 +63,10 @@ impl EventKind {
             EventKind::MemoryWrite => "memory.write",
             EventKind::ContextFileLoaded => "context.file_loaded",
             EventKind::ContextFileBlocked => "context.file_blocked",
+            EventKind::AgentSpawned => "agent.spawned",
+            EventKind::AgentCompleted => "agent.completed",
+            EventKind::AgentFailed => "agent.failed",
+            EventKind::AgentCancelled => "agent.cancelled",
         }
     }
 
@@ -74,6 +85,10 @@ impl EventKind {
             "memory.write" => EventKind::MemoryWrite,
             "context.file_loaded" => EventKind::ContextFileLoaded,
             "context.file_blocked" => EventKind::ContextFileBlocked,
+            "agent.spawned" => EventKind::AgentSpawned,
+            "agent.completed" => EventKind::AgentCompleted,
+            "agent.failed" => EventKind::AgentFailed,
+            "agent.cancelled" => EventKind::AgentCancelled,
             _ => return None,
         })
     }

@@ -9,6 +9,7 @@ rust-version.workspace = true
 kernel.workspace = true
 lsp = { path = "../lsp" }
 mcp = { path = "../mcp" }
+orchestrator = { path = "../orchestrator" }
 sandbox = { path = "../sandbox" }
 policy = { path = "../policy" }
 memory = { path = "../memory" }
@@ -36,3 +37,4 @@ pdf-extract = "0.12"
 sha2 = "0.10"
 
 [dev-dependencies]
+tokio-util = { version = "0.7" }

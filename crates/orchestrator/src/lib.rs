@@ -35,6 +35,8 @@ pub const MAX_SUMMARY_CHARS: usize = 16_000;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("sub-agents are not available in this session")]
+    Unavailable,
     #[error("agent objective is empty")]
     NoObjective,
     #[error("delegation depth {depth} exceeds the limit of {max}")]
@@ -130,6 +132,31 @@ pub struct ChildOutcome {
     pub tool_calls: u32,
     /// Least-trusted label seen across the child's observations.
     pub trust: TrustLabel,
+}
+
+/// A runner installed after construction. The kernel owns the executor that
+/// hosts `agent.spawn`, so the tool must exist before the kernel does; filling
+/// this in once afterwards breaks that cycle without a `Weak` dance at every
+/// call site.
+#[derive(Default)]
+pub struct DeferredRunner(std::sync::OnceLock<Arc<dyn ChildRunner>>);
+
+impl DeferredRunner {
+    /// Install the real runner. Later calls are ignored, so a second install
+    /// cannot swap the runtime out from under a running tree.
+    pub fn install(&self, runner: Arc<dyn ChildRunner>) {
+        let _ = self.0.set(runner);
+    }
+}
+
+#[async_trait::async_trait]
+impl ChildRunner for DeferredRunner {
+    async fn run(&self, run: ChildRun) -> Result<ChildOutcome, String> {
+        match self.0.get() {
+            Some(runner) => runner.run(run).await,
+            None => Err(Error::Unavailable.to_string()),
+        }
+    }
 }
 
 /// Control plane for one session tree. Held by the parent session and shared

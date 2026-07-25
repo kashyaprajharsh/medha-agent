@@ -803,6 +803,120 @@ impl Tool for McpStart {
     }
 }
 
+/// Delegate a bounded task to a child agent. The child is built from this
+/// objective — nothing has to be registered first — and runs with its own
+/// transcript, so its intermediate work never enters the parent's context.
+struct AgentSpawn {
+    control: Arc<orchestrator::AgentControl>,
+    executor: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
+    artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
+}
+
+#[async_trait]
+impl Tool for AgentSpawn {
+    fn name(&self) -> &str {
+        "agent.spawn"
+    }
+    fn icon(&self) -> &'static str {
+        "⚇"
+    }
+    fn description(&self) -> &str {
+        "Delegate a self-contained read-only investigation to a child agent and get back a summary. \
+         Use it when a question needs many searches or file reads whose intermediate output you do \
+         not want in this conversation — surveying a codebase, checking how something is used \
+         everywhere, gathering background. State the objective fully: the child cannot see this \
+         conversation. Give `contract` when the answer must have a particular shape. The child \
+         cannot write, and cannot use any tool you do not already have."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        // Read-only children: no mutation, but real model spend, so it stays
+        // above a plain read.
+        BlastRadius::ReversibleLocal
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Other
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "objective": {
+                    "type": "string",
+                    "description": "The complete task. The child sees only this — not this conversation."
+                },
+                "name": { "type": "string", "description": "Short label for the agent (optional)" },
+                "contract": {
+                    "type": "string",
+                    "description": "What the result must contain, e.g. 'a list of file:line with one sentence each'"
+                },
+                "tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Narrow the child to these tools. Omit to inherit yours. Cannot exceed yours."
+                },
+                "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" }
+            },
+            "required": ["objective"]
+        })
+    }
+    async fn preview(&self, args: &Value) -> Option<String> {
+        Some(format!(
+            "delegate to a read-only agent:\n{}",
+            args.get("objective")?.as_str()?
+        ))
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let objective = arg_str(args, "objective")?;
+        let Some(parent) = self.executor.lock().ok().and_then(|e| e.clone()) else {
+            return Err(ToolError::Failed(
+                "the agent runtime is not available in this session".into(),
+            ));
+        };
+        let spec = orchestrator::AgentSpec {
+            name: args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            objective,
+            contract: args
+                .get("contract")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tools: args.get("tools").and_then(Value::as_array).map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            }),
+            max_turns: args
+                .get("max_turns")
+                .and_then(Value::as_u64)
+                .map(|turns| turns as u32),
+        };
+        // The parent's remaining turns are not visible here; the kernel clamps
+        // the child again when it runs, so this is an upper bound, not the cap.
+        let mut result = self
+            .control
+            .spawn(spec, parent, AGENT_TURN_CEILING)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        // A long summary is bounded for context but never discarded.
+        if let Some(store) = &self.artifacts
+            && result.summary.len() >= orchestrator::MAX_SUMMARY_CHARS
+            && let Ok(hash) = store.put(result.summary.as_bytes())
+        {
+            result.artifact = Some(hash);
+        }
+        serde_json::to_value(result).map_err(|error| ToolError::Failed(error.to_string()))
+    }
+}
+
+/// Upper bound on a child's turns when the parent's remaining budget is not
+/// visible at the tool boundary.
+const AGENT_TURN_CEILING: u32 = 24;
+
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// The workspace sandbox, kept so the executor can report its containment
@@ -826,6 +940,9 @@ pub struct ToolRegistry {
     /// server that connects mid-session appears without rebuilding the registry).
     mcp: Option<Arc<mcp::McpManager>>,
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
+    /// The executor a child inherits from — this registry itself, installed
+    /// after the kernel is built. A child's tools are narrowed from it.
+    agent_parent: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
 }
 
 /// Shared handle to the surface's question-asker. `main` sets it after building
@@ -844,6 +961,7 @@ impl ToolRegistry {
             lsp: Arc::new(Mutex::new(None)),
             mcp: None,
             artifacts: None,
+            agent_parent: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -934,6 +1052,24 @@ impl ToolRegistry {
         }));
         self.register(Arc::new(McpStart { manager }));
         self
+    }
+
+    /// Enable `agent.spawn`. The control plane is built before the kernel (the
+    /// kernel owns this registry), so the parent executor is installed later via
+    /// the returned handle — see [`Self::agent_parent_handle`].
+    pub fn register_agents(&mut self, control: Arc<orchestrator::AgentControl>) -> &mut Self {
+        self.register(Arc::new(AgentSpawn {
+            control,
+            executor: Arc::clone(&self.agent_parent),
+            artifacts: self.artifacts.clone(),
+        }));
+        self
+    }
+
+    /// Handle for installing the executor children inherit from. `main` fills it
+    /// with the finished registry once the kernel exists.
+    pub fn agent_parent_handle(&self) -> Arc<Mutex<Option<Arc<dyn kernel::Executor>>>> {
+        Arc::clone(&self.agent_parent)
     }
 
     /// The names of every registered tool — used to validate a skill's
@@ -6445,5 +6581,83 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(out.get("skipped").and_then(Value::as_bool), Some(true));
+    }
+
+    /// A runner that reports what the child was actually given, so the wiring
+    /// from tool arguments through to a narrowed executor is covered end to end.
+    struct EchoRunner;
+
+    #[async_trait]
+    impl orchestrator::ChildRunner for EchoRunner {
+        async fn run(
+            &self,
+            run: orchestrator::ChildRun,
+        ) -> Result<orchestrator::ChildOutcome, String> {
+            let tools: Vec<String> = run.executor.specs().into_iter().map(|s| s.name).collect();
+            Ok(orchestrator::ChildOutcome {
+                status: orchestrator::AgentStatus::Completed,
+                summary: format!("saw {} tool(s): {}", tools.len(), tools.join(",")),
+                turns: 1,
+                tool_calls: 0,
+                trust: kernel::TrustLabel::Tool,
+            })
+        }
+    }
+
+    fn registry_with_agents() -> Arc<ToolRegistry> {
+        let mut registry = ToolRegistry::default();
+        let control = Arc::new(orchestrator::AgentControl::new(
+            Arc::new(EchoRunner),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        registry.register_agents(control);
+        let parent = registry.agent_parent_handle();
+        let registry = Arc::new(registry);
+        // What `main` does once the kernel exists: children narrow from the
+        // finished registry.
+        *parent.lock().unwrap() = Some(registry.clone() as Arc<dyn kernel::Executor>);
+        registry
+    }
+
+    #[tokio::test]
+    async fn agent_spawn_is_exposed_and_delegates_read_only() {
+        let registry = registry_with_agents();
+        assert!(
+            registry
+                .specs()
+                .iter()
+                .any(|spec| spec.name == "agent.spawn"),
+            "agent.spawn must reach the model"
+        );
+
+        let observation = registry
+            .execute(&kernel::ToolIntent {
+                id: "i1".into(),
+                tool: "agent.spawn".into(),
+                args: json!({ "objective": "survey the crate" }),
+            })
+            .await;
+        assert_eq!(observation.status, kernel::ObsStatus::Ok);
+        let summary = observation.payload["summary"].as_str().unwrap_or_default();
+        // The child inherited the parent's registry but only its read-only half,
+        // so a mutating tool must not appear in what it saw.
+        assert!(
+            !summary.contains("fs.write"),
+            "child got a write tool: {summary}"
+        );
+        assert_eq!(observation.payload["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn agent_spawn_without_an_objective_is_rejected() {
+        let registry = registry_with_agents();
+        let observation = registry
+            .execute(&kernel::ToolIntent {
+                id: "i1".into(),
+                tool: "agent.spawn".into(),
+                args: json!({ "objective": "  " }),
+            })
+            .await;
+        assert_ne!(observation.status, kernel::ObsStatus::Ok);
     }
 }

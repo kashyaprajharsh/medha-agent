@@ -12,6 +12,7 @@
 //! Env overrides: MEDHA_BASE_URL, MEDHA_MODEL, MEDHA_API_KEY
 
 mod acp;
+mod agents;
 mod config;
 mod skill_judge;
 mod tui_tea;
@@ -1236,6 +1237,16 @@ async fn main() -> Result<()> {
     if let Ok(mut slot) = registry.clarify_handle().lock() {
         *slot = Some(asker);
     }
+    // Sub-agents (Stage 3, O1). The control plane must exist before the kernel,
+    // because the kernel owns the registry that hosts `agent.spawn`; the runner
+    // and the parent executor are installed once the kernel is built.
+    let agent_runner = Arc::new(orchestrator::DeferredRunner::default());
+    let agent_control = Arc::new(orchestrator::AgentControl::new(
+        agent_runner.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    registry.register_agents(agent_control);
+    let agent_parent = registry.agent_parent_handle();
     let executor = Arc::new(registry);
 
     // Context engine: budget-aware two-phase compaction (§4.3), tuned from
@@ -1347,6 +1358,13 @@ async fn main() -> Result<()> {
     if let Some(progressive_context) = progressive_context {
         kernel = kernel.with_progressive_context(progressive_context);
     }
+    let kernel = Arc::new(kernel);
+    // Close the loop: children narrow from the finished registry, and the runner
+    // holds the kernel weakly so the cycle does not leak it.
+    if let Ok(mut slot) = agent_parent.lock() {
+        *slot = Some(Arc::clone(&kernel.executor));
+    }
+    agent_runner.install(Arc::new(agents::KernelRunner::new(&kernel)));
 
     // K1 Identity sheath is assembled by the context compiler, not hardcoded
     // here; config may override the persona (§4.3).
@@ -1470,7 +1488,7 @@ async fn main() -> Result<()> {
     // return when the editor disconnects. Takes priority over TUI/headless.
     if let Some((writer, pending)) = acp_bridge {
         acp::run(
-            Arc::new(kernel),
+            kernel.clone(),
             session,
             system,
             model_name,
@@ -1488,7 +1506,7 @@ async fn main() -> Result<()> {
     if !has_task {
         if let Some((tx, rx)) = tui_channel {
             tui_tea::run_tea(
-                Arc::new(kernel),
+                kernel.clone(),
                 session,
                 system,
                 model_name,

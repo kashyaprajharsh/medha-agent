@@ -812,6 +812,10 @@ struct AgentSpawn {
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
     /// Operator ceiling on one child's turns, from `[agents] max_turns`.
     max_turns: u32,
+    /// The dispatching session. A background report is addressed to whoever
+    /// asked for it at dispatch time, so this has to be known before the child
+    /// runs — not resolved when it finishes.
+    session: SessionHandle,
 }
 
 #[async_trait]
@@ -866,7 +870,11 @@ impl Tool for AgentSpawn {
                     "items": { "type": "string" },
                     "description": "Narrow the child to these tools. Omit to inherit yours. Cannot exceed yours."
                 },
-                "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" }
+                "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" },
+                "background": {
+                    "type": "boolean",
+                    "description": "Return immediately instead of waiting. The report arrives at the start of a later turn. Use for work you do not need before answering; keep it false when you need the answer now."
+                }
             },
             "required": ["objective"]
         })
@@ -907,6 +915,27 @@ impl Tool for AgentSpawn {
                 .and_then(Value::as_u64)
                 .map(|turns| turns as u32),
         };
+        // Background: hand back the handle now, report arrives on a later turn.
+        if args
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let owner = self.session.lock().ok().and_then(|id| *id).ok_or_else(|| {
+                ToolError::Failed("no session to deliver a background report to".into())
+            })?;
+            let handle = self
+                .control
+                .spawn_background(spec, parent, self.max_turns, owner)
+                .await
+                .map_err(|error| ToolError::Failed(error.to_string()))?;
+            return Ok(json!({
+                "agent": handle.agent,
+                "session": handle.session,
+                "status": "running",
+                "note": "running in the background; its report will arrive at the start of a later turn. Do not wait for it — carry on, and do not invent its findings.",
+            }));
+        }
         // The parent's live turn counter is not visible at the tool boundary, so
         // the operator's ceiling is the bound. A child's turns are its own
         // session's anyway; the tokens are the shared cost, which this caps.
@@ -939,6 +968,68 @@ impl Tool for AgentSpawn {
     }
 }
 
+/// Shared slot for the session a background report belongs to.
+pub type SessionHandle = Arc<Mutex<Option<ulid::Ulid>>>;
+
+/// Inspect and stop running agents. Read-only listing plus a targeted stop, so
+/// the model can abandon work it no longer needs rather than paying for it.
+struct AgentControlTool {
+    control: Arc<orchestrator::AgentControl>,
+    stop: bool,
+}
+
+#[async_trait]
+impl Tool for AgentControlTool {
+    fn name(&self) -> &str {
+        if self.stop {
+            "agent.cancel"
+        } else {
+            "agent.list"
+        }
+    }
+    fn icon(&self) -> &'static str {
+        "⚇"
+    }
+    fn description(&self) -> &str {
+        if self.stop {
+            "Stop one running agent by its name or session id. Its siblings keep running, and \
+             whatever it had found is still reported."
+        } else {
+            "List the agents running right now, with what each was asked to do."
+        }
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+    fn schema(&self) -> Value {
+        if self.stop {
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "description": "Agent name or session id" }
+                },
+                "required": ["agent"]
+            })
+        } else {
+            json!({ "type": "object", "properties": {} })
+        }
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        if !self.stop {
+            return Ok(json!({ "agents": self.control.active() }));
+        }
+        let id = arg_str(args, "agent")?;
+        let stopped = self.control.cancel(&id);
+        if stopped.is_empty() {
+            return Err(ToolError::Failed(format!("no running agent '{id}'")));
+        }
+        Ok(json!({ "cancelled": stopped }))
+    }
+}
+
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// The workspace sandbox, kept so the executor can report its containment
@@ -965,6 +1056,7 @@ pub struct ToolRegistry {
     /// The executor a child inherits from — this registry itself, installed
     /// after the kernel is built. A child's tools are narrowed from it.
     agent_parent: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
+    agent_session: SessionHandle,
 }
 
 /// Shared handle to the surface's question-asker. `main` sets it after building
@@ -984,6 +1076,7 @@ impl ToolRegistry {
             mcp: None,
             artifacts: None,
             agent_parent: Arc::new(Mutex::new(None)),
+            agent_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1085,12 +1178,27 @@ impl ToolRegistry {
         max_turns: u32,
     ) -> &mut Self {
         self.register(Arc::new(AgentSpawn {
-            control,
+            control: control.clone(),
             executor: Arc::clone(&self.agent_parent),
             artifacts: self.artifacts.clone(),
             max_turns: max_turns.max(1),
+            session: Arc::clone(&self.agent_session),
+        }));
+        self.register(Arc::new(AgentControlTool {
+            control: control.clone(),
+            stop: false,
+        }));
+        self.register(Arc::new(AgentControlTool {
+            control,
+            stop: true,
         }));
         self
+    }
+
+    /// Handle for the session background reports belong to. `main` fills it once
+    /// the session id exists.
+    pub fn agent_session_handle(&self) -> SessionHandle {
+        Arc::clone(&self.agent_session)
     }
 
     /// Handle for installing the executor children inherit from. `main` fills it

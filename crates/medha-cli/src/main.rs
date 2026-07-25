@@ -1247,12 +1247,16 @@ async fn main() -> Result<()> {
                 agent_runner.clone(),
                 tokio_util::sync::CancellationToken::new(),
             )
-            .with_limits(lock.agents.max_active, lock.agents.max_depth),
+            .with_limits(lock.agents.max_active, lock.agents.max_depth)
+            // Delivery rides the event log, so a background report survives a
+            // restart and reaches the session that dispatched it.
+            .with_outbox(Arc::new(agents::LogOutbox::new(log.clone()))),
         );
         registry.register_agents(control.clone(), lock.agents.max_turns);
         control
     });
     let agent_parent = registry.agent_parent_handle();
+    let agent_session = registry.agent_session_handle();
     let executor = Arc::new(registry);
 
     // Context engine: budget-aware two-phase compaction (§4.3), tuned from
@@ -1438,6 +1442,11 @@ async fn main() -> Result<()> {
             (Session::new(), Vec::new())
         }
     };
+    // Background reports are addressed to this session at dispatch time, so the
+    // id has to be known before any agent can be launched.
+    if let Ok(mut slot) = agent_session.lock() {
+        *slot = Some(session.id);
+    }
     if lock.memory.enabled {
         let session_events = log.events(session.id).await;
         let forked = session_events

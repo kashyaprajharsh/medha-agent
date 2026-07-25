@@ -3399,11 +3399,30 @@ pub(super) fn spawn_turn<P, L>(
     // Apply the live autonomy dial to this turn's session (the policy reads it).
     let mut session = session.clone();
     session.autonomy = model.autonomy;
-    let messages = transcript.clone();
+    let mut messages = transcript.clone();
     let budget = budget.clone();
     let tx = tx.clone();
+    let agents = model.agents.clone();
 
     tokio::spawn(async move {
+        // Reports from background agents, delivered at the head of the turn.
+        // Collecting here rather than on completion is what makes delivery
+        // survive a restart: the outbox holds them until their owner next runs.
+        if let Some(control) = &agents {
+            for result in control.collect(session.id).await {
+                messages.push(Message::new(
+                    kernel::Role::User,
+                    format!(
+                        "[background agent '{}' finished — {}]\n{}",
+                        result.agent,
+                        serde_json::to_string(&result.status)
+                            .unwrap_or_default()
+                            .trim_matches('"'),
+                        result.summary
+                    ),
+                ));
+            }
+        }
         let sink = TuiSink { tx: tx.clone() };
         match kernel
             .run_session(&session, messages, budget, &sink, Some(queue))

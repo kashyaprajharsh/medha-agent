@@ -65,7 +65,7 @@ pub struct AgentSpec {
     pub max_turns: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Completed,
@@ -77,7 +77,10 @@ pub enum AgentStatus {
 
 /// What the parent sees. Never the child's transcript — that stays in the event
 /// log under the child's own session id, durable and resumable.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Round-trips through the log: a background report is written when the child
+/// finishes and read back when its owner next runs, possibly in another process.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct AgentResult {
     pub agent: String,
     pub session: String,
@@ -161,8 +164,9 @@ pub trait Outbox: Send + Sync {
     /// Record a terminal result against its dispatch.
     async fn finished(&self, dispatch: &Dispatch, result: &AgentResult);
     /// Mark a result handed to its owner. Delivery is idempotent: replaying the
-    /// log must not inject the same report twice.
-    async fn delivered(&self, child: Ulid);
+    /// log must not inject the same report twice. Takes `parent` because the
+    /// record belongs on the owner's chain, not the child's.
+    async fn delivered(&self, parent: Ulid, child: Ulid);
     /// Results owned by `parent` that have not been delivered, oldest first.
     async fn undelivered(&self, parent: Ulid) -> Vec<AgentResult>;
 }
@@ -290,7 +294,7 @@ impl AgentControl {
         let ready = outbox.undelivered(parent).await;
         for result in &ready {
             if let Ok(child) = result.session.parse() {
-                outbox.delivered(child).await;
+                outbox.delivered(parent, child).await;
             }
         }
         ready
@@ -865,7 +869,7 @@ mod tests {
                 row.1 = Some(result.clone());
             }
         }
-        async fn delivered(&self, child: Ulid) {
+        async fn delivered(&self, _parent: Ulid, child: Ulid) {
             if let Some(row) = self
                 .rows
                 .lock()

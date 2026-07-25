@@ -44,6 +44,9 @@ pub enum EventKind {
     AgentCompleted,
     AgentFailed,
     AgentCancelled,
+    /// A background agent's report handed to the session that dispatched it.
+    /// Delivery has to be recorded, or replaying the log re-injects the report.
+    AgentDelivered,
 }
 
 impl EventKind {
@@ -67,6 +70,7 @@ impl EventKind {
             EventKind::AgentCompleted => "agent.completed",
             EventKind::AgentFailed => "agent.failed",
             EventKind::AgentCancelled => "agent.cancelled",
+            EventKind::AgentDelivered => "agent.delivered",
         }
     }
 
@@ -89,6 +93,7 @@ impl EventKind {
             "agent.completed" => EventKind::AgentCompleted,
             "agent.failed" => EventKind::AgentFailed,
             "agent.cancelled" => EventKind::AgentCancelled,
+            "agent.delivered" => EventKind::AgentDelivered,
             _ => return None,
         })
     }
@@ -175,6 +180,44 @@ impl Event {
             EventKind::AgentSpawned,
             json!({ "agent": name, "objective": objective, "tools": tools }),
             // The objective is authored by the model, not the user.
+            TrustLabel::System,
+        )
+    }
+
+    /// A background agent dispatched, recorded on the *dispatching* session's
+    /// chain. This is the outbox row: its presence without a terminal event is
+    /// what makes an orphaned child visible after a crash.
+    pub fn agent_dispatched(s: &Session, name: &str, child: Ulid, objective: &str) -> Self {
+        Self::new(
+            s,
+            EventKind::AgentSpawned,
+            json!({ "agent": name, "child": child.to_string(), "objective": objective }),
+            TrustLabel::System,
+        )
+    }
+
+    /// A background agent's report, against its dispatch. `trust` is the weakest
+    /// label the child touched, so the record says what the report is worth.
+    pub fn agent_report(
+        s: &Session,
+        kind: EventKind,
+        child: Ulid,
+        mut payload: Value,
+        trust: TrustLabel,
+    ) -> Self {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("child".into(), Value::String(child.to_string()));
+        }
+        Self::new(s, kind, payload, trust)
+    }
+
+    /// A report handed to its owner. Without this the fold would re-deliver on
+    /// every replay.
+    pub fn agent_delivered(s: &Session, child: Ulid) -> Self {
+        Self::new(
+            s,
+            EventKind::AgentDelivered,
+            json!({ "child": child.to_string() }),
             TrustLabel::System,
         )
     }

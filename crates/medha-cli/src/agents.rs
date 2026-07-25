@@ -39,6 +39,113 @@ fn child_prompt(run: &ChildRun) -> String {
     prompt
 }
 
+/// Durable delivery folded from the dispatching session's own event chain.
+///
+/// Medha's log is append-only, hash-chained and already per-session, so the
+/// outbox needs no storage of its own: `agent.spawned` is the dispatch row,
+/// a terminal event carries the report, and `agent.delivered` closes it. State
+/// is whatever the fold says, which means it survives a restart for free and
+/// cannot disagree with the audit trail.
+pub struct LogOutbox<L: EventLog> {
+    log: Arc<L>,
+}
+
+impl<L: EventLog> LogOutbox<L> {
+    pub fn new(log: Arc<L>) -> Self {
+        Self { log }
+    }
+}
+
+/// Events are addressed by session id; the rest of `Session` is not read when
+/// one is appended, so this is enough to write onto another session's chain.
+fn chain(id: ulid::Ulid) -> Session {
+    Session {
+        id,
+        done: false,
+        autonomy: kernel::AutonomyLevel::Careful,
+    }
+}
+
+#[async_trait::async_trait]
+impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
+    async fn dispatched(&self, dispatch: &orchestrator::Dispatch) {
+        // On the parent's chain, and written before the child starts: a crash
+        // in between leaves a dispatch with no terminal event, which reads as an
+        // orphan rather than as nothing having happened.
+        let _ = self
+            .log
+            .append(Event::agent_dispatched(
+                &chain(dispatch.parent),
+                &dispatch.agent,
+                dispatch.child,
+                &dispatch.objective,
+            ))
+            .await;
+    }
+
+    async fn finished(
+        &self,
+        dispatch: &orchestrator::Dispatch,
+        result: &orchestrator::AgentResult,
+    ) {
+        let kind = match result.status {
+            orchestrator::AgentStatus::Cancelled => EventKind::AgentCancelled,
+            orchestrator::AgentStatus::Failed => EventKind::AgentFailed,
+            _ => EventKind::AgentCompleted,
+        };
+        let payload = serde_json::to_value(result).unwrap_or_default();
+        let _ = self
+            .log
+            .append(Event::agent_report(
+                &chain(dispatch.parent),
+                kind,
+                dispatch.child,
+                payload,
+                result.trust,
+            ))
+            .await;
+    }
+
+    async fn delivered(&self, parent: ulid::Ulid, child: ulid::Ulid) {
+        let _ = self
+            .log
+            .append(Event::agent_delivered(&chain(parent), child))
+            .await;
+    }
+
+    async fn undelivered(&self, parent: ulid::Ulid) -> Vec<orchestrator::AgentResult> {
+        let mut ready: Vec<(ulid::Ulid, orchestrator::AgentResult)> = Vec::new();
+        let mut delivered: Vec<String> = Vec::new();
+        for event in self.log.events(parent).await {
+            let child = event
+                .payload
+                .get("child")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            match event.kind {
+                EventKind::AgentCompleted | EventKind::AgentFailed | EventKind::AgentCancelled => {
+                    if let Ok(result) = serde_json::from_value(event.payload.clone())
+                        && let Ok(id) = child.parse()
+                    {
+                        ready.push((id, result));
+                    }
+                }
+                EventKind::AgentDelivered => delivered.push(child),
+                _ => {}
+            }
+        }
+        // Oldest first, and never one already handed over — the fold is what
+        // makes redelivery impossible rather than a flag someone has to remember.
+        ready.sort_by_key(|(id, _)| *id);
+        ready
+            .into_iter()
+            .filter(|(id, _)| !delivered.contains(&id.to_string()))
+            .map(|(_, result)| result)
+            .collect()
+    }
+}
+
 pub struct KernelRunner<P: Provider, L: EventLog> {
     /// Weak on purpose: the kernel owns the executor that hosts `agent.spawn`,
     /// which owns the control plane that owns this runner. A strong handle would

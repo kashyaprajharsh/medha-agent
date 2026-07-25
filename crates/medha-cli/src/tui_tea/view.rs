@@ -87,13 +87,15 @@ pub(super) fn activity_label(model: &Model) -> String {
 pub(super) fn veena_line(frame: u64) -> Line<'static> {
     const FRETS: usize = 8;
     let mut glyphs: Vec<&'static str> = Vec::new();
-    glyphs.extend(["◖", "◉", "◗"]); // kudam — large resonator + soundhole
+    // Light box-drawing only. The heavy/mixed-weight forms (`━`, `┿`) and the
+    // pegbox curl (`╮`) fall back to unrelated glyphs in common terminal fonts —
+    // the curl was rendering as a stray `⌐` hanging off the end.
+    glyphs.extend(["◖", "◉", "◗"]); // kudam — resonator + soundhole
     for _ in 0..FRETS {
-        glyphs.extend(["━", "┿"]); // fretted neck (dandi)
+        glyphs.extend(["─", "┼"]); // fretted neck (dandi)
     }
-    glyphs.push("━");
-    glyphs.push("○"); // tumba — small upper gourd
-    glyphs.push("╮"); // pegbox curl
+    glyphs.push("─");
+    glyphs.push("○"); // tumba — upper gourd
 
     let n = glyphs.len();
     // The resonance travels the neck, then a short gap lets the string settle
@@ -221,28 +223,38 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
         )],
         w,
     ));
-    body.push(Line::from(""));
-    for (i, line) in LOGO.lines().enumerate() {
-        let rgb = LOGO_GRADIENT[i.min(LOGO_GRADIENT.len() - 1)];
-        body.push(center_line(logo_row(line, rgb), w));
+    // The block logo is the tallest element and the first to go. A short
+    // terminal used to render the splash from row 0 and clip it mid-letter;
+    // dropping the art keeps a composed screen at any height.
+    let logo_rows = LOGO.lines().count();
+    // wordmark + blank + tagline + blank + veena + blank + hint, plus the art.
+    let room_for_logo = (area.height as usize) >= logo_rows + 9;
+    if room_for_logo {
+        body.push(Line::from(""));
+        for (i, line) in LOGO.lines().enumerate() {
+            let rgb = LOGO_GRADIENT[i.min(LOGO_GRADIENT.len() - 1)];
+            body.push(center_line(logo_row(line, rgb), w));
+        }
     }
     body.push(Line::from(""));
     body.push(center_line(
         vec![Span::styled(
-            "verification-first · open-first agent harness",
+            "verification-first · open source · your machine, your keys",
             Style::default()
                 .fg(theme::dim())
                 .add_modifier(Modifier::ITALIC),
         )],
         w,
     ));
-    body.push(Line::from(""));
-    let veena = veena_line(model.anim_frame);
-    body.push(center_line(veena.spans, w));
+    if area.height >= 12 {
+        body.push(Line::from(""));
+        let veena = veena_line(model.anim_frame);
+        body.push(center_line(veena.spans, w));
+    }
     body.push(Line::from(""));
     body.push(center_line(
         vec![Span::styled(
-            "type below to begin · /help for commands · Ctrl-D to quit",
+            "describe a task below · / for commands · ctrl-d to quit",
             Style::default().fg(theme::faint()),
         )],
         w,
@@ -1120,7 +1132,13 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  {} [{}]", model.model, model.protocol.as_str()),
+            // The protocol tag is the first thing to go: a long model name plus
+            // a long protocol name is what pushes a narrow status line over.
+            if area.width >= 100 {
+                format!("  {} [{}]", model.model, model.protocol.as_str())
+            } else {
+                format!("  {}", model.model)
+            },
             Style::default().fg(theme::dim()),
         ),
     ];
@@ -1249,14 +1267,29 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     } else {
         "/reasoning · /detail · /help"
     };
-    let right = format!("{ctx}{cost} · {reasoning}{stream}   {hints}");
     // Pad in terminal cells (K14) so the right block stays right-aligned even
     // with wide glyphs in the left block.
     let left_w: usize = left
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let pad = (area.width as usize).saturating_sub(left_w + UnicodeWidthStr::width(right.as_str()));
+    // Fullest first. A status line that does not fit used to overflow the row
+    // and get clipped by the renderer, which cuts mid-word ("…/rea"); dropping
+    // detail in priority order degrades legibly instead. Two cells of gap keep
+    // the blocks from touching.
+    let available = (area.width as usize).saturating_sub(left_w + 2);
+    let right = [
+        format!("{ctx}{cost} · {reasoning}{stream}   {hints}"),
+        format!("{ctx}{cost} · {reasoning}{stream}"),
+        format!("{ctx}{cost} · reasoning {mode}{stream}"),
+        format!("{ctx}{cost}"),
+        ctx.clone(),
+    ]
+    .into_iter()
+    .find(|candidate| UnicodeWidthStr::width(candidate.as_str()) <= available)
+    .unwrap_or_default();
+
+    let pad = available.saturating_sub(UnicodeWidthStr::width(right.as_str())) + 2;
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(pad)));
     spans.push(Span::styled(right, Style::default().fg(theme::faint())));
@@ -1316,6 +1349,21 @@ pub(super) fn input_rows(model: &Model, outer_width: u16) -> usize {
         .len()
 }
 
+/// Composer placeholder, longest variant that fits `width` cells. Hints are
+/// worth showing but not worth truncating: a half-printed shortcut is noise.
+fn placeholder(width: usize) -> &'static str {
+    const VARIANTS: [&str; 4] = [
+        "Ask medha to build, fix, or explain something…   ( / commands · \\+enter newline · ctrl-click opens links )",
+        "Ask medha to build, fix, or explain something…   ( / commands · \\+enter newline )",
+        "Ask medha to build, fix, or explain something…   ( / for commands )",
+        "Ask medha to build, fix, or explain something…",
+    ];
+    VARIANTS
+        .into_iter()
+        .find(|variant| UnicodeWidthStr::width(*variant) <= width)
+        .unwrap_or("Ask medha…")
+}
+
 pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
     let (accent, glyph) = if model.running {
         (theme::faint(), "…")
@@ -1326,8 +1374,9 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(accent))
-        // 1 col each side + 1 blank line top/bottom → a roomier, less cramped box.
-        .padding(ratatui::widgets::Padding::new(1, 1, 1, 1));
+        // Horizontal breathing room only. Vertical padding cost two rows of
+        // transcript and made an empty composer five rows tall.
+        .padding(ratatui::widgets::Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if model.input.is_empty() && !model.running {
@@ -1376,8 +1425,10 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
                 format!("{glyph} "),
                 Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ),
+            // Longest that fits, so the hints never get clipped mid-word. The
+            // invitation always survives; the shortcuts are what give way.
             Span::styled(
-                "Ask medha to build, fix, or explain something…   ( / for commands · \\ + enter or ctrl+j for newline · ctrl-click to open a link or file )",
+                placeholder(inner.width.saturating_sub(2) as usize),
                 Style::default().fg(theme::faint()),
             ),
         ]);
@@ -1832,11 +1883,11 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     let content_w = area.width.saturating_sub(margin * 2);
 
     // Input box interior width = content minus the rounded border (1 each side)
-    // and its horizontal padding (1 each side) = 4. Height reserves the border
-    // (2) plus one blank line of vertical padding top and bottom (2) so the
-    // prompt sits with breathing room rather than crammed against the border.
+    // and its horizontal padding (1 each side) = 4. Height is the text plus the
+    // border only: a blank line above and below cost two rows of transcript for
+    // no legibility, and made an empty composer five rows tall.
     let text_rows = input_rows(model, content_w.saturating_sub(4)) as u16;
-    let box_h = text_rows.clamp(1, 8) + 4;
+    let box_h = text_rows.clamp(1, 8) + 2;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2260,5 +2311,37 @@ mod clarify_view_tests {
         let code_hash_header = parse_inline_markdown("#include <stdio.h>");
         assert_eq!(code_hash_header.spans.len(), 1);
         assert_eq!(code_hash_header.spans[0].content, "#include <stdio.h>");
+    }
+
+    #[test]
+    fn the_placeholder_never_gets_clipped_mid_hint() {
+        use unicode_width::UnicodeWidthStr;
+        // Every width must yield something that fits, including absurdly narrow
+        // ones — the composer used to print a half-finished shortcut.
+        for width in [10usize, 40, 60, 80, 100, 140, 200] {
+            let text = super::placeholder(width);
+            assert!(
+                UnicodeWidthStr::width(text) <= width || width < 12,
+                "placeholder {:?} ({} cells) overflows width {width}",
+                text,
+                UnicodeWidthStr::width(text)
+            );
+        }
+        // The invitation survives at every width; only the hints give way.
+        assert!(super::placeholder(200).contains("ctrl-click"));
+        assert!(!super::placeholder(60).contains("ctrl-click"));
+        assert!(super::placeholder(60).starts_with("Ask medha"));
+    }
+
+    #[test]
+    fn the_veena_uses_only_glyphs_that_render() {
+        // Heavy and mixed-weight box drawing falls back to unrelated shapes in
+        // common terminal fonts; the pegbox curl rendered as a stray `⌐`.
+        let line = super::veena_line(0);
+        let drawn: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        for bad in ['━', '┿', '╮', '╯'] {
+            assert!(!drawn.contains(bad), "veena still uses {bad:?}");
+        }
+        assert!(drawn.contains('◉') && drawn.contains('○'));
     }
 }

@@ -922,7 +922,7 @@ pub(super) fn handle_key<P, L>(
                     None
                 };
                 if let Some(id) = id {
-                    open_mcp_tools(model, &id);
+                    open_mcp_tools(model, &id, tx);
                 }
                 return;
             }
@@ -2086,6 +2086,13 @@ pub(super) fn handle_agent_event(
             };
             model.upsert_notice("MCP", text);
         }
+        TuiEvent::McpTools { server, tools } => {
+            if tools.is_empty() {
+                model.push_notice(format!("'{server}' exposes no tools"));
+            } else {
+                model.picker = Some(Picker::new(PickerKind::McpTools { id: server, tools }));
+            }
+        }
         TuiEvent::McpNeedsAuth { server, url } => {
             model.picker = Some(Picker::new(PickerKind::McpAuth { id: server, url }));
         }
@@ -2754,7 +2761,20 @@ fn connect_mcp_server(
     tx: mpsc::UnboundedSender<TuiEvent>,
 ) {
     tokio::spawn(async move {
-        match manager.approve_and_connect(&id, None).await {
+        // A server edited straight into config.toml is not in this session's
+        // host yet; register it from the config rather than reporting it missing.
+        let mut outcome = manager.approve_and_connect(&id, None).await;
+        if matches!(outcome, Err(mcp::Error::UnknownServer(_)))
+            && let Some(server) = config::load()
+                .ok()
+                .flatten()
+                .and_then(|c| c.mcp.get(&id).cloned())
+        {
+            outcome = manager
+                .add_server(config::resolve_mcp_server(&id, &server))
+                .await;
+        }
+        match outcome {
             Err(mcp::Error::NeedsAuth(_)) => authorize_mcp_server(manager, id, tx),
             Err(mcp::Error::NeedsToken(_)) => {
                 let url = manager
@@ -2876,9 +2896,9 @@ fn mcp_set_disabled(
         let (id, tx) = (id.to_string(), tx.clone());
         let resolved = config::resolve_mcp_server(&id, &server);
         tokio::spawn(async move {
-            if disabled {
-                let _ = manager.remove_server(&id).await;
-            } else {
+            // The server may predate this session's host (added straight to
+            // config.toml); register it before switching it on.
+            if manager.set_disabled(&id, disabled).await.is_err() && !disabled {
                 let _ = manager.add_server(resolved).await;
             }
             let _ = tx.send(TuiEvent::McpStatus(Ok(
@@ -2895,20 +2915,51 @@ fn mcp_set_disabled(
 
 /// Open one server's catalogue so individual tools can be switched off. A large
 /// server injects every schema into every request, so this is real context cost.
-fn open_mcp_tools(model: &mut Model, id: &str) {
+/// Connects on demand — browsing tools should not require connecting first.
+fn open_mcp_tools(model: &mut Model, id: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let Some(manager) = model.mcp.clone() else {
         return model.push_notice("MCP host unavailable");
     };
     let tools = manager.server_tools(id);
-    if tools.is_empty() {
+    if !tools.is_empty() {
+        model.picker = Some(Picker::new(PickerKind::McpTools {
+            id: id.to_string(),
+            tools,
+        }));
+        return;
+    }
+    // A switched-off server has no catalogue and connecting would un-park it,
+    // which is not what `t` should do behind the user's back.
+    let configured = config::load()
+        .ok()
+        .flatten()
+        .and_then(|c| c.mcp.get(id).cloned());
+    if configured.as_ref().is_some_and(|server| server.disabled) {
         return model.push_notice(format!(
-            "'{id}' has no listed tools — connect it first (Enter on its row)"
+            "'{id}' is switched off — press space to turn it on"
         ));
     }
-    model.picker = Some(Picker::new(PickerKind::McpTools {
-        id: id.to_string(),
-        tools,
-    }));
+    model.push_notice(format!("(listing tools for '{id}' …)"));
+    let (id, tx) = (id.to_string(), tx.clone());
+    tokio::spawn(async move {
+        let mut outcome = manager.approve_and_connect(&id, None).await;
+        if matches!(outcome, Err(mcp::Error::UnknownServer(_)))
+            && let Some(server) = configured
+        {
+            outcome = manager
+                .add_server(config::resolve_mcp_server(&id, &server))
+                .await;
+        }
+        match outcome {
+            Ok(_) => {
+                let tools = manager.server_tools(&id);
+                let _ = tx.send(TuiEvent::McpTools { server: id, tools });
+            }
+            Err(error) => {
+                let _ = tx.send(TuiEvent::McpStatus(Err(format!("'{id}': {error}"))));
+            }
+        }
+    });
 }
 
 /// Switch one tool's exposure, persisting it as a `deny_tools` entry.

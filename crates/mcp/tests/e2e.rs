@@ -469,3 +469,32 @@ async fn the_tool_browser_lists_filtered_tools_as_switched_off() {
     assert!(tools.iter().any(|(name, on)| name == "echo" && *on));
     manager.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switching_a_server_off_parks_it_without_forgetting_it() {
+    let Some(fake) = Fake::new() else { return };
+    let manager = McpManager::new(
+        fake.path().to_path_buf(),
+        config(server("fake", fake.command("normal", None))),
+    );
+    manager.connect_startup().await;
+    assert_eq!(manager.status().await[0].state, ServerState::Ready);
+
+    // Off: the client is torn down and its tools leave context…
+    manager.set_disabled("fake", true).await.unwrap();
+    assert_eq!(manager.status().await[0].state, ServerState::Disabled);
+    assert!(manager.tool_specs().is_empty());
+
+    // …but the server is still known, so the UI can act on it again. This is
+    // the regression: a parked server used to be dropped from the manager and
+    // then reported as "no MCP server named 'fake'".
+    manager.set_disabled("fake", false).await.unwrap();
+    assert_eq!(manager.status().await[0].state, ServerState::Ready);
+    assert_eq!(manager.tool_specs().len(), 5);
+
+    // Connecting is also an un-park, so Enter on a switched-off row works.
+    manager.set_disabled("fake", true).await.unwrap();
+    manager.approve_and_connect("fake", None).await.unwrap();
+    assert_eq!(manager.status().await[0].state, ServerState::Ready);
+    manager.shutdown().await;
+}

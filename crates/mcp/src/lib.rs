@@ -628,15 +628,19 @@ impl McpManager {
         server_id: &str,
         announce: Option<&UrlSink>,
     ) -> Result<ServerStatus, Error> {
-        let server = self.server_config(server_id).await?;
         self.ensure_supervisor();
-        {
+        let server = {
             let mut servers = self.inner.servers.lock().await;
-            if let Some(slot) = servers.get_mut(server_id) {
-                slot.failures = 0;
-                slot.retry_at = None;
-            }
-        }
+            let slot = servers
+                .get_mut(server_id)
+                .ok_or_else(|| Error::UnknownServer(server_id.to_string()))?;
+            // Connecting is an explicit human action: it un-parks the server too,
+            // so Enter on a switched-off row does what it looks like it does.
+            slot.config.disabled = false;
+            slot.failures = 0;
+            slot.retry_at = None;
+            slot.config.clone()
+        };
         match (self.connect_one(&server).await, announce) {
             (Err(Error::NeedsAuth(_)), Some(announce)) => self.authorize(server_id, announce).await,
             (result, _) => {
@@ -689,6 +693,42 @@ impl McpManager {
         store.save(server_id, &credentials);
         self.ensure_supervisor();
         self.connect_one(&server).await?;
+        self.server_status(server_id).await
+    }
+
+    /// Park or unpark a server. Disabling tears down the live client so its
+    /// tools leave the model's context at once, but keeps the slot — the server
+    /// is switched off, not forgotten, so it stays selectable in the UI.
+    pub async fn set_disabled(
+        &self,
+        server_id: &str,
+        disabled: bool,
+    ) -> Result<ServerStatus, Error> {
+        let (retiree, config) = {
+            let mut servers = self.inner.servers.lock().await;
+            let slot = servers
+                .get_mut(server_id)
+                .ok_or_else(|| Error::UnknownServer(server_id.to_string()))?;
+            slot.config.disabled = disabled;
+            if !disabled {
+                slot.failures = 0;
+                slot.retry_at = None;
+                (None, Some(slot.config.clone()))
+            } else {
+                slot.state = ServerState::Disabled;
+                slot.detail = None;
+                slot.retry_at = None;
+                (Some(slot.detach()), None)
+            }
+        };
+        if let Some(retiree) = retiree {
+            self.forget_tools(server_id);
+            retiree.retire().await;
+        }
+        if let Some(config) = config {
+            self.ensure_supervisor();
+            self.connect_one(&config).await?;
+        }
         self.server_status(server_id).await
     }
 

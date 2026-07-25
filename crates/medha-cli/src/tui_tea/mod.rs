@@ -449,6 +449,11 @@ pub(crate) enum TuiEvent {
         server: String,
         url: String,
     },
+    /// A server's catalogue is ready to browse.
+    McpTools {
+        server: String,
+        tools: Vec<(String, bool)>,
+    },
     /// A queued steer was applied at a turn boundary — promote its "queued"
     /// notice to a real user line.
     Steered(String),

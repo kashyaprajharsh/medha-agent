@@ -87,11 +87,32 @@ pub struct Config {
     pub mcp: BTreeMap<String, McpServer>,
 }
 
+impl McpServer {
+    /// What the server points at — URL for a hosted server, command line for a
+    /// local one. Used wherever a definition is shown to the user.
+    pub fn target(&self) -> String {
+        if self.url.is_empty() {
+            self.command.join(" ")
+        } else {
+            self.url.clone()
+        }
+    }
+}
+
 /// A user-scoped MCP server definition. Secret-free: any API key is referenced
 /// as the literal `${key}` in `command` and resolved from the credential store.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpServer {
+    /// Local stdio server. Mutually exclusive with `url`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
+    /// Hosted server reached over Streamable HTTP. Takes precedence over `command`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// Credential scheme for `url`: `""` (none), `bearer`, or `oauth`. A bearer
+    /// token lives under `mcp://<id>`; OAuth tokens under `mcp-oauth://<id>`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auth: String,
     /// Extra environment for the server. Values may reference `${key}` (resolved
     /// from the credential store) — e.g. `GITHUB_TOKEN = "${key}"`.
     #[serde(default)]
@@ -1390,6 +1411,48 @@ fn mcp_key_id(id: &str) -> String {
     format!("mcp://{id}")
 }
 
+/// Credential-store id holding a remote server's OAuth credentials.
+fn mcp_oauth_id(id: &str) -> String {
+    format!("mcp-oauth://{id}")
+}
+
+/// Keychain-backed persistence for remote OAuth credentials, so an authorized
+/// server reconnects at launch instead of demanding a browser every time.
+#[derive(Debug)]
+pub struct McpTokens;
+
+impl mcp::TokenStore for McpTokens {
+    fn load(&self, server: &str) -> Option<String> {
+        load_key(&mcp_oauth_id(server))
+    }
+
+    fn save(&self, server: &str, blob: &str) {
+        if let Err(error) = store_key(&mcp_oauth_id(server), blob) {
+            tracing::warn!(target: "medha_mcp", server, %error, "could not persist MCP OAuth credentials");
+        }
+    }
+
+    fn clear(&self, server: &str) {
+        purge_credential(&mcp_oauth_id(server));
+    }
+}
+
+/// Best-effort removal of one credential from every layer (cache, file, keychain).
+fn purge_credential(cred_id: &str) {
+    if let Ok(mut cache) = key_cache().lock() {
+        cache.remove(cred_id);
+    }
+    if let Ok(path) = credentials_path() {
+        let mut creds = read_credentials_file(&path);
+        if creds.keys.remove(cred_id).is_some() {
+            let _ = write_credentials_file(&path, &creds);
+        }
+    }
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, cred_id) {
+        let _ = entry.delete_credential();
+    }
+}
+
 /// Store an MCP server's API key in the credential store — never in `config.toml`
 /// or `medha.lock`. Empty key is a no-op (server needs no secret).
 pub fn store_mcp_key(id: &str, key: &str) -> Result<()> {
@@ -1408,22 +1471,12 @@ pub fn mcp_key_present(id: &str) -> bool {
 /// Best-effort purge of an MCP server's key from every layer (cache, credentials
 /// file, keychain) — so `mcp remove` leaves no orphaned secret behind.
 pub fn delete_mcp_key(id: &str) {
-    let cred_id = mcp_key_id(id);
-    if let Ok(mut cache) = key_cache().lock() {
-        cache.remove(&cred_id);
-    }
-    if let Ok(path) = credentials_path() {
-        let mut creds = read_credentials_file(&path);
-        if creds.keys.remove(&cred_id).is_some() {
-            let _ = write_credentials_file(&path, &creds);
-        }
-    }
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &cred_id) {
-        let _ = entry.delete_credential();
-    }
+    purge_credential(&mcp_key_id(id));
+    // Remote servers also hold OAuth credentials; removing the server drops both.
+    purge_credential(&mcp_oauth_id(id));
 }
 
-/// Resolve a user-scoped server into a spawnable definition, substituting the
+/// Resolve a user-scoped server into a connectable definition, substituting the
 /// literal `${key}` in the command/env with the stored secret at spawn time.
 pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
     let key = load_key(&mcp_key_id(id));
@@ -1431,14 +1484,31 @@ pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
         Some(secret) => value.replace("${key}", secret),
         None => value.to_string(),
     };
+    let transport = if server.url.is_empty() {
+        mcp::Transport::Stdio {
+            command: server.command.iter().map(|arg| sub(arg)).collect(),
+            env: server
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), sub(v)))
+                .collect(),
+        }
+    } else {
+        mcp::Transport::Remote {
+            url: server.url.clone(),
+            auth: match server.auth.as_str() {
+                "oauth" => mcp::RemoteAuth::OAuth,
+                // A bearer server without a stored token is a config mistake, not
+                // a secret-free server: keep it explicit rather than silently
+                // connecting unauthenticated.
+                "bearer" => mcp::RemoteAuth::Bearer(key.clone().unwrap_or_default()),
+                _ => mcp::RemoteAuth::None,
+            },
+        }
+    };
     mcp::ServerConfig {
         id: id.to_string(),
-        command: server.command.iter().map(|arg| sub(arg)).collect(),
-        env: server
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), sub(v)))
-            .collect(),
+        transport,
         requires_approval: server.trust != "trusted",
         allow_network: server.network,
         tools: mcp::ToolFilter {

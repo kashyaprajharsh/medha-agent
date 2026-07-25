@@ -14,7 +14,17 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 # Official MCP SDK: stdio child-process transport + client lifecycle. Pinned to a
 # crates.io release (not git) so the static build is reproducible.
-rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "2.2", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "auth",
+    "reqwest",
+] }
+# Must track rmcp's reqwest major, not the workspace's — the HTTP client is
+# handed straight to rmcp's transport, so a version split would not type-check.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+url = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Process-group teardown: uvx/npx fork the real server, so killing the direct

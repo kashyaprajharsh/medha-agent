@@ -179,6 +179,8 @@ pub struct McpConfig {
     pub max_reconnects: u32,
     /// How long a parked server waits before one slow self-probe.
     pub park_probe_ms: u64,
+    /// How long the interactive OAuth flow waits for the browser redirect.
+    pub auth_timeout_ms: u64,
 }
 
 impl Default for McpConfig {
@@ -191,6 +193,7 @@ impl Default for McpConfig {
             health_interval_ms: 5_000,
             max_reconnects: 5,
             park_probe_ms: 300_000,
+            auth_timeout_ms: 300_000,
         }
     }
 }

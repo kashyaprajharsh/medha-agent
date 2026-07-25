@@ -5,7 +5,7 @@
 
 use std::{path::Path, time::Duration};
 
-use mcp::{Config, Error, McpManager, ServerConfig, ServerState, ToolFilter};
+use mcp::{Config, Error, McpManager, ServerConfig, ServerState, ToolFilter, Transport};
 use serde_json::json;
 
 /// Modes: `normal`, `hostile` (malformed tool names), `churn` (announces
@@ -120,7 +120,10 @@ fn config(server: ServerConfig) -> Config {
 fn server(id: &str, command: Vec<String>) -> ServerConfig {
     ServerConfig {
         id: id.into(),
-        command,
+        transport: Transport::Stdio {
+            command,
+            env: Vec::new(),
+        },
         ..Default::default()
     }
 }
@@ -239,7 +242,9 @@ async fn medha_secrets_never_reach_the_server() {
     // SAFETY: set before any child spawn in this single-threaded test body.
     unsafe { std::env::set_var("MEDHA_TEST_SECRET", "do-not-leak") };
     let mut definition = server("fake", fake.command("normal", None));
-    definition.env = vec![("SERVER_TOKEN".into(), "granted".into())];
+    if let Transport::Stdio { env, .. } = &mut definition.transport {
+        env.push(("SERVER_TOKEN".into(), "granted".into()));
+    }
     let manager = McpManager::new(fake.path().to_path_buf(), config(definition));
     manager.connect_startup().await;
 

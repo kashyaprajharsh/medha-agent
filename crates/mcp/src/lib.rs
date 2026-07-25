@@ -24,7 +24,10 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientInfo, ContentBlock, Implementation,
 };
 use rmcp::service::{NotificationContext, Peer, RoleClient, RunningService, ServiceExt};
-use rmcp::transport::TokioChildProcess;
+use rmcp::transport::{
+    IntoTransport, TokioChildProcess,
+    streamable_http_client::{StreamableHttpClientTransport, StreamableHttpClientTransportConfig},
+};
 use rmcp::{ClientHandler, model::Tool};
 use sandbox::{BackendKind, ExecRequest, NetPolicy, SandboxConfig, select_backend};
 use serde::Serialize;
@@ -37,6 +40,8 @@ use tokio::{
     time::{Instant, MissedTickBehavior, timeout},
 };
 use tokio_util::sync::CancellationToken;
+
+mod oauth;
 
 /// Prefix that marks a tool as MCP-provided and namespaces it by server.
 pub const TOOL_PREFIX: &str = "mcp__";
@@ -78,6 +83,14 @@ pub enum Error {
     },
     #[error("MCP command is empty")]
     EmptyCommand,
+    #[error(
+        "MCP server '{0}' needs authorization — connect it from /mcp or run `medha mcp auth {0}`"
+    )]
+    NeedsAuth(String),
+    #[error("MCP authorization failed: {0}")]
+    Auth(String),
+    #[error("invalid MCP server URL: {0}")]
+    BadUrl(String),
     #[error("MCP sandbox could not be prepared: {0}")]
     Sandbox(String),
     #[error("failed to start MCP server: {0}")]
@@ -93,7 +106,7 @@ impl Error {
     fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Error::EmptyCommand | Error::Unavailable { .. } | Error::Sandbox(_)
+            Error::EmptyCommand | Error::Unavailable { .. } | Error::Sandbox(_) | Error::BadUrl(_)
         )
     }
 
@@ -131,15 +144,77 @@ fn glob(pattern: &str, name: &str) -> bool {
     }
 }
 
+/// How Medha reaches a server.
+#[derive(Debug, Clone)]
+pub enum Transport {
+    /// Local child process spoken to over stdio, sandboxed with a sanitized
+    /// environment.
+    Stdio {
+        command: Vec<String>,
+        /// Explicit environment the server needs (e.g. an API token). Nothing
+        /// else from Medha's environment is inherited.
+        env: Vec<(String, String)>,
+    },
+    /// Hosted server reached over Streamable HTTP.
+    Remote { url: String, auth: RemoteAuth },
+}
+
+impl Default for Transport {
+    fn default() -> Self {
+        Transport::Stdio {
+            command: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+}
+
+impl Transport {
+    /// One-line description for approval previews and status.
+    pub fn target(&self) -> String {
+        match self {
+            Transport::Stdio { command, .. } => command.join(" "),
+            Transport::Remote { url, .. } => url.clone(),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Transport::Stdio { .. } => "stdio",
+            Transport::Remote { .. } => "http",
+        }
+    }
+}
+
+/// Credential scheme for a remote server.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RemoteAuth {
+    #[default]
+    None,
+    /// Static token sent as `Authorization: Bearer …`.
+    Bearer(String),
+    /// Authorization-code + PKCE. Tokens persist through the host's
+    /// [`TokenStore`], so the browser is needed once, not every launch.
+    OAuth,
+}
+
+/// Where remote OAuth credentials persist between sessions. Medha wires this to
+/// the OS keychain; without one an OAuth server re-authorizes every launch.
+pub trait TokenStore: Send + Sync + fmt::Debug {
+    fn load(&self, server: &str) -> Option<String>;
+    fn save(&self, server: &str, blob: &str);
+    fn clear(&self, server: &str);
+}
+
+/// Sink for an authorization URL, so the caller shows it in whatever UI it owns
+/// while the browser opens.
+pub type UrlSink = tokio::sync::mpsc::UnboundedSender<String>;
+
 /// One configured server. Built from the user config; `requires_approval` gates
 /// a project-defined command behind a one-time human preview.
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
     pub id: String,
-    pub command: Vec<String>,
-    /// Explicit environment the server needs (e.g. an API token). Nothing else
-    /// from Medha's environment is inherited.
-    pub env: Vec<(String, String)>,
+    pub transport: Transport,
     pub requires_approval: bool,
     /// Per-server network override; `None` falls back to the host default.
     pub allow_network: Option<bool>,
@@ -165,6 +240,10 @@ pub struct Config {
     pub max_reconnects: u32,
     /// How long a parked server waits before one slow self-probe.
     pub park_probe: Duration,
+    /// How long the interactive OAuth flow waits for the browser redirect.
+    pub auth_timeout: Duration,
+    /// Persistence for remote OAuth credentials.
+    pub tokens: Option<Arc<dyn TokenStore>>,
 }
 
 impl Default for Config {
@@ -180,6 +259,8 @@ impl Default for Config {
             health_interval: Duration::from_secs(5),
             max_reconnects: 5,
             park_probe: Duration::from_secs(300),
+            auth_timeout: Duration::from_secs(300),
+            tokens: None,
         }
     }
 }
@@ -190,6 +271,8 @@ impl Default for Config {
 #[serde(rename_all = "snake_case")]
 pub enum ServerState {
     NeedsApproval,
+    /// Remote server with no usable credentials; waiting on an interactive sign-in.
+    NeedsAuth,
     Connecting,
     Ready,
     /// Was ready, lost its transport; a reconnect is scheduled.
@@ -213,6 +296,7 @@ impl fmt::Display for ServerState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::NeedsApproval => "awaiting approval",
+            Self::NeedsAuth => "needs sign-in",
             Self::Connecting => "connecting",
             Self::Ready => "ready",
             Self::Degraded => "degraded",
@@ -244,7 +328,9 @@ fn is_zero(count: &usize) -> bool {
 #[derive(Debug, Clone, Serialize)]
 pub struct StartPreview {
     pub server: String,
-    pub command: Vec<String>,
+    pub transport: String,
+    /// Command line for stdio, URL for remote.
+    pub target: String,
     pub approval_required: bool,
 }
 
@@ -465,7 +551,8 @@ impl McpManager {
         let server = self.server_config(server_id).await?;
         Ok(StartPreview {
             server: server.id,
-            command: server.command,
+            transport: server.transport.label().to_string(),
+            target: server.transport.target(),
             approval_required: server.requires_approval,
         })
     }
@@ -510,7 +597,16 @@ impl McpManager {
 
     /// Approve and connect an approval-gated server. Also the manual refresh
     /// path: it clears the failure budget so a parked server retries at once.
-    pub async fn approve_and_connect(&self, server_id: &str) -> Result<ServerStatus, Error> {
+    ///
+    /// `announce` opts the caller into the interactive sign-in for a remote
+    /// OAuth server that has no usable credentials — it receives the
+    /// authorization URL while a browser opens. Passing `None` keeps the call
+    /// non-interactive, which is what a model-invoked tool must do.
+    pub async fn approve_and_connect(
+        &self,
+        server_id: &str,
+        announce: Option<&UrlSink>,
+    ) -> Result<ServerStatus, Error> {
         let server = self.server_config(server_id).await?;
         self.ensure_supervisor();
         {
@@ -520,8 +616,65 @@ impl McpManager {
                 slot.retry_at = None;
             }
         }
+        match (self.connect_one(&server).await, announce) {
+            (Err(Error::NeedsAuth(_)), Some(announce)) => self.authorize(server_id, announce).await,
+            (result, _) => {
+                result?;
+                self.server_status(server_id).await
+            }
+        }
+    }
+
+    /// Run the interactive OAuth flow for a remote server, persist the tokens,
+    /// and connect. The only path that may open a browser.
+    pub async fn authorize(
+        &self,
+        server_id: &str,
+        announce: &UrlSink,
+    ) -> Result<ServerStatus, Error> {
+        let server = self.server_config(server_id).await?;
+        let Transport::Remote {
+            url,
+            auth: RemoteAuth::OAuth,
+        } = &server.transport
+        else {
+            return Err(Error::Auth(format!(
+                "'{server_id}' is not an OAuth server; nothing to sign in to"
+            )));
+        };
+        let store = self
+            .inner
+            .config
+            .tokens
+            .as_ref()
+            .ok_or_else(|| Error::Auth("no credential store is configured".into()))?;
+        self.set_state(
+            server_id,
+            ServerState::Connecting,
+            Some("signing in…".into()),
+        )
+        .await;
+        let credentials =
+            match oauth::authorize(url, self.inner.config.auth_timeout, announce).await {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    self.set_state(server_id, ServerState::NeedsAuth, Some(error.to_string()))
+                        .await;
+                    return Err(error);
+                }
+            };
+        store.save(server_id, &credentials);
+        self.ensure_supervisor();
         self.connect_one(&server).await?;
         self.server_status(server_id).await
+    }
+
+    /// Forget a remote server's stored credentials, so the next connect asks
+    /// for a fresh sign-in.
+    pub fn sign_out(&self, server_id: &str) {
+        if let Some(store) = &self.inner.config.tokens {
+            store.clear(server_id);
+        }
     }
 
     /// Currently-exposed tools, namespaced. Read each turn to build the
@@ -538,6 +691,17 @@ impl McpManager {
 
     pub fn is_mcp_tool(name: &str) -> bool {
         name.starts_with(TOOL_PREFIX)
+    }
+
+    /// Whether this server's credentials must be obtained interactively before
+    /// it can connect.
+    pub async fn needs_sign_in(&self, server_id: &str) -> bool {
+        self.inner
+            .servers
+            .lock()
+            .await
+            .get(server_id)
+            .is_some_and(|slot| slot.state == ServerState::NeedsAuth)
     }
 
     /// Invoke `mcp__<server>__<tool>` with the given arguments.
@@ -791,8 +955,15 @@ impl McpManager {
         let Some(slot) = servers.get_mut(server_id) else {
             return;
         };
-        slot.failures = slot.failures.saturating_add(1);
         slot.detail = Some(error.to_string());
+        // Missing credentials are not a fault to retry — only a human can clear
+        // it, so park the slot in a state the UI can act on.
+        if matches!(error, Error::NeedsAuth(_)) {
+            slot.state = ServerState::NeedsAuth;
+            slot.retry_at = None;
+            return;
+        }
+        slot.failures = slot.failures.saturating_add(1);
         if error.is_terminal() {
             slot.state = ServerState::Failed;
             slot.retry_at = None;
@@ -806,6 +977,14 @@ impl McpManager {
         }
     }
 
+    async fn set_state(&self, server_id: &str, state: ServerState, detail: Option<String>) {
+        let mut servers = self.inner.servers.lock().await;
+        if let Some(slot) = servers.get_mut(server_id) {
+            slot.state = state;
+            slot.detail = detail;
+        }
+    }
+
     async fn mark_proven(&self, server_id: &str) {
         let mut servers = self.inner.servers.lock().await;
         if let Some(slot) = servers.get_mut(server_id) {
@@ -815,7 +994,19 @@ impl McpManager {
     }
 
     async fn spawn_client(&self, server: &ServerConfig) -> Result<Connected, Error> {
-        let (program, args) = server.command.split_first().ok_or(Error::EmptyCommand)?;
+        match &server.transport {
+            Transport::Stdio { command, env } => self.spawn_stdio(server, command, env).await,
+            Transport::Remote { url, auth } => self.connect_remote(server, url, auth).await,
+        }
+    }
+
+    async fn spawn_stdio(
+        &self,
+        server: &ServerConfig,
+        command: &[String],
+        env: &[(String, String)],
+    ) -> Result<Connected, Error> {
+        let (program, args) = command.split_first().ok_or(Error::EmptyCommand)?;
         if !sandbox::program_on_path(program) {
             return Err(Error::Unavailable {
                 server: server.id.clone(),
@@ -823,15 +1014,85 @@ impl McpManager {
                 hint: "install the configured MCP server executable".into(),
             });
         }
-        let command = self.build_command(program, args, server)?;
+        let command = self.build_command(program, args, env, server)?;
         let transport = TokioChildProcess::new(command).map_err(|e| Error::Spawn(e.to_string()))?;
         let pid = transport.id();
+        match self.handshake(server, transport).await {
+            Ok(mut connected) => {
+                connected.pid = pid;
+                Ok(connected)
+            }
+            // The transport is already dropped; reap the tree it may have spawned.
+            Err(error) => {
+                kill_process_group(pid);
+                Err(error)
+            }
+        }
+    }
+
+    /// Connect a hosted server over Streamable HTTP. OAuth reconnects from
+    /// persisted credentials only — the interactive flow needs a human, so it
+    /// lives in [`McpManager::authorize`] and never runs from a model call.
+    async fn connect_remote(
+        &self,
+        server: &ServerConfig,
+        url: &str,
+        auth: &RemoteAuth,
+    ) -> Result<Connected, Error> {
+        oauth::require_secure(url)?;
+        let config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+        match auth {
+            RemoteAuth::None => {
+                self.handshake(
+                    server,
+                    StreamableHttpClientTransport::with_client(reqwest::Client::new(), config),
+                )
+                .await
+            }
+            RemoteAuth::Bearer(token) => {
+                self.handshake(
+                    server,
+                    StreamableHttpClientTransport::with_client(
+                        reqwest::Client::new(),
+                        config.auth_header(token.clone()),
+                    ),
+                )
+                .await
+            }
+            RemoteAuth::OAuth => {
+                let stored = self
+                    .inner
+                    .config
+                    .tokens
+                    .as_ref()
+                    .and_then(|store| store.load(&server.id))
+                    .ok_or_else(|| Error::NeedsAuth(server.id.clone()))?;
+                let client = oauth::client_from_stored(url, &stored).await?;
+                self.handshake(
+                    server,
+                    StreamableHttpClientTransport::with_client(client, config),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Protocol handshake plus the first catalogue listing, under one deadline.
+    async fn handshake<T, E, A>(
+        &self,
+        server: &ServerConfig,
+        transport: T,
+    ) -> Result<Connected, Error>
+    where
+        T: IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
         let handler = Handler {
             server: server.id.clone(),
             changed: self.inner.changed_tx.clone(),
         };
         let deadline = self.inner.config.startup_timeout;
-        let handshake = async {
+        let connect = async {
             let client = handler
                 .serve(transport)
                 .await
@@ -843,22 +1104,15 @@ impl McpManager {
                 .map_err(|e| Error::Protocol(e.to_string()))?;
             Ok::<_, Error>((client, tools))
         };
-        match timeout(deadline, handshake).await {
+        match timeout(deadline, connect).await {
             Ok(Ok((client, tools))) => Ok(Connected {
                 peer: client.peer().clone(),
                 client,
-                pid,
+                pid: None,
                 catalog: build_catalog(&server.id, &server.tools, tools),
             }),
-            // The transport is already dropped; reap the tree it may have spawned.
-            Ok(Err(error)) => {
-                kill_process_group(pid);
-                Err(error)
-            }
-            Err(_) => {
-                kill_process_group(pid);
-                Err(Error::Timeout(deadline))
-            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(Error::Timeout(deadline)),
         }
     }
 
@@ -866,6 +1120,7 @@ impl McpManager {
         &self,
         program: &str,
         args: &[String],
+        env: &[(String, String)],
         server: &ServerConfig,
     ) -> Result<Command, Error> {
         let allow_network = server
@@ -912,7 +1167,7 @@ impl McpManager {
             environment.push(("npm_config_cache".into(), path("npm")));
         }
         // Explicit per-server env (e.g. an API token) wins over the defaults.
-        environment.extend(server.env.iter().cloned());
+        environment.extend(env.iter().cloned());
         let request = ExecRequest {
             program: program.to_string(),
             args: args.to_vec(),
@@ -1187,6 +1442,12 @@ fn sanitized_environment() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Reject a remote server URL that would carry credentials in the clear.
+/// Exposed so configuration is validated when it is written, not at connect time.
+pub fn validate_remote_url(url: &str) -> Result<(), Error> {
+    oauth::require_secure(url)
+}
+
 fn normalize(path: &std::path::Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1195,6 +1456,13 @@ fn normalize(path: &std::path::Path) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn stdio(command: &[&str]) -> Transport {
+        Transport::Stdio {
+            command: command.iter().map(|part| part.to_string()).collect(),
+            env: Vec::new(),
+        }
+    }
 
     fn tool(name: &str) -> Tool {
         Tool::new(name.to_string(), "a tool", Arc::new(serde_json::Map::new()))
@@ -1305,7 +1573,7 @@ mod tests {
                 enabled: true,
                 servers: vec![ServerConfig {
                     id: "gated".into(),
-                    command: vec!["true".into()],
+                    transport: stdio(&["true"]),
                     requires_approval: true,
                     ..Default::default()
                 }],
@@ -1331,7 +1599,7 @@ mod tests {
                 enabled: true,
                 servers: vec![ServerConfig {
                     id: "missing".into(),
-                    command: vec!["medha-no-such-binary".into()],
+                    transport: stdio(&["medha-no-such-binary"]),
                     ..Default::default()
                 }],
                 ..Config::default()

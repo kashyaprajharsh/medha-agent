@@ -785,16 +785,17 @@ impl Tool for McpStart {
         let server = args.get("server")?.as_str()?;
         let preview = self.manager.start_preview(server).await.ok()?;
         Some(format!(
-            "start MCP server '{}'\ncommand: {}",
-            preview.server,
-            preview.command.join(" ")
+            "start MCP server '{}'\n{}: {}",
+            preview.server, preview.transport, preview.target
         ))
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let server = arg_str(args, "server")?;
         serde_json::to_value(
             self.manager
-                .approve_and_connect(&server)
+                // `None`: a model-invoked tool must never open a browser. A
+                // server needing sign-in reports that state for the user to act on.
+                .approve_and_connect(&server, None)
                 .await
                 .map_err(|error| ToolError::Failed(error.to_string()))?,
         )

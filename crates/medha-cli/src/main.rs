@@ -1192,6 +1192,8 @@ async fn main() -> Result<()> {
             health_interval: std::time::Duration::from_millis(lock.mcp.health_interval_ms),
             max_reconnects: lock.mcp.max_reconnects,
             park_probe: std::time::Duration::from_millis(lock.mcp.park_probe_ms),
+            auth_timeout: std::time::Duration::from_millis(lock.mcp.auth_timeout_ms),
+            tokens: Some(Arc::new(config::McpTokens)),
         };
         let manager = Arc::new(mcp::McpManager::new(cwd.clone(), mcp_config));
         registry.register_mcp(manager.clone());
@@ -1604,9 +1606,14 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                             }
                         ),
                     };
+                    let scheme = match server.auth.as_str() {
+                        "" if server.url.is_empty() => "stdio",
+                        "" => "http",
+                        other => other,
+                    };
                     println!(
-                        "  {id}  [{trust}]  {}{key}{filter}",
-                        server.command.join(" ")
+                        "  {id}  [{trust}/{scheme}]  {}{key}{filter}",
+                        server.target()
                     );
                 }
             }
@@ -1624,11 +1631,14 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             }
         }
         "add" => {
-            // medha mcp add <id> [--key K] [--trust trusted] [--env K=V]
-            //   [--allow-tool P] [--deny-tool P] [--no-network] [--parallel] [--] <command>
+            // medha mcp add <id> [--url U [--bearer T | --oauth]] [--key K]
+            //   [--trust trusted] [--env K=V] [--allow-tool P] [--deny-tool P]
+            //   [--no-network] [--parallel] [--] <command>
             let mut id = None;
             let mut trust = "workspace".to_string();
             let mut key: Option<String> = None;
+            let mut url = String::new();
+            let mut auth = String::new();
             let mut env = std::collections::BTreeMap::new();
             let mut allow_tools: Vec<String> = Vec::new();
             let mut deny_tools: Vec<String> = Vec::new();
@@ -1639,6 +1649,12 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             while let Some(arg) = it.next() {
                 match arg.as_str() {
                     "--key" => key = it.next().cloned(),
+                    "--url" => url = it.next().cloned().unwrap_or_default(),
+                    "--bearer" => {
+                        auth = "bearer".into();
+                        key = it.next().cloned();
+                    }
+                    "--oauth" => auth = "oauth".into(),
                     "--trust" => trust = it.next().cloned().unwrap_or(trust),
                     "--env" => {
                         if let Some((k, v)) = it.next().and_then(|kv| kv.split_once('=')) {
@@ -1656,12 +1672,19 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             }
             let id = id.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "usage: medha mcp add <id> [--key K] [--trust trusted] [--env K=V] \
+                    "usage: medha mcp add <id> --url <https://…> [--oauth | --bearer T]\n   \
+                     or: medha mcp add <id> [--key K] [--trust trusted] [--env K=V] \
                      [--allow-tool P] [--deny-tool P] [--no-network] [--parallel] -- <command>"
                 )
             })?;
-            if command.is_empty() {
-                return Err(anyhow::anyhow!("no command given for server '{id}'"));
+            if url.is_empty() && command.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "server '{id}' needs either --url <https://…> or -- <command>"
+                ));
+            }
+            if !url.is_empty() {
+                // Fail here rather than at connect time, when the user is not looking.
+                mcp::validate_remote_url(&url)?;
             }
             if let Some(k) = &key {
                 config::store_mcp_key(&id, k)?;
@@ -1670,6 +1693,8 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                 id.clone(),
                 config::McpServer {
                     command,
+                    url,
+                    auth: auth.clone(),
                     env,
                     trust,
                     allow_tools,
@@ -1682,30 +1707,23 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             println!(
                 "added MCP server '{id}'{}",
                 if key.is_some() {
-                    " (key stored in credential store)"
+                    " (key stored in the credential store)"
                 } else {
                     ""
                 }
             );
 
-            // Connect once for immediate ready/failed feedback.
+            // Connect once for immediate ready/failed feedback; an OAuth server
+            // runs the browser flow here, which is the one place a CLI can.
             print!("connecting… ");
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            let cwd = std::env::current_dir()?;
-            let server = config::resolve_mcp_server(&id, &cfg.mcp[&id]);
-            let manager = mcp::McpManager::new(
-                cwd,
-                mcp::Config {
-                    enabled: true,
-                    servers: vec![server],
-                    startup_timeout: std::time::Duration::from_secs(15),
-                    request_timeout: std::time::Duration::from_secs(10),
-                    // One-shot probe: no supervisor sweep, no reconnect budget.
-                    max_reconnects: 1,
-                    ..mcp::Config::default()
-                },
-            );
-            manager.connect_startup().await;
+            let manager = one_shot_mcp(&id, &cfg)?;
+            if auth == "oauth" {
+                println!();
+                authorize_mcp(&manager, &id).await;
+            } else {
+                manager.connect_startup().await;
+            }
             for status in manager.status().await {
                 match status.state {
                     mcp::ServerState::Ready => println!(
@@ -1724,13 +1742,72 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             }
             manager.shutdown().await;
         }
+        "auth" => {
+            // Re-run the browser sign-in for a configured remote server, e.g.
+            // after revoking access or when the refresh token has expired.
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: medha mcp auth <id>"))?;
+            if !cfg.mcp.contains_key(id) {
+                return Err(anyhow::anyhow!("no MCP server '{id}'"));
+            }
+            let manager = one_shot_mcp(id, &cfg)?;
+            manager.sign_out(id);
+            authorize_mcp(&manager, id).await;
+            for status in manager.status().await {
+                println!(
+                    "{} — {}{}",
+                    status.server,
+                    status.state,
+                    status.detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                );
+            }
+            manager.shutdown().await;
+        }
         other => {
             return Err(anyhow::anyhow!(
-                "unknown mcp subcommand '{other}' (use add|list|remove)"
+                "unknown mcp subcommand '{other}' (use add|list|remove|auth)"
             ));
         }
     }
     Ok(())
+}
+
+/// A throwaway host holding exactly one configured server — used by the CLI for
+/// immediate connect/auth feedback, with no supervisor and no reconnect budget.
+fn one_shot_mcp(id: &str, cfg: &config::Config) -> Result<mcp::McpManager> {
+    let server = cfg
+        .mcp
+        .get(id)
+        .ok_or_else(|| anyhow::anyhow!("no MCP server '{id}'"))?;
+    Ok(mcp::McpManager::new(
+        std::env::current_dir()?,
+        mcp::Config {
+            enabled: true,
+            servers: vec![config::resolve_mcp_server(id, server)],
+            startup_timeout: std::time::Duration::from_secs(15),
+            request_timeout: std::time::Duration::from_secs(10),
+            max_reconnects: 1,
+            tokens: Some(Arc::new(config::McpTokens)),
+            ..mcp::Config::default()
+        },
+    ))
+}
+
+/// Run the interactive OAuth flow, printing the URL as the browser opens so a
+/// headless or restricted machine can still complete it.
+async fn authorize_mcp(manager: &mcp::McpManager, id: &str) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let printer = tokio::spawn(async move {
+        while let Some(url) = rx.recv().await {
+            println!("open this URL to authorize:\n  {url}");
+        }
+    });
+    if let Err(error) = manager.authorize(id, &tx).await {
+        println!("authorization failed: {error}");
+    }
+    drop(tx);
+    let _ = printer.await;
 }
 
 /// Convert a lockfile LSP `settings` table to JSON; empty = server defaults.

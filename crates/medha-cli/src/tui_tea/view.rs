@@ -1363,7 +1363,7 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
                 Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "Ask medha to build, fix, or explain something…   ( / for commands · \\ + enter or ctrl+j for newline )",
+                "Ask medha to build, fix, or explain something…   ( / for commands · \\ + enter or ctrl+j for newline · ctrl-click to open a link or file )",
                 Style::default().fg(theme::faint()),
             ),
         ]);

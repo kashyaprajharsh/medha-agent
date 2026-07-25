@@ -439,6 +439,11 @@ pub(crate) enum TuiEvent {
     /// `/lsp` completed querying the registered LSP status tool.
     LspStatus(Result<serde_json::Value, String>),
     McpStatus(Result<serde_json::Value, String>),
+    /// A remote MCP server's browser sign-in is waiting on this URL.
+    McpAuthUrl {
+        server: String,
+        url: String,
+    },
     /// A queued steer was applied at a turn boundary — promote its "queued"
     /// notice to a real user line.
     Steered(String),
@@ -1341,7 +1346,10 @@ impl PickerKind {
                 .map(|(_, desc)| (*desc).to_string())
                 .collect(),
             PickerKind::Mcp(rows) => std::iter::once("＋ Add a server".to_string())
-                .chain(rows.iter().map(|row| format!("{}   {}", row.id, row.command)))
+                .chain(
+                    rows.iter()
+                        .map(|row| format!("{}   {}", row.id, row.command)),
+                )
                 .collect(),
             // Row 0 is always "install from a link" (never a dead end); the rest
             // are the browsable catalog, one row per skill.

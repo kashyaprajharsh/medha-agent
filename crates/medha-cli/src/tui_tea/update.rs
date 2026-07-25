@@ -43,8 +43,19 @@ pub(super) fn update<P, L>(
 
 fn handle_mouse(model: &mut Model, event: MouseEvent) {
     const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(450);
+    /// Any of these turns a click into "open this", leaving plain click to select.
+    const OPEN_CHORD: KeyModifiers = KeyModifiers::CONTROL
+        .union(KeyModifiers::ALT)
+        .union(KeyModifiers::SUPER);
 
     match event.kind {
+        // Mouse capture is on, so the terminal's own ⌘-click on a URL never
+        // fires — Medha has to do the opening itself.
+        MouseEventKind::Down(MouseButton::Left) if event.modifiers.intersects(OPEN_CHORD) => {
+            if let Some(point) = model.transcript_point(event.column, event.row) {
+                open_under_cursor(model, point);
+            }
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(point) = model.transcript_point(event.column, event.row) else {
                 model.text_selection = None;
@@ -104,6 +115,130 @@ fn handle_mouse(model: &mut Model, event: MouseEvent) {
             model.queue_selection_copy();
         }
         _ => {}
+    }
+}
+
+/// What a modifier-click can hand to the operating system.
+enum OpenTarget {
+    Url(String),
+    Path(std::path::PathBuf),
+}
+
+/// Open the URL or file path under the cursor. Anything else is left alone
+/// rather than guessed at — a stray word must not launch an application.
+fn open_under_cursor(model: &mut Model, point: TextPoint) {
+    let target = model
+        .transcript_line(point.row)
+        .and_then(|line| target_at(&line_text(line), point.column));
+    match target {
+        Some(OpenTarget::Url(url)) => {
+            os_open(&url);
+            model.push_notice(format!("opening {url}"));
+        }
+        Some(OpenTarget::Path(path)) => {
+            os_open(&path.to_string_lossy());
+            model.push_notice(format!("opening {}", path.display()));
+        }
+        None => model
+            .push_notice("nothing to open there — ctrl/alt-click a URL or a file path that exists"),
+    }
+}
+
+/// Classify the token under `column`: an http(s) URL, or a path that resolves
+/// inside the workspace.
+fn target_at(text: &str, column: usize) -> Option<OpenTarget> {
+    let token = token_at(text, column)?;
+    let token = markdown_link_target(&token).unwrap_or_else(|| trim_delimiters(&token).to_string());
+    if token.starts_with("https://") || token.starts_with("http://") {
+        return Some(OpenTarget::Url(token));
+    }
+    // `path:42`, `path#L42` and `path:12:5` are how tools and the model cite
+    // code; the locator is not part of the filename.
+    let bare = strip_locator(token.split('#').next().unwrap_or(&token));
+    if bare.is_empty() {
+        return None;
+    }
+    let path = match bare.strip_prefix("~/") {
+        Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None => std::path::PathBuf::from(bare),
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    path.exists().then_some(OpenTarget::Path(path))
+}
+
+/// The whitespace-delimited token covering `column`, measured in terminal cells
+/// so wide characters earlier in the line do not shift the hit test.
+fn token_at(text: &str, column: usize) -> Option<String> {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut cell = 0usize;
+    let mut start = 0usize;
+    let mut token = String::new();
+    // The trailing space closes the final token without duplicating the check.
+    for character in text.chars().chain(std::iter::once(' ')) {
+        let width = character.width().unwrap_or(0);
+        if character.is_whitespace() {
+            if !token.is_empty() && (start..cell).contains(&column) {
+                return Some(token);
+            }
+            token.clear();
+            start = cell + width;
+        } else {
+            token.push(character);
+        }
+        cell += width;
+    }
+    None
+}
+
+/// `[label](target)` → `target`, so a rendered markdown link is clickable.
+fn markdown_link_target(token: &str) -> Option<String> {
+    let (_, rest) = token.split_once("](")?;
+    Some(rest.trim_end_matches(')').to_string())
+}
+
+/// Strip the punctuation prose wraps around a reference: ``see `src/lib.rs`,``.
+fn trim_delimiters(token: &str) -> &str {
+    token
+        .trim_start_matches(['`', '\'', '"', '(', '[', '{', '<'])
+        .trim_end_matches(['`', '\'', '"', ')', ']', '}', '>', ',', ';', '!', '?', '.'])
+}
+
+/// Drop a trailing `:line[:col]` locator while leaving a Windows drive letter
+/// (`C:\…`) alone, since that suffix is not numeric.
+fn strip_locator(token: &str) -> &str {
+    match token.rsplit_once(':') {
+        Some((head, tail))
+            if !head.is_empty() && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            strip_locator(head)
+        }
+        _ => token,
+    }
+}
+
+/// Hand the target to the OS opener — the user's browser or GUI editor, never a
+/// terminal editor that would fight the TUI for the screen.
+fn os_open(target: &str) {
+    #[cfg(target_os = "macos")]
+    let (program, args) = ("open", vec![target]);
+    #[cfg(target_os = "linux")]
+    let (program, args) = ("xdg-open", vec![target]);
+    #[cfg(target_os = "windows")]
+    let (program, args) = ("cmd", vec!["/C", "start", "", target]);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let (program, args): (&str, Vec<&str>) = ("", Vec::new());
+
+    if !program.is_empty() {
+        let _ = std::process::Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }
 
@@ -962,16 +1097,7 @@ pub(super) fn handle_key<P, L>(
                     model.picker = None;
                     if let (Some(id), Some(manager)) = (id, model.mcp.clone()) {
                         model.push_notice(format!("(connecting MCP server '{id}' …)"));
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let result = match manager.approve_and_connect(&id).await {
-                                Ok(_) => {
-                                    Ok(serde_json::json!({ "servers": manager.status().await }))
-                                }
-                                Err(error) => Err(error.to_string()),
-                            };
-                            let _ = tx.send(TuiEvent::McpStatus(result));
-                        });
+                        connect_mcp_server(manager, id, tx.clone());
                     }
                     return;
                 }
@@ -1905,6 +2031,15 @@ pub(super) fn handle_agent_event(
             };
             model.upsert_notice("MCP", text);
         }
+        TuiEvent::McpAuthUrl { server, url } => {
+            model.upsert_notice(
+                "MCP",
+                format!(
+                    "MCP: signing in to '{server}' — a browser should have opened.\n  \
+                     If not, open this URL:\n  {url}"
+                ),
+            );
+        }
         // A queued steer reached its turn boundary: promote the "queued"
         // notice to a real user line (that's what the model now sees).
         TuiEvent::Steered(text) => {
@@ -2435,19 +2570,22 @@ fn open_mcp_picker(model: &mut Model) {
         .into_iter()
         .map(|(id, server)| McpRow {
             id,
-            command: server.command.join(" "),
+            command: server.target(),
         })
         .collect();
     model.picker = Some(Picker::new(PickerKind::Mcp(rows)));
 }
 
-/// `/mcp add <id> [--key K] [--trust trusted] [--env K=V] [--allow-tool P]
-/// [--deny-tool P] [--no-network] [--parallel] -- <command>` — save to
-/// `~/.medha/config.toml` (key → credential store), then connect live.
+/// `/mcp add <id> --url <https://…> [--oauth | --bearer T]` for a hosted server,
+/// or `/mcp add <id> [--key K] [--trust trusted] [--env K=V] [--allow-tool P]
+/// [--deny-tool P] [--no-network] [--parallel] -- <command>` for a local one.
+/// Saves to `~/.medha/config.toml` (secrets → credential store), then connects live.
 fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let mut id = None;
     let mut trust = "workspace".to_string();
     let mut key: Option<String> = None;
+    let mut url = String::new();
+    let mut auth = String::new();
     let mut env = std::collections::BTreeMap::new();
     let mut allow_tools: Vec<String> = Vec::new();
     let mut deny_tools: Vec<String> = Vec::new();
@@ -2458,6 +2596,12 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
     while let Some(token) = it.next() {
         match token {
             "--key" => key = it.next().map(str::to_string),
+            "--url" => url = it.next().unwrap_or_default().to_string(),
+            "--bearer" => {
+                auth = "bearer".into();
+                key = it.next().map(str::to_string);
+            }
+            "--oauth" => auth = "oauth".into(),
             "--trust" => trust = it.next().unwrap_or("workspace").to_string(),
             "--env" => {
                 if let Some((k, v)) = it.next().and_then(|kv| kv.split_once('=')) {
@@ -2473,12 +2617,18 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
             _ => command.push(token.to_string()),
         }
     }
-    let (Some(id), false) = (id, command.is_empty()) else {
+    let (Some(id), false) = (id, url.is_empty() && command.is_empty()) else {
         model.push_notice(
-            "usage: /mcp add <id> [--key K] -- <command>   e.g.  github --key ghp_… -- npx -y @modelcontextprotocol/server-github",
+            "usage: /mcp add <id> --url https://… [--oauth]   ·   /mcp add <id> [--key K] -- <command>",
         );
         return;
     };
+    if !url.is_empty()
+        && let Err(error) = mcp::validate_remote_url(&url)
+    {
+        model.push_notice(format!("mcp add: {error}"));
+        return;
+    }
     if let Some(k) = &key
         && let Err(error) = config::store_mcp_key(&id, k)
     {
@@ -2487,6 +2637,8 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
     }
     let server = config::McpServer {
         command,
+        url,
+        auth,
         env,
         trust,
         allow_tools,
@@ -2508,6 +2660,12 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
             // Report the status list either way: a failed server shows up as a
             // row with its state and reason, which beats a bare error string.
             let _ = manager.add_server(resolved).await;
+            // A remote OAuth server lands in needs-sign-in; carry straight on
+            // into the browser flow rather than making the user pick it again.
+            if manager.needs_sign_in(&id).await {
+                authorize_mcp_server(manager, id, tx);
+                return;
+            }
             let servers = serde_json::json!({ "servers": manager.status().await });
             let _ = tx.send(TuiEvent::McpStatus(Ok(servers)));
         });
@@ -2517,6 +2675,59 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
         ));
     }
     open_mcp_picker(model);
+}
+
+/// Connect a configured server, falling through to the interactive sign-in when
+/// it is a remote OAuth server without usable credentials.
+fn connect_mcp_server(
+    manager: Arc<mcp::McpManager>,
+    id: String,
+    tx: mpsc::UnboundedSender<TuiEvent>,
+) {
+    tokio::spawn(async move {
+        match manager.approve_and_connect(&id, None).await {
+            Err(mcp::Error::NeedsAuth(_)) => authorize_mcp_server(manager, id, tx),
+            outcome => {
+                if let Err(error) = outcome {
+                    let _ = tx.send(TuiEvent::McpStatus(Err(format!("'{id}': {error}"))));
+                    return;
+                }
+                let servers = serde_json::json!({ "servers": manager.status().await });
+                let _ = tx.send(TuiEvent::McpStatus(Ok(servers)));
+            }
+        }
+    });
+}
+
+/// Run the browser sign-in, surfacing the authorization URL as a notice so a
+/// machine that cannot open a browser can still finish by hand.
+fn authorize_mcp_server(
+    manager: Arc<mcp::McpManager>,
+    id: String,
+    tx: mpsc::UnboundedSender<TuiEvent>,
+) {
+    tokio::spawn(async move {
+        let (urls, mut rx) = mpsc::unbounded_channel();
+        let relay = {
+            let tx = tx.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                while let Some(url) = rx.recv().await {
+                    let _ = tx.send(TuiEvent::McpAuthUrl {
+                        server: id.clone(),
+                        url,
+                    });
+                }
+            })
+        };
+        let outcome = manager.authorize(&id, &urls).await;
+        drop(urls);
+        let _ = relay.await;
+        let _ = tx.send(TuiEvent::McpStatus(match outcome {
+            Ok(_) => Ok(serde_json::json!({ "servers": manager.status().await })),
+            Err(error) => Err(format!("'{id}': {error}")),
+        }));
+    });
 }
 
 /// Remove a server from the `/mcp` picker: drop it from `config.toml` and the
@@ -4824,5 +5035,47 @@ mod fix_tests {
         let state = m.clarify.as_ref().unwrap();
         assert!(state.other_input.is_char_boundary(state.other_cursor));
         assert_eq!(m.input, "keep this steer");
+    }
+
+    #[test]
+    fn token_hit_test_uses_terminal_cells() {
+        let line = "see src/lib.rs and https://x.dev/a";
+        assert_eq!(token_at(line, 0).as_deref(), Some("see"));
+        assert_eq!(token_at(line, 4).as_deref(), Some("src/lib.rs"));
+        assert_eq!(token_at(line, 20).as_deref(), Some("https://x.dev/a"));
+        assert_eq!(token_at(line, 3), None); // the space between tokens
+        // A wide glyph earlier in the line must not shift later hit tests.
+        assert_eq!(token_at("→ src/lib.rs", 2).as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn references_are_unwrapped_before_resolving() {
+        assert_eq!(trim_delimiters("`src/lib.rs`,"), "src/lib.rs");
+        assert_eq!(trim_delimiters("(src/lib.rs)."), "src/lib.rs");
+        assert_eq!(
+            markdown_link_target("[lib.rs](crates/mcp/src/lib.rs)").as_deref(),
+            Some("crates/mcp/src/lib.rs")
+        );
+        assert_eq!(markdown_link_target("plain"), None);
+    }
+
+    #[test]
+    fn line_locators_are_not_part_of_the_filename() {
+        assert_eq!(strip_locator("src/lib.rs:42"), "src/lib.rs");
+        assert_eq!(strip_locator("src/lib.rs:42:7"), "src/lib.rs");
+        assert_eq!(strip_locator("src/lib.rs"), "src/lib.rs");
+        // Not a locator: a Windows drive letter must survive intact.
+        assert_eq!(strip_locator("C:\\src\\lib.rs"), "C:\\src\\lib.rs");
+    }
+
+    #[test]
+    fn only_urls_and_existing_paths_are_openable() {
+        assert!(matches!(
+            target_at("visit https://medha.dev/docs now", 6),
+            Some(OpenTarget::Url(url)) if url == "https://medha.dev/docs"
+        ));
+        // A word that is not a path resolves to nothing, so no app is launched.
+        assert!(target_at("just some prose here", 5).is_none());
+        assert!(target_at("see does/not/exist.rs", 4).is_none());
     }
 }

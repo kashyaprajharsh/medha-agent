@@ -653,6 +653,16 @@ pub enum DiagnosticReport {
     },
 }
 
+/// One configured adapter's availability, independent of whether it is running.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerAvailability {
+    pub server: String,
+    pub extensions: Vec<String>,
+    pub installed: bool,
+    /// True when `medha lsp install` can fetch it without a language toolchain.
+    pub installable: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerStatus {
     pub server: String,
@@ -1121,6 +1131,32 @@ impl LspManager {
             .servers
             .iter()
             .any(|adapter| adapter_language_id(adapter, path).is_some())
+    }
+
+    /// Every configured adapter and whether its binary is resolvable here.
+    ///
+    /// Running sessions alone cannot answer "why did this come back as a text
+    /// match" — servers start lazily, so an empty session list is equally
+    /// consistent with "nothing asked yet" and "nothing is installed". This
+    /// distinguishes them.
+    pub fn inventory(&self) -> Vec<ServerAvailability> {
+        self.inner
+            .config
+            .servers
+            .iter()
+            .map(|adapter| ServerAvailability {
+                server: adapter.id.clone(),
+                extensions: adapter
+                    .languages
+                    .iter()
+                    .map(|language| language.extension.clone())
+                    .collect(),
+                installed: server_on_path(
+                    adapter.command.first().map(String::as_str).unwrap_or(""),
+                ),
+                installable: install_recipe(&adapter.id).is_some(),
+            })
+            .collect()
     }
 
     pub async fn status(&self) -> Vec<ServerStatus> {
@@ -3348,6 +3384,68 @@ pub fn server_on_path(program: &str) -> bool {
         .any(|dir| dir.join(program).exists())
 }
 
+/// The exact command `install_server` would run, for showing a user before they
+/// approve it. Nothing should be installed without this being visible first.
+pub fn install_command(server: &str) -> Option<(String, Vec<String>)> {
+    let recipe = install_recipe(server)?;
+    let into = server_install_dir()?;
+    let own = into.to_string_lossy().into_owned();
+    Some(match recipe[0] {
+        // `--prefix` keeps this out of the global npm root: an agent installing a
+        // package should not alter the machine outside a directory the user can
+        // delete in one command.
+        "npm" => (
+            "npm".into(),
+            ["install", "--prefix", &own]
+                .into_iter()
+                .map(str::to_string)
+                .chain(recipe[1..].iter().map(|part| (*part).to_string()))
+                .collect(),
+        ),
+        "go" => (
+            "go".into(),
+            std::iter::once("install".to_string())
+                .chain(recipe[1..].iter().map(|part| (*part).to_string()))
+                .collect(),
+        ),
+        program => (
+            program.into(),
+            recipe[1..].iter().map(|part| (*part).to_string()).collect(),
+        ),
+    })
+}
+
+/// Fetch a server into Medha's own directory. Callers must have obtained consent
+/// first — this runs a package manager.
+pub async fn install_server(server: &str) -> Result<String, Error> {
+    let (program, arguments) = install_command(server)
+        .ok_or_else(|| Error::Protocol(format!("no install recipe for '{server}'")))?;
+    if !sandbox::program_on_path(&program) {
+        return Err(Error::Protocol(format!(
+            "{program} is needed to install {server} and is not available"
+        )));
+    }
+    let into =
+        server_install_dir().ok_or_else(|| Error::Protocol("no Medha home directory".into()))?;
+    std::fs::create_dir_all(into.join("bin"))
+        .map_err(|error| Error::Protocol(error.to_string()))?;
+    let output = tokio::process::Command::new(&program)
+        .args(&arguments)
+        // Keeps `go install` out of the user's shared GOBIN.
+        .env("GOBIN", into.join("bin"))
+        .output()
+        .await
+        .map_err(|error| Error::Protocol(error.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Protocol(format!(
+            "{program} failed: {}",
+            stderr.lines().last().unwrap_or("no output")
+        )));
+    }
+    Ok(format!("{server} installed into {}", into.display()))
+}
+
 /// Language servers need local toolchain discovery, but they should not inherit
 /// API keys, cloud credentials, or arbitrary session secrets from Medha.
 fn language_server_environment() -> Vec<(String, String)> {
@@ -3421,17 +3519,47 @@ fn kill_process_group(group: u64) {
     }
 }
 
-fn server_install_hint(server: &str) -> &'static str {
+fn server_install_hint(server: &str) -> String {
+    // A server Medha can fetch itself gets the command that does it; the rest
+    // get the toolchain that owns them. Either way the report says what to run,
+    // so a missing server is never a dead end.
+    if install_recipe(server).is_some() {
+        return format!("run `medha lsp install {server}`");
+    }
     match server {
         "rust-analyzer" => "install rust-analyzer with rustup or your system package manager",
-        "typescript-language-server" => {
-            "install typescript-language-server and typescript (for example with npm)"
-        }
-        "pyright" => "install pyright-langserver (for example with npm or pip)",
-        "gopls" => "install gopls with the Go toolchain",
         "clangd" => "install clangd with LLVM or your system package manager",
+        "ruby-lsp" => "gem install ruby-lsp",
+        "jdtls" => "install the Eclipse JDT language server",
+        "omnisharp" => "install the .NET SDK, then OmniSharp",
+        "lua-language-server" => "install lua-language-server from your package manager",
+        "zls" => "install zls matching your zig version",
+        "sourcekit-lsp" => "install a Swift toolchain (it ships with Xcode)",
         _ => "install the configured language-server executable",
     }
+    .to_string()
+}
+
+/// Packages Medha can fetch for a server, as `(fetcher, args…)`. Only servers
+/// with one unambiguous recipe appear — anything needing a language toolchain is
+/// left to the toolchain, because guessing wrong there breaks a user's setup.
+///
+/// This is metadata, not payload: the servers are downloaded at run time into
+/// Medha's own directory and nothing is bundled into the binary.
+pub fn install_recipe(server: &str) -> Option<&'static [&'static str]> {
+    Some(match server {
+        "typescript-language-server" => {
+            // The server resolves the TypeScript SDK from its own tree, so both
+            // have to land together or it starts and reports nothing.
+            &["npm", "typescript-language-server", "typescript"]
+        }
+        "pyright" => &["npm", "pyright"],
+        "bash-language-server" => &["npm", "bash-language-server"],
+        "yaml-language-server" => &["npm", "yaml-language-server"],
+        "intelephense" => &["npm", "intelephense"],
+        "gopls" => &["go", "golang.org/x/tools/gopls@latest"],
+        _ => return None,
+    })
 }
 
 fn detect_root(path: &Path, workspace: &Path, markers: &[String]) -> PathBuf {
@@ -4079,10 +4207,14 @@ mod tests {
             assert!(manager.supports(path), "missing adapter for {path}");
         }
         assert!(!manager.supports("README.md"));
+        // A server Medha can fetch points at the command that does it; one it
+        // cannot names the toolchain that owns it. Either way a missing server
+        // reports what to run rather than dead-ending.
         assert_eq!(
             server_install_hint("typescript-language-server"),
-            "install typescript-language-server and typescript (for example with npm)"
+            "run `medha lsp install typescript-language-server`"
         );
+        assert!(server_install_hint("clangd").contains("LLVM"));
     }
 
     #[test]

@@ -2039,9 +2039,17 @@ pub(super) fn handle_agent_event(
                                     lines.push(format!("    {detail}"));
                                 }
                             }
+                            lines.push(lsp_inventory_line(&payload));
                             lines.join("\n")
                         }
-                        _ => "LSP: enabled; no server has been started yet".to_string(),
+                        // "No server started" is true but useless on its own: it
+                        // reads the same whether nothing has been asked yet or
+                        // nothing is installed, which is exactly the question
+                        // someone typing /lsp is asking.
+                        _ => format!(
+                            "LSP: enabled, no server started yet\n{}",
+                            lsp_inventory_line(&payload)
+                        ),
                     }
                 }
             };
@@ -2759,6 +2767,47 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
         ));
     }
     open_mcp_picker(model);
+}
+
+/// Which language servers this machine can actually run, and what to do about
+/// the ones it cannot. Servers start lazily, so the running list alone never
+/// explains why an answer came back as a text match.
+fn lsp_inventory_line(payload: &serde_json::Value) -> String {
+    let Some(available) = payload
+        .get("available")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return String::new();
+    };
+    let installed: Vec<&str> = available
+        .iter()
+        .filter(|entry| entry["installed"].as_bool() == Some(true))
+        .filter_map(|entry| entry["server"].as_str())
+        .collect();
+    let fetchable: Vec<&str> = available
+        .iter()
+        .filter(|entry| {
+            entry["installed"].as_bool() != Some(true)
+                && entry["installable"].as_bool() == Some(true)
+        })
+        .filter_map(|entry| entry["server"].as_str())
+        .collect();
+    let mut text = format!(
+        "  {}/{} servers available here",
+        installed.len(),
+        available.len()
+    );
+    if !installed.is_empty() {
+        text.push_str(&format!(": {}", installed.join(", ")));
+    }
+    if !fetchable.is_empty() {
+        text.push_str(&format!(
+            "\n  · medha lsp install <id>   ({})",
+            fetchable.join(", ")
+        ));
+    }
+    text.push_str("\n  · a file with no server falls back to text search");
+    text
 }
 
 /// Connect a configured server. The server itself decides what happens next: an

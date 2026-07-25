@@ -727,7 +727,7 @@ async fn main() -> Result<()> {
         return run_mcp_command(raw[2..].to_vec()).await;
     }
     if raw.get(1).map(|s| s == "lsp").unwrap_or(false) {
-        return run_lsp_command(&raw[2..]);
+        return run_lsp_command(&raw[2..]).await;
     }
 
     let cli = Cli::parse();
@@ -1889,62 +1889,10 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// How to obtain a server, for the ones with a single obvious recipe. Medha
-/// never installs anything on its own — the plan is explicit that an unreviewed
-/// server package must not be downloaded or executed silently. Typing
-/// `medha lsp install <id>` is the approval, and the exact command is printed
-/// before it runs.
-fn lsp_install_recipe(id: &str) -> Option<&'static [&'static str]> {
-    Some(match id {
-        "typescript-language-server" => {
-            // The server resolves the TypeScript SDK from its own tree, so the
-            // two have to be installed together or it starts and does nothing.
-            &["npm", "typescript-language-server", "typescript"]
-        }
-        "pyright" => &["npm", "pyright"],
-        "bash-language-server" => &["npm", "bash-language-server"],
-        "yaml-language-server" => &["npm", "yaml-language-server"],
-        "intelephense" => &["npm", "intelephense"],
-        "go" => &["go", "golang.org/x/tools/gopls@latest"],
-        "gopls" => &["go", "golang.org/x/tools/gopls@latest"],
-        "rust-analyzer" => &["rustup", "component", "add", "rust-analyzer"],
-        _ => return None,
-    })
-}
-
-/// Turn a recipe into the command to run, scoped to Medha's own directory.
-/// Nothing installs to the global npm root or any shared prefix: the agent
-/// should not alter the machine outside a directory the user can delete.
-fn lsp_install_command(recipe: &[&str], into: &std::path::Path) -> (String, Vec<String>) {
-    let own = into.to_string_lossy().into_owned();
-    match recipe[0] {
-        "npm" => (
-            "npm".into(),
-            ["install", "--prefix", &own]
-                .into_iter()
-                .map(str::to_string)
-                .chain(recipe[1..].iter().map(|p| (*p).to_string()))
-                .collect(),
-        ),
-        // GOBIN redirects the binary; the module cache stays wherever Go keeps it.
-        "go" => (
-            "go".into(),
-            ["install"]
-                .into_iter()
-                .map(str::to_string)
-                .chain(recipe[1..].iter().map(|p| (*p).to_string()))
-                .collect(),
-        ),
-        // rustup owns the toolchain; there is no sensible way to redirect it, and
-        // a component is not a package download in the same sense.
-        program => (
-            program.into(),
-            recipe[1..].iter().map(|p| (*p).to_string()).collect(),
-        ),
-    }
-}
-
-/// Where to get the rest, which need a language toolchain rather than one command.
+/// Where to get the servers Medha cannot fetch itself — those need a language
+/// toolchain rather than one command, and guessing wrong breaks a user's setup.
+/// The fetchable ones live in `lsp::install_recipe`, shared with the runtime so
+/// the CLI and the gated tool can never disagree about what would run.
 fn lsp_install_hint(id: &str) -> &'static str {
     match id {
         "clangd" => "install LLVM (brew install llvm, apt install clangd)",
@@ -1961,7 +1909,7 @@ fn lsp_install_hint(id: &str) -> &'static str {
 /// `medha lsp list|status|install` — which language servers this machine can
 /// actually run. Without this the only way to discover that code intelligence is
 /// silently unavailable is to notice that answers look like text matches.
-fn run_lsp_command(args: &[String]) -> Result<()> {
+async fn run_lsp_command(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let lock = lockfile::MedhaLock::load(&cwd).unwrap_or_default();
     let mut config = lsp::Config {
@@ -2027,7 +1975,7 @@ fn run_lsp_command(args: &[String]) -> Result<()> {
                 .iter()
                 .filter(|adapter| {
                     !lsp::server_on_path(adapter.command.first().map(String::as_str).unwrap_or(""))
-                        && lsp_install_recipe(&adapter.id).is_some()
+                        && lsp::install_recipe(&adapter.id).is_some()
                 })
                 .map(|adapter| adapter.id.as_str())
                 .collect();
@@ -2051,44 +1999,22 @@ fn run_lsp_command(args: &[String]) -> Result<()> {
                 println!("{id} is already installed ({program})");
                 return Ok(());
             }
-            let Some(recipe) = lsp_install_recipe(id) else {
+            let Some((runner, arguments)) = lsp::install_command(id) else {
                 return Err(anyhow::anyhow!(
                     "{id} has no one-command install — {}",
                     lsp_install_hint(id)
                 ));
             };
-            if !sandbox::program_on_path(recipe[0]) {
-                return Err(anyhow::anyhow!(
-                    "{} is required to install {id} and is not on PATH",
-                    recipe[0]
-                ));
-            }
-            let into = lsp::server_install_dir()
-                .ok_or_else(|| anyhow::anyhow!("cannot locate the Medha home directory"))?;
-            std::fs::create_dir_all(into.join("bin"))
-                .with_context(|| format!("creating {}", into.display()))?;
-            let (program_to_run, arguments) = lsp_install_command(recipe, &into);
             // Show it before running it: this executes a package manager, and the
             // user should see exactly what runs and where it writes.
-            println!("$ {program_to_run} {}", arguments.join(" "));
-            println!("  installing into {}", into.display());
-            let status = std::process::Command::new(&program_to_run)
-                .args(&arguments)
-                // Keeps `go install` out of the user's shared GOBIN.
-                .env("GOBIN", into.join("bin"))
-                .status()
-                .with_context(|| format!("running {program_to_run}"))?;
-            if !status.success() {
-                return Err(anyhow::anyhow!("{program_to_run} failed"));
+            println!("$ {runner} {}", arguments.join(" "));
+            if let Some(into) = lsp::server_install_dir() {
+                println!("  installing into {}", into.display());
             }
-            println!(
-                "{id} installed{}",
-                if lsp::server_on_path(&program) {
-                    String::new()
-                } else {
-                    format!(" — but '{program}' is still not resolvable; check the install output")
-                }
-            );
+            println!("{}", lsp::install_server(id).await?);
+            if !lsp::server_on_path(&program) {
+                println!("note: '{program}' is still not resolvable; check the output above");
+            }
         }
         other => {
             return Err(anyhow::anyhow!(

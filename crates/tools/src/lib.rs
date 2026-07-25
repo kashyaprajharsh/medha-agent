@@ -268,7 +268,12 @@ impl Tool for LspStart {
         "lsp.start"
     }
     fn description(&self) -> &str {
-        "Approve and start the configured language server for a source file. Built-in servers start lazily without this; project-defined commands require this human-gated action once per session/root."
+        "Approve and start the configured language server for a source file. Built-in servers \
+         start lazily without this; project-defined commands require this human-gated action once \
+         per session/root. Pass `install: true` when a report says the server's binary is missing \
+         and Medha can fetch it — that downloads it into Medha's own directory first. Offer that \
+         rather than silently falling back to text search: the user should know why code \
+         intelligence is unavailable."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::External
@@ -281,7 +286,8 @@ impl Tool for LspStart {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Source file selecting the configured server and project root" },
-                "server": { "type": "string", "description": "Server id; required only when multiple project-defined servers match" }
+                "server": { "type": "string", "description": "Server id; required only when multiple project-defined servers match" },
+                "install": { "type": "boolean", "description": "Fetch the server's binary first if Medha can (default false)" }
             },
             "required": ["path"]
         })
@@ -291,12 +297,26 @@ impl Tool for LspStart {
         let server = args.get("server").and_then(Value::as_str);
         let absolute = self.sbx.resolve(path).await.ok()?;
         let preview = self.manager.start_preview_for(absolute, server).ok()?;
-        Some(format!(
+        let mut text = format!(
             "start language server '{}' in {}\ncommand: {}",
             preview.server,
             preview.root.display(),
             preview.command.join(" ")
-        ))
+        );
+        // The install runs a package manager, so the approval has to show
+        // exactly what will be fetched and where it lands.
+        if args.get("install").and_then(Value::as_bool) == Some(true)
+            && let Some((program, arguments)) = lsp::install_command(&preview.server)
+        {
+            text.push_str(&format!(
+                "\n\nfirst install it:\n$ {program} {}\ninto {}",
+                arguments.join(" "),
+                lsp::server_install_dir()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default()
+            ));
+        }
+        Some(text)
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
@@ -306,13 +326,35 @@ impl Tool for LspStart {
             .resolve(&path)
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?;
-        serde_json::to_value(
+        let mut installed = None;
+        if args.get("install").and_then(Value::as_bool) == Some(true) {
+            let target = match server {
+                Some(id) => id.to_string(),
+                None => self
+                    .manager
+                    .start_preview_for(absolute.clone(), None)
+                    .map(|preview| preview.server)
+                    .map_err(|error| ToolError::Failed(error.to_string()))?,
+            };
+            installed = Some(
+                lsp::install_server(&target)
+                    .await
+                    .map_err(|error| ToolError::Failed(error.to_string()))?,
+            );
+        }
+        let mut status = serde_json::to_value(
             self.manager
                 .approve_and_start_for(absolute, server)
                 .await
                 .map_err(|error| ToolError::Failed(error.to_string()))?,
         )
-        .map_err(|error| ToolError::Failed(error.to_string()))
+        .map_err(|error| ToolError::Failed(error.to_string()))?;
+        if let Some(note) = installed
+            && let Some(object) = status.as_object_mut()
+        {
+            object.insert("installed".into(), Value::String(note));
+        }
+        Ok(status)
     }
 }
 
@@ -339,7 +381,13 @@ impl Tool for LspStatus {
     }
 
     async fn execute(&self, _args: &Value) -> Result<Value, ToolError> {
-        Ok(json!({ "servers": self.manager.status().await }))
+        // Sessions alone cannot answer "why was that a text match" — servers
+        // start lazily, so an empty list means either "nothing asked yet" or
+        // "nothing installed". The inventory separates the two.
+        Ok(json!({
+            "servers": self.manager.status().await,
+            "available": self.manager.inventory(),
+        }))
     }
 }
 

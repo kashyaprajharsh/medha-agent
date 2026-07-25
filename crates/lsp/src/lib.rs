@@ -192,6 +192,119 @@ impl ServerAdapter {
             settings: Value::Null,
         }
     }
+
+    /// Declarative adapter for a server that needs no special handling: an id, a
+    /// command, its extensions and the markers that identify a project root.
+    /// Nothing spawns unless the binary is actually on PATH, so listing a server
+    /// costs nothing on a machine that does not have it.
+    fn simple(
+        id: &str,
+        command: &[&str],
+        languages: &[(&str, &str)],
+        root_markers: &[&str],
+    ) -> Self {
+        Self {
+            id: id.into(),
+            command: command.iter().map(|part| (*part).to_string()).collect(),
+            languages: languages
+                .iter()
+                .map(|(extension, language_id)| Language {
+                    extension: (*extension).into(),
+                    language_id: (*language_id).into(),
+                })
+                .collect(),
+            root_markers: root_markers
+                .iter()
+                .map(|marker| (*marker).to_string())
+                .chain(std::iter::once(".git".to_string()))
+                .collect(),
+            requires_approval: false,
+            settings: Value::Null,
+        }
+    }
+
+    pub fn ruby() -> Self {
+        Self::simple(
+            "ruby-lsp",
+            &["ruby-lsp"],
+            &[("rb", "ruby"), ("rake", "ruby"), ("gemspec", "ruby")],
+            &["Gemfile", ".ruby-version"],
+        )
+    }
+
+    pub fn java() -> Self {
+        Self::simple(
+            "jdtls",
+            &["jdtls"],
+            &[("java", "java")],
+            &["pom.xml", "build.gradle", "build.gradle.kts", ".classpath"],
+        )
+    }
+
+    pub fn csharp() -> Self {
+        Self::simple(
+            "omnisharp",
+            &["omnisharp", "-lsp"],
+            &[("cs", "csharp")],
+            // Markers are matched as exact filenames, not globs, so a solution
+            // file cannot be named here — `.git` carries these projects.
+            &["omnisharp.json", "global.json", "NuGet.config"],
+        )
+    }
+
+    pub fn php() -> Self {
+        Self::simple(
+            "intelephense",
+            &["intelephense", "--stdio"],
+            &[("php", "php")],
+            &["composer.json"],
+        )
+    }
+
+    pub fn lua() -> Self {
+        Self::simple(
+            "lua-language-server",
+            &["lua-language-server"],
+            &[("lua", "lua")],
+            &[".luarc.json", "stylua.toml"],
+        )
+    }
+
+    pub fn bash() -> Self {
+        Self::simple(
+            "bash-language-server",
+            &["bash-language-server", "start"],
+            &[("sh", "shellscript"), ("bash", "shellscript")],
+            &[],
+        )
+    }
+
+    pub fn zig() -> Self {
+        Self::simple(
+            "zls",
+            &["zls"],
+            &[("zig", "zig"), ("zon", "zig")],
+            &["build.zig"],
+        )
+    }
+
+    pub fn swift() -> Self {
+        Self::simple(
+            "sourcekit-lsp",
+            &["sourcekit-lsp"],
+            &[("swift", "swift")],
+            &["Package.swift"],
+        )
+    }
+
+    pub fn yaml() -> Self {
+        Self::simple(
+            "yaml-language-server",
+            &["yaml-language-server", "--stdio"],
+            &[("yaml", "yaml"), ("yml", "yaml")],
+            &[],
+        )
+    }
 }
 
 pub fn language_mappings(names: &[String]) -> Vec<Language> {
@@ -289,12 +402,26 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: true,
+            // Listing an adapter costs nothing when its binary is absent —
+            // nothing spawns and the file simply falls through to the text
+            // tools. Coverage is therefore a matter of naming servers, and a
+            // narrow list is the only reason a language would silently get no
+            // code intelligence at all.
             servers: vec![
                 ServerAdapter::rust_analyzer(),
                 ServerAdapter::typescript(),
                 ServerAdapter::python(),
                 ServerAdapter::go(),
                 ServerAdapter::clangd(),
+                ServerAdapter::ruby(),
+                ServerAdapter::java(),
+                ServerAdapter::csharp(),
+                ServerAdapter::php(),
+                ServerAdapter::lua(),
+                ServerAdapter::bash(),
+                ServerAdapter::zig(),
+                ServerAdapter::swift(),
+                ServerAdapter::yaml(),
             ],
             startup_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(8),
@@ -3616,6 +3743,41 @@ mod tests {
         let status = manager.status().await;
         assert_eq!(status.len(), 1);
         assert!(matches!(status[0].state, ServerState::Broken));
+    }
+
+    #[test]
+    fn every_built_in_adapter_is_well_formed() {
+        let servers = Config::default().servers;
+        let mut extensions: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for adapter in &servers {
+            assert!(!adapter.command.is_empty(), "{} has no command", adapter.id);
+            assert!(
+                !adapter.languages.is_empty(),
+                "{} claims no extensions",
+                adapter.id
+            );
+            for marker in &adapter.root_markers {
+                // Roots are found with `join(marker).exists()`, so a glob is a
+                // marker that can never match — silently, and the server would
+                // just always fall back to the workspace root.
+                assert!(
+                    !marker.contains('*'),
+                    "{}: root marker {marker:?} is a glob and will never match",
+                    adapter.id
+                );
+            }
+            for language in &adapter.languages {
+                // Two servers claiming one extension means both are started for
+                // every such file, doubling spawn cost and merging two opinions.
+                if let Some(previous) = extensions.insert(&language.extension, &adapter.id) {
+                    panic!(
+                        "extension {:?} is claimed by both {previous} and {}",
+                        language.extension, adapter.id
+                    );
+                }
+            }
+        }
     }
 
     /// A parked server has to be revivable without restarting Medha: a few

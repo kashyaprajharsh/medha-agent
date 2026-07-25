@@ -726,6 +726,9 @@ async fn main() -> Result<()> {
     if raw.get(1).map(|s| s == "mcp").unwrap_or(false) {
         return run_mcp_command(raw[2..].to_vec()).await;
     }
+    if raw.get(1).map(|s| s == "lsp").unwrap_or(false) {
+        return run_lsp_command(&raw[2..]);
+    }
 
     let cli = Cli::parse();
 
@@ -1880,6 +1883,79 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
         other => {
             return Err(anyhow::anyhow!(
                 "unknown mcp subcommand '{other}' (use add|list|remove|auth|enable|disable|tools)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `medha lsp list|status` — which language servers this machine can actually
+/// run. Without this the only way to discover that code intelligence is silently
+/// unavailable is to notice that answers look like text matches.
+fn run_lsp_command(args: &[String]) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let lock = lockfile::MedhaLock::load(&cwd).unwrap_or_default();
+    let mut config = lsp::Config {
+        enabled: lock.lsp.enabled,
+        ..lsp::Config::default()
+    };
+    // Project-defined servers replace a built-in of the same id, so the listing
+    // shows what would actually run rather than the defaults.
+    for configured in &lock.lsp.servers {
+        if configured.command.is_empty() || configured.languages.is_empty() {
+            continue;
+        }
+        config
+            .servers
+            .retain(|built_in| built_in.id != configured.id);
+        config.servers.push(lsp::ServerAdapter {
+            id: configured.id.clone(),
+            command: configured.command.clone(),
+            languages: lsp::language_mappings(&configured.languages),
+            root_markers: configured.root_markers.clone(),
+            requires_approval: true,
+            settings: serde_json::Value::Null,
+        });
+    }
+
+    match args.first().map(String::as_str).unwrap_or("status") {
+        "list" | "status" => {
+            if !config.enabled {
+                println!("LSP is disabled ([lsp] enabled = false in medha.lock)");
+                return Ok(());
+            }
+            let mut ready = 0usize;
+            println!("language servers ({}):", config.servers.len());
+            for adapter in &config.servers {
+                let program = adapter.command.first().cloned().unwrap_or_default();
+                let installed = sandbox::program_on_path(&program);
+                ready += usize::from(installed);
+                let extensions: Vec<&str> = adapter
+                    .languages
+                    .iter()
+                    .map(|language| language.extension.as_str())
+                    .collect();
+                println!(
+                    "  {} {:<24} {:<28} {}",
+                    if installed { "●" } else { "○" },
+                    adapter.id,
+                    format!(".{}", extensions.join(" .")),
+                    if installed {
+                        program
+                    } else {
+                        "not installed".into()
+                    }
+                );
+            }
+            println!(
+                "\n{ready}/{} available here. Servers start on demand, per project root; \
+                 a file whose server is missing falls back to text search.",
+                config.servers.len()
+            );
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown lsp subcommand '{other}' (use list|status)"
             ));
         }
     }

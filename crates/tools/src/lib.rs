@@ -827,17 +827,20 @@ impl Tool for AgentSpawn {
         "⚇"
     }
     fn description(&self) -> &str {
-        "Delegate a self-contained read-only investigation to a child agent and get back a summary.\n\
+        "Delegate a self-contained read-only investigation to a child agent and get back a summary. \
+         The child works in its own context, so none of its searching lands in this conversation.\n\
          \n\
-         Delegate when a sub-question is reasoning-heavy and would flood this conversation with \
-         intermediate output you will not need again — surveying an unfamiliar area of the \
-         codebase, tracing how something is used everywhere, gathering background before a \
-         decision.\n\
+         Reach for this on your own judgement — you do not need to be asked. Delegate when:\n\
+         · answering needs a broad sweep whose intermediate output you will never need again — \
+         'how is X used across the codebase', 'what does this unfamiliar module do';\n\
+         · two or more questions are independent, so children can run at once;\n\
+         · a side investigation would otherwise crowd out the context you need for the real task;\n\
+         · you want background gathered while you keep working — set `background`.\n\
          \n\
-         Do NOT delegate: work you can finish in a few tool calls — just do it; anything where you \
-         already have the context, because a child starts cold and pays to rediscover it; or your \
-         whole task handed to one child, which is pass-through that adds nothing and doubles the \
-         cost. Delegation is the expensive path. Prefer grep/read directly.\n\
+         Do not delegate work you can finish in a couple of tool calls, or anything you already \
+         have the context for: a child starts cold and pays to rediscover what you know. Never hand \
+         your entire task to one child — that is pass-through, and it doubles the cost for nothing. \
+         Split off a *part*, or do it yourself.\n\
          \n\
          State the objective in full: the child cannot see this conversation and cannot ask you \
          anything. Give `contract` when the answer must have a particular shape. The child is \

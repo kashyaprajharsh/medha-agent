@@ -103,14 +103,30 @@ pub(super) fn veena_line(frame: u64) -> Line<'static> {
     const GAP: usize = 8;
     let head = (frame / 3) as usize % (n + GAP);
 
+    // The comet's head was a hardcoded near-white, which vanishes on parchment.
+    // On light the head is the darkest ink and the tail lightens — the same
+    // gesture read the other way up.
+    let is_dark = theme::current().is_dark;
     let white = Style::default()
-        .fg(Color::Rgb(255, 246, 214))
+        .fg(if is_dark {
+            Color::Rgb(255, 246, 214)
+        } else {
+            Color::Rgb(92, 56, 10)
+        })
         .add_modifier(Modifier::BOLD);
     let bright_gold = Style::default()
-        .fg(Color::Rgb(247, 208, 120))
+        .fg(if is_dark {
+            Color::Rgb(247, 208, 120)
+        } else {
+            Color::Rgb(140, 90, 16)
+        })
         .add_modifier(Modifier::BOLD);
     let gold = Style::default().fg(theme::accent());
-    let dim = Style::default().fg(Color::Rgb(150, 120, 70));
+    let dim = Style::default().fg(if is_dark {
+        Color::Rgb(150, 120, 70)
+    } else {
+        Color::Rgb(184, 156, 112)
+    });
     let faint = Style::default().fg(theme::faint());
 
     let mut spans = Vec::with_capacity(n);
@@ -134,19 +150,22 @@ pub(super) fn veena_line(frame: u64) -> Line<'static> {
     Line::from(spans)
 }
 
-pub(super) const LOGO: &str = r#"███╗   ███╗ ███████╗ ██████╗  ██╗  ██╗  █████╗
-████╗ ████║ ██╔════╝ ██╔══██╗ ██║  ██║ ██╔══██╗
-██╔████╔██║ █████╗   ██║  ██║ ███████║ ███████║
-██║╚██╔╝██║ ██╔══╝   ██║  ██║ ██╔══██║ ██╔══██║
-██║ ╚═╝ ██║ ███████╗ ██████╔╝ ██║  ██║ ██║  ██║
-╚═╝     ╚═╝ ╚══════╝ ╚═════╝  ╚═╝  ╚═╝ ╚═╝  ╚═╝"#;
+/// Solid blocks only. The previous form mixed full blocks with box-drawing
+/// outlines (`╗ ║ ═`), which come from a different glyph family — most terminal
+/// fonts render the two at different weights and baselines, so the outline
+/// floated off the fill and the letterforms read as broken.
+pub(super) const LOGO: &str = r#"██   ██ ██████ █████  ██   ██  █████
+███ ███ ██     ██  ██ ██   ██ ██   ██
+██ █ ██ █████  ██  ██ ███████ ███████
+██   ██ ██     ██  ██ ██   ██ ██   ██
+██   ██ ██████ █████  ██   ██ ██   ██"#;
 
 /// MEDHA's identity palette, grounded in Saraswati's iconography: **white**
 /// (purity, true knowledge) crowning **gold/yellow** (intellect, the Vasant
 /// spring colour). The wordmark is lit from the top — a near-white crown, warm
 /// gold body, deep bronze base — so the six rows read as a solid form receding
 /// into shadow, not flat text. All warm: no cool/blue tones.
-pub(super) const LOGO_GRADIENT: [(u8, u8, u8); 6] = [
+const LOGO_GRADIENT_DARK: [(u8, u8, u8); 6] = [
     (255, 248, 224),
     (247, 208, 120),
     (230, 176, 84),
@@ -154,6 +173,27 @@ pub(super) const LOGO_GRADIENT: [(u8, u8, u8); 6] = [
     (176, 126, 66),
     (150, 108, 56),
 ];
+
+/// The same form on parchment. The dark ramp crowns at near-white, which is all
+/// but invisible on a light canvas — the splash washed out entirely under the
+/// light theme. Here the light is carried by saturation instead: warm amber
+/// crown down to deep bronze base, so the rows still read as one solid mass.
+const LOGO_GRADIENT_LIGHT: [(u8, u8, u8); 6] = [
+    (198, 142, 50),
+    (178, 120, 34),
+    (158, 102, 24),
+    (138, 86, 18),
+    (120, 72, 14),
+    (104, 62, 12),
+];
+
+pub(super) fn logo_gradient() -> [(u8, u8, u8); 6] {
+    if theme::current().is_dark {
+        LOGO_GRADIENT_DARK
+    } else {
+        LOGO_GRADIENT_LIGHT
+    }
+}
 
 /// Darken an rgb toward its shadow (num/den of full brightness). Used to bevel
 /// the logo's box-drawing outline beneath the bright block fill.
@@ -215,10 +255,19 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
     let level = if t < 30 { t } else { 60 - t };
     // Devanagari wordmark breathes between deep gold and Saraswati's white —
     // knowledge-light pulsing over the intellect-gold (no cool/blue tones).
-    let word = lerp_color((214, 158, 74), (255, 248, 224), level, 30);
+    // Breathe between the palette's own accent ends, so the pulse stays visible
+    // on parchment instead of fading into it.
+    let word = if theme::current().is_dark {
+        lerp_color((214, 158, 74), (255, 248, 224), level, 30)
+    } else {
+        lerp_color((160, 106, 18), (206, 150, 60), level, 30)
+    };
     body.push(center_line(
         vec![Span::styled(
-            "◆  मेधा  ◆",
+            // Romanised, not Devanagari: terminals have no Indic shaping engine,
+            // so the `ा` matra cannot attach to `ध` and falls back to a dotted
+            // placeholder circle — the wordmark rendered as `मेध◌ा`.
+            "◆  medhā · intellect  ◆",
             Style::default().fg(word).add_modifier(Modifier::BOLD),
         )],
         w,
@@ -231,8 +280,9 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
     let room_for_logo = (area.height as usize) >= logo_rows + 9;
     if room_for_logo {
         body.push(Line::from(""));
+        let gradient = logo_gradient();
         for (i, line) in LOGO.lines().enumerate() {
-            let rgb = LOGO_GRADIENT[i.min(LOGO_GRADIENT.len() - 1)];
+            let rgb = gradient[i.min(gradient.len() - 1)];
             body.push(center_line(logo_row(line, rgb), w));
         }
     }
@@ -276,9 +326,22 @@ pub(super) struct ToolViz {
 
 /// Colour for a tool's *category* (glyph is the tool's own, from `ToolViz`).
 pub(super) fn cat_color(cat: ToolCategory) -> Color {
-    let blue = Color::Rgb(120, 170, 235);
-    let purple = Color::Rgb(186, 148, 236);
-    let cyan = Color::Rgb(110, 196, 208);
+    // The dark set is pastel, which needs a dark canvas behind it — on parchment
+    // those three washed out to near-illegible. Light gets saturated, darker
+    // siblings of the same hues.
+    let (blue, purple, cyan) = if theme::current().is_dark {
+        (
+            Color::Rgb(120, 170, 235),
+            Color::Rgb(186, 148, 236),
+            Color::Rgb(110, 196, 208),
+        )
+    } else {
+        (
+            Color::Rgb(38, 92, 168),
+            Color::Rgb(108, 62, 170),
+            Color::Rgb(22, 112, 124),
+        )
+    };
     match cat {
         ToolCategory::Read => blue,
         ToolCategory::Write => theme::warn(),
@@ -668,7 +731,9 @@ pub(super) fn parse_inline_markdown_spans(line: &str, base_style: Style) -> Vec<
         if !text.is_empty() {
             let mut style = base_style;
             if code {
-                style = style.fg(Color::Rgb(220, 200, 140));
+                // Palette slot, not a fixed gold: the hardcoded value was tuned
+                // for warm ink and all but disappeared on the light parchment.
+                style = style.fg(theme::code_fg());
             } else {
                 if bold {
                     style = style.add_modifier(Modifier::BOLD);
@@ -2249,7 +2314,7 @@ mod clarify_view_tests {
     fn test_parse_inline_markdown() {
         use super::parse_inline_markdown;
         use crate::tui_tea::theme;
-        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::style::{Modifier, Style};
 
         let normal = parse_inline_markdown("hello world");
         assert_eq!(normal.spans.len(), 1);
@@ -2283,7 +2348,7 @@ mod clarify_view_tests {
         assert_eq!(code.spans.len(), 3);
         assert_eq!(code.spans[0].content, "some ");
         assert_eq!(code.spans[1].content, "code");
-        assert_eq!(code.spans[1].style.fg, Some(Color::Rgb(220, 200, 140)));
+        assert_eq!(code.spans[1].style.fg, Some(theme::code_fg()));
         assert_eq!(code.spans[2].content, " block");
 
         let non_matching = parse_inline_markdown("x * y * z");
@@ -2331,6 +2396,24 @@ mod clarify_view_tests {
         assert!(super::placeholder(200).contains("ctrl-click"));
         assert!(!super::placeholder(60).contains("ctrl-click"));
         assert!(super::placeholder(60).starts_with("Ask medha"));
+    }
+
+    #[test]
+    fn the_splash_stays_visible_on_parchment() {
+        // Asserted on the ramps directly rather than by swapping the global
+        // palette: the theme is process-wide, and mutating it here would race
+        // every other test that renders.
+        let (light, dark) = (super::LOGO_GRADIENT_LIGHT, super::LOGO_GRADIENT_DARK);
+        assert_ne!(light, dark, "the logo must re-colour with the palette");
+        let luma = |(r, g, b): (u8, u8, u8)| 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        // The dark ramp crowns at near-white, which is invisible on parchment —
+        // the whole splash used to wash out under the light theme.
+        for row in light {
+            assert!(luma(row) < 180.0, "{row:?} is too pale for a light canvas");
+        }
+        for row in dark {
+            assert!(luma(row) > 90.0, "{row:?} is too dark for warm ink");
+        }
     }
 
     #[test]

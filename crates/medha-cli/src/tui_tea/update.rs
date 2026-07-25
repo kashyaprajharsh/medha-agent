@@ -954,7 +954,7 @@ pub(super) fn handle_key<P, L>(
                         prefill_command(
                             model,
                             "/mcp add ",
-                            "type: <id> -- <command>   e.g.  github -- npx -y @modelcontextprotocol/server-github",
+                            "<id> [--key K] [--deny-tool P] -- <command>   e.g.  github --key ghp_… -- npx -y @modelcontextprotocol/server-github   (--key goes to the OS keychain, never a file)",
                         );
                         return;
                     }
@@ -965,7 +965,9 @@ pub(super) fn handle_key<P, L>(
                         let tx = tx.clone();
                         tokio::spawn(async move {
                             let result = match manager.approve_and_connect(&id).await {
-                                Ok(_) => Ok(serde_json::json!({ "servers": manager.status().await })),
+                                Ok(_) => {
+                                    Ok(serde_json::json!({ "servers": manager.status().await }))
+                                }
                                 Err(error) => Err(error.to_string()),
                             };
                             let _ = tx.send(TuiEvent::McpStatus(result));
@@ -1858,7 +1860,7 @@ pub(super) fn handle_agent_event(
         }
         TuiEvent::McpStatus(result) => {
             let text = match result {
-                Err(error) => format!("MCP: disabled or unavailable\n  {error}"),
+                Err(error) => format!("MCP: {error}"),
                 Ok(payload) => {
                     let servers = payload.get("servers").and_then(serde_json::Value::as_array);
                     match servers {
@@ -1877,7 +1879,17 @@ pub(super) fn handle_agent_event(
                                     .get("tools")
                                     .and_then(serde_json::Value::as_u64)
                                     .unwrap_or(0);
-                                lines.push(format!("  {name} [{state}]  {tools} tool(s)"));
+                                let hidden = server
+                                    .get("hidden")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0);
+                                let filtered = match hidden {
+                                    0 => String::new(),
+                                    n => format!(", {n} filtered"),
+                                };
+                                lines.push(format!(
+                                    "  {name} [{state}]  {tools} tool(s){filtered}"
+                                ));
                                 if let Some(detail) =
                                     server.get("detail").and_then(serde_json::Value::as_str)
                                 {
@@ -2414,7 +2426,11 @@ fn start_mcp_server(
 /// Open the `/mcp` management picker: row 0 adds a server, the rest are the
 /// user-config servers (`~/.medha/config.toml`).
 fn open_mcp_picker(model: &mut Model) {
-    let servers = config::load().ok().flatten().map(|c| c.mcp).unwrap_or_default();
+    let servers = config::load()
+        .ok()
+        .flatten()
+        .map(|c| c.mcp)
+        .unwrap_or_default();
     let rows: Vec<McpRow> = servers
         .into_iter()
         .map(|(id, server)| McpRow {
@@ -2425,13 +2441,18 @@ fn open_mcp_picker(model: &mut Model) {
     model.picker = Some(Picker::new(PickerKind::Mcp(rows)));
 }
 
-/// `/mcp add <id> [--key K] [--trust trusted] [--env K=V] -- <command>` — save to
+/// `/mcp add <id> [--key K] [--trust trusted] [--env K=V] [--allow-tool P]
+/// [--deny-tool P] [--no-network] [--parallel] -- <command>` — save to
 /// `~/.medha/config.toml` (key → credential store), then connect live.
 fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let mut id = None;
     let mut trust = "workspace".to_string();
     let mut key: Option<String> = None;
     let mut env = std::collections::BTreeMap::new();
+    let mut allow_tools: Vec<String> = Vec::new();
+    let mut deny_tools: Vec<String> = Vec::new();
+    let mut network = None;
+    let mut parallel_calls = false;
     let mut command: Vec<String> = Vec::new();
     let mut it = args.split_whitespace();
     while let Some(token) = it.next() {
@@ -2443,6 +2464,10 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
                     env.insert(k.to_string(), v.to_string());
                 }
             }
+            "--allow-tool" => allow_tools.extend(it.next().map(str::to_string)),
+            "--deny-tool" => deny_tools.extend(it.next().map(str::to_string)),
+            "--no-network" => network = Some(false),
+            "--parallel" => parallel_calls = true,
             "--" => command.extend(it.by_ref().map(str::to_string)),
             _ if id.is_none() => id = Some(token.to_string()),
             _ => command.push(token.to_string()),
@@ -2464,6 +2489,10 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
         command,
         env,
         trust,
+        allow_tools,
+        deny_tools,
+        network,
+        parallel_calls,
     };
     let mut cfg = config::load().ok().flatten().unwrap_or_default();
     cfg.mcp.insert(id.clone(), server.clone());
@@ -2476,14 +2505,16 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
         let resolved = config::resolve_mcp_server(&id, &server);
         let tx = tx.clone();
         tokio::spawn(async move {
-            let result = match manager.add_server(resolved).await {
-                Ok(_) => Ok(serde_json::json!({ "servers": manager.status().await })),
-                Err(error) => Err(error.to_string()),
-            };
-            let _ = tx.send(TuiEvent::McpStatus(result));
+            // Report the status list either way: a failed server shows up as a
+            // row with its state and reason, which beats a bare error string.
+            let _ = manager.add_server(resolved).await;
+            let servers = serde_json::json!({ "servers": manager.status().await });
+            let _ = tx.send(TuiEvent::McpStatus(Ok(servers)));
         });
     } else {
-        model.push_notice(format!("added '{id}' to config.toml (restart to use)"));
+        model.push_notice(format!(
+            "added '{id}' to config.toml (MCP host unavailable)"
+        ));
     }
     open_mcp_picker(model);
 }

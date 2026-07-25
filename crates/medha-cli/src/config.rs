@@ -99,6 +99,20 @@ pub struct McpServer {
     /// `workspace` (default) requires approval to start; `trusted` auto-connects.
     #[serde(default)]
     pub trust: String,
+    /// Tools exposed to the model. `allow` (when set) whitelists, then `deny`
+    /// subtracts; entries are exact names or a `prefix*` glob. A big server can
+    /// publish 100+ schemas — filtering keeps them out of every model request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_tools: Vec<String>,
+    /// Per-server network override; unset falls back to the host `[mcp]` default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<bool>,
+    /// Opt in to concurrent calls. Off by default: most servers hold per-session
+    /// state, and a server's own "read only" annotation is a hint, not a promise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parallel_calls: bool,
 }
 
 /// Persisted web-search choice. API keys are secrets and live in the credential
@@ -1420,8 +1434,18 @@ pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
     mcp::ServerConfig {
         id: id.to_string(),
         command: server.command.iter().map(|arg| sub(arg)).collect(),
-        env: server.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect(),
+        env: server
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), sub(v)))
+            .collect(),
         requires_approval: server.trust != "trusted",
+        allow_network: server.network,
+        tools: mcp::ToolFilter {
+            allow: server.allow_tools.clone(),
+            deny: server.deny_tools.clone(),
+        },
+        parallel_calls: server.parallel_calls,
     }
 }
 

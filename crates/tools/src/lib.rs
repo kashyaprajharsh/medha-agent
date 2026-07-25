@@ -1163,12 +1163,19 @@ impl Executor for ToolRegistry {
             };
             return match mcp.call(&intent.tool, &intent.args).await {
                 Ok(out) => {
-                    let payload = json!({
+                    // Bound what reaches the model; the full result is preserved
+                    // losslessly in the artifact store rather than discarded.
+                    let cap = mcp.max_text_chars();
+                    let cut = out.text.char_indices().nth(cap).map(|(index, _)| index);
+                    let mut payload = json!({
                         "server": out.server,
                         "tool": out.tool,
-                        "content": out.text,
-                        "truncated": out.truncated,
+                        "content": cut.map_or(out.text.as_str(), |index| &out.text[..index]),
+                        "truncated": cut.is_some(),
                     });
+                    if let (Some(_), Some(store)) = (cut, &self.artifacts) {
+                        attach_artifact(&mut payload, out.text.into_bytes(), store.as_ref());
+                    }
                     if out.is_error {
                         Observation {
                             intent_id: intent.id.clone(),

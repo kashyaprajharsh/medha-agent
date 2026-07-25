@@ -16,6 +16,12 @@ tracing = "0.1"
 # crates.io release (not git) so the static build is reproducible.
 rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process"] }
 
+[target.'cfg(unix)'.dependencies]
+# Process-group teardown: uvx/npx fork the real server, so killing the direct
+# child alone leaves an orphan.
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+futures.workspace = true

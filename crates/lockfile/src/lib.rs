@@ -170,7 +170,15 @@ pub struct McpConfig {
     pub startup_timeout_ms: u64,
     pub request_timeout_ms: u64,
     pub max_text_chars: usize,
+    /// Default network policy; a server may override it with `network` in the
+    /// user config.
     pub allow_network: bool,
+    /// Supervisor sweep period: liveness probe and reconnect scheduling.
+    pub health_interval_ms: u64,
+    /// Consecutive connect failures tolerated before a server is parked.
+    pub max_reconnects: u32,
+    /// How long a parked server waits before one slow self-probe.
+    pub park_probe_ms: u64,
 }
 
 impl Default for McpConfig {
@@ -180,6 +188,9 @@ impl Default for McpConfig {
             request_timeout_ms: 60_000,
             max_text_chars: 16_000,
             allow_network: true,
+            health_interval_ms: 5_000,
+            max_reconnects: 5,
+            park_probe_ms: 300_000,
         }
     }
 }

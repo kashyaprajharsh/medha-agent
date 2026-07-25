@@ -1167,7 +1167,6 @@ async fn main() -> Result<()> {
     // MCP servers live in the user config (~/.medha/config.toml); their keys live
     // in the credential store and are substituted into the command at spawn. The
     // lockfile only carries runtime tuning (timeouts, allow_network) + the switch.
-    let mut mcp_manager: Option<Arc<mcp::McpManager>> = None;
     let mcp_servers: Vec<mcp::ServerConfig> = model_profiles
         .lock()
         .ok()
@@ -1179,7 +1178,10 @@ async fn main() -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    if !mcp_servers.is_empty() {
+    // Always build the host, even with zero servers configured: it costs nothing
+    // idle and is what lets `/mcp add` connect live instead of asking for a restart.
+    let mcp_manager = {
+        let had_servers = !mcp_servers.is_empty();
         let mcp_config = mcp::Config {
             enabled: true,
             servers: mcp_servers,
@@ -1187,12 +1189,22 @@ async fn main() -> Result<()> {
             request_timeout: std::time::Duration::from_millis(lock.mcp.request_timeout_ms),
             max_text_chars: lock.mcp.max_text_chars,
             allow_network: lock.mcp.allow_network,
+            health_interval: std::time::Duration::from_millis(lock.mcp.health_interval_ms),
+            max_reconnects: lock.mcp.max_reconnects,
+            park_probe: std::time::Duration::from_millis(lock.mcp.park_probe_ms),
         };
         let manager = Arc::new(mcp::McpManager::new(cwd.clone(), mcp_config));
-        manager.connect_startup().await; // bounded; a slow server never stalls startup
         registry.register_mcp(manager.clone());
-        mcp_manager = Some(manager);
-    }
+        if had_servers {
+            // Connect in the background: tools are re-projected every turn, so a
+            // slow or broken server surfaces in status without delaying turn one.
+            tokio::spawn({
+                let manager = manager.clone();
+                async move { manager.connect_startup().await }
+            });
+        }
+        Some(manager)
+    };
     registry.register_skills(skill_store.clone());
     // Typed memory (D9): project entries in the workspace state dir, user
     // entries in the user-global store — recall merges both.
@@ -1576,7 +1588,26 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                     } else {
                         ""
                     };
-                    println!("  {id}  [{trust}]  {}{key}", server.command.join(" "));
+                    let filter = match (&server.allow_tools[..], &server.deny_tools[..]) {
+                        ([], []) => String::new(),
+                        (allow, deny) => format!(
+                            "\n      tools: {}{}",
+                            if allow.is_empty() {
+                                "all".to_string()
+                            } else {
+                                allow.join(", ")
+                            },
+                            if deny.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" minus {}", deny.join(", "))
+                            }
+                        ),
+                    };
+                    println!(
+                        "  {id}  [{trust}]  {}{key}{filter}",
+                        server.command.join(" ")
+                    );
                 }
             }
         }
@@ -1593,11 +1624,16 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             }
         }
         "add" => {
-            // medha mcp add <id> [--key K] [--trust trusted] [--env K=V]... [--] <command>
+            // medha mcp add <id> [--key K] [--trust trusted] [--env K=V]
+            //   [--allow-tool P] [--deny-tool P] [--no-network] [--parallel] [--] <command>
             let mut id = None;
             let mut trust = "workspace".to_string();
             let mut key: Option<String> = None;
             let mut env = std::collections::BTreeMap::new();
+            let mut allow_tools: Vec<String> = Vec::new();
+            let mut deny_tools: Vec<String> = Vec::new();
+            let mut network = None;
+            let mut parallel_calls = false;
             let mut command: Vec<String> = Vec::new();
             let mut it = args[1..].iter();
             while let Some(arg) = it.next() {
@@ -1609,6 +1645,10 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                             env.insert(k.to_string(), v.to_string());
                         }
                     }
+                    "--allow-tool" => allow_tools.extend(it.next().cloned()),
+                    "--deny-tool" => deny_tools.extend(it.next().cloned()),
+                    "--no-network" => network = Some(false),
+                    "--parallel" => parallel_calls = true,
                     "--" => command.extend(it.by_ref().cloned()),
                     _ if id.is_none() => id = Some(arg.clone()),
                     _ => command.push(arg.clone()),
@@ -1616,7 +1656,8 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             }
             let id = id.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "usage: medha mcp add <id> [--key K] [--trust trusted] [--env K=V] -- <command>"
+                    "usage: medha mcp add <id> [--key K] [--trust trusted] [--env K=V] \
+                     [--allow-tool P] [--deny-tool P] [--no-network] [--parallel] -- <command>"
                 )
             })?;
             if command.is_empty() {
@@ -1631,6 +1672,10 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                     command,
                     env,
                     trust,
+                    allow_tools,
+                    deny_tools,
+                    network,
+                    parallel_calls,
                 },
             );
             config::save(&cfg)?;
@@ -1655,16 +1700,24 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                     servers: vec![server],
                     startup_timeout: std::time::Duration::from_secs(15),
                     request_timeout: std::time::Duration::from_secs(10),
-                    max_text_chars: 16_000,
-                    allow_network: true,
+                    // One-shot probe: no supervisor sweep, no reconnect budget.
+                    max_reconnects: 1,
+                    ..mcp::Config::default()
                 },
             );
             manager.connect_startup().await;
             for status in manager.status().await {
                 match status.state {
-                    mcp::ServerState::Ready => println!("ready — {} tool(s)", status.tools),
+                    mcp::ServerState::Ready => println!(
+                        "ready — {} tool(s){}",
+                        status.tools,
+                        match status.hidden {
+                            0 => String::new(),
+                            n => format!(", {n} filtered out"),
+                        }
+                    ),
                     state => println!(
-                        "{state:?}{}",
+                        "{state}{}",
                         status.detail.map(|d| format!(" ({d})")).unwrap_or_default()
                     ),
                 }

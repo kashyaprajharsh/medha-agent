@@ -2006,6 +2006,8 @@ dependencies = [
 name = "mcp"
 version = "0.0.1"
 dependencies = [
+ "futures",
+ "libc",
  "rmcp",
  "sandbox",
  "serde",

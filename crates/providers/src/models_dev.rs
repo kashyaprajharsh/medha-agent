@@ -1,11 +1,11 @@
 //! Model metadata lookup via models.dev (§4.4) — a real, externally
-//! maintained metadata database (the same source opencode uses), not a
+//! maintained metadata database, not a
 //! hardcoded table baked into the binary. Fetched once, cached to disk, and
 //! matched by model id. If a model genuinely isn't in it, we say so and leave
 //! the value unknown (P2: never fabricate a number) — the caller then either
-//! asks the user to set one explicitly or disables the dependent feature,
-//! matching how opencode behaves when metadata can't be resolved for a
-//! local/custom model. Carries both context windows and per-MTok list prices
+//! asks the user to set one explicitly or disables the dependent feature —
+//! the safe behaviour when metadata can't be resolved for a local/custom
+//! model. Carries both context windows and per-MTok list prices
 //! (the latter feed the cost meter, P1-12 — indicative for self-hosted routes).
 
 use serde::{Deserialize, Serialize};

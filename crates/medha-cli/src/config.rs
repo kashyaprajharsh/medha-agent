@@ -18,8 +18,8 @@
 //!   env var  >  ~/.medha/credentials.toml (owner-only, 0600)  >  OS keychain
 //!
 //! The owner-only credentials file is the default store — the same convention
-//! as the other agent CLIs (Codex, OpenCode, gh, gcloud all keep an
-//! auth/credentials file under the user's home). The OS keychain is NOT the
+//! as most CLI tooling (`gh`, `gcloud` and others keep an auth/credentials
+//! file under the user's home). The OS keychain is NOT the
 //! default because macOS binds keychain ACLs to the binary's code signature:
 //! every rebuilt (ad-hoc-signed) dev binary looks like a new app and throws a
 //! password dialog on each read — the exact prompt-fatigue this design
@@ -504,7 +504,7 @@ pub fn skills_lock_path() -> Result<PathBuf> {
 }
 
 /// Per-workspace runtime state directory: `~/.medha/projects/<encoded-cwd>/`
-/// (Claude Code style). Runtime state — the event log, artifacts, snapshots,
+/// Runtime state — the event log, artifacts, snapshots,
 /// logs — lives HERE, out of the working tree, so it never clutters or gets
 /// committed to the user's repos. Only committed config (`.medha/skills`,
 /// `medha.lock`) stays in the workspace. Creates the dir. `workspace` should be
@@ -520,8 +520,8 @@ fn state_dir_in(home: &std::path::Path, workspace: &std::path::Path) -> PathBuf 
     home.join("projects").join(encode_workspace(workspace))
 }
 
-/// Encode an absolute workspace path into one readable directory name, the way
-/// Claude Code does: every path separator becomes `-`, so
+/// Encode an absolute workspace path into one readable directory name: every
+/// path separator becomes `-`, so
 /// `/Users/x/proj` → `-Users-x-proj`. Existing hyphens are left as-is; a
 /// Windows drive colon becomes `-`.
 fn encode_workspace(p: &std::path::Path) -> String {

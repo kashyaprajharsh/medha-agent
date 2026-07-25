@@ -405,7 +405,7 @@ pub(super) fn render_plan(payload: &serde_json::Value) -> Vec<Line<'static>> {
             Style::default().fg(theme::dim()),
         ),
     ])];
-    // Optional one-line note about this update (Codex-style "explanation", inline).
+    // Optional one-line note about this update, rendered inline.
     if let Some(exp) = payload.get("explanation").and_then(|v| v.as_str()) {
         if !exp.trim().is_empty() {
             lines.push(Line::from(Span::styled(

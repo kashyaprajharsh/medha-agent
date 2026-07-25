@@ -1,11 +1,10 @@
 //! Capability narrowing — the point where "a child can never widen" stops being
 //! a prompt instruction and becomes a runtime property.
 //!
-//! Hermes filters a child's toolsets against the parent's available set at
-//! construction; this does the same, and then enforces it a second time on
-//! dispatch. Both halves are load-bearing: `specs()` decides what the child is
-//! *shown*, but a model can name a tool it was never shown, so `execute()` must
-//! refuse independently.
+//! The requested set is intersected with the parent's at construction, and then
+//! enforced a second time on dispatch. Both halves are load-bearing: `specs()`
+//! decides what the child is *shown*, but a model can name a tool it was never
+//! shown, so `execute()` must refuse independently.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

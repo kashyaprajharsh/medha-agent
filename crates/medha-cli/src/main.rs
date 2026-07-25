@@ -894,7 +894,7 @@ async fn main() -> Result<()> {
     }
 
     // Runtime state lives OUT of the working tree, under
-    // ~/.medha/projects/<encoded-cwd>/ (Claude Code style) — event log,
+    // ~/.medha/projects/<encoded-cwd>/ — event log,
     // artifacts, snapshots, logs. Only committed config (.medha/skills,
     // medha.lock) stays in the workspace. See config::state_dir.
     let cwd = std::env::current_dir()?;

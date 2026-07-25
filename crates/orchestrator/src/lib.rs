@@ -24,9 +24,8 @@ use ulid::Ulid;
 mod narrow;
 pub use narrow::NarrowedExecutor;
 
-/// Ceiling on children alive at once. Hermes defaults to 3 and warns past 10,
-/// on the grounds that each child burns tokens independently; the same reasoning
-/// applies here.
+/// Ceiling on children alive at once. Each child burns tokens independently, so
+/// this is a spend bound as much as a concurrency one.
 pub const DEFAULT_MAX_ACTIVE: usize = 3;
 /// How deep delegation may nest. O1 is flat: a child cannot spawn a child.
 pub const DEFAULT_MAX_DEPTH: usize = 1;
@@ -140,7 +139,7 @@ pub struct ChildOutcome {
 /// A dispatched agent, recorded before any work starts.
 ///
 /// `parent` is captured here and never re-derived. Resolving "the current
-/// session" when a child finishes is the bug Hermes documents: after a reset or
+/// session" when a child finishes is a known failure mode: after a reset or
 /// restart the newest session is a different conversation, and the result lands
 /// in someone else's chat.
 #[derive(Debug, Clone)]

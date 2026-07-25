@@ -39,7 +39,7 @@ pub enum BudgetStop {
     Wall,
     /// Even the engine's best compaction couldn't fit under the hard safety
     /// ceiling for this turn — refusing to send rather than risk an API
-    /// context-length error (§4.3 emergency_ratio, the Hermes-style second
+    /// context-length error (§4.3 emergency_ratio, the second
     /// safety layer above the normal compaction trigger).
     ContextOverflow,
 }

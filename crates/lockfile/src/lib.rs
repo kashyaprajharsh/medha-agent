@@ -177,7 +177,9 @@ pub struct AgentsConfig {
     /// exists.
     pub max_depth: usize,
     /// Turn ceiling for one child. A child's turns are its own session's, but
-    /// the tokens are the same wallet, so this is the real spend bound.
+    /// the tokens are the same wallet, so this is the real spend bound. Set it
+    /// generously: a child cut off before it reports has spent everything and
+    /// returned nothing, which is the expensive failure.
     pub max_turns: u32,
 }
 
@@ -185,11 +187,14 @@ impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Hermes' default, on the reasoning that each child burns tokens
+            //  default, on the reasoning that each child burns tokens
             // independently.
             max_active: 3,
             max_depth: 1,
-            max_turns: 24,
+            // A real survey burned all 24 on exploration and was cut off before
+            // writing anything; the whole run was wasted. The child is told its
+            // budget and to wrap up early, but the ceiling has to leave room to.
+            max_turns: 100,
         }
     }
 }

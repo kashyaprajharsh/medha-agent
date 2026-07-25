@@ -26,16 +26,22 @@ fn child_prompt(run: &ChildRun) -> String {
     if let Some(contract) = &run.spec.contract {
         prompt.push_str(&format!("\nYour answer must be: {contract}\n"));
     }
-    prompt.push_str(
+    prompt.push_str(&format!(
         "\nYou are read-only: you cannot modify anything. Investigate, then \
          finish with your findings as your final message.\n\n\
-         That message is the only thing returned, and it lands in the parent's \
-         context window — so keep it tight. Lead with the answer, use bullets \
-         over paragraphs, cite concrete file paths and line numbers, and do not \
-         replay how you got there. An overlong report crowds out the context the \
-         parent needs to act on it. If you could not answer, say so plainly and \
-         say what you ruled out.",
-    );
+         You have {} turns. That is a hard stop — when it runs out you are cut \
+         off wherever you are, and whatever you had said last is what gets \
+         returned. So do not save the answer for the end: once you are around \
+         two thirds through, stop exploring and write what you have, marking \
+         anything you could not confirm. A partial answer delivered is worth \
+         more than a complete one you never reached.\n\n\
+         Your final message is the only thing returned, and it lands in the \
+         parent's context window — so keep it tight. Lead with the answer, use \
+         bullets over paragraphs, cite concrete file paths and line numbers, and \
+         do not replay how you got there. If you could not answer, say so plainly \
+         and say what you ruled out.",
+        run.max_turns
+    ));
     prompt
 }
 
@@ -245,14 +251,29 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             }
         };
 
-        // The child's last assistant message is its report; the rest of the
-        // transcript stays in the log under its own session id.
-        let summary = transcript
+        // The child's last assistant message is its report — but only when it
+        // chose to stop. A child cut off by its budget was mid-sentence, so its
+        // last message is a narration fragment ("Let me compile the table…"),
+        // and handing that to the parent as an answer is worse than useless: it
+        // reads as a report and sends the parent hunting for content that was
+        // never written.
+        let last = transcript
             .iter()
             .rev()
             .find(|message| message.role == Role::Assistant && !message.content.trim().is_empty())
-            .map(|message| message.content.clone())
-            .unwrap_or_else(|| "the agent finished without reporting anything".into());
+            .map(|message| message.content.clone());
+        let summary = match (&stop, last) {
+            (StopReason::Finished, Some(text)) => text,
+            (StopReason::Finished, None) => "the agent finished without reporting anything".into(),
+            // Say what happened first, then offer the fragment as evidence of
+            // where it got to rather than as the answer.
+            (_, Some(text)) => format!(
+                "[incomplete — the agent was stopped before it reported. \
+                 Treat the following as where it had got to, not as an answer. \
+                 Re-run with a narrower objective or a higher turn budget.]\n\n{text}"
+            ),
+            (_, None) => "the agent was stopped before it produced anything".into(),
+        };
         let tool_calls = transcript
             .iter()
             .map(|message| message.tool_calls.len() as u32)

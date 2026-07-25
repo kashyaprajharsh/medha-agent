@@ -3410,6 +3410,18 @@ pub(super) fn spawn_turn<P, L>(
         // survive a restart: the outbox holds them until their owner next runs.
         if let Some(control) = &agents {
             for result in control.collect(session.id).await {
+                // Bound it: a background report reaches context directly, without
+                // the tool layer's cap, so a long one would otherwise arrive
+                // whole and crowd out the conversation it was meant to serve.
+                let mut summary = result.summary;
+                if let Some(cut) = summary
+                    .char_indices()
+                    .nth(orchestrator::MAX_SUMMARY_CHARS)
+                    .map(|(index, _)| index)
+                {
+                    summary.truncate(cut);
+                    summary.push_str("\n… report truncated");
+                }
                 messages.push(Message::new(
                     kernel::Role::User,
                     format!(
@@ -3418,7 +3430,7 @@ pub(super) fn spawn_turn<P, L>(
                         serde_json::to_string(&result.status)
                             .unwrap_or_default()
                             .trim_matches('"'),
-                        result.summary
+                        summary
                     ),
                 ));
             }

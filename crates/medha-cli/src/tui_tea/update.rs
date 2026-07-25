@@ -950,6 +950,18 @@ pub(super) fn handle_key<P, L>(
                 }
                 return;
             }
+            // `d` stops the selected sub-agent.
+            KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Agents(_)) => {
+                let session = if let PickerKind::Agents(runs) = &picker.kind {
+                    runs.get(picker.selected).map(|run| run.session.clone())
+                } else {
+                    None
+                };
+                if let Some(session) = session {
+                    agents_stop(model, &session);
+                }
+                return;
+            }
             // `d` removes the selected server in the /mcp picker (row 0 is Add).
             KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Mcp(_)) => {
                 let id = if let PickerKind::Mcp(rows) = &picker.kind {
@@ -2413,6 +2425,7 @@ enum SlashAction {
     Lsp,
     /// `/mcp` — open the MCP management picker.
     Mcp,
+    Agents,
     /// `/mcp start <id>` — approve and connect a configured MCP server.
     McpStart(String),
     /// `/mcp add <id> [--trust trusted] [--env K=V] -- <command>` — add + connect.
@@ -2460,6 +2473,7 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "clear" => SlashAction::Clear,
         "lsp" => SlashAction::Lsp,
         "mcp" => SlashAction::Mcp,
+        "agents" => SlashAction::Agents,
         c if c.strip_prefix("mcp start").is_some_and(is_cmd_boundary) => {
             SlashAction::McpStart(c.strip_prefix("mcp start").unwrap_or("").trim().to_string())
         }
@@ -2568,6 +2582,7 @@ fn dispatch_slash<P, L>(
         SlashAction::Clear => do_clear(model, session, transcript),
         SlashAction::Lsp => show_lsp_status(kernel, tx),
         SlashAction::Mcp => open_mcp_picker(model),
+        SlashAction::Agents => open_agents_picker(model),
         SlashAction::McpStart(id) => start_mcp_server(kernel, &id, tx),
         SlashAction::McpAdd(args) => mcp_add(model, &args, tx),
         SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
@@ -2783,6 +2798,35 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
         ));
     }
     open_mcp_picker(model);
+}
+
+/// `/agents` — what Medha has delegated and is still waiting on. A child's work
+/// never enters the transcript, so without this the only sign one exists is a
+/// name in the status bar.
+fn open_agents_picker(model: &mut Model) {
+    let runs = model
+        .agents
+        .as_ref()
+        .map(|control| control.active())
+        .unwrap_or_default();
+    model.picker = Some(Picker::new(PickerKind::Agents(runs)));
+}
+
+/// Stop one agent by hand. `agent.cancel` gives the model this; the user needs
+/// it too, and for the same reason — work that is no longer worth paying for.
+fn agents_stop(model: &mut Model, session: &str) {
+    let Some(control) = model.agents.clone() else {
+        return;
+    };
+    let stopped = control.cancel(session);
+    match stopped.first() {
+        // Cancelling is not discarding: the child still reports what it found.
+        Some(name) => model.push_notice(format!(
+            "stopped agent '{name}' — whatever it had found still arrives with your next message"
+        )),
+        None => model.push_notice("that agent already finished"),
+    }
+    open_agents_picker(model);
 }
 
 /// Which language servers this machine can actually run, and what to do about

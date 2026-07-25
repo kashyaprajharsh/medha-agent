@@ -278,6 +278,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "/mcp",
         "MCP servers — manage · connect · remove · add  ·  /mcp start <id> to connect",
     ),
+    ("/agents", "sub-agents running now · d stops one"),
     (
         "/memory",
         "list memories · /memory <name> jumps to provenance",
@@ -1071,6 +1072,9 @@ enum PickerKind {
         id: String,
         tools: Vec<(String, bool)>,
     },
+    /// `/agents`: the sub-agents running right now. `d` stops one; the work it
+    /// had already done is still reported.
+    Agents(Vec<orchestrator::AgentHandle>),
     /// How to authenticate a remote MCP server the probe could not classify.
     /// Only shown when the server is ambiguous — a server advertising OAuth
     /// signs in without asking.
@@ -1206,6 +1210,10 @@ impl PickerKind {
                     tools.len()
                 )
             }
+            PickerKind::Agents(runs) => match runs.len() {
+                0 => " agents — none running · Esc close ".into(),
+                n => format!(" {n} agent(s) running — ↑↓ select · d stop · Esc close "),
+            },
             PickerKind::McpAuth { id, .. } => {
                 format!(" {id} needs credentials — ↑↓ select · Enter · Esc cancel ")
             }
@@ -1399,6 +1407,18 @@ impl PickerKind {
                         row.command
                     )
                 }))
+                .collect(),
+            PickerKind::Agents(runs) if runs.is_empty() => {
+                vec!["no sub-agents running".to_string()]
+            }
+            PickerKind::Agents(runs) => runs
+                .iter()
+                .map(|run| {
+                    // The objective is what distinguishes two agents at a glance;
+                    // the name is a label and the session id is unreadable.
+                    let objective: String = run.objective.chars().take(64).collect();
+                    format!("⚇ {}   {objective}", run.agent)
+                })
                 .collect(),
             PickerKind::McpTools { tools, .. } => tools
                 .iter()

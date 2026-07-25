@@ -925,9 +925,22 @@ impl Tool for AgentSpawn {
                 "background": {
                     "type": "boolean",
                     "description": "Return immediately instead of waiting. The report arrives at the start of a later turn. Use for work you do not need before answering; keep it false when you need the answer now."
+                },
+                "tasks": {
+                    "type": "array",
+                    "description": "Run several independent investigations at once, each its own agent, and get every report back together. Use this instead of one call per question — they run concurrently rather than in sequence. Give `tasks` OR `objective`, not both.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "objective": { "type": "string" },
+                            "name": { "type": "string" },
+                            "contract": { "type": "string" },
+                            "tools": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["objective"]
+                    }
                 }
-            },
-            "required": ["objective"]
+            }
         })
     }
     async fn preview(&self, args: &Value) -> Option<String> {
@@ -937,6 +950,57 @@ impl Tool for AgentSpawn {
         ))
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        // Batch: independent questions run at once rather than one call after
+        // another. Capacity is already bounded per tree, so an over-large batch
+        // is refused by the runtime rather than flooding it.
+        if let Some(tasks) = args.get("tasks").and_then(Value::as_array) {
+            if tasks.is_empty() {
+                return Err(ToolError::Args("tasks is empty".into()));
+            }
+            let Some(parent) = self.executor.lock().ok().and_then(|e| e.clone()) else {
+                return Err(ToolError::Failed(
+                    "the agent runtime is not available in this session".into(),
+                ));
+            };
+            let runs = tasks.iter().map(|task| {
+                let spec = orchestrator::AgentSpec {
+                    name: task
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    objective: task
+                        .get("objective")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    contract: task
+                        .get("contract")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    tools: task.get("tools").and_then(Value::as_array).map(|names| {
+                        names
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    }),
+                    max_turns: None,
+                };
+                self.control.spawn(spec, parent.clone(), self.max_turns)
+            });
+            // One failure must not discard its siblings' work, so each result is
+            // reported on its own terms.
+            let reports: Vec<Value> = futures::future::join_all(runs)
+                .await
+                .into_iter()
+                .map(|outcome| match outcome {
+                    Ok(result) => serde_json::to_value(result).unwrap_or_default(),
+                    Err(error) => json!({ "status": "failed", "summary": error.to_string() }),
+                })
+                .collect();
+            return Ok(json!({ "agents": reports, "count": reports.len() }));
+        }
         let objective = arg_str(args, "objective")?;
         let Some(parent) = self.executor.lock().ok().and_then(|e| e.clone()) else {
             return Err(ToolError::Failed(

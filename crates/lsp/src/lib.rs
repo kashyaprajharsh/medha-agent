@@ -619,7 +619,24 @@ impl LspManager {
     ) -> Result<ServerStatus, Error> {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
         let (adapter, root, key) = self.resolve_start_server(&path, server_id)?;
-        self.inner.approved_servers.lock().await.insert(key);
+        self.inner.approved_servers.lock().await.insert(key.clone());
+        // An explicit start is also the manual refresh: drop a parked entry so it
+        // starts clean. Without this, a server that exhausted its restart budget
+        // — a few transient crashes during a heavy build is enough — keeps
+        // returning its cached error for the rest of the session, with no way
+        // back short of restarting Medha.
+        let parked = {
+            let mut clients = self.inner.clients.lock().await;
+            match clients.get(&key) {
+                Some(entry) if entry.failures > 0 => clients.remove(&key),
+                _ => None,
+            }
+        };
+        if let Some(entry) = parked
+            && let Some(Ok(client)) = entry.cell.get()
+        {
+            client.shutdown().await;
+        }
         let client = self
             .client_for_resolved(
                 adapter.clone(),
@@ -3599,6 +3616,47 @@ mod tests {
         let status = manager.status().await;
         assert_eq!(status.len(), 1);
         assert!(matches!(status[0].state, ServerState::Broken));
+    }
+
+    /// A parked server has to be revivable without restarting Medha: a few
+    /// transient crashes during a heavy build can exhaust the restart budget,
+    /// and the cached error would otherwise disable code intelligence for the
+    /// rest of the session.
+    #[tokio::test]
+    async fn an_explicit_start_clears_a_parked_entry() {
+        let directory = tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\n",
+        )
+        .unwrap();
+        let path = directory.path().join("main.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        let manager = LspManager::new(
+            directory.path().to_path_buf(),
+            Config {
+                servers: vec![missing_adapter()],
+                max_restart_attempts: 0,
+                ..Config::default()
+            },
+        );
+
+        // Fail it hard enough that the backoff path will never replace it.
+        let _ = manager.diagnostics(&path).await;
+        let _ = manager.diagnostics(&path).await;
+        assert!(matches!(
+            manager.status().await[0].state,
+            ServerState::Broken
+        ));
+
+        // The start still fails (the binary really is missing), but it must have
+        // retired the parked entry rather than handing back the cached error.
+        let _ = manager.approve_and_start(&path).await;
+        let entries = manager.inner.clients.lock().await;
+        assert!(
+            entries.values().all(|entry| entry.failures == 0),
+            "an explicit start must reset the restart budget"
+        );
     }
 
     #[test]

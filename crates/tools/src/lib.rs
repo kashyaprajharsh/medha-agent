@@ -1319,6 +1319,7 @@ impl ToolRegistry {
         }));
         r.register(Arc::new(References {
             sbx: sandbox.clone(),
+            lsp: Arc::clone(&r.lsp),
         }));
         r.register(Arc::new(Tree {
             sbx: sandbox.clone(),
@@ -2343,6 +2344,65 @@ impl Tool for CodeOutline {
 
 struct References {
     sbx: Arc<WorkspaceSandbox>,
+    /// Answers from the language server when one can serve this file. The text
+    /// scan still runs first — it is what turns a bare symbol name into the
+    /// position the server needs — but its matches are a fallback, not the
+    /// answer, whenever the server can do better.
+    lsp: LspHandle,
+}
+
+/// Upgrade a text hit to compiler-resolved references.
+///
+/// A language server needs a position, and the caller only has a name; the text
+/// scan bridges that. Any occurrence works as the anchor — the server resolves
+/// whatever symbol is at that position — so the first hit is enough.
+async fn lsp_upgrade(
+    manager: &lsp::LspManager,
+    hits: &[Value],
+    symbol: &str,
+    max: usize,
+) -> Option<Value> {
+    let first = hits.first()?;
+    let path = first.get("path")?.as_str()?;
+    let line = first.get("line")?.as_u64()? as u32;
+    // Recorded during the scan against the raw line: the column has to land
+    // inside the identifier or the server resolves nothing.
+    let character = first.get("col")?.as_u64()? as u32;
+    let report = manager
+        .references(
+            path,
+            lsp::Position {
+                line: line.saturating_sub(1),
+                character,
+            },
+            true,
+        )
+        .await;
+    let lsp::QueryReport::Ready { server, items, .. } = report else {
+        return None;
+    };
+    // An empty result is not an upgrade: the anchor may have been a comment or
+    // a string, and reporting "0 references" would be worse than the text hits.
+    if items.is_empty() {
+        return None;
+    }
+    let references: Vec<Value> = items
+        .iter()
+        .take(max)
+        .map(|location| {
+            json!({
+                "path": location.path,
+                "line": location.range.start.line + 1,
+            })
+        })
+        .collect();
+    Some(json!({
+        "symbol": symbol,
+        "backend": server,
+        "references": references,
+        "count": items.len(),
+        "truncated": items.len() > max,
+    }))
 }
 
 #[async_trait]
@@ -2357,12 +2417,13 @@ impl Tool for References {
         ToolCategory::Search
     }
     fn description(&self) -> &str {
-        "Find every place a symbol (function/type/variable name) appears — WHOLE-WORD \
-         matches only, so 'run' won't match 'running'. Returns {path, line, text} for \
-         each occurrence (you judge from the text which is the definition vs a use). \
-         Use after `code_outline` to see a symbol's call sites before changing or \
-         renaming it. More precise than `grep` for identifiers; use `grep` for free-form \
-         regex/text."
+        "Find every place a symbol (function/type/variable name) is used. Give it a name; \
+         it works out the rest. When a language server can serve the file you get \
+         compiler-resolved references — the actual symbol, not same-named ones elsewhere \
+         or mentions in comments — and `backend` names the server. Otherwise it falls back to a \
+         whole-word text scan ('run' won't match 'running') and `backend` says \"text\". \
+         This is the tool for 'where is X used' and for finding call sites before you \
+         change or rename something. Use `grep` for free-form regex or non-code text."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -2399,9 +2460,10 @@ impl Tool for References {
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
         let root = self.sbx.root().to_path_buf();
+        let symbol_for_lsp = symbol.clone();
 
         // Full walk + reads are blocking work — off the async runtime.
-        tokio::task::spawn_blocking(move || {
+        let scan = tokio::task::spawn_blocking(move || {
             let mut refs: Vec<Value> = Vec::new();
             let mut files = std::collections::HashSet::new();
             let mut truncated = false;
@@ -2418,7 +2480,7 @@ impl Tool for References {
                 let Ok(content) = std::fs::read_to_string(dent.path()) else { continue };
                 let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
                 for (i, line) in content.lines().enumerate() {
-                    if word.is_match(line) {
+                    if let Some(found) = word.find(line) {
                         if refs.len() >= max {
                             truncated = true;
                             break 'outer;
@@ -2427,6 +2489,11 @@ impl Tool for References {
                         refs.push(json!({
                             "path": rel,
                             "line": i + 1,
+                            // The language server wants a 0-based UTF-16 offset
+                            // into the raw line. Deriving it later from the
+                            // trimmed, clipped `text` would be short by the
+                            // indent and wrong again on any non-ASCII line.
+                            "col": line[..found.start()].encode_utf16().count(),
                             "text": clip_marked(line.trim(), 200),
                         }));
                     }
@@ -2434,7 +2501,7 @@ impl Tool for References {
             }
             let count = refs.len();
             let file_count = files.len();
-            let mut out = json!({ "symbol": symbol, "references": refs, "count": count, "files": file_count, "truncated": truncated });
+            let mut out = json!({ "symbol": symbol, "backend": "text", "references": refs, "count": count, "files": file_count, "truncated": truncated });
             if skipped_large > 0 {
                 out["note"] = json!(format!(
                     "[skipped {skipped_large} file(s) >1MB — not searched; use shell.exec grep for those]"
@@ -2443,7 +2510,21 @@ impl Tool for References {
             Ok(out)
         })
         .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+
+        let text_hits = scan?;
+        // Prefer the server's answer. Text matching cannot tell this symbol from
+        // an unrelated one of the same name, or from a mention in a comment; a
+        // language server resolves the actual symbol. The caller asks the same
+        // question either way and `backend` says which answered.
+        let manager = self.lsp.lock().ok().and_then(|slot| slot.clone());
+        if let Some(manager) = manager
+            && let Some(hits) = text_hits.get("references").and_then(Value::as_array)
+            && let Some(upgraded) = lsp_upgrade(&manager, hits, &symbol_for_lsp, max).await
+        {
+            return Ok(upgraded);
+        }
+        Ok(text_hits)
     }
 }
 
@@ -5355,7 +5436,10 @@ mod tests {
         )
         .unwrap();
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
-        let tool = References { sbx };
+        let tool = References {
+            sbx,
+            lsp: Arc::new(Mutex::new(None)),
+        };
         let out = tool.execute(&json!({ "symbol": "helper" })).await.unwrap();
         // Whole-word: matches the def line and the call, but NOT `helperx`.
         assert_eq!(
@@ -5363,6 +5447,19 @@ mod tests {
             2,
             "should match the def line and the call, not helperx"
         );
+        // No language server wired here, so the text scan is the answer and says so.
+        assert_eq!(out["backend"], "text");
+        // The recorded column is what a language server would be handed to
+        // resolve the symbol. It must index the RAW line — the call site is
+        // indented four spaces, so a column derived from the trimmed display
+        // text would land before the identifier and resolve nothing.
+        let call = out["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["line"] == 3)
+            .expect("the indented call site");
+        assert_eq!(call["col"], 4, "column must index the untrimmed line");
         let refs = out["references"].as_array().unwrap();
         assert!(
             refs.iter()

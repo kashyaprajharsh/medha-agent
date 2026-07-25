@@ -42,6 +42,8 @@ pub enum Error {
     TooDeep { depth: usize, max: usize },
     #[error("too many agents already running (limit {0}); wait for one to finish")]
     AtCapacity(usize),
+    #[error("no agent '{0}'")]
+    UnknownAgent(String),
     #[error("agent failed: {0}")]
     Failed(String),
 }
@@ -168,6 +170,12 @@ pub trait Outbox: Send + Sync {
     async fn delivered(&self, parent: Ulid, child: Ulid);
     /// Results owned by `parent` that have not been delivered, oldest first.
     async fn undelivered(&self, parent: Ulid) -> Vec<AgentResult>;
+
+    /// What a child actually did, newest last. A report is a summary by design,
+    /// so when one is thin or wrong the only honest recourse is to look at the
+    /// work — without this the caller is left guessing at a transcript that
+    /// exists but is unreachable.
+    async fn transcript(&self, child: Ulid) -> Vec<String>;
 }
 
 /// A runner installed after construction. The kernel owns the executor that
@@ -297,6 +305,17 @@ impl AgentControl {
             }
         }
         ready
+    }
+
+    /// Read back what a child did. Its transcript lives under its own session id
+    /// and outlives the run, so this answers for a finished agent as well as a
+    /// running one.
+    pub async fn transcript(&self, child: &str) -> Result<Vec<String>, Error> {
+        let outbox = self.outbox.as_ref().ok_or(Error::Unavailable)?;
+        let id = child
+            .parse()
+            .map_err(|_| Error::UnknownAgent(child.to_string()))?;
+        Ok(outbox.transcript(id).await)
     }
 
     /// Reserve capacity before anything is published. Returns `AtCapacity`
@@ -878,6 +897,9 @@ mod tests {
             {
                 row.2 = true;
             }
+        }
+        async fn transcript(&self, _child: Ulid) -> Vec<String> {
+            Vec::new()
         }
         async fn undelivered(&self, parent: Ulid) -> Vec<AgentResult> {
             self.rows

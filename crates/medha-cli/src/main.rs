@@ -1564,6 +1564,13 @@ async fn main() -> Result<()> {
         } else {
             eprintln!("usage: medha \"<task>\"   (run `medha --setup` to reconfigure)");
         }
+        // A backgrounded agent outlives the turn that spawned it, so leaving the
+        // session without settling it would let a child keep spending against the
+        // user's account with nothing watching. Its partial result is persisted
+        // on the way down, so what it had found is delivered next run.
+        if let Some(control) = &agent_control {
+            control.shutdown().await;
+        }
         return Ok(());
     }
 
@@ -1571,6 +1578,21 @@ async fn main() -> Result<()> {
     // newline. (Structured NDJSON output for CI is a separate `--json` mode.)
     let mut messages = vec![Message::system(system)];
     messages.extend(resumed);
+    // Reports from agents an earlier run left behind. Delivery is durable, so a
+    // child that finished after its session ended is picked up here rather than
+    // only in the TUI.
+    if let Some(control) = &agent_control {
+        for result in control.collect(session.id).await {
+            messages.push(Message::user(format!(
+                "[background agent '{}' finished — {}]\n{}",
+                result.agent,
+                serde_json::to_string(&result.status)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                result.summary
+            )));
+        }
+    }
     messages.push(Message::user(prompt));
     let sink = PrintSink::plain();
     match kernel
@@ -1591,6 +1613,9 @@ async fn main() -> Result<()> {
         }
         Ok(_) => println!(),
         Err(e) => eprintln!("error: {e}"),
+    }
+    if let Some(control) = &agent_control {
+        control.shutdown().await;
     }
     Ok(())
 }

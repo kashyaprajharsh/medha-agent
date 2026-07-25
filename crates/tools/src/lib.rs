@@ -1024,29 +1024,44 @@ pub type SessionHandle = Arc<Mutex<Option<ulid::Ulid>>>;
 
 /// Inspect and stop running agents. Read-only listing plus a targeted stop, so
 /// the model can abandon work it no longer needs rather than paying for it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentAction {
+    List,
+    Cancel,
+    Transcript,
+}
+
 struct AgentControlTool {
     control: Arc<orchestrator::AgentControl>,
-    stop: bool,
+    action: AgentAction,
 }
 
 #[async_trait]
 impl Tool for AgentControlTool {
     fn name(&self) -> &str {
-        if self.stop {
-            "agent.cancel"
-        } else {
-            "agent.list"
+        match self.action {
+            AgentAction::List => "agent.list",
+            AgentAction::Cancel => "agent.cancel",
+            AgentAction::Transcript => "agent.transcript",
         }
     }
     fn icon(&self) -> &'static str {
         "⚇"
     }
     fn description(&self) -> &str {
-        if self.stop {
-            "Stop one running agent by its name or session id. Its siblings keep running, and \
-             whatever it had found is still reported."
-        } else {
-            "List the agents running right now, with what each was asked to do."
+        match self.action {
+            AgentAction::Cancel => {
+                "Stop one running agent by its name or session id. Its siblings keep running, and \
+                 whatever it had found is still reported."
+            }
+            AgentAction::List => {
+                "List the agents running right now, with what each was asked to do."
+            }
+            AgentAction::Transcript => {
+                "Read what an agent actually did, by its session id. A report is a summary; when \
+                 one looks thin, wrong, or was cut short, read the work behind it instead of \
+                 guessing or re-running the search yourself."
+            }
         }
     }
     fn blast_radius(&self) -> BlastRadius {
@@ -1056,28 +1071,59 @@ impl Tool for AgentControlTool {
         ToolCategory::Diagnostic
     }
     fn schema(&self) -> Value {
-        if self.stop {
-            json!({
+        match self.action {
+            AgentAction::List => json!({ "type": "object", "properties": {} }),
+            AgentAction::Cancel => json!({
                 "type": "object",
                 "properties": {
                     "agent": { "type": "string", "description": "Agent name or session id" }
                 },
                 "required": ["agent"]
-            })
-        } else {
-            json!({ "type": "object", "properties": {} })
+            }),
+            AgentAction::Transcript => json!({
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "description": "The agent's session id, as returned by agent.spawn" },
+                    "tail": { "type": "integer", "description": "Only the last N steps (default: all)" }
+                },
+                "required": ["agent"]
+            }),
         }
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        if !self.stop {
-            return Ok(json!({ "agents": self.control.active() }));
+        match self.action {
+            AgentAction::List => Ok(json!({ "agents": self.control.active() })),
+            AgentAction::Cancel => {
+                let id = arg_str(args, "agent")?;
+                let stopped = self.control.cancel(&id);
+                if stopped.is_empty() {
+                    return Err(ToolError::Failed(format!("no running agent '{id}'")));
+                }
+                Ok(json!({ "cancelled": stopped }))
+            }
+            AgentAction::Transcript => {
+                let id = arg_str(args, "agent")?;
+                let mut steps = self
+                    .control
+                    .transcript(&id)
+                    .await
+                    .map_err(|error| ToolError::Failed(error.to_string()))?;
+                if steps.is_empty() {
+                    return Err(ToolError::Failed(format!(
+                        "no transcript for '{id}' — pass the session id from agent.spawn, not the name"
+                    )));
+                }
+                let total = steps.len();
+                // A child can run for dozens of turns; the tail is usually where
+                // the answer was forming when it stopped.
+                if let Some(tail) = args.get("tail").and_then(Value::as_u64)
+                    && (tail as usize) < total
+                {
+                    steps = steps.split_off(total - tail as usize);
+                }
+                Ok(json!({ "agent": id, "steps": steps, "total": total }))
+            }
         }
-        let id = arg_str(args, "agent")?;
-        let stopped = self.control.cancel(&id);
-        if stopped.is_empty() {
-            return Err(ToolError::Failed(format!("no running agent '{id}'")));
-        }
-        Ok(json!({ "cancelled": stopped }))
     }
 }
 
@@ -1235,14 +1281,16 @@ impl ToolRegistry {
             max_turns: max_turns.max(1),
             session: Arc::clone(&self.agent_session),
         }));
-        self.register(Arc::new(AgentControlTool {
-            control: control.clone(),
-            stop: false,
-        }));
-        self.register(Arc::new(AgentControlTool {
-            control,
-            stop: true,
-        }));
+        for action in [
+            AgentAction::List,
+            AgentAction::Cancel,
+            AgentAction::Transcript,
+        ] {
+            self.register(Arc::new(AgentControlTool {
+                control: control.clone(),
+                action,
+            }));
+        }
         self
     }
 

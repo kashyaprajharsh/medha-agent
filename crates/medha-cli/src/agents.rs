@@ -119,6 +119,37 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
             .await;
     }
 
+    async fn transcript(&self, child: ulid::Ulid) -> Vec<String> {
+        // The child's own chain, rendered as readable lines. A report is a
+        // summary by design; when one looks thin the work behind it has to be
+        // reachable, or the only recourse is guessing.
+        self.log
+            .events(child)
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::UserMessage => Some(format!(
+                    "objective: {}",
+                    event.payload["text"].as_str().unwrap_or_default()
+                )),
+                EventKind::ModelText => Some(format!(
+                    "said: {}",
+                    event.payload["text"].as_str().unwrap_or_default()
+                )),
+                EventKind::ModelIntent => Some(format!(
+                    "called {}({})",
+                    event.payload["tool"].as_str().unwrap_or("?"),
+                    event.payload["args"]
+                )),
+                EventKind::ToolObs => Some(format!(
+                    "  → {}",
+                    event.payload["status"].as_str().unwrap_or("ok")
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn undelivered(&self, parent: ulid::Ulid) -> Vec<orchestrator::AgentResult> {
         let mut ready: Vec<(ulid::Ulid, orchestrator::AgentResult)> = Vec::new();
         let mut delivered: Vec<String> = Vec::new();

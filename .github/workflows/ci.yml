@@ -24,10 +24,17 @@ jobs:
       # path instead of silently skipping when a binary is absent.
       - name: Install language servers
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-tools
-          # rust-analyzer ships as a rustup component; expose it on PATH.
           mkdir -p "$HOME/.local/bin"
+          sudo apt-get update
+          # `clangd`, not `clang-tools`: the latter installs only versioned
+          # binaries (clangd-14, …) and no unversioned symlink, so a bare
+          # `clangd` is not on PATH. Fall back to symlinking whichever
+          # versioned one apt provides if the meta-package is unavailable.
+          sudo apt-get install -y clangd \
+            || sudo apt-get install -y clang-tools
+          command -v clangd >/dev/null \
+            || ln -sf "$(ls -1 /usr/bin/clangd-* | sort -V | tail -1)" "$HOME/.local/bin/clangd"
+          # rust-analyzer ships as a rustup component; expose it on PATH.
           ln -sf "$(rustup which rust-analyzer)" "$HOME/.local/bin/rust-analyzer"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 

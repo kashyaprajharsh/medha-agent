@@ -302,9 +302,50 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
     }
 
+    /// A kernel for a sub-session: same provider, log, artifacts, policy and
+    /// verifier, but its own executor, context engine and gate.
+    ///
+    /// Everything that shapes how a run behaves — pricing, tool parallelism,
+    /// progressive context, the settle window — is inherited. Rebuilding a
+    /// child with `Kernel::new` silently dropped all of it: a child metered no
+    /// cost at all, so a shared cost ceiling could never trip on its spend.
+    pub fn derive(
+        &self,
+        executor: Arc<dyn Executor>,
+        context: Arc<dyn ContextEngine>,
+        gate: Arc<dyn crate::gate::HumanGate>,
+    ) -> Self {
+        Self {
+            provider: Arc::clone(&self.provider),
+            log: Arc::clone(&self.log),
+            executor,
+            context,
+            artifacts: Arc::clone(&self.artifacts),
+            policy: Arc::clone(&self.policy),
+            gate,
+            verifier: Arc::clone(&self.verifier),
+            progressive_context: self.progressive_context.clone(),
+            max_parallel_tools: self.max_parallel_tools,
+            pricing: self.pricing,
+            gate_serial: futures::lock::Mutex::new(()),
+            settle_grace: self.settle_grace,
+        }
+    }
+
     /// Set resolved model pricing so the governor meters real dollars (P1-12).
     pub fn with_pricing(mut self, pricing: Option<crate::types::Pricing>) -> Self {
         self.pricing = pricing;
+        self
+    }
+
+    /// Replace the deterministic verifier for a derived execution context.
+    ///
+    /// Writer sub-agents use this to disable the parent's fixed-directory
+    /// verifier: their checkout is verified authoritatively by the orchestrator
+    /// after patch extraction, while running the parent's verifier here would
+    /// check the wrong tree.
+    pub fn with_verifier(mut self, verifier: Arc<dyn crate::verify::Verifier>) -> Self {
+        self.verifier = verifier;
         self
     }
 
@@ -344,7 +385,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     /// stop / cancel) — a steer that raced the final turn must reach the
     /// surface, never evaporate.
     fn return_unapplied_steers(q: &mut crate::interrupts::InterruptQueue, sink: &dyn StreamSink) {
-        let leftover = q.drain_steers();
+        // The surface gets the text back to put in its input box; the label
+        // matters only to the loop that would have applied it.
+        let leftover: Vec<String> = q.drain_steers().into_iter().map(|(text, _)| text).collect();
         if !leftover.is_empty() {
             sink.steers_returned(&leftover);
         }
@@ -449,22 +492,54 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 m.content = self.maybe_spill(std::mem::take(&mut m.content));
             }
         }
-        // Record this turn's new user message so the session is fully
-        // reconstructable from the log (resume/replay). Callers append the user
-        // message then call run_session, so the tail is the new prompt; earlier
-        // user turns were logged on their own prior calls (no duplication).
+        // Record this turn's new user messages so the session is fully
+        // reconstructable from the log (resume/replay). Every *trailing* user
+        // message is new, not just the last: a surface can append a typed prompt
+        // and then a background agent's report in one turn, and logging only the
+        // tail dropped the prompt from the log — and with it from the rehydrated
+        // context below, so the model never saw what was typed.
         // Memory taint window (D6): the evidence a memory write may cite — event
         // ids since the last real user message, and the lowest trust label seen
         // among them. Kernel-owned; the model can never assert these.
         let mut window_events: Vec<ulid::Ulid> = Vec::new();
         let mut window_taint = TrustLabel::User;
-        if let Some(last) = messages.last() {
-            if last.role == crate::types::Role::User {
-                let e = self
-                    .log
-                    .append(Event::user_message(session, &last.content))
-                    .await?;
-                window_events.push(e.id);
+        // Skip what the log already ends with. A turn that failed after this
+        // point leaves its trailing run logged; retrying with the same messages
+        // would append the run a second time, and the projection only collapses
+        // *adjacent* identical user turns, so `[prompt, report]` twice survives
+        // as four messages.
+        let prior_events = self.log.events(session.id).await;
+        let already = logged_tail(&prior_events);
+        // Retried input is already durable but still belongs to this evidence
+        // window. Skipping its append must not also erase its provenance or
+        // upgrade a Web/Tool report back to User.
+        window_events.extend(already.iter().map(|input| input.id));
+        for input in &already {
+            window_taint = window_taint.min(input.trust);
+        }
+        let mut logged_cursor = 0;
+        let fresh = unlogged_tail(&messages);
+        for message in &messages[fresh..] {
+            // Match the durable suffix in order and with its trust label.
+            // Membership matching reordered duplicate lines, while comparing
+            // text alone could treat a Tool/Web report as a trusted retry.
+            let trust = message.trust.unwrap_or(TrustLabel::User);
+            if already
+                .get(logged_cursor)
+                .is_some_and(|input| input.content == message.content && input.trust == trust)
+            {
+                logged_cursor += 1;
+                continue;
+            }
+            let e = self
+                .log
+                .append(Event::user_input(session, &message.content, trust))
+                .await?;
+            window_events.push(e.id);
+            // A report carries the weakest label its agent touched; injected
+            // content must not enter as if the user had typed it.
+            if let Some(trust) = message.trust {
+                window_taint = window_taint.min(trust);
             }
         }
         let mut ordered_messages: Vec<ModelMessage> =
@@ -489,8 +564,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
         // Trust-flow taint (§4.6): flips true once a web-labeled observation
         // enters this request, so a later consequential action derived from it
-        // can be escalated. Scoped to the request (one run_session).
-        let mut web_tainted = false;
+        // can be escalated. Scoped to the request (one run_session). Seeded from
+        // injected content, so a sub-agent that read the web taints the parent
+        // that acts on its report.
+        let mut web_tainted = messages
+            .iter()
+            .any(|message| message.trust == Some(TrustLabel::Web));
         loop {
             // Turn boundary: honor a pending cancel first (queued steers go
             // BACK to the surface, not into a turn that won't run), then
@@ -499,18 +578,29 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 if q.cancel_requested() {
                     return self.finish_interrupted(session, messages, q, sink).await;
                 }
-                for s in q.drain_steers() {
-                    let e = self.log.append(Event::user_message(session, &s)).await?;
+                for (s, trust) in q.drain_steers() {
+                    let e = self
+                        .log
+                        .append(Event::user_input(session, &s, trust))
+                        .await?;
                     // Fresh user input starts a new memory-evidence window.
                     window_events.clear();
                     window_events.push(e.id);
-                    window_taint = TrustLabel::User;
+                    // A sub-agent's report arrives on this queue too, and it is
+                    // worth what the agent touched, not what the operator says.
+                    window_taint = trust;
+                    if matches!(trust, TrustLabel::Web) {
+                        web_tainted = true;
+                    }
                     self.log
                         .append(Event::interrupt(session, "steer", Some(&s)))
                         .await
                         .ok();
                     sink.steered(&s);
-                    let message = Message::user(s);
+                    let mut message = Message::user(s);
+                    if trust != TrustLabel::User {
+                        message.trust = Some(trust);
+                    }
                     ordered_messages.push(message.ordered());
                     messages.push(message);
                 }
@@ -761,11 +851,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // sink (diffs, errors) and feed it back to the model.
             for (id, tool, mut obs, discovered) in results {
                 // Label web-tool output as untrusted content (P7): a fetched
-                // page must not be treated like a local file read.
+                // page must not be treated like a local file read. A tool
+                // relaying content it did not produce declares that content's
+                // label, and the weaker of the two wins.
                 let trust = match self.executor.category(&tool) {
                     Some(ToolCategory::Web) => TrustLabel::Web,
                     _ => TrustLabel::Tool,
                 };
+                let trust = obs
+                    .relayed_trust
+                    .map_or(trust, |relayed| trust.min(relayed));
                 if let Some(discovered) = discovered {
                     let context_event = self
                         .log
@@ -831,7 +926,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // Deterministic verification after edits (§4.7): run the configured
             // check and feed the result back so a broken build self-corrects.
             if modified_files {
-                if let Some(rep) = self.verifier.check().await {
+                let verification = self.verifier.check(&cancel).await;
+                // Cancellation can arrive while the verifier is running. Its
+                // process tree has now settled; stop instead of injecting a
+                // synthetic verifier failure into a turn the user cancelled.
+                if cancel.is_cancelled() {
+                    if let Some(q) = interrupts.as_mut() {
+                        return self.finish_interrupted(session, messages, q, sink).await;
+                    }
+                    return Ok((messages, StopReason::Interrupted));
+                }
+                if let Some(rep) = verification {
                     sink.verify(rep.ok, &rep.summary);
                     let mut tail: Vec<&str> = rep.output.lines().rev().take(40).collect();
                     tail.reverse();
@@ -841,15 +946,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         rep.summary,
                         tail.join("\n")
                     );
-                    // Log it as a user message so a resumed session sees the same
-                    // verifier feedback the model reasoned about (K12) — otherwise
-                    // replay diverges (the model self-corrected against text that
-                    // no longer exists in the reconstructed history).
+                    // Verifier output is tool-produced, and can contain arbitrary
+                    // build-script/test output. Labelling it as User launders that
+                    // text into the most-trusted instruction channel.
                     self.log
-                        .append(Event::user_message(session, &feedback))
-                        .await
-                        .ok();
-                    let message = Message::user(feedback);
+                        .append(Event::user_input(session, &feedback, TrustLabel::Tool))
+                        .await?;
+                    let message = Message::user(feedback).carrying(TrustLabel::Tool);
                     ordered_messages.push(message.ordered());
                     messages.push(message);
                 }
@@ -1255,6 +1358,116 @@ fn escalate_for_trust_flow(
         Decision::Human
     } else {
         decision
+    }
+}
+
+/// The texts of the user messages the log currently ends with.
+///
+/// The counterpart to [`unlogged_tail`] on the durable side: what a retry after
+/// a failed turn would otherwise append a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoggedInput {
+    id: ulid::Ulid,
+    content: String,
+    trust: TrustLabel,
+}
+
+fn logged_tail(events: &[Event]) -> Vec<LoggedInput> {
+    let mut tail: Vec<LoggedInput> = Vec::new();
+    for event in events.iter().rev() {
+        match event.kind {
+            EventKind::UserMessage => tail.push(LoggedInput {
+                id: event.id,
+                content: event.payload["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                trust: event.trust,
+            }),
+            // Anything else ends the run: only the trailing block is this
+            // turn's, and an identical prompt from an earlier turn is a real
+            // repeat the user typed.
+            EventKind::Interrupt => continue,
+            _ => break,
+        }
+    }
+    // Rebuilt in send order, so a caller matching front-to-back lines up with
+    // what was actually appended.
+    tail.reverse();
+    tail
+}
+
+/// Index of the first user message this turn has not logged yet.
+///
+/// Callers append what is new and then call `run_session`, so the trailing run
+/// of user messages is this turn's; everything before it was logged by an
+/// earlier call. It is a *run*, not one message: a surface can append a typed
+/// prompt and a background agent's report together.
+fn unlogged_tail(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .rposition(|message| message.role != Role::User)
+        .map_or(0, |last_other| last_other + 1)
+}
+
+#[cfg(test)]
+mod unlogged_tail_tests {
+    use super::unlogged_tail;
+    use crate::types::{Message, Role};
+
+    #[test]
+    fn a_prompt_and_a_report_arriving_together_are_both_new() {
+        let messages = vec![
+            Message::system("s"),
+            Message::user("earlier"),
+            Message::new(Role::Assistant, "answered"),
+            Message::user("what the user typed"),
+            Message::user("[background agent finished] …"),
+        ];
+        // Taking only the last dropped the typed prompt from the log, and the
+        // rehydration that follows rebuilds context from the log.
+        assert_eq!(unlogged_tail(&messages), 3);
+    }
+
+    /// A line the user genuinely sent twice must be logged twice. Matching by
+    /// membership rather than by count silently swallowed the repeat.
+    #[test]
+    fn a_repeated_line_is_not_mistaken_for_a_replay() {
+        use super::logged_tail;
+        use crate::events::Event;
+        use crate::types::Session;
+
+        let session = Session {
+            id: ulid::Ulid::new(),
+            done: false,
+            autonomy: crate::types::AutonomyLevel::Careful,
+        };
+        let events = vec![
+            Event::user_message(&session, "again"),
+            Event::user_message(&session, "again"),
+        ];
+        let tail = logged_tail(&events);
+        assert_eq!(
+            tail.iter()
+                .map(|input| input.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["again", "again"]
+        );
+        assert_eq!(
+            logged_tail(&[Event::model_text(&session, "answered")]),
+            Vec::new(),
+            "an assistant turn ends the run"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_added_nothing_logs_nothing() {
+        let messages = vec![
+            Message::system("s"),
+            Message::user("prompt"),
+            Message::new(Role::Assistant, "answer"),
+        ];
+        assert_eq!(unlogged_tail(&messages), messages.len());
     }
 }
 

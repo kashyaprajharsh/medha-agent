@@ -46,6 +46,20 @@ fn env_usize(name: &str) -> Option<usize> {
 /// default. Only fields whose env var is actually set are overridden — an
 /// absent var must never wipe out a value the lock file specified.
 ///   MEDHA_MAX_TURNS · MEDHA_MAX_TOKENS · MEDHA_MAX_COST (usd) · MEDHA_MAX_WALL (s)
+/// The budget for one task, with a pool of its own, published so any sub-agent
+/// this task spawns draws tokens, cost and wall-clock from the same tally.
+///
+/// Per task, not per process: a pool built once at startup never resets, so a
+/// long-running surface would exhaust the ceiling and stay exhausted.
+pub(crate) fn task_budget(base: &kernel::Budget, slot: &kernel::BudgetHandle) -> kernel::Budget {
+    let budget = base.clone().with_fresh_pool();
+    if let Ok(mut published) = slot.lock() {
+        // A clone shares the pool, so a child's spend lands on the same tally.
+        *published = Some(budget.clone());
+    }
+    budget
+}
+
 fn apply_budget_env(mut b: kernel::Budget) -> kernel::Budget {
     if let Some(t) = env_u32("MEDHA_MAX_TURNS") {
         b.max_turns = Some(t);
@@ -1060,6 +1074,7 @@ async fn main() -> Result<()> {
         }
     }
     let exec_backend = sandbox::select_backend(&sbx_cfg, extra_writable);
+    let verifier_exec = Arc::clone(&exec_backend);
 
     // Kept so a writing sub-agent's sandbox can be rebuilt at its own worktree
     // root with exactly these settings — same permissions, same audit log, same
@@ -1135,6 +1150,9 @@ async fn main() -> Result<()> {
             max_results: lock.lsp.max_results,
             max_text_chars: lock.lsp.max_text_chars,
             max_open_documents: lock.lsp.max_open_documents,
+            install_timeout: std::time::Duration::from_millis(lock.lsp.install_timeout_ms),
+            write_timeout: std::time::Duration::from_millis(lock.lsp.write_timeout_ms),
+            max_frame_bytes: lock.lsp.max_frame_bytes,
             allow_network: lock.lsp.allow_network,
             ..lsp::Config::default()
         };
@@ -1180,7 +1198,7 @@ async fn main() -> Result<()> {
         registry.register_lsp(Arc::new(lsp::LspManager::new(cwd.clone(), lsp_config)));
     }
     // MCP servers live in the user config (~/.medha/config.toml); their keys live
-    // in the credential store and are substituted into the command at spawn. The
+    // in the credential store and are substituted into explicit env at spawn. The
     // lockfile only carries runtime tuning (timeouts, allow_network) + the switch.
     let mcp_servers: Vec<mcp::ServerConfig> = model_profiles
         .lock()
@@ -1188,7 +1206,13 @@ async fn main() -> Result<()> {
         .map(|cfg| {
             cfg.mcp
                 .iter()
-                .filter(|(id, server)| !id.trim().is_empty() && !server.command.is_empty())
+                // A remote server has no command; requiring one dropped every
+                // url-only server at startup, so one added with `/mcp add
+                // <url>` connected once and was gone after the next launch.
+                .filter(|(id, server)| {
+                    let reachable = !server.command.is_empty() || !server.url.is_empty();
+                    !id.trim().is_empty() && reachable
+                })
                 .map(|(id, server)| config::resolve_mcp_server(id, server))
                 .collect()
         })
@@ -1208,6 +1232,7 @@ async fn main() -> Result<()> {
             max_reconnects: lock.mcp.max_reconnects,
             park_probe: std::time::Duration::from_millis(lock.mcp.park_probe_ms),
             auth_timeout: std::time::Duration::from_millis(lock.mcp.auth_timeout_ms),
+            http_timeout: std::time::Duration::from_millis(lock.mcp.http_timeout_ms),
             tokens: Some(Arc::new(config::McpTokens)),
         };
         let manager = Arc::new(mcp::McpManager::new(cwd.clone(), mcp_config));
@@ -1278,12 +1303,17 @@ async fn main() -> Result<()> {
             Arc::clone(&agent_registry),
             sandbox_template,
             verify_cmd.clone(),
+            std::time::Duration::from_secs(lock.agents.verify_timeout_secs),
+            lock.agents.max_patch_bytes,
         )
         .await
         .map(|workspaces| Arc::new(workspaces) as Arc<dyn orchestrator::Workspaces>)
     } else {
         None
     };
+    // Filled once the session budget is resolved, below. Children read it at
+    // spawn time, which is always after that.
+    let agent_budget: kernel::BudgetHandle = Arc::new(std::sync::Mutex::new(None));
     let agent_control = lock.agents.enabled.then(|| {
         let mut control = orchestrator::AgentControl::new(
             agent_runner.clone(),
@@ -1296,6 +1326,9 @@ async fn main() -> Result<()> {
             max: std::time::Duration::from_secs(lock.agents.max_wait_secs),
         })
         .with_transcript_tail(lock.agents.transcript_tail)
+        .with_cancel_grace(std::time::Duration::from_secs(
+            lock.agents.cancel_grace_secs,
+        ))
         // Delivery rides the event log, so a background report survives a
         // restart and reaches the session that dispatched it.
         .with_outbox(Arc::new(agents::LogOutbox::new(log.clone())))
@@ -1306,7 +1339,10 @@ async fn main() -> Result<()> {
         // Durable patch records live on the owning session's chain, so the
         // control plane shares the same session slot the agent tools use —
         // filled once the session id exists.
-        .with_owner(registry.agent_session_handle());
+        .with_owner(registry.agent_session_handle())
+        // Children inherit the root's token/cost/wall ceilings and spend
+        // against the same pool, so delegating cannot multiply the budget.
+        .with_budget(Arc::clone(&agent_budget));
         if let Some(workspaces) = agent_workspaces {
             control = control.with_workspaces(workspaces);
         }
@@ -1367,11 +1403,16 @@ async fn main() -> Result<()> {
         Some(cmd) => Arc::new(CommandVerifier {
             command: cmd,
             dir: cwd.clone(),
+            limit: std::time::Duration::from_secs(lock.agents.verify_timeout_secs),
+            exec: Arc::clone(&verifier_exec),
         }),
         None => Arc::new(kernel::NoVerify),
     };
 
-    let base_budget = lock.budget.to_budget();
+    // Env overrides applied once, here: children read this budget too, and
+    // applying them only at each task's own call site left every sub-agent
+    // running against the lockfile value with MEDHA_MAX_* ignored.
+    let base_budget = apply_budget_env(lock.budget.to_budget());
     let ui_config = lock.ui.clone();
 
     // Cost meter (P1-12): the operator's configured rate wins; else the model's
@@ -1581,7 +1622,8 @@ async fn main() -> Result<()> {
             session,
             system,
             model_name,
-            apply_budget_env(base_budget),
+            base_budget.clone(),
+            Arc::clone(&agent_budget),
             writer,
             pending,
         )
@@ -1603,7 +1645,7 @@ async fn main() -> Result<()> {
                 model_profiles,
                 active_profile,
                 open_setup,
-                apply_budget_env(base_budget),
+                task_budget(&base_budget, &agent_budget),
                 ui_config,
                 resumed,
                 workspace.clone(),
@@ -1628,7 +1670,8 @@ async fn main() -> Result<()> {
                 system,
                 &model_name,
                 max_ctx,
-                apply_budget_env(base_budget),
+                base_budget.clone(),
+                Arc::clone(&agent_budget),
                 resumed,
             )
             .await?;
@@ -1652,30 +1695,42 @@ async fn main() -> Result<()> {
     // Reports from agents an earlier run left behind. Delivery is durable, so a
     // child that finished after its session ended is picked up here rather than
     // only in the TUI.
+    let mut taken: Vec<orchestrator::AgentResult> = Vec::new();
     if let Some(control) = &agent_control {
-        for result in control.collect(session.id).await {
-            messages.push(Message::user(format!(
-                "[background agent '{}' finished — {}]\n{}",
-                result.agent,
-                serde_json::to_string(&result.status)
-                    .unwrap_or_default()
-                    .trim_matches('"'),
-                result.summary
-            )));
+        taken = control.collect(session.id).await;
+        for result in &taken {
+            // Labelled with what the child touched, exactly as the TUI does: a
+            // report is not the user speaking, and headless is where an
+            // unescalated consequential action is least likely to be noticed.
+            messages.push(
+                Message::new(
+                    kernel::Role::User,
+                    format!(
+                        "[background agent '{}' finished — {}]\n{}",
+                        result.agent,
+                        serde_json::to_string(&result.status)
+                            .unwrap_or_default()
+                            .trim_matches('"'),
+                        result.summary
+                    ),
+                )
+                .carrying(result.trust),
+            );
         }
     }
     messages.push(Message::user(prompt));
     let sink = PrintSink::plain();
-    match kernel
+    let run = kernel
         .run_session(
             &session,
             messages,
-            apply_budget_env(base_budget),
+            task_budget(&base_budget, &agent_budget),
             &sink,
             None,
         )
-        .await
-    {
+        .await;
+    let committed = run.is_ok();
+    match run {
         Ok((_t, kernel::StopReason::Budget(stop))) => {
             eprintln!(
                 "\n(stopped: {} reached — raise the limit to continue)",
@@ -1686,6 +1741,11 @@ async fn main() -> Result<()> {
         Err(e) => eprintln!("error: {e}"),
     }
     if let Some(control) = &agent_control {
+        // After the run: the reports are in the log by then. Acknowledging at
+        // collection time lost them whenever the run that took them failed.
+        if committed {
+            control.settle(session.id, &taken).await;
+        }
         control.shutdown().await;
     }
     Ok(())
@@ -1703,7 +1763,7 @@ async fn main() -> Result<()> {
 /// be blocked entirely.
 /// `medha mcp add|list|remove` — manage MCP servers in the user config
 /// (`~/.medha/config.toml`). Secrets never touch a file: `--key` goes to the
-/// credential store and the command references it as `${key}`.
+/// credential store and an environment value references it as `${key}`.
 async fn run_mcp_command(args: Vec<String>) -> Result<()> {
     let mut cfg = config::load()?.unwrap_or_default();
     match args.first().map(String::as_str).unwrap_or("list") {
@@ -1726,7 +1786,7 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                     } else {
                         &server.trust
                     };
-                    let key = if config::mcp_key_present(id) {
+                    let key = if config::mcp_key_present(id, server) {
                         "  · key stored"
                     } else {
                         ""
@@ -1764,9 +1824,9 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             let id = args
                 .get(1)
                 .ok_or_else(|| anyhow::anyhow!("usage: medha mcp remove <id>"))?;
-            if cfg.mcp.remove(id).is_some() {
+            if let Some(removed) = cfg.mcp.remove(id) {
                 config::save(&cfg)?;
-                config::delete_mcp_key(id);
+                config::delete_mcp_key(id, &removed);
                 println!("removed MCP server '{id}' (config + stored key)");
             } else {
                 println!("no MCP server '{id}'");
@@ -1776,80 +1836,14 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             // medha mcp add <id> [--url U [--bearer T | --oauth]] [--key K]
             //   [--trust trusted] [--env K=V] [--allow-tool P] [--deny-tool P]
             //   [--no-network] [--parallel] [--] <command>
-            let mut id = None;
-            let mut trust = "workspace".to_string();
-            let mut key: Option<String> = None;
-            let mut url = String::new();
-            let mut auth = String::new();
-            let mut env = std::collections::BTreeMap::new();
-            let mut allow_tools: Vec<String> = Vec::new();
-            let mut deny_tools: Vec<String> = Vec::new();
-            let mut network = None;
-            let mut parallel_calls = false;
-            let mut command: Vec<String> = Vec::new();
-            let mut it = args[1..].iter();
-            while let Some(arg) = it.next() {
-                match arg.as_str() {
-                    "--key" => key = it.next().cloned(),
-                    "--url" => url = it.next().cloned().unwrap_or_default(),
-                    "--bearer" => {
-                        auth = "bearer".into();
-                        key = it.next().cloned();
-                    }
-                    "--oauth" => auth = "oauth".into(),
-                    "--trust" => trust = it.next().cloned().unwrap_or(trust),
-                    "--env" => {
-                        if let Some((k, v)) = it.next().and_then(|kv| kv.split_once('=')) {
-                            env.insert(k.to_string(), v.to_string());
-                        }
-                    }
-                    "--allow-tool" => allow_tools.extend(it.next().cloned()),
-                    "--deny-tool" => deny_tools.extend(it.next().cloned()),
-                    "--no-network" => network = Some(false),
-                    "--parallel" => parallel_calls = true,
-                    "--" => command.extend(it.by_ref().cloned()),
-                    // A pasted URL is the server, wherever it appears — the id
-                    // is derived from it when not given.
-                    _ if mcp::is_url(arg) => url = arg.clone(),
-                    _ if id.is_none() => id = Some(arg.clone()),
-                    _ => command.push(arg.clone()),
-                }
-            }
-            let id = id.or_else(|| mcp::id_from_url(&url)).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "usage: medha mcp add <https://…>            (id derived from the URL)\n   \
-                         or: medha mcp add <id> <https://…>       (explicit id)\n   \
-                         or: medha mcp add <id> [--key K] [--trust trusted] [--env K=V] \
-                         [--allow-tool P] [--deny-tool P] -- <command>"
-                )
-            })?;
-            if url.is_empty() && command.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "server '{id}' needs either --url <https://…> or -- <command>"
-                ));
-            }
-            if !url.is_empty() {
-                // Fail here rather than at connect time, when the user is not looking.
-                mcp::validate_remote_url(&url)?;
-            }
+            let parsed = config::parse_mcp_add_args(args[1..].iter().cloned())?;
+            let (id, definition, key) = (parsed.id, parsed.server, parsed.key);
+            // After the definition exists: the credential is filed against what
+            // this server points at, so the target has to be known first.
             if let Some(k) = &key {
-                config::store_mcp_key(&id, k)?;
+                config::store_mcp_key(&id, &definition, k)?;
             }
-            cfg.mcp.insert(
-                id.clone(),
-                config::McpServer {
-                    command,
-                    disabled: false,
-                    url,
-                    auth: auth.clone(),
-                    env,
-                    trust,
-                    allow_tools,
-                    deny_tools,
-                    network,
-                    parallel_calls,
-                },
-            );
+            cfg.mcp.insert(id.clone(), definition);
             config::save(&cfg)?;
             println!(
                 "added MCP server '{id}'{}",
@@ -1899,7 +1893,7 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                 return Err(anyhow::anyhow!("no MCP server '{id}'"));
             }
             let manager = one_shot_mcp(id, &cfg)?;
-            manager.sign_out(id);
+            manager.sign_out(id, &cfg.mcp[id].url);
             authorize_mcp(&manager, id).await;
             for status in manager.status().await {
                 println!(
@@ -2107,7 +2101,14 @@ async fn run_lsp_command(args: &[String]) -> Result<()> {
             if let Some(into) = lsp::server_install_dir() {
                 println!("  installing into {}", into.display());
             }
-            println!("{}", lsp::install_server(id).await?);
+            println!(
+                "{}",
+                lsp::install_server(
+                    id,
+                    std::time::Duration::from_millis(lock.lsp.install_timeout_ms)
+                )
+                .await?
+            );
             if !lsp::server_on_path(&program) {
                 println!("note: '{program}' is still not resolvable; check the output above");
             }
@@ -2213,37 +2214,58 @@ fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
     out
 }
 
+/// How much verifier output reaches the model. The tail, because that is where
+/// a failing build says what failed.
+const VERIFY_MAX_OUTPUT: usize = 8_192;
+
 /// Deterministic verifier: runs a shell check (e.g. `cargo check`) in the
 /// workspace after edits and reports pass/fail (§4.7).
 struct CommandVerifier {
     command: String,
     dir: std::path::PathBuf,
+    limit: std::time::Duration,
+    exec: Arc<dyn sandbox::ExecBackend>,
 }
 
 #[async_trait::async_trait]
 impl kernel::Verifier for CommandVerifier {
-    async fn check(&self) -> Option<kernel::VerifyReport> {
-        let out = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&self.command)
-            .current_dir(&self.dir)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .ok()?;
-        let output = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+    async fn check(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<kernel::VerifyReport> {
+        // Bounded in time and output, and group-reaped: this runs whatever the
+        // project's check command is, and an unbounded one wedges the gate
+        // while its orphaned compiler jobs hold the locks the retry needs.
+        let out = match sandbox::run_shell_bounded_with(
+            self.exec.as_ref(),
+            &self.command,
+            &self.dir,
+            self.limit,
+            VERIFY_MAX_OUTPUT,
+            Some(cancel),
+        )
+        .await
+        {
+            Ok(out) => out,
+            // Configured means mandatory. Treating a missing shell, invalid
+            // cwd, or spawn failure as `None` is indistinguishable from
+            // "verification disabled" and silently waves a broken edit on.
+            Err(error) => {
+                return Some(kernel::VerifyReport {
+                    ok: false,
+                    summary: format!("could not run `{}`", self.command),
+                    output: error.to_string(),
+                });
+            }
+        };
         Some(kernel::VerifyReport {
-            ok: out.status.success(),
-            summary: format!(
-                "`{}` exit {}",
-                self.command,
-                out.status.code().unwrap_or(-1)
-            ),
-            output,
+            ok: out.passed(),
+            summary: match (out.cancelled, out.timed_out) {
+                (true, _) => format!("`{}` cancelled", self.command),
+                (_, true) => format!("`{}` timed out", self.command),
+                _ => format!("`{}` exit {}", self.command, out.status.unwrap_or(-1)),
+            },
+            output: out.output,
         })
     }
 }
@@ -2612,13 +2634,15 @@ async fn resolve_resume(
 
 /// readline editing, history, and slash commands. The transcript accrues across
 /// turns, so compaction engages naturally on long sessions.
+#[allow(clippy::too_many_arguments)]
 async fn run_repl<P, L>(
     kernel: &Kernel<P, L>,
     session: &Session,
     system: String,
     model: &str,
     max_ctx: Option<u32>,
-    budget: kernel::Budget,
+    base_budget: kernel::Budget,
+    agent_budget: kernel::BudgetHandle,
     resumed: Vec<Message>,
 ) -> Result<()>
 where
@@ -2680,9 +2704,11 @@ where
                 // Output (streamed text, ⏺ tool lines, ↯ compaction) renders live
                 // through the sink, which also records real token usage.
                 let sink = PrintSink::tracking(usage.clone());
-                // Each user message is a fresh task → fresh budget contract.
+                // Each user message is a fresh task → fresh budget contract,
+                // published for any children it delegates.
+                let budget = task_budget(&base_budget, &agent_budget);
                 match kernel
-                    .run_session(session, transcript.clone(), budget.clone(), &sink, None)
+                    .run_session(session, transcript.clone(), budget, &sink, None)
                     .await
                 {
                     Ok((updated, kernel::StopReason::Budget(stop))) => {

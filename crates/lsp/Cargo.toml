@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+dirs = "5"
+fd-lock = "4"
 futures.workspace = true
 sandbox = { path = "../sandbox" }
 serde.workspace = true

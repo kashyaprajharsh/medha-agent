@@ -5,10 +5,43 @@
 //! mid-tool kill, P10). This is the principled replacement for a hardcoded
 //! turn cap: the *user* sets the ceiling; turn-count is just one dimension.
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Generous anti-runaway backstop on turns when the user sets nothing.
 pub const DEFAULT_MAX_TURNS: u32 = 200;
+
+/// Spend pooled across every session in one agent tree.
+///
+/// Turns are per-session — a child needs its own working room — but tokens,
+/// cost and wall-clock are the user's, and a tree that hands each child a fresh
+/// copy of the ceiling has no ceiling at all: three children sequentially, or
+/// one nesting three deep, spends the budget three times over.
+pub type Allowance = Arc<Mutex<Pooled>>;
+
+/// Shared slot holding the budget a session was started with, so anything that
+/// spawns work on its behalf can derive ceilings from the same source.
+pub type BudgetHandle = Arc<Mutex<Option<Budget>>>;
+
+#[derive(Debug, Default)]
+pub struct Pooled {
+    tokens: u64,
+    cost_usd: f64,
+    started: Option<Instant>,
+}
+
+impl Pooled {
+    pub fn new() -> Allowance {
+        Arc::new(Mutex::new(Self::default()))
+    }
+
+    fn elapsed_s(&mut self) -> u64 {
+        self.started
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .as_secs()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Budget {
@@ -16,6 +49,9 @@ pub struct Budget {
     pub max_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
     pub max_wall_s: Option<u64>,
+    /// Shared with every descendant, so their spend counts against the same
+    /// ceilings. `None` leaves this session accounting only for itself.
+    pub pooled: Option<Allowance>,
 }
 
 impl Default for Budget {
@@ -26,6 +62,41 @@ impl Default for Budget {
             max_tokens: None,
             max_cost_usd: None,
             max_wall_s: None,
+            pooled: None,
+        }
+    }
+}
+
+impl Budget {
+    /// The ceilings a child inherits: the same limits, against the same pool.
+    /// Turns are the caller's to set — a child needs its own working room.
+    pub fn inherited(&self, max_turns: u32) -> Self {
+        Self {
+            max_turns: Some(max_turns),
+            ..self.clone()
+        }
+    }
+
+    /// Start pooling the non-turn ceilings across a tree of agents. Keeps an
+    /// existing pool, so a child inheriting one stays on its parent's tally.
+    pub fn pooling(mut self) -> Self {
+        self.pooled.get_or_insert_with(Pooled::new);
+        self
+    }
+
+    /// A pool of its own, replacing any inherited one. For the start of a task:
+    /// carrying the previous task's tally forward means the ceiling is spent
+    /// once and never recovered.
+    pub fn with_fresh_pool(mut self) -> Self {
+        self.pooled = Some(Pooled::new());
+        self
+    }
+
+    /// A turn-only budget. Handy where a caller has no ceilings to inherit.
+    pub fn turns(max_turns: u32) -> Self {
+        Self {
+            max_turns: Some(max_turns),
+            ..Self::default()
         }
     }
 }
@@ -78,20 +149,39 @@ impl Governor {
     }
 
     /// Returns `Some(reason)` if any ceiling is reached — stop before the turn.
+    ///
+    /// Turns are this session's own; everything else is measured against the
+    /// pool when there is one, so a tree cannot spend its ceiling once per agent.
     pub fn check(&self) -> Option<BudgetStop> {
         if matches!(self.budget.max_turns, Some(m) if self.turns >= m) {
             return Some(BudgetStop::Turns);
         }
-        if matches!(self.budget.max_tokens, Some(m) if self.tokens >= m) {
+        let (tokens, cost_usd, elapsed_s) = self.spent();
+        if matches!(self.budget.max_tokens, Some(m) if tokens >= m) {
             return Some(BudgetStop::Tokens);
         }
-        if matches!(self.budget.max_cost_usd, Some(m) if self.cost_usd >= m) {
+        if matches!(self.budget.max_cost_usd, Some(m) if cost_usd >= m) {
             return Some(BudgetStop::Cost);
         }
-        if matches!(self.budget.max_wall_s, Some(m) if self.start.elapsed().as_secs() >= m) {
+        if matches!(self.budget.max_wall_s, Some(m) if elapsed_s >= m) {
             return Some(BudgetStop::Wall);
         }
         None
+    }
+
+    /// What counts against the ceilings: the pool's totals where one is shared,
+    /// this session's own otherwise. A poisoned pool falls back to local rather
+    /// than removing the ceiling.
+    fn spent(&self) -> (u64, f64, u64) {
+        match self
+            .budget
+            .pooled
+            .as_ref()
+            .and_then(|pool| pool.lock().ok())
+        {
+            Some(mut pool) => (pool.tokens, pool.cost_usd, pool.elapsed_s()),
+            None => (self.tokens, self.cost_usd, self.start.elapsed().as_secs()),
+        }
     }
 
     pub fn record_turn(&mut self) {
@@ -102,6 +192,15 @@ impl Governor {
     pub fn record_tokens(&mut self, total_tokens: u64, cost_usd: f64) {
         self.tokens = self.tokens.saturating_add(total_tokens);
         self.cost_usd += cost_usd;
+        if let Some(mut pool) = self
+            .budget
+            .pooled
+            .as_ref()
+            .and_then(|pool| pool.lock().ok())
+        {
+            pool.tokens = pool.tokens.saturating_add(total_tokens);
+            pool.cost_usd += cost_usd;
+        }
     }
 
     pub fn turns(&self) -> u32 {
@@ -139,6 +238,7 @@ mod tests {
             max_tokens: Some(1000),
             max_cost_usd: None,
             max_wall_s: None,
+            pooled: None,
         });
         g.record_tokens(600, 0.0);
         assert_eq!(g.check(), None);
@@ -162,11 +262,56 @@ mod tests {
             max_tokens: None,
             max_cost_usd: Some(1.0),
             max_wall_s: None,
+            pooled: None,
         });
         g.record_tokens(120_000, per_turn);
         assert_eq!(g.check(), None);
         g.record_tokens(120_000, per_turn);
         assert_eq!(g.check(), Some(BudgetStop::Cost));
+    }
+
+    /// Each child used to get a fresh copy of the ceiling, so a tree spent the
+    /// user's whole token budget once per agent.
+    #[test]
+    fn a_childs_spend_counts_against_the_parents_ceiling() {
+        let parent = Budget {
+            max_turns: Some(10),
+            max_tokens: Some(1000),
+            max_cost_usd: None,
+            max_wall_s: None,
+            pooled: None,
+        }
+        .pooling();
+        let mut root = Governor::new(parent.clone());
+        root.record_tokens(600, 0.0);
+        assert_eq!(root.check(), None);
+
+        // A child with its own turns, drawing on the same pool.
+        let mut child = Governor::new(parent.inherited(5));
+        assert_eq!(child.check(), None, "the parent has not exhausted it yet");
+        child.record_tokens(600, 0.0);
+        assert_eq!(child.check(), Some(BudgetStop::Tokens));
+        assert_eq!(
+            root.check(),
+            Some(BudgetStop::Tokens),
+            "the parent sees what its child spent"
+        );
+    }
+
+    #[test]
+    fn an_unpooled_budget_still_accounts_only_for_itself() {
+        let solo = Budget {
+            max_turns: None,
+            max_tokens: Some(100),
+            max_cost_usd: None,
+            max_wall_s: None,
+            pooled: None,
+        };
+        let mut a = Governor::new(solo.clone());
+        let b = Governor::new(solo);
+        a.record_tokens(150, 0.0);
+        assert_eq!(a.check(), Some(BudgetStop::Tokens));
+        assert_eq!(b.check(), None);
     }
 
     #[test]
@@ -176,6 +321,7 @@ mod tests {
             max_tokens: None,
             max_cost_usd: None,
             max_wall_s: None,
+            pooled: None,
         });
         assert_eq!(g.check(), None);
     }

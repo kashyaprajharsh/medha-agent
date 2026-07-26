@@ -2025,6 +2025,8 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 name = "lsp"
 version = "0.0.1"
 dependencies = [
+ "dirs",
+ "fd-lock",
  "futures",
  "libc",
  "sandbox",
@@ -2096,6 +2098,7 @@ version = "0.0.1"
 dependencies = [
  "futures",
  "libc",
+ "oauth2",
  "reqwest 0.13.4",
  "rmcp",
  "sandbox",
@@ -2131,6 +2134,7 @@ dependencies = [
  "context",
  "crossterm",
  "dirs",
+ "fd-lock",
  "futures",
  "gate",
  "kernel",
@@ -2149,6 +2153,7 @@ dependencies = [
  "sandbox",
  "serde",
  "serde_json",
+ "sha2",
  "similar",
  "store",
  "syntect",
@@ -3402,6 +3407,7 @@ dependencies = [
  "permissions",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "ulid",
 ]
 

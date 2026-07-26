@@ -1134,7 +1134,10 @@ pub(super) enum AgentRow {
     /// A writer's patch, waiting for the user to accept or ignore it.
     Patch {
         agent: String,
-        session: String,
+        /// Exact durable handout, and the only way a patch is addressed: a
+        /// follow-up reuses the child's session, so a session id names a moving
+        /// target while this names the diff the user is looking at.
+        dispatch: String,
         files: usize,
         /// `None` when the project has no verify command — not the same as a
         /// patch that failed, and must not be shown as if it were.

@@ -106,11 +106,11 @@ fn reply(body: &str) -> Value {
 struct MemoryTokens;
 
 impl TokenStore for MemoryTokens {
-    fn load(&self, _server: &str) -> Option<String> {
+    fn load(&self, _server: &str, _url: &str) -> Option<String> {
         None
     }
-    fn save(&self, _server: &str, _blob: &str) {}
-    fn clear(&self, _server: &str) {}
+    fn save(&self, _server: &str, _url: &str, _blob: &str) {}
+    fn clear(&self, _server: &str, _url: &str) {}
 }
 
 fn remote(id: &str, url: String, auth: RemoteAuth) -> Config {

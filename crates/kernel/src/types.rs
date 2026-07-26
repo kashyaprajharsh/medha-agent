@@ -116,6 +116,11 @@ pub struct Message {
     /// Tool messages: the id of the call this message answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Trust of content injected into the conversation from outside it — a
+    /// sub-agent's report above all. Without it a background report enters as
+    /// plain user text and the taint the child accumulated is lost at the door.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<TrustLabel>,
 }
 
 impl Message {
@@ -125,7 +130,13 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            trust: None,
         }
+    }
+
+    pub fn carrying(mut self, trust: TrustLabel) -> Self {
+        self.trust = Some(trust);
+        self
     }
     pub fn system(content: impl Into<String>) -> Self {
         Self::new(Role::System, content)
@@ -140,6 +151,7 @@ impl Message {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            trust: None,
         }
     }
     /// A tool result answering a specific call.
@@ -149,6 +161,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            trust: None,
         }
     }
 }
@@ -359,6 +372,7 @@ impl TryFrom<&ModelMessage> for Message {
             content,
             tool_calls,
             tool_call_id,
+            trust: None,
         })
     }
 }
@@ -563,6 +577,11 @@ pub struct Observation {
     pub intent_id: String,
     pub status: ObsStatus,
     pub payload: serde_json::Value,
+    /// Trust of content this tool is *relaying* rather than producing, when it
+    /// knows the provenance. The kernel takes the weaker of this and the label
+    /// its category implies, so a tool handing back a sub-agent's web-derived
+    /// findings cannot launder them into ordinary tool output.
+    pub relayed_trust: Option<TrustLabel>,
 }
 
 impl Observation {
@@ -571,6 +590,7 @@ impl Observation {
             intent_id: intent_id.into(),
             status: ObsStatus::Ok,
             payload,
+            relayed_trust: None,
         }
     }
     pub fn denial(intent_id: impl Into<String>, reason: impl Into<String>) -> Self {
@@ -578,6 +598,7 @@ impl Observation {
             intent_id: intent_id.into(),
             status: ObsStatus::Denied,
             payload: serde_json::json!({ "reason": reason.into() }),
+            relayed_trust: None,
         }
     }
     pub fn error(intent_id: impl Into<String>, message: impl Into<String>) -> Self {
@@ -585,7 +606,12 @@ impl Observation {
             intent_id: intent_id.into(),
             status: ObsStatus::Error,
             payload: serde_json::json!({ "error": message.into() }),
+            relayed_trust: None,
         }
+    }
+    pub fn relaying(mut self, trust: TrustLabel) -> Self {
+        self.relayed_trust = Some(trust);
+        self
     }
 }
 

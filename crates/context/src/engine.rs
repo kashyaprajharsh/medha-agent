@@ -111,6 +111,15 @@ impl PipelineEngine {
         self.full_compaction_refresh = Some(refresh);
         self
     }
+
+    /// The same configuration over a fresh conversation.
+    fn forked(&self) -> Self {
+        let mut engine = Self::with_counter(self.policy.clone(), Arc::clone(&self.counter));
+        engine.summarizer = Arc::clone(&self.summarizer);
+        engine.artifacts = self.artifacts.clone();
+        engine.full_compaction_refresh = self.full_compaction_refresh.clone();
+        engine
+    }
 }
 
 impl Default for PipelineEngine {
@@ -178,6 +187,10 @@ const PER_TOOL_SCAFFOLD_TOKENS: u32 = 18;
 
 #[async_trait]
 impl ContextEngine for PipelineEngine {
+    fn fork(&self) -> Option<Arc<dyn ContextEngine>> {
+        Some(Arc::new(self.forked()))
+    }
+
     fn update_usage(&self, prompt_tokens: u32, _total_tokens: u32) {
         // Real usage already counts tool defs — store verbatim.
         self.last_prompt_tokens

@@ -19,6 +19,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use ulid::Ulid;
 
 /// Branch prefix for agent worktrees. Namespaced so a sweep can recognise its
@@ -33,6 +34,24 @@ fn owner_marker(worktree: &Path) -> PathBuf {
     let mut marker = worktree.as_os_str().to_os_string();
     marker.push(".owner");
     PathBuf::from(marker)
+}
+
+/// Marks a checkout whose work was never captured as a patch. A sibling, like
+/// the owner marker, so it stays out of the child's diff.
+fn keep_marker(worktree: &Path) -> PathBuf {
+    let mut marker = worktree.as_os_str().to_os_string();
+    marker.push(".keep");
+    PathBuf::from(marker)
+}
+
+/// Whether this checkout holds work that exists nowhere else.
+///
+/// On disk rather than in memory, because the process that decided to keep it
+/// is usually gone by the time anything sweeps: the in-memory lease dies with
+/// it, and the next launch would read a live rescue as an abandoned directory
+/// and force it away — losing exactly what the rescue was for.
+fn keeps_work(worktree: &Path) -> bool {
+    keep_marker(worktree).exists()
 }
 
 /// Whether the process that claimed `worktree` is still running.
@@ -72,6 +91,10 @@ fn owner_alive(worktree: &Path) -> bool {
 /// [`Patch::is_large`] flags it so the summary path can spill instead of
 /// flooding a context window.
 pub const LARGE_PATCH_BYTES: usize = 64 * 1024;
+/// Default hard ceiling for an extracted patch. A diff is duplicated into the
+/// result and durable event, so allowing it to grow with the checkout makes a
+/// single generated file an OOM vector.
+pub const DEFAULT_MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum WorktreeError {
@@ -87,6 +110,67 @@ pub enum WorktreeError {
     Spawn(String),
     #[error("io error: {0}")]
     Io(String),
+    #[error("patch exceeds the configured {limit}-byte limit; the checkout was preserved instead")]
+    PatchTooLarge { limit: usize },
+}
+
+/// Run a fixed git command while reading at most `limit + 1` stdout bytes.
+/// Seeing the extra byte is a distinct error; callers must never truncate a
+/// patch because a truncated binary/unified diff is not safely applicable.
+async fn git_bounded(dir: &Path, args: &[&str], limit: usize) -> Result<String, WorktreeError> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| WorktreeError::Spawn(error.to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| WorktreeError::Spawn("git stdout was not captured".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| WorktreeError::Spawn("git stderr was not captured".into()))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes).await;
+        bytes
+    });
+    let mut bytes = Vec::with_capacity(limit.min(1024 * 1024).saturating_add(1));
+    let read_limit = limit.saturating_add(1) as u64;
+    stdout
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| WorktreeError::Io(error.to_string()))?;
+    if bytes.len() > limit {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        stderr_task.abort();
+        return Err(WorktreeError::PatchTooLarge { limit });
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| WorktreeError::Spawn(error.to_string()))?;
+    let stderr = stderr_task.await.unwrap_or_default();
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(WorktreeError::Git {
+            command: args.join(" "),
+            message: if message.is_empty() {
+                format!("exit {:?}", status.code())
+            } else {
+                message
+            },
+        });
+    }
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
 /// Run git in `dir` and return stdout, or the failure with git's own stderr —
@@ -179,6 +263,11 @@ pub struct Worktree {
     /// Shared with the pool, so the lease is released by the same guard that
     /// removes the directory and cannot drift out of step with it.
     leases: Leases,
+    /// Set when the child's work could not be captured as a patch. Both `reap`
+    /// and the `Drop` guard then leave the checkout alone: the directory is the
+    /// only remaining copy of the work, and removing it is unrecoverable.
+    preserve: std::sync::atomic::AtomicBool,
+    max_patch_bytes: usize,
 }
 
 type Leases = Arc<Mutex<HashSet<PathBuf>>>;
@@ -207,7 +296,7 @@ impl Worktree {
     /// done nothing.
     pub async fn patch(&self) -> Result<Patch, WorktreeError> {
         git(&self.path, &["add", "--all", "--intent-to-add", "."]).await?;
-        let diff = git(
+        let diff = git_bounded(
             &self.path,
             // Binary files cannot be applied from a textual patch, so a marker
             // beats a corrupt hunk. `--no-color` because a configured
@@ -220,6 +309,7 @@ impl Worktree {
                 "--binary",
                 &self.base,
             ],
+            self.max_patch_bytes,
         )
         .await?;
         let files = git(
@@ -242,7 +332,56 @@ impl Worktree {
     /// Remove the checkout and its branch. Idempotent, and safe to call before
     /// the [`Drop`] guard runs — the pool lease is what makes the second call a
     /// no-op rather than a spurious git failure.
+    /// Lay a previous patch into this checkout, so a follow-up continues from
+    /// where the agent left off.
+    ///
+    /// Without it a resumed writer starts from a clean HEAD and has to redo —
+    /// or silently discard — everything it had already done, which is the one
+    /// outcome a follow-up exists to avoid.
+    pub async fn restore(&self, patch: &Patch) -> Result<(), WorktreeError> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        apply(&self.path, patch, &["--3way"], None).await
+    }
+
+    /// Keep this checkout: its work was never captured, so the directory is the
+    /// only copy left. Survives `reap`, the `Drop` guard, and — because the mark
+    /// is on disk — the next process's sweep.
+    pub fn preserve(&self) {
+        self.preserve
+            .store(true, std::sync::atomic::Ordering::Release);
+        let marker = keep_marker(&self.path);
+        if let Err(error) = std::fs::write(
+            &marker,
+            format!(
+                "Medha kept this checkout: an agent's changes could not be captured as a patch.\n\
+                 Recover them from here, then delete this file and the directory.\n\
+                 branch: {}\nbase: {}\n",
+                self.branch, self.base
+            ),
+        ) {
+            // Nothing else can carry this across a restart, so say so loudly
+            // rather than leaving a rescue that the next sweep will undo.
+            tracing::error!(
+                target: "medha_orchestrator",
+                path = %self.path.display(), %error,
+                "could not mark a checkout as preserved; it may be swept on restart"
+            );
+        }
+    }
+
+    fn preserved(&self) -> bool {
+        self.preserve.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub async fn reap(&self) {
+        if self.preserved() || keeps_work(&self.path) {
+            if let Ok(mut leases) = self.leases.lock() {
+                leases.remove(&self.path);
+            }
+            return;
+        }
         if !self
             .leases
             .lock()
@@ -281,6 +420,12 @@ impl Drop for Worktree {
     /// the removal to a detached blocking command; the lease is released here so
     /// the pool's view is correct immediately either way.
     fn drop(&mut self) {
+        // Preserved: hold the lease as well as the directory. Releasing it would
+        // let this process's own sweep treat the checkout as abandoned and
+        // force it away — the exact loss the flag exists to prevent.
+        if self.preserved() || keeps_work(&self.path) {
+            return;
+        }
         let held = self
             .leases
             .lock()
@@ -318,6 +463,7 @@ pub struct WorktreePool {
     repo: PathBuf,
     dir: PathBuf,
     leases: Leases,
+    max_patch_bytes: usize,
 }
 
 impl WorktreePool {
@@ -328,7 +474,15 @@ impl WorktreePool {
             repo: repo.into(),
             dir: dir.into(),
             leases: Arc::new(Mutex::new(HashSet::new())),
+            max_patch_bytes: DEFAULT_MAX_PATCH_BYTES,
         }
+    }
+
+    /// Configure the hard extraction ceiling. Exceeding it preserves the
+    /// checkout; it never returns a truncated patch.
+    pub fn with_max_patch_bytes(mut self, max_patch_bytes: usize) -> Self {
+        self.max_patch_bytes = max_patch_bytes;
+        self
     }
 
     /// Resolve the repository root for `path`, so a pool created from a
@@ -405,13 +559,29 @@ impl WorktreePool {
         // live worktree as abandoned and force-remove it mid-edit — two
         // terminals in one project is ordinary, and the child's uncommitted work
         // would go with it.
-        let _ = std::fs::write(owner_marker(&path), std::process::id().to_string());
+        if let Err(error) = std::fs::write(owner_marker(&path), std::process::id().to_string()) {
+            let _ = git(
+                &self.repo,
+                &["worktree", "remove", "--force", &path.to_string_lossy()],
+            )
+            .await;
+            let _ = git(&self.repo, &["worktree", "prune"]).await;
+            let _ = git(&self.repo, &["branch", "-D", &branch]).await;
+            if let Ok(mut leases) = self.leases.lock() {
+                leases.remove(&path);
+            }
+            return Err(WorktreeError::Io(format!(
+                "could not record the worktree owner: {error}"
+            )));
+        }
         Ok(Worktree {
+            preserve: std::sync::atomic::AtomicBool::new(false),
             repo: self.repo.clone(),
             path,
             branch,
             base,
             leases: Arc::clone(&self.leases),
+            max_patch_bytes: self.max_patch_bytes,
         })
     }
 
@@ -433,7 +603,8 @@ impl WorktreePool {
             } else if let Some(branch) = line.strip_prefix("branch ") {
                 // Only ours. Someone else's worktree in the same repo is not
                 // Medha's to remove, however stale it looks.
-                if branch.contains(BRANCH_PREFIX)
+                let prefix = format!("refs/heads/{BRANCH_PREFIX}/");
+                if branch.starts_with(&prefix)
                     && let Some(path) = current.take()
                 {
                     stale.push(path);
@@ -454,6 +625,40 @@ impl WorktreePool {
             // The lease table only knows about this process.
             if owner_alive(Path::new(&path)) {
                 continue;
+            }
+            // …and a checkout holding uncaptured work is never abandoned, however
+            // dead its owner. The marker outlives the process that wrote it,
+            // which is the whole point: the rescue has to survive the restart.
+            if keeps_work(Path::new(&path)) {
+                tracing::info!(
+                    target: "medha_orchestrator",
+                    %path,
+                    "keeping a checkout whose work was never captured as a patch"
+                );
+                continue;
+            }
+            // Missing markers are not permission to destroy uncommitted work:
+            // the owner/keep write may have failed or this may be a checkout
+            // from an older Medha. Fail closed on both dirty output and an
+            // inability to inspect it.
+            match git_bounded(Path::new(&path), &["status", "--porcelain"], 0).await {
+                Ok(_) => {}
+                Err(WorktreeError::PatchTooLarge { .. }) => {
+                    tracing::warn!(
+                        target: "medha_orchestrator",
+                        %path,
+                        "keeping an unmarked checkout because it has uncommitted work"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "medha_orchestrator",
+                        %path, %error,
+                        "keeping an unmarked checkout because its state could not be inspected"
+                    );
+                    continue;
+                }
             }
             let _ = git(&self.repo, &["worktree", "remove", "--force", &path]).await;
             let _ = std::fs::remove_file(owner_marker(Path::new(&path)));
@@ -665,6 +870,58 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "one\ntwo\nthree\n"
+        );
+    }
+
+    /// The `Drop` guard force-removes any checkout it still holds a lease for,
+    /// so merely declining to call `reap` was not enough to keep work whose
+    /// patch could not be captured — the directory went anyway, on a path with
+    /// no other copy of it.
+    #[tokio::test]
+    async fn a_preserved_checkout_survives_being_dropped() {
+        let (_repo, root) = repo().await;
+        let (_state, pool) = pool(&root);
+        let path = {
+            let tree = pool.checkout(Ulid::new()).await.unwrap();
+            std::fs::write(tree.path().join("a.txt"), "work nobody captured\n").unwrap();
+            tree.preserve();
+            tree.path().to_path_buf()
+        };
+        // The guard has run by now; give the detached remover a chance to as
+        // well, so this fails loudly if preservation is not honoured.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(path.exists(), "preserved checkout was removed anyway");
+        assert_eq!(
+            std::fs::read_to_string(path.join("a.txt")).unwrap(),
+            "work nobody captured\n"
+        );
+        // And the sweep must not take it either: the lease is deliberately held.
+        pool.sweep().await;
+        assert!(path.exists(), "sweep removed a preserved checkout");
+    }
+
+    /// The rescue has to outlive the process that made it. A restart holds no
+    /// lease and reads a dead owner pid, so without an on-disk mark the next
+    /// launch sweeps away exactly the work the rescue existed to save.
+    #[tokio::test]
+    async fn a_preserved_checkout_survives_a_restart() {
+        let (_repo, root) = repo().await;
+        let (state, pool) = pool(&root);
+        let path = {
+            let tree = pool.checkout(Ulid::new()).await.unwrap();
+            std::fs::write(tree.path().join("a.txt"), "unrecoverable elsewhere\n").unwrap();
+            tree.preserve();
+            tree.path().to_path_buf()
+        };
+        // A second pool over the same directory is what the next launch has:
+        // no lease table, and an owner marker naming a process that is gone.
+        std::fs::write(owner_marker(&path), dead_pid().to_string()).unwrap();
+        let restarted = WorktreePool::new(&root, state.path().join("worktrees"));
+        restarted.sweep().await;
+        assert!(path.exists(), "restart swept away preserved work");
+        assert_eq!(
+            std::fs::read_to_string(path.join("a.txt")).unwrap(),
+            "unrecoverable elsewhere\n"
         );
     }
 

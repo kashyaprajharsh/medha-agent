@@ -197,6 +197,8 @@ impl Tool for AgentSpawn {
          The child works in its own context, so none of its searching lands in this conversation.\n\
          \n\
          Reach for this on your own judgement — you do not need to be asked. Delegate when:\n\
+         · reviewing or auditing a whole workspace — split independent subsystems into one \
+         parallel `tasks` call and keep one slice for yourself;\n\
          · answering needs a broad sweep whose intermediate output you will never need again — \
          'how is X used across the codebase', 'what does this unfamiliar module do';\n\
          · two or more questions are independent, so children can run at once;\n\
@@ -218,7 +220,8 @@ impl Tool for AgentSpawn {
          \n\
          Once you have sent something to a background child, leave it alone. Its report reaches \
          you on its own the moment it is ready — you do not need to check, and there is nothing to \
-         wait for. Specifically: do not call agent.list repeatedly to watch it, do not read its \
+         poll. Use `agent.wait` only when its answer blocks your next step; otherwise keep working. \
+         Specifically: do not call agent.list repeatedly to watch it, do not read its \
          transcript to see whether it is progressing, do not cancel it for being quiet, and do not \
          start doing its task yourself in the meantime. A child that looks idle is almost always \
          composing its answer; killing it there throws away work that was nearly finished and \
@@ -305,6 +308,7 @@ impl Tool for AgentSpawn {
                             "name": { "type": "string" },
                             "contract": { "type": "string" },
                             "tools": { "type": "array", "items": { "type": "string" } },
+                            "max_turns": { "type": "integer", "description": "Turn ceiling for this task, clamped to the caller and operator ceilings." },
                             "write": { "type": "boolean", "description": "REQUIRED if this task changes anything; without it the child is read-only and cannot edit." },
                             "fork": { "type": "string", "description": "How much of this conversation this child inherits: 'all' (default), 'none', or a number of turns." }
                         },
@@ -362,7 +366,10 @@ impl Tool for AgentSpawn {
                             .map(str::to_string)
                             .collect()
                     }),
-                    max_turns: None,
+                    max_turns: task
+                        .get("max_turns")
+                        .and_then(Value::as_u64)
+                        .map(|turns| turns.min(u32::MAX as u64) as u32),
                     write: task.get("write").and_then(Value::as_bool).unwrap_or(false),
                     fork: parse_fork(task)?,
                 };
@@ -371,7 +378,12 @@ impl Tool for AgentSpawn {
                 started.push(
                     match self
                         .control
-                        .spawn_background(spec, &caller, parent.clone(), self.max_turns)
+                        .spawn_background(
+                            spec,
+                            &caller,
+                            parent.clone(),
+                            child_budget(&self.control, &caller, self.max_turns),
+                        )
                         .await
                     {
                         Ok(agent) => json!({
@@ -417,7 +429,7 @@ impl Tool for AgentSpawn {
             max_turns: args
                 .get("max_turns")
                 .and_then(Value::as_u64)
-                .map(|turns| turns as u32),
+                .map(|turns| turns.min(u32::MAX as u64) as u32),
             write: args.get("write").and_then(Value::as_bool).unwrap_or(false),
             fork: parse_fork(args)?,
         };
@@ -428,7 +440,12 @@ impl Tool for AgentSpawn {
         let caller = self.caller.resolve()?;
         let agent = self
             .control
-            .spawn_background(spec, &caller, parent, self.max_turns)
+            .spawn_background(
+                spec,
+                &caller,
+                parent,
+                child_budget(&self.control, &caller, self.max_turns),
+            )
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?;
         Ok(json!({
@@ -444,6 +461,22 @@ impl Tool for AgentSpawn {
 
 /// Shared slot for the session a background report belongs to.
 pub type SessionHandle = Arc<Mutex<Option<ulid::Ulid>>>;
+
+/// The ceilings to hand a child: the operator's per-child turn cap, and the
+/// *caller's* token/cost/wall limits against the caller's own pool.
+///
+/// The caller's, not the root's: a grandchild reading the root's budget rejoins
+/// the root's pool and ignores any ceiling its own parent was narrowed to.
+fn child_budget(
+    control: &orchestrator::AgentControl,
+    caller: &Caller,
+    max_turns: u32,
+) -> kernel::Budget {
+    let mut budget = control.budget_for(&caller.path);
+    let caller_ceiling = budget.max_turns.unwrap_or(max_turns);
+    budget.max_turns = Some(max_turns.min(caller_ceiling));
+    budget
+}
 
 /// Shared slot for the executor a child inherits from.
 ///
@@ -716,7 +749,13 @@ impl Tool for AgentControlTool {
                 let caller = self.caller.resolve()?;
                 let agent = self
                     .control
-                    .followup(&caller, &id, &text, parent, self.max_turns)
+                    .followup(
+                        &caller,
+                        &id,
+                        &text,
+                        parent,
+                        child_budget(&self.control, &caller, self.max_turns),
+                    )
                     .await
                     .map_err(|error| ToolError::Failed(error.to_string()))?;
                 Ok(json!({
@@ -746,10 +785,24 @@ impl Tool for AgentControlTool {
                         // mid-turn, so the caller was left holding a promise
                         // nothing kept and went digging through the transcript
                         // instead, which is the one thing it is told not to do.
-                        let reports: Vec<Value> = self
-                            .control
-                            .collect(self.caller.resolve()?.session)
-                            .await
+                        let owner = self.caller.resolve()?.session;
+                        let collected = self.control.collect(owner).await;
+                        // Do not acknowledge here. Tool execution precedes the
+                        // durable ToolObs append; a crash or append failure in
+                        // that gap would lose reports the caller never received.
+                        // The log outbox folds these dispatch ids from the
+                        // observation itself, making the append the commit.
+                        let acknowledgements: Vec<&str> = collected
+                            .iter()
+                            .map(|result| result.dispatch.as_str())
+                            .collect();
+                        // The weakest label across the reports being handed
+                        // back, so web-derived findings keep escalating what the
+                        // caller does with them.
+                        let relayed = orchestrator::least_trusted(
+                            collected.iter().map(|result| result.trust),
+                        );
+                        let reports: Vec<Value> = collected
                             .iter()
                             .map(|result| {
                                 json!({
@@ -765,6 +818,8 @@ impl Tool for AgentControlTool {
                             "timed_out": false,
                             "reports": reports,
                             "note": "These are their answers. Do not read their transcripts.",
+                            orchestrator::REPORT_ACKS_FIELD: acknowledgements,
+                            crate::RELAYED_TRUST: relayed,
                         }))
                     }
                     Waited::TimedOut => Ok(json!({
@@ -820,6 +875,9 @@ impl Tool for AgentControlTool {
                     "steps": steps,
                     "showing": steps.len(),
                     "total": total,
+                    // Raw output from another agent's tools, verbatim. Whatever
+                    // it read, the caller is now reading.
+                    crate::RELAYED_TRUST: kernel::TrustLabel::Web,
                 }))
             }
         }
@@ -845,7 +903,7 @@ impl Tool for AgentApply {
         "⚇"
     }
     fn description(&self) -> &str {
-        "Apply a writing agent's patch to the working tree, by its session id or name. Until you \
+        "Apply a writing agent's patch to the working tree by its exact patch_id. Until you \
          call this, the agent's work exists only as a diff and nothing in the workspace has \
          changed.\n\
          \n\
@@ -870,9 +928,9 @@ impl Tool for AgentApply {
         json!({
             "type": "object",
             "properties": {
-                "agent": {
+                "patch_id": {
                     "type": "string",
-                    "description": "The writing agent's session id (or name). Omit to list the patches waiting to be applied."
+                    "description": "The exact patch_id returned by the listing. Omit to list the patches waiting to be applied."
                 },
                 "force": {
                     "type": "boolean",
@@ -882,8 +940,16 @@ impl Tool for AgentApply {
         })
     }
     async fn preview(&self, args: &Value) -> Option<String> {
-        let id = args.get("agent").and_then(Value::as_str)?;
-        let patch = self.control.patch(id).await?;
+        let id = args.get("patch_id").and_then(Value::as_str)?;
+        let pending = self.control.pending(id).await?;
+        if pending.dispatch != id {
+            return Some(
+                "Refusing an ambiguous patch reference. List pending patches and pass the exact \
+                 patch_id."
+                    .into(),
+            );
+        }
+        let patch = &pending.patch;
         // The gate shows the diff itself. Approving "apply agent-3's patch"
         // without seeing what it does is not a decision, it is a formality.
         let files = patch.files.join(", ");
@@ -903,37 +969,51 @@ impl Tool for AgentApply {
         ))
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let Some(id) = args.get("agent").and_then(Value::as_str) else {
+        let Some(id) = args.get("patch_id").and_then(Value::as_str) else {
             let waiting: Vec<Value> = self
                 .control
                 .outstanding()
                 .await
                 .into_iter()
-                .map(|(agent, session, patch)| {
+                .map(|pending| {
                     json!({
-                        "agent": agent,
-                        "session": session,
-                        "files": patch.files,
-                        "verified": patch.verified(),
+                        "agent": pending.agent,
+                        "session": pending.session,
+                        // The exact handout. A session can hold several once it
+                        // has been followed up, so this is what addresses one.
+                        "patch_id": pending.dispatch,
+                        "files": pending.patch.files,
+                        "verified": pending.patch.verified(),
                     })
                 })
                 .collect();
             return Ok(json!({ "unmerged": waiting, "count": waiting.len() }));
         };
-        let patch = self.control.patch(id).await.ok_or_else(|| {
+        let pending = self.control.pending(id).await.ok_or_else(|| {
             ToolError::Failed(format!(
                 "no patch from '{id}' — it may have changed nothing, or been a read-only agent"
             ))
         })?;
+        if pending.dispatch != id {
+            return Err(ToolError::Failed(format!(
+                "'{id}' is not an exact patch_id, so nothing was applied. Call agent.apply with \
+                 no arguments, then pass the patch_id it lists."
+            )));
+        }
+        let patch = &pending.patch;
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-        match self.control.merge(&patch, force).await {
+        match self.control.merge(patch, force).await {
             Ok(check) => {
-                // Applied, so it is no longer outstanding. Leaving it listed
-                // would invite a second apply, which would either fail
-                // confusingly or double-apply.
-                self.control.forget(id).await;
+                // Closed by handout, not by session: a follow-up reuses the
+                // session, and closing by it would mark a diff nobody applied
+                // as applied. Leaving it open instead would invite a second
+                // apply, which either fails confusingly or double-applies.
+                self.control.forget(&pending.dispatch).await;
                 Ok(json!({
                     "applied": true,
+                    // Carries verifier output, which is whatever running the
+                    // agent's own edits printed — never the operator speaking.
+                    crate::RELAYED_TRUST: kernel::TrustLabel::Tool,
                     "files": patch.files,
                     "merge": check,
                     "verified": patch.verified(),

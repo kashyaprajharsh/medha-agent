@@ -20,7 +20,7 @@ pub mod verify;
 pub mod kernel_loop;
 
 pub use artifacts::ArtifactStore;
-pub use budgets::{Budget, BudgetStop, DEFAULT_MAX_TURNS, Governor};
+pub use budgets::{Budget, BudgetHandle, BudgetStop, DEFAULT_MAX_TURNS, Governor, Pooled};
 pub use clarify::{Answer, Asker, NoAsker, QOption, Question};
 pub use context::{CompileResult, ContextEngine, DiscoveredContext, ProgressiveContext};
 pub use errors::KernelError;

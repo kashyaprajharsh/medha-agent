@@ -84,6 +84,7 @@ impl Executor for SleepyExecutor {
             intent_id: intent.id.clone(),
             status: ObsStatus::Ok,
             payload: json!({ "ok": true, "tool": intent.tool }),
+            relayed_trust: None,
         }
     }
 }

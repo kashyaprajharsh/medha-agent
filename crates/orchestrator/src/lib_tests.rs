@@ -45,7 +45,10 @@ struct Recorder {
 impl ChildRunner for Recorder {
     async fn run(&self, run: ChildRun) -> Result<ChildOutcome, String> {
         let tools = run.executor.specs().into_iter().map(|s| s.name).collect();
-        self.seen.lock().unwrap().push((tools, run.max_turns));
+        self.seen
+            .lock()
+            .unwrap()
+            .push((tools, run.budget.max_turns.unwrap_or(0)));
         Ok(ChildOutcome {
             status: AgentStatus::Completed,
             summary: "done".into(),
@@ -103,12 +106,14 @@ async fn run_as(
         *slot = Some(Arc::new(move || wake.notify_one()));
     }
     control
-        .spawn_background(spec, caller, Arc::new(Tools), turns)
+        .spawn_background(spec, caller, Arc::new(Tools), kernel::Budget::turns(turns))
         .await?;
     ready.notified().await;
-    Ok(control
-        .collect(caller.session)
-        .await
+    // Collect then settle, as a surface does: reading no longer acknowledges,
+    // so without the settle the next call would hand back this report again.
+    let reports = control.collect(caller.session).await;
+    control.settle(caller.session, &reports).await;
+    Ok(reports
         .into_iter()
         .next()
         .expect("the signal fires only once the report is collectable"))
@@ -199,6 +204,70 @@ async fn an_empty_objective_is_rejected() {
         run(&control, spec("   "), 5).await,
         Err(Error::NoObjective)
     ));
+}
+
+/// Settles itself when its queue's token trips, as the real runner does now,
+/// and records that it got to return rather than being dropped mid-run.
+struct Cooperative {
+    settled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl ChildRunner for Cooperative {
+    async fn run(&self, run: ChildRun) -> Result<ChildOutcome, String> {
+        run.cancel.cancelled().await;
+        // A dropped future never reaches this line.
+        self.settled
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(ChildOutcome {
+            status: AgentStatus::Cancelled,
+            summary: "settled its own work before returning".into(),
+            turns: 1,
+            tool_calls: 0,
+            trust: TrustLabel::Tool,
+        })
+    }
+}
+
+/// A cancelled child must be allowed to finish writing and answer its own
+/// in-flight tool calls. Racing its future against the token dropped it
+/// mid-tool, which is how a half-written file and an unanswered call happen on
+/// the one path where the work still has to survive.
+#[tokio::test]
+async fn a_cancelled_child_settles_itself_rather_than_being_dropped() {
+    let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control = Arc::new(deliverable(
+        Arc::new(Cooperative {
+            settled: Arc::clone(&settled),
+        }),
+        CancellationToken::new(),
+    ));
+    let parent = Ulid::new();
+    control
+        .spawn_background(
+            spec("will be cancelled"),
+            &Caller::root(parent),
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
+        .await
+        .unwrap();
+    until("the child to start", || !control.active().is_empty()).await;
+    control
+        .cancel(&AgentPath::root(), "/will-be-cancelled")
+        .unwrap();
+    control.drain().await;
+
+    assert!(
+        settled.load(std::sync::atomic::Ordering::Acquire),
+        "the run future was dropped instead of being allowed to settle"
+    );
+    let reported = control.collect(parent).await;
+    assert_eq!(reported.len(), 1);
+    assert_eq!(
+        reported[0].summary, "settled its own work before returning",
+        "the child's own account of the cancellation was discarded"
+    );
 }
 
 /// Blocks until cancelled, so the roster/cancellation behaviour is testable
@@ -326,7 +395,12 @@ async fn a_child_settling_mid_wait_wakes_the_waiter() {
     let control = Arc::new(deliverable(Arc::new(Hangs), CancellationToken::new()));
     let root = AgentPath::root();
     control
-        .spawn_background(spec("slow"), &Caller::root(Ulid::new()), Arc::new(Tools), 5)
+        .spawn_background(
+            spec("slow"),
+            &Caller::root(Ulid::new()),
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
         .await
         .unwrap();
     let stopper = Arc::clone(&control);
@@ -367,10 +441,13 @@ async fn a_nested_childs_report_reaches_its_own_parent() {
             objective: "survey".into(),
             started_ms: epoch_ms(),
             state: registry::State::Running,
+            write: false,
+            tools: None,
         },
         registry::Live {
             cancel: CancellationToken::new(),
             steer: handle,
+            budget: kernel::Budget::turns(5),
         },
     );
 
@@ -386,12 +463,15 @@ async fn a_nested_childs_report_reaches_its_own_parent() {
     // Tagged, not prose: it arrives on the queue the parent is told to treat as
     // authoritative, so an untagged report reads as an order to do what the
     // report describes.
-    let Some(text) = delivered.first() else {
+    let Some((text, trust)) = delivered.first() else {
         panic!("the parent never received its child's report");
     };
     assert!(text.contains("AGENT_REPORT"), "untagged report: {text}");
     assert!(text.contains("/survey/parse"), "unattributed: {text}");
     assert!(text.contains("COMPLETED"), "no outcome: {text}");
+    // Labelled with what the child touched, so a nested parent acting on the
+    // report escalates exactly as it would on a direct observation.
+    assert_eq!(*trust, TrustLabel::Tool, "report arrived unlabelled");
 }
 
 /// Hands back whatever conversation it was given, so a test can assert on what
@@ -499,10 +579,13 @@ fn listening(control: &AgentControl, path: &str) -> (AgentPath, kernel::Interrup
             objective: "work".into(),
             started_ms: epoch_ms(),
             state: registry::State::Running,
+            write: false,
+            tools: None,
         },
         registry::Live {
             cancel: CancellationToken::new(),
             steer: handle,
+            budget: kernel::Budget::turns(5),
         },
     );
     (path, queue)
@@ -525,7 +608,7 @@ async fn a_peers_message_is_not_dressed_up_as_an_order() {
     // what arrives there as authoritative and superseding. A peer is not its
     // operator, and an untagged note would be obeyed as though it were.
     let delivered = queue.drain_steers();
-    let text = delivered.first().expect("the message reached the agent");
+    let (text, _) = delivered.first().expect("the message reached the agent");
     assert!(text.contains("AGENT_MESSAGE"), "untagged: {text}");
     assert!(text.contains("/peer"), "unattributed: {text}");
     assert!(
@@ -552,7 +635,12 @@ async fn a_followup_continues_the_same_agent_rather_than_cloning_it() {
     let owner = Ulid::new();
     let caller = Caller::root(owner);
     let first = control
-        .spawn_background(spec("survey the crate"), &caller, Arc::new(Tools), 5)
+        .spawn_background(
+            spec("survey the crate"),
+            &caller,
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
         .await
         .unwrap();
     control.drain().await;
@@ -563,7 +651,7 @@ async fn a_followup_continues_the_same_agent_rather_than_cloning_it() {
             "/survey-the-crate",
             "now check the lexer",
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -588,7 +676,13 @@ async fn a_followup_is_refused_for_an_agent_that_is_not_the_callers() {
     // A follow-up spends money on someone else's worker and restarts it.
     assert!(matches!(
         control
-            .followup(&stranger, "/mine", "more work", Arc::new(Tools), 5)
+            .followup(
+                &stranger,
+                "/mine",
+                "more work",
+                Arc::new(Tools),
+                kernel::Budget::turns(5)
+            )
             .await,
         Err(Error::OutOfReach(_))
     ));
@@ -604,7 +698,7 @@ async fn a_wait_ends_when_the_operator_speaks() {
             spec("long job"),
             &Caller::root(Ulid::new()),
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -636,7 +730,7 @@ async fn a_wait_ignores_what_was_said_before_it_started() {
             spec("long job"),
             &Caller::root(Ulid::new()),
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -703,36 +797,39 @@ struct Recorded {
     parent: Ulid,
     agent: String,
     child: String,
+    dispatch: String,
     patch: Patch,
     applied: bool,
 }
 
 #[async_trait]
 impl Outbox for MemoryOutbox {
-    async fn dispatched(&self, dispatch: &Dispatch) {
+    async fn dispatched(&self, dispatch: &Dispatch) -> bool {
         self.rows
             .lock()
             .unwrap()
             .push((dispatch.clone(), None, false));
+        true
     }
-    async fn finished(&self, dispatch: &Dispatch, result: &AgentResult) {
+    async fn finished(&self, dispatch: &Dispatch, result: &AgentResult) -> bool {
         if let Some(row) = self
             .rows
             .lock()
             .unwrap()
             .iter_mut()
-            .find(|(d, _, _)| d.child == dispatch.child)
+            .find(|(d, _, _)| d.id == dispatch.id)
         {
             row.1 = Some(result.clone());
         }
+        true
     }
-    async fn delivered(&self, _parent: Ulid, child: Ulid) {
+    async fn delivered(&self, _parent: Ulid, dispatch: Ulid) {
         if let Some(row) = self
             .rows
             .lock()
             .unwrap()
             .iter_mut()
-            .find(|(d, _, _)| d.child == child)
+            .find(|(d, _, _)| d.id == dispatch)
         {
             row.2 = true;
         }
@@ -740,33 +837,47 @@ impl Outbox for MemoryOutbox {
     async fn transcript(&self, _child: Ulid) -> Vec<String> {
         Vec::new()
     }
-    async fn recorded(&self, parent: Ulid, agent: &str, child: Ulid, patch: &Patch) {
+    async fn recorded(
+        &self,
+        parent: Ulid,
+        dispatch: Ulid,
+        agent: &str,
+        child: Ulid,
+        patch: &Patch,
+    ) -> bool {
         self.patches.lock().unwrap().push(Recorded {
             parent,
             agent: agent.to_string(),
             child: child.to_string(),
+            dispatch: dispatch.to_string(),
             patch: patch.clone(),
             applied: false,
         });
+        true
     }
-    async fn applied(&self, _parent: Ulid, child: Ulid) {
+    async fn applied(&self, _parent: Ulid, dispatch: Ulid) {
         if let Some(row) = self
             .patches
             .lock()
             .unwrap()
             .iter_mut()
-            .find(|row| row.child == child.to_string())
+            .find(|row| row.dispatch == dispatch.to_string())
         {
             row.applied = true;
         }
     }
-    async fn unapplied(&self, parent: Ulid) -> Vec<(String, String, Patch)> {
+    async fn unapplied(&self, parent: Ulid) -> Vec<Pending> {
         self.patches
             .lock()
             .unwrap()
             .iter()
             .filter(|row| row.parent == parent && !row.applied)
-            .map(|row| (row.agent.clone(), row.child.clone(), row.patch.clone()))
+            .map(|row| Pending {
+                agent: row.agent.clone(),
+                session: row.child.clone(),
+                dispatch: row.dispatch.clone(),
+                patch: row.patch.clone(),
+            })
             .collect()
     }
     async fn last_activity(&self, child: Ulid) -> Option<f64> {
@@ -782,6 +893,7 @@ impl Outbox for MemoryOutbox {
                 *result = Some(AgentResult {
                     agent: dispatch.agent.clone(),
                     session: dispatch.child.to_string(),
+                    dispatch: dispatch.id.to_string(),
                     status: AgentStatus::Failed,
                     summary: "[outcome unknown — abandoned]".into(),
                     artifact: None,
@@ -826,7 +938,12 @@ async fn a_background_result_reaches_the_session_that_asked_for_it() {
     let someone_else = Ulid::new();
 
     control
-        .spawn_background(spec("survey"), &Caller::root(asked), Arc::new(Tools), 5)
+        .spawn_background(
+            spec("survey"),
+            &Caller::root(asked),
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
         .await
         .unwrap();
     control.drain().await;
@@ -862,7 +979,12 @@ async fn the_ready_signal_never_arrives_before_the_report_is_collectable() {
     }
 
     reader
-        .spawn_background(spec("survey"), &Caller::root(parent), Arc::new(Tools), 5)
+        .spawn_background(
+            spec("survey"),
+            &Caller::root(parent),
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
         .await
         .unwrap();
     reader.drain().await;
@@ -880,13 +1002,23 @@ async fn a_delivered_result_is_never_handed_over_twice() {
     let (_outbox, control) = background_control();
     let parent = Ulid::new();
     control
-        .spawn_background(spec("survey"), &Caller::root(parent), Arc::new(Tools), 5)
+        .spawn_background(
+            spec("survey"),
+            &Caller::root(parent),
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
         .await
         .unwrap();
     control.drain().await;
 
+    let reports = control.collect(parent).await;
+    assert_eq!(reports.len(), 1);
+    // Reading is not acknowledging: until the caller settles, a failed turn
+    // must be able to see the report again.
     assert_eq!(control.collect(parent).await.len(), 1);
-    // Replaying must not inject the same report again.
+    control.settle(parent, &reports).await;
+    // Once settled, replaying must not inject the same report again.
     assert!(control.collect(parent).await.is_empty());
 }
 
@@ -906,7 +1038,7 @@ async fn a_spawn_is_refused_without_durable_delivery() {
                 spec("survey"),
                 &Caller::root(Ulid::new()),
                 Arc::new(Tools),
-                5
+                kernel::Budget::turns(5)
             )
             .await,
         Err(Error::Unavailable)
@@ -923,7 +1055,7 @@ async fn a_cancelled_background_agent_still_reports() {
             spec("never finishes"),
             &Caller::root(parent),
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -952,7 +1084,12 @@ impl ChildRunner for Listens {
             if run.cancel.is_cancelled() {
                 break;
             }
-            heard.extend(run.interrupts.drain_steers());
+            heard.extend(
+                run.interrupts
+                    .drain_steers()
+                    .into_iter()
+                    .map(|(text, _)| text),
+            );
             tokio::task::yield_now().await;
         }
         Ok(ChildOutcome {
@@ -997,7 +1134,7 @@ async fn a_stalled_child_is_distinguishable_from_a_working_one() {
             spec("busy worker"),
             &Caller::root(parent),
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -1006,7 +1143,7 @@ async fn a_stalled_child_is_distinguishable_from_a_working_one() {
             spec("stalled worker"),
             &Caller::root(parent),
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -1036,7 +1173,7 @@ async fn a_child_that_has_recorded_nothing_reads_as_unknown_not_stalled() {
             spec("just started"),
             &Caller::root(parent),
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -1086,7 +1223,7 @@ async fn cancelling_one_agent_leaves_its_siblings_running() {
             spec("first task"),
             &Caller::root(parent),
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -1095,7 +1232,7 @@ async fn cancelling_one_agent_leaves_its_siblings_running() {
             spec("second task"),
             &Caller::root(parent),
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -1156,7 +1293,7 @@ impl Workspaces for Isolation {
             executor: Arc::new(Tools),
         })
     }
-    async fn verify(&self, _root: &Path) -> Option<Verification> {
+    async fn verify(&self, _root: &Path, _cancel: &CancellationToken) -> Option<Verification> {
         self.verification.clone()
     }
     fn repo(&self) -> std::path::PathBuf {
@@ -1302,7 +1439,7 @@ async fn a_cancelled_writer_still_hands_back_what_it_changed() {
             writer("never finishes"),
             &Caller::root(parent),
             Arc::new(Tools),
-            5,
+            kernel::Budget::turns(5),
         )
         .await
         .unwrap();
@@ -1462,12 +1599,13 @@ async fn a_patch_outlives_the_process_that_produced_it() {
         judged(&root, &state, None),
     );
     assert!(after.cached_patch(&session).is_none());
-    let recovered = after.patch(&session).await.expect("patch survived");
-    assert!(recovered.diff.contains("rewritten by the child"));
+    let recovered = after.pending(&session).await.expect("patch survived");
+    assert!(recovered.patch.diff.contains("rewritten by the child"));
     assert_eq!(after.outstanding().await.len(), 1);
 
-    after.merge(&recovered, false).await.unwrap();
-    after.forget(&session).await;
+    after.merge(&recovered.patch, false).await.unwrap();
+    // Closed by handout: the session may hold several once followed up.
+    after.forget(&recovered.dispatch).await;
     // And once applied it stays applied — a later run must not offer it
     // again, or the same patch lands twice.
     let later = restarted(outbox, owner, judged(&root, &state, None));

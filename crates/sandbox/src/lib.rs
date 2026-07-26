@@ -16,7 +16,8 @@ use permissions::PermissionManager;
 pub mod exec;
 pub use exec::{
     BackendKind, ExecBackend, ExecError, ExecOutput, ExecRequest, HostBackend, NetPolicy,
-    SandboxConfig, native_backend_available, program_on_path, select_backend,
+    SandboxConfig, ShellOutcome, native_backend_available, program_in_dir, program_on_path,
+    run_command_bounded, run_shell_bounded, run_shell_bounded_with, select_backend,
 };
 
 #[derive(Debug, thiserror::Error)]

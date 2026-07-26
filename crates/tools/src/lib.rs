@@ -151,14 +151,31 @@ pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observatio
         None => run.await,
     };
     match result {
-        Ok(payload) => Observation::ok(&intent.id, payload),
+        Ok(mut payload) => {
+            let relayed = take_relayed_trust(&mut payload);
+            let obs = Observation::ok(&intent.id, payload);
+            match relayed {
+                Some(trust) => obs.relaying(trust),
+                None => obs,
+            }
+        }
         Err(ToolError::Structured(payload)) => Observation {
             intent_id: intent.id.clone(),
             status: kernel::ObsStatus::Error,
             payload,
+            relayed_trust: None,
         },
         Err(error) => Observation::error(&intent.id, error.to_string()),
     }
+}
+
+/// Key a tool sets to declare the trust of content it is relaying rather than
+/// producing. Stripped here: it is provenance for the kernel, not for the model.
+pub(crate) const RELAYED_TRUST: &str = "_relayed_trust";
+
+fn take_relayed_trust(payload: &mut Value) -> Option<kernel::TrustLabel> {
+    let taken = payload.as_object_mut()?.remove(RELAYED_TRUST)?;
+    serde_json::from_value(taken).ok()
 }
 
 fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
@@ -376,7 +393,7 @@ impl Tool for LspStart {
                     .map_err(|error| ToolError::Failed(error.to_string()))?,
             };
             installed = Some(
-                lsp::install_server(&target)
+                lsp::install_server(&target, self.manager.install_timeout())
                     .await
                     .map_err(|error| ToolError::Failed(error.to_string()))?,
             );
@@ -1359,6 +1376,7 @@ impl Executor for ToolRegistry {
                             intent_id: intent.id.clone(),
                             status: kernel::ObsStatus::Error,
                             payload,
+                            relayed_trust: None,
                         }
                     } else {
                         Observation::ok(&intent.id, payload)
@@ -6775,22 +6793,24 @@ mod tests {
 
     #[async_trait]
     impl orchestrator::Outbox for TestOutbox {
-        async fn dispatched(&self, _dispatch: &orchestrator::Dispatch) {}
+        async fn dispatched(&self, _dispatch: &orchestrator::Dispatch) -> bool {
+            true
+        }
         async fn finished(
             &self,
             dispatch: &orchestrator::Dispatch,
             result: &orchestrator::AgentResult,
-        ) {
+        ) -> bool {
             self.finished
                 .lock()
                 .unwrap()
                 .push((dispatch.parent, result.clone()));
+            true
         }
-        async fn delivered(&self, parent: ulid::Ulid, child: ulid::Ulid) {
-            self.finished
-                .lock()
-                .unwrap()
-                .retain(|(owner, result)| *owner != parent || result.session != child.to_string());
+        async fn delivered(&self, parent: ulid::Ulid, dispatch: ulid::Ulid) {
+            self.finished.lock().unwrap().retain(|(owner, result)| {
+                *owner != parent || result.dispatch != dispatch.to_string()
+            });
         }
         async fn undelivered(&self, parent: ulid::Ulid) -> Vec<orchestrator::AgentResult> {
             self.finished
@@ -6807,16 +6827,15 @@ mod tests {
         async fn recorded(
             &self,
             _parent: ulid::Ulid,
+            _dispatch: ulid::Ulid,
             _agent: &str,
             _child: ulid::Ulid,
             _patch: &orchestrator::Patch,
-        ) {
+        ) -> bool {
+            true
         }
-        async fn applied(&self, _parent: ulid::Ulid, _child: ulid::Ulid) {}
-        async fn unapplied(
-            &self,
-            _parent: ulid::Ulid,
-        ) -> Vec<(String, String, orchestrator::Patch)> {
+        async fn applied(&self, _parent: ulid::Ulid, _dispatch: ulid::Ulid) {}
+        async fn unapplied(&self, _parent: ulid::Ulid) -> Vec<orchestrator::Pending> {
             Vec::new()
         }
         async fn last_activity(&self, _child: ulid::Ulid) -> Option<f64> {

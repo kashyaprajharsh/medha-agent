@@ -111,6 +111,15 @@ pub struct LspConfig {
     pub max_results: usize,
     pub max_text_chars: usize,
     pub max_open_documents: usize,
+    /// Ceiling on one `lsp.install`. Network-bound, so generous.
+    pub install_timeout_ms: u64,
+    /// Ceiling on one write to a server's stdin, including waiting for the
+    /// writer. A server that stops reading otherwise stalls every later caller.
+    pub write_timeout_ms: u64,
+    /// Largest single LSP frame accepted. `Content-Length` is the server's word
+    /// for how much to allocate, and believing it turns one bad frame into an
+    /// out-of-memory abort.
+    pub max_frame_bytes: usize,
     pub allow_network: bool,
     pub servers: Vec<LspServerConfig>,
 }
@@ -157,6 +166,9 @@ impl Default for LspConfig {
             max_results: 200,
             max_text_chars: 16_000,
             max_open_documents: 64,
+            install_timeout_ms: 600_000,
+            write_timeout_ms: 30_000,
+            max_frame_bytes: 64 * 1024 * 1024,
             allow_network: false,
             servers: Vec::new(),
         }
@@ -194,6 +206,16 @@ pub struct AgentsConfig {
     /// Enough to see what an agent was doing when it stopped; short of what
     /// spills to an artifact and costs turns to page back in.
     pub transcript_tail: usize,
+    /// Ceiling on one patch verification. The command runs whatever build
+    /// scripts and tests the writer just edited, so it has to terminate.
+    pub verify_timeout_secs: u64,
+    /// How long a cancelled child may take to settle itself before its future
+    /// is dropped. Long enough for a tool call in flight to finish writing,
+    /// short enough that a cancel the user asked for still feels like one.
+    pub cancel_grace_secs: u64,
+    /// Hard ceiling for one extracted writer diff. Oversized work is preserved
+    /// on disk rather than buffered or truncated.
+    pub max_patch_bytes: usize,
 }
 
 impl Default for AgentsConfig {
@@ -216,6 +238,9 @@ impl Default for AgentsConfig {
             default_wait_secs: 120,
             max_wait_secs: 600,
             transcript_tail: 40,
+            verify_timeout_secs: 900,
+            cancel_grace_secs: 5,
+            max_patch_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -240,6 +265,10 @@ pub struct McpConfig {
     pub park_probe_ms: u64,
     /// How long the interactive OAuth flow waits for the browser redirect.
     pub auth_timeout_ms: u64,
+    /// Total deadline on one HTTP request to a remote server, discovery and
+    /// token exchange included. A host that accepts the connection and then
+    /// never answers otherwise hangs the flow.
+    pub http_timeout_ms: u64,
 }
 
 impl Default for McpConfig {
@@ -253,6 +282,7 @@ impl Default for McpConfig {
             max_reconnects: 5,
             park_probe_ms: 300_000,
             auth_timeout_ms: 300_000,
+            http_timeout_ms: 60_000,
         }
     }
 }
@@ -463,11 +493,16 @@ impl Default for BudgetConfig {
 
 impl BudgetConfig {
     pub fn to_budget(&self) -> kernel::Budget {
+        // Unpooled: a pool is per *task*, and the caller starts one when a task
+        // does. Pooling here would share one tally across every task the
+        // process ever runs, so a long session would exhaust the ceiling and
+        // never recover it.
         kernel::Budget {
             max_turns: self.max_turns,
             max_tokens: self.max_tokens,
             max_cost_usd: self.max_cost_usd,
             max_wall_s: self.max_wall_s,
+            pooled: None,
         }
     }
 }

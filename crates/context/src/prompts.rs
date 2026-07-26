@@ -82,6 +82,14 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_makes_workspace_audits_an_explicit_delegation_case() {
+        let prompt = embedded(SYSTEM_IDENTITY).expect("system prompt is embedded");
+        assert!(prompt.contains("whole-workspace review or audit"));
+        assert!(prompt.contains("parallel `agent.spawn` `tasks`"));
+        assert!(!prompt.contains("use `background`"));
+    }
+
+    #[test]
     fn unknown_id_is_none() {
         assert!(get("no_such_prompt").is_none());
     }

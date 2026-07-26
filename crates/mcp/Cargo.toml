@@ -25,6 +25,8 @@ rmcp = { version = "2.2", default-features = false, features = [
 # handed straight to rmcp's transport, so a version split would not type-check.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 url = "2"
+oauth2 = { version = "5.0", default-features = false }
+futures.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Process-group teardown: uvx/npx fork the real server, so killing the direct
@@ -34,4 +36,3 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
-futures.workspace = true

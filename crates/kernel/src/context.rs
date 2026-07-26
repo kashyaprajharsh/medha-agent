@@ -56,6 +56,16 @@ pub trait ContextEngine: Send + Sync {
     /// is the resolved input-only allowance for this request. `None` means the
     /// allowance is unknown, so proactive compaction must not guess one.
     async fn compile(&self, messages: &[Message], max_input_tokens: Option<u32>) -> CompileResult;
+
+    /// An engine configured the same way but with no conversation state.
+    ///
+    /// Token counts, compaction latches and the last summary all describe *one*
+    /// conversation. A concurrent sub-agent sharing them reads another's usage
+    /// as its own and can be handed another's summary; returning `None` keeps
+    /// the shared engine for engines that hold no such state.
+    fn fork(&self) -> Option<std::sync::Arc<dyn ContextEngine>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -35,7 +35,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     process::Command,
-    sync::{Mutex, Semaphore, mpsc},
+    sync::{Mutex, RwLock as AsyncRwLock, Semaphore, mpsc},
     task::JoinSet,
     time::{Instant, MissedTickBehavior, timeout},
 };
@@ -55,12 +55,25 @@ const PARALLEL_CALLS: usize = 8;
 
 type Client = RunningService<RoleClient, Handler>;
 
+/// Exclusive hold on one server incarnation, kept while it is superseded.
+type AdmissionLease = tokio::sync::OwnedRwLockWriteGuard<()>;
+type ResolvedStdio = (Vec<String>, Vec<(String, String)>);
+
+/// Monotonic across the process, so no two incarnations of a server id ever
+/// share a generation however often slots are replaced.
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("MCP is disabled")]
     Disabled,
     #[error("no MCP server named '{0}'")]
     UnknownServer(String),
+    #[error("MCP server '{0}' changed while the operation was in flight; retry it")]
+    Superseded(String),
     /// The server exists but is not usable right now. Carries the state so a
     /// caller can tell "approve it" from "it crashed" without parsing text.
     #[error("MCP server '{server}' is {state}{}", detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default())]
@@ -83,6 +96,11 @@ pub enum Error {
     },
     #[error("MCP command is empty")]
     EmptyCommand,
+    #[error(
+        "MCP server '{0}' puts `${{key}}` in a command argument; move the placeholder \
+         to `--env NAME=${{key}}` because command-line secrets are visible to other local processes"
+    )]
+    SecretInArgv(String),
     #[error(
         "MCP server '{0}' needs authorization — connect it from /mcp or run `medha mcp auth {0}`"
     )]
@@ -207,10 +225,14 @@ pub enum RemoteAuth {
 
 /// Where remote OAuth credentials persist between sessions. Medha wires this to
 /// the OS keychain; without one an OAuth server re-authorizes every launch.
+///
+/// `url` is part of the identity, not just context: a server definition can be
+/// re-pointed at a different host under the same id, and credentials keyed on
+/// the id alone would then be replayed to whatever it now names.
 pub trait TokenStore: Send + Sync + fmt::Debug {
-    fn load(&self, server: &str) -> Option<String>;
-    fn save(&self, server: &str, blob: &str);
-    fn clear(&self, server: &str);
+    fn load(&self, server: &str, url: &str) -> Option<String>;
+    fn save(&self, server: &str, url: &str, blob: &str);
+    fn clear(&self, server: &str, url: &str);
 }
 
 /// Sink for an authorization URL, so the caller shows it in whatever UI it owns
@@ -234,6 +256,37 @@ pub struct ServerConfig {
     /// Opt-in concurrent calls. Off by default: most servers hold per-session
     /// state and a server annotation is a hint, never a guarantee.
     pub parallel_calls: bool,
+    /// Value substituted for the literal `${key}` in explicit environment
+    /// values when the process is spawned. Command arguments deliberately do
+    /// not support substitution: argv is observable by other local processes.
+    /// Held apart from the transport so the secret never reaches an approval
+    /// card, status line, log or persisted command.
+    pub secret: Option<String>,
+}
+
+impl ServerConfig {
+    fn resolve_stdio(
+        &self,
+        command: &[String],
+        env: &[(String, String)],
+    ) -> Result<ResolvedStdio, Error> {
+        let has_arg_placeholder = command.iter().any(|arg| arg.contains("${key}"));
+        let has_env_placeholder = env.iter().any(|(_, value)| value.contains("${key}"));
+        let Some(secret) = &self.secret else {
+            if has_arg_placeholder || has_env_placeholder {
+                return Err(Error::NeedsToken(self.id.clone()));
+            }
+            return Ok((command.to_vec(), env.to_vec()));
+        };
+        if has_arg_placeholder {
+            return Err(Error::SecretInArgv(self.id.clone()));
+        }
+        let env = env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.replace("${key}", secret)))
+            .collect();
+        Ok((command.to_vec(), env))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +306,9 @@ pub struct Config {
     pub park_probe: Duration,
     /// How long the interactive OAuth flow waits for the browser redirect.
     pub auth_timeout: Duration,
+    /// Total deadline on one HTTP request to a remote server, discovery and
+    /// token exchange included.
+    pub http_timeout: Duration,
     /// Persistence for remote OAuth credentials.
     pub tokens: Option<Arc<dyn TokenStore>>,
 }
@@ -271,6 +327,7 @@ impl Default for Config {
             max_reconnects: 5,
             park_probe: Duration::from_secs(300),
             auth_timeout: Duration::from_secs(300),
+            http_timeout: Duration::from_secs(60),
             tokens: None,
         }
     }
@@ -409,6 +466,11 @@ struct Slot {
     peer: Option<Peer<RoleClient>>,
     /// Bounds in-flight calls: 1 permit unless the server opts into parallel.
     gate: Arc<Semaphore>,
+    /// A call holds a read lease from its final generation check until the
+    /// response arrives. Reconfiguration takes the write lease before changing
+    /// or retiring this incarnation, closing the check-to-send race without
+    /// holding the global server-map lock across network I/O.
+    admission: Arc<AsyncRwLock<()>>,
     pid: Option<u32>,
     detail: Option<String>,
     /// Consecutive connect failures. Reset only once a live request proves the
@@ -416,6 +478,15 @@ struct Slot {
     failures: u32,
     proven: bool,
     retry_at: Option<Instant>,
+    /// Which incarnation of this server id the slot holds. A connect that
+    /// started under an older generation has been superseded: installing its
+    /// client would overwrite the newer one, and its catalogue would resurrect
+    /// tools for a server that is no longer configured that way.
+    ///
+    /// Drawn from a process-wide counter rather than reset per slot: a replaced
+    /// slot starting again at zero collides with the generation an in-flight
+    /// connect captured from the slot it replaced.
+    generation: u64,
 }
 
 impl Slot {
@@ -438,11 +509,13 @@ impl Slot {
             client: None,
             peer: None,
             gate: Arc::new(Semaphore::new(permits)),
+            admission: Arc::new(AsyncRwLock::new(())),
             pid: None,
             detail: None,
             failures: 0,
             proven: false,
             retry_at: None,
+            generation: next_generation(),
         }
     }
 
@@ -450,6 +523,7 @@ impl Slot {
     fn detach(&mut self) -> Retiree {
         self.peer = None;
         self.proven = false;
+        self.generation = next_generation();
         Retiree {
             client: self.client.take(),
             pid: self.pid.take(),
@@ -492,6 +566,9 @@ struct ManagerInner {
     workspace: PathBuf,
     config: Config,
     servers: Mutex<HashMap<String, Slot>>,
+    /// Serializes slot mutations while they acquire an incarnation's exclusive
+    /// admission lease. It is never held for transport shutdown or connection.
+    mutations: Mutex<()>,
     tools: RwLock<HashMap<String, Catalog>>,
     changed_tx: mpsc::UnboundedSender<String>,
     changed_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
@@ -528,6 +605,7 @@ impl McpManager {
                 workspace: normalize(&workspace),
                 config,
                 servers: Mutex::new(servers),
+                mutations: Mutex::new(()),
                 tools: RwLock::new(HashMap::new()),
                 changed_tx,
                 changed_rx: Mutex::new(Some(changed_rx)),
@@ -554,15 +632,19 @@ impl McpManager {
             return;
         }
         self.ensure_supervisor();
+        let starts: Vec<(String, u64)> = {
+            let servers = self.inner.servers.lock().await;
+            servers
+                .iter()
+                .filter(|(_, slot)| !slot.config.requires_approval && !slot.config.disabled)
+                .map(|(id, slot)| (id.clone(), slot.generation))
+                .collect()
+        };
         let mut set = JoinSet::new();
-        for server in &self.inner.config.servers {
-            if server.requires_approval || server.disabled {
-                continue;
-            }
+        for (server, generation) in starts {
             let this = self.clone();
-            let server = server.clone();
             set.spawn(async move {
-                let _ = this.connect_one(&server).await;
+                let _ = this.connect_one(&server, generation).await;
             });
         }
         while set.join_next().await.is_some() {}
@@ -584,34 +666,49 @@ impl McpManager {
             return Err(Error::Disabled);
         }
         self.ensure_supervisor();
-        let replaced = {
+        // Scoped to the swap itself. `connect_one` takes the same two locks, so
+        // holding them across it would deadlock; and the exclusive lease exists
+        // to drain calls admitted against the *old* incarnation, which is done
+        // the moment the replacement is in the map.
+        let (replaced, generation) = {
+            let _mutation = self.inner.mutations.lock().await;
+            let _exclusive = self.exclusive(&server.id).await;
             let mut servers = self.inner.servers.lock().await;
             let mut slot = Slot::new(server.clone());
             // A runtime add is its own approval; connect it without a second gate.
-            slot.state = ServerState::Connecting;
-            servers
+            if !slot.config.disabled {
+                slot.state = ServerState::Connecting;
+            }
+            let generation = slot.generation;
+            let replaced = servers
                 .insert(server.id.clone(), slot)
-                .map(|mut old| old.detach())
+                .map(|mut old| old.detach());
+            // The old catalogue describes the old target and old filter. Remove
+            // it under the same slot lock that publishes the replacement.
+            self.tools_mut().remove(&server.id);
+            (replaced, generation)
         };
         if let Some(retiree) = replaced {
             retiree.retire().await;
         }
-        self.connect_one(&server).await?;
+        self.connect_one(&server.id, generation).await?;
         self.server_status(&server.id).await
     }
 
     /// Remove a server at runtime (from `/mcp remove`): protocol shutdown, reap
     /// its process tree, and purge its tools.
     pub async fn remove_server(&self, server_id: &str) -> Result<(), Error> {
-        let retiree = self
-            .inner
-            .servers
-            .lock()
-            .await
-            .remove(server_id)
-            .map(|mut slot| slot.detach())
-            .ok_or_else(|| Error::UnknownServer(server_id.to_string()))?;
-        self.forget_tools(server_id);
+        let _mutation = self.inner.mutations.lock().await;
+        let _exclusive = self.exclusive(server_id).await;
+        let retiree = {
+            let mut servers = self.inner.servers.lock().await;
+            let retiree = servers
+                .remove(server_id)
+                .map(|mut slot| slot.detach())
+                .ok_or_else(|| Error::UnknownServer(server_id.to_string()))?;
+            self.tools_mut().remove(server_id);
+            retiree
+        };
         retiree.retire().await;
         Ok(())
     }
@@ -629,7 +726,7 @@ impl McpManager {
         announce: Option<&UrlSink>,
     ) -> Result<ServerStatus, Error> {
         self.ensure_supervisor();
-        let server = {
+        let generation = {
             let mut servers = self.inner.servers.lock().await;
             let slot = servers
                 .get_mut(server_id)
@@ -639,9 +736,9 @@ impl McpManager {
             slot.config.disabled = false;
             slot.failures = 0;
             slot.retry_at = None;
-            slot.config.clone()
+            slot.generation
         };
-        match (self.connect_one(&server).await, announce) {
+        match (self.connect_one(server_id, generation).await, announce) {
             (Err(Error::NeedsAuth(_)), Some(announce)) => self.authorize(server_id, announce).await,
             (result, _) => {
                 result?;
@@ -657,7 +754,25 @@ impl McpManager {
         server_id: &str,
         announce: &UrlSink,
     ) -> Result<ServerStatus, Error> {
-        let server = self.server_config(server_id).await?;
+        // Snapshot config and generation atomically. Reading them in separate
+        // lock acquisitions allowed an old config to be paired with a
+        // replacement's generation (and `None == None` after removal).
+        let (server, generation) = {
+            let mut servers = self.inner.servers.lock().await;
+            let slot = servers
+                .get_mut(server_id)
+                .ok_or_else(|| Error::UnknownServer(server_id.to_string()))?;
+            if slot.config.disabled {
+                return Err(Error::ServerNotReady {
+                    server: server_id.to_string(),
+                    state: ServerState::Disabled,
+                    detail: None,
+                });
+            }
+            slot.state = ServerState::Connecting;
+            slot.detail = Some("signing in…".into());
+            (slot.config.clone(), slot.generation)
+        };
         // `Auto` reaches here once the probe found an OAuth challenge, so both
         // it and an explicit `OAuth` are valid sign-in targets.
         let Transport::Remote {
@@ -675,24 +790,41 @@ impl McpManager {
             .tokens
             .as_ref()
             .ok_or_else(|| Error::Auth("no credential store is configured".into()))?;
-        self.set_state(
-            server_id,
-            ServerState::Connecting,
-            Some("signing in…".into()),
+        let credentials = match oauth::authorize(
+            url,
+            self.inner.config.auth_timeout,
+            self.inner.config.http_timeout,
+            announce,
         )
-        .await;
-        let credentials =
-            match oauth::authorize(url, self.inner.config.auth_timeout, announce).await {
-                Ok(credentials) => credentials,
-                Err(error) => {
-                    self.set_state(server_id, ServerState::NeedsAuth, Some(error.to_string()))
-                        .await;
-                    return Err(error);
-                }
+        .await
+        {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                self.set_state(
+                    server_id,
+                    generation,
+                    ServerState::NeedsAuth,
+                    Some(error.to_string()),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        {
+            // Keep the generation check and persistence in the same manager
+            // critical section. A manager-side remove/re-point cannot slip
+            // between them and have the old flow save into its incarnation.
+            let servers = self.inner.servers.lock().await;
+            let Some(slot) = servers.get(server_id) else {
+                return Err(Error::Superseded(server_id.to_string()));
             };
-        store.save(server_id, &credentials);
+            if slot.generation != generation || slot.config.disabled {
+                return Err(Error::Superseded(server_id.to_string()));
+            }
+            store.save(server_id, url, &credentials);
+        }
         self.ensure_supervisor();
-        self.connect_one(&server).await?;
+        self.connect_one(server_id, generation).await?;
         self.server_status(server_id).await
     }
 
@@ -704,39 +836,47 @@ impl McpManager {
         server_id: &str,
         disabled: bool,
     ) -> Result<ServerStatus, Error> {
-        let (retiree, config) = {
+        // Scoped: `connect_one` below takes both of these itself, and neither is
+        // re-entrant. Held across that call this deadlocks outright.
+        let (retiree, generation) = {
+            let _mutation = self.inner.mutations.lock().await;
+            let _exclusive = self.exclusive(server_id).await;
             let mut servers = self.inner.servers.lock().await;
             let slot = servers
                 .get_mut(server_id)
                 .ok_or_else(|| Error::UnknownServer(server_id.to_string()))?;
             slot.config.disabled = disabled;
+            // Supersedes any connect already in flight, so a slow one cannot
+            // land after this and mark a disabled server ready.
+            slot.generation = next_generation();
             if !disabled {
                 slot.failures = 0;
                 slot.retry_at = None;
-                (None, Some(slot.config.clone()))
+                (None, Some(slot.generation))
             } else {
                 slot.state = ServerState::Disabled;
                 slot.detail = None;
                 slot.retry_at = None;
-                (Some(slot.detach()), None)
+                let retiree = slot.detach();
+                self.tools_mut().remove(server_id);
+                (Some(retiree), None)
             }
         };
         if let Some(retiree) = retiree {
-            self.forget_tools(server_id);
             retiree.retire().await;
         }
-        if let Some(config) = config {
+        if let Some(generation) = generation {
             self.ensure_supervisor();
-            self.connect_one(&config).await?;
+            self.connect_one(server_id, generation).await?;
         }
         self.server_status(server_id).await
     }
 
     /// Forget a remote server's stored credentials, so the next connect asks
     /// for a fresh sign-in.
-    pub fn sign_out(&self, server_id: &str) {
+    pub fn sign_out(&self, server_id: &str, url: &str) {
         if let Some(store) = &self.inner.config.tokens {
-            store.clear(server_id);
+            store.clear(server_id, url);
         }
     }
 
@@ -793,12 +933,13 @@ impl McpManager {
             return Err(Error::Disabled);
         }
         let (server, tool) = parse_qualified(qualified)?;
-        let (peer, gate) = {
+        let (peer, gate, generation, schema, admission) = {
             let servers = self.inner.servers.lock().await;
             let slot = servers
                 .get(&server)
                 .ok_or_else(|| Error::UnknownServer(server.clone()))?;
-            match (&slot.peer, slot.state.is_live()) {
+            let admission = Arc::clone(&slot.admission);
+            let (peer, gate) = match (&slot.peer, slot.state.is_live()) {
                 (Some(peer), true) => (peer.clone(), Arc::clone(&slot.gate)),
                 _ => {
                     return Err(Error::ServerNotReady {
@@ -807,19 +948,21 @@ impl McpManager {
                         detail: slot.detail.clone(),
                     });
                 }
-            }
+            };
+            // Read the schema while holding the slot lock. Catalogue publication
+            // follows the same servers→tools lock order, so peer, generation,
+            // filter and schema all describe one incarnation.
+            let schema = self
+                .catalogs()
+                .get(&server)
+                .and_then(|catalog| catalog.exposed.iter().find(|spec| spec.name == qualified))
+                .map(|spec| spec.schema.clone())
+                .ok_or_else(|| Error::UnknownTool {
+                    server: server.clone(),
+                    tool: tool.clone(),
+                })?;
+            (peer, gate, slot.generation, schema, admission)
         };
-        // Only exposed tools are callable: a filtered or malformed tool is not
-        // addressable even if the model guesses its name.
-        let schema = self
-            .catalogs()
-            .get(&server)
-            .and_then(|catalog| catalog.exposed.iter().find(|spec| spec.name == qualified))
-            .map(|spec| spec.schema.clone())
-            .ok_or_else(|| Error::UnknownTool {
-                server: server.clone(),
-                tool: tool.clone(),
-            })?;
         validate_arguments(&schema, args).map_err(|reason| Error::BadArguments {
             tool: qualified.to_string(),
             reason,
@@ -834,6 +977,16 @@ impl McpManager {
             state: ServerState::Stopped,
             detail: None,
         })?;
+        // A queued call must not run after disable/re-point. An operation already
+        // on the wire may finish, but waiting on the old semaphore grants no
+        // authority over the replacement.
+        //
+        // The read lease is taken *before* the final check and held across the
+        // send: reconfiguration takes the write lease before it changes this
+        // incarnation, so there is no window between "still current" and "on the
+        // wire" for a swap to slip through.
+        let _admitted = admission.read().await;
+        self.ensure_live_generation(&server, generation).await?;
         let result = match timeout(self.inner.config.request_timeout, peer.call_tool(params)).await
         {
             Ok(Ok(result)) => result,
@@ -841,7 +994,7 @@ impl McpManager {
             Err(_) => return Err(Error::Timeout(self.inner.config.request_timeout)),
         };
         // A completed round trip is the proof that resets the reconnect budget.
-        self.mark_proven(&server).await;
+        self.mark_proven(&server, generation).await;
         Ok(CallOutput {
             server,
             tool,
@@ -922,13 +1075,13 @@ impl McpManager {
                             slot.detail = Some("connection lost".into());
                             slot.retry_at = Some(now);
                         } else if !slot.proven {
-                            probe.push(slot.config.id.clone());
+                            probe.push((slot.config.id.clone(), slot.generation));
                         }
                     }
                     ServerState::Degraded | ServerState::Parked => {
                         if slot.retry_at.is_some_and(|at| at <= now) {
                             slot.retry_at = None;
-                            due.push(slot.config.clone());
+                            due.push((slot.config.id.clone(), slot.generation));
                         }
                     }
                     _ => {}
@@ -939,24 +1092,28 @@ impl McpManager {
         for retiree in retirees.into_iter().filter(|r| !r.is_empty()) {
             retiree.retire().await;
         }
-        for id in probe {
-            self.refresh_tools(&id).await;
+        for (id, generation) in probe {
+            self.refresh_tools(&id, Some(generation)).await;
         }
-        for server in due {
-            self.forget_tools(&server.id);
-            let _ = self.connect_one(&server).await;
+        for (server, generation) in due {
+            let _ = self.connect_one(&server, generation).await;
         }
     }
 
     /// Re-list a server's catalogue. Doubles as the liveness probe: a successful
     /// round trip is what proves a fresh connection and clears its failure count.
-    async fn refresh_tools(&self, server_id: &str) {
-        let Some((peer, filter)) = ({
+    async fn refresh_tools(&self, server_id: &str, expected: Option<u64>) {
+        let Some((peer, filter, generation)) = ({
             let servers = self.inner.servers.lock().await;
             servers.get(server_id).and_then(|slot| {
+                if expected.is_some_and(|generation| slot.generation != generation)
+                    || !slot.state.is_live()
+                {
+                    return None;
+                }
                 slot.peer
                     .clone()
-                    .map(|peer| (peer, slot.config.tools.clone()))
+                    .map(|peer| (peer, slot.config.tools.clone(), slot.generation))
             })
         }) else {
             return;
@@ -964,8 +1121,16 @@ impl McpManager {
         match timeout(self.inner.config.request_timeout, peer.list_all_tools()).await {
             Ok(Ok(tools)) => {
                 let catalog = build_catalog(server_id, &filter, tools);
+                let mut servers = self.inner.servers.lock().await;
+                let Some(slot) = servers.get_mut(server_id) else {
+                    return;
+                };
+                if slot.generation != generation || !slot.state.is_live() {
+                    return;
+                }
                 self.tools_mut().insert(server_id.to_string(), catalog);
-                self.mark_proven(server_id).await;
+                slot.proven = true;
+                slot.failures = 0;
             }
             outcome => {
                 let detail = match outcome {
@@ -979,28 +1144,64 @@ impl McpManager {
 
     /// Reconnect (or first-connect) a server: reap any predecessor, spawn, and
     /// install or record the failure with a backoff.
-    async fn connect_one(&self, server: &ServerConfig) -> Result<(), Error> {
-        let previous = {
+    /// One connect attempt, scoped to the incarnation of the slot it starts
+    /// from. Every later mutation — installing the client, publishing the
+    /// catalogue, recording a failure — is refused once that generation has
+    /// been superseded, so a slow attempt cannot overwrite the server that
+    /// replaced it or resurrect its tools.
+    async fn connect_one(&self, server_id: &str, expected: u64) -> Result<(), Error> {
+        // Drains the outgoing incarnation before this attempt supersedes it.
+        // Held only across the slot mutation — never across `spawn_client`,
+        // which does network I/O and would otherwise block every call and every
+        // other reconfiguration for the whole connect.
+        let previous_and_generation = {
+            let _mutation = self.inner.mutations.lock().await;
+            let _exclusive = self.exclusive(server_id).await;
             let mut servers = self.inner.servers.lock().await;
-            let Some(slot) = servers.get_mut(&server.id) else {
-                return Err(Error::UnknownServer(server.id.clone()));
+            let Some(slot) = servers.get_mut(server_id) else {
+                return Err(Error::UnknownServer(server_id.to_string()));
             };
+            if slot.generation != expected {
+                return Err(Error::Superseded(server_id.to_string()));
+            }
+            if slot.config.disabled {
+                return Err(Error::ServerNotReady {
+                    server: server_id.to_string(),
+                    state: ServerState::Disabled,
+                    detail: None,
+                });
+            }
             slot.state = if slot.failures > 0 || slot.client.is_some() {
                 ServerState::Reconnecting
             } else {
                 ServerState::Connecting
             };
-            slot.detach()
+            let server = slot.config.clone();
+            // Detach bumps the generation, so this attempt owns what follows.
+            let previous = slot.detach();
+            let generation = slot.generation;
+            self.tools_mut().remove(server_id);
+            (previous, generation, server)
         };
+        let (previous, generation, server) = previous_and_generation;
         if !previous.is_empty() {
             previous.retire().await;
         }
 
-        match self.spawn_client(server).await {
+        match self.spawn_client(&server).await {
             Ok(connected) => {
                 let orphan = {
                     let mut servers = self.inner.servers.lock().await;
-                    match servers.get_mut(&server.id) {
+                    match servers.get_mut(server_id) {
+                        // Superseded while connecting — replaced, disabled or
+                        // reconnected. Presence alone is not enough: the slot
+                        // may be a different server wearing the same id.
+                        Some(slot) if slot.generation != generation || slot.config.disabled => {
+                            Some(Retiree {
+                                client: Some(connected.client),
+                                pid: connected.pid,
+                            })
+                        }
                         Some(slot) => {
                             slot.client = Some(connected.client);
                             slot.peer = Some(connected.peer);
@@ -1008,6 +1209,12 @@ impl McpManager {
                             slot.state = ServerState::Ready;
                             slot.detail = None;
                             slot.retry_at = None;
+                            // Published while the slot lock is held and the
+                            // generation is known current. Publishing after the
+                            // lock let a superseded attempt install its
+                            // catalogue over the live one.
+                            self.tools_mut()
+                                .insert(server_id.to_string(), connected.catalog);
                             None
                         }
                         // Removed mid-connect: retire the new client, don't leak it.
@@ -1019,25 +1226,26 @@ impl McpManager {
                 };
                 if let Some(orphan) = orphan {
                     orphan.retire().await;
-                    return Err(Error::UnknownServer(server.id.clone()));
+                    return Err(Error::Superseded(server_id.to_string()));
                 }
-                self.tools_mut()
-                    .insert(server.id.clone(), connected.catalog);
                 Ok(())
             }
             Err(error) => {
-                self.record_failure(&server.id, &error).await;
-                tracing::debug!(target: "medha_mcp", server = %server.id, %error, "MCP server failed to start");
+                self.record_failure(server_id, generation, &error).await;
+                tracing::debug!(target: "medha_mcp", server = %server_id, %error, "MCP server failed to start");
                 Err(error)
             }
         }
     }
 
-    async fn record_failure(&self, server_id: &str, error: &Error) {
+    async fn record_failure(&self, server_id: &str, generation: u64, error: &Error) {
         let mut servers = self.inner.servers.lock().await;
         let Some(slot) = servers.get_mut(server_id) else {
             return;
         };
+        if slot.generation != generation {
+            return;
+        }
         slot.detail = Some(error.to_string());
         // Missing credentials are not a fault to retry — only a human can clear
         // it, so park the slot in a state the UI can act on.
@@ -1068,25 +1276,75 @@ impl McpManager {
         }
     }
 
-    async fn set_state(&self, server_id: &str, state: ServerState, detail: Option<String>) {
+    async fn set_state(
+        &self,
+        server_id: &str,
+        generation: u64,
+        state: ServerState,
+        detail: Option<String>,
+    ) {
         let mut servers = self.inner.servers.lock().await;
-        if let Some(slot) = servers.get_mut(server_id) {
+        if let Some(slot) = servers.get_mut(server_id)
+            && slot.generation == generation
+        {
             slot.state = state;
             slot.detail = detail;
         }
     }
 
-    async fn mark_proven(&self, server_id: &str) {
+    async fn mark_proven(&self, server_id: &str, generation: u64) {
         let mut servers = self.inner.servers.lock().await;
-        if let Some(slot) = servers.get_mut(server_id) {
+        if let Some(slot) = servers.get_mut(server_id)
+            && slot.generation == generation
+        {
             slot.proven = true;
             slot.failures = 0;
         }
     }
 
+    /// Take an incarnation out of service, waiting for calls already admitted
+    /// against it to finish first.
+    ///
+    /// The write lease is awaited *without* the server-map lock held, so
+    /// blocking on one server's in-flight call never stalls every other server.
+    /// `mutations` serializes the acquire-then-mutate pair so two
+    /// reconfigurations of the same slot cannot interleave in that window.
+    async fn exclusive(&self, server_id: &str) -> Option<AdmissionLease> {
+        let admission = {
+            let servers = self.inner.servers.lock().await;
+            Arc::clone(&servers.get(server_id)?.admission)
+        };
+        Some(admission.write_owned().await)
+    }
+
+    async fn ensure_live_generation(&self, server_id: &str, generation: u64) -> Result<(), Error> {
+        let servers = self.inner.servers.lock().await;
+        let Some(slot) = servers.get(server_id) else {
+            return Err(Error::UnknownServer(server_id.to_string()));
+        };
+        if slot.generation != generation {
+            return Err(Error::Superseded(server_id.to_string()));
+        }
+        if !slot.state.is_live() || slot.peer.is_none() {
+            return Err(Error::ServerNotReady {
+                server: server_id.to_string(),
+                state: slot.state,
+                detail: slot.detail.clone(),
+            });
+        }
+        Ok(())
+    }
+
     async fn spawn_client(&self, server: &ServerConfig) -> Result<Connected, Error> {
         match &server.transport {
-            Transport::Stdio { command, env } => self.spawn_stdio(server, command, env).await,
+            Transport::Stdio { command, env } => {
+                // Resolved here and nowhere earlier: previews/status/logs read
+                // the placeholder-bearing transport. Only env is eligible;
+                // argv substitution would expose the secret through process
+                // inspection and sandbox-wrapper arguments.
+                let (command, env) = server.resolve_stdio(command, env)?;
+                self.spawn_stdio(server, &command, &env).await
+            }
             Transport::Remote { url, auth } => self.connect_remote(server, url, auth).await,
         }
     }
@@ -1141,6 +1399,9 @@ impl McpManager {
                 .await
             }
             RemoteAuth::Bearer(token) => {
+                if token.trim().is_empty() {
+                    return Err(Error::NeedsToken(server.id.clone()));
+                }
                 self.handshake(
                     server,
                     StreamableHttpClientTransport::with_client(
@@ -1152,9 +1413,10 @@ impl McpManager {
             }
             RemoteAuth::OAuth => {
                 let stored = self
-                    .stored_token(&server.id)
+                    .stored_token(&server.id, url)
                     .ok_or_else(|| Error::NeedsAuth(server.id.clone()))?;
-                let client = oauth::client_from_stored(url, &stored).await?;
+                let client =
+                    oauth::client_from_stored(url, &stored, self.inner.config.http_timeout).await?;
                 self.handshake(
                     server,
                     StreamableHttpClientTransport::with_client(client, config),
@@ -1163,10 +1425,10 @@ impl McpManager {
             }
             // Let the server decide, so configuring one is just a pasted URL.
             RemoteAuth::Auto => {
-                if self.stored_token(&server.id).is_some() {
+                if self.stored_token(&server.id, url).is_some() {
                     return Box::pin(self.connect_remote(server, url, &RemoteAuth::OAuth)).await;
                 }
-                match oauth::probe(url).await {
+                match oauth::probe(url, self.inner.config.http_timeout).await {
                     oauth::Challenge::Open => {
                         Box::pin(self.connect_remote(server, url, &RemoteAuth::None)).await
                     }
@@ -1177,12 +1439,12 @@ impl McpManager {
         }
     }
 
-    fn stored_token(&self, server_id: &str) -> Option<String> {
+    fn stored_token(&self, server_id: &str, url: &str) -> Option<String> {
         self.inner
             .config
             .tokens
             .as_ref()
-            .and_then(|store| store.load(server_id))
+            .and_then(|store| store.load(server_id, url))
     }
 
     /// Protocol handshake plus the first catalogue listing, under one deadline.
@@ -1317,10 +1579,6 @@ impl McpManager {
     fn tools_mut(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Catalog>> {
         self.inner.tools.write().expect("mcp tools lock poisoned")
     }
-
-    fn forget_tools(&self, server_id: &str) {
-        self.tools_mut().remove(server_id);
-    }
 }
 
 /// Supervisor sweep: ticks until the manager is cancelled or dropped.
@@ -1351,7 +1609,7 @@ async fn watch_tool_changes(weak: Weak<ManagerInner>, mut rx: mpsc::UnboundedRec
         if inner.cancel.is_cancelled() {
             return;
         }
-        McpManager { inner }.refresh_tools(&server).await;
+        McpManager { inner }.refresh_tools(&server, None).await;
     }
 }
 
@@ -1593,6 +1851,103 @@ mod tests {
 
     fn tool(name: &str) -> Tool {
         Tool::new(name.to_string(), "a tool", Arc::new(serde_json::Map::new()))
+    }
+
+    #[test]
+    fn a_secret_reaches_explicit_env_but_not_preview_or_argv() {
+        let server = ServerConfig {
+            id: "gh".into(),
+            transport: Transport::Stdio {
+                command: vec!["server".into()],
+                env: vec![("GITHUB_TOKEN".into(), "${key}".into())],
+            },
+            secret: Some("s3cr3t".into()),
+            ..Default::default()
+        };
+        let shown = server.transport.target();
+        assert!(!shown.contains("s3cr3t"), "secret leaked into {shown:?}");
+        let (command, env) = match &server.transport {
+            Transport::Stdio { command, env } => server.resolve_stdio(command, env).unwrap(),
+            Transport::Remote { .. } => unreachable!(),
+        };
+        assert_eq!(command, vec!["server"]);
+        assert_eq!(env, vec![("GITHUB_TOKEN".into(), "s3cr3t".into())]);
+    }
+
+    #[test]
+    fn stored_secrets_are_never_substituted_into_argv() {
+        let server = ServerConfig {
+            id: "gh".into(),
+            transport: stdio(&["server", "--token=${key}"]),
+            secret: Some("s3cr3t".into()),
+            ..Default::default()
+        };
+        let error = match &server.transport {
+            Transport::Stdio { command, env } => server.resolve_stdio(command, env).unwrap_err(),
+            Transport::Remote { .. } => unreachable!(),
+        };
+        assert!(matches!(error, Error::SecretInArgv(id) if id == "gh"));
+    }
+
+    #[tokio::test]
+    async fn a_current_disabled_slot_is_refused_before_spawn() {
+        let definition = ServerConfig {
+            id: "off".into(),
+            transport: stdio(&["this-program-must-never-run"]),
+            disabled: true,
+            ..Default::default()
+        };
+        let manager = McpManager::new(
+            PathBuf::from("."),
+            Config {
+                enabled: true,
+                servers: vec![definition],
+                ..Config::default()
+            },
+        );
+        let generation = manager.inner.servers.lock().await["off"].generation;
+        let result = manager.connect_one("off", generation).await;
+        assert!(matches!(
+            result,
+            Err(Error::ServerNotReady {
+                state: ServerState::Disabled,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_queued_attempt_cannot_claim_a_replacements_generation() {
+        let manager = McpManager::new(
+            PathBuf::from("."),
+            Config {
+                enabled: true,
+                servers: vec![ServerConfig {
+                    id: "same".into(),
+                    transport: stdio(&["old-program"]),
+                    ..Default::default()
+                }],
+                ..Config::default()
+            },
+        );
+        let old_generation = manager.inner.servers.lock().await["same"].generation;
+        {
+            let mut servers = manager.inner.servers.lock().await;
+            servers.insert(
+                "same".into(),
+                Slot::new(ServerConfig {
+                    id: "same".into(),
+                    transport: stdio(&["new-program"]),
+                    ..Default::default()
+                }),
+            );
+        }
+        assert!(matches!(
+            manager.connect_one("same", old_generation).await,
+            Err(Error::Superseded(id)) if id == "same"
+        ));
+        let current = manager.server_config("same").await.unwrap();
+        assert_eq!(current.transport.target(), "new-program");
     }
 
     #[test]

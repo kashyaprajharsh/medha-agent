@@ -42,6 +42,14 @@ pub const DEFAULT_MAX_ACTIVE: usize = 3;
 pub const DEFAULT_MAX_DEPTH: u32 = 1;
 /// Summary text handed back to the parent before the rest spills to an artifact.
 pub const MAX_SUMMARY_CHARS: usize = 16_000;
+/// How long a cancelled child may take to settle itself before its future is
+/// dropped. Long enough for a tool call in flight to finish writing, short
+/// enough that a cancel the user asked for still feels like one.
+pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(5);
+/// Private field placed in an `agent.wait` tool observation. The log outbox
+/// folds these ids as delivery acknowledgements, so a report is acknowledged
+/// only after the observation containing it is durably appended.
+pub const REPORT_ACKS_FIELD: &str = "_agent_report_dispatches";
 
 /// Bounds on one [`AgentControl::wait`]. The floor is what stops a wait being
 /// turned back into a poll; the ceiling is what stops it being turned back into
@@ -146,7 +154,7 @@ pub struct AgentSpec {
     /// Tools to narrow to. `None` inherits the parent's set — which is still
     /// only the parent's set.
     pub tools: Option<Vec<String>>,
-    /// Turn ceiling for this child, clamped to the parent's remaining budget.
+    /// Turn ceiling for this child, clamped to the operator's per-child cap.
     pub max_turns: Option<u32>,
     /// Whether this child may modify code (O3). A writer runs in its own git
     /// worktree and hands back a patch; it never edits the parent's tree, and
@@ -175,6 +183,9 @@ pub enum AgentStatus {
 pub struct AgentResult {
     pub agent: String,
     pub session: String,
+    /// The handout this answers. Empty for a foreground run, which has none.
+    #[serde(default)]
+    pub dispatch: String,
     pub status: AgentStatus,
     pub summary: String,
     /// Set when the summary was too long for context; the whole thing is here.
@@ -183,10 +194,10 @@ pub struct AgentResult {
     pub turns: u32,
     pub tool_calls: u32,
     pub duration_ms: u64,
-    /// The least-trusted content this child touched. Medha labels every
-    /// observation, so a child that read a web page hands back a `web`-labelled
-    /// result and the kernel's existing trust-flow escalation still applies —
-    /// delegation cannot launder taint into a trusted-looking summary.
+    /// The least-trusted content this child touched. Whoever delivers this
+    /// report must carry the label with it — as a message trust, or as a tool
+    /// observation's relayed trust — or delegation launders taint into a
+    /// trusted-looking summary.
     pub trust: TrustLabel,
     /// What a writer changed, as a diff against the commit it started from,
     /// with whatever evidence it has that the change works. `None` for a
@@ -207,6 +218,17 @@ pub struct AgentResult {
 #[async_trait::async_trait]
 pub trait ChildRunner: Send + Sync {
     async fn run(&self, run: ChildRun) -> Result<ChildOutcome, String>;
+
+    /// Whether cancellation is settled inside `run`.
+    ///
+    /// The kernel roots its interrupt queue at the child token and has its own
+    /// bounded tool-settle path. Giving that runner a second, equal outer
+    /// deadline races the two clocks and drops the kernel just before it can
+    /// record the settled transcript. Simple/custom runners keep the outer
+    /// backstop by default.
+    fn settles_cancellation(&self) -> bool {
+        false
+    }
 }
 
 /// Who is asking. Depth, name resolution and reach all follow from this, so an
@@ -262,7 +284,9 @@ pub struct ChildRun {
     /// Already narrowed — the runner must use exactly this, never the parent's.
     /// For a writer it is also already *rooted at the worktree*.
     pub executor: Arc<dyn Executor>,
-    pub max_turns: u32,
+    /// Ceilings for this child: its own turn count, the parent's everything
+    /// else, drawn from the tree's shared pool.
+    pub budget: kernel::Budget,
     pub cancel: CancellationToken,
     /// A writer's isolated checkout. The runner must make this the child's cwd:
     /// the executor is rooted here, and a child whose working directory still
@@ -300,7 +324,10 @@ pub trait Workspaces: Send + Sync {
     /// configured. The orchestrator runs this itself rather than trusting the
     /// child's account: "I ran the tests and they passed" is exactly the claim
     /// a merge gate cannot afford to take on faith.
-    async fn verify(&self, root: &Path) -> Option<Verification>;
+    /// `cancel` is the child's own token: a cancelled agent should not leave a
+    /// build running to its ceiling, and the verification is worthless anyway
+    /// once nobody is waiting for the patch.
+    async fn verify(&self, root: &Path, cancel: &CancellationToken) -> Option<Verification>;
 
     /// Where a patch merges back to — the repository root.
     fn repo(&self) -> std::path::PathBuf;
@@ -324,6 +351,8 @@ pub struct ChildOutcome {
 /// in someone else's chat.
 #[derive(Debug, Clone)]
 pub struct Dispatch {
+    /// This handout. Distinct from `child`, which a follow-up reuses.
+    pub id: Ulid,
     pub agent: String,
     pub child: Ulid,
     pub parent: Ulid,
@@ -349,13 +378,16 @@ pub struct Dispatch {
 pub trait Outbox: Send + Sync {
     /// Persist the dispatch *before* the child starts. A crash between here and
     /// completion leaves a visible orphan rather than silent loss.
-    async fn dispatched(&self, dispatch: &Dispatch);
+    #[must_use]
+    async fn dispatched(&self, dispatch: &Dispatch) -> bool;
     /// Record a terminal result against its dispatch.
-    async fn finished(&self, dispatch: &Dispatch, result: &AgentResult);
+    #[must_use]
+    async fn finished(&self, dispatch: &Dispatch, result: &AgentResult) -> bool;
     /// Mark a result handed to its owner. Delivery is idempotent: replaying the
-    /// log must not inject the same report twice. Takes `parent` because the
-    /// record belongs on the owner's chain, not the child's.
-    async fn delivered(&self, parent: Ulid, child: Ulid);
+    /// log must not inject the same report twice. Keyed on the *dispatch*, not
+    /// the child session, so a follow-up's report is not suppressed by the
+    /// delivery of the one before it.
+    async fn delivered(&self, parent: Ulid, dispatch: Ulid);
     /// Results owned by `parent` that have not been delivered, oldest first.
     async fn undelivered(&self, parent: Ulid) -> Vec<AgentResult>;
 
@@ -367,20 +399,25 @@ pub trait Outbox: Send + Sync {
 
     /// Persist a writer's patch against `parent`.
     ///
-    /// The child's worktree is reaped as soon as the diff is taken, so this
-    /// record is the only surviving copy of the work. An in-memory registry
-    /// alone would mean a background writer finishing, the process exiting, and
-    /// the patch being silently lost while its report survived — the worst
-    /// shape of failure, because the transcript says the work was done.
-    async fn recorded(&self, parent: Ulid, agent: &str, child: Ulid, patch: &Patch);
+    /// Persist a writer's patch against `parent`. Returns false when the write
+    /// failed: the worktree is reaped straight after, so a caller that ignores
+    /// this discards the only surviving copy of the work.
+    #[must_use]
+    async fn recorded(
+        &self,
+        parent: Ulid,
+        dispatch: Ulid,
+        agent: &str,
+        child: Ulid,
+        patch: &Patch,
+    ) -> bool;
 
     /// Mark a patch merged. `pending → applied`, mirroring delivery, so a
     /// restart does not offer already-applied work as outstanding.
-    async fn applied(&self, parent: Ulid, child: Ulid);
+    async fn applied(&self, parent: Ulid, dispatch: Ulid);
 
-    /// Patches owned by `parent` that have not been applied, oldest first, as
-    /// `(agent, child session, patch)`.
-    async fn unapplied(&self, parent: Ulid) -> Vec<(String, String, Patch)>;
+    /// Patches owned by `parent` that have not been applied, oldest first.
+    async fn unapplied(&self, parent: Ulid) -> Vec<Pending>;
 
     /// When `child` last recorded anything, as epoch seconds.
     ///
@@ -428,6 +465,12 @@ impl ChildRunner for DeferredRunner {
             None => Err(Error::Unavailable.to_string()),
         }
     }
+
+    fn settles_cancellation(&self) -> bool {
+        self.0
+            .get()
+            .is_some_and(|runner| runner.settles_cancellation())
+    }
 }
 
 /// Control plane for one session tree. Held by the parent session and shared
@@ -439,6 +482,7 @@ pub struct AgentControl {
     capacity: Arc<Semaphore>,
     max_active: usize,
     max_depth: u32,
+    cancel_grace: Duration,
     wait_bounds: WaitBounds,
     transcript_tail: usize,
     /// Builds a child's own delegation tools. Installed after construction: the
@@ -466,6 +510,7 @@ pub struct AgentControl {
     /// by the surface once the session id exists — the same deferred-handle
     /// shape the parent executor uses, for the same reason.
     owner: OwnerHandle,
+    budget: kernel::BudgetHandle,
     /// Signalled when a background report becomes collectable.
     notifier: NotifierHandle,
     /// The root operator's interrupt handle, so a wait at the top of the tree
@@ -506,7 +551,19 @@ pub type NotifierHandle = Arc<std::sync::Mutex<Option<Notifier>>>;
 struct Delivered {
     agent: String,
     session: String,
+    dispatch: String,
     patch: Patch,
+}
+
+/// A recorded patch that has not been applied yet.
+#[derive(Debug, Clone)]
+pub struct Pending {
+    pub agent: String,
+    /// The child session that produced it — how a surface addresses it.
+    pub session: String,
+    /// The handout it belongs to; what [`Outbox::applied`] closes.
+    pub dispatch: String,
+    pub patch: Patch,
 }
 
 impl AgentControl {
@@ -516,6 +573,7 @@ impl AgentControl {
             capacity: Arc::new(Semaphore::new(DEFAULT_MAX_ACTIVE)),
             max_active: DEFAULT_MAX_ACTIVE,
             max_depth: DEFAULT_MAX_DEPTH,
+            cancel_grace: DEFAULT_CANCEL_GRACE,
             wait_bounds: WaitBounds::default(),
             transcript_tail: 40,
             delegation: std::sync::OnceLock::new(),
@@ -526,11 +584,47 @@ impl AgentControl {
             transcripts: None,
             patches: Arc::new(std::sync::Mutex::new(Vec::new())),
             owner: Arc::new(std::sync::Mutex::new(None)),
+            budget: Arc::new(std::sync::Mutex::new(None)),
             notifier: Arc::new(std::sync::Mutex::new(None)),
             root: std::sync::Mutex::new(None),
             settled: Arc::new(tokio::sync::Notify::new()),
             tasks: tokio_util::task::TaskTracker::new(),
         }
+    }
+
+    /// Share the slot holding the root budget children derive ceilings from.
+    /// Without it every child gets a default budget and the tree is unbounded.
+    pub fn with_budget(mut self, budget: kernel::BudgetHandle) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Set the budget children derive their ceilings from. A surface calls this
+    /// when a task starts, so the tree joins that task's pool.
+    pub fn publish_budget(&self, budget: kernel::Budget) {
+        if let Ok(mut slot) = self.budget.lock() {
+            *slot = Some(budget);
+        }
+    }
+
+    /// The budget this tree draws from, as the surface last set it.
+    pub fn root_budget(&self) -> kernel::Budget {
+        self.budget
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
+    }
+
+    /// The budget a child of `caller` should draw on: the caller's own where it
+    /// is a running agent, the tree's where it is the surface.
+    ///
+    /// A grandchild reading the root's budget rejoins the root's pool, which is
+    /// right for spend but wrong for any ceiling its parent narrowed.
+    pub fn budget_for(&self, caller: &AgentPath) -> kernel::Budget {
+        self.registry
+            .budget(caller)
+            .unwrap_or_else(|| self.root_budget())
     }
 
     /// Share the slot naming the session these children belong to.
@@ -554,6 +648,15 @@ impl AgentControl {
         self.owner.lock().ok().and_then(|slot| *slot)
     }
 
+    /// Point this tree at the session that now owns it. A surface that swaps its
+    /// session — `/clear`, `/resume`, `/rewind` — must call this, or children
+    /// keep addressing reports and patches to a session nobody collects from.
+    pub fn adopt(&self, session: Ulid) {
+        if let Ok(mut slot) = self.owner.lock() {
+            *slot = Some(session);
+        }
+    }
+
     /// What a run borrows from this control plane. `owner` overrides the shared
     /// handle for a background child, whose owner is fixed at dispatch.
     fn shared(&self, owner: Option<Ulid>) -> Shared {
@@ -565,12 +668,19 @@ impl AgentControl {
             patches: Arc::clone(&self.patches),
             registry: Arc::clone(&self.registry),
             settled: Arc::clone(&self.settled),
+            cancel_grace: self.cancel_grace,
         }
     }
 
     /// Every child this session knows about, running or settled.
     pub fn agents(&self) -> Vec<Agent> {
         self.registry.all()
+    }
+
+    /// How long a cancelled child gets to settle itself before it is dropped.
+    pub fn with_cancel_grace(mut self, grace: Duration) -> Self {
+        self.cancel_grace = grace;
+        self
     }
 
     pub fn with_limits(mut self, max_active: usize, max_depth: u32) -> Self {
@@ -702,7 +812,18 @@ impl AgentControl {
     /// that produced it. Session id wins over name: it is the identity, and a
     /// name can be reused across sessions.
     pub async fn patch(&self, id: &str) -> Option<Patch> {
-        if let Some(found) = self.cached_patch(id) {
+        self.pending(id).await.map(|pending| pending.patch)
+    }
+
+    /// The outstanding patch `id` names, with the handout that identifies it.
+    ///
+    /// `id` may be a dispatch id, a child session or an agent name. The first is
+    /// exact; the others take the newest match, because a session can produce
+    /// several handouts and a name can be reused. Callers that then apply must
+    /// close the returned `dispatch` — closing by session would settle handouts
+    /// whose diffs were never applied.
+    pub async fn pending(&self, id: &str) -> Option<Pending> {
+        if let Some(found) = self.cached_pending(id) {
             return Some(found);
         }
         let (outbox, owner) = (self.outbox.as_ref()?, self.owner()?);
@@ -711,8 +832,7 @@ impl AgentControl {
             .await
             .into_iter()
             .rev()
-            .find(|(agent, session, _)| session == id || agent == id)
-            .map(|(_, _, patch)| patch)
+            .find(|pending| pending.dispatch == id || pending.session == id || pending.agent == id)
     }
 
     /// How many patches this process is holding. The render-pass counterpart to
@@ -728,19 +848,18 @@ impl AgentControl {
     /// Patches this process is holding, for a surface that must render before
     /// it can await. Correct for everything produced in this session — the
     /// durable [`Self::outstanding`] adds what survived a restart.
-    pub fn cached_unmerged_patches(&self) -> Vec<(String, String, Patch)> {
+    pub fn cached_unmerged_patches(&self) -> Vec<Pending> {
         self.patches
             .lock()
             .map(|patches| {
                 patches
                     .iter()
                     .filter(|entry| !entry.patch.is_empty())
-                    .map(|entry| {
-                        (
-                            entry.agent.clone(),
-                            entry.session.clone(),
-                            entry.patch.clone(),
-                        )
+                    .map(|entry| Pending {
+                        agent: entry.agent.clone(),
+                        session: entry.session.clone(),
+                        dispatch: entry.dispatch.clone(),
+                        patch: entry.patch.clone(),
                     })
                     .collect()
             })
@@ -750,19 +869,31 @@ impl AgentControl {
     /// The in-memory fast path, for callers that cannot await — the TUI's
     /// render pass among them.
     pub fn cached_patch(&self, id: &str) -> Option<Patch> {
+        self.cached_pending(id).map(|pending| pending.patch)
+    }
+
+    /// The in-memory fast path, carrying the handout so a caller can close
+    /// exactly the diff it applied.
+    pub fn cached_pending(&self, id: &str) -> Option<Pending> {
         let patches = self.patches.lock().ok()?;
         patches
             .iter()
             .rev()
-            .find(|entry| entry.session == id)
+            .find(|entry| entry.dispatch == id)
+            .or_else(|| patches.iter().rev().find(|entry| entry.session == id))
             .or_else(|| patches.iter().rev().find(|entry| entry.agent == id))
-            .map(|entry| entry.patch.clone())
+            .map(|entry| Pending {
+                agent: entry.agent.clone(),
+                session: entry.session.clone(),
+                dispatch: entry.dispatch.clone(),
+                patch: entry.patch.clone(),
+            })
     }
 
     /// Patches still waiting to be applied, oldest first, from the durable
     /// record so a restart does not hide finished work.
-    pub async fn outstanding(&self) -> Vec<(String, String, Patch)> {
-        let mut found: Vec<(String, String, Patch)> = match (&self.outbox, self.owner()) {
+    pub async fn outstanding(&self) -> Vec<Pending> {
+        let mut found: Vec<Pending> = match (&self.outbox, self.owner()) {
             (Some(outbox), Some(owner)) => outbox.unapplied(owner).await,
             _ => Vec::new(),
         };
@@ -773,29 +904,34 @@ impl AgentControl {
             for entry in patches.iter().filter(|entry| !entry.patch.is_empty()) {
                 if !found
                     .iter()
-                    .any(|(_, session, _)| *session == entry.session)
+                    .any(|pending| pending.dispatch == entry.dispatch)
                 {
-                    found.push((
-                        entry.agent.clone(),
-                        entry.session.clone(),
-                        entry.patch.clone(),
-                    ));
+                    found.push(Pending {
+                        agent: entry.agent.clone(),
+                        session: entry.session.clone(),
+                        dispatch: entry.dispatch.clone(),
+                        patch: entry.patch.clone(),
+                    });
                 }
             }
         }
         found
     }
 
-    /// Close a patch out once it has been applied: dropped from memory and
-    /// marked in the log, so neither this process nor the next offers it again.
-    pub async fn forget(&self, session: &str) {
+    /// Close one handout once its diff has been applied: dropped from memory
+    /// and marked in the log, so neither this process nor the next offers it
+    /// again.
+    ///
+    /// Exactly the handout named, never every handout of a session: a follow-up
+    /// reuses the session, and closing by session marked diffs applied that
+    /// nobody had applied. Take the id from [`Self::pending`].
+    pub async fn forget(&self, dispatch: &str) {
         if let Ok(mut patches) = self.patches.lock() {
-            patches.retain(|entry| entry.session != session);
+            patches.retain(|entry| entry.dispatch != dispatch);
         }
-        if let (Some(outbox), Some(owner), Ok(child)) =
-            (&self.outbox, self.owner(), session.parse())
+        if let (Some(outbox), Some(owner), Ok(id)) = (&self.outbox, self.owner(), dispatch.parse())
         {
-            outbox.applied(owner, child).await;
+            outbox.applied(owner, id).await;
         }
     }
 
@@ -854,7 +990,14 @@ impl AgentControl {
              From: {from}\n\
              Message:\n{text}"
         );
-        match self.registry.steer(&agent.path, &note) {
+        // Never `User`: a peer agent is not the recipient's operator, and text
+        // it composed may be built from anything it read. `Tool` is the floor
+        // for agent-authored content — the sender's own taint already rode its
+        // report to whoever forwarded this.
+        match self
+            .registry
+            .steer_labelled(&agent.path, &note, TrustLabel::Tool)
+        {
             true => Ok(agent.path),
             false => Err(Error::Settled(reference.to_string())),
         }
@@ -1004,20 +1147,30 @@ impl AgentControl {
         }
     }
 
-    /// Results finished but not yet handed to `parent`, marked delivered as they
-    /// are taken. A delivered result is never returned twice, so a replayed log
-    /// cannot duplicate a report.
+    /// Results finished but not yet handed to `parent`.
+    ///
+    /// Reading does *not* acknowledge: the caller has to call [`Self::settle`]
+    /// once the reports are somewhere durable. Marking here lost every report
+    /// in flight if the turn that collected them then failed — and delivery is
+    /// specified at-least-once, so a duplicate on retry is the safe direction
+    /// and silent loss is not.
     pub async fn collect(&self, parent: Ulid) -> Vec<AgentResult> {
+        match &self.outbox {
+            Some(outbox) => outbox.undelivered(parent).await,
+            None => Vec::new(),
+        }
+    }
+
+    /// Acknowledge reports the caller has now committed. Idempotent.
+    pub async fn settle(&self, parent: Ulid, reports: &[AgentResult]) {
         let Some(outbox) = &self.outbox else {
-            return Vec::new();
+            return;
         };
-        let ready = outbox.undelivered(parent).await;
-        for result in &ready {
-            if let Ok(child) = result.session.parse() {
-                outbox.delivered(parent, child).await;
+        for result in reports {
+            if let Ok(dispatch) = result.dispatch.parse() {
+                outbox.delivered(parent, dispatch).await;
             }
         }
-        ready
     }
 
     /// Read back what a child did. Its transcript lives under its own session id
@@ -1050,7 +1203,7 @@ impl AgentControl {
         caller: &Caller,
         resuming: Option<&Agent>,
         parent_executor: Arc<dyn Executor>,
-        remaining_turns: u32,
+        parent_budget: kernel::Budget,
     ) -> Result<Admitted, Error> {
         if spec.objective.trim().is_empty() {
             return Err(Error::NoObjective);
@@ -1087,6 +1240,7 @@ impl AgentControl {
         };
         spec.name = path.name().to_string();
         let permit = self.reserve()?;
+        let mut supersedes: Option<String> = None;
         // The two paths differ only in *where* the child works and whether it
         // keeps its mutating tools. A writer without a worktree is refused
         // (§6.4) rather than degraded: silently running it read-only would fail
@@ -1101,6 +1255,25 @@ impl AgentControl {
                 .checkout(session)
                 .await
                 .map_err(Error::NoIsolation)?;
+            // A resumed writer picks its own work back up. The checkout is cut
+            // fresh from HEAD, so without this a follow-up starts from nothing
+            // and either redoes everything or quietly drops it — and the diff it
+            // finally returns would silently omit the earlier edits.
+            if resuming.is_some()
+                && let Some(previous) = self.pending(&session.to_string()).await
+            {
+                worktree.restore(&previous.patch).await.map_err(|error| {
+                    Error::NoIsolation(format!(
+                        "could not restore this agent's previous patch into its checkout: \
+                         {error}. Apply or discard that patch first, then send the follow-up."
+                    ))
+                })?;
+                // The patch this run produces will contain those edits too, so
+                // the old handout must stop being offered beside it — otherwise
+                // the surface lists two diffs for one agent and applying both
+                // double-applies the earlier work.
+                supersedes = Some(previous.dispatch);
+            }
             // Narrowed against the *parent's* names as well as the rebased
             // executor's. The rebase is a re-registration of the same tools, so
             // the sets already match — but "already match" is an assumption
@@ -1147,12 +1320,10 @@ impl AgentControl {
             ),
             None => executor,
         };
-        // A child's budget is a slice of what the parent has left, never more.
-        let max_turns = spec
-            .max_turns
-            .unwrap_or(remaining_turns)
-            .min(remaining_turns)
-            .max(1);
+        // Turns are the child's own; every other ceiling is the parent's, drawn
+        // from the same pool, so a tree cannot outspend its root by delegating.
+        let ceiling = parent_budget.max_turns.unwrap_or(u32::MAX);
+        let budget = parent_budget.inherited(spec.max_turns.unwrap_or(ceiling).min(ceiling).max(1));
 
         // A resume inherits its *own* prior conversation, whole: a follow-up to
         // an agent that has forgotten what it already did would redo it.
@@ -1161,10 +1332,21 @@ impl AgentControl {
             (Some(transcripts), fork) => fork.apply(&transcripts.history(inherit_from).await),
         };
 
-        // Per-child token, so cancelling one agent leaves its siblings alone;
-        // it is a child of the tree's, so cancelling the tree still settles all.
-        let cancel = self.cancel.child_token();
-        let (steer, interrupts) = kernel::InterruptQueue::pair();
+        // Derived from the *spawner's* token, not the tree's: cancelling an
+        // agent has to take its descendants with it. Rooting every agent at the
+        // tree made them all siblings, so a cancelled parent left its own
+        // children running with nobody to report to. Falls back to the tree for
+        // a caller with no live entry — the root operator, which has none.
+        let cancel = self
+            .registry
+            .token(&caller.path)
+            .unwrap_or_else(|| self.cancel.clone())
+            .child_token();
+        // Rooted at this child's token: cancelling the agent then reaches the
+        // session loop as its own cooperative interrupt, which settles and
+        // returns. A separate token left the runner racing the loop, and the
+        // race dropped it mid-tool.
+        let (steer, interrupts) = kernel::InterruptQueue::rooted(cancel.clone());
         reservation.commit(
             registry::Agent {
                 path: path.clone(),
@@ -1172,10 +1354,13 @@ impl AgentControl {
                 objective: spec.objective.clone(),
                 started_ms: epoch_ms(),
                 state: registry::State::Running,
+                write: spec.write,
+                tools: spec.tools.clone(),
             },
             registry::Live {
                 cancel: cancel.clone(),
                 steer,
+                budget: budget.clone(),
             },
         );
         Ok(Admitted {
@@ -1186,8 +1371,9 @@ impl AgentControl {
             interrupts,
             executor,
             workspace,
-            max_turns,
+            budget,
             permit,
+            supersedes,
         })
     }
 
@@ -1202,9 +1388,9 @@ impl AgentControl {
         spec: AgentSpec,
         caller: &Caller,
         parent_executor: Arc<dyn Executor>,
-        remaining_turns: u32,
+        parent_budget: kernel::Budget,
     ) -> Result<Agent, Error> {
-        self.start(spec, caller, None, parent_executor, remaining_turns)
+        self.start(spec, caller, None, parent_executor, parent_budget)
             .await
     }
 
@@ -1220,7 +1406,7 @@ impl AgentControl {
         reference: &str,
         text: &str,
         parent_executor: Arc<dyn Executor>,
-        remaining_turns: u32,
+        parent_budget: kernel::Budget,
     ) -> Result<Agent, Error> {
         if text.trim().is_empty() {
             return Err(Error::NoObjective);
@@ -1236,9 +1422,15 @@ impl AgentControl {
             // Whole, and its own: a follow-up to an agent that has forgotten
             // what it already did would pay to redo it.
             fork: Fork::All,
+            // The contract it was admitted under, not the defaults: resuming a
+            // writer read-only fails the follow-up outright, and resuming a
+            // narrowed agent with `None` hands it back the parent's whole set —
+            // a privilege it never had, granted by asking it to continue.
+            write: agent.write,
+            tools: agent.tools.clone(),
             ..Default::default()
         };
-        self.start(spec, caller, Some(&agent), parent_executor, remaining_turns)
+        self.start(spec, caller, Some(&agent), parent_executor, parent_budget)
             .await
     }
 
@@ -1248,20 +1440,15 @@ impl AgentControl {
         caller: &Caller,
         resuming: Option<&Agent>,
         parent_executor: Arc<dyn Executor>,
-        remaining_turns: u32,
+        parent_budget: kernel::Budget,
     ) -> Result<Agent, Error> {
         // No durable delivery means no background: a result that cannot outlive
         // the process is not a background result, it is a lost one.
         let outbox = Arc::clone(self.outbox.as_ref().ok_or(Error::Unavailable)?);
         let parent = caller.session;
+        let restore = resuming.cloned();
         let admitted = self
-            .admit(
-                &mut spec,
-                caller,
-                resuming,
-                parent_executor,
-                remaining_turns,
-            )
+            .admit(&mut spec, caller, resuming, parent_executor, parent_budget)
             .await?;
         let handle = Agent {
             path: admitted.path.clone(),
@@ -1269,14 +1456,22 @@ impl AgentControl {
             objective: spec.objective.clone(),
             started_ms: epoch_ms(),
             state: registry::State::Running,
+            write: spec.write,
+            tools: spec.tools.clone(),
         };
         let dispatch = Dispatch {
+            id: Ulid::new(),
             agent: spec.name.clone(),
             child: admitted.session,
             parent,
             objective: spec.objective.clone(),
         };
-        outbox.dispatched(&dispatch).await;
+        if !outbox.dispatched(&dispatch).await {
+            self.registry.rollback_start(&admitted.path, restore);
+            return Err(Error::Failed(
+                "could not durably record the agent dispatch; no child was started".into(),
+            ));
+        }
 
         // The owner is the dispatching session as given, not the handle's
         // current value: a background child can finish after the surface has
@@ -1284,12 +1479,9 @@ impl AgentControl {
         let shared = self.shared(Some(parent));
         let notifier = Arc::clone(&self.notifier);
         self.tasks.spawn(async move {
-            let result = execute(shared, spec, admitted).await;
-            outbox.finished(&dispatch, &result).await;
-            // Only now is the report collectable. Signalling any earlier — off
-            // the roster, or before this write — would hand the surface a
-            // completion it cannot yet read.
-            //
+            // `execute` writes the report and only then leaves the roster, so a
+            // waiter that sees the agent settle can already read it.
+            execute(shared, dispatch, spec, admitted).await;
             // Cloned out with the guard dropped before the call: a notifier
             // that re-entered this control plane while the lock was held would
             // deadlock on a non-reentrant mutex, and that is the class of bug
@@ -1347,9 +1539,12 @@ struct Admitted {
     /// A writer's checkout, held here so it is reaped on exactly one path
     /// regardless of how the child ends.
     workspace: Option<Worktree>,
-    max_turns: u32,
+    budget: kernel::Budget,
     /// Held for the child's lifetime; dropping it frees a slot in the tree.
     permit: OwnedSemaphorePermit,
+    /// A prior handout this run's patch will contain, closed once the new one
+    /// is durable. Set when a follow-up restored an agent's own earlier work.
+    supersedes: Option<String>,
 }
 
 /// The collaborators a run needs from its control plane. Bundled so foreground
@@ -1363,11 +1558,18 @@ struct Shared {
     patches: Patches,
     registry: Arc<AgentRegistry>,
     settled: Arc<tokio::sync::Notify>,
+    cancel_grace: Duration,
 }
 
 /// The one execution path, shared by foreground and background spawn so they
 /// cannot drift in how they cancel, time or bound a child.
-async fn execute(shared: Shared, spec: AgentSpec, admitted: Admitted) -> AgentResult {
+async fn execute(
+    shared: Shared,
+    dispatch: Dispatch,
+    spec: AgentSpec,
+    admitted: Admitted,
+) -> AgentResult {
+    let handout = dispatch.id;
     let Shared {
         runner,
         workspaces,
@@ -1376,17 +1578,19 @@ async fn execute(shared: Shared, spec: AgentSpec, admitted: Admitted) -> AgentRe
         patches,
         registry,
         settled,
+        cancel_grace,
     } = shared;
     let Admitted {
         session,
         cancel,
         executor,
         workspace,
-        max_turns,
+        budget,
         permit,
         interrupts,
         path,
         history,
+        supersedes,
     } = admitted;
     let started = Instant::now();
     let run = runner.run(ChildRun {
@@ -1394,18 +1598,28 @@ async fn execute(shared: Shared, spec: AgentSpec, admitted: Admitted) -> AgentRe
         spec: spec.clone(),
         history,
         executor,
-        max_turns,
+        budget,
         cancel: cancel.clone(),
         interrupts,
         workspace: workspace.as_ref().map(|tree| tree.path().to_path_buf()),
     });
-    // Race the run against the token. A cooperative runner honours it itself,
-    // but one that ignores it must not outlive a cancellation, so dropping the
-    // future here is the backstop.
-    let outcome = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(None),
-        outcome = run => outcome.map_err(Some),
+    tokio::pin!(run);
+    // On cancellation the runner settles the child itself and returns; give it
+    // a bounded chance to. Dropping the future the instant the token trips —
+    // which a biased select did — killed the kernel mid-tool, leaving a
+    // half-written file and an unanswered call on the one path where the work
+    // still has to survive. The timeout is the backstop for a runner that
+    // ignores the token, not the normal route.
+    let outcome = if runner.settles_cancellation() {
+        run.await.map_err(Some)
+    } else {
+        tokio::select! {
+            outcome = &mut run => outcome.map_err(Some),
+            _ = cancel.cancelled() => match tokio::time::timeout(cancel_grace, run).await {
+                Ok(outcome) => outcome.map_err(Some),
+                Err(_) => Err(None),
+            },
+        }
     };
     drop(permit);
 
@@ -1413,33 +1627,39 @@ async fn execute(shared: Shared, spec: AgentSpec, admitted: Admitted) -> AgentRe
     // included. A writer killed halfway has usually still changed something,
     // and throwing that away is the same partial-output loss §6.5 forbids for
     // summaries — only more expensive, because it was real work on real files.
-    let patch = match (&workspace, &workspaces) {
-        (Some(tree), Some(workspaces)) => {
-            let mut patch = tree.patch().await.unwrap_or_default();
-            // Verification runs here rather than being reported by the child:
-            // "I ran the tests and they passed" is exactly the claim a merge
-            // gate cannot take on faith. Skipped for an empty patch — there is
-            // nothing to verify, and a build is not free.
-            if !patch.is_empty() {
-                patch.verification = workspaces.verify(tree.path()).await;
+    let (patch, extracted) = match (&workspace, &workspaces) {
+        (Some(tree), Some(workspaces)) => match tree.patch().await {
+            Ok(mut patch) => {
+                // Verification runs here rather than being reported by the
+                // child: "I ran the tests and they passed" is exactly the claim
+                // a merge gate cannot take on faith. Skipped for an empty patch
+                // — there is nothing to verify, and a build is not free.
+                if !patch.is_empty() {
+                    patch.verification = workspaces.verify(tree.path(), &cancel).await;
+                }
+                (Some(patch), true)
             }
-            Some(patch)
-        }
-        _ => None,
+            // An empty patch here would read as "the writer changed nothing"
+            // and the checkout would be reaped on the strength of it.
+            Err(error) => {
+                tracing::error!(
+                    target: "medha_orchestrator",
+                    %session, %error,
+                    "could not extract a patch; keeping the worktree"
+                );
+                (None, false)
+            }
+        },
+        _ => (None, true),
     };
-    // Only now: the diff is out, so the checkout has nothing left to protect.
-    // Reaping before this would discard the child's work; not reaping at all
-    // wedges the next `git worktree add` on that path.
-    if let Some(tree) = &workspace {
-        tree.reap().await;
-    }
 
     let elapsed = started.elapsed();
     let mut result = match outcome {
-        Ok(outcome) => bound(spec.name, session, outcome, elapsed),
+        Ok(outcome) => bound(handout, spec.name, session, outcome, elapsed),
         // Partial-result preservation (§6.5): a cancelled or failed child still
         // reports, so the parent learns what happened rather than nothing.
         Err(reason) => bound(
+            handout,
             spec.name,
             session,
             ChildOutcome {
@@ -1458,37 +1678,108 @@ async fn execute(shared: Shared, spec: AgentSpec, admitted: Admitted) -> AgentRe
     // Retained so the merge can be asked for by agent id. Round-tripping a diff
     // back through the model to apply it would put a whitespace-exact artifact
     // through a channel that does not preserve whitespace exactly.
-    if let Some(patch) = &patch
-        && !patch.is_empty()
-    {
-        if let Ok(mut patches) = patches.lock() {
+    let mut durable = true;
+    if let Some(patch) = &patch {
+        if !patch.is_empty()
+            && let Ok(mut patches) = patches.lock()
+        {
             patches.push(Delivered {
                 agent: result.agent.clone(),
                 session: result.session.clone(),
+                dispatch: handout.to_string(),
                 patch: patch.clone(),
             });
             let excess = patches.len().saturating_sub(MAX_RETAINED_PATCHES);
             patches.drain(..excess);
         }
-        // And durably. The worktree is already gone, so if this is the process
-        // that dies next, the log is the only place the work still exists.
-        if let (Some(outbox), Some(owner)) = (&outbox, owner) {
-            outbox.recorded(owner, &result.agent, session, patch).await;
+        // An empty replacement is still a durable outcome: it says the
+        // restored prior patch was intentionally removed. Without recording
+        // that outcome, the superseded handout remains offered forever.
+        if (!patch.is_empty() || supersedes.is_some())
+            && let (Some(outbox), Some(owner)) = (&outbox, owner)
+        {
+            durable = outbox
+                .recorded(owner, handout, &result.agent, session, patch)
+                .await;
+            if !durable {
+                tracing::error!(
+                    target: "medha_orchestrator",
+                    %session,
+                    "could not record the patch; keeping the worktree"
+                );
+            }
+            // Only once the replacement is durable: closing the old handout
+            // first would leave a window where neither diff is on offer.
+            if durable && let Some(old) = supersedes.as_ref() {
+                if let Ok(mut patches) = patches.lock() {
+                    patches.retain(|entry| &entry.dispatch != old);
+                }
+                if let Ok(id) = old.parse() {
+                    outbox.applied(owner, id).await;
+                }
+                // The empty replacement is a tombstone, not a patch the user
+                // can apply. Close it after it has closed the prior handout.
+                if patch.is_empty() {
+                    outbox.applied(owner, handout).await;
+                }
+            }
         }
+    }
+    // Only once the diff is somewhere that survives this process. Not reaping
+    // is not enough on its own: the `Drop` guard force-removes any checkout it
+    // still holds a lease for, so the worktree has to be told to keep itself.
+    if let Some(tree) = &workspace {
+        match extracted && durable {
+            true => tree.reap().await,
+            false => {
+                tree.preserve();
+                // Nobody is served by a rescued directory they are never told
+                // about, so the path goes into the report the parent reads.
+                result.summary.push_str(&format!(
+                    "\n\n[this agent's changes could not be captured as a patch. \
+                     They are still on disk at {} — recover them from there. \
+                     The checkout is deliberately not cleaned up.]",
+                    tree.path().display()
+                ));
+            }
+        }
+    }
+    // Before the record is written, not after: the persisted report is what a
+    // restart reads back, and one without its patch describes work whose diff
+    // has vanished.
+    result.patch = patch;
+    // Durable before anyone can observe the agent as finished. `agent.wait`
+    // wakes on the roster, so leaving the roster first handed the caller a
+    // settled agent whose report was not yet collectable — the empty-reports
+    // race `agent.wait` exists to avoid.
+    let report_durable = match &outbox {
+        Some(outbox) => outbox.finished(&dispatch, &result).await,
+        None => true,
+    };
+    if !report_durable {
+        tracing::error!(
+            target: "medha_orchestrator",
+            %session,
+            dispatch = %dispatch.id,
+            "could not durably record the agent's terminal report; the dispatch remains \
+             recoverable as an abandoned run"
+        );
     }
     // Hand the report to the agent that asked for it. A nested parent is a
     // running session, not a surface: it has no outbox pass of its own, so
     // without this its child's result is written to a chain nobody reads and
     // the parent waits forever on work that finished.
-    if let Ok(parent) = path.parent()
+    if report_durable
+        && let Ok(parent) = path.parent()
         && !parent.is_root()
     {
-        registry.steer(&parent, &report(&path, &result));
+        // Labelled: a nested parent reads this on its steer queue, and a report
+        // built from web content must escalate what that parent does next.
+        registry.steer_labelled(&parent, &report(&path, &result), result.trust);
     }
     registry.settled(&path, result.status);
     // After the registry and the outbox, so anything woken here can read both.
     settled.notify_waiters();
-    result.patch = patch;
     result
 }
 
@@ -1528,10 +1819,17 @@ fn report(sender: &AgentPath, result: &AgentResult) -> String {
 /// caller owns the artifact store, so it caps for context and spills the
 /// remainder there. Truncating here would discard the tail before anyone could
 /// persist it.
-fn bound(name: String, session: Ulid, outcome: ChildOutcome, elapsed: Duration) -> AgentResult {
+fn bound(
+    dispatch: Ulid,
+    name: String,
+    session: Ulid,
+    outcome: ChildOutcome,
+    elapsed: Duration,
+) -> AgentResult {
     AgentResult {
         agent: name,
         session: session.to_string(),
+        dispatch: dispatch.to_string(),
         status: outcome.status,
         summary: outcome.summary,
         artifact: None,

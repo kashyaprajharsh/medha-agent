@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+tokio-util = "0.7"
 thiserror.workspace = true
 ulid.workspace = true
 async-trait.workspace = true

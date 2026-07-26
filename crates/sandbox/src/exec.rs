@@ -157,14 +157,6 @@ fn base_command(program: &str, args: &[String], req: &ExecRequest) -> tokio::pro
     cmd
 }
 
-fn to_output(o: std::process::Output) -> ExecOutput {
-    ExecOutput {
-        status: o.status.code(),
-        stdout: o.stdout,
-        stderr: o.stderr,
-    }
-}
-
 /// Fires a `SIGKILL` at a whole process group when dropped while still *armed*.
 /// This is the fix for the compounding-timeout bug: `kill_on_drop` only kills
 /// the direct child, so a timed-out `sh -c "cargo build"` orphaned its
@@ -186,19 +178,53 @@ impl GroupReaper {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    /// Tear down anything that is still attached to the command after its
+    /// leader returned. Build tools occasionally background helpers and close
+    /// their inherited pipes; treating the leader's zero exit as proof that the
+    /// whole tree is gone leaks those helpers past the verifier/install gate.
+    fn reap_remaining(&mut self) {
+        if let Some(pid) = self.pid {
+            kill_process_tree(pid);
+        }
+        self.disarm();
+    }
 }
 
 impl Drop for GroupReaper {
     fn drop(&mut self) {
-        #[cfg(unix)]
         if self.armed {
             if let Some(pid) = self.pid {
-                // Negative pid = the process GROUP led by `pid`.
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
+                kill_process_tree(pid);
             }
         }
+    }
+}
+
+/// Kill the command and descendants that still belong to it.
+///
+/// Unix commands are launched as process-group leaders. Windows has no
+/// `killpg`; `taskkill /T` is the platform fallback and is invoked by absolute
+/// System32 path so a workspace cannot shadow it with a different executable.
+#[allow(unused_variables)]
+fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        // Negative pid = the process GROUP led by `pid`.
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let taskkill = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("System32")
+            .join("taskkill.exe");
+        let _ = std::process::Command::new(taskkill)
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 
@@ -209,17 +235,241 @@ impl Drop for GroupReaper {
 fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool) {
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Lets Windows treat the child as a distinct process group. Tree
+        // teardown itself uses `taskkill /T`, because Rust has no Job Object
+        // wrapper in std.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.as_std_mut().creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(kill_on_drop);
 }
 
-/// SIGKILL an entire process group by its leader pid (unix). No-op elsewhere.
-#[allow(unused_variables)]
-fn kill_group(pid: u32) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
+/// What a bounded shell run produced.
+#[derive(Debug)]
+pub struct ShellOutcome {
+    pub status: Option<i32>,
+    /// Combined stdout and stderr, truncated to the requested bound.
+    pub output: String,
+    pub timed_out: bool,
+    pub cancelled: bool,
+}
+
+impl ShellOutcome {
+    pub fn passed(&self) -> bool {
+        !self.timed_out && !self.cancelled && self.status == Some(0)
+    }
+}
+
+/// Run `command` under the platform shell in `dir`, bounded in time and output.
+///
+/// The process is its own group leader and the run future is group-reaped on
+/// drop, so a timeout takes the whole tree — a bare `Command::output()` timeout
+/// leaves `sh`'s grandchildren (compiler jobs, dev servers) holding locks and
+/// ports, and the next attempt then hangs for the same reason.
+///
+pub async fn run_shell_bounded(
+    command: &str,
+    dir: &std::path::Path,
+    limit: std::time::Duration,
+    max_output: usize,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<ShellOutcome, ExecError> {
+    run_shell_bounded_with(&HostBackend, command, dir, limit, max_output, cancel).await
+}
+
+/// Run a shell command through a configured execution backend, retaining the
+/// same timeout/output/process-tree guarantees as [`run_shell_bounded`].
+///
+/// This is the verifier path: build scripts and tests are workspace-controlled
+/// code, so they must execute under the same jail the editing tools use rather
+/// than escaping to an unconfined host shell.
+pub async fn run_shell_bounded_with(
+    backend: &dyn ExecBackend,
+    command: &str,
+    dir: &std::path::Path,
+    limit: std::time::Duration,
+    max_output: usize,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<ShellOutcome, ExecError> {
+    // Container/SSH backends target Unix-like execution environments even when
+    // the Medha client itself runs on Windows.
+    #[cfg(windows)]
+    let host_shell = matches!(backend.label(), "host" | "native");
+    #[cfg(not(windows))]
+    let host_shell = false;
+    let (program, args) = if host_shell {
+        (
+            "cmd.exe".to_string(),
+            vec!["/D".into(), "/S".into(), "/C".into(), command.into()],
+        )
+    } else {
+        ("sh".to_string(), vec!["-c".into(), command.into()])
+    };
+    let request = ExecRequest {
+        program,
+        args,
+        cwd: dir.to_path_buf(),
+        env: Vec::new(),
+        clear_env: false,
+    };
+    let cmd = backend.build_command(&request)?;
+    run_command_bounded(cmd, limit, max_output, cancel).await
+}
+
+/// Run an already-configured command with the same bounded capture and process
+/// tree teardown as [`run_shell_bounded`]. This is used for fixed-argv package
+/// managers where round-tripping arguments through a shell would be unsafe.
+pub async fn run_command_bounded(
+    mut cmd: tokio::process::Command,
+    limit: std::time::Duration,
+    max_output: usize,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<ShellOutcome, ExecError> {
+    configure_for_spawn(&mut cmd, true);
+    // Spawned and reaped through `std`, deliberately, rather than through
+    // tokio's `Child`.
+    //
+    // Descendants are torn down by signalling the process group, and a group's
+    // id *is* its leader's pid. Tokio reaps children asynchronously off SIGCHLD,
+    // which frees that pid while the helpers are still alive — so by the time
+    // the kill goes out the number may already name an unrelated group, and the
+    // helper it was meant for survives. Owning the reap keeps the leader a
+    // zombie, and a zombie still holds its pid, so the group stays addressable
+    // until we have finished with it.
+    let mut child = cmd
+        .as_std_mut()
+        .spawn()
+        .map_err(|e| ExecError::Spawn(e.to_string()))?;
+    let leader = child.id();
+    let mut reaper = GroupReaper::new(Some(leader));
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Streamed into a rolling window rather than buffered whole: a runaway
+    // suite can emit gigabytes, and reading it all in only to throw most of it
+    // away is an out-of-memory waiting for a verbose test run.
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Rolling::new(max_output)));
+    // Blocking reads on a worker thread: these are `std` pipes, and registering
+    // them with the reactor would mean handing the fds back to tokio.
+    let drains = {
+        let (out, err) = (captured.clone(), captured.clone());
+        async move {
+            let _ = tokio::join!(
+                tokio::task::spawn_blocking(move || drain_blocking(stdout, &out)),
+                tokio::task::spawn_blocking(move || drain_blocking(stderr, &err)),
+            );
+        }
+    };
+
+    let text = || {
+        captured
+            .lock()
+            .map(|buffer| buffer.text())
+            .unwrap_or_default()
+    };
+
+    tokio::pin!(drains);
+    // Both pipes closing means the leader and everything sharing its stdout are
+    // done, so its status is settled; a timeout or a cancel means it is not.
+    let ended = match cancel {
+        // Cancellation stops the run rather than waiting out the ceiling: a
+        // user who pressed Esc should not sit through a fifteen-minute build.
+        Some(token) => tokio::select! {
+            drained = tokio::time::timeout(limit, &mut drains) => drained.map_err(|_| false),
+            _ = token.cancelled() => Err(true),
+        },
+        None => tokio::time::timeout(limit, &mut drains)
+            .await
+            .map_err(|_| false),
+    };
+
+    // Unconditional, and always before the reap. On the settled path the leader
+    // is already a zombie, so this only reaches the helpers it left behind; on
+    // the other two it stops the leader as well.
+    kill_process_tree(leader);
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .map_err(|error| ExecError::Spawn(error.to_string()))?
+        .map_err(|error| ExecError::Spawn(error.to_string()))?;
+    reaper.disarm();
+
+    Ok(match ended {
+        Ok(()) => ShellOutcome {
+            status: status.code(),
+            output: text(),
+            timed_out: false,
+            cancelled: false,
+        },
+        Err(cancelled) => ShellOutcome {
+            status: None,
+            output: format!(
+                "{}\n[{}]",
+                text(),
+                match cancelled {
+                    true => "cancelled".to_string(),
+                    false => format!("timed out after {}s and was stopped", limit.as_secs()),
+                }
+            ),
+            timed_out: !cancelled,
+            cancelled,
+        },
+    })
+}
+
+type SharedRolling = std::sync::Arc<std::sync::Mutex<Rolling>>;
+
+/// The same rolling capture over a blocking `std` pipe, for the path that owns
+/// its own reaping and therefore cannot hand its fds to the reactor.
+fn drain_blocking<R: std::io::Read>(pipe: Option<R>, into: &SharedRolling) {
+    let Some(mut pipe) = pipe else { return };
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if let Ok(mut buffer) = into.lock() {
+                    buffer.push(&chunk[..read]);
+                }
+            }
+        }
+    }
+}
+
+/// The last `cap` bytes seen, remembering that earlier output was dropped. The
+/// tail is what matters: that is where a build or test run says what failed.
+struct Rolling {
+    data: Vec<u8>,
+    cap: usize,
+    dropped: bool,
+}
+
+impl Rolling {
+    fn new(cap: usize) -> Self {
+        Self {
+            data: Vec::new(),
+            cap: cap.max(1),
+            dropped: false,
+        }
+    }
+    fn push(&mut self, bytes: &[u8]) {
+        self.data.extend_from_slice(bytes);
+        if self.data.len() > self.cap {
+            let excess = self.data.len() - self.cap;
+            self.data.drain(..excess);
+            self.dropped = true;
+        }
+    }
+    fn text(&self) -> String {
+        let body = String::from_utf8_lossy(&self.data);
+        match self.dropped {
+            true => format!("[… earlier output dropped …]\n{body}"),
+            false => body.into_owned(),
+        }
     }
 }
 
@@ -229,14 +479,40 @@ fn kill_group(pid: u32) {
 /// [`GroupReaper`] SIGKILLs the whole process tree, so nothing is orphaned.
 async fn spawn_and_wait(mut cmd: tokio::process::Command) -> Result<ExecOutput, ExecError> {
     configure_for_spawn(&mut cmd, true); // reaper backstops the group; kill_on_drop the leader
-    let child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
+    let mut child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
     let mut reaper = GroupReaper::new(child.id());
-    let out = child
-        .wait_with_output()
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let (stdout, stderr) = tokio::join!(read_to_end(stdout), read_to_end(stderr));
+
+    // Both streams are at EOF, so the leader is done — reap the helpers it left
+    // behind. This must precede the wait, not follow it: a group is named by its
+    // leader's pid, and waiting releases that pid, so a kill afterwards signals
+    // a number the kernel no longer maps to this group (or has since recycled).
+    // Long-running work belongs in `spawn_background`, whose lifetime is
+    // explicit rather than an accidental orphan.
+    reaper.reap_remaining();
+    let status = child
+        .wait()
         .await
         .map_err(|e| ExecError::Spawn(e.to_string()))?;
-    reaper.disarm(); // finished on its own — nothing to tear down
-    Ok(to_output(out))
+    Ok(ExecOutput {
+        status: status.code(),
+        stdout,
+        stderr,
+    })
+}
+
+/// Read a child pipe to EOF. A closed stream is the signal that the leader and
+/// everything still sharing its output are finished.
+async fn read_to_end<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut buffer = Vec::new();
+    let _ = pipe.read_to_end(&mut buffer).await;
+    buffer
 }
 
 /// A cap on each retained stream of a background task; once exceeded, oldest
@@ -312,7 +588,7 @@ impl BgProc {
     /// SIGKILL the whole process group.
     pub fn kill(&self) {
         if let Some(pid) = self.pid {
-            kill_group(pid);
+            kill_process_tree(pid);
         }
     }
 }
@@ -624,15 +900,47 @@ impl ExecBackend for LandlockBackend {
     }
 }
 
-/// True if `program` resolves on the current PATH (or is an existing absolute
-/// path). Used to detect an installed container runtime.
+/// True if `program` exists in `dir`, including Windows `PATHEXT` resolution.
+///
+/// `Command::new("npm")` can resolve `npm.cmd` on Windows; probing only the
+/// extensionless path reports a runnable tool as missing and disables installs.
+pub fn program_in_dir(dir: &std::path::Path, program: &str) -> bool {
+    let candidate = dir.join(program);
+    if candidate.exists() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if candidate.extension().is_none() {
+            let extensions =
+                std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            return extensions
+                .to_string_lossy()
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .any(|extension| {
+                    let extension = extension.trim_start_matches('.');
+                    candidate.with_extension(extension).exists()
+                });
+        }
+    }
+    false
+}
+
+/// True if `program` resolves on the current PATH (or as an explicit path).
+/// Used to detect an installed container runtime and language-server tooling.
 pub fn program_on_path(program: &str) -> bool {
-    let p = std::path::Path::new(program);
-    if p.is_absolute() {
-        return p.exists();
+    let path = std::path::Path::new(program);
+    if path.is_absolute() || path.components().count() > 1 {
+        let dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(program);
+        return program_in_dir(dir, name);
     }
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).exists()))
+        .map(|paths| std::env::split_paths(&paths).any(|dir| program_in_dir(&dir, program)))
         .unwrap_or(false)
 }
 
@@ -922,6 +1230,77 @@ mod tests {
         assert!(
             !marker.exists(),
             "grandchild survived the group kill (orphaned tree)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_shell_drains_but_retains_only_the_tail() {
+        let output = run_shell_bounded(
+            "i=0; while [ \"$i\" -lt 4000 ]; do printf 0123456789; i=$((i + 1)); done; printf TAIL",
+            &std::env::temp_dir(),
+            std::time::Duration::from_secs(5),
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.passed());
+        assert!(output.output.ends_with("TAIL"));
+        assert!(
+            output.output.len() <= 1100,
+            "rolling capture retained too much: {} bytes",
+            output.output.len()
+        );
+        assert!(output.output.contains("earlier output dropped"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_shell_cancellation_reaps_the_process_group() {
+        let dir = std::env::temp_dir().join(format!("medha-cancelpg-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("survived.txt");
+        let script = format!("(sleep 1; touch {}) & wait", marker.display());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+        let output = run_shell_bounded(
+            &script,
+            &dir,
+            std::time::Duration::from_secs(5),
+            1024,
+            Some(&cancel),
+        )
+        .await
+        .unwrap();
+        assert!(output.cancelled);
+        assert!(!output.timed_out);
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(!marker.exists(), "cancelled verifier left a helper alive");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_shell_reaps_helpers_after_a_successful_leader_exit() {
+        let dir = std::env::temp_dir().join(format!("medha-successpg-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("survived.txt");
+        let script = format!("(sleep 1; touch {}) >/dev/null 2>&1 &", marker.display());
+        let output =
+            run_shell_bounded(&script, &dir, std::time::Duration::from_secs(5), 1024, None)
+                .await
+                .unwrap();
+        assert!(output.passed());
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            !marker.exists(),
+            "successful verifier orphaned a background helper"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

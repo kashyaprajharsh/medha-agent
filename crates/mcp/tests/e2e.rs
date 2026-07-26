@@ -9,7 +9,8 @@ use mcp::{Config, Error, McpManager, ServerConfig, ServerState, ToolFilter, Tran
 use serde_json::json;
 
 /// Modes: `normal`, `hostile` (malformed tool names), `churn` (announces
-/// tools/list_changed), `flaky <marker>` (exits once, then behaves).
+/// tools/list_changed), `stale <marker>` (blocks a refresh after marking it),
+/// `flaky <marker>` (exits once, then behaves).
 const FAKE_SERVER: &str = r#"
 import sys, json, os, time, subprocess
 
@@ -19,6 +20,7 @@ die_after_call = mode == "flaky" and marker and not os.path.exists(marker)
 if die_after_call:
     open(marker, "w").close()
 grew = False
+lists = 0
 
 def send(msg):
     sys.stdout.write(json.dumps(msg) + "\n"); sys.stdout.flush()
@@ -31,6 +33,8 @@ def spec(name, required=None):
 def catalog():
     if mode == "hostile":
         return [spec("bad__name"), spec("new\nline"), spec("x" * 200), spec("fine")]
+    if mode == "stale":
+        return [spec("trigger"), spec("old")]
     tools = [spec("echo", ["text"]), spec("slow"), spec("leak"), spec("big"), spec("spawn")]
     if mode == "churn":
         tools.append(spec("grow"))
@@ -47,6 +51,10 @@ for line in sys.stdin:
             "capabilities":{"tools":{"listChanged":True}},
             "serverInfo":{"name":"fake","version":"0.0.1"}}})
     elif method == "tools/list":
+        lists += 1
+        if mode == "stale" and lists > 1:
+            if marker: open(marker, "w").close()
+            time.sleep(2)
         send({"jsonrpc":"2.0","id":mid,"result":{"tools":catalog()}})
     elif method == "tools/call":
         params = msg.get("params",{}); name = params.get("name"); args = params.get("arguments",{})
@@ -54,6 +62,8 @@ for line in sys.stdin:
             time.sleep(30)
         if name == "grow":
             grew = True
+            send({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
+        if name == "trigger":
             send({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
         if name == "spawn":
             child = subprocess.Popen(["sleep", "300"])
@@ -369,6 +379,92 @@ async fn tools_list_changed_refreshes_the_catalogue() {
             .any(|s| s.name.ends_with("sprouted"))
     })
     .await;
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_refresh_cannot_overwrite_a_replacement_catalogue() {
+    let Some(fake) = Fake::new() else { return };
+    let marker = fake
+        .path()
+        .join("refresh-started")
+        .to_string_lossy()
+        .into_owned();
+    let manager = McpManager::new(
+        fake.path().to_path_buf(),
+        config(server("fake", fake.command("stale", Some(&marker)))),
+    );
+    manager.connect_startup().await;
+    manager
+        .call("mcp__fake__trigger", &json!({}))
+        .await
+        .unwrap();
+    wait_for("old refresh to start", async || Path::new(&marker).exists()).await;
+
+    manager
+        .add_server(server("fake", fake.command("normal", None)))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    let names: Vec<String> = manager
+        .tool_specs()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert!(names.contains(&"mcp__fake__echo".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"mcp__fake__old".to_string()),
+        "superseded refresh replaced the live catalogue: {names:?}"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_add_cannot_claim_the_newer_slots_generation() {
+    let Some(fake) = Fake::new() else { return };
+    // The `slow` call below is only a lock-holder and its result is discarded,
+    // so the ceiling it eventually hits is dead time; the race it sets up plays
+    // out in well under a second.
+    let mut cfg = config(server("fake", fake.command("normal", None)));
+    cfg.request_timeout = Duration::from_secs(2);
+    let manager = McpManager::new(fake.path().to_path_buf(), cfg);
+    manager.connect_startup().await;
+
+    // Keep retirement of the original connection busy while add A publishes
+    // its slot. Add B then supersedes A before A reaches connect_one.
+    let slow = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.call("mcp__fake__slow", &json!({})).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let add_a = {
+        let manager = manager.clone();
+        let definition = server("fake", fake.command("hostile", None));
+        tokio::spawn(async move { manager.add_server(definition).await })
+    };
+    wait_for("first replacement slot", async || {
+        manager
+            .start_preview("fake")
+            .await
+            .is_ok_and(|preview| preview.target.contains("hostile"))
+    })
+    .await;
+    manager
+        .add_server(server("fake", fake.command("normal", None)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(add_a.await.unwrap(), Err(Error::Superseded(id)) if id == "fake"),
+        "older add unexpectedly connected"
+    );
+    let _ = slow.await;
+    let names: Vec<String> = manager
+        .tool_specs()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert!(names.contains(&"mcp__fake__echo".to_string()), "{names:?}");
+    assert!(!names.contains(&"mcp__fake__fine".to_string()), "{names:?}");
     manager.shutdown().await;
 }
 

@@ -53,6 +53,8 @@ struct ClientSettings {
     max_results: usize,
     max_text_chars: usize,
     max_open_documents: usize,
+    write_timeout: Duration,
+    max_frame_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -362,6 +364,8 @@ struct ReaderState {
     sync_kind: Arc<AtomicU64>,
     settings: Arc<Value>,
     cancel: CancellationToken,
+    max_frame_bytes: usize,
+    write_timeout: Duration,
 }
 
 struct ClientEntry {
@@ -374,6 +378,19 @@ struct ClientEntry {
 
 /// Ceiling for the exponential restart backoff.
 const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Largest header block accepted before the blank line. Real headers are two
+/// short lines; past this is a server that will never send a body, and
+/// `read_line` would otherwise grow until the process dies. Not covered by the
+/// body cap, which is only read once a `Content-Length` has been parsed.
+const MAX_HEADER_BYTES: usize = 8 * 1024;
+/// Retained tail of one language-server stderr line. Stderr is diagnostic only;
+/// it must still be drained, but a server that never emits `\n` cannot be
+/// allowed to grow Medha's logging buffer without limit.
+const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
+/// Retained installer output. Package managers can be extremely verbose; only
+/// the tail is useful when reporting a failure.
+const INSTALL_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Runtime configuration. Built-in commands are trusted application defaults;
 /// project-defined commands remain approval-gated by the manager.
@@ -395,6 +412,15 @@ pub struct Config {
     /// Max documents kept open per server; the least-recently-used is closed
     /// past this to bound language-server memory in long sessions.
     pub max_open_documents: usize,
+    /// Ceiling on one `install_server`. Network-bound, so generous.
+    pub install_timeout: Duration,
+    /// Ceiling on one write to a server's stdin, waiting for the writer
+    /// included: a server that stops reading stalls every later caller.
+    pub write_timeout: Duration,
+    /// Largest single frame accepted. `Content-Length` is the server's word for
+    /// how much to allocate, and believing it turns one bad frame into an
+    /// out-of-memory abort.
+    pub max_frame_bytes: usize,
     pub allow_network: bool,
 }
 
@@ -429,6 +455,9 @@ impl Default for Config {
             diagnostic_settle: Duration::from_secs(1),
             idle_timeout: Duration::from_secs(10 * 60),
             restart_backoff: Duration::from_secs(5),
+            install_timeout: Duration::from_secs(600),
+            write_timeout: Duration::from_secs(30),
+            max_frame_bytes: 64 * 1024 * 1024,
             max_restart_attempts: 5,
             // Above the number of built-in adapters, so a polyglot repo does not
             // thrash the LRU just by touching each of its languages once.
@@ -711,6 +740,11 @@ impl Drop for ManagerInner {
 }
 
 impl LspManager {
+    /// Ceiling on one `install_server`, as configured.
+    pub fn install_timeout(&self) -> Duration {
+        self.inner.config.install_timeout
+    }
+
     pub fn new(workspace: PathBuf, config: Config) -> Self {
         Self {
             inner: Arc::new(ManagerInner {
@@ -1855,6 +1889,7 @@ struct LspClient {
     max_results: usize,
     max_text_chars: usize,
     max_open_documents: usize,
+    write_timeout: Duration,
     document_clock: AtomicU64,
     alive: Arc<AtomicBool>,
     process_group: Arc<AtomicU64>,
@@ -1916,6 +1951,14 @@ impl LspClient {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command
+                .as_std_mut()
+                .creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Error::ServerUnavailable {
@@ -1953,23 +1996,14 @@ impl LspClient {
                 max_results: config.max_results,
                 max_text_chars: config.max_text_chars,
                 max_open_documents: config.max_open_documents,
+                write_timeout: config.write_timeout,
+                max_frame_bytes: config.max_frame_bytes,
             },
             configuration,
         );
         if let Some(stderr) = stderr {
             let cancel = client.cancel.clone();
-            client.stderr_task = Some(tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        line = lines.next_line() => match line {
-                            Ok(Some(line)) => tracing::debug!(target: "medha_lsp", "{line}"),
-                            _ => break,
-                        }
-                    }
-                }
-            }));
+            client.stderr_task = Some(tokio::spawn(drain_server_stderr(stderr, cancel)));
         }
         client.initialize().await?;
         Ok(client)
@@ -2014,6 +2048,8 @@ impl LspClient {
                 sync_kind: Arc::clone(&sync_kind),
                 settings: Arc::clone(&configuration),
                 cancel: cancel.clone(),
+                max_frame_bytes: settings.max_frame_bytes,
+                write_timeout: settings.write_timeout,
             },
         ));
         Self {
@@ -2035,6 +2071,7 @@ impl LspClient {
             max_results: settings.max_results,
             max_text_chars: settings.max_text_chars,
             max_open_documents: settings.max_open_documents,
+            write_timeout: settings.write_timeout,
             document_clock: AtomicU64::new(0),
             alive,
             process_group,
@@ -2696,9 +2733,34 @@ impl LspClient {
     async fn send(&self, message: Value) -> Result<(), Error> {
         let payload =
             serde_json::to_vec(&message).map_err(|error| Error::Protocol(error.to_string()))?;
-        let mut writer = self.writer.lock().await;
-        write_frame(&mut *writer, &payload).await?;
-        Ok(())
+        // Deadline around the lock as well as the write: a server that stops
+        // reading its stdin blocks the writer, and every later caller then
+        // queues on this mutex — including the document mutex holders, which is
+        // how one wedged server stalls editing altogether.
+        let written = tokio::time::timeout(self.write_timeout, async {
+            let mut writer = self.writer.lock().await;
+            write_frame(&mut *writer, &payload).await
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                // Any I/O error may follow a partial header/body write. Reusing
+                // the stream can therefore desynchronise every later frame.
+                self.alive.store(false, Ordering::Release);
+                self.cancel.cancel();
+                Err(Error::Io(error))
+            }
+            Err(_) => {
+                // A timeout drops the write mid-frame, so the server may have
+                // half a header on stdin. Retire rather than reuse it.
+                self.alive.store(false, Ordering::Release);
+                self.cancel.cancel();
+                Err(Error::Protocol(
+                    "timed out writing to the language server; the connection was dropped".into(),
+                ))
+            }
+        }
     }
 
     async fn shutdown(&self) {
@@ -2707,14 +2769,19 @@ impl LspClient {
             .await;
         let _ = self.notify("exit", Value::Null).await;
         let mut child_guard = self.child.lock().await;
-        if let Some(child) = child_guard.as_mut()
-            && timeout(Duration::from_millis(500), child.wait())
+        if let Some(child) = child_guard.as_mut() {
+            if timeout(Duration::from_millis(500), child.wait())
                 .await
                 .is_err()
-        {
-            kill_process_group(self.process_group.swap(0, Ordering::AcqRel));
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            {
+                kill_process_group(self.process_group.swap(0, Ordering::AcqRel));
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            } else {
+                // The server leader exited, but helpers can close stdio and
+                // remain in its group. Reap them before forgetting the group.
+                kill_process_group(self.process_group.swap(0, Ordering::AcqRel));
+            }
         }
         self.process_group.store(0, Ordering::Release);
         self.cancel.cancel();
@@ -2741,6 +2808,55 @@ impl Drop for LspClient {
     }
 }
 
+async fn drain_server_stderr<R>(mut stderr: R, cancel: CancellationToken)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut chunk = [0u8; 8 * 1024];
+    let mut line = Vec::new();
+    let mut truncated = false;
+    loop {
+        let read = tokio::select! {
+            _ = cancel.cancelled() => break,
+            read = stderr.read(&mut chunk) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            }
+        };
+        let mut rest = &chunk[..read];
+        while !rest.is_empty() {
+            let newline = rest.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(rest.len(), |at| at + 1);
+            let part = &rest[..take];
+            line.extend_from_slice(part);
+            if line.len() > MAX_STDERR_LINE_BYTES {
+                let excess = line.len() - MAX_STDERR_LINE_BYTES;
+                line.drain(..excess);
+                truncated = true;
+            }
+            if newline.is_some() {
+                log_server_stderr_line(&line, truncated);
+                line.clear();
+                truncated = false;
+            }
+            rest = &rest[take..];
+        }
+    }
+    if !line.is_empty() {
+        log_server_stderr_line(&line, truncated);
+    }
+}
+
+fn log_server_stderr_line(line: &[u8], truncated: bool) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim_end_matches(['\r', '\n']);
+    if truncated {
+        tracing::debug!(target: "medha_lsp", "[… earlier stderr dropped …] {line}");
+    } else {
+        tracing::debug!(target: "medha_lsp", "{line}");
+    }
+}
+
 async fn reader_loop(reader: BoxReader, state: ReaderState) {
     let ReaderState {
         writer,
@@ -2754,12 +2870,14 @@ async fn reader_loop(reader: BoxReader, state: ReaderState) {
         sync_kind,
         settings,
         cancel,
+        max_frame_bytes,
+        write_timeout,
     } = state;
     let mut reader = BufReader::new(reader);
     loop {
         let message = tokio::select! {
             _ = cancel.cancelled() => break,
-            message = read_frame(&mut reader) => match message {
+            message = read_frame(&mut reader, max_frame_bytes) => match message {
                 Ok(Some(message)) => message,
                 Ok(None) | Err(_) => break,
             }
@@ -2819,8 +2937,18 @@ async fn reader_loop(reader: BoxReader, state: ReaderState) {
                 Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
             };
             if let Ok(payload) = serde_json::to_vec(&response) {
-                let mut writer = writer.lock().await;
-                if write_frame(&mut *writer, &payload).await.is_err() {
+                // The same deadline `send` applies. Replies to server-initiated
+                // requests are written from here rather than through `send`, so
+                // without it one unread reply blocks the reader loop forever —
+                // and a timeout mid-frame leaves the stream desynchronised, so
+                // the connection is retired rather than reused.
+                let written = tokio::time::timeout(write_timeout, async {
+                    let mut writer = writer.lock().await;
+                    write_frame(&mut *writer, &payload).await
+                })
+                .await;
+                if !matches!(written, Ok(Ok(()))) {
+                    alive.store(false, Ordering::Release);
                     break;
                 }
             }
@@ -2859,19 +2987,31 @@ async fn reader_loop(reader: BoxReader, state: ReaderState) {
     kill_process_group(process_group.swap(0, Ordering::AcqRel));
 }
 
-async fn read_frame<R>(reader: &mut R) -> Result<Option<Value>, Error>
+async fn read_frame<R>(reader: &mut R, max_bytes: usize) -> Result<Option<Value>, Error>
 where
     R: AsyncBufRead + Unpin,
 {
     let mut content_length = None;
+    let mut header_bytes = 0usize;
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
-            return Ok(None);
-        }
-        if line == "\r\n" || line == "\n" {
+        // Bound while reading, not after `read_line`: the latter first grows a
+        // String to the attacker's newline and only then lets us inspect it.
+        let remaining = MAX_HEADER_BYTES.saturating_sub(header_bytes);
+        let Some(line) = read_bounded_header_line(reader, remaining).await? else {
+            return if header_bytes == 0 {
+                Ok(None)
+            } else {
+                Err(Error::Protocol(
+                    "language server closed in the middle of a header".into(),
+                ))
+            };
+        };
+        header_bytes += line.len();
+        if line == b"\r\n" || line == b"\n" {
             break;
         }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| Error::Protocol("language-server header is not UTF-8".into()))?;
         if let Some((name, value)) = line.split_once(':')
             && name.eq_ignore_ascii_case("content-length")
         {
@@ -2885,11 +3025,54 @@ where
     }
     let length =
         content_length.ok_or_else(|| Error::Protocol("missing Content-Length".to_string()))?;
+    // The header is the server's word for how much to allocate. Believing it
+    // unconditionally turns one bad frame into an out-of-memory abort.
+    if length > max_bytes {
+        return Err(Error::Protocol(format!(
+            "frame of {length} bytes exceeds the {max_bytes}-byte limit"
+        )));
+    }
     let mut payload = vec![0; length];
     reader.read_exact(&mut payload).await?;
     serde_json::from_slice(&payload)
         .map(Some)
         .map_err(|error| Error::Protocol(error.to_string()))
+}
+
+/// Read one header line without ever retaining more than `max_bytes`.
+async fn read_bounded_header_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, Error>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(Error::Protocol(
+                    "language server closed in the middle of a header line".into(),
+                ))
+            };
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |at| at + 1);
+        if line.len().saturating_add(take) > max_bytes {
+            return Err(Error::Protocol("header block is too large".into()));
+        }
+        let complete = available.get(take.saturating_sub(1)) == Some(&b'\n');
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if complete {
+            return Ok(Some(line));
+        }
+    }
 }
 
 async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<(), std::io::Error>
@@ -3362,7 +3545,7 @@ fn adapter_language_id<'a>(adapter: &'a ServerAdapter, path: &Path) -> Option<&'
 pub fn server_install_dir() -> Option<PathBuf> {
     let base = std::env::var_os("MEDHA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".medha")))?;
+        .or_else(|| dirs::home_dir().map(|home| home.join(".medha")))?;
     Some(base.join("lsp"))
 }
 
@@ -3381,7 +3564,7 @@ pub fn server_on_path(program: &str) -> bool {
     }
     server_bin_dirs()
         .into_iter()
-        .any(|dir| dir.join(program).exists())
+        .any(|dir| sandbox::program_in_dir(&dir, program))
 }
 
 /// The exact command `install_server` would run, for showing a user before they
@@ -3417,7 +3600,7 @@ pub fn install_command(server: &str) -> Option<(String, Vec<String>)> {
 
 /// Fetch a server into Medha's own directory. Callers must have obtained consent
 /// first — this runs a package manager.
-pub async fn install_server(server: &str) -> Result<String, Error> {
+pub async fn install_server(server: &str, timeout: Duration) -> Result<String, Error> {
     let (program, arguments) = install_command(server)
         .ok_or_else(|| Error::Protocol(format!("no install recipe for '{server}'")))?;
     if !sandbox::program_on_path(&program) {
@@ -3429,18 +3612,55 @@ pub async fn install_server(server: &str) -> Result<String, Error> {
         server_install_dir().ok_or_else(|| Error::Protocol("no Medha home directory".into()))?;
     std::fs::create_dir_all(into.join("bin"))
         .map_err(|error| Error::Protocol(error.to_string()))?;
-    let output = tokio::process::Command::new(&program)
-        .args(&arguments)
-        // Keeps `go install` out of the user's shared GOBIN.
-        .env("GOBIN", into.join("bin"))
-        .output()
+    // Recipes share one prefix and bin directory. The in-process lock prevents
+    // two tools in this runtime from racing; the advisory file lock covers the
+    // more common case of two `medha lsp install` processes.
+    static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _serial = INSTALLING.lock().await;
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(into.join(".install.lock"))
+        .map_err(|error| Error::Protocol(format!("could not open the install lock: {error}")))?;
+    let mut process_lock = fd_lock::RwLock::new(lock_file);
+    let _exclusive = process_lock.try_write().map_err(|error| {
+        let detail = if error.kind() == std::io::ErrorKind::WouldBlock {
+            "another Medha process is already installing a language server".to_string()
+        } else {
+            format!("could not lock the language-server install directory: {error}")
+        };
+        Error::Protocol(detail)
+    })?;
+
+    let mut command = tokio::process::Command::new(&program);
+    command.args(&arguments);
+    // An installer runs arbitrary package scripts. It gets the same allowlist a
+    // language server does rather than the session's whole environment, which
+    // carries API keys and cloud credentials.
+    command.env_clear();
+    for (key, value) in language_server_environment() {
+        command.env(key, value);
+    }
+    command.env("GOBIN", into.join("bin"));
+    let output = sandbox::run_command_bounded(command, timeout, INSTALL_MAX_OUTPUT_BYTES, None)
         .await
         .map_err(|error| Error::Protocol(error.to_string()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.passed() {
+        let tail = output
+            .output
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
         return Err(Error::Protocol(format!(
             "{program} failed: {}",
-            stderr.lines().last().unwrap_or("no output")
+            if tail.is_empty() { "no output" } else { &tail }
         )));
     }
     Ok(format!("{server} installed into {}", into.display()))
@@ -3479,22 +3699,15 @@ fn language_server_environment() -> Vec<(String, String)> {
         .collect();
     // Prepend Medha's own install directory so a server installed through
     // `medha lsp install` is found without the user editing their shell PATH.
-    let extra = server_bin_dirs();
-    if !extra.is_empty() {
-        let inherited = environment
-            .iter()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| value.clone())
-            .unwrap_or_default();
-        let joined = extra
-            .iter()
-            .map(|dir| dir.to_string_lossy().into_owned())
-            .chain(std::iter::once(inherited))
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(":");
-        environment.retain(|(key, _)| key != "PATH");
-        environment.push(("PATH".into(), joined));
+    let mut paths = server_bin_dirs();
+    if let Some(inherited) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&inherited));
+    }
+    if !paths.is_empty()
+        && let Ok(joined) = std::env::join_paths(paths)
+    {
+        environment.retain(|(key, _)| !key.eq_ignore_ascii_case("PATH"));
+        environment.push(("PATH".into(), joined.to_string_lossy().into_owned()));
     }
     environment
 }
@@ -3511,11 +3724,16 @@ fn kill_process_group(group: u64) {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        let taskkill = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("System32")
+            .join("taskkill.exe");
+        let _ = std::process::Command::new(taskkill)
             .args(["/F", "/T", "/PID", &group.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .status();
     }
 }
 
@@ -3638,6 +3856,8 @@ mod tests {
             max_results,
             max_text_chars,
             max_open_documents: 64,
+            write_timeout: Duration::from_secs(30),
+            max_frame_bytes: 64 * 1024 * 1024,
         }
     }
 
@@ -3659,6 +3879,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frame_limits_apply_before_header_and_body_allocation() {
+        let mut oversized_header = vec![b'x'; MAX_HEADER_BYTES + 1];
+        oversized_header.push(b'\n');
+        let mut reader = BufReader::new(oversized_header.as_slice());
+        assert!(matches!(
+            read_frame(&mut reader, 1024).await,
+            Err(Error::Protocol(message)) if message.contains("header block")
+        ));
+
+        let frame = b"Content-Length: 1025\r\n\r\n";
+        let mut reader = BufReader::new(frame.as_slice());
+        assert!(matches!(
+            read_frame(&mut reader, 1024).await,
+            Err(Error::Protocol(message)) if message.contains("exceeds")
+        ));
+    }
+
+    #[tokio::test]
+    async fn every_write_error_retires_the_transport() {
+        let directory = tempdir().unwrap();
+        let (client_read, server_write) = duplex(1024);
+        let (client_write, server_read) = duplex(1);
+        drop(server_read);
+        let client = LspClient::from_io(
+            "broken-writer".into(),
+            directory.path().to_path_buf(),
+            fake_languages(),
+            ClientTransport {
+                reader: Box::new(client_read),
+                writer: Box::new(client_write),
+                child: None,
+            },
+            test_settings(Duration::from_millis(20), 20, 1000),
+            Value::Null,
+        );
+        let result = client
+            .send(json!({"jsonrpc": "2.0", "method": "test"}))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            !client.is_alive(),
+            "a possibly partial write must retire the stream"
+        );
+        drop(server_write);
+    }
+
+    #[tokio::test]
     async fn fresh_empty_diagnostics_are_distinct_from_no_fresh_data() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("main.rs");
@@ -3671,7 +3938,10 @@ mod tests {
             let mut server_read = BufReader::new(server_read);
             let mut configuration_answered = false;
             let mut pending_document = None;
-            while let Some(message) = read_frame(&mut server_read).await.unwrap() {
+            while let Some(message) = read_frame(&mut server_read, 64 * 1024 * 1024)
+                .await
+                .unwrap()
+            {
                 match message.get("method").and_then(Value::as_str) {
                     Some("initialize") => {
                         let id = message["id"].as_i64().unwrap();
@@ -3757,7 +4027,10 @@ mod tests {
         let (server_read, mut server_write) = split(server_stream);
         let server = tokio::spawn(async move {
             let mut server_read = BufReader::new(server_read);
-            while let Some(message) = read_frame(&mut server_read).await.unwrap() {
+            while let Some(message) = read_frame(&mut server_read, 64 * 1024 * 1024)
+                .await
+                .unwrap()
+            {
                 if message.get("method").and_then(Value::as_str) == Some("initialize") {
                     let payload = serde_json::to_vec(&json!({
                         "jsonrpc": "2.0", "id": message["id"],
@@ -3797,7 +4070,10 @@ mod tests {
         let (server_read, mut server_write) = split(server_stream);
         let server = tokio::spawn(async move {
             let mut server_read = BufReader::new(server_read);
-            while let Some(message) = read_frame(&mut server_read).await.unwrap() {
+            while let Some(message) = read_frame(&mut server_read, 64 * 1024 * 1024)
+                .await
+                .unwrap()
+            {
                 match message.get("method").and_then(Value::as_str) {
                     Some("initialize") | Some("shutdown") => {
                         let payload = serde_json::to_vec(&json!({
@@ -3835,6 +4111,8 @@ mod tests {
                 max_results: 20,
                 max_text_chars: 1000,
                 max_open_documents: 64,
+                write_timeout: Duration::from_secs(30),
+                max_frame_bytes: 64 * 1024 * 1024,
             },
             Value::Null,
         );
@@ -4324,7 +4602,10 @@ mod tests {
         let server_uri = uri.clone();
         let server = tokio::spawn(async move {
             let mut server_read = BufReader::new(server_read);
-            while let Some(message) = read_frame(&mut server_read).await.unwrap() {
+            while let Some(message) = read_frame(&mut server_read, 64 * 1024 * 1024)
+                .await
+                .unwrap()
+            {
                 let Some(method) = message.get("method").and_then(Value::as_str) else {
                     continue;
                 };
@@ -4515,6 +4796,8 @@ mod tests {
                 max_results: 20,
                 max_text_chars: 1000,
                 max_open_documents: 64,
+                write_timeout: Duration::from_secs(30),
+                max_frame_bytes: 64 * 1024 * 1024,
             },
             Value::Null,
         ));

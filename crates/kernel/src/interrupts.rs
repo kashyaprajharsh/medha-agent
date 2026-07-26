@@ -21,7 +21,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug)]
 pub enum Interrupt {
     /// Inject a user message at the next turn boundary; the session continues.
-    Steer(String),
+    /// The label says where the text came from — an operator typing is `User`,
+    /// a sub-agent's report is whatever that agent touched.
+    Steer(String, crate::types::TrustLabel),
     /// Finish in-flight work gracefully, then stop with `StopReason::Interrupted`.
     CancelTurn,
 }
@@ -42,10 +44,20 @@ pub struct InterruptHandle {
 
 impl InterruptHandle {
     pub fn steer(&self, text: impl Into<String>) {
-        let _ = self.tx.send(Interrupt::Steer(text.into()));
+        let _ = self.steer_labelled(text, crate::types::TrustLabel::User);
+    }
+
+    /// Queue text that did not come from the operator, carrying its label so a
+    /// consequential action derived from it escalates the same way a direct
+    /// observation would.
+    pub fn steer_labelled(&self, text: impl Into<String>, trust: crate::types::TrustLabel) -> bool {
+        if self.tx.send(Interrupt::Steer(text.into(), trust)).is_err() {
+            return false;
+        }
         // After the send, never before: a watcher woken by the count must find
         // the text already queued behind it.
         self.activity.send_modify(|count| *count += 1);
+        true
     }
 
     /// Request a graceful stop. Also trips the cancellation token so the
@@ -75,8 +87,16 @@ pub struct InterruptQueue {
 
 impl InterruptQueue {
     pub fn pair() -> (InterruptHandle, InterruptQueue) {
+        Self::rooted(CancellationToken::new())
+    }
+
+    /// A pair whose cancellation *is* `cancel`.
+    ///
+    /// For a caller that already owns a token for this work — a sub-agent's,
+    /// say. Tripping it then routes through the loop's own settle path, so the
+    /// run ends by returning rather than by having its future dropped.
+    pub fn rooted(cancel: CancellationToken) -> (InterruptHandle, InterruptQueue) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
         let activity = Arc::new(watch::Sender::new(0));
         (
             InterruptHandle {
@@ -111,11 +131,11 @@ impl InterruptQueue {
 
     /// Take every queued steer message, in send order. `CancelTurn` entries
     /// carry no payload (the token is the signal) and are simply consumed.
-    pub fn drain_steers(&mut self) -> Vec<String> {
+    pub fn drain_steers(&mut self) -> Vec<(String, crate::types::TrustLabel)> {
         let mut out = Vec::new();
         while let Ok(i) = self.rx.try_recv() {
-            if let Interrupt::Steer(s) = i {
-                out.push(s);
+            if let Interrupt::Steer(text, trust) = i {
+                out.push((text, trust));
             }
         }
         out
@@ -134,7 +154,10 @@ mod tests {
         assert!(!queue.cancel_requested());
         assert_eq!(
             queue.drain_steers(),
-            vec!["first".to_string(), "second".to_string()]
+            vec![
+                ("first".to_string(), crate::types::TrustLabel::User),
+                ("second".to_string(), crate::types::TrustLabel::User)
+            ]
         );
         assert!(queue.drain_steers().is_empty(), "drained once, gone");
 
@@ -143,7 +166,7 @@ mod tests {
         assert!(queue.cancel_requested(), "cancel_turn trips the token");
         assert_eq!(
             queue.drain_steers(),
-            vec!["late".to_string()],
+            vec![("late".to_string(), crate::types::TrustLabel::User)],
             "cancel entries carry no text"
         );
     }
@@ -158,7 +181,10 @@ mod tests {
         assert!(activity.has_changed().unwrap(), "a steer is activity");
         // Watching must not take the text: the queue belongs to the session
         // loop, and a watcher that consumed from it would steal its input.
-        assert_eq!(queue.drain_steers(), vec!["narrow it".to_string()]);
+        assert_eq!(
+            queue.drain_steers(),
+            vec![("narrow it".to_string(), crate::types::TrustLabel::User)]
+        );
     }
 
     #[tokio::test]

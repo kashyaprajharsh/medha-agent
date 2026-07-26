@@ -5,10 +5,21 @@ fn registry() -> Arc<AgentRegistry> {
     Arc::new(AgentRegistry::new())
 }
 
+thread_local! {
+    /// The loop side of every queue these tests create, held for the duration.
+    /// `steer` reports whether anything is listening, so dropping the receiver
+    /// would make it fail for a reason none of these tests is about.
+    static QUEUES: std::cell::RefCell<Vec<kernel::InterruptQueue>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn live() -> Live {
+    let (steer, queue) = kernel::InterruptQueue::pair();
+    QUEUES.with(|queues| queues.borrow_mut().push(queue));
     Live {
         cancel: CancellationToken::new(),
-        steer: kernel::InterruptQueue::pair().0,
+        steer,
+        budget: kernel::Budget::turns(5),
     }
 }
 
@@ -19,6 +30,8 @@ fn agent(path: &AgentPath, started_ms: u64) -> Agent {
         objective: "work".into(),
         started_ms,
         state: State::Running,
+        write: false,
+        tools: None,
     }
 }
 
@@ -146,4 +159,26 @@ fn settled_history_is_bounded() {
     assert_eq!(registry.all().len(), 2);
     assert!(registry.find(&AgentPath::root(), "agent-0").is_none());
     assert!(registry.find(&AgentPath::root(), "agent-3").is_some());
+}
+
+/// A follow-up revives a settled agent before admission can fail. Without a
+/// rollback the agent it was asked to continue is simply gone — no roster
+/// entry, nothing to retry against, and no record that it ever ran.
+#[test]
+fn a_revive_that_is_never_committed_puts_the_agent_back() {
+    let registry = registry();
+    let (path, reservation) = registry.claim(&AgentPath::root(), "writer").unwrap();
+    reservation.commit(agent(&path, 0), live());
+    registry.settled(&path, AgentStatus::Completed);
+    assert_eq!(registry.all().len(), 1);
+
+    // Admission fails after the revive — at capacity, no isolation, anything.
+    drop(registry.revive(&path).unwrap());
+
+    let found = registry.all();
+    assert_eq!(found.len(), 1, "the revived agent was lost");
+    assert_eq!(found[0].path, path);
+    assert!(!found[0].is_running(), "it should be settled again");
+    // And it is addressable, so the follow-up can be retried.
+    assert!(registry.find(&AgentPath::root(), "writer").is_some());
 }

@@ -33,6 +33,7 @@ futures.workspace = true
 async-trait.workspace = true
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+sha2 = "0.10"
 dirs = "5"
 rustyline = "14"
 # Keep crossterm pinned to the same version ratatui re-exports (PART 7) — a mismatch
@@ -48,6 +49,7 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 similar = "2"
 crossterm = { version = "0.29", features = ["event-stream"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+fd-lock = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

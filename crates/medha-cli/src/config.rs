@@ -82,7 +82,7 @@ pub struct Config {
     pub search: SearchConfig,
     /// User-scoped MCP servers (machine-local, never committed). The API key is
     /// NOT stored here — it lives in the credential store (`mcp://<id>`), and the
-    /// command references it as `${key}`, substituted at spawn.
+    /// server environment references it as `${key}`, substituted at spawn.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServer>,
 }
@@ -100,7 +100,8 @@ impl McpServer {
 }
 
 /// A user-scoped MCP server definition. Secret-free: any API key is referenced
-/// as the literal `${key}` in `command` and resolved from the credential store.
+/// as the literal `${key}` in an env value and resolved from the credential
+/// store. Command arguments may not contain it because argv is locally visible.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpServer {
     /// Local stdio server. Mutually exclusive with `url`.
@@ -138,6 +139,146 @@ pub struct McpServer {
     /// state, and a server's own "read only" annotation is a hint, not a promise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub parallel_calls: bool,
+}
+
+/// MCP add flags whose values are credentials. Shared with TUI history
+/// redaction so adding a parser spelling cannot silently create a logging leak.
+pub const MCP_SECRET_FLAGS: &[&str] = &["--key", "--bearer", "--token", "--password"];
+
+pub struct ParsedMcpAdd {
+    pub id: String,
+    pub server: McpServer,
+    pub key: Option<String>,
+}
+
+/// Parse the common `mcp add` grammar used by both the CLI and TUI. Keeping one
+/// parser prevents `--bearer=value` from being safe in one surface but persisted
+/// as an unknown command argument in the other.
+pub fn parse_mcp_add_args<I, S>(args: I) -> Result<ParsedMcpAdd>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    fn value(
+        args: &[String],
+        index: &mut usize,
+        joined: Option<&str>,
+        flag: &str,
+    ) -> Result<String> {
+        let value = match joined {
+            Some(value) => value.to_string(),
+            None => {
+                *index += 1;
+                args.get(*index)
+                    .filter(|value| !value.starts_with("--"))
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))?
+            }
+        };
+        if value.is_empty() {
+            anyhow::bail!("{flag} needs a non-empty value");
+        }
+        Ok(value)
+    }
+
+    let args: Vec<String> = args.into_iter().map(Into::into).collect();
+    let mut id = None;
+    let mut trust = "workspace".to_string();
+    let mut key = None;
+    let mut url = String::new();
+    let mut auth = String::new();
+    let mut env = BTreeMap::new();
+    let mut allow_tools = Vec::new();
+    let mut deny_tools = Vec::new();
+    let mut network = None;
+    let mut parallel_calls = false;
+    let mut command = Vec::new();
+
+    let mut index = 0;
+    while index < args.len() {
+        let raw = &args[index];
+        if raw == "--" {
+            command.extend(args[index + 1..].iter().cloned());
+            break;
+        }
+        let (flag, joined) = raw
+            .split_once('=')
+            .filter(|(flag, _)| flag.starts_with("--"))
+            .map_or((raw.as_str(), None), |(flag, value)| (flag, Some(value)));
+        match flag {
+            "--key" => key = Some(value(&args, &mut index, joined, flag)?),
+            "--url" => url = value(&args, &mut index, joined, flag)?,
+            "--bearer" => {
+                auth = "bearer".into();
+                key = Some(value(&args, &mut index, joined, flag)?);
+            }
+            "--oauth" => {
+                if joined.is_some() {
+                    anyhow::bail!("--oauth does not take a value");
+                }
+                auth = "oauth".into();
+            }
+            "--trust" => trust = value(&args, &mut index, joined, flag)?,
+            "--env" => {
+                let pair = value(&args, &mut index, joined, flag)?;
+                let (name, value) = pair
+                    .split_once('=')
+                    .filter(|(name, _)| !name.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("--env needs NAME=VALUE"))?;
+                env.insert(name.to_string(), value.to_string());
+            }
+            "--allow-tool" => allow_tools.push(value(&args, &mut index, joined, flag)?),
+            "--deny-tool" => deny_tools.push(value(&args, &mut index, joined, flag)?),
+            "--no-network" => {
+                if joined.is_some() {
+                    anyhow::bail!("--no-network does not take a value");
+                }
+                network = Some(false);
+            }
+            "--parallel" => {
+                if joined.is_some() {
+                    anyhow::bail!("--parallel does not take a value");
+                }
+                parallel_calls = true;
+            }
+            unknown if unknown.starts_with("--") => {
+                anyhow::bail!("unknown MCP option '{unknown}' (put server arguments after --)");
+            }
+            _ if mcp::is_url(raw) => url = raw.clone(),
+            _ if id.is_none() => id = Some(raw.clone()),
+            _ => command.push(raw.clone()),
+        }
+        index += 1;
+    }
+
+    let id = id
+        .or_else(|| mcp::id_from_url(&url))
+        .ok_or_else(|| anyhow::anyhow!("MCP server needs an id or URL"))?;
+    if url.is_empty() == command.is_empty() {
+        anyhow::bail!("server '{id}' needs exactly one of --url <https://…> or -- <command>");
+    }
+    if !url.is_empty() {
+        mcp::validate_remote_url(&url)?;
+    }
+    if command.iter().any(|arg| arg.contains("${key}")) {
+        anyhow::bail!("server '{id}' puts `${{key}}` in argv; use --env NAME=${{key}} instead");
+    }
+    Ok(ParsedMcpAdd {
+        id,
+        server: McpServer {
+            command,
+            url,
+            auth,
+            env,
+            trust,
+            disabled: false,
+            allow_tools,
+            deny_tools,
+            network,
+            parallel_calls,
+        },
+        key,
+    })
 }
 
 /// Persisted web-search choice. API keys are secrets and live in the credential
@@ -1293,15 +1434,6 @@ fn prefer_keychain() -> bool {
         .eq_ignore_ascii_case("keychain")
 }
 
-/// Per-process key cache. A key is fetched from the OS at most once per
-/// endpoint per run — model switches after that are instant and prompt-free.
-/// Only found keys are cached; a miss stays a cheap, silent lookup.
-fn key_cache() -> &'static std::sync::Mutex<BTreeMap<String, String>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, String>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
-}
-
 /// The default secrets file. Owner-only (0600); holds `[keys]` mapping
 /// base URL → API key.
 fn credentials_path() -> Result<PathBuf> {
@@ -1332,6 +1464,10 @@ fn write_credentials_file(path: &std::path::Path, creds: &CredentialsFile) -> Re
          # Set MEDHA_CRED_STORE=keychain to use the OS keychain instead.\n{}",
         toml::to_string_pretty(creds).context("serializing credentials")?
     );
+    // Written beside the target and renamed over it: truncating in place left a
+    // window where a crash produced an empty credentials file, taking every
+    // stored key with it. Rename is atomic on the same filesystem.
+    let temporary = path.with_extension(format!("tmp{}", std::process::id()));
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -1341,19 +1477,68 @@ fn write_credentials_file(path: &std::path::Path, creds: &CredentialsFile) -> Re
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+            .open(&temporary)
+            .with_context(|| format!("opening {}", temporary.display()))?;
         f.set_permissions(std::fs::Permissions::from_mode(0o600))
             .ok();
         f.write_all(text.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        f.sync_all().ok();
     }
     #[cfg(not(unix))]
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
-fn file_store_key(base_url: &str, key: &str) -> Result<()> {
+/// Serializes the read-modify-write on the credentials file.
+///
+/// Two writers each read the file, add their own key and write the whole thing
+/// back; without this the second silently drops the first's key. Process-local,
+/// which covers the concurrency Medha creates itself — a second Medha racing
+/// this one is rarer and costs a re-entered key rather than a corrupt file.
+fn credentials_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Run one credential-store operation under both the process mutex and an
+/// advisory cross-process lock. The stable sibling is intentional: locking
+/// `credentials.toml` itself would stop protecting anything after its atomic
+/// rename replaced the locked inode/handle.
+fn with_credentials_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _process = credentials_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("credential lock is poisoned"))?;
+    let dir = medha_home()?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("credentials.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    let mut lock = fd_lock::RwLock::new(file);
+    let _cross_process = lock
+        .write()
+        .with_context(|| format!("locking {}", path.display()))?;
+    operation()
+}
+
+/// The credentials-file read-modify-write. Every caller holds
+/// [`credentials_lock`] — the lock covers the keychain too, so store, load and
+/// purge cannot interleave across the two stores.
+fn write_key_file_locked(base_url: &str, key: &str) -> Result<()> {
     let path = credentials_path()?;
     let mut creds = read_credentials_file(&path);
     creds.keys.insert(base_url.to_string(), key.to_string());
@@ -1388,36 +1573,67 @@ pub(crate) fn store_key(base_url: &str, key: &str) -> Result<()> {
     if key.is_empty() {
         anyhow::bail!("API key cannot be empty");
     }
-    let stored = if prefer_keychain() {
-        keyring::Entry::new(KEYRING_SERVICE, base_url)
-            .and_then(|entry| entry.set_password(&key))
-            .map_err(anyhow::Error::from)
-            .or_else(|keychain_err| {
-                file_store_key(base_url, &key).map_err(|file_err| {
-                    anyhow::anyhow!(
-                        "could not store the key in the OS keychain ({keychain_err}) or \
-                         ~/.medha/credentials.toml ({file_err}); set MEDHA_API_KEY instead"
-                    )
+    // The keychain is a shared store like the file is, and a purge touches
+    // both. Serializing only the file left a store racing a delete: written to
+    // the keychain, deleted from it, then published to the cache — a credential
+    // the user removed, alive for the rest of the session.
+    with_credentials_lock(|| {
+        if prefer_keychain() {
+            keyring::Entry::new(KEYRING_SERVICE, base_url)
+                .and_then(|entry| entry.set_password(&key))
+                .map_err(anyhow::Error::from)
+                .or_else(|keychain_err| {
+                    write_key_file_locked(base_url, &key).map_err(|file_err| {
+                        anyhow::anyhow!(
+                            "could not store the key in the OS keychain ({keychain_err}) or \
+                             ~/.medha/credentials.toml ({file_err}); set MEDHA_API_KEY instead"
+                        )
+                    })
                 })
-            })
-    } else {
-        file_store_key(base_url, &key)
-    };
-    stored?;
-    if let Ok(mut cache) = key_cache().lock() {
-        cache.insert(base_url.to_string(), key);
-    }
-    Ok(())
+        } else {
+            write_key_file_locked(base_url, &key)
+        }
+    })
 }
 
 /// Credential-store id holding an MCP server's API key.
-fn mcp_key_id(id: &str) -> String {
-    format!("mcp://{id}")
+///
+/// Bound to the target as well as the name. Keyed on the id alone, editing a
+/// server's url or command to point somewhere else — same entry, new
+/// destination — silently sent the stored secret to whatever it now names.
+fn mcp_key_id(id: &str, server: &McpServer) -> String {
+    format!("mcp://{id}#{}", target_fingerprint(server))
 }
 
 /// Credential-store id holding a remote server's OAuth credentials.
-fn mcp_oauth_id(id: &str) -> String {
-    format!("mcp-oauth://{id}")
+fn mcp_oauth_id(id: &str, url: &str) -> String {
+    format!("mcp-oauth://{id}#{}", fingerprint(url.as_bytes()))
+}
+
+/// What a server points at, as a short stable digest. The full target is not
+/// used: credential ids reach the OS keychain, and a command line can carry
+/// paths the user would not expect to see listed there.
+fn target_fingerprint(server: &McpServer) -> String {
+    // Environment is part of a stdio server's destination: the same proxy
+    // command with API_BASE_URL changed points at a different recipient.
+    // Structured encoding prevents separators inside an argument from making
+    // two configurations alias.
+    let identity = if server.url.is_empty() {
+        serde_json::to_vec(&("stdio", &server.command, &server.env))
+    } else {
+        serde_json::to_vec(&("remote", &server.url))
+    }
+    .unwrap_or_default();
+    fingerprint(&identity)
+}
+
+fn fingerprint(value: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value);
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Keychain-backed persistence for remote OAuth credentials, so an authorized
@@ -1426,75 +1642,83 @@ fn mcp_oauth_id(id: &str) -> String {
 pub struct McpTokens;
 
 impl mcp::TokenStore for McpTokens {
-    fn load(&self, server: &str) -> Option<String> {
-        load_key(&mcp_oauth_id(server))
+    fn load(&self, server: &str, url: &str) -> Option<String> {
+        load_key(&mcp_oauth_id(server, url))
     }
 
-    fn save(&self, server: &str, blob: &str) {
-        if let Err(error) = store_key(&mcp_oauth_id(server), blob) {
+    fn save(&self, server: &str, url: &str, blob: &str) {
+        if let Err(error) = store_key(&mcp_oauth_id(server, url), blob) {
             tracing::warn!(target: "medha_mcp", server, %error, "could not persist MCP OAuth credentials");
         }
     }
 
-    fn clear(&self, server: &str) {
-        purge_credential(&mcp_oauth_id(server));
+    fn clear(&self, server: &str, url: &str) {
+        purge_credential(&mcp_oauth_id(server, url));
     }
 }
 
 /// Best-effort removal of one credential from every layer (cache, file, keychain).
 fn purge_credential(cred_id: &str) {
-    if let Ok(mut cache) = key_cache().lock() {
-        cache.remove(cred_id);
-    }
-    if let Ok(path) = credentials_path() {
-        let mut creds = read_credentials_file(&path);
-        if creds.keys.remove(cred_id).is_some() {
-            let _ = write_credentials_file(&path, &creds);
+    // Cache eviction inside the same lock a load takes. Evicting first and
+    // locking after let a concurrent load — which had already read the key off
+    // disk — publish it back into the cache behind this delete, resurrecting a
+    // credential the user asked to remove for the life of the process.
+    let result = with_credentials_lock(|| {
+        if let Ok(path) = credentials_path() {
+            let mut creds = read_credentials_file(&path);
+            if creds.keys.remove(cred_id).is_some() {
+                write_credentials_file(&path, &creds)?;
+            }
         }
-    }
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, cred_id) {
-        let _ = entry.delete_credential();
+        // Inside the lock too: a concurrent store must not slip a key back into
+        // the keychain between the file delete and this one.
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, cred_id) {
+            let _ = entry.delete_credential();
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        tracing::warn!(target: "medha_credentials", credential = cred_id, %error, "could not purge credential");
     }
 }
 
 /// Store an MCP server's API key in the credential store — never in `config.toml`
 /// or `medha.lock`. Empty key is a no-op (server needs no secret).
-pub fn store_mcp_key(id: &str, key: &str) -> Result<()> {
+pub fn store_mcp_key(id: &str, server: &McpServer, key: &str) -> Result<()> {
     if key.trim().is_empty() {
         return Ok(());
     }
-    store_key(&mcp_key_id(id), key)
+    store_key(&mcp_key_id(id, server), key)
 }
 
 /// True when a stored key exists for this server (display only — never returns
 /// the secret itself).
-pub fn mcp_key_present(id: &str) -> bool {
-    load_key(&mcp_key_id(id)).is_some()
+pub fn mcp_key_present(id: &str, server: &McpServer) -> bool {
+    load_key(&mcp_key_id(id, server)).is_some()
 }
 
 /// Best-effort purge of an MCP server's key from every layer (cache, credentials
 /// file, keychain) — so `mcp remove` leaves no orphaned secret behind.
-pub fn delete_mcp_key(id: &str) {
-    purge_credential(&mcp_key_id(id));
+pub fn delete_mcp_key(id: &str, server: &McpServer) {
+    purge_credential(&mcp_key_id(id, server));
     // Remote servers also hold OAuth credentials; removing the server drops both.
-    purge_credential(&mcp_oauth_id(id));
+    purge_credential(&mcp_oauth_id(id, &server.url));
 }
 
-/// Resolve a user-scoped server into a connectable definition, substituting the
-/// literal `${key}` in the command/env with the stored secret at spawn time.
+/// Resolve a user-scoped server into a connectable definition. The MCP host
+/// substitutes `${key}` only in explicit environment values at spawn time.
 pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
-    let key = load_key(&mcp_key_id(id));
-    let sub = |value: &str| match &key {
-        Some(secret) => value.replace("${key}", secret),
-        None => value.to_string(),
-    };
+    let key = load_key(&mcp_key_id(id, server));
+    // The placeholder is left in the transport and resolved by the host at
+    // spawn time. Substituting here put the live secret into approval previews;
+    // substituting in argv would also expose it to local process inspection.
     let transport = if server.url.is_empty() {
         mcp::Transport::Stdio {
-            command: server.command.iter().map(|arg| sub(arg)).collect(),
+            command: server.command.clone(),
             env: server
                 .env
                 .iter()
-                .map(|(k, v)| (k.clone(), sub(v)))
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         }
     } else {
@@ -1523,6 +1747,7 @@ pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
             deny: server.deny_tools.clone(),
         },
         parallel_calls: server.parallel_calls,
+        secret: key,
     }
 }
 
@@ -1547,28 +1772,24 @@ fn normalize_api_key(value: &str) -> String {
 /// keychain-first build: it is migrated into the credentials file, so the OS
 /// prompt that read may have cost is paid at most once, ever.
 fn load_key(base_url: &str) -> Option<String> {
-    if let Ok(cache) = key_cache().lock() {
-        if let Some(hit) = cache.get(base_url) {
-            return Some(hit.clone());
-        }
-    }
-    let found = if prefer_keychain() {
-        keychain_load_key(base_url).or_else(|| file_load_key(base_url))
-    } else {
-        file_load_key(base_url).or_else(|| {
-            let legacy = keychain_load_key(base_url);
-            if let Some(key) = &legacy {
-                let _ = file_store_key(base_url, key);
-            }
-            legacy
+    // Do not retain a process-local secret cache: another Medha process can
+    // remove a key, and no advisory file lock can invalidate a value already
+    // copied into this process. Reads are serialized with store/purge instead.
+    with_credentials_lock(|| {
+        Ok(if prefer_keychain() {
+            keychain_load_key(base_url).or_else(|| file_load_key(base_url))
+        } else {
+            file_load_key(base_url).or_else(|| {
+                let legacy = keychain_load_key(base_url);
+                if let Some(key) = &legacy {
+                    let _ = write_key_file_locked(base_url, key);
+                }
+                legacy
+            })
         })
-    };
-    if let Some(key) = &found {
-        if let Ok(mut cache) = key_cache().lock() {
-            cache.insert(base_url.to_string(), key.clone());
-        }
-    }
-    found
+    })
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]

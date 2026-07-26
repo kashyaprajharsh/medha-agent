@@ -204,12 +204,14 @@ async fn read_frame(
 /// `message.send` arriving mid-turn becomes a STEER (injected at the next
 /// turn boundary); `cancel`/`interrupt` stops gracefully via the kernel's
 /// interrupt handle (in-flight tools settle; never a mid-tool kill).
+#[allow(clippy::too_many_arguments)]
 pub async fn run<P, L>(
     kernel: Arc<Kernel<P, L>>,
     session: Session,
     system: String,
     model: String,
-    budget: Budget,
+    base_budget: Budget,
+    agent_budget: kernel::BudgetHandle,
     writer: Arc<Writer>,
     pending: Pending,
 ) -> anyhow::Result<()>
@@ -279,7 +281,10 @@ where
                         let kernel = kernel.clone();
                         let session = session.clone();
                         let messages = transcript.clone();
-                        let budget = budget.clone();
+                        // One editor message starts one task. Publish its fresh
+                        // pool before the turn so descendants share this task,
+                        // not the spend accumulated by an earlier message.
+                        let budget = crate::task_budget(&base_budget, &agent_budget);
                         let writer = writer.clone();
                         let done_tx = done_tx.clone();
                         tokio::spawn(async move {

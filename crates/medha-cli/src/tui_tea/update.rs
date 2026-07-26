@@ -1003,15 +1003,15 @@ pub(super) fn handle_key<P, L>(
             // failed. Two keys rather than a prompt, so the override is a
             // deliberate act and never a reflex Enter on a confirmation.
             KeyCode::Char(key @ ('a' | 'A')) if matches!(&picker.kind, PickerKind::Agents(_)) => {
-                let session = match &picker.kind {
+                let dispatch = match &picker.kind {
                     PickerKind::Agents(rows) => match rows.get(picker.selected) {
-                        Some(AgentRow::Patch { session, .. }) => Some(session.clone()),
+                        Some(AgentRow::Patch { dispatch, .. }) => Some(dispatch.clone()),
                         _ => None,
                     },
                     _ => None,
                 };
-                match session {
-                    Some(session) => agents_apply_patch(model, &session, key == 'A', tx),
+                match dispatch {
+                    Some(dispatch) => agents_apply_patch(model, &dispatch, key == 'A', tx),
                     // Say what this row *can* do rather than only what it
                     // cannot — a running agent has a transcript to watch, which
                     // is usually what someone reaching for a key here wants.
@@ -1024,15 +1024,15 @@ pub(super) fn handle_key<P, L>(
             // Enter on a patch row shows the diff, so applying is never a blind
             // choice between two words on a row.
             KeyCode::Enter | KeyCode::Right if matches!(&picker.kind, PickerKind::Agents(_)) => {
-                let session = match &picker.kind {
+                let dispatch = match &picker.kind {
                     PickerKind::Agents(rows) => match rows.get(picker.selected) {
-                        Some(AgentRow::Patch { session, .. }) => Some(session.clone()),
+                        Some(AgentRow::Patch { dispatch, .. }) => Some(dispatch.clone()),
                         _ => None,
                     },
                     _ => None,
                 };
-                match session {
-                    Some(session) => agents_view_patch(model, &session, tx),
+                match dispatch {
+                    Some(dispatch) => agents_view_patch(model, &dispatch, tx),
                     // No diff on this row — but a running or finished child has
                     // a live transcript, and "what is it actually doing" is the
                     // question the panel gets asked most. Stop-or-nothing was
@@ -1594,7 +1594,11 @@ pub(super) fn handle_key<P, L>(
                 let line = std::mem::take(&mut model.input);
                 model.cursor = 0;
                 model.ac_sel = 0;
-                model.history.push(line.clone());
+                // Redacted, not dropped: the command stays recallable with ↑,
+                // but the token does not sit in the scrollback. It is already
+                // in the keychain, so a second copy is only somewhere to leak
+                // from.
+                model.history.push(redact_secrets(&line));
                 model.history_idx = None;
                 let cmd = line.trim_start_matches('/').trim();
                 dispatch_slash(model, cmd, kernel, session, transcript, tx);
@@ -2291,7 +2295,15 @@ pub(super) fn handle_agent_event(
         // A past session's events were replayed — swap session id, rebuild the
         // transcript (keeping the system message at [0]), and repaint the items.
         TuiEvent::Resumed(id, msgs, memory_events) => {
+            // The replay is async, so a turn can have started since `/resume`
+            // was accepted. Swapping the transcript under it would have the
+            // running turn write its result back over the resumed session.
+            if model.running {
+                model.push_notice("(resume dropped — a turn started while it was loading)");
+                return;
+            }
             session.id = id;
+            adopt_session(model, id);
             // Preserve transcript[0] (the system prompt); replace the rest.
             let mut system = transcript
                 .first()
@@ -2441,6 +2453,7 @@ pub(super) fn handle_agent_event(
             };
             if let Some(id) = new_id {
                 session.id = id;
+                adopt_session(model, id);
                 let mut system = transcript
                     .first()
                     .cloned()
@@ -2818,83 +2831,56 @@ fn open_mcp_picker(model: &mut Model) {
     model.picker = Some(Picker::new(PickerKind::Mcp(rows)));
 }
 
+/// Redact the credential flags exported by the shared CLI/TUI MCP parser. A
+/// single list prevents parser and history behavior from drifting apart.
+/// `line` with every credential value replaced.
+///
+/// Command history is recalled with ↑ and rendered in the scrollback, so a
+/// pasted token would otherwise stay on screen for the rest of the session.
+/// Both spellings are covered: `--bearer TOKEN` and `--bearer=TOKEN`.
+fn redact_secrets(line: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut redact_next = false;
+    for word in line.split_whitespace() {
+        if std::mem::take(&mut redact_next) {
+            out.push("<redacted>".into());
+            continue;
+        }
+        match word.split_once('=') {
+            Some((flag, _)) if config::MCP_SECRET_FLAGS.contains(&flag) => {
+                out.push(format!("{flag}=<redacted>"));
+            }
+            _ => {
+                redact_next = config::MCP_SECRET_FLAGS.contains(&word);
+                out.push(word.to_string());
+            }
+        }
+    }
+    out.join(" ")
+}
+
 /// `/mcp add <id> --url <https://…> [--oauth | --bearer T]` for a hosted server,
 /// or `/mcp add <id> [--key K] [--trust trusted] [--env K=V] [--allow-tool P]
 /// [--deny-tool P] [--no-network] [--parallel] -- <command>` for a local one.
 /// Saves to `~/.medha/config.toml` (secrets → credential store), then connects live.
 fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
-    let mut id = None;
-    let mut trust = "workspace".to_string();
-    let mut key: Option<String> = None;
-    let mut url = String::new();
-    let mut auth = String::new();
-    let mut env = std::collections::BTreeMap::new();
-    let mut allow_tools: Vec<String> = Vec::new();
-    let mut deny_tools: Vec<String> = Vec::new();
-    let mut network = None;
-    let mut parallel_calls = false;
-    let mut command: Vec<String> = Vec::new();
-    let mut it = args.split_whitespace();
-    while let Some(token) = it.next() {
-        match token {
-            "--key" => key = it.next().map(str::to_string),
-            "--url" => url = it.next().unwrap_or_default().to_string(),
-            "--bearer" => {
-                auth = "bearer".into();
-                key = it.next().map(str::to_string);
-            }
-            "--oauth" => auth = "oauth".into(),
-            "--trust" => trust = it.next().unwrap_or("workspace").to_string(),
-            "--env" => {
-                if let Some((k, v)) = it.next().and_then(|kv| kv.split_once('=')) {
-                    env.insert(k.to_string(), v.to_string());
-                }
-            }
-            "--allow-tool" => allow_tools.extend(it.next().map(str::to_string)),
-            "--deny-tool" => deny_tools.extend(it.next().map(str::to_string)),
-            "--no-network" => network = Some(false),
-            "--parallel" => parallel_calls = true,
-            "--" => command.extend(it.by_ref().map(str::to_string)),
-            // A pasted URL is the server, wherever it appears — the id is
-            // derived from it when not given.
-            _ if mcp::is_url(token) => url = token.to_string(),
-            _ if id.is_none() => id = Some(token.to_string()),
-            _ => command.push(token.to_string()),
+    let parsed = match config::parse_mcp_add_args(args.split_whitespace().map(str::to_string)) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            model.push_notice(format!("mcp add: {error}"));
+            return;
         }
-    }
-    let (Some(id), false) = (
-        id.or_else(|| mcp::id_from_url(&url)),
-        url.is_empty() && command.is_empty(),
-    ) else {
-        model.push_notice(
-            "usage: /mcp add https://…   ·   /mcp add <id> https://…   ·   /mcp add <id> -- <command>",
-        );
-        return;
     };
-    if !url.is_empty()
-        && let Err(error) = mcp::validate_remote_url(&url)
-    {
-        model.push_notice(format!("mcp add: {error}"));
-        return;
-    }
+    let (id, server, key) = (parsed.id, parsed.server, parsed.key);
+    let url = server.url.clone();
+    // After the definition exists: the credential is filed against what this
+    // server points at, so the target has to be known first.
     if let Some(k) = &key
-        && let Err(error) = config::store_mcp_key(&id, k)
+        && let Err(error) = config::store_mcp_key(&id, &server, k)
     {
         model.push_notice(format!("mcp add: could not store key: {error}"));
         return;
     }
-    let server = config::McpServer {
-        command,
-        disabled: false,
-        url: url.clone(),
-        auth,
-        env,
-        trust,
-        allow_tools,
-        deny_tools,
-        network,
-        parallel_calls,
-    };
     let mut cfg = config::load().ok().flatten().unwrap_or_default();
     cfg.mcp.insert(id.clone(), server.clone());
     if let Err(error) = config::save(&cfg) {
@@ -2969,12 +2955,12 @@ fn open_agents_picker(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
 /// the list goes from "act now" to "waiting on you" to "for reference".
 fn agent_rows(
     control: &orchestrator::AgentControl,
-    outstanding: Vec<(String, String, orchestrator::Patch)>,
+    outstanding: Vec<orchestrator::Pending>,
     idle: &std::collections::HashMap<String, Option<u64>>,
 ) -> Vec<AgentRow> {
     let waiting: Vec<String> = outstanding
         .iter()
-        .map(|(_, session, _)| session.clone())
+        .map(|pending| pending.session.clone())
         .collect();
     let (running, settled): (Vec<_>, Vec<_>) = control
         .agents()
@@ -2985,12 +2971,16 @@ fn agent_rows(
         .partition(orchestrator::Agent::is_running);
 
     let mut rows: Vec<AgentRow> = branched(running, idle);
-    for (agent, session, patch) in outstanding {
+    for pending in outstanding {
         rows.push(AgentRow::Patch {
-            agent,
-            session,
-            files: patch.files.len(),
-            verified: patch.verification.as_ref().map(|evidence| evidence.passed),
+            agent: pending.agent,
+            dispatch: pending.dispatch,
+            files: pending.patch.files.len(),
+            verified: pending
+                .patch
+                .verification
+                .as_ref()
+                .map(|evidence| evidence.passed),
         });
     }
     // History reads newest-first, so it is a list rather than a tree — the
@@ -3051,19 +3041,26 @@ fn branched(
 ///
 /// Applying without reading is the failure this panel exists to prevent, so
 /// viewing is one keystroke and never requires asking the model to fetch it.
-fn agents_view_patch(model: &mut Model, session: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+fn agents_view_patch(model: &mut Model, patch_id: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let Some(control) = model.agents.clone() else {
         return;
     };
     model.picker = None;
-    let (session, tx) = (session.to_string(), tx.clone());
+    let (patch_id, tx) = (patch_id.to_string(), tx.clone());
     tokio::spawn(async move {
-        let Some(patch) = control.patch(&session).await else {
+        let Some(pending) = control.pending(&patch_id).await else {
             let _ = tx.send(TuiEvent::AgentPatchAction(Err(
                 "that patch is no longer available".into(),
             )));
             return;
         };
+        if pending.dispatch != patch_id {
+            let _ = tx.send(TuiEvent::AgentPatchAction(Err(
+                "that patch reference is ambiguous; reopen /agents".into(),
+            )));
+            return;
+        }
+        let patch = pending.patch;
         let evidence = match &patch.verification {
             Some(v) if v.passed => format!("`{}` passed", v.command),
             Some(v) => format!("`{}` FAILED\n{}", v.command, v.output),
@@ -3080,7 +3077,8 @@ fn agents_view_patch(model: &mut Model, session: &str, tx: &mpsc::UnboundedSende
             .collect::<Vec<_>>()
             .join("\n");
         let _ = tx.send(TuiEvent::AgentPatchAction(Ok(format!(
-            "patch from '{session}' — {evidence}\n\n{body}{}",
+            "patch {patch_id} from '{}' — {evidence}\n\n{body}{}",
+            pending.agent,
             match total.saturating_sub(MAX_LINES) {
                 0 => String::new(),
                 n => format!("\n… {n} more line(s)"),
@@ -3166,7 +3164,7 @@ fn agents_followup<P, L>(
     // Resuming *runs* the agent, so it cannot happen on the keystroke.
     tokio::spawn(async move {
         let notice = control
-            .followup(&caller, &id, &text, executor, DEFAULT_FOLLOWUP_TURNS)
+            .followup(&caller, &id, &text, executor, followup_budget(&control))
             .await
             .map(|agent| {
                 format!(
@@ -3183,6 +3181,15 @@ fn agents_followup<P, L>(
 /// pass, not a fresh investigation, so this is deliberately below `[agents]
 /// max_turns` — a follow-up that ran as long as the original would be a re-run.
 const DEFAULT_FOLLOWUP_TURNS: u32 = 30;
+
+/// A follow-up gets its own turns but the tree's remaining spend.
+fn followup_budget(control: &orchestrator::AgentControl) -> kernel::Budget {
+    let mut budget = control.root_budget().with_fresh_pool();
+    let ceiling = budget.max_turns.unwrap_or(DEFAULT_FOLLOWUP_TURNS);
+    budget.max_turns = Some(DEFAULT_FOLLOWUP_TURNS.min(ceiling));
+    control.publish_budget(budget.clone());
+    budget
+}
 
 /// `/steer <agent> <text>` — correct a running agent without killing it.
 ///
@@ -3306,27 +3313,36 @@ fn agents_view_transcript(model: &mut Model, session: &str, tx: &mpsc::Unbounded
 /// reconciliation, and no keystroke should be able to override that.
 fn agents_apply_patch(
     model: &mut Model,
-    session: &str,
+    patch_id: &str,
     force: bool,
     tx: &mpsc::UnboundedSender<TuiEvent>,
 ) {
     let Some(control) = model.agents.clone() else {
         return;
     };
-    let (session, tx) = (session.to_string(), tx.clone());
+    let (patch_id, tx) = (patch_id.to_string(), tx.clone());
     // Off the UI thread: applying runs git, and a keystroke handler that waits
     // on a subprocess freezes the interface at best.
     tokio::spawn(async move {
-        let Some(patch) = control.patch(&session).await else {
+        let Some(pending) = control.pending(&patch_id).await else {
             let _ = tx.send(TuiEvent::AgentPatchAction(Err(
                 "that patch is no longer available".into(),
             )));
             return;
         };
+        if pending.dispatch != patch_id {
+            let _ = tx.send(TuiEvent::AgentPatchAction(Err(
+                "that patch reference is ambiguous; reopen /agents".into(),
+            )));
+            return;
+        }
+        let patch = &pending.patch;
         let files = patch.files.join(", ");
-        let outcome = match control.merge(&patch, force).await {
+        let outcome = match control.merge(patch, force).await {
             Ok(_) => {
-                control.forget(&session).await;
+                // The handout that was applied, not every handout this session
+                // produced: a follow-up reuses the session.
+                control.forget(&pending.dispatch).await;
                 let caveat = match (patch.verification.is_some(), force) {
                     (_, true) => " — applied over a failing build",
                     (false, _) => " — nothing was run against this patch",
@@ -3659,19 +3675,30 @@ fn mcp_set_tool(model: &mut Model, id: &str, tool: &str, expose: bool) {
 /// live host, then reopen the picker.
 fn mcp_remove(model: &mut Model, id: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let mut cfg = config::load().ok().flatten().unwrap_or_default();
-    if cfg.mcp.remove(id).is_some() {
-        let _ = config::save(&cfg);
-        config::delete_mcp_key(id);
+    let Some(removed) = cfg.mcp.remove(id) else {
+        model.push_notice(format!("no MCP server '{id}'"));
+        return;
+    };
+    if let Err(error) = config::save(&cfg) {
+        model.push_notice(format!("mcp: could not save config.toml: {error}"));
+        return;
     }
     if let Some(manager) = model.mcp.clone() {
         let id = id.to_string();
+        let removed = removed.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
+            // Supersede any browser authorization before purging. Purging first
+            // let the still-live OAuth flow save its token immediately after the
+            // delete and resurrect a removed server's credential.
             let _ = manager.remove_server(&id).await;
+            config::delete_mcp_key(&id, &removed);
             let _ = tx.send(TuiEvent::McpStatus(Ok(
                 serde_json::json!({ "servers": manager.status().await }),
             )));
         });
+    } else {
+        config::delete_mcp_key(id, &removed);
     }
     model.push_notice(format!("removed MCP server '{id}'"));
     open_mcp_picker(model);
@@ -4069,7 +4096,14 @@ pub(super) fn spawn_turn<P, L>(
     let mut session = session.clone();
     session.autonomy = model.autonomy;
     let mut messages = transcript.clone();
-    let budget = budget.clone();
+    // A turn is a task, so it gets its own pool: the token, cost and wall-clock
+    // ceilings are per task, and carrying one tally across a whole session
+    // would exhaust them and never recover. Published so this turn's sub-agents
+    // spend against the same tally rather than each getting the full ceiling.
+    let budget = budget.clone().with_fresh_pool();
+    if let Some(control) = &model.agents {
+        control.publish_budget(budget.clone());
+    }
     let tx = tx.clone();
     let agents = model.agents.clone();
     // A turn nobody typed exists only to deliver reports. If none are left by
@@ -4083,9 +4117,11 @@ pub(super) fn spawn_turn<P, L>(
         // Reports from background agents, delivered at the head of the turn.
         // Collecting here rather than on completion is what makes delivery
         // survive a restart: the outbox holds them until their owner next runs.
+        let mut taken: Vec<orchestrator::AgentResult> = Vec::new();
         if let Some(control) = &agents {
             for result in control.collect(session.id).await {
                 collected += 1;
+                taken.push(result.clone());
                 // Bound it: a background report reaches context directly, without
                 // the tool layer's cap, so a long one would otherwise arrive
                 // whole and crowd out the conversation it was meant to serve.
@@ -4106,17 +4142,23 @@ pub(super) fn spawn_turn<P, L>(
                         None => "\n… report truncated".to_string(),
                     });
                 }
-                messages.push(Message::new(
-                    kernel::Role::User,
-                    format!(
-                        "[background agent '{}' finished — {}]\n{}",
-                        result.agent,
-                        serde_json::to_string(&result.status)
-                            .unwrap_or_default()
-                            .trim_matches('"'),
-                        summary
-                    ),
-                ));
+                // Carrying the child's label: this is not the user speaking, and
+                // a report built from web content must escalate what the parent
+                // does next exactly as a direct fetch would.
+                messages.push(
+                    Message::new(
+                        kernel::Role::User,
+                        format!(
+                            "[background agent '{}' finished — {}]\n{}",
+                            result.agent,
+                            serde_json::to_string(&result.status)
+                                .unwrap_or_default()
+                                .trim_matches('"'),
+                            summary
+                        ),
+                    )
+                    .carrying(result.trust),
+                );
             }
         }
         if needs_a_report && collected == 0 {
@@ -4132,9 +4174,18 @@ pub(super) fn spawn_turn<P, L>(
             .await
         {
             Ok((updated, reason)) => {
+                // Acknowledged only now. `run_session` logs the reports as part
+                // of the turn, so this is the first point at which they survive
+                // a restart; acknowledging at collection time lost every report
+                // in flight whenever the turn that took them then failed.
+                if let Some(control) = &agents {
+                    control.settle(session.id, &taken).await;
+                }
                 let _ = tx.send(TuiEvent::Done(updated, reason));
             }
             Err(e) => {
+                // Left undelivered on purpose: they arrive again next turn.
+                // Delivery is at-least-once, so a repeat beats silent loss.
                 let _ = tx.send(TuiEvent::Error(e.to_string()));
             }
         }
@@ -4318,6 +4369,15 @@ fn handle_reasoning_picker_key<P: kernel::Provider>(
     true
 }
 
+/// Re-point the agent tree at the session the surface now holds. The handle is
+/// shared with the tool registry, so a child spawned after this addresses its
+/// report and its patch to the session that will actually collect them.
+fn adopt_session(model: &Model, session: ulid::Ulid) {
+    if let Some(control) = &model.agents {
+        control.adopt(session);
+    }
+}
+
 /// `/clear`: reset the conversation for real. Clearing only the rendered items
 /// (as `run_slash` used to) left the full prior history in `transcript`, so the
 /// very next turn re-shipped everything to the model. Truncate the transcript to
@@ -4336,6 +4396,7 @@ fn do_clear(model: &mut Model, session: &mut Session, transcript: &mut Vec<Messa
     transcript.clear();
     transcript.push(system);
     *session = Session::new();
+    adopt_session(model, session.id);
     model.items.clear();
     model.reasoning_received_this_turn = false;
     model.last_turn_reasoning_received = None;
@@ -5364,6 +5425,24 @@ mod fix_tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn a_pasted_token_never_reaches_command_history() {
+        let recalled = redact_secrets("/mcp add gh https://x/mcp --bearer sk-live-abc123");
+        assert!(!recalled.contains("sk-live-abc123"), "{recalled}");
+        assert_eq!(
+            recalled, "/mcp add gh https://x/mcp --bearer <redacted>",
+            "the command stays recallable, only the value goes"
+        );
+        assert_eq!(redact_secrets("/mcp list"), "/mcp list");
+        // A flag with nothing after it must not redact into the next command.
+        assert_eq!(redact_secrets("/mcp add gh --key"), "/mcp add gh --key");
+        // The joined spelling is the same secret.
+        assert_eq!(
+            redact_secrets("/mcp add gh --bearer=sk-live-abc"),
+            "/mcp add gh --bearer=<redacted>"
+        );
+    }
+
     fn model() -> Model {
         let dir = std::env::temp_dir().join(format!("medha-upd-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6103,6 +6182,8 @@ mod agent_tree_tests {
             objective: "work".into(),
             started_ms: 0,
             state: orchestrator::State::Running,
+            write: false,
+            tools: None,
         }
     }
 

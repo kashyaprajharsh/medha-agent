@@ -17,6 +17,13 @@ pub struct Agent {
     pub objective: String,
     pub started_ms: u64,
     pub state: State,
+    /// The capabilities this agent was admitted with, kept so a follow-up
+    /// resumes the same agent rather than a differently-privileged one wearing
+    /// its name. Not part of the listing the model reads.
+    #[serde(skip)]
+    pub write: bool,
+    #[serde(skip)]
+    pub tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -36,6 +43,9 @@ impl Agent {
 pub(crate) struct Live {
     pub(crate) cancel: CancellationToken,
     pub(crate) steer: kernel::InterruptHandle,
+    /// What this agent was admitted with, so its own children inherit its
+    /// ceilings and its pool rather than the root's.
+    pub(crate) budget: kernel::Budget,
 }
 
 #[derive(Default)]
@@ -105,6 +115,7 @@ impl AgentRegistry {
             Reservation {
                 registry: Arc::clone(self),
                 path: Some(path),
+                restore: None,
             },
         ))
     }
@@ -118,12 +129,17 @@ impl AgentRegistry {
             Some(_) => return Err(Error::NameTaken(path.to_string())),
             None => return Err(Error::UnknownAgent(path.to_string())),
         }
-        tree.agents.remove(path);
+        // Held for the reservation's lifetime: a follow-up that then fails
+        // admission — at capacity, no isolation for a writer — would otherwise
+        // have deleted the agent it was asked to continue, leaving nothing to
+        // retry against and no record that it ever existed.
+        let previous = tree.agents.remove(path);
         tree.settled.retain(|settled| settled != path);
         tree.reserved.insert(path.clone());
         Ok(Reservation {
             registry: Arc::clone(self),
             path: Some(path.clone()),
+            restore: previous,
         })
     }
 
@@ -197,18 +213,51 @@ impl AgentRegistry {
         }
     }
 
+    /// The live cancellation token of a running agent, so a child can be
+    /// derived from its own parent rather than from the root of the tree.
+    pub(crate) fn token(&self, path: &AgentPath) -> Option<CancellationToken> {
+        self.lock().live.get(path).map(|live| live.cancel.clone())
+    }
+
+    /// A running agent's own budget, for sizing the children it spawns.
+    pub(crate) fn budget(&self, path: &AgentPath) -> Option<kernel::Budget> {
+        self.lock().live.get(path).map(|live| live.budget.clone())
+    }
+
     /// Watch what is being queued against `path`'s own session.
     pub(crate) fn activity(&self, path: &AgentPath) -> Option<kernel::Activity> {
         self.lock().live.get(path).map(|live| live.steer.activity())
     }
 
     pub(crate) fn steer(&self, path: &AgentPath, text: &str) -> bool {
+        self.steer_labelled(path, text, kernel::TrustLabel::User)
+    }
+
+    /// Queue text that did not come from the operator — a child's report above
+    /// all — so its label reaches the receiving session's taint window.
+    pub(crate) fn steer_labelled(
+        &self,
+        path: &AgentPath,
+        text: &str,
+        trust: kernel::TrustLabel,
+    ) -> bool {
         match self.lock().live.get(path) {
-            Some(live) => {
-                live.steer.steer(text);
-                true
-            }
+            Some(live) => live.steer.steer_labelled(text, trust),
             None => false,
+        }
+    }
+
+    /// Undo an admission whose durable dispatch could not be written. No child
+    /// has started yet, so removing its live entry is lossless; a failed
+    /// follow-up restores the settled agent it displaced.
+    pub(crate) fn rollback_start(&self, path: &AgentPath, restore: Option<Agent>) {
+        let mut tree = self.lock();
+        tree.live.remove(path);
+        tree.agents.remove(path);
+        tree.settled.retain(|settled| settled != path);
+        if let Some(agent) = restore {
+            tree.settled.push(path.clone());
+            tree.agents.insert(path.clone(), agent);
         }
     }
 
@@ -224,19 +273,32 @@ impl AgentRegistry {
 pub(crate) struct Reservation {
     registry: Arc<AgentRegistry>,
     path: Option<AgentPath>,
+    /// The settled agent a revive took off the roster, put back if the
+    /// reservation is dropped without being committed.
+    restore: Option<Agent>,
 }
 
 impl Reservation {
     pub(crate) fn commit(mut self, agent: Agent, live: Live) {
         self.path = None;
+        self.restore = None;
         self.registry.started(agent, live);
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            self.registry.lock().reserved.remove(&path);
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        let mut tree = self.registry.lock();
+        tree.reserved.remove(&path);
+        // Uncommitted: whatever this reservation displaced goes back, or a
+        // failed follow-up silently destroys the agent it meant to resume.
+        if let Some(agent) = self.restore.take() {
+            tree.settled.retain(|settled| settled != &path);
+            tree.settled.push(path.clone());
+            tree.agents.insert(path, agent);
         }
     }
 }

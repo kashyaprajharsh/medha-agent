@@ -2541,6 +2541,10 @@ enum SlashAction {
     Agents,
     /// `/steer <agent> <text>` — send further instruction to a running agent.
     Steer(String),
+    /// `/followup <agent> <text>` — more work for an agent, finished or not.
+    Followup(String),
+    /// `/tree` — the whole agent tree, settled ones included.
+    Tree,
     /// `/mcp start <id>` — approve and connect a configured MCP server.
     McpStart(String),
     /// `/mcp add <id> [--trust trusted] [--env K=V] -- <command>` — add + connect.
@@ -2589,6 +2593,10 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "lsp" => SlashAction::Lsp,
         "mcp" => SlashAction::Mcp,
         "agents" => SlashAction::Agents,
+        "tree" => SlashAction::Tree,
+        c if c.strip_prefix("followup").is_some_and(is_cmd_boundary) => {
+            SlashAction::Followup(c.strip_prefix("followup").unwrap_or("").trim().to_string())
+        }
         c if c.strip_prefix("steer").is_some_and(is_cmd_boundary) => {
             SlashAction::Steer(c.strip_prefix("steer").unwrap_or("").trim().to_string())
         }
@@ -2702,6 +2710,8 @@ fn dispatch_slash<P, L>(
         SlashAction::Mcp => open_mcp_picker(model),
         SlashAction::Agents => open_agents_picker(model, tx),
         SlashAction::Steer(rest) => agents_steer(model, &rest),
+        SlashAction::Followup(rest) => agents_followup(model, &rest, kernel, session, tx),
+        SlashAction::Tree => show_agent_tree(model),
         SlashAction::McpStart(id) => start_mcp_server(kernel, &id, tx),
         SlashAction::McpAdd(args) => mcp_add(model, &args, tx),
         SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
@@ -2974,13 +2984,7 @@ fn agent_rows(
         .filter(|agent| agent.is_running() || !waiting.contains(&agent.session))
         .partition(orchestrator::Agent::is_running);
 
-    let row = |agent: orchestrator::Agent| AgentRow::Agent {
-        // Absent from the map reads the same as nothing recorded yet — both
-        // mean no answer, and neither should be shown as a stall.
-        idle_ms: idle.get(&agent.session).copied().flatten(),
-        agent,
-    };
-    let mut rows: Vec<AgentRow> = running.into_iter().map(row).collect();
+    let mut rows: Vec<AgentRow> = branched(running, idle);
     for (agent, session, patch) in outstanding {
         rows.push(AgentRow::Patch {
             agent,
@@ -2989,8 +2993,58 @@ fn agent_rows(
             verified: patch.verification.as_ref().map(|evidence| evidence.passed),
         });
     }
-    rows.extend(settled.into_iter().rev().map(row));
+    // History reads newest-first, so it is a list rather than a tree — the
+    // question there is "what happened", not "who owns whom".
+    let mut history = settled;
+    history.reverse();
+    rows.extend(history.into_iter().map(|agent| AgentRow::Agent {
+        idle_ms: idle.get(&agent.session).copied().flatten(),
+        agent,
+        branch: String::new(),
+    }));
     rows
+}
+
+/// Order agents so a child sits under its parent, with the branch each row
+/// needs to draw.
+///
+/// Sorting by path is the whole tree walk: `/survey` < `/survey/parse` <
+/// `/writer` orders depth-first, parents before their own children, with no
+/// recursion and no parent lookup.
+fn branched(
+    mut agents: Vec<orchestrator::Agent>,
+    idle: &std::collections::HashMap<String, Option<u64>>,
+) -> Vec<AgentRow> {
+    agents.sort_by(|a, b| a.path.cmp(&b.path));
+    let depths: Vec<u32> = agents.iter().map(|agent| agent.path.depth()).collect();
+    agents
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| {
+            let depth = depths[index];
+            // The last child of a parent is whichever has no later sibling
+            // before the tree pops back above this depth.
+            let has_sibling_below = depths[index + 1..]
+                .iter()
+                .take_while(|below| **below >= depth)
+                .any(|below| *below == depth);
+            let branch = match depth {
+                0 | 1 => String::new(),
+                _ => format!(
+                    "{}{} ",
+                    "  ".repeat(depth as usize - 2),
+                    if has_sibling_below { "├" } else { "└" }
+                ),
+            };
+            AgentRow::Agent {
+                // Absent from the map reads the same as nothing recorded yet —
+                // both mean no answer, and neither should be shown as a stall.
+                idle_ms: idle.get(&agent.session).copied().flatten(),
+                agent: agent.clone(),
+                branch,
+            }
+        })
+        .collect()
 }
 
 /// Show a writer's patch in the transcript.
@@ -3034,6 +3088,101 @@ fn agents_view_patch(model: &mut Model, session: &str, tx: &mpsc::UnboundedSende
         ))));
     });
 }
+
+/// `/tree` — the whole agent tree, settled ones included.
+///
+/// The panel shows what is outstanding; this shows what *happened*. A finished
+/// agent's address is what `/followup` and `agent.apply` need, and until now
+/// there was nowhere to read one once it left the panel.
+fn show_agent_tree(model: &mut Model) {
+    let Some(control) = model.agents.clone() else {
+        model.push_notice("sub-agents are not enabled in this session");
+        return;
+    };
+    let mut agents = control.agents();
+    if agents.is_empty() {
+        model.push_notice("nothing has been delegated in this session");
+        return;
+    }
+    agents.sort_by(|a, b| a.path.cmp(&b.path));
+    let lines: Vec<String> = agents
+        .iter()
+        .map(|agent| {
+            let mark = match agent.state {
+                orchestrator::State::Running => "⚇ running",
+                orchestrator::State::Settled(orchestrator::AgentStatus::Completed) => "✓ done",
+                orchestrator::State::Settled(orchestrator::AgentStatus::Exhausted) => "◐ budget",
+                orchestrator::State::Settled(orchestrator::AgentStatus::Cancelled) => "⊘ stopped",
+                orchestrator::State::Settled(orchestrator::AgentStatus::Failed) => "✗ failed",
+            };
+            // Full path, not the branch drawing: these lines are meant to be
+            // read *and copied* into `/followup`, and a branch glyph is not part
+            // of an address.
+            let objective: String = agent.objective.chars().take(60).collect();
+            format!(
+                "{:<28} {mark:<10} {objective}",
+                agent.path.as_str(),
+                mark = mark
+            )
+        })
+        .collect();
+    model.push_notice(format!(
+        "agents in this session — pass a path to /followup or agent.apply\n\n{}",
+        lines.join("\n")
+    ));
+}
+
+/// `/followup <agent> <text>` — more work for an agent, finished or not.
+///
+/// A finished agent still holds everything it learned. Re-spawning to build on
+/// its work pays for all of that a second time, and a writer whose patch needs
+/// one more fix is the case where that is most expensive.
+fn agents_followup<P, L>(
+    model: &mut Model,
+    rest: &str,
+    kernel: &Arc<Kernel<P, L>>,
+    session: &Session,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) where
+    P: ProfileProvider + 'static,
+    L: EventLog + 'static,
+{
+    let Some(control) = model.agents.clone() else {
+        model.push_notice("sub-agents are not enabled in this session");
+        return;
+    };
+    let Some((id, text)) = rest.trim().split_once(char::is_whitespace) else {
+        model.push_notice("/followup <agent> <message> — /tree lists the addresses");
+        return;
+    };
+    let (id, text) = (id.to_string(), text.trim().to_string());
+    if text.is_empty() {
+        model.push_notice("nothing to send — /followup <agent> <message>");
+        return;
+    }
+    let executor = Arc::clone(&kernel.executor);
+    let caller = orchestrator::Caller::root(session.id);
+    let tx = tx.clone();
+    // Resuming *runs* the agent, so it cannot happen on the keystroke.
+    tokio::spawn(async move {
+        let notice = control
+            .followup(&caller, &id, &text, executor, DEFAULT_FOLLOWUP_TURNS)
+            .await
+            .map(|agent| {
+                format!(
+                    "'{}' picked up where it left off — its report arrives on its own",
+                    agent.path.name()
+                )
+            })
+            .map_err(|error| format!("{id}: {error}"));
+        let _ = tx.send(TuiEvent::AgentPatchAction(notice));
+    });
+}
+
+/// Turn ceiling for a hand-typed follow-up. The operator is asking for one more
+/// pass, not a fresh investigation, so this is deliberately below `[agents]
+/// max_turns` — a follow-up that ran as long as the original would be a re-run.
+const DEFAULT_FOLLOWUP_TURNS: u32 = 30;
 
 /// `/steer <agent> <text>` — correct a running agent without killing it.
 ///
@@ -5920,5 +6069,75 @@ mod fix_tests {
         // A word that is not a path resolves to nothing, so no app is launched.
         assert!(target_at("just some prose here", 5).is_none());
         assert!(target_at("see does/not/exist.rs", 4).is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_tree_tests {
+    use super::*;
+
+    fn agent(path: &str) -> orchestrator::Agent {
+        orchestrator::Agent {
+            path: orchestrator::AgentPath::parse(path).unwrap(),
+            session: ulid::Ulid::new().to_string(),
+            objective: "work".into(),
+            started_ms: 0,
+            state: orchestrator::State::Running,
+        }
+    }
+
+    fn drawn(paths: &[&str]) -> Vec<String> {
+        let idle = std::collections::HashMap::new();
+        branched(paths.iter().map(|path| agent(path)).collect(), &idle)
+            .into_iter()
+            .map(|row| match row {
+                AgentRow::Agent { agent, branch, .. } => {
+                    format!("{branch}{}", agent.path.name())
+                }
+                AgentRow::Patch { agent, .. } => agent,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_child_is_drawn_under_the_agent_that_started_it() {
+        // Spawn order says nothing about ownership; the path does. Listing by
+        // start time would scatter a parent's children among strangers'.
+        assert_eq!(
+            drawn(&["/writer", "/survey/parse", "/survey", "/survey/lex"]),
+            ["survey", "├ lex", "└ parse", "writer"]
+        );
+    }
+
+    #[test]
+    fn the_last_child_closes_its_branch() {
+        assert_eq!(
+            drawn(&["/survey", "/survey/only"]),
+            ["survey", "└ only"],
+            "an only child is also a last child"
+        );
+    }
+
+    #[test]
+    fn a_grandchild_is_not_mistaken_for_a_sibling() {
+        // `ast` sits below `parse` at a greater depth. Counting rows rather
+        // than comparing depths would read it as another child of `survey` and
+        // leave `parse` drawn as though something followed it.
+        assert_eq!(
+            drawn(&[
+                "/survey",
+                "/survey/parse",
+                "/survey/parse/ast",
+                "/survey/lex"
+            ]),
+            ["survey", "├ lex", "└ parse", "  └ ast"]
+        );
+    }
+
+    #[test]
+    fn a_flat_tree_is_drawn_flat() {
+        // The common case at the default depth of 1: no indentation to read
+        // past when there is no nesting to show.
+        assert_eq!(drawn(&["/one", "/two"]), ["one", "two"]);
     }
 }

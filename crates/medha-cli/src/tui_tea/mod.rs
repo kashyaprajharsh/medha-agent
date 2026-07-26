@@ -287,6 +287,14 @@ const COMMANDS: &[(&str, &str)] = &[
         "correct a running agent without killing it — /steer <message>, or /steer <agent> <message>",
     ),
     (
+        "/followup",
+        "give a finished agent more work — it resumes with what it already found  ·  /followup <agent> <message>",
+    ),
+    (
+        "/tree",
+        "the whole agent tree, finished ones included — addresses for /followup and agent.apply",
+    ),
+    (
         "/memory",
         "list memories · /memory <name> jumps to provenance",
     ),
@@ -1118,6 +1126,10 @@ pub(super) enum AgentRow {
         /// Silence so far. `None` means nothing recorded yet — starting up, not
         /// stalled.
         idle_ms: Option<u64>,
+        /// Drawn tree branch for this row's depth, empty at the top level.
+        /// Precomputed because it depends on what *follows* the row, which a
+        /// per-row render cannot see.
+        branch: String,
     },
     /// A writer's patch, waiting for the user to accept or ignore it.
     Patch {
@@ -1491,7 +1503,11 @@ impl PickerKind {
             PickerKind::Agents(rows) => rows
                 .iter()
                 .map(|row| match row {
-                    AgentRow::Agent { agent, idle_ms } => {
+                    AgentRow::Agent {
+                        agent,
+                        idle_ms,
+                        branch,
+                    } => {
                         let objective: String = agent.objective.chars().take(52).collect();
                         // Nothing is recorded while a model composes, so an
                         // agent mid-generation looks exactly like a wedged one.
@@ -1518,7 +1534,7 @@ impl PickerKind {
                             }
                             orchestrator::State::Settled(orchestrator::AgentStatus::Failed) => "✗",
                         };
-                        format!("{mark} {}   {objective}{note}", agent.path.name())
+                        format!("{branch}{mark} {}   {objective}{note}", agent.path.name())
                     }
                     // Verification is on the row, not one level down: a patch
                     // that failed its build is a draft, and that is the thing a

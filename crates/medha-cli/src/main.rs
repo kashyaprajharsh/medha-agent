@@ -2167,7 +2167,14 @@ fn toml_table_to_json(table: &toml::Table) -> serde_json::Value {
 }
 
 fn approve_list(base: Vec<String>) -> Vec<String> {
-    let raw = std::env::var("MEDHA_APPROVE").unwrap_or_default();
+    approve_list_from(base, &std::env::var("MEDHA_APPROVE").unwrap_or_default())
+}
+
+/// The set with the override supplied rather than read.
+///
+/// Split so the decision is testable: reading the environment inside made every
+/// assertion about the default set depend on the machine running it.
+fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
     let parts: Vec<&str> = raw
         .split(',')
         .map(str::trim)
@@ -2179,14 +2186,24 @@ fn approve_list(base: Vec<String>) -> Vec<String> {
         return Vec::new();
     }
 
-    // Default: gate the one IRREVERSIBLE_LOCAL surface (shell), plus the lock file's list.
+    // Default: gate the one IRREVERSIBLE_LOCAL surface (shell), plus delegation,
+    // plus the lock file's list.
+    //
+    // Delegation sits beside shell rather than beside an edit. Its blast radius
+    // is `ReversibleLocal`, which is a true statement about *files* and the
+    // wrong reading of the action: what a spawn spends is tokens, several
+    // agents' worth, and cancelling a child refunds none of it. The radius enum
+    // has no axis for that, which is the same gap `agent.apply` needed its own
+    // rule to cover.
     let mut out = base;
     out.push("shell.exec".into());
+    out.extend(["agent.spawn", "agent.followup"].map(String::from));
     for part in parts {
         match part {
             "all" => out.extend(["fs.write", "fs.edit", "shell.exec"].map(String::from)),
             "writes" => out.extend(["fs.write", "fs.edit"].map(String::from)),
             "shell" => out.push("shell.exec".into()),
+            "agents" => out.extend(["agent.spawn", "agent.followup"].map(String::from)),
             other => out.push(other.to_string()),
         }
     }
@@ -2933,5 +2950,41 @@ mod migration_tests {
         assert_eq!(std::fs::read(&to).unwrap(), b"DB");
         assert!(!from.exists());
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod approve_list_tests {
+    use super::approve_list_from;
+
+    fn approved(override_: &str) -> Vec<String> {
+        approve_list_from(Vec::new(), override_)
+    }
+
+    /// The policy only gates what is in the set, so the set is where delegation
+    /// being gated at all is decided.
+    #[test]
+    fn delegation_is_gated_out_of_the_box() {
+        let approved = approved("");
+        assert!(approved.contains(&"agent.spawn".to_string()));
+        assert!(approved.contains(&"agent.followup".to_string()));
+        // Beside shell, because both spend and both reach outside this turn.
+        assert!(approved.contains(&"shell.exec".to_string()));
+    }
+
+    #[test]
+    fn messaging_and_listing_are_never_gated() {
+        // Reading the roster or passing a note to an agent costs nothing that
+        // needs a decision; a prompt there is noise that trains people to
+        // approve without looking.
+        let approved = approved("");
+        for free in ["agent.list", "agent.message", "agent.steer", "agent.wait"] {
+            assert!(!approved.contains(&free.to_string()), "{free} was gated");
+        }
+    }
+
+    #[test]
+    fn the_autonomous_escape_hatch_still_clears_everything() {
+        assert!(approved("none").is_empty());
     }
 }

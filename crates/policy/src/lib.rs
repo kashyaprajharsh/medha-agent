@@ -898,3 +898,55 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod delegation_tests {
+    use super::*;
+    use kernel::{AutonomyLevel, BlastRadius, Decision, ToolIntent};
+    use serde_json::json;
+
+    fn spawn() -> ToolIntent {
+        ToolIntent {
+            id: "i1".into(),
+            tool: "agent.spawn".into(),
+            args: json!({ "objective": "survey the crate" }),
+        }
+    }
+
+    fn decide(level: AutonomyLevel) -> Decision {
+        DefaultPolicy::requiring_approval(["shell.exec", "agent.spawn"]).authorize(
+            level,
+            &spawn(),
+            Some(BlastRadius::ReversibleLocal),
+        )
+    }
+
+    /// Delegation is a spend, not an edit. Its radius says `ReversibleLocal`,
+    /// which is true of files and silent about the several agents' worth of
+    /// tokens a spawn commits — and cancelling a child refunds none of them.
+    #[test]
+    fn delegation_asks_wherever_shell_asks() {
+        assert!(matches!(decide(AutonomyLevel::Careful), Decision::Human));
+        assert!(matches!(decide(AutonomyLevel::Normal), Decision::Human));
+    }
+
+    #[test]
+    fn yolo_delegates_without_asking() {
+        // The whole point of the level. The floor still applies — it just has
+        // nothing to say about a spawn.
+        assert!(matches!(decide(AutonomyLevel::Yolo), Decision::Allow));
+    }
+
+    #[test]
+    fn delegation_left_out_of_the_approve_set_is_not_gated() {
+        // The set is configuration. Someone who wants the old behaviour drops
+        // the entry, and that is a visible committed choice rather than a mode
+        // nobody can see.
+        let ungated = DefaultPolicy::requiring_approval(["shell.exec"]).authorize(
+            AutonomyLevel::Careful,
+            &spawn(),
+            Some(BlastRadius::ReversibleLocal),
+        );
+        assert!(matches!(ungated, Decision::Allow));
+    }
+}

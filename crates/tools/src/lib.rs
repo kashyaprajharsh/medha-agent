@@ -2618,7 +2618,19 @@ impl Tool for ReadArtifact {
             .get("length")
             .and_then(Value::as_u64)
             .map(|l| l as usize);
-        let total = self.store.size(&hash).map_err(ToolError::Failed)?;
+        // Name the actual failure. A raw `No such file` from the store reads as a
+        // transient IO fault, so a model that guessed a hash guesses again rather
+        // than changing approach — the observed failure mode is several invented
+        // hashes in a row. Say that the hash is the problem, and where real ones
+        // come from.
+        let total = self.store.size(&hash).map_err(|err| {
+            ToolError::Failed(format!(
+                "no artifact stored under hash {hash} ({err}). Artifact hashes are only \
+                 valid if a tool result printed one — they cannot be guessed or \
+                 constructed. To read a file from disk use `fs.read`; to search it use \
+                 `grep`."
+            ))
+        })?;
         let bytes = self
             .store
             .get(&hash, offset, length)

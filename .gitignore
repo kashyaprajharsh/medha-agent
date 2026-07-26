@@ -15,3 +15,6 @@ SELF_EVOLVING_AGENTS_RESEARCH.md
 
 # per-user harness config; medha.lock.example is the shared template
 medha.lock
+
+# macOS
+.DS_Store

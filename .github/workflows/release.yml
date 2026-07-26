@@ -1,0 +1,108 @@
+name: Release
+
+# Cuts a release from a tag. Publishing the archives is what makes the
+# curl|sh installers work — `install.sh` and `install.ps1` resolve the
+# latest tag from this repo's releases and download the matching asset.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on the oldest supported glibc so the binary keeps working on
+          # distros older than the runner.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # keyring's Linux backend talks to the Secret Service over D-Bus.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p medha-cli
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          staging="medha-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/medha" "$staging/"
+          cp README.md medha.lock.example "$staging/" 2>/dev/null || true
+          tar czf "$staging.tar.gz" "$staging"
+          shasum -a 256 "$staging.tar.gz" > "$staging.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          staging="medha-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/medha.exe" "$staging/"
+          cp README.md medha.lock.example "$staging/" 2>/dev/null || true
+          7z a "$staging.zip" "$staging"
+          certutil -hashfile "$staging.zip" SHA256 | sed -n 2p > "$staging.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: medha-${{ matrix.target }}
+          path: |
+            medha-${{ matrix.target }}.tar.gz*
+            medha-${{ matrix.target }}.zip*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: false
+          generate_release_notes: true
+          files: dist/*

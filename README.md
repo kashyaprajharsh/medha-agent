@@ -206,7 +206,7 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
 
 ## Status
 
-Pre-1.0 (`0.0.1`) — interfaces may still change.
+Pre-1.0 (`0.1.0`) — interfaces may still change.
 
 **Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 52 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation, graceful interrupts, the ACP bridge, and the Eval Gate.
 

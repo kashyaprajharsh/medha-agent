@@ -22,7 +22,7 @@ use crate::{Tool, ToolError, arg_str};
 /// the life of the process.
 pub struct Delegate {
     control: std::sync::Weak<orchestrator::AgentControl>,
-    executor: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
+    executor: ParentHandle,
     max_turns: u32,
     session: SessionHandle,
 }
@@ -30,7 +30,7 @@ pub struct Delegate {
 impl Delegate {
     pub fn new(
         control: &Arc<orchestrator::AgentControl>,
-        executor: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
+        executor: ParentHandle,
         max_turns: u32,
         session: SessionHandle,
     ) -> Self {
@@ -175,7 +175,7 @@ impl kernel::Executor for Rebound {
 /// transcript, so its intermediate work never enters the parent's context.
 struct AgentSpawn {
     control: Arc<orchestrator::AgentControl>,
-    executor: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
+    executor: ParentHandle,
     /// Operator ceiling on one child's turns, from `[agents] max_turns`.
     max_turns: u32,
     /// Whose spawn this is. Children hang off this address and reports are
@@ -330,7 +330,7 @@ impl Tool for AgentSpawn {
             if tasks.is_empty() {
                 return Err(ToolError::Args("tasks is empty".into()));
             }
-            let Some(parent) = self.executor.lock().ok().and_then(|e| e.clone()) else {
+            let Some(parent) = parent_executor(&self.executor) else {
                 return Err(ToolError::Failed(
                     "the agent runtime is not available in this session".into(),
                 ));
@@ -389,7 +389,7 @@ impl Tool for AgentSpawn {
             }));
         }
         let objective = arg_str(args, "objective")?;
-        let Some(parent) = self.executor.lock().ok().and_then(|e| e.clone()) else {
+        let Some(parent) = parent_executor(&self.executor) else {
             return Err(ToolError::Failed(
                 "the agent runtime is not available in this session".into(),
             ));
@@ -442,6 +442,20 @@ impl Tool for AgentSpawn {
 
 /// Shared slot for the session a background report belongs to.
 pub type SessionHandle = Arc<Mutex<Option<ulid::Ulid>>>;
+
+/// Shared slot for the executor a child inherits from.
+///
+/// Weak, and it has to be: that executor is the registry which owns the tool
+/// holding this slot. A strong handle closes the loop, and nothing in the cycle
+/// is ever dropped — the registry, every tool in it, the control plane and each
+/// child's worktree lease all outlive the session that made them, for the life
+/// of the process.
+pub type ParentHandle = Arc<Mutex<Option<std::sync::Weak<dyn kernel::Executor>>>>;
+
+/// The executor a child narrows from, if the session that owns it is still up.
+fn parent_executor(slot: &ParentHandle) -> Option<Arc<dyn kernel::Executor>> {
+    slot.lock().ok()?.as_ref()?.upgrade()
+}
 
 /// How much conversation a child inherits. Absent means `all`, matching the
 /// reading that a child asked to help with *this* work should know about it.
@@ -505,7 +519,7 @@ struct AgentControlTool {
     caller: CallerSlot,
     /// Only `agent.followup` needs these — resuming an agent runs it, so it
     /// goes through the same admission as a spawn.
-    executor: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
+    executor: ParentHandle,
     max_turns: u32,
 }
 
@@ -692,7 +706,7 @@ impl Tool for AgentControlTool {
             AgentAction::Followup => {
                 let id = arg_str(args, "agent")?;
                 let text = arg_str(args, "text")?;
-                let Some(parent) = self.executor.lock().ok().and_then(|slot| slot.clone()) else {
+                let Some(parent) = parent_executor(&self.executor) else {
                     return Err(ToolError::Failed(
                         "the agent runtime is not available in this session".into(),
                     ));

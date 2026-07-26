@@ -108,11 +108,14 @@ pub struct SandboxTemplate {
     pub readable: Vec<PathBuf>,
 }
 
-/// Shared slot for the registry a child's tools are rebased from. The registry
-/// is what hosts `agent.spawn`, so it cannot exist before the control plane
-/// that owns this — the same cycle `agent_parent_handle` breaks, broken the
-/// same way.
-pub type RegistryHandle = Arc<Mutex<Option<Arc<tools::ToolRegistry>>>>;
+/// Shared slot for the registry a child's tools are rebased from.
+///
+/// Deferred because the registry hosts `agent.spawn`, so it cannot exist before
+/// the control plane that owns this. Weak because it would otherwise close the
+/// loop back to that registry: nothing in the cycle is ever dropped, so the
+/// registry, every tool in it and each child's worktree lease would outlive the
+/// session that made them for the life of the process.
+pub type RegistryHandle = Arc<Mutex<Option<std::sync::Weak<tools::ToolRegistry>>>>;
 
 /// Writer isolation over git worktrees (§6.4).
 pub struct WorktreeWorkspaces {
@@ -166,8 +169,8 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
             .registry
             .lock()
             .ok()
-            .and_then(|slot| slot.clone())
-            .ok_or("the tool registry is not available yet")?;
+            .and_then(|slot| slot.as_ref()?.upgrade())
+            .ok_or("this session is shutting down")?;
         let worktree = self
             .pool
             .checkout(session)

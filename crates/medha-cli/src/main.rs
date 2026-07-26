@@ -1320,7 +1320,7 @@ async fn main() -> Result<()> {
     // worktree. `agent_parent` cannot serve: it is type-erased to
     // `dyn Executor`, and re-rooting the workspace tools needs the registry.
     if let Ok(mut slot) = agent_registry.lock() {
-        *slot = Some(Arc::clone(&executor));
+        *slot = Some(Arc::downgrade(&executor));
     }
 
     // Context engine: budget-aware two-phase compaction (§4.3), tuned from
@@ -1430,7 +1430,9 @@ async fn main() -> Result<()> {
     // Close the loop: children narrow from the finished registry, and the runner
     // holds the kernel weakly so the cycle does not leak it.
     if let Ok(mut slot) = agent_parent.lock() {
-        *slot = Some(Arc::clone(&kernel.executor));
+        // Weak: this slot is reachable from the registry it points at, and a
+        // strong handle would keep the whole tool graph alive for the process.
+        *slot = Some(Arc::downgrade(&kernel.executor));
     }
     agent_runner.install(Arc::new(agents::KernelRunner::new(&kernel)));
 

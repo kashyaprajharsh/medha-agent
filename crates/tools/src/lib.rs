@@ -8,7 +8,7 @@ use ignore::WalkBuilder;
 use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
 
 mod agents;
-pub use agents::SessionHandle;
+pub use agents::{ParentHandle, SessionHandle};
 
 pub mod hub;
 pub mod judge;
@@ -915,7 +915,7 @@ pub struct ToolRegistry {
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
     /// The executor a child inherits from — this registry itself, installed
     /// after the kernel is built. A child's tools are narrowed from it.
-    agent_parent: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
+    agent_parent: ParentHandle,
     agent_session: SessionHandle,
 }
 
@@ -1061,7 +1061,7 @@ impl ToolRegistry {
 
     /// Handle for installing the executor children inherit from. `main` fills it
     /// with the finished registry once the kernel exists.
-    pub fn agent_parent_handle(&self) -> Arc<Mutex<Option<Arc<dyn kernel::Executor>>>> {
+    pub fn agent_parent_handle(&self) -> ParentHandle {
         Arc::clone(&self.agent_parent)
     }
 
@@ -6847,8 +6847,25 @@ mod tests {
         let registry = Arc::new(registry);
         // What `main` does once the kernel exists: children narrow from the
         // finished registry.
-        *parent.lock().unwrap() = Some(registry.clone() as Arc<dyn kernel::Executor>);
+        let parent_executor: Arc<dyn kernel::Executor> = registry.clone();
+        *parent.lock().unwrap() = Some(Arc::downgrade(&parent_executor));
         (registry, saw)
+    }
+
+    /// The registry owns `agent.spawn`, which holds the slot naming the executor
+    /// a child inherits from — which is the registry. Strong, that loop is never
+    /// collected, and the registry, every tool in it, the control plane and each
+    /// child's worktree lease outlive their session for the life of the process.
+    #[tokio::test]
+    async fn the_tool_graph_is_collected_when_its_session_ends() {
+        let (registry, _saw) = registry_with_agents();
+        let watching = Arc::downgrade(&registry);
+        assert!(watching.upgrade().is_some(), "alive while held");
+        drop(registry);
+        assert!(
+            watching.upgrade().is_none(),
+            "the registry outlived every strong reference to it"
+        );
     }
 
     #[tokio::test]

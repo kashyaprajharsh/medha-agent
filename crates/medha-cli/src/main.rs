@@ -1295,6 +1295,7 @@ async fn main() -> Result<()> {
             default: std::time::Duration::from_secs(lock.agents.default_wait_secs),
             max: std::time::Duration::from_secs(lock.agents.max_wait_secs),
         })
+        .with_transcript_tail(lock.agents.transcript_tail)
         // Delivery rides the event log, so a background report survives a
         // restart and reaches the session that dispatched it.
         .with_outbox(Arc::new(agents::LogOutbox::new(log.clone())))

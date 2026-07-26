@@ -440,6 +440,7 @@ pub struct AgentControl {
     max_active: usize,
     max_depth: u32,
     wait_bounds: WaitBounds,
+    transcript_tail: usize,
     /// Builds a child's own delegation tools. Installed after construction: the
     /// tools it builds are hosted by the registry that owns this control plane,
     /// so it cannot exist first — the same cycle [`DeferredRunner`] breaks,
@@ -516,6 +517,7 @@ impl AgentControl {
             max_active: DEFAULT_MAX_ACTIVE,
             max_depth: DEFAULT_MAX_DEPTH,
             wait_bounds: WaitBounds::default(),
+            transcript_tail: 40,
             delegation: std::sync::OnceLock::new(),
             registry: Arc::new(AgentRegistry::new()),
             cancel,
@@ -581,6 +583,18 @@ impl AgentControl {
     pub fn with_wait_bounds(mut self, bounds: WaitBounds) -> Self {
         self.wait_bounds = bounds;
         self
+    }
+
+    /// How much of a transcript a caller gets when it does not say. A ceiling in
+    /// practice: the failure it exists to prevent is an oversized payload, and a
+    /// caller that could ask for more would walk straight back into it.
+    pub fn with_transcript_tail(mut self, steps: usize) -> Self {
+        self.transcript_tail = steps.max(1);
+        self
+    }
+
+    pub fn transcript_tail(&self) -> usize {
+        self.transcript_tail
     }
 
     /// Let children hold delegation tools addressed at themselves. Later calls

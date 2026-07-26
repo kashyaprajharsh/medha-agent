@@ -6763,24 +6763,46 @@ mod tests {
 
     /// Delivery for the agent tests. Every spawn is asynchronous, so a control
     /// without an outbox refuses all of them.
+    ///
+    /// It records rather than discards: a stub that always returns nothing
+    /// cannot tell a delivered report from a lost one, which is the distinction
+    /// these tests exist to pin.
     #[derive(Default)]
-    struct TestOutbox;
+    struct TestOutbox {
+        finished: Mutex<Vec<(ulid::Ulid, orchestrator::AgentResult)>>,
+        steps: Mutex<Vec<String>>,
+    }
 
     #[async_trait]
     impl orchestrator::Outbox for TestOutbox {
         async fn dispatched(&self, _dispatch: &orchestrator::Dispatch) {}
         async fn finished(
             &self,
-            _dispatch: &orchestrator::Dispatch,
-            _result: &orchestrator::AgentResult,
+            dispatch: &orchestrator::Dispatch,
+            result: &orchestrator::AgentResult,
         ) {
+            self.finished
+                .lock()
+                .unwrap()
+                .push((dispatch.parent, result.clone()));
         }
-        async fn delivered(&self, _parent: ulid::Ulid, _child: ulid::Ulid) {}
-        async fn undelivered(&self, _parent: ulid::Ulid) -> Vec<orchestrator::AgentResult> {
-            Vec::new()
+        async fn delivered(&self, parent: ulid::Ulid, child: ulid::Ulid) {
+            self.finished
+                .lock()
+                .unwrap()
+                .retain(|(owner, result)| *owner != parent || result.session != child.to_string());
+        }
+        async fn undelivered(&self, parent: ulid::Ulid) -> Vec<orchestrator::AgentResult> {
+            self.finished
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(owner, _)| *owner == parent)
+                .map(|(_, result)| result.clone())
+                .collect()
         }
         async fn transcript(&self, _child: ulid::Ulid) -> Vec<String> {
-            Vec::new()
+            self.steps.lock().unwrap().clone()
         }
         async fn recorded(
             &self,
@@ -6829,6 +6851,109 @@ mod tests {
         }
     }
 
+    /// The same, plus the outbox, for tests that assert on what is delivered.
+    fn registry_with_outbox() -> (Arc<ToolRegistry>, Arc<TestOutbox>, ulid::Ulid) {
+        let outbox = Arc::new(TestOutbox::default());
+        let mut registry = ToolRegistry::default();
+        let control = Arc::new(
+            orchestrator::AgentControl::new(
+                Arc::new(EchoRunner {
+                    saw: Arc::new(Mutex::new(Vec::new())),
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .with_outbox(outbox.clone()),
+        );
+        registry.register_agents(control, 8);
+        let parent = registry.agent_parent_handle();
+        let owner = ulid::Ulid::new();
+        *registry.agent_session_handle().lock().unwrap() = Some(owner);
+        let registry = Arc::new(registry);
+        let parent_executor: Arc<dyn kernel::Executor> = registry.clone();
+        *parent.lock().unwrap() = Some(Arc::downgrade(&parent_executor));
+        (registry, outbox, owner)
+    }
+
+    async fn call(registry: &ToolRegistry, tool: &str, args: Value) -> Value {
+        let observation = registry
+            .execute(&kernel::ToolIntent {
+                id: "i1".into(),
+                tool: tool.into(),
+                args,
+            })
+            .await;
+        assert_eq!(observation.status, kernel::ObsStatus::Ok, "{observation:?}");
+        observation.payload
+    }
+
+    /// `agent.wait` told the caller "their reports arrive with the rest of this
+    /// turn's results". They do not: collection runs at the head of a turn and
+    /// this call is mid-turn. The caller was left holding a promise nothing kept
+    /// and went digging through the transcript — the one thing it is told not to
+    /// do, and the one that costs the most context.
+    #[tokio::test]
+    async fn waiting_hands_back_the_reports_it_waited_for() {
+        let (registry, _outbox, _owner) = registry_with_outbox();
+        call(
+            &registry,
+            "agent.spawn",
+            json!({ "objective": "count the tests", "name": "counter" }),
+        )
+        .await;
+
+        let waited = call(&registry, "agent.wait", json!({ "timeout_seconds": 5 })).await;
+        assert_eq!(
+            waited.get("timed_out").and_then(Value::as_bool),
+            Some(false)
+        );
+        let reports = waited
+            .get("reports")
+            .and_then(Value::as_array)
+            .expect("a settled wait carries the answers, not a promise of them");
+        assert_eq!(reports.len(), 1, "got {waited}");
+        assert_eq!(
+            reports[0].get("agent").and_then(Value::as_str),
+            Some("counter")
+        );
+        assert!(reports[0].get("report").is_some(), "the answer itself");
+    }
+
+    /// A child that ran sixty tool calls produces a step list larger than the
+    /// context it is read into: it spills to an artifact, and the caller then
+    /// spends turns paging the artifact back in to answer a question its report
+    /// already answered.
+    #[tokio::test]
+    async fn a_transcript_is_bounded_even_when_nobody_asks() {
+        let (registry, outbox, _owner) = registry_with_outbox();
+        *outbox.steps.lock().unwrap() = (0..500).map(|n| format!("step {n}")).collect();
+        let spawned = call(
+            &registry,
+            "agent.spawn",
+            json!({ "objective": "read everything", "name": "reader" }),
+        )
+        .await;
+        let session = spawned
+            .get("session")
+            .and_then(Value::as_str)
+            .expect("session id")
+            .to_string();
+
+        let shown = call(&registry, "agent.transcript", json!({ "agent": session })).await;
+        assert_eq!(shown.get("total").and_then(Value::as_u64), Some(500));
+        assert_eq!(
+            shown.get("showing").and_then(Value::as_u64),
+            Some(40),
+            "an unbounded default is what spilled the transcript to an artifact"
+        );
+        // The tail, not the head: it is where the answer was forming.
+        let steps = shown.get("steps").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            steps.last().and_then(Value::as_str),
+            Some("step 499"),
+            "the most recent step must survive the bound"
+        );
+    }
+
     /// Returns the registry and what the child was handed, filled once it runs.
     fn registry_with_agents() -> (Arc<ToolRegistry>, Arc<Mutex<Vec<String>>>) {
         let saw = Arc::new(Mutex::new(Vec::new()));
@@ -6838,7 +6963,7 @@ mod tests {
                 Arc::new(EchoRunner { saw: saw.clone() }),
                 tokio_util::sync::CancellationToken::new(),
             )
-            .with_outbox(Arc::new(TestOutbox)),
+            .with_outbox(Arc::new(TestOutbox::default())),
         );
         registry.register_agents(control, 8);
         let parent = registry.agent_parent_handle();

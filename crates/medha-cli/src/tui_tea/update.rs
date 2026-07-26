@@ -3189,6 +3189,39 @@ const DEFAULT_FOLLOWUP_TURNS: u32 = 30;
 /// With one agent running the id may be omitted, because that is the case where
 /// having to look one up is pure friction. With several it is required: sending
 /// a correction to the wrong agent is worse than being asked which.
+/// Who `/steer <rest>` addresses and what it says, given the agents in reach as
+/// `(name, session)`.
+///
+/// Pure, because every interesting case here is a parse: the version that read
+/// the roster inline sent an agent its own name as a message and nothing could
+/// see it happen.
+fn steer_target(rest: &str, running: &[(String, String)]) -> Result<(String, String), String> {
+    let missing = || "nothing to send — /steer <agent> <message>".to_string();
+    let addressed = |word: &str| running.iter().any(|(name, id)| name == word || id == word);
+
+    let (id, text) = match rest.split_once(char::is_whitespace) {
+        Some((first, tail)) if addressed(first) => (first.to_string(), tail.trim().to_string()),
+        // A bare agent name is a command someone stopped typing, not a message
+        // that happens to read like one. Sent verbatim, the agent spends a turn
+        // reading its own name and the sender is told it was delivered.
+        None if addressed(rest.trim()) => return Err(missing()),
+        // No recognised id in front: the whole thing is the message, which is
+        // only unambiguous with exactly one agent running.
+        _ if running.len() == 1 => (running[0].1.clone(), rest.trim().to_string()),
+        _ => {
+            let names: Vec<&str> = running.iter().map(|(name, _)| name.as_str()).collect();
+            return Err(format!(
+                "several agents are running — say which: /steer <agent> <message>  ({})",
+                names.join(", ")
+            ));
+        }
+    };
+    match text.is_empty() {
+        true => Err(missing()),
+        false => Ok((id, text)),
+    }
+}
+
 fn agents_steer(model: &mut Model, rest: &str) {
     let Some(control) = model.agents.clone() else {
         model.push_notice("sub-agents are not enabled in this session");
@@ -3199,30 +3232,17 @@ fn agents_steer(model: &mut Model, rest: &str) {
         model.push_notice("no agent is running — /agents shows what has finished");
         return;
     }
-    let (id, text) = match rest.split_once(char::is_whitespace) {
-        Some((first, tail))
-            if running
-                .iter()
-                .any(|run| run.path.name() == first || run.session == first) =>
-        {
-            (first.to_string(), tail.trim().to_string())
-        }
-        // No recognised id in front: the whole thing is the message, which is
-        // only unambiguous with exactly one agent running.
-        _ if running.len() == 1 => (running[0].session.clone(), rest.trim().to_string()),
-        _ => {
-            let names: Vec<&str> = running.iter().map(|run| run.path.name()).collect();
-            model.push_notice(format!(
-                "several agents are running — say which: /steer <agent> <message>  ({})",
-                names.join(", ")
-            ));
+    let addressable: Vec<(String, String)> = running
+        .iter()
+        .map(|run| (run.path.name().to_string(), run.session.clone()))
+        .collect();
+    let (id, text) = match steer_target(rest, &addressable) {
+        Ok(resolved) => resolved,
+        Err(notice) => {
+            model.push_notice(notice);
             return;
         }
     };
-    if text.is_empty() {
-        model.push_notice("nothing to send — /steer <agent> <message>");
-        return;
-    }
     // The user is the root of the tree, so every agent is within reach.
     match control.steer(&orchestrator::AgentPath::root(), &id, &text) {
         Ok(path) => model.push_notice(format!(
@@ -6139,5 +6159,59 @@ mod agent_tree_tests {
         // The common case at the default depth of 1: no indentation to read
         // past when there is no nesting to show.
         assert_eq!(drawn(&["/one", "/two"]), ["one", "two"]);
+    }
+}
+
+#[cfg(test)]
+mod steer_target_tests {
+    use super::steer_target;
+
+    fn one() -> Vec<(String, String)> {
+        vec![("tokio-audit".into(), "01SESSION".into())]
+    }
+
+    fn two() -> Vec<(String, String)> {
+        vec![
+            ("tokio-audit".into(), "01AAA".into()),
+            ("lexer-survey".into(), "01BBB".into()),
+        ]
+    }
+
+    #[test]
+    fn a_bare_agent_name_is_a_half_typed_command_not_a_message() {
+        // Sent verbatim it costs the agent a turn to read its own name, and the
+        // sender is told the message landed.
+        assert!(steer_target("tokio-audit", &one()).is_err());
+        assert!(steer_target("01SESSION", &one()).is_err());
+        assert!(steer_target("tokio-audit   ", &one()).is_err());
+    }
+
+    #[test]
+    fn a_named_agent_takes_the_rest_as_the_message() {
+        let (id, text) = steer_target("tokio-audit skip the tests", &two()).unwrap();
+        assert_eq!(id, "tokio-audit");
+        assert_eq!(text, "skip the tests");
+    }
+
+    #[test]
+    fn with_one_agent_running_the_whole_line_is_the_message() {
+        let (id, text) = steer_target("skip the tests", &one()).unwrap();
+        assert_eq!(id, "01SESSION", "addressed by session, not guessed by name");
+        assert_eq!(text, "skip the tests");
+    }
+
+    #[test]
+    fn an_unnamed_message_with_several_running_asks_which() {
+        // Picking one would send it to whichever sorted first, which is a coin
+        // toss the sender cannot see.
+        let refused = steer_target("skip the tests", &two()).unwrap_err();
+        assert!(refused.contains("say which"), "{refused}");
+        assert!(refused.contains("tokio-audit"), "names the candidates");
+    }
+
+    #[test]
+    fn an_empty_message_reaches_nobody() {
+        assert!(steer_target("", &one()).is_err());
+        assert!(steer_target("tokio-audit    ", &two()).is_err());
     }
 }

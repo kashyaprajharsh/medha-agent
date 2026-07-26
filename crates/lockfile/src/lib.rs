@@ -190,6 +190,10 @@ pub struct AgentsConfig {
     pub min_wait_secs: u64,
     pub default_wait_secs: u64,
     pub max_wait_secs: u64,
+    /// Steps `agent.transcript` returns when the caller does not say how many.
+    /// Enough to see what an agent was doing when it stopped; short of what
+    /// spills to an artifact and costs turns to page back in.
+    pub transcript_tail: usize,
 }
 
 impl Default for AgentsConfig {
@@ -211,6 +215,7 @@ impl Default for AgentsConfig {
             min_wait_secs: 1,
             default_wait_secs: 120,
             max_wait_secs: 600,
+            transcript_tail: 40,
         }
     }
 }

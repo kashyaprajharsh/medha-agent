@@ -739,11 +739,34 @@ impl Tool for AgentControlTool {
                 // A timeout is an outcome, not a failure — say so, or the model
                 // reads an error and abandons work that is still running fine.
                 match self.control.wait(&from, timeout).await {
-                    Waited::Settled(settled) => Ok(json!({
-                        "settled": settled,
-                        "timed_out": false,
-                        "note": "Their reports arrive with the rest of this turn's results.",
-                    })),
+                    Waited::Settled(settled) => {
+                        // The reports themselves, not a promise of them. Saying
+                        // "they arrive with this turn's results" was false —
+                        // collection happens at a turn boundary and this call is
+                        // mid-turn, so the caller was left holding a promise
+                        // nothing kept and went digging through the transcript
+                        // instead, which is the one thing it is told not to do.
+                        let reports: Vec<Value> = self
+                            .control
+                            .collect(self.caller.resolve()?.session)
+                            .await
+                            .iter()
+                            .map(|result| {
+                                json!({
+                                    "agent": result.agent,
+                                    "session": result.session,
+                                    "status": result.status,
+                                    "report": result.summary,
+                                })
+                            })
+                            .collect();
+                        Ok(json!({
+                            "settled": settled,
+                            "timed_out": false,
+                            "reports": reports,
+                            "note": "These are their answers. Do not read their transcripts.",
+                        }))
+                    }
                     Waited::TimedOut => Ok(json!({
                         "settled": [],
                         "timed_out": true,
@@ -775,14 +798,29 @@ impl Tool for AgentControlTool {
                     )));
                 }
                 let total = steps.len();
-                // A child can run for dozens of turns; the tail is usually where
-                // the answer was forming when it stopped.
-                if let Some(tail) = args.get("tail").and_then(Value::as_u64)
-                    && (tail as usize) < total
-                {
-                    steps = steps.split_off(total - tail as usize);
+                // Bounded by default. A child that ran sixty tool calls produces
+                // a step list too large for the context it is being read into —
+                // it spills to an artifact, and the caller then pages the
+                // artifact, spending several turns reading a log to answer a
+                // question the report already answered. The tail is also the
+                // part worth having: it is where the answer was forming.
+                // Capped, not merely defaulted. The failure this prevents is an
+                // oversized payload, and a caller free to ask for more walks
+                // straight back into it.
+                let cap = self.control.transcript_tail();
+                let tail = args
+                    .get("tail")
+                    .and_then(Value::as_u64)
+                    .map_or(cap, |asked| (asked as usize).min(cap));
+                if tail < total {
+                    steps = steps.split_off(total - tail);
                 }
-                Ok(json!({ "agent": id, "steps": steps, "total": total }))
+                Ok(json!({
+                    "agent": id,
+                    "steps": steps,
+                    "showing": steps.len(),
+                    "total": total,
+                }))
             }
         }
     }

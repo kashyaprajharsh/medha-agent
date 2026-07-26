@@ -12,3 +12,6 @@
 # personal research/notes at repo root — never commit
 learn-self-evolving-agents.html
 SELF_EVOLVING_AGENTS_RESEARCH.md
+
+# per-user harness config; medha.lock.example is the shared template
+medha.lock

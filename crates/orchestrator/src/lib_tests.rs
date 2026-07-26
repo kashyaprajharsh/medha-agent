@@ -383,10 +383,15 @@ async fn a_nested_childs_report_reaches_its_own_parent() {
     // A nested parent is a running session, not a surface: it has no outbox
     // pass, so a report written only to its chain is one nobody ever reads.
     let delivered = queue.drain_steers();
-    assert!(
-        delivered.iter().any(|text| text.contains("Agent 'parse'")),
-        "the parent never received its child's report: {delivered:?}"
-    );
+    // Tagged, not prose: it arrives on the queue the parent is told to treat as
+    // authoritative, so an untagged report reads as an order to do what the
+    // report describes.
+    let Some(text) = delivered.first() else {
+        panic!("the parent never received its child's report");
+    };
+    assert!(text.contains("AGENT_REPORT"), "untagged report: {text}");
+    assert!(text.contains("/survey/parse"), "unattributed: {text}");
+    assert!(text.contains("COMPLETED"), "no outcome: {text}");
 }
 
 /// Hands back whatever conversation it was given, so a test can assert on what
@@ -475,6 +480,58 @@ async fn a_message_reaches_sideways_where_control_does_not() {
         control.reach(&stranger, "/survey/parse"),
         Err(Error::OutOfReach(_))
     ));
+}
+
+/// Register a live agent by hand, keeping its queue so a test can read what was
+/// delivered to it. Production has a running session on the other end.
+fn listening(control: &AgentControl, path: &str) -> (AgentPath, kernel::InterruptQueue) {
+    let path = AgentPath::parse(path).unwrap();
+    let reservation = control
+        .registry
+        .claim(&path.parent().unwrap(), path.name())
+        .unwrap()
+        .1;
+    let (handle, queue) = kernel::InterruptQueue::pair();
+    reservation.commit(
+        registry::Agent {
+            path: path.clone(),
+            session: Ulid::new().to_string(),
+            objective: "work".into(),
+            started_ms: epoch_ms(),
+            state: registry::State::Running,
+        },
+        registry::Live {
+            cancel: CancellationToken::new(),
+            steer: handle,
+        },
+    );
+    (path, queue)
+}
+
+#[tokio::test]
+async fn a_peers_message_is_not_dressed_up_as_an_order() {
+    let (_, control) = control();
+    let (path, mut queue) = listening(&control, "/worker");
+
+    control
+        .message(
+            &AgentPath::parse("/peer").unwrap(),
+            path.as_str(),
+            "the lexer is generated, do not read it",
+        )
+        .unwrap();
+
+    // Same queue as the recipient's own operator, and an agent is told to treat
+    // what arrives there as authoritative and superseding. A peer is not its
+    // operator, and an untagged note would be obeyed as though it were.
+    let delivered = queue.drain_steers();
+    let text = delivered.first().expect("the message reached the agent");
+    assert!(text.contains("AGENT_MESSAGE"), "untagged: {text}");
+    assert!(text.contains("/peer"), "unattributed: {text}");
+    assert!(
+        text.contains("the lexer is generated, do not read it"),
+        "the message itself must survive tagging: {text}"
+    );
 }
 
 #[tokio::test]

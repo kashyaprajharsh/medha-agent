@@ -241,7 +241,9 @@ impl Tool for AgentSpawn {
          If the user asked for a particular language, tone or format, say so there too, or the \
          child's summary will come back in the wrong one and contaminate your reply. Give \
          `contract` when the answer must have a particular shape. A child can never use a tool you \
-         do not already have, and can only reach the agents it started itself.\n\
+         do not already have. It can message you and any other running agent, but it can only stop \
+         or steer the agents it started itself. A read-only child cannot delegate further; a \
+         writing one can.\n\
          \n\
          A child's report is its own account of what it did, not an established fact. For anything \
          with an effect outside its own reasoning — a file written, a request sent, a test claimed \

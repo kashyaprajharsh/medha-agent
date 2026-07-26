@@ -59,13 +59,40 @@ fn child_prompt(run: &ChildRun) -> String {
              doing it is the harmful one.\n",
         ),
     }
+    // Read from the child's own tool set rather than assumed. A writer keeps
+    // `agent.spawn`; a read-only child loses it to narrowing. Stating either as
+    // a constant is how the prompt came to claim a limit the child did not have
+    // — and a model told it cannot do something will not try, however plainly
+    // the tool sits in its list.
+    let holds = |name: &str| run.executor.specs().iter().any(|spec| spec.name == name);
+    prompt.push_str(match holds("agent.spawn") {
+        true => {
+            "\nYou may delegate a bounded piece of this to your own sub-agent, which \
+             reports back to you. Do that only for work that is genuinely separable — \
+             you are already a delegate, and a chain of agents each passing the task \
+             on costs more at every link.\n"
+        }
+        false => "\nYou cannot delegate: do this work yourself.\n",
+    });
+    if holds("agent.message") {
+        prompt.push_str(
+            "\nYou can send a message to the agent that sent you here, or to another \
+             running agent, when you find something it needs and cannot see. That is \
+             for passing on findings, not for asking questions — nobody is waiting to \
+             answer you.\n",
+        );
+    }
     // Stated literally, because a model asked to reason about its own limits
-    // will otherwise invent them — planning a handoff to a worker it cannot
-    // spawn, or asking a question nobody will read.
+    // will otherwise invent them — asking a question nobody will read, or
+    // planning a handoff it cannot make.
     prompt.push_str(
-        "\nYou work alone: you cannot delegate to another agent, and you cannot \
-         ask a question and wait for an answer. Where the task is ambiguous, \
-         choose the most reasonable reading, say which you chose, and continue.\n\
+        "\nYou cannot ask a question and wait for an answer. Where the task is \
+         ambiguous, choose the most reasonable reading, say which you chose, and \
+         continue.\n\
+         \n\
+         Actions that touch anything outside your own reasoning may stop for the \
+         user's approval, and the request will name you. That is normal — wait for \
+         it rather than looking for a way around it.\n\
          \n\
          A further message may arrive from whoever sent you here — a correction, \
          a constraint, a narrowing of scope. Treat it as authoritative and \
@@ -905,5 +932,84 @@ mod tests {
         // A recovered report joins the same delivery fold, so it cannot be
         // re-injected on the next turn.
         assert!(restarted.undelivered(parent).await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod child_prompt_tests {
+    use super::*;
+    use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
+    use orchestrator::AgentSpec;
+
+    struct Holding(Vec<&'static str>);
+
+    #[async_trait::async_trait]
+    impl Executor for Holding {
+        fn specs(&self) -> Vec<ToolSpec> {
+            self.0
+                .iter()
+                .map(|name| ToolSpec {
+                    name: (*name).to_string(),
+                    description: String::new(),
+                    schema: serde_json::json!({}),
+                    blast_radius: BlastRadius::Read,
+                    category: ToolCategory::Other,
+                    icon: "•".into(),
+                })
+                .collect()
+        }
+        async fn execute(&self, intent: &ToolIntent) -> Observation {
+            Observation::ok(&intent.id, serde_json::Value::Null)
+        }
+    }
+
+    fn prompt_for(tools: Vec<&'static str>, workspace: Option<PathBuf>) -> String {
+        child_prompt(&ChildRun {
+            session: ulid::Ulid::new(),
+            spec: AgentSpec {
+                objective: "survey the crate".into(),
+                ..Default::default()
+            },
+            history: Vec::new(),
+            executor: Arc::new(Holding(tools)),
+            max_turns: 10,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            workspace,
+            interrupts: kernel::InterruptQueue::pair().1,
+        })
+    }
+
+    #[test]
+    fn a_child_is_told_it_can_delegate_only_when_it_actually_can() {
+        // Read from the child's own tool set, never assumed. A model told it
+        // cannot do something will not try, however plainly the tool sits in
+        // its list — so a stale constant here silently disables a capability.
+        let reader = prompt_for(vec!["fs.read"], None);
+        assert!(reader.contains("You cannot delegate"));
+
+        let writer = prompt_for(
+            vec!["fs.read", "agent.spawn"],
+            Some(PathBuf::from("/tmp/wt")),
+        );
+        assert!(writer.contains("You may delegate"));
+        assert!(!writer.contains("You cannot delegate"));
+    }
+
+    #[test]
+    fn a_child_is_told_about_messaging_only_when_it_holds_the_tool() {
+        assert!(!prompt_for(vec!["fs.read"], None).contains("send a message"));
+        assert!(
+            prompt_for(vec!["fs.read", "agent.message"], None).contains("send a message"),
+            "a child that can reach its parent and is not told so will not"
+        );
+    }
+
+    #[test]
+    fn every_child_is_told_it_cannot_ask_but_may_be_stopped_for_approval() {
+        // Two different things, and conflating them is what made a child treat
+        // an approval prompt as a dead end and work around it.
+        let prompt = prompt_for(vec!["fs.read"], None);
+        assert!(prompt.contains("cannot ask a question"));
+        assert!(prompt.contains("approval"));
     }
 }

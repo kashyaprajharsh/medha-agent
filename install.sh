@@ -1,5 +1,5 @@
 #!/bin/sh
-# MEDHA installer — Linux, macOS, WSL2.
+# MEDHA installer -- Linux, macOS, WSL2.
 #
 #   curl -fsSL https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/main/install.sh | sh
 #
@@ -38,7 +38,7 @@ case "$os" in
   Linux)  os_part="unknown-linux-gnu" ;;
   Darwin) os_part="apple-darwin" ;;
   MINGW*|MSYS*|CYGWIN*)
-    die "Windows detected — use the PowerShell installer instead:
+    die "Windows detected -- use the PowerShell installer instead:
   irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex" ;;
   *) die "unsupported operating system: $os" ;;
 esac
@@ -54,7 +54,7 @@ TARGET="${arch_part}-${os_part}"
 # ---- resolve the version ----------------------------------------------------
 
 if [ "$VERSION" = "latest" ]; then
-  say "Resolving the latest release…"
+  say "Resolving the latest release..."
   VERSION="$(fetch "https://api.github.com/repos/$REPO/releases/latest" \
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     | head -n1)"
@@ -82,7 +82,7 @@ mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-say "Downloading medha $VERSION for $TARGET…"
+say "Downloading medha $VERSION for ${TARGET}..."
 fetch_to "$URL" "$tmp/$ASSET" || die "download failed: $URL
 This platform may not have a published build for $VERSION."
 
@@ -91,7 +91,7 @@ if fetch_to "$URL.sha256" "$tmp/$ASSET.sha256" 2>/dev/null; then
   if command -v shasum >/dev/null 2>&1; then
     expected="$(cut -d' ' -f1 < "$tmp/$ASSET.sha256")"
     actual="$(shasum -a 256 "$tmp/$ASSET" | cut -d' ' -f1)"
-    [ "$expected" = "$actual" ] || die "checksum mismatch — refusing to install"
+    [ "$expected" = "$actual" ] || die "checksum mismatch -- refusing to install"
     say "Checksum verified."
   fi
 fi

@@ -15,10 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No version here on purpose: the action reads rust-toolchain.toml, which
+      # is the single source of truth. A floating `stable` meant a new clippy
+      # release could fail CI on unchanged code, unreproducibly.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy, rust-analyzer
+        uses: dtolnay/rust-toolchain@master
 
       # Real language servers so the LSP end-to-end tests exercise the protocol
       # path instead of silently skipping when a binary is absent.

@@ -328,7 +328,8 @@ impl Tool for MemoryWrite {
         response["usage"] = json!({
             "tokens": usage_tokens,
             "budget_tokens": self.budget_tokens,
-            "percent": if self.budget_tokens == 0 { 100 } else { usage_tokens.saturating_mul(100) / self.budget_tokens },
+            // A zero budget reads as "full", not as a division by zero.
+            "percent": usage_tokens.saturating_mul(100).checked_div(self.budget_tokens).unwrap_or(100),
         });
         Ok(response)
     }

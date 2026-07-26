@@ -528,11 +528,12 @@ impl Renderer {
             let mut remaining = budget;
             let n = ncols;
             for w in widths.iter_mut() {
-                let share = if total == 0 {
-                    budget / n
-                } else {
-                    *w * budget / total
-                };
+                // Weight each column by its measured width. With nothing
+                // measured (total 0), fall back to an even split — and to the
+                // whole budget if there are somehow no columns.
+                let share = (*w * budget)
+                    .checked_div(total)
+                    .unwrap_or_else(|| budget.checked_div(n).unwrap_or(budget));
                 *w = share.max(3);
                 remaining = remaining.saturating_sub(*w);
             }

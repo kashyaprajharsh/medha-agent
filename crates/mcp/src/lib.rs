@@ -1078,11 +1078,11 @@ impl McpManager {
                             probe.push((slot.config.id.clone(), slot.generation));
                         }
                     }
-                    ServerState::Degraded | ServerState::Parked => {
-                        if slot.retry_at.is_some_and(|at| at <= now) {
-                            slot.retry_at = None;
-                            due.push((slot.config.id.clone(), slot.generation));
-                        }
+                    ServerState::Degraded | ServerState::Parked
+                        if slot.retry_at.is_some_and(|at| at <= now) =>
+                    {
+                        slot.retry_at = None;
+                        due.push((slot.config.id.clone(), slot.generation));
                     }
                     _ => {}
                 }

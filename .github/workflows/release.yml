@@ -19,8 +19,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A tag must not be able to publish a broken binary. Without this the build
+  # matrix ran regardless of CI's verdict — and did, for three commits while CI
+  # was red. Costs a few minutes per release; buys not shipping a broken build.
+  gate:
+    name: lint + test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gate
+      - name: Install build and language-server dependencies
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+          sudo apt-get install -y clangd || sudo apt-get install -y clang-tools
+          command -v clangd >/dev/null \
+            || ln -sf "$(ls -1 /usr/bin/clangd-* | sort -V | tail -1)" "$HOME/.local/bin/clangd"
+          ln -sf "$(rustup which rust-analyzer)" "$HOME/.local/bin/rust-analyzer"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
   build:
     name: ${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -42,7 +69,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Version comes from rust-toolchain.toml, so a published binary is built
+      # by the same compiler CI linted with — not whatever stable happens to be.
+      - uses: dtolnay/rust-toolchain@master
         with:
           targets: ${{ matrix.target }}
 

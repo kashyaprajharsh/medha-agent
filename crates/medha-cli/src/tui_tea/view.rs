@@ -888,15 +888,15 @@ pub(super) fn checklist_line(line: &str) -> Option<Line<'static>> {
     let body = rest
         .strip_prefix("- ")
         .or_else(|| rest.strip_prefix("* "))?;
-    let (mark, color, text, done) = if let Some(t) = body
+    let (mark, color, text, done) = match body
         .strip_prefix("[x]")
         .or_else(|| body.strip_prefix("[X]"))
     {
-        ("✔", theme::ok(), t.trim_start(), true)
-    } else if let Some(t) = body.strip_prefix("[ ]") {
-        ("○", theme::dim(), t.trim_start(), false)
-    } else {
-        return None;
+        Some(t) => ("✔", theme::ok(), t.trim_start(), true),
+        None => {
+            let t = body.strip_prefix("[ ]")?;
+            ("○", theme::dim(), t.trim_start(), false)
+        }
     };
     let text_style = if done {
         Style::default().fg(theme::dim())

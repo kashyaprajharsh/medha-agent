@@ -1,0 +1,16 @@
+# Pinned so local and CI lint with the SAME clippy.
+#
+# With a floating `stable`, a new clippy release can fail CI on code that has
+# not changed, and the failure cannot be reproduced locally until the developer
+# happens to update — which is exactly what happened on the first green CI run
+# (clippy 1.97 flagged a `collapsible_match` that 1.91 did not).
+#
+# This is the toolchain used to BUILD. It is not the MSRV — that stays declared
+# as `rust-version` in Cargo.toml, and is what consumers must satisfy.
+#
+# Bump deliberately: raise the version here, run `cargo clippy --workspace
+# --all-targets -- -D warnings`, and fix whatever the newer lints find in the
+# same commit.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy", "rust-analyzer"]

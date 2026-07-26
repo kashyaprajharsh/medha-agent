@@ -2664,7 +2664,7 @@ impl Tool for ReadArtifact {
             "total_size": total,
             "content": content
         });
-        if next_offset < total as usize {
+        if next_offset < total {
             out["next_offset"] = json!(next_offset);
         }
         Ok(out)

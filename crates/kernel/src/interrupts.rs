@@ -12,7 +12,9 @@
 //! Steers that never reached a boundary when a cancel lands are handed back to
 //! the surface via `StreamSink::steers_returned` — typed text must not vanish.
 
-use tokio::sync::mpsc;
+use std::sync::Arc;
+
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// What a surface can ask of a running session.
@@ -24,16 +26,26 @@ pub enum Interrupt {
     CancelTurn,
 }
 
+/// How many interrupts a session has been sent. Monotonic, so a watcher that
+/// samples it and later compares can tell that *something* arrived without
+/// having to consume it — the queue belongs to the session loop, and a watcher
+/// that took from it would be stealing the loop's input.
+pub type Activity = watch::Receiver<u64>;
+
 /// Cloneable sender held by the surface (TUI / ACP / gateway later).
 #[derive(Clone)]
 pub struct InterruptHandle {
     tx: mpsc::UnboundedSender<Interrupt>,
     cancel: CancellationToken,
+    activity: Arc<watch::Sender<u64>>,
 }
 
 impl InterruptHandle {
     pub fn steer(&self, text: impl Into<String>) {
         let _ = self.tx.send(Interrupt::Steer(text.into()));
+        // After the send, never before: a watcher woken by the count must find
+        // the text already queued behind it.
+        self.activity.send_modify(|count| *count += 1);
     }
 
     /// Request a graceful stop. Also trips the cancellation token so the
@@ -41,6 +53,16 @@ impl InterruptHandle {
     pub fn cancel_turn(&self) {
         let _ = self.tx.send(Interrupt::CancelTurn);
         self.cancel.cancel();
+        self.activity.send_modify(|count| *count += 1);
+    }
+
+    /// Watch for anything queued against this session.
+    ///
+    /// This is what lets a long wait inside a tool end the moment its own
+    /// operator says something, instead of holding the turn for its full
+    /// duration against instructions that are already obsolete.
+    pub fn activity(&self) -> Activity {
+        self.activity.subscribe()
     }
 }
 
@@ -48,19 +70,34 @@ impl InterruptHandle {
 pub struct InterruptQueue {
     rx: mpsc::UnboundedReceiver<Interrupt>,
     cancel: CancellationToken,
+    activity: Arc<watch::Sender<u64>>,
 }
 
 impl InterruptQueue {
     pub fn pair() -> (InterruptHandle, InterruptQueue) {
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
+        let activity = Arc::new(watch::Sender::new(0));
         (
             InterruptHandle {
                 tx,
                 cancel: cancel.clone(),
+                activity: Arc::clone(&activity),
             },
-            InterruptQueue { rx, cancel },
+            InterruptQueue {
+                rx,
+                cancel,
+                activity,
+            },
         )
+    }
+
+    /// Watch for anything queued against this session. Held by the queue as
+    /// well as the handle so a watcher outlives every surface that could steer
+    /// — otherwise the channel closes the moment the last handle drops and the
+    /// watch reads as "gone" rather than "quiet".
+    pub fn activity(&self) -> Activity {
+        self.activity.subscribe()
     }
 
     /// Token the loop selects on; clone freely into tool waits.
@@ -108,6 +145,34 @@ mod tests {
             queue.drain_steers(),
             vec!["late".to_string()],
             "cancel entries carry no text"
+        );
+    }
+
+    #[test]
+    fn activity_counts_without_consuming_what_the_loop_will_read() {
+        let (handle, mut queue) = InterruptQueue::pair();
+        let mut activity = handle.activity();
+        assert_eq!(*activity.borrow_and_update(), 0);
+
+        handle.steer("narrow it");
+        assert!(activity.has_changed().unwrap(), "a steer is activity");
+        // Watching must not take the text: the queue belongs to the session
+        // loop, and a watcher that consumed from it would steal its input.
+        assert_eq!(queue.drain_steers(), vec!["narrow it".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_watcher_outlives_every_surface_that_could_steer() {
+        let (handle, queue) = InterruptQueue::pair();
+        let mut activity = queue.activity();
+        activity.borrow_and_update();
+        drop(handle);
+        // The queue holds a sender too, so this reads as "quiet", not "gone".
+        // Otherwise a wait would end instantly the moment a surface detached.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), activity.changed())
+                .await
+                .is_err()
         );
     }
 }

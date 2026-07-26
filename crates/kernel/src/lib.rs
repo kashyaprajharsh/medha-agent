@@ -30,7 +30,7 @@ pub use events::{
 };
 pub use executor::{BackgroundTask, Executor};
 pub use gate::{Approval, AutoDeny, HumanGate};
-pub use interrupts::{Interrupt, InterruptHandle, InterruptQueue};
+pub use interrupts::{Activity, Interrupt, InterruptHandle, InterruptQueue};
 pub use kernel_loop::{DEFAULT_MAX_PARALLEL_TOOLS, Kernel, StopReason};
 pub use policy::{AllowAll, Policy};
 pub use provider::{

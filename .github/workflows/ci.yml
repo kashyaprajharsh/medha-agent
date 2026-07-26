@@ -15,11 +15,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No version here on purpose: the action reads rust-toolchain.toml, which
-      # is the single source of truth. A floating `stable` meant a new clippy
-      # release could fail CI on unchanged code, unreproducibly.
+      # rust-toolchain.toml is the single source of truth, but the action needs
+      # the version as an input — so read it out rather than duplicating it.
+      - name: Read pinned toolchain
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy, rust-analyzer
 
       # Real language servers so the LSP end-to-end tests exercise the protocol
       # path instead of silently skipping when a binary is absent.

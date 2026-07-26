@@ -22,10 +22,13 @@ jobs:
 
       # Real language servers so the LSP end-to-end tests exercise the protocol
       # path instead of silently skipping when a binary is absent.
-      - name: Install language servers
+      - name: Install build and language-server dependencies
         run: |
           mkdir -p "$HOME/.local/bin"
           sudo apt-get update
+          # keyring's Linux backend (sync-secret-service) links against D-Bus,
+          # so libdbus-sys needs the headers and pkg-config to find them.
+          sudo apt-get install -y libdbus-1-dev pkg-config
           # `clangd`, not `clang-tools`: the latter installs only versioned
           # binaries (clangd-14, …) and no unversioned symlink, so a bare
           # `clangd` is not on PATH. Fall back to symlinking whichever

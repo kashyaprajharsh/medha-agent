@@ -174,7 +174,7 @@ pub struct AgentsConfig {
     pub max_active: usize,
     /// Delegation depth. 1 keeps it flat: a child cannot spawn a child, which
     /// bounds how far a single request can fan out.
-    pub max_depth: usize,
+    pub max_depth: u32,
     /// Whether children may modify code (§6.4). A writing child works in its
     /// own git worktree and returns a patch that only lands once a human
     /// approves it — the parent's tree is never touched by the child itself.
@@ -185,6 +185,11 @@ pub struct AgentsConfig {
     /// generously: a child cut off before it reports has spent everything and
     /// returned nothing, which is the expensive failure.
     pub max_turns: u32,
+    /// Bounds on one `agent.wait`, in seconds. The floor exists because a
+    /// zero-length wait is a poll, and a model that can poll will.
+    pub min_wait_secs: u64,
+    pub default_wait_secs: u64,
+    pub max_wait_secs: u64,
 }
 
 impl Default for AgentsConfig {
@@ -203,6 +208,9 @@ impl Default for AgentsConfig {
             // writing anything; the whole run was wasted. The child is told its
             // budget and to wrap up early, but the ceiling has to leave room to.
             max_turns: 100,
+            min_wait_secs: 1,
+            default_wait_secs: 120,
+            max_wait_secs: 600,
         }
     }
 }

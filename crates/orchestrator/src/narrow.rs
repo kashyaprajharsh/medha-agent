@@ -50,40 +50,12 @@ impl NarrowedExecutor {
         self
     }
 
-    /// Drop the delegation tools, so a child cannot spawn a child.
-    ///
-    /// This is what actually enforces the depth limit. The counter on
-    /// `AgentControl` does not: a child runs against the *same* control plane
-    /// as its parent, so its depth reads as the parent's and the check passes.
-    /// Read-only children were covered by accident — `read_only` strips
-    /// `agent.spawn` along with everything else that mutates — but a writer
-    /// keeps its mutating tools, and so kept the ability to delegate.
-    ///
-    /// Removing the capability is the enforcement, because it holds regardless
-    /// of what any counter says.
-    pub fn no_delegation(mut self) -> Self {
-        self.allowed.retain(|name| !name.starts_with("agent."));
-        self
-    }
-
-    /// Drop `clarify` — the child's ability to stop and ask an open question.
-    ///
-    /// **This is not permission gating.** A child still routes consequential
-    /// actions through the human gate and still gets approved or refused there;
-    /// that is how a child is meant to ask "may I do this?", and it stays.
-    ///
-    /// What goes is the open-ended question. A child cannot see the
-    /// conversation, so its question arrives without the context that would
-    /// make it answerable, and a background child outlives the turn entirely —
-    /// so it can block indefinitely on an answer from someone who has moved on.
-    /// A delegated task has to be self-contained or it should not have been
-    /// delegated; where it is ambiguous the child is told to choose, say which
-    /// reading it chose, and continue.
-    ///
-    /// `read_only` does not cover this: asking a question mutates nothing, so
-    /// `clarify` is a read and survives that filter. The child prompt already
-    /// tells a child it cannot ask; this makes that true rather than a claim
-    /// the model is free to disregard.
+    /// Drop `clarify`. Not permission gating — a child still routes
+    /// consequential actions through the human gate. What goes is the
+    /// open-ended question: a child cannot see the conversation, so its
+    /// question is unanswerable, and a background one can block forever on
+    /// someone who has moved on. `read_only` misses it because asking mutates
+    /// nothing.
     pub fn no_clarifying_questions(mut self) -> Self {
         self.allowed.retain(|name| name != "clarify");
         self
@@ -278,30 +250,12 @@ mod tests {
         assert!(!narrowed.allows("shell.exec"));
     }
 
-    /// A writer keeps its mutating tools, so `read_only` does not cover it —
-    /// which is precisely how `agent.spawn` survived into writing children and
-    /// left "no grandchildren" unenforced for exactly the children that can do
-    /// the most damage.
     #[test]
-    fn a_writing_child_cannot_delegate_even_though_it_keeps_its_mutating_tools() {
-        let writer = NarrowedExecutor::new(Arc::new(Delegating), None).no_delegation();
-        assert!(
-            names(&writer).contains(&"fs.write".to_string()),
-            "a writer must keep the tools it needs to write"
-        );
-        assert!(!writer.allows("agent.spawn"));
-        assert!(!writer.allows("agent.cancel"));
-    }
-
-    #[tokio::test]
-    async fn delegation_is_refused_at_dispatch_not_only_hidden() {
-        let child = NarrowedExecutor::new(Arc::new(Delegating), None).no_delegation();
-        // Filtering the spec list is not enforcement: the model can name a tool
-        // it was never shown.
-        assert_eq!(
-            child.execute(&intent("agent.spawn")).await.status,
-            kernel::ObsStatus::Denied
-        );
+    fn a_writer_keeps_the_delegation_tools_the_depth_limit_now_governs() {
+        let writer = NarrowedExecutor::new(Arc::new(Delegating), None);
+        assert!(names(&writer).contains(&"fs.write".to_string()));
+        // Nesting is bounded by the child's path depth, not by hiding the tool.
+        assert!(writer.allows("agent.spawn"));
     }
 
     /// Asking a question mutates nothing, so `clarify` is a *read* and survives

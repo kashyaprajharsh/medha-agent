@@ -1112,11 +1112,11 @@ enum PickerKind {
 /// something to forget.
 #[derive(Debug, Clone)]
 pub(super) enum AgentRow {
-    Running {
-        handle: orchestrator::AgentHandle,
-        /// How long it has been silent. `None` means it has recorded nothing
-        /// yet — starting up, not stalled. Elapsed-since-start cannot answer
-        /// "is this moving?", which is the question a spinner prompts.
+    /// A child, running or settled — its `state` says which.
+    Agent {
+        agent: orchestrator::Agent,
+        /// Silence so far. `None` means nothing recorded yet — starting up, not
+        /// stalled.
         idle_ms: Option<u64>,
     },
     /// A writer's patch, waiting for the user to accept or ignore it.
@@ -1124,14 +1124,10 @@ pub(super) enum AgentRow {
         agent: String,
         session: String,
         files: usize,
-        /// `None` when the project has no verify command — which is not the
-        /// same as a patch that failed, and must not be shown as if it were.
+        /// `None` when the project has no verify command — not the same as a
+        /// patch that failed, and must not be shown as if it were.
         verified: Option<bool>,
     },
-    /// A child that has settled. §6.6 asks for completed and failed children,
-    /// not only active ones: the roster drops an entry the instant its child
-    /// finishes, so without this a run that ended badly leaves no trace here.
-    Done(orchestrator::Finished),
 }
 
 /// Rows of [`PickerKind::McpAuth`], in order.
@@ -1263,7 +1259,9 @@ impl PickerKind {
             PickerKind::Agents(rows) => {
                 let running = rows
                     .iter()
-                    .filter(|row| matches!(row, AgentRow::Running { .. }))
+                    .filter(
+                        |row| matches!(row, AgentRow::Agent { agent, .. } if agent.is_running()),
+                    )
                     .count();
                 let patches = rows
                     .iter()
@@ -1493,32 +1491,38 @@ impl PickerKind {
             PickerKind::Agents(rows) => rows
                 .iter()
                 .map(|row| match row {
-                    // The objective is what distinguishes two agents at a glance;
-                    // the name is a label and the session id is unreadable.
-                    AgentRow::Running { handle, idle_ms } => {
-                        let objective: String = handle.objective.chars().take(52).collect();
-                        // Silence is a weak signal and the threshold has to
-                        // respect that: nothing is recorded while a model
-                        // composes an answer, so an agent mid-generation looks
-                        // exactly like a wedged one. On a large model a single
-                        // step can run past a minute, and a marker that fires
-                        // there brands healthy agents as broken — which is
-                        // worse than staying quiet, because it invites killing
-                        // work that was nearly done.
-                        //
+                    AgentRow::Agent { agent, idle_ms } => {
+                        let objective: String = agent.objective.chars().take(52).collect();
+                        // Nothing is recorded while a model composes, so an
+                        // agent mid-generation looks exactly like a wedged one.
                         // Only multi-minute silence is worth remarking on, and
-                        // even then it is reported as silence, not as a fault.
-                        let quiet = match idle_ms {
-                            Some(ms) if *ms >= 180_000 => format!("  quiet {}m", ms / 60_000),
-                            Some(_) => String::new(),
-                            None => "  starting".to_string(),
+                        // then as silence, not as a fault.
+                        let note = match agent.state {
+                            orchestrator::State::Running => match idle_ms {
+                                Some(ms) if *ms >= 180_000 => format!("  quiet {}m", ms / 60_000),
+                                Some(_) => String::new(),
+                                None => "  starting".to_string(),
+                            },
+                            orchestrator::State::Settled(_) => String::new(),
                         };
-                        format!("⚇ {}   {objective}{quiet}", handle.agent)
+                        let mark = match agent.state {
+                            orchestrator::State::Running => "⚇",
+                            orchestrator::State::Settled(orchestrator::AgentStatus::Completed) => {
+                                "✓"
+                            }
+                            orchestrator::State::Settled(orchestrator::AgentStatus::Exhausted) => {
+                                "◐"
+                            }
+                            orchestrator::State::Settled(orchestrator::AgentStatus::Cancelled) => {
+                                "⊘"
+                            }
+                            orchestrator::State::Settled(orchestrator::AgentStatus::Failed) => "✗",
+                        };
+                        format!("{mark} {}   {objective}{note}", agent.path.name())
                     }
-                    // Verification status is on the row, not one level down: a
-                    // patch that failed its build is a draft, and that is
-                    // exactly the thing a user should not have to go looking
-                    // for before applying.
+                    // Verification is on the row, not one level down: a patch
+                    // that failed its build is a draft, and that is the thing a
+                    // user should not have to go looking for before applying.
                     AgentRow::Patch {
                         agent,
                         files,
@@ -1530,21 +1534,6 @@ impl PickerKind {
                             Some(true) => "verified",
                             Some(false) => "BUILD FAILED",
                             None => "not verified",
-                        }
-                    ),
-                    AgentRow::Done(done) => format!(
-                        "{} {}   {}{}",
-                        match done.status {
-                            orchestrator::AgentStatus::Completed => "✓",
-                            orchestrator::AgentStatus::Exhausted => "◐",
-                            orchestrator::AgentStatus::Cancelled => "⊘",
-                            orchestrator::AgentStatus::Failed => "✗",
-                        },
-                        done.agent,
-                        done.objective.chars().take(52).collect::<String>(),
-                        match done.duration_ms {
-                            0 => String::new(),
-                            ms => format!("  ({}s)", ms / 1000),
                         }
                     ),
                 })
@@ -1914,7 +1903,7 @@ struct Model {
     /// what. `None` when sub-agents are disabled.
     agents: Option<Arc<orchestrator::AgentControl>>,
     /// Children running right now, refreshed on the animation tick.
-    agent_runs: Vec<orchestrator::AgentHandle>,
+    agent_runs: Vec<orchestrator::Agent>,
 }
 
 impl Model {

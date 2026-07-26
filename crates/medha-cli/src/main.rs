@@ -1290,9 +1290,18 @@ async fn main() -> Result<()> {
             tokio_util::sync::CancellationToken::new(),
         )
         .with_limits(lock.agents.max_active, lock.agents.max_depth)
+        .with_wait_bounds(orchestrator::WaitBounds {
+            min: std::time::Duration::from_secs(lock.agents.min_wait_secs),
+            default: std::time::Duration::from_secs(lock.agents.default_wait_secs),
+            max: std::time::Duration::from_secs(lock.agents.max_wait_secs),
+        })
         // Delivery rides the event log, so a background report survives a
         // restart and reaches the session that dispatched it.
         .with_outbox(Arc::new(agents::LogOutbox::new(log.clone())))
+        // Same fold, read as conversation rather than as delivery: a forked
+        // child starts with what the caller already knows instead of paying to
+        // rediscover it.
+        .with_transcripts(Arc::new(agents::LogOutbox::new(log.clone())))
         // Durable patch records live on the owning session's chain, so the
         // control plane shares the same session slot the agent tools use —
         // filled once the session id exists.

@@ -1278,7 +1278,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         let names = model
             .agent_runs
             .iter()
-            .map(|run| run.agent.as_str())
+            .map(|run| run.path.name())
             .collect::<Vec<_>>()
             .join(", ");
         left.push(Span::styled(

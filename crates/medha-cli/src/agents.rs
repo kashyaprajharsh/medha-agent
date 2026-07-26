@@ -46,7 +46,17 @@ fn child_prompt(run: &ChildRun) -> String {
         ),
         None => prompt.push_str(
             "\nYou are read-only: you cannot modify anything. Investigate, then \
-             finish with your findings as your final message.\n",
+             finish with your findings as your final message.\n\
+             \n\
+             If the task above asks you to CHANGE anything — write, edit, add, \
+             fix, rename, create a file — you cannot do it, and you must say so \
+             as the first line of your answer: state plainly that you were sent \
+             read-only and the task needs write access. Do not describe the \
+             changes you would have made and leave it at that: a plan written \
+             out in full reads like completed work, and whoever sent you will \
+             believe the job is done and find the files untouched. Reporting \
+             the refusal is the useful outcome; describing the work instead of \
+             doing it is the harmful one.\n",
         ),
     }
     // Stated literally, because a model asked to reason about its own limits
@@ -266,6 +276,15 @@ fn chain(id: ulid::Ulid) -> Session {
         id,
         done: false,
         autonomy: kernel::AutonomyLevel::Careful,
+    }
+}
+
+#[async_trait::async_trait]
+impl<L: EventLog + 'static> orchestrator::Transcripts for LogOutbox<L> {
+    /// The same projection `--resume` uses, so a forked child sees exactly the
+    /// conversation a human resuming that session would.
+    async fn history(&self, session: ulid::Ulid) -> Vec<Message> {
+        kernel::project_messages(&self.log.events(session).await)
     }
 }
 
@@ -613,7 +632,12 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             max_turns: Some(run.max_turns),
             ..Default::default()
         };
-        let messages = vec![Message::new(Role::User, child_prompt(&run))];
+        // Inherited conversation first, objective last: the child reads what was
+        // already said and then what it is being asked to do about it. The other
+        // order makes the objective the thing it has forgotten by the time it
+        // finishes reading.
+        let mut messages = run.history.clone();
+        messages.push(Message::new(Role::User, child_prompt(&run)));
 
         // The child's chain opens with what it was asked to do, so its session
         // stands on its own when read back later.

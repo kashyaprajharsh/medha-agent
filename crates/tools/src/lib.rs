@@ -7,6 +7,9 @@ use async_trait::async_trait;
 use ignore::WalkBuilder;
 use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
 
+mod agents;
+pub use agents::SessionHandle;
+
 pub mod hub;
 pub mod judge;
 pub mod memory_tools;
@@ -122,6 +125,42 @@ fn cap_preview(s: &str) -> String {
 }
 
 /// Helper: required string argument.
+/// Run one tool under its own timeout and shape the result into an observation.
+///
+/// The ceiling is the tool's own (default 60s); tools that self-manage a longer
+/// run (`shell.exec` promotes to background; `diagnostics`, `web.crawl`,
+/// `agent.*`) return a larger value or `None` for no cap. On timeout the run
+/// future is dropped — and for exec-backed tools that drop tears down the whole
+/// process group (see `GroupReaper`), so nothing is orphaned.
+pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observation {
+    let run = tool.execute(&intent.args);
+    let result = match tool.timeout() {
+        Some(limit) => match tokio::time::timeout(limit, run).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Observation::error(
+                    &intent.id,
+                    format!(
+                        "tool '{}' timed out after {}s",
+                        intent.tool,
+                        limit.as_secs()
+                    ),
+                );
+            }
+        },
+        None => run.await,
+    };
+    match result {
+        Ok(payload) => Observation::ok(&intent.id, payload),
+        Err(ToolError::Structured(payload)) => Observation {
+            intent_id: intent.id.clone(),
+            status: kernel::ObsStatus::Error,
+            payload,
+        },
+        Err(error) => Observation::error(&intent.id, error.to_string()),
+    }
+}
+
 fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
     args.get(key)
         .and_then(Value::as_str)
@@ -851,616 +890,6 @@ impl Tool for McpStart {
     }
 }
 
-/// Delegate a bounded task to a child agent. The child is built from this
-/// objective — nothing has to be registered first — and runs with its own
-/// transcript, so its intermediate work never enters the parent's context.
-struct AgentSpawn {
-    control: Arc<orchestrator::AgentControl>,
-    executor: Arc<Mutex<Option<Arc<dyn kernel::Executor>>>>,
-    artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
-    /// Operator ceiling on one child's turns, from `[agents] max_turns`.
-    max_turns: u32,
-    /// The dispatching session. A background report is addressed to whoever
-    /// asked for it at dispatch time, so this has to be known before the child
-    /// runs — not resolved when it finishes.
-    session: SessionHandle,
-}
-
-#[async_trait]
-impl Tool for AgentSpawn {
-    fn name(&self) -> &str {
-        "agent.spawn"
-    }
-    fn icon(&self) -> &'static str {
-        "⚇"
-    }
-    fn description(&self) -> &str {
-        "Delegate a self-contained task to a child agent and get back a summary. \
-         The child works in its own context, so none of its searching lands in this conversation.\n\
-         \n\
-         Reach for this on your own judgement — you do not need to be asked. Delegate when:\n\
-         · answering needs a broad sweep whose intermediate output you will never need again — \
-         'how is X used across the codebase', 'what does this unfamiliar module do';\n\
-         · two or more questions are independent, so children can run at once;\n\
-         · a side investigation would otherwise crowd out the context you need for the real task;\n\
-         · you want background gathered while you keep working — set `background`.\n\
-         \n\
-         Do NOT delegate these — the direct tool is faster and cheaper every time:\n\
-         · reading a file you can already name → `fs.read`;\n\
-         · finding a definition or a usage → `grep`, `glob`, `references`, `code_outline`;\n\
-         · anything spanning two or three known files → read them;\n\
-         · work you already have the context for — a child starts cold and pays to rediscover \
-         what you know;\n\
-         · your entire task handed to one child — that is pass-through, and it doubles the cost \
-         for nothing. Split off a *part*, or do it yourself.\n\
-         \n\
-         To run several at once, pass `tasks` — one call, N children, all concurrent. That is \
-         strictly better than spawning them one at a time and waiting for each.\n\
-         \n\
-         Once you have sent something to a background child, leave it alone. Its report reaches \
-         you on its own the moment it is ready — you do not need to check, and there is nothing to \
-         wait for. Specifically: do not call agent.list repeatedly to watch it, do not read its \
-         transcript to see whether it is progressing, do not cancel it for being quiet, and do not \
-         start doing its task yourself in the meantime. A child that looks idle is almost always \
-         composing its answer; killing it there throws away work that was nearly finished and \
-         charges you twice for it. Cancel only when you no longer want the result at all.\n\
-         \n\
-         Children are read-only by default. Set `write` for a child that must change code: it gets \
-         its own private checkout of the repository, and hands back a patch plus the result of \
-         building it. Nothing it does touches your files — review the patch and apply it with \
-         `agent.apply`, which asks the user first. Two writing children can safely run at once; \
-         they cannot see each other's changes.\n\
-         \n\
-         State the objective in full: the child cannot see this conversation and cannot ask you \
-         anything — put every path, error message and constraint it needs in the objective itself. \
-         If the user asked for a particular language, tone or format, say so there too, or the \
-         child's summary will come back in the wrong one and contaminate your reply. Give \
-         `contract` when the answer must have a particular shape. A child can never use a tool you \
-         do not already have, and cannot delegate further.\n\
-         \n\
-         A child's report is its own account of what it did, not an established fact. For anything \
-         with an effect outside its own reasoning — a file written, a request sent, a test claimed \
-         to pass — get the verifiable handle (path, URL, status, command output) and check it \
-         yourself before you tell the user it happened. Its report comes back to you, not to the \
-         user — relay what matters."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        // Read-only children: no mutation, but real model spend, so it stays
-        // above a plain read.
-        BlastRadius::ReversibleLocal
-    }
-    fn timeout(&self) -> Option<std::time::Duration> {
-        // No tool-level cap. A child is a whole session — it runs to its own
-        // turn budget, which is the bound that means anything here. The default
-        // 60s killed any child that did real work, and killed it *silently* from
-        // the parent's side: the report was lost even though the child had been
-        // making progress. Cancellation still settles it, through the parent's
-        // own interrupt and the child's token.
-        None
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Other
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "objective": {
-                    "type": "string",
-                    "description": "The complete task. The child sees only this — not this conversation."
-                },
-                "name": { "type": "string", "description": "Short label for the agent (optional)" },
-                "contract": {
-                    "type": "string",
-                    "description": "What the result must contain, e.g. 'a list of file:line with one sentence each'"
-                },
-                "tools": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Narrow the child to these tools. Omit to inherit yours. Cannot exceed yours."
-                },
-                "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" },
-                "write": {
-                    "type": "boolean",
-                    "description": "Let the child change code. It works in a private checkout and returns a patch — your files are never touched. Apply it with `agent.apply`. Refused if this workspace is not a git repository."
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "Return immediately instead of waiting. The report arrives at the start of a later turn. Use for work you do not need before answering; keep it false when you need the answer now."
-                },
-                "tasks": {
-                    "type": "array",
-                    "description": "Run several independent investigations at once, each its own agent, and get every report back together. Use this instead of one call per question — they run concurrently rather than in sequence. Give `tasks` OR `objective`, not both.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "objective": { "type": "string" },
-                            "name": { "type": "string" },
-                            "contract": { "type": "string" },
-                            "tools": { "type": "array", "items": { "type": "string" } },
-                            "write": { "type": "boolean" }
-                        },
-                        "required": ["objective"]
-                    }
-                }
-            }
-        })
-    }
-    async fn preview(&self, args: &Value) -> Option<String> {
-        let kind = match args.get("write").and_then(Value::as_bool).unwrap_or(false) {
-            true => "a writing agent (private checkout, returns a patch)",
-            false => "a read-only agent",
-        };
-        Some(format!(
-            "delegate to {kind}:\n{}",
-            args.get("objective")?.as_str()?
-        ))
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        // Batch: independent questions run at once rather than one call after
-        // another. Capacity is already bounded per tree, so an over-large batch
-        // is refused by the runtime rather than flooding it.
-        if let Some(tasks) = args.get("tasks").and_then(Value::as_array) {
-            if tasks.is_empty() {
-                return Err(ToolError::Args("tasks is empty".into()));
-            }
-            let Some(parent) = self.executor.lock().ok().and_then(|e| e.clone()) else {
-                return Err(ToolError::Failed(
-                    "the agent runtime is not available in this session".into(),
-                ));
-            };
-            let runs = tasks.iter().map(|task| {
-                let spec = orchestrator::AgentSpec {
-                    name: task
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    objective: task
-                        .get("objective")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    contract: task
-                        .get("contract")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    tools: task.get("tools").and_then(Value::as_array).map(|names| {
-                        names
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    }),
-                    max_turns: None,
-                    write: task.get("write").and_then(Value::as_bool).unwrap_or(false),
-                };
-                self.control.spawn(spec, parent.clone(), self.max_turns)
-            });
-            // One failure must not discard its siblings' work, so each result is
-            // reported on its own terms.
-            let reports: Vec<Value> = futures::future::join_all(runs)
-                .await
-                .into_iter()
-                .map(|outcome| match outcome {
-                    Ok(result) => serde_json::to_value(result).unwrap_or_default(),
-                    Err(error) => json!({ "status": "failed", "summary": error.to_string() }),
-                })
-                .collect();
-            return Ok(json!({ "agents": reports, "count": reports.len() }));
-        }
-        let objective = arg_str(args, "objective")?;
-        let Some(parent) = self.executor.lock().ok().and_then(|e| e.clone()) else {
-            return Err(ToolError::Failed(
-                "the agent runtime is not available in this session".into(),
-            ));
-        };
-        let spec = orchestrator::AgentSpec {
-            name: args
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            objective,
-            contract: args
-                .get("contract")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            tools: args.get("tools").and_then(Value::as_array).map(|names| {
-                names
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            }),
-            max_turns: args
-                .get("max_turns")
-                .and_then(Value::as_u64)
-                .map(|turns| turns as u32),
-            write: args.get("write").and_then(Value::as_bool).unwrap_or(false),
-        };
-        // Background: hand back the handle now, report arrives on a later turn.
-        if args
-            .get("background")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            let owner = self.session.lock().ok().and_then(|id| *id).ok_or_else(|| {
-                ToolError::Failed("no session to deliver a background report to".into())
-            })?;
-            let handle = self
-                .control
-                .spawn_background(spec, parent, self.max_turns, owner)
-                .await
-                .map_err(|error| ToolError::Failed(error.to_string()))?;
-            return Ok(json!({
-                "agent": handle.agent,
-                "session": handle.session,
-                "status": "running",
-                "note": "running in the background; its report will arrive at the start of a later turn. Do not wait for it — carry on, and do not invent its findings.",
-            }));
-        }
-        // The parent's live turn counter is not visible at the tool boundary, so
-        // the operator's ceiling is the bound. A child's turns are its own
-        // session's anyway; the tokens are the shared cost, which this caps.
-        let mut result = self
-            .control
-            .spawn(spec, parent, self.max_turns)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        // Bound what reaches the model, but persist the whole report first —
-        // truncating before spilling would lose exactly the part worth keeping.
-        let cap = orchestrator::MAX_SUMMARY_CHARS;
-        if let Some(cut) = result
-            .summary
-            .char_indices()
-            .nth(cap)
-            .map(|(index, _)| index)
-        {
-            if let Some(store) = &self.artifacts
-                && let Ok(hash) = store.put(result.summary.as_bytes())
-            {
-                result.artifact = Some(hash);
-            }
-            result.summary.truncate(cut);
-            result.summary.push_str(match &result.artifact {
-                Some(_) => "\n… truncated; read the rest with `read_artifact`",
-                None => "\n… truncated",
-            });
-        }
-        let mut value =
-            serde_json::to_value(&result).map_err(|error| ToolError::Failed(error.to_string()))?;
-        // A writer's patch is the point of the call but not something the model
-        // needs to read in full — a large refactor would spend the context
-        // window on a diff nobody is going to review by eye. The patch itself
-        // stays whole in the artifact store, and `agent.apply` works from the
-        // agent's id, so bounding what is *shown* costs no capability.
-        if let Some(patch) = &result.patch
-            && patch.is_large()
-            && let Some(store) = &self.artifacts
-            && let Ok(hash) = store.put(patch.diff.as_bytes())
-        {
-            value["patch"]["diff"] = json!(format!(
-                "[{} bytes across {} file(s); read it with `read_artifact` {hash}]",
-                patch.diff.len(),
-                patch.files.len()
-            ));
-            value["patch"]["artifact"] = json!(hash);
-        }
-        Ok(value)
-    }
-}
-
-/// Shared slot for the session a background report belongs to.
-pub type SessionHandle = Arc<Mutex<Option<ulid::Ulid>>>;
-
-/// Inspect and stop running agents. Read-only listing plus a targeted stop, so
-/// the model can abandon work it no longer needs rather than paying for it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AgentAction {
-    List,
-    Cancel,
-    Transcript,
-    Steer,
-}
-
-struct AgentControlTool {
-    control: Arc<orchestrator::AgentControl>,
-    action: AgentAction,
-}
-
-#[async_trait]
-impl Tool for AgentControlTool {
-    fn name(&self) -> &str {
-        match self.action {
-            AgentAction::List => "agent.list",
-            AgentAction::Cancel => "agent.cancel",
-            AgentAction::Transcript => "agent.transcript",
-            AgentAction::Steer => "agent.steer",
-        }
-    }
-    fn icon(&self) -> &'static str {
-        "⚇"
-    }
-    fn description(&self) -> &str {
-        match self.action {
-            AgentAction::Cancel => {
-                "Stop one running agent by its name or session id. Its siblings keep running, and \
-                 whatever it had found is still reported."
-            }
-            AgentAction::List => {
-                "List the agents running right now, with what each was asked to do.\n\
-                 \n\
-                 `idle_ms` is time since the agent last *recorded* a step, and a model writes \
-                 nothing while it is composing a long answer — so a large value usually means it \
-                 is mid-generation, not stuck. Minutes of silence on a big model is ordinary. Do \
-                 not treat this as a fault signal, do not poll it, and do not cancel an agent \
-                 because it is quiet: you would be throwing away work that was nearly done and \
-                 paying for it twice."
-            }
-            AgentAction::Transcript => {
-                "Read what an agent actually did, by its session id. A report is a summary; when \
-                 one looks thin, wrong, or was cut short, read the work behind it instead of \
-                 guessing or re-running the search yourself."
-            }
-            AgentAction::Steer => {
-                "Send further instruction to an agent that is still running — a correction, a \
-                 constraint you forgot, or a narrowing of scope. It arrives as a message at the \
-                 agent's next step; it does not restart the agent or discard what it has already \
-                 found.\n\
-                 \n\
-                 Use this the moment you realise a running agent is working from something wrong. \
-                 The only alternative is cancelling it and paying for the whole run again, and an \
-                 agent cannot ask you a question when it gets stuck."
-            }
-        }
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Diagnostic
-    }
-    fn schema(&self) -> Value {
-        match self.action {
-            AgentAction::List => json!({ "type": "object", "properties": {} }),
-            AgentAction::Cancel => json!({
-                "type": "object",
-                "properties": {
-                    "agent": { "type": "string", "description": "Agent name or session id" }
-                },
-                "required": ["agent"]
-            }),
-            AgentAction::Transcript => json!({
-                "type": "object",
-                "properties": {
-                    "agent": { "type": "string", "description": "The agent's session id, as returned by agent.spawn" },
-                    "tail": { "type": "integer", "description": "Only the last N steps (default: all)" }
-                },
-                "required": ["agent"]
-            }),
-            AgentAction::Steer => json!({
-                "type": "object",
-                "properties": {
-                    "agent": { "type": "string", "description": "Agent name or session id" },
-                    "text": { "type": "string", "description": "What to tell it. Stands alone — the agent cannot see this conversation." }
-                },
-                "required": ["agent", "text"]
-            }),
-        }
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        match self.action {
-            AgentAction::List => {
-                // Elapsed-since-start cannot answer "is it moving?", which is
-                // the only question worth asking about a long-running agent.
-                let idle = self.control.idle_times().await;
-                let agents: Vec<Value> = self
-                    .control
-                    .active()
-                    .into_iter()
-                    .map(|handle| {
-                        let quiet = idle.get(&handle.session).copied().flatten();
-                        let mut row = serde_json::to_value(&handle).unwrap_or_default();
-                        if let Some(object) = row.as_object_mut() {
-                            object.insert("idle_ms".into(), json!(quiet));
-                        }
-                        row
-                    })
-                    .collect();
-                Ok(json!({ "agents": agents }))
-            }
-            AgentAction::Cancel => {
-                let id = arg_str(args, "agent")?;
-                let stopped = self.control.cancel(&id);
-                if stopped.is_empty() {
-                    return Err(ToolError::Failed(format!("no running agent '{id}'")));
-                }
-                Ok(json!({ "cancelled": stopped }))
-            }
-            AgentAction::Steer => {
-                let id = arg_str(args, "agent")?;
-                let text = arg_str(args, "text")?;
-                if text.trim().is_empty() {
-                    return Err(ToolError::Args("nothing to send".into()));
-                }
-                let steered = self.control.steer(&id, &text);
-                // Reporting success for text nobody received would be the worst
-                // outcome here: the caller would carry on believing it had
-                // corrected a run that is still going the wrong way.
-                if steered.is_empty() {
-                    return Err(ToolError::Failed(format!(
-                        "no running agent '{id}' — it may have already finished, in which case \
-                         read its report or spawn a new agent"
-                    )));
-                }
-                Ok(json!({ "steered": steered, "delivers": "at the agent's next step" }))
-            }
-            AgentAction::Transcript => {
-                let id = arg_str(args, "agent")?;
-                let mut steps = self
-                    .control
-                    .transcript(&id)
-                    .await
-                    .map_err(|error| ToolError::Failed(error.to_string()))?;
-                if steps.is_empty() {
-                    return Err(ToolError::Failed(format!(
-                        "no transcript for '{id}' — pass the session id from agent.spawn, not the name"
-                    )));
-                }
-                let total = steps.len();
-                // A child can run for dozens of turns; the tail is usually where
-                // the answer was forming when it stopped.
-                if let Some(tail) = args.get("tail").and_then(Value::as_u64)
-                    && (tail as usize) < total
-                {
-                    steps = steps.split_off(total - tail as usize);
-                }
-                Ok(json!({ "agent": id, "steps": steps, "total": total }))
-            }
-        }
-    }
-}
-
-/// Merge a writing child's patch into the user's working tree (§6.4).
-///
-/// Separate from `agent.spawn` on purpose. A child finishing is not consent to
-/// change the user's files, so the patch waits until someone asks for it — and
-/// because this is a consequential action, the ask goes through the human gate
-/// with the diff on screen.
-struct AgentApply {
-    control: Arc<orchestrator::AgentControl>,
-}
-
-#[async_trait]
-impl Tool for AgentApply {
-    fn name(&self) -> &str {
-        "agent.apply"
-    }
-    fn icon(&self) -> &'static str {
-        "⚇"
-    }
-    fn description(&self) -> &str {
-        "Apply a writing agent's patch to the working tree, by its session id or name. Until you \
-         call this, the agent's work exists only as a diff and nothing in the workspace has \
-         changed.\n\
-         \n\
-         A patch whose verification failed is refused: it does not build, so it is a draft, not a \
-         fix. Read the failure and fix it, or re-run the agent. `force` overrides that and should \
-         be used only once you have established the failure was already there and is unrelated — \
-         never as a way past an error you have not read.\n\
-         \n\
-         If the agent's changes overlap edits made since it started, this reports a conflict and \
-         applies nothing — resolve it yourself rather than retrying. With no arguments it lists \
-         the patches still waiting."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        // It rewrites files the user owns. Reversible — the tree is a git repo
-        // by construction here — but never something to do unasked.
-        BlastRadius::ReversibleLocal
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Vcs
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "agent": {
-                    "type": "string",
-                    "description": "The writing agent's session id (or name). Omit to list the patches waiting to be applied."
-                },
-                "force": {
-                    "type": "boolean",
-                    "description": "Apply even though verification failed. Only after you have read the failure and established it is pre-existing and unrelated to this patch."
-                }
-            }
-        })
-    }
-    async fn preview(&self, args: &Value) -> Option<String> {
-        let id = args.get("agent").and_then(Value::as_str)?;
-        let patch = self.control.patch(id).await?;
-        // The gate shows the diff itself. Approving "apply agent-3's patch"
-        // without seeing what it does is not a decision, it is a formality.
-        let files = patch.files.join(", ");
-        let evidence = match &patch.verification {
-            Some(v) if v.passed => format!("verified: `{}` passed", v.command),
-            Some(v) => format!("NOT VERIFIED: `{}` failed", v.command),
-            None => "NOT VERIFIED: nothing was run against this patch".to_string(),
-        };
-        let body: String = patch.diff.lines().take(200).collect::<Vec<_>>().join("\n");
-        let elided = patch.diff.lines().count().saturating_sub(200);
-        Some(format!(
-            "apply {id}'s patch to {files}\n{evidence}\n\n{body}{}",
-            match elided {
-                0 => String::new(),
-                n => format!("\n… {n} more line(s)"),
-            }
-        ))
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let Some(id) = args.get("agent").and_then(Value::as_str) else {
-            let waiting: Vec<Value> = self
-                .control
-                .outstanding()
-                .await
-                .into_iter()
-                .map(|(agent, session, patch)| {
-                    json!({
-                        "agent": agent,
-                        "session": session,
-                        "files": patch.files,
-                        "verified": patch.verified(),
-                    })
-                })
-                .collect();
-            return Ok(json!({ "unmerged": waiting, "count": waiting.len() }));
-        };
-        let patch = self.control.patch(id).await.ok_or_else(|| {
-            ToolError::Failed(format!(
-                "no patch from '{id}' — it may have changed nothing, or been a read-only agent"
-            ))
-        })?;
-        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-        match self.control.merge(&patch, force).await {
-            Ok(check) => {
-                // Applied, so it is no longer outstanding. Leaving it listed
-                // would invite a second apply, which would either fail
-                // confusingly or double-apply.
-                self.control.forget(id).await;
-                Ok(json!({
-                    "applied": true,
-                    "files": patch.files,
-                    "merge": check,
-                    "verified": patch.verified(),
-                    "forced": force,
-                }))
-            }
-            // A patch that does not build does not merge (§6.4). The failure
-            // output travels with the refusal, so the next step is reading it
-            // rather than guessing or reaching for `force`.
-            Err(orchestrator::Error::Unverified(command)) => Err(ToolError::Failed(format!(
-                "{} — nothing was applied.\n\n{}",
-                orchestrator::Error::Unverified(command),
-                patch
-                    .verification
-                    .as_ref()
-                    .map(|evidence| evidence.output.clone())
-                    .unwrap_or_default()
-            ))),
-            // §6.4: conflicting patches go to reconciliation, never
-            // last-writer-wins. Nothing was applied, and saying so precisely is
-            // what stops the model from "fixing" it by force.
-            Err(error) => Err(ToolError::Failed(format!(
-                "{error} — nothing was applied. The files {} changed since this agent started; \
-                 read the patch and make the edits yourself, or re-run the agent from the \
-                 current state.",
-                patch.files.join(", ")
-            ))),
-        }
-    }
-}
-
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// The workspace sandbox, kept so the executor can report its containment
@@ -1608,29 +1037,19 @@ impl ToolRegistry {
         control: Arc<orchestrator::AgentControl>,
         max_turns: u32,
     ) -> &mut Self {
-        self.register(Arc::new(AgentSpawn {
-            control: control.clone(),
-            executor: Arc::clone(&self.agent_parent),
-            artifacts: self.artifacts.clone(),
-            max_turns: max_turns.max(1),
-            session: Arc::clone(&self.agent_session),
-        }));
-        for action in [
-            AgentAction::List,
-            AgentAction::Cancel,
-            AgentAction::Transcript,
-            AgentAction::Steer,
-        ] {
-            self.register(Arc::new(AgentControlTool {
-                control: control.clone(),
-                action,
-            }));
+        let root = agents::Delegate::new(
+            &control,
+            Arc::clone(&self.agent_parent),
+            max_turns.max(1),
+            Arc::clone(&self.agent_session),
+        );
+        for tool in root.tools_for_root() {
+            self.register(tool);
         }
-        // Only where writers are possible. Offering a merge tool in a session
-        // that can never produce a patch is a tool that can only ever fail.
-        if control.can_write() {
-            self.register(Arc::new(AgentApply { control }));
-        }
+        // A child's copy of these is built the same way, addressed at itself.
+        // Without it a child holds the root's, and every path it derives is the
+        // root's — so the depth limit reads zero forever.
+        control.install_delegation(Arc::new(root));
         self
     }
 
@@ -1951,38 +1370,7 @@ impl Executor for ToolRegistry {
         let Some(tool) = self.tools.get(&intent.tool) else {
             return Observation::denial(&intent.id, format!("unknown tool '{}'", intent.tool));
         };
-        // Per-tool timeout so a stuck tool never hangs the session. The ceiling
-        // is the tool's own (default 60s); tools that self-manage a longer run
-        // (shell.exec promotes to background; diagnostics/web.crawl) return a
-        // larger value or `None` for no cap. On timeout the run future is dropped
-        // — and for exec-backed tools that drop tears down the whole process
-        // group (see `GroupReaper`), so nothing is orphaned.
-        let run = tool.execute(&intent.args);
-        let result = match tool.timeout() {
-            Some(limit) => match tokio::time::timeout(limit, run).await {
-                Ok(r) => r,
-                Err(_) => {
-                    return Observation::error(
-                        &intent.id,
-                        format!(
-                            "tool '{}' timed out after {}s",
-                            intent.tool,
-                            limit.as_secs()
-                        ),
-                    );
-                }
-            },
-            None => run.await,
-        };
-        match result {
-            Ok(payload) => Observation::ok(&intent.id, payload),
-            Err(ToolError::Structured(payload)) => Observation {
-                intent_id: intent.id.clone(),
-                status: kernel::ObsStatus::Error,
-                payload,
-            },
-            Err(e) => Observation::error(&intent.id, e.to_string()),
-        }
+        run_tool(tool.as_ref(), intent).await
     }
 
     async fn preview(&self, intent: &ToolIntent) -> Option<String> {
@@ -7373,9 +6761,55 @@ mod tests {
         assert_eq!(out.get("skipped").and_then(Value::as_bool), Some(true));
     }
 
+    /// Delivery for the agent tests. Every spawn is asynchronous, so a control
+    /// without an outbox refuses all of them.
+    #[derive(Default)]
+    struct TestOutbox;
+
+    #[async_trait]
+    impl orchestrator::Outbox for TestOutbox {
+        async fn dispatched(&self, _dispatch: &orchestrator::Dispatch) {}
+        async fn finished(
+            &self,
+            _dispatch: &orchestrator::Dispatch,
+            _result: &orchestrator::AgentResult,
+        ) {
+        }
+        async fn delivered(&self, _parent: ulid::Ulid, _child: ulid::Ulid) {}
+        async fn undelivered(&self, _parent: ulid::Ulid) -> Vec<orchestrator::AgentResult> {
+            Vec::new()
+        }
+        async fn transcript(&self, _child: ulid::Ulid) -> Vec<String> {
+            Vec::new()
+        }
+        async fn recorded(
+            &self,
+            _parent: ulid::Ulid,
+            _agent: &str,
+            _child: ulid::Ulid,
+            _patch: &orchestrator::Patch,
+        ) {
+        }
+        async fn applied(&self, _parent: ulid::Ulid, _child: ulid::Ulid) {}
+        async fn unapplied(
+            &self,
+            _parent: ulid::Ulid,
+        ) -> Vec<(String, String, orchestrator::Patch)> {
+            Vec::new()
+        }
+        async fn last_activity(&self, _child: ulid::Ulid) -> Option<f64> {
+            None
+        }
+        async fn reap_abandoned(&self, _parent: ulid::Ulid) -> usize {
+            0
+        }
+    }
+
     /// A runner that reports what the child was actually given, so the wiring
     /// from tool arguments through to a narrowed executor is covered end to end.
-    struct EchoRunner;
+    struct EchoRunner {
+        saw: Arc<Mutex<Vec<String>>>,
+    }
 
     #[async_trait]
     impl orchestrator::ChildRunner for EchoRunner {
@@ -7384,6 +6818,7 @@ mod tests {
             run: orchestrator::ChildRun,
         ) -> Result<orchestrator::ChildOutcome, String> {
             let tools: Vec<String> = run.executor.specs().into_iter().map(|s| s.name).collect();
+            *self.saw.lock().unwrap() = tools.clone();
             Ok(orchestrator::ChildOutcome {
                 status: orchestrator::AgentStatus::Completed,
                 summary: format!("saw {} tool(s): {}", tools.len(), tools.join(",")),
@@ -7394,24 +6829,31 @@ mod tests {
         }
     }
 
-    fn registry_with_agents() -> Arc<ToolRegistry> {
+    /// Returns the registry and what the child was handed, filled once it runs.
+    fn registry_with_agents() -> (Arc<ToolRegistry>, Arc<Mutex<Vec<String>>>) {
+        let saw = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::default();
-        let control = Arc::new(orchestrator::AgentControl::new(
-            Arc::new(EchoRunner),
-            tokio_util::sync::CancellationToken::new(),
-        ));
+        let control = Arc::new(
+            orchestrator::AgentControl::new(
+                Arc::new(EchoRunner { saw: saw.clone() }),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .with_outbox(Arc::new(TestOutbox)),
+        );
         registry.register_agents(control, 8);
         let parent = registry.agent_parent_handle();
+        // A spawn is addressed to the owning session, so one has to exist.
+        *registry.agent_session_handle().lock().unwrap() = Some(ulid::Ulid::new());
         let registry = Arc::new(registry);
         // What `main` does once the kernel exists: children narrow from the
         // finished registry.
         *parent.lock().unwrap() = Some(registry.clone() as Arc<dyn kernel::Executor>);
-        registry
+        (registry, saw)
     }
 
     #[tokio::test]
-    async fn agent_spawn_is_exposed_and_delegates_read_only() {
-        let registry = registry_with_agents();
+    async fn agent_spawn_returns_at_once_and_delegates_read_only() {
+        let (registry, saw) = registry_with_agents();
         assert!(
             registry
                 .specs()
@@ -7428,14 +6870,24 @@ mod tests {
             })
             .await;
         assert_eq!(observation.status, kernel::ObsStatus::Ok);
-        let summary = observation.payload["summary"].as_str().unwrap_or_default();
-        // The child inherited the parent's registry but only its read-only half,
-        // so a mutating tool must not appear in what it saw.
+        // The call returns immediately — there is no waiting path left, so a
+        // report here would mean the turn had been blocked to produce it.
+        assert_eq!(observation.payload["status"], "running");
+        assert!(observation.payload["agent"].as_str().is_some());
+
+        for _ in 0..20_000 {
+            if !saw.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // The child inherited the parent's registry but only its read-only half.
+        let tools = saw.lock().unwrap().clone();
+        assert!(!tools.is_empty(), "the child never ran");
         assert!(
-            !summary.contains("fs.write"),
-            "child got a write tool: {summary}"
+            !tools.iter().any(|tool| tool == "fs.write"),
+            "child got a write tool: {tools:?}"
         );
-        assert_eq!(observation.payload["status"], "completed");
     }
 
     /// A child is a whole session and routinely outlives any per-tool cap. The
@@ -7444,7 +6896,7 @@ mod tests {
     /// making progress.
     #[test]
     fn delegation_is_not_subject_to_the_per_tool_timeout() {
-        let registry = registry_with_agents();
+        let (registry, _saw) = registry_with_agents();
         let spawn = registry
             .tools
             .get("agent.spawn")
@@ -7474,7 +6926,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_spawn_without_an_objective_is_rejected() {
-        let registry = registry_with_agents();
+        let (registry, _saw) = registry_with_agents();
         let observation = registry
             .execute(&kernel::ToolIntent {
                 id: "i1".into(),

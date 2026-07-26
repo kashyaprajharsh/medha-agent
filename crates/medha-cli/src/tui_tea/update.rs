@@ -55,21 +55,14 @@ pub(super) fn update<P, L>(
                     .as_ref()
                     .map(|control| control.active())
                     .unwrap_or_default();
-                // An entry leaves the roster exactly when its child reaches a
-                // terminal state, so the difference is the finish notification —
-                // no extra channel needed, and the user is not left watching a
-                // spinner for work that already landed.
-                // Background children only: a foreground result is returned
-                // inline, so announcing one would be both redundant and wrong —
-                // it would promise a report later that has already arrived.
+                // A child leaves the running set exactly when it settles, so the
+                // difference is the finish notification — no extra channel, and
+                // the user is not left watching a spinner for work that landed.
                 let finished: Vec<(String, String)> = model
                     .agent_runs
                     .iter()
-                    .filter(|previous| {
-                        previous.background
-                            && !running.iter().any(|run| run.session == previous.session)
-                    })
-                    .map(|previous| (previous.agent.clone(), previous.session.clone()))
+                    .filter(|previous| !running.iter().any(|run| run.session == previous.session))
+                    .map(|previous| (previous.path.name().to_string(), previous.session.clone()))
                     .collect();
                 model.agent_runs = running;
                 for (agent, session) in finished {
@@ -993,7 +986,9 @@ pub(super) fn handle_key<P, L>(
             KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Agents(_)) => {
                 let session = match &picker.kind {
                     PickerKind::Agents(rows) => match rows.get(picker.selected) {
-                        Some(AgentRow::Running { handle, .. }) => Some(handle.session.clone()),
+                        Some(AgentRow::Agent { agent, .. }) if agent.is_running() => {
+                            Some(agent.session.clone())
+                        }
                         _ => None,
                     },
                     _ => None,
@@ -1045,10 +1040,7 @@ pub(super) fn handle_key<P, L>(
                     None => {
                         let watching = match &picker.kind {
                             PickerKind::Agents(rows) => match rows.get(picker.selected) {
-                                Some(AgentRow::Running { handle, .. }) => {
-                                    Some(handle.session.clone())
-                                }
-                                Some(AgentRow::Done(done)) => Some(done.session.clone()),
+                                Some(AgentRow::Agent { agent, .. }) => Some(agent.session.clone()),
                                 _ => None,
                             },
                             _ => None,
@@ -2970,21 +2962,25 @@ fn agent_rows(
     outstanding: Vec<(String, String, orchestrator::Patch)>,
     idle: &std::collections::HashMap<String, Option<u64>>,
 ) -> Vec<AgentRow> {
-    let mut rows: Vec<AgentRow> = control
-        .active()
-        .into_iter()
-        .map(|handle| AgentRow::Running {
-            // Absent from the map means it was not measured this pass, which
-            // reads the same as "nothing recorded yet" — both mean no answer,
-            // and neither should be shown as a stall.
-            idle_ms: idle.get(&handle.session).copied().flatten(),
-            handle,
-        })
-        .collect();
     let waiting: Vec<String> = outstanding
         .iter()
         .map(|(_, session, _)| session.clone())
         .collect();
+    let (running, settled): (Vec<_>, Vec<_>) = control
+        .agents()
+        .into_iter()
+        // A settled writer whose patch is still waiting appears as a patch row;
+        // listing it twice would read as two separate pieces of work.
+        .filter(|agent| agent.is_running() || !waiting.contains(&agent.session))
+        .partition(orchestrator::Agent::is_running);
+
+    let row = |agent: orchestrator::Agent| AgentRow::Agent {
+        // Absent from the map reads the same as nothing recorded yet — both
+        // mean no answer, and neither should be shown as a stall.
+        idle_ms: idle.get(&agent.session).copied().flatten(),
+        agent,
+    };
+    let mut rows: Vec<AgentRow> = running.into_iter().map(row).collect();
     for (agent, session, patch) in outstanding {
         rows.push(AgentRow::Patch {
             agent,
@@ -2993,17 +2989,7 @@ fn agent_rows(
             verified: patch.verification.as_ref().map(|evidence| evidence.passed),
         });
     }
-    rows.extend(
-        control
-            .history()
-            .into_iter()
-            .rev()
-            // A finished writer whose patch is still waiting is already above
-            // as a patch row; listing it twice would read as two separate
-            // pieces of work.
-            .filter(|done| !waiting.contains(&done.session))
-            .map(AgentRow::Done),
-    );
+    rows.extend(settled.into_iter().rev().map(row));
     rows
 }
 
@@ -3068,7 +3054,7 @@ fn agents_steer(model: &mut Model, rest: &str) {
         Some((first, tail))
             if running
                 .iter()
-                .any(|run| run.agent == first || run.session == first) =>
+                .any(|run| run.path.name() == first || run.session == first) =>
         {
             (first.to_string(), tail.trim().to_string())
         }
@@ -3076,7 +3062,7 @@ fn agents_steer(model: &mut Model, rest: &str) {
         // only unambiguous with exactly one agent running.
         _ if running.len() == 1 => (running[0].session.clone(), rest.trim().to_string()),
         _ => {
-            let names: Vec<&str> = running.iter().map(|run| run.agent.as_str()).collect();
+            let names: Vec<&str> = running.iter().map(|run| run.path.name()).collect();
             model.push_notice(format!(
                 "several agents are running — say which: /steer <agent> <message>  ({})",
                 names.join(", ")
@@ -3088,13 +3074,15 @@ fn agents_steer(model: &mut Model, rest: &str) {
         model.push_notice("nothing to send — /steer <agent> <message>");
         return;
     }
-    match control.steer(&id, &text).first() {
-        Some(agent) => model.push_notice(format!(
-            "sent to '{agent}' — it arrives at the agent's next step"
+    // The user is the root of the tree, so every agent is within reach.
+    match control.steer(&orchestrator::AgentPath::root(), &id, &text) {
+        Ok(path) => model.push_notice(format!(
+            "sent to '{}' — it arrives at the agent's next step",
+            path.name()
         )),
         // Between listing and sending it can finish; saying so beats implying
         // the message landed.
-        None => model.push_notice(format!("'{id}' is no longer running — nothing was sent")),
+        Err(error) => model.push_notice(format!("'{id}': {error} — nothing was sent")),
     }
 }
 
@@ -3111,7 +3099,8 @@ fn agents_view_transcript(model: &mut Model, session: &str, tx: &mpsc::Unbounded
     model.picker = None;
     let (session, tx) = (session.to_string(), tx.clone());
     tokio::spawn(async move {
-        let outcome = match control.transcript(&session).await {
+        let root = orchestrator::AgentPath::root();
+        let outcome = match control.transcript(&root, &session).await {
             Ok(lines) if lines.is_empty() => Err(format!(
                 "'{session}' has not recorded anything yet — it may still be on its first step"
             )),
@@ -3203,13 +3192,13 @@ fn agents_stop(model: &mut Model, session: &str, tx: &mpsc::UnboundedSender<TuiE
     let Some(control) = model.agents.clone() else {
         return;
     };
-    let stopped = control.cancel(session);
-    match stopped.first() {
+    match control.cancel(&orchestrator::AgentPath::root(), session) {
         // Cancelling is not discarding: the child still reports what it found.
-        Some(name) => model.push_notice(format!(
-            "stopped agent '{name}' — whatever it had found still arrives with your next message"
+        Ok(path) => model.push_notice(format!(
+            "stopped agent '{}' — whatever it had found still arrives with its report",
+            path.name()
         )),
-        None => model.push_notice("that agent already finished"),
+        Err(_) => model.push_notice("that agent already finished"),
     }
     open_agents_picker(model, tx);
 }
@@ -3897,6 +3886,12 @@ pub(super) fn spawn_turn<P, L>(
     // handle; run_session ALWAYS returns (settled history + StopReason), so
     // there is no select! race dropping the session future mid-tool anymore.
     let (handle, queue) = kernel::InterruptQueue::pair();
+    // The control plane watches this so an `agent.wait` ends the moment you
+    // type, rather than holding the turn against instructions you have already
+    // superseded. A fresh handle per turn, so this replaces the last one.
+    if let Some(control) = &model.agents {
+        control.attend(handle.clone());
+    }
     model.interrupt = Some(handle);
     model.cancelling = false;
 
@@ -3931,8 +3926,16 @@ pub(super) fn spawn_turn<P, L>(
                     .nth(orchestrator::MAX_SUMMARY_CHARS)
                     .map(|(index, _)| index)
                 {
+                    // Spill before trimming: the tail is the part worth keeping,
+                    // and truncating first would discard it unrecoverably.
+                    let spilled = kernel.artifacts.put(summary.as_bytes()).ok();
                     summary.truncate(cut);
-                    summary.push_str("\n… report truncated");
+                    summary.push_str(&match spilled {
+                        Some(hash) => {
+                            format!("\n… truncated; read the rest with `read_artifact` {hash}")
+                        }
+                        None => "\n… report truncated".to_string(),
+                    });
                 }
                 messages.push(Message::new(
                     kernel::Role::User,

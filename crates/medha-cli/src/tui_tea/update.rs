@@ -1135,7 +1135,7 @@ pub(super) fn handle_key<P, L>(
                 if matches!(picker.kind, PickerKind::Theme) {
                     let selected = picker.selected;
                     model.picker = None;
-                    if let Some((id, _)) = THEME_MODES.get(selected).copied() {
+                    if let Some((id, _)) = super::theme::modes().get(selected).copied() {
                         set_theme(model, id);
                     }
                     return;
@@ -5290,59 +5290,56 @@ pub(super) fn run_slash<P: kernel::Provider>(
     }
 }
 
-/// `/theme` opens the picker (↑↓ + Enter). `/theme light|dark|auto|toggle`
-/// applies directly without the menu. `auto` re-detects from the terminal.
+/// `/theme` opens the picker (↑↓ + Enter). `/theme <id>` and `/theme toggle`
+/// apply directly without the menu.
 fn apply_theme_command(model: &mut Model, arg: &str) {
+    use super::theme;
     match arg {
         "" => open_theme_picker(model),
-        "light" | "dark" | "auto" => set_theme(model, arg),
+        // Light and back. Returning to the *default* rather than to `dark` keeps
+        // the toggle a round trip — otherwise a session that started on the
+        // default could never toggle its way home.
         "toggle" => {
-            let id = if super::theme::current().is_dark {
+            let id = if theme::current().is_dark {
                 "light"
             } else {
-                "dark"
+                theme::default_palette().id
             };
             set_theme(model, id);
         }
-        _ => model.push_notice(
-            "usage: /theme [light|dark|auto]  (bare /theme opens a picker)".to_string(),
-        ),
+        id if theme::modes().iter().any(|(m, _)| *m == id) => set_theme(model, id),
+        _ => {
+            let ids: Vec<&str> = theme::modes().iter().map(|(m, _)| *m).collect();
+            model.push_notice(format!(
+                "usage: /theme [{}]  (bare /theme opens a picker)",
+                ids.join("|")
+            ));
+        }
     }
 }
 
 /// Open the `/theme` picker, cursor on the current mode.
 pub(super) fn open_theme_picker(model: &mut Model) {
-    let sel = if super::theme::current().is_dark {
-        0
-    } else {
-        1
-    };
+    let id = super::theme::current().id;
+    let sel = super::theme::modes()
+        .iter()
+        .position(|(m, _)| *m == id)
+        .unwrap_or(0);
     model.picker = Some(Picker::with_selected(PickerKind::Theme, sel));
 }
 
-/// Apply a theme by its [`THEME_MODES`] id and re-colour the UI live.
+/// Apply a theme by its id and re-colour the UI live.
 fn set_theme(model: &mut Model, id: &str) {
     use super::theme;
-    let palette = match id {
-        "light" => theme::Palette::light(),
-        // `detect()` re-queries the terminal, which cannot work here: fd 1/2 are
-        // redirected to the stray-stdout log and we are mid-alternate-screen.
-        // Reuse what startup learned instead.
-        "auto" => {
-            if theme::terminal_is_light() {
-                theme::Palette::light()
-            } else {
-                theme::Palette::dark()
-            }
-        }
-        // Terminal-aware: forcing dark onto a light terminal has to paint its
-        // own canvas, or it is near-white text on white.
-        _ => theme::dark_for_terminal(),
-    };
-    let mode = if palette.is_dark { "dark" } else { "light" };
+    let palette = theme::resolve(id);
     theme::set(palette);
     model.invalidate_all_renders();
-    model.push_notice(format!("theme: {mode}"));
+    // On the splash the re-colour is its own confirmation, and a notice would
+    // empty the transcript check that keeps the splash up — replacing the very
+    // screen the theme is being judged on with a one-line receipt.
+    if !model.on_welcome_splash() {
+        model.push_notice(format!("theme: {}", palette.id));
+    }
 }
 
 fn open_reasoning_panel(model: &mut Model) {

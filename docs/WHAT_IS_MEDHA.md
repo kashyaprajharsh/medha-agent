@@ -1251,12 +1251,21 @@ Built on The Elm Architecture: `Model → Update(model, msg) → Model → View(
 The view is a **pure function of the model**, so the same state always renders
 identically — there is no shared mutable UI state to drift.
 
-**Theme.** A warm identity — intellect-gold on ink for dark terminals, deep
-amber-bronze on parchment for light — with no cool/blue tones. Colours are read
-through a live palette, so `/theme` re-colours the whole UI on the next frame. The
-dark palette keeps the terminal's own background (`Color::Reset`) so transparency and
-blur survive; the light palette paints parchment explicitly, because otherwise dark
-text lands on a dark terminal background.
+**Theme.** Four palettes, each a whole visual identity rather than a set of text
+colours: `dark` (intellect-gold on warm ink) and `light` (ink on parchment) are the
+signature pair, joined by `indigo` — nīla, gold on resist-dyed cloth — and `copper`,
+the engraved tāmrapatra with verdigris in its recesses. A theme carries its canvas,
+semantic slots, tool-category hues, splash wordmark **and its animation motif**, so
+switching themes changes how the UI moves as well as how it looks: the veena's pluck,
+the loom's shuttle, the graver's stroke. Everything is read through a live palette, so
+`/theme` re-colours and re-animates the whole UI on the next frame, and adding a theme
+is one `const fn` in `tui_tea/theme.rs` and nothing else.
+
+Every text slot is tested at 4.5:1 against the surface it is drawn on and every chrome
+slot at 3:1, so a palette that regresses fails the build. `dark` alone keeps the
+terminal's own background (`Color::Reset`) so transparency and blur survive — but
+paints an explicit canvas when the terminal underneath is *light*, or it would be
+near-white text on white. Every other palette paints its own.
 
 **Private tty.** Some dependencies print to stdout unconditionally — a PDF text
 extractor emits a warning on ligatures, which any `web.fetch` of an academic PDF

@@ -30,386 +30,8 @@ mod view;
 use update::*;
 use view::*;
 
-/// Shared palette for the TUI's visual identity (amber accent + indigo depth).
-/// Runtime, light/dark-adaptive color palette. Colours are read through the
-/// accessor fns (`theme::text()` …) which return slots from the *current*
-/// palette, so a `/theme` switch or startup background-detection re-colours the
-/// whole UI without threading a palette through every render fn. Reads take an
-/// uncontended `RwLock` read (tens of ns) — negligible at a few hundred per frame.
-pub(crate) mod theme {
-    use ratatui::style::Color;
-    use std::sync::RwLock;
-
-    #[derive(Clone, Copy)]
-    pub struct Palette {
-        pub is_dark: bool,
-        /// Canvas background. Dark uses `Reset` (keep the terminal's own bg, so
-        /// transparency/blur survive); light paints an explicit parchment so the
-        /// theme is readable even on a dark terminal (otherwise dark text lands
-        /// on a dark bg — the "light theme looks weird" bug).
-        pub bg: Color,
-        pub accent: Color,
-        pub text: Color,
-        pub dim: Color,
-        pub faint: Color,
-        pub ok: Color,
-        pub err: Color,
-        pub warn: Color,
-        pub lineno: Color,
-        pub add_bg: Color,
-        pub del_bg: Color,
-        pub add_fg: Color,
-        pub del_fg: Color,
-        // Markdown / UI-polish slots.
-        pub code_fg: Color,
-        pub code_bg: Color,
-        pub border: Color,
-        pub link: Color,
-        pub quote: Color,
-        /// syntect theme name used for code-fence highlighting in this mode.
-        pub syntect_theme: &'static str,
-    }
-
-    impl Palette {
-        /// MEDHA dark — "intellect-gold on warm ink". Medha (मेधा) is Sanskrit for
-        /// intellect/wisdom; the identity is a warm gold accent over warm-neutral
-        /// ink, deliberately free of cool/blue tones. This is medha's signature,
-        /// distinct from Claude's rust or generic terminal blues.
-        /// Background used when the dark palette has to supply its own canvas —
-        /// see [`Palette::dark_on`]. Warm ink, matching `code_bg`, so a forced
-        /// dark theme still reads as MEDHA rather than as generic black.
-        pub const DARK_CANVAS: Color = Color::Rgb(26, 24, 21);
-
-        pub const fn dark() -> Self {
-            Self {
-                is_dark: true,
-                bg: Color::Reset, // keep the terminal's own (possibly transparent) bg
-                accent: Color::Rgb(233, 181, 92), // intellect gold
-                text: Color::Rgb(230, 226, 216), // warm parchment-white
-                dim: Color::Rgb(150, 142, 126), // warm grey
-                faint: Color::Rgb(98, 92, 80),
-                ok: Color::Rgb(150, 196, 128), // sage (warm-leaning green)
-                err: Color::Rgb(226, 120, 100), // warm terracotta-red
-                warn: Color::Rgb(228, 178, 98),
-                lineno: Color::Rgb(96, 90, 78),
-                add_bg: Color::Rgb(26, 44, 30),
-                del_bg: Color::Rgb(52, 28, 26),
-                add_fg: Color::Rgb(158, 210, 150),
-                del_fg: Color::Rgb(232, 140, 128),
-                code_fg: Color::Rgb(224, 200, 148), // parchment gold
-                code_bg: Color::Rgb(34, 31, 27),    // warm ink
-                border: Color::Rgb(86, 79, 68),     // warm bronze-grey
-                link: Color::Rgb(240, 206, 138),    // knowledge-light (underlined)
-                quote: Color::Rgb(172, 158, 134),
-                syntect_theme: "base16-ocean.dark",
-            }
-        }
-        /// The dark palette, told whether the terminal underneath it is light.
-        ///
-        /// `dark()` alone keeps `Color::Reset` so a translucent dark terminal
-        /// keeps its transparency and blur — deliberate, and worth preserving.
-        /// But on a *light* terminal that means near-white text on white: the
-        /// mirror of the "light theme looks weird" bug the light palette already
-        /// fixes by painting its own parchment. So when the canvas underneath is
-        /// light, dark paints one too.
-        pub const fn dark_on(light_terminal: bool) -> Self {
-            let mut p = Self::dark();
-            if light_terminal {
-                p.bg = Self::DARK_CANVAS;
-            }
-            p
-        }
-
-        /// MEDHA light — "ink on parchment". The same warm identity inverted for
-        /// light terminals: deep amber/bronze accent over warm near-black ink.
-        pub const fn light() -> Self {
-            Self {
-                is_dark: false,
-                bg: Color::Rgb(249, 246, 239), // warm parchment — painted explicitly
-                accent: Color::Rgb(160, 106, 18), // deep amber-bronze
-                text: Color::Rgb(43, 38, 30),  // warm near-black ink
-                dim: Color::Rgb(112, 103, 88),
-                faint: Color::Rgb(158, 150, 136),
-                ok: Color::Rgb(52, 120, 58),
-                err: Color::Rgb(188, 58, 42),
-                warn: Color::Rgb(160, 108, 18),
-                lineno: Color::Rgb(158, 150, 136),
-                add_bg: Color::Rgb(224, 244, 226),
-                del_bg: Color::Rgb(250, 226, 222),
-                add_fg: Color::Rgb(34, 108, 52),
-                del_fg: Color::Rgb(176, 46, 38),
-                code_fg: Color::Rgb(122, 82, 16),
-                code_bg: Color::Rgb(243, 237, 224), // parchment
-                border: Color::Rgb(198, 188, 168),
-                link: Color::Rgb(146, 94, 20), // warm bronze (underlined)
-                quote: Color::Rgb(112, 103, 88),
-                syntect_theme: "InspiredGitHub",
-            }
-        }
-    }
-
-    static CURRENT: RwLock<Palette> = RwLock::new(Palette::dark());
-
-    /// Whether the terminal's own canvas is light, learned once at startup.
-    /// `None` until detection runs, or when the terminal would not say.
-    ///
-    /// Kept because `/theme dark` needs it *later*: forcing dark onto a light
-    /// terminal has to paint its own background, and by then the OSC query is
-    /// long gone.
-    static TERMINAL_IS_LIGHT: RwLock<Option<bool>> = RwLock::new(None);
-
-    /// Record what the terminal reported. Called once by [`detect`].
-    fn note_terminal_is_light(light: bool) {
-        *TERMINAL_IS_LIGHT.write().unwrap() = Some(light);
-    }
-
-    /// `true` only when the terminal positively reported a light canvas. An
-    /// unknown terminal is treated as dark, which is the safe assumption: it
-    /// keeps `Color::Reset` and so preserves transparency.
-    pub fn terminal_is_light() -> bool {
-        TERMINAL_IS_LIGHT.read().unwrap().unwrap_or(false)
-    }
-
-    /// The dark palette, adapted to the terminal underneath it.
-    pub fn dark_for_terminal() -> Palette {
-        Palette::dark_on(terminal_is_light())
-    }
-
-    /// Swap the active palette (startup detection / `/theme`). Cheap; next frame
-    /// re-colours from the new slots.
-    pub fn set(p: Palette) {
-        *CURRENT.write().unwrap() = p;
-    }
-    /// Snapshot the whole palette — use when reading several slots at once
-    /// (e.g. the markdown renderer) to take one lock instead of many.
-    pub fn current() -> Palette {
-        *CURRENT.read().unwrap()
-    }
-
-    /// Pick a palette at startup. Precedence:
-    /// `MEDHA_THEME=light|dark|auto` → an **OSC 11** query to the terminal →
-    /// the legacy `COLORFGBG` hint → dark.
-    ///
-    /// The OSC query matters: `COLORFGBG` is an xterm/rxvt convention that
-    /// macOS Terminal.app never sets, so a `COLORFGBG`-only probe fell through
-    /// to dark and painted the dark palette onto a white canvas — the wordmark
-    /// crowns at near-white and simply vanished. OSC 11 is what modern
-    /// terminals (Terminal.app, iTerm2, Ghostty, WezTerm, Kitty, Alacritty)
-    /// actually answer.
-    ///
-    /// Must run BEFORE `tty::init`, which redirects fd 1/2 to the stray-stdout
-    /// log — after that the query would be written to a file, not the terminal.
-    pub fn detect() -> Palette {
-        // Probe the terminal even when MEDHA_THEME forces a palette: `/theme`
-        // can switch away later, and the answer is only available here.
-        let reported_light = query_background_luma().map(|luma| {
-            // Rec. 601 luma; the midpoint separates parchment from ink well
-            // enough that only a deliberately grey terminal is ambiguous.
-            luma > 0.5
-        });
-        let reported_light = reported_light.or_else(|| {
-            // COLORFGBG is "fg;bg" (occasionally "fg;def;bg"). The final field is
-            // the background palette index; 7 (light grey) and 15 (white) are the
-            // standard light-background signals.
-            let cfb = std::env::var("COLORFGBG").ok()?;
-            let bg = cfb.rsplit(';').next()?.trim().parse::<u8>().ok()?;
-            Some(matches!(bg, 7 | 15))
-        });
-        if let Some(light) = reported_light {
-            note_terminal_is_light(light);
-        }
-
-        if let Ok(v) = std::env::var("MEDHA_THEME") {
-            match v.trim().to_ascii_lowercase().as_str() {
-                "light" => return Palette::light(),
-                "dark" => return dark_for_terminal(),
-                _ => {} // "auto"/anything else falls through to detection
-            }
-        }
-        match reported_light {
-            Some(true) => Palette::light(),
-            // A terminal that answered "dark" gets `Color::Reset`, so its
-            // transparency survives; one that stayed silent is assumed dark too.
-            _ => Palette::dark(),
-        }
-    }
-
-    /// Ask the terminal for its background colour and return its perceived
-    /// brightness in `0.0..=1.0`. `None` when there is no tty, the terminal
-    /// stays silent, or the reply cannot be parsed — every one of which falls
-    /// back to the next detection tier rather than guessing.
-    ///
-    /// Deliberately bounded: raw mode is held only for the round trip, and a
-    /// terminal that ignores OSC 11 costs one 120 ms timeout at startup, not a
-    /// hang.
-    fn query_background_luma() -> Option<f32> {
-        use std::io::{IsTerminal, Write};
-
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            return None;
-        }
-
-        // Raw mode so the reply arrives unbuffered and is not echoed. Restored
-        // on every exit path, including the `?` early returns below.
-        struct RawGuard;
-        impl Drop for RawGuard {
-            fn drop(&mut self) {
-                let _ = crossterm::terminal::disable_raw_mode();
-            }
-        }
-        crossterm::terminal::enable_raw_mode().ok()?;
-        let _raw = RawGuard;
-
-        let mut out = std::io::stdout();
-        out.write_all(b"\x1b]11;?\x1b\\").ok()?;
-        out.flush().ok()?;
-
-        // Read straight from fd 0 rather than through `std::io::stdin()`.
-        // `Stdin` is BufReader-backed: its first read pulls the WHOLE reply into
-        // a userspace buffer and hands back one byte, after which poll(2) sees an
-        // empty kernel queue and reports "nothing ready" — so the loop gave up
-        // holding just the leading ESC and detection silently fell through to
-        // dark. Unbuffered reads keep poll(2) and the data in the same place.
-        //
-        // Reply shape: ESC ] 11 ; rgb:RRRR/GGGG/BBBB  terminated by BEL or ST.
-        let mut buf = Vec::with_capacity(64);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
-        while std::time::Instant::now() < deadline && buf.len() < 64 {
-            if !stdin_ready(deadline) {
-                break;
-            }
-            match read_stdin_byte() {
-                Some(b) => {
-                    buf.push(b);
-                    // BEL, or the ST that closes a string terminator.
-                    if b == 0x07 || (b == b'\\' && buf.ends_with(b"\x1b\\")) {
-                        break;
-                    }
-                }
-                None => break,
-            }
-        }
-
-        parse_osc11_luma(&String::from_utf8_lossy(&buf))
-    }
-
-    /// One unbuffered byte from stdin, or `None` on EOF/error.
-    #[cfg(unix)]
-    fn read_stdin_byte() -> Option<u8> {
-        let mut b = 0u8;
-        // SAFETY: a one-byte read into a live local, on the already-open fd 0.
-        let n = unsafe { libc::read(0, std::ptr::addr_of_mut!(b).cast(), 1) };
-        (n == 1).then_some(b)
-    }
-
-    #[cfg(not(unix))]
-    fn read_stdin_byte() -> Option<u8> {
-        None
-    }
-
-    /// Perceived brightness of an OSC 11 reply, `0.0..=1.0`.
-    ///
-    /// Split out from the I/O so the parsing — the part that actually varies
-    /// between terminals — is unit-testable without a tty.
-    pub(super) fn parse_osc11_luma(reply: &str) -> Option<f32> {
-        let spec = reply.split("rgb:").nth(1)?;
-        let mut parts = spec.split('/');
-        // Components are hex of arbitrary width: xterm answers 4 nibbles, some
-        // terminals 2. Normalise each by its own width rather than assuming 16-bit.
-        let mut channel = || -> Option<f32> {
-            let raw: String = parts
-                .next()?
-                .chars()
-                .take_while(|c| c.is_ascii_hexdigit())
-                .collect();
-            if raw.is_empty() {
-                return None;
-            }
-            let max = 16f32.powi(raw.len() as i32) - 1.0;
-            Some(u32::from_str_radix(&raw, 16).ok()? as f32 / max)
-        };
-        let (r, g, b) = (channel()?, channel()?, channel()?);
-        Some(0.299 * r + 0.587 * g + 0.114 * b)
-    }
-
-    /// `true` when stdin has a byte ready before `deadline`. Uses `poll(2)` so a
-    /// silent terminal cannot block the read.
-    #[cfg(unix)]
-    fn stdin_ready(deadline: std::time::Instant) -> bool {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        let mut fd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: a single well-formed pollfd for stdin, with a bounded timeout.
-        unsafe { libc::poll(&mut fd, 1, remaining.as_millis() as i32) == 1 }
-    }
-
-    #[cfg(not(unix))]
-    fn stdin_ready(_deadline: std::time::Instant) -> bool {
-        // No poll(2); skip the query and fall through to COLORFGBG.
-        false
-    }
-
-    pub fn bg() -> Color {
-        CURRENT.read().unwrap().bg
-    }
-    pub fn accent() -> Color {
-        CURRENT.read().unwrap().accent
-    }
-    pub fn text() -> Color {
-        CURRENT.read().unwrap().text
-    }
-    pub fn dim() -> Color {
-        CURRENT.read().unwrap().dim
-    }
-    pub fn faint() -> Color {
-        CURRENT.read().unwrap().faint
-    }
-    pub fn ok() -> Color {
-        CURRENT.read().unwrap().ok
-    }
-    pub fn err() -> Color {
-        CURRENT.read().unwrap().err
-    }
-    pub fn warn() -> Color {
-        CURRENT.read().unwrap().warn
-    }
-    pub fn lineno() -> Color {
-        CURRENT.read().unwrap().lineno
-    }
-    pub fn add_bg() -> Color {
-        CURRENT.read().unwrap().add_bg
-    }
-    pub fn del_bg() -> Color {
-        CURRENT.read().unwrap().del_bg
-    }
-    pub fn add_fg() -> Color {
-        CURRENT.read().unwrap().add_fg
-    }
-    pub fn del_fg() -> Color {
-        CURRENT.read().unwrap().del_fg
-    }
-    pub fn code_fg() -> Color {
-        CURRENT.read().unwrap().code_fg
-    }
-    pub fn code_bg() -> Color {
-        CURRENT.read().unwrap().code_bg
-    }
-    pub fn border() -> Color {
-        CURRENT.read().unwrap().border
-    }
-    pub fn link() -> Color {
-        CURRENT.read().unwrap().link
-    }
-    pub fn quote() -> Color {
-        CURRENT.read().unwrap().quote
-    }
-}
+mod termbg;
+pub(crate) mod theme;
 
 /// Maximum lines to keep in scrollback buffer
 const MAX_SCROLLBACK_LINES: usize = 5000;
@@ -1271,7 +893,7 @@ enum PickerKind {
     /// `(repo, path, removable)`; built-ins are shown but not removable. Rows are
     /// an "Add a source…" row, one per source, then "Back".
     SkillSources(Vec<(String, String, bool)>),
-    /// `/theme`: pick the colour theme. Rows are [`THEME_MODES`]; choosing one
+    /// `/theme`: pick the colour theme. Rows are [`theme::modes`]; choosing one
     /// re-colours the UI live for the session.
     Theme,
     /// `/mcp`: manage MCP servers. Row 0 is "＋ Add a server"; the rest are the
@@ -1343,14 +965,6 @@ pub(super) struct McpRow {
     pub command: String,
     pub disabled: bool,
 }
-
-/// The colour themes offered by the `/theme` picker. `id` drives the switch;
-/// the description is shown verbatim in the menu. Order: dark, light, auto.
-pub(super) const THEME_MODES: &[(&str, &str)] = &[
-    ("dark", "Dark — intellect-gold on warm ink"),
-    ("light", "Light — ink on parchment"),
-    ("auto", "Auto — match the terminal background"),
-];
 
 /// The autonomy levels offered by the `/mode` picker, with self-explanatory
 /// descriptions (the picker shows these verbatim). Order = increasing autonomy.
@@ -1696,7 +1310,7 @@ impl PickerKind {
                 .iter()
                 .map(|(_, desc)| (*desc).to_string())
                 .collect(),
-            PickerKind::Theme => THEME_MODES
+            PickerKind::Theme => theme::modes()
                 .iter()
                 .map(|(_, desc)| (*desc).to_string())
                 .collect(),
@@ -2519,6 +2133,13 @@ impl Model {
 
     fn queue_selection_copy(&mut self) {
         self.pending_clipboard = self.selected_text();
+    }
+
+    /// Whether the identity splash is what the user is currently looking at.
+    /// Mirrors the guard in `view::draw_transcript`: the first pushed item, of
+    /// any kind, replaces the splash for the rest of the session.
+    fn on_welcome_splash(&self) -> bool {
+        self.welcome && self.items.is_empty()
     }
 
     fn push_notice(&mut self, s: impl Into<String>) {
@@ -3798,27 +3419,5 @@ mod tests {
             1,
             "Esc must not consume a pending approval"
         );
-    }
-
-    /// Real replies from xterm (4-nibble) and terminals that answer with 2.
-    /// Parsing is what varies between terminals, so it is tested without a tty.
-    #[test]
-    fn osc11_reply_parses_to_a_brightness() {
-        use super::theme::parse_osc11_luma;
-        // White background — must read as light.
-        let white = parse_osc11_luma("\x1b]11;rgb:ffff/ffff/ffff\x07").unwrap();
-        assert!(white > 0.9, "white read as {white}");
-        // Near-black — must read as dark.
-        let black = parse_osc11_luma("\x1b]11;rgb:0000/0000/0000\x1b\\").unwrap();
-        assert!(black < 0.1, "black read as {black}");
-        // Two-nibble form normalises by its own width, not a fixed 16 bits.
-        let short = parse_osc11_luma("\x1b]11;rgb:ff/ff/ff\x07").unwrap();
-        assert!(short > 0.9, "2-nibble white read as {short}");
-        // Terminal.app parchment stays on the light side of the midpoint.
-        let parchment = parse_osc11_luma("\x1b]11;rgb:f9f9/f6f6/efef\x07").unwrap();
-        assert!(parchment > 0.5, "parchment read as {parchment}");
-        // Garbage and silence fall through rather than guessing.
-        assert!(parse_osc11_luma("").is_none());
-        assert!(parse_osc11_luma("\x1b]11;not-a-colour\x07").is_none());
     }
 }

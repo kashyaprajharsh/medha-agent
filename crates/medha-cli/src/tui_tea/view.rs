@@ -4,7 +4,12 @@
 use super::*;
 use unicode_width::UnicodeWidthStr;
 
-pub(super) use super::spin::primary as spinner_frame;
+/// The spinner glyph plus the colour it glows at this frame — the two always
+/// travel together, so no call site can draw it in a flat colour by accident.
+pub(super) fn spinner_span(frame: u64) -> Span<'static> {
+    let (glyph, lit) = super::spin::primary_at(frame);
+    Span::styled(glyph, Style::default().fg(theme::current().glow(lit)))
+}
 
 /// Human-readable verb for a tool name (used both for the live activity label and
 /// the in-progress tool-call line).
@@ -76,76 +81,50 @@ pub(super) fn activity_label(model: &Model) -> String {
     }
 }
 
-/// A Saraswati veena — the instrument Medha/Saraswati holds: a large resonator
-/// gourd (kudam) with a soundhole, a long fretted neck (dandi), a small upper
-/// gourd (tumba) and a pegbox curl. Playing the veena means tuning the intellect
-/// into harmony, so the animation is a *pluck*: a bright resonance comet sweeps
-/// down the neck, pauses while the string settles, then re-plucks — looping
-/// continuously (driven by the always-advancing `anim_frame`, not the one-shot
-/// intro clock). The gourds glow near-white throughout — Saraswati's white, the
-/// colour of purity and true-knowledge discrimination.
-pub(super) fn veena_line(frame: u64) -> Line<'static> {
-    const FRETS: usize = 8;
-    let mut glyphs: Vec<&'static str> = Vec::new();
-    // Light box-drawing only. The heavy/mixed-weight forms (`━`, `┿`) and the
-    // pegbox curl (`╮`) fall back to unrelated glyphs in common terminal fonts —
-    // the curl was rendering as a stray `⌐` hanging off the end.
-    glyphs.extend(["◖", "◉", "◗"]); // kudam — resonator + soundhole
-    for _ in 0..FRETS {
-        glyphs.extend(["─", "┼"]); // fretted neck (dandi)
-    }
-    glyphs.push("─");
-    glyphs.push("○"); // tumba — upper gourd
+/// The active theme's ornament, with its head travelling along it.
+///
+/// For `dark`/`light` this is a Saraswati veena — the instrument Medha holds:
+/// resonator gourd (kudam), fretted neck (dandi), upper gourd (tumba). Playing
+/// it means tuning the intellect into harmony, so the gesture is a *pluck*.
+/// Other themes bring their own shape and pace; see [`super::spin::track`].
+/// Driven by the always-advancing `anim_frame`, not the one-shot intro clock.
+pub(super) fn motif_line(frame: u64) -> Line<'static> {
+    let p = theme::current();
+    let t = spin::track(p.motif);
+    let n = t.glyphs.len();
+    let head = t.head(frame);
 
-    let n = glyphs.len();
-    // The resonance travels the neck, then a short gap lets the string settle
-    // before the next pluck. `/3` slows the sweep to a graceful ~1.5s cadence.
-    const GAP: usize = 8;
-    let head = (frame / 3) as usize % (n + GAP);
+    // Cells the tail fades across. Three hard steps banded visibly; a smooth
+    // ramp over six reads as one moving light instead of three lit cells.
+    const TAIL: usize = 6;
 
-    // The comet's head was a hardcoded near-white, which vanishes on parchment.
-    // On light the head is the darkest ink and the tail lightens — the same
-    // gesture read the other way up.
-    let is_dark = theme::current().is_dark;
     let white = Style::default()
-        .fg(if is_dark {
-            Color::Rgb(255, 246, 214)
-        } else {
-            Color::Rgb(92, 56, 10)
-        })
+        .fg(p.glow(100))
         .add_modifier(Modifier::BOLD);
-    let bright_gold = Style::default()
-        .fg(if is_dark {
-            Color::Rgb(247, 208, 120)
-        } else {
-            Color::Rgb(140, 90, 16)
-        })
-        .add_modifier(Modifier::BOLD);
-    let gold = Style::default().fg(theme::accent());
-    let dim = Style::default().fg(if is_dark {
-        Color::Rgb(150, 120, 70)
-    } else {
-        Color::Rgb(184, 156, 112)
-    });
-    let faint = Style::default().fg(theme::faint());
+    let gold = Style::default().fg(p.accent);
+    let dim = Style::default().fg(p.glow(0));
 
     let mut spans = Vec::with_capacity(n);
-    for (i, g) in glyphs.iter().enumerate() {
-        // Comet: brightest at the head, a short fading tail; nothing during the gap.
-        let comet = match i.abs_diff(head) {
-            0 => Some(white),
-            1 => Some(bright_gold),
-            2 => Some(gold),
-            _ => None,
+    for i in 0..n {
+        let comet = head.and_then(|h| {
+            let d = i.abs_diff(h);
+            (d <= TAIL).then(|| {
+                let s = Style::default().fg(p.glow(((TAIL - d) * 100 / TAIL) as u16));
+                if d == 0 {
+                    s.add_modifier(Modifier::BOLD)
+                } else {
+                    s
+                }
+            })
+        });
+        let base = t.glyphs[i];
+        let style = match comet {
+            Some(s) => s,
+            None if t.glow.contains(&base) => white,
+            None if t.rim.contains(&base) => gold,
+            None => dim,
         };
-        let style = match *g {
-            "◉" | "○" => white,            // gourds always glow (purity)
-            "◖" | "◗" => gold,             // gourd rim
-            "╮" => dim,                    // pegbox
-            "┿" => comet.unwrap_or(faint), // frets: faint, lift as resonance passes
-            _ => comet.unwrap_or(dim),     // neck: warm gold, flares with the pluck
-        };
-        spans.push(Span::styled(*g, style));
+        spans.push(Span::styled(t.glyph_at(i, frame), style));
     }
     Line::from(spans)
 }
@@ -159,41 +138,6 @@ pub(super) const LOGO: &str = r#"██   ██ ██████ ████
 ██ █ ██ █████  ██  ██ ███████ ███████
 ██   ██ ██     ██  ██ ██   ██ ██   ██
 ██   ██ ██████ █████  ██   ██ ██   ██"#;
-
-/// MEDHA's identity palette, grounded in Saraswati's iconography: **white**
-/// (purity, true knowledge) crowning **gold/yellow** (intellect, the Vasant
-/// spring colour). The wordmark is lit from the top — a near-white crown, warm
-/// gold body, deep bronze base — so the six rows read as a solid form receding
-/// into shadow, not flat text. All warm: no cool/blue tones.
-const LOGO_GRADIENT_DARK: [(u8, u8, u8); 6] = [
-    (255, 248, 224),
-    (247, 208, 120),
-    (230, 176, 84),
-    (206, 150, 78),
-    (176, 126, 66),
-    (150, 108, 56),
-];
-
-/// The same form on parchment. The dark ramp crowns at near-white, which is all
-/// but invisible on a light canvas — the splash washed out entirely under the
-/// light theme. Here the light is carried by saturation instead: warm amber
-/// crown down to deep bronze base, so the rows still read as one solid mass.
-const LOGO_GRADIENT_LIGHT: [(u8, u8, u8); 6] = [
-    (198, 142, 50),
-    (178, 120, 34),
-    (158, 102, 24),
-    (138, 86, 18),
-    (120, 72, 14),
-    (104, 62, 12),
-];
-
-pub(super) fn logo_gradient() -> [(u8, u8, u8); 6] {
-    if theme::current().is_dark {
-        LOGO_GRADIENT_DARK
-    } else {
-        LOGO_GRADIENT_LIGHT
-    }
-}
 
 /// Darken an rgb toward its shadow (num/den of full brightness). Used to bevel
 /// the logo's box-drawing outline beneath the bright block fill.
@@ -251,17 +195,12 @@ pub(super) fn lerp_color(a: (u8, u8, u8), b: (u8, u8, u8), num: i32, den: i32) -
 pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
     let w = area.width;
     let mut body: Vec<Line> = Vec::new();
+    let p = theme::current();
     let t = (model.anim_frame % 60) as i32;
     let level = if t < 30 { t } else { 60 - t };
-    // Devanagari wordmark breathes between deep gold and Saraswati's white —
-    // knowledge-light pulsing over the intellect-gold (no cool/blue tones).
-    // Breathe between the palette's own accent ends, so the pulse stays visible
-    // on parchment instead of fading into it.
-    let word = if theme::current().is_dark {
-        lerp_color((214, 158, 74), (255, 248, 224), level, 30)
-    } else {
-        lerp_color((160, 106, 18), (206, 150, 60), level, 30)
-    };
+    // The wordmark breathes between the theme's own two ends, so the pulse stays
+    // visible on parchment instead of fading into it.
+    let word = lerp_color(p.word_lo, p.word_hi, level, 30);
     body.push(center_line(
         vec![Span::styled(
             // Romanised, not Devanagari: terminals have no Indic shaping engine,
@@ -280,10 +219,11 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
     let room_for_logo = (area.height as usize) >= logo_rows + 9;
     if room_for_logo {
         body.push(Line::from(""));
-        let gradient = logo_gradient();
         for (i, line) in LOGO.lines().enumerate() {
-            let rgb = gradient[i.min(gradient.len() - 1)];
-            body.push(center_line(logo_row(line, rgb), w));
+            body.push(center_line(
+                logo_row(line, p.logo[i.min(p.logo.len() - 1)]),
+                w,
+            ));
         }
     }
     body.push(Line::from(""));
@@ -298,8 +238,7 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
     ));
     if area.height >= 12 {
         body.push(Line::from(""));
-        let veena = veena_line(model.anim_frame);
-        body.push(center_line(veena.spans, w));
+        body.push(center_line(motif_line(model.anim_frame).spans, w));
     }
     body.push(Line::from(""));
     body.push(center_line(
@@ -326,32 +265,17 @@ pub(super) struct ToolViz {
 
 /// Colour for a tool's *category* (glyph is the tool's own, from `ToolViz`).
 pub(super) fn cat_color(cat: ToolCategory) -> Color {
-    // The dark set is pastel, which needs a dark canvas behind it — on parchment
-    // those three washed out to near-illegible. Light gets saturated, darker
-    // siblings of the same hues.
-    let (blue, purple, cyan) = if theme::current().is_dark {
-        (
-            Color::Rgb(120, 170, 235),
-            Color::Rgb(186, 148, 236),
-            Color::Rgb(110, 196, 208),
-        )
-    } else {
-        (
-            Color::Rgb(38, 92, 168),
-            Color::Rgb(108, 62, 170),
-            Color::Rgb(22, 112, 124),
-        )
-    };
+    let p = theme::current();
     match cat {
-        ToolCategory::Read => blue,
-        ToolCategory::Write => theme::warn(),
-        ToolCategory::Search => purple,
-        ToolCategory::Web => cyan,
-        ToolCategory::Shell => theme::err(),
-        ToolCategory::Vcs => Color::Rgb(226, 142, 90),
-        ToolCategory::Diagnostic => theme::warn(),
-        ToolCategory::Plan => theme::accent(),
-        ToolCategory::Other => theme::dim(),
+        ToolCategory::Read => p.cat_read,
+        ToolCategory::Write => p.warn,
+        ToolCategory::Search => p.cat_search,
+        ToolCategory::Web => p.cat_web,
+        ToolCategory::Shell => p.err,
+        ToolCategory::Vcs => p.cat_vcs,
+        ToolCategory::Diagnostic => p.warn,
+        ToolCategory::Plan => p.accent,
+        ToolCategory::Other => p.dim,
     }
 }
 
@@ -1237,20 +1161,19 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     } else if model.running {
+        left.push(Span::raw("  "));
+        left.push(spinner_span(model.anim_frame));
         left.push(Span::styled(
-            format!(
-                "  {} {} · {}",
-                spinner_frame(model.anim_frame),
-                activity_label(model),
-                elapsed_str(model)
-            ),
+            format!("  {} · {}", activity_label(model), elapsed_str(model)),
             Style::default().fg(theme::warn()),
         ));
     }
     // Live "compacting…" indicator while a summarize pass calls the model.
     if model.compacting {
+        left.push(Span::raw("  "));
+        left.push(spinner_span(model.anim_frame));
         left.push(Span::styled(
-            format!("  {} compacting context…", spinner_frame(model.anim_frame)),
+            "  compacting context…",
             Style::default()
                 .fg(theme::warn())
                 .add_modifier(Modifier::BOLD),
@@ -2062,10 +1985,10 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
     // off the bottom even when auto-scrolled.
     model.viewport_height = area.height as usize;
     model.transcript_area = area;
-    // Show the welcome splash only while the transcript is truly empty. Guarding
-    // on `items.is_empty()` too means any pushed content (e.g. a `/skills` notice
-    // run as the first action) always wins — the splash can never hide it.
-    if model.welcome && model.items.is_empty() {
+    // Show the welcome splash only while the transcript is truly empty, so any
+    // pushed content (e.g. a `/skills` notice run as the first action) always
+    // wins — the splash can never hide it.
+    if model.on_welcome_splash() {
         model.content_height = area.height as usize;
         draw_welcome(f, model, area);
         return;
@@ -2164,12 +2087,9 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
     push_block(&model.approval_rows, &mut off, &mut visible);
     if show_spinner {
         let spinner = vec![Line::from(vec![
+            spinner_span(model.anim_frame),
             Span::styled(
-                spinner_frame(model.anim_frame),
-                Style::default().fg(theme::accent()),
-            ),
-            Span::styled(
-                format!(" {}…", activity_label(model)),
+                format!("  {}…", activity_label(model)),
                 Style::default().fg(theme::dim()),
             ),
         ])];
@@ -2418,32 +2338,63 @@ mod clarify_view_tests {
     }
 
     #[test]
-    fn the_splash_stays_visible_on_parchment() {
+    fn the_splash_stays_visible_on_every_canvas() {
         // Asserted on the ramps directly rather than by swapping the global
         // palette: the theme is process-wide, and mutating it here would race
         // every other test that renders.
-        let (light, dark) = (super::LOGO_GRADIENT_LIGHT, super::LOGO_GRADIENT_DARK);
-        assert_ne!(light, dark, "the logo must re-colour with the palette");
         let luma = |(r, g, b): (u8, u8, u8)| 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-        // The dark ramp crowns at near-white, which is invisible on parchment —
-        // the whole splash used to wash out under the light theme.
-        for row in light {
-            assert!(luma(row) < 180.0, "{row:?} is too pale for a light canvas");
+        for build in theme::Palette::ALL {
+            let p = build();
+            for row in p.logo {
+                // A dark ramp crowning at near-white is invisible on parchment —
+                // the whole splash used to wash out under the light theme.
+                if p.is_dark {
+                    assert!(luma(row) > 90.0, "{}: {row:?} is too dark", p.id);
+                } else {
+                    assert!(luma(row) < 180.0, "{}: {row:?} is too pale", p.id);
+                }
+            }
         }
-        for row in dark {
-            assert!(luma(row) > 90.0, "{row:?} is too dark for warm ink");
-        }
+        let ramps: Vec<_> = theme::Palette::ALL.iter().map(|b| b().logo).collect();
+        assert!(
+            ramps.windows(2).any(|w| w[0] != w[1]),
+            "the logo must re-colour with the palette"
+        );
     }
 
     #[test]
-    fn the_veena_uses_only_glyphs_that_render() {
+    fn every_motif_uses_only_glyphs_that_render() {
         // Heavy and mixed-weight box drawing falls back to unrelated shapes in
         // common terminal fonts; the pegbox curl rendered as a stray `⌐`.
-        let line = super::veena_line(0);
-        let drawn: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        for bad in ['━', '┿', '╮', '╯'] {
-            assert!(!drawn.contains(bad), "veena still uses {bad:?}");
+        // Checked per motif rather than through the active palette, so changing
+        // the default theme cannot quietly stop covering the other two.
+        for motif in [
+            theme::Motif::Veena,
+            theme::Motif::Loom,
+            theme::Motif::Chisel,
+        ] {
+            let t = super::super::spin::track(motif);
+            for g in t.glyphs.iter().chain(std::iter::once(&t.head_glyph)) {
+                for bad in ['━', '┿', '╮', '╯'] {
+                    assert!(!g.contains(bad), "{motif:?} uses {bad:?}");
+                }
+            }
         }
-        assert!(drawn.contains('◉') && drawn.contains('○'));
+        // Whatever the active palette names, the ornament renders and is drawn
+        // entirely from that motif's own glyph set.
+        let t = super::super::spin::track(theme::current().motif);
+        let drawn: String = super::motif_line(0)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(drawn.chars().count(), t.glyphs.len());
+        for ch in drawn.chars() {
+            let s = ch.to_string();
+            assert!(
+                t.glyphs.contains(&s.as_str()) || s == t.head_glyph,
+                "{s:?} is not part of this motif"
+            );
+        }
     }
 }

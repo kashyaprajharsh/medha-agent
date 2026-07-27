@@ -17,11 +17,8 @@
 
 </div>
 
-<!-- DEMO: drop the recorded TUI session at docs/assets/demo.gif and it renders here.
-     See docs/assets/README.md for the asciinema + agg recipe. -->
 <div align="center">
   <img src="docs/assets/demo.gif" alt="MEDHA running a task in the TUI" width="820">
-  <br><sub><i>Demo recording in progress.</i></sub>
 </div>
 
 ---

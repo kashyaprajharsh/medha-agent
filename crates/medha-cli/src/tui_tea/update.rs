@@ -5325,8 +5325,19 @@ fn set_theme(model: &mut Model, id: &str) {
     use super::theme;
     let palette = match id {
         "light" => theme::Palette::light(),
-        "auto" => theme::detect(),
-        _ => theme::Palette::dark(),
+        // `detect()` re-queries the terminal, which cannot work here: fd 1/2 are
+        // redirected to the stray-stdout log and we are mid-alternate-screen.
+        // Reuse what startup learned instead.
+        "auto" => {
+            if theme::terminal_is_light() {
+                theme::Palette::light()
+            } else {
+                theme::Palette::dark()
+            }
+        }
+        // Terminal-aware: forcing dark onto a light terminal has to paint its
+        // own canvas, or it is near-white text on white.
+        _ => theme::dark_for_terminal(),
     };
     let mode = if palette.is_dark { "dark" } else { "light" };
     theme::set(palette);

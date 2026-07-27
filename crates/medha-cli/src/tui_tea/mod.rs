@@ -75,6 +75,11 @@ pub(crate) mod theme {
         /// intellect/wisdom; the identity is a warm gold accent over warm-neutral
         /// ink, deliberately free of cool/blue tones. This is medha's signature,
         /// distinct from Claude's rust or generic terminal blues.
+        /// Background used when the dark palette has to supply its own canvas —
+        /// see [`Palette::dark_on`]. Warm ink, matching `code_bg`, so a forced
+        /// dark theme still reads as MEDHA rather than as generic black.
+        pub const DARK_CANVAS: Color = Color::Rgb(26, 24, 21);
+
         pub const fn dark() -> Self {
             Self {
                 is_dark: true,
@@ -99,6 +104,22 @@ pub(crate) mod theme {
                 syntect_theme: "base16-ocean.dark",
             }
         }
+        /// The dark palette, told whether the terminal underneath it is light.
+        ///
+        /// `dark()` alone keeps `Color::Reset` so a translucent dark terminal
+        /// keeps its transparency and blur — deliberate, and worth preserving.
+        /// But on a *light* terminal that means near-white text on white: the
+        /// mirror of the "light theme looks weird" bug the light palette already
+        /// fixes by painting its own parchment. So when the canvas underneath is
+        /// light, dark paints one too.
+        pub const fn dark_on(light_terminal: bool) -> Self {
+            let mut p = Self::dark();
+            if light_terminal {
+                p.bg = Self::DARK_CANVAS;
+            }
+            p
+        }
+
         /// MEDHA light — "ink on parchment". The same warm identity inverted for
         /// light terminals: deep amber/bronze accent over warm near-black ink.
         pub const fn light() -> Self {
@@ -129,6 +150,31 @@ pub(crate) mod theme {
 
     static CURRENT: RwLock<Palette> = RwLock::new(Palette::dark());
 
+    /// Whether the terminal's own canvas is light, learned once at startup.
+    /// `None` until detection runs, or when the terminal would not say.
+    ///
+    /// Kept because `/theme dark` needs it *later*: forcing dark onto a light
+    /// terminal has to paint its own background, and by then the OSC query is
+    /// long gone.
+    static TERMINAL_IS_LIGHT: RwLock<Option<bool>> = RwLock::new(None);
+
+    /// Record what the terminal reported. Called once by [`detect`].
+    fn note_terminal_is_light(light: bool) {
+        *TERMINAL_IS_LIGHT.write().unwrap() = Some(light);
+    }
+
+    /// `true` only when the terminal positively reported a light canvas. An
+    /// unknown terminal is treated as dark, which is the safe assumption: it
+    /// keeps `Color::Reset` and so preserves transparency.
+    pub fn terminal_is_light() -> bool {
+        TERMINAL_IS_LIGHT.read().unwrap().unwrap_or(false)
+    }
+
+    /// The dark palette, adapted to the terminal underneath it.
+    pub fn dark_for_terminal() -> Palette {
+        Palette::dark_on(terminal_is_light())
+    }
+
     /// Swap the active palette (startup detection / `/theme`). Cheap; next frame
     /// re-colours from the new slots.
     pub fn set(p: Palette) {
@@ -154,39 +200,38 @@ pub(crate) mod theme {
     /// Must run BEFORE `tty::init`, which redirects fd 1/2 to the stray-stdout
     /// log — after that the query would be written to a file, not the terminal.
     pub fn detect() -> Palette {
+        // Probe the terminal even when MEDHA_THEME forces a palette: `/theme`
+        // can switch away later, and the answer is only available here.
+        let reported_light = query_background_luma().map(|luma| {
+            // Rec. 601 luma; the midpoint separates parchment from ink well
+            // enough that only a deliberately grey terminal is ambiguous.
+            luma > 0.5
+        });
+        let reported_light = reported_light.or_else(|| {
+            // COLORFGBG is "fg;bg" (occasionally "fg;def;bg"). The final field is
+            // the background palette index; 7 (light grey) and 15 (white) are the
+            // standard light-background signals.
+            let cfb = std::env::var("COLORFGBG").ok()?;
+            let bg = cfb.rsplit(';').next()?.trim().parse::<u8>().ok()?;
+            Some(matches!(bg, 7 | 15))
+        });
+        if let Some(light) = reported_light {
+            note_terminal_is_light(light);
+        }
+
         if let Ok(v) = std::env::var("MEDHA_THEME") {
             match v.trim().to_ascii_lowercase().as_str() {
                 "light" => return Palette::light(),
-                "dark" => return Palette::dark(),
+                "dark" => return dark_for_terminal(),
                 _ => {} // "auto"/anything else falls through to detection
             }
         }
-        if let Some(luma) = query_background_luma() {
-            // Rec. 601 luma; the midpoint separates parchment from ink well
-            // enough that only a deliberately grey terminal is ambiguous.
-            return if luma > 0.5 {
-                Palette::light()
-            } else {
-                Palette::dark()
-            };
+        match reported_light {
+            Some(true) => Palette::light(),
+            // A terminal that answered "dark" gets `Color::Reset`, so its
+            // transparency survives; one that stayed silent is assumed dark too.
+            _ => Palette::dark(),
         }
-        // COLORFGBG is "fg;bg" (occasionally "fg;def;bg"). The final field is the
-        // background palette index; 7 (light grey) and 15 (white) are the standard
-        // light-background signals — everything else is treated as dark.
-        if let Ok(cfb) = std::env::var("COLORFGBG") {
-            if let Some(bg) = cfb
-                .rsplit(';')
-                .next()
-                .and_then(|s| s.trim().parse::<u8>().ok())
-            {
-                return if matches!(bg, 7 | 15) {
-                    Palette::light()
-                } else {
-                    Palette::dark()
-                };
-            }
-        }
-        Palette::dark()
     }
 
     /// Ask the terminal for its background colour and return its perceived

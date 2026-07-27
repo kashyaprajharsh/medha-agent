@@ -52,7 +52,7 @@ One binary. No Python, no Node, no Docker daemon — SQLite is compiled in and T
 <summary>Pin a version, change the location, or build from source</summary>
 
 ```bash
-MEDHA_VERSION=v0.1.1     curl -fsSL .../install.sh | sh   # pin a release
+MEDHA_VERSION=v0.1.2     curl -fsSL .../install.sh | sh   # pin a release
 MEDHA_INSTALL_DIR=~/bin  curl -fsSL .../install.sh | sh   # choose the destination
 
 git clone https://github.com/kashyaprajharsh/medha-agent   # build it yourself (Rust 1.85+)
@@ -206,7 +206,7 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
 
 ## Status
 
-Pre-1.0 (`0.1.1`) — interfaces may still change.
+Pre-1.0 (`0.1.2`) — interfaces may still change.
 
 **Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 52 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation, graceful interrupts, the ACP bridge, and the Eval Gate.
 

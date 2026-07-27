@@ -198,7 +198,7 @@ pub(crate) mod theme {
     /// terminal that ignores OSC 11 costs one 120 ms timeout at startup, not a
     /// hang.
     fn query_background_luma() -> Option<f32> {
-        use std::io::{IsTerminal, Read, Write};
+        use std::io::{IsTerminal, Write};
 
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             return None;
@@ -219,27 +219,47 @@ pub(crate) mod theme {
         out.write_all(b"\x1b]11;?\x1b\\").ok()?;
         out.flush().ok()?;
 
+        // Read straight from fd 0 rather than through `std::io::stdin()`.
+        // `Stdin` is BufReader-backed: its first read pulls the WHOLE reply into
+        // a userspace buffer and hands back one byte, after which poll(2) sees an
+        // empty kernel queue and reports "nothing ready" — so the loop gave up
+        // holding just the leading ESC and detection silently fell through to
+        // dark. Unbuffered reads keep poll(2) and the data in the same place.
+        //
         // Reply shape: ESC ] 11 ; rgb:RRRR/GGGG/BBBB  terminated by BEL or ST.
         let mut buf = Vec::with_capacity(64);
-        let mut byte = [0u8; 1];
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
         while std::time::Instant::now() < deadline && buf.len() < 64 {
             if !stdin_ready(deadline) {
                 break;
             }
-            match std::io::stdin().read(&mut byte) {
-                Ok(1) => {
-                    buf.push(byte[0]);
+            match read_stdin_byte() {
+                Some(b) => {
+                    buf.push(b);
                     // BEL, or the ST that closes a string terminator.
-                    if byte[0] == 0x07 || (byte[0] == b'\\' && buf.ends_with(b"\x1b\\")) {
+                    if b == 0x07 || (b == b'\\' && buf.ends_with(b"\x1b\\")) {
                         break;
                     }
                 }
-                _ => break,
+                None => break,
             }
         }
 
         parse_osc11_luma(&String::from_utf8_lossy(&buf))
+    }
+
+    /// One unbuffered byte from stdin, or `None` on EOF/error.
+    #[cfg(unix)]
+    fn read_stdin_byte() -> Option<u8> {
+        let mut b = 0u8;
+        // SAFETY: a one-byte read into a live local, on the already-open fd 0.
+        let n = unsafe { libc::read(0, std::ptr::addr_of_mut!(b).cast(), 1) };
+        (n == 1).then_some(b)
+    }
+
+    #[cfg(not(unix))]
+    fn read_stdin_byte() -> Option<u8> {
+        None
     }
 
     /// Perceived brightness of an OSC 11 reply, `0.0..=1.0`.

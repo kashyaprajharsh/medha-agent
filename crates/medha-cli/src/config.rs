@@ -665,9 +665,20 @@ fn state_dir_in(home: &std::path::Path, workspace: &std::path::Path) -> PathBuf 
 /// path separator becomes `-`, so
 /// `/Users/x/proj` → `-Users-x-proj`. Existing hyphens are left as-is; a
 /// Windows drive colon becomes `-`.
+///
+/// Windows `canonicalize` hands back a *verbatim* path — `\\?\C:\Users\x`, or
+/// `\\?\UNC\server\share` for a network drive — and its `?` is one of the
+/// characters Windows forbids in a filename. Encoded as-is that produced
+/// `--?-C--Users-x`, so creating the state dir failed with os error 123 and
+/// medha could not start at all. The prefix is stripped first; on Unix, where
+/// `canonicalize` returns a plain absolute path, there is nothing to strip.
 fn encode_workspace(p: &std::path::Path) -> String {
-    p.to_string_lossy()
-        .chars()
+    let raw = p.to_string_lossy();
+    let path = raw
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| raw.strip_prefix(r"\\?\"))
+        .unwrap_or(&raw);
+    path.chars()
         .map(|c| {
             if matches!(c, '/' | '\\' | ':') {
                 '-'
@@ -1809,6 +1820,54 @@ mod tests {
             "-Users-reeturajharsh-Personal-files-medha"
         );
         assert_eq!(encode_workspace(Path::new("/a/my-repo")), "-a-my-repo");
+    }
+
+    #[test]
+    fn encodes_a_windows_verbatim_path_without_illegal_characters() {
+        // What `canonicalize` actually returns on Windows. Encoded verbatim this
+        // produced `--?-C--Users-ASUS`, and `?` is forbidden in a Windows
+        // filename, so the state dir could not be created (os error 123) and
+        // medha failed to start on every Windows machine.
+        let enc = encode_workspace(Path::new(r"\\?\C:\Users\ASUS"));
+        assert_eq!(enc, "C--Users-ASUS");
+
+        // A drive path that was never verbatim encodes the same way, so the two
+        // forms of the same directory share one state dir.
+        assert_eq!(encode_workspace(Path::new(r"C:\Users\ASUS")), enc);
+
+        // Network drives come back as `\\?\UNC\server\share`.
+        assert_eq!(
+            encode_workspace(Path::new(r"\\?\UNC\server\share\proj")),
+            "server-share-proj"
+        );
+
+        // Nothing Windows forbids in a filename may survive encoding.
+        for p in [
+            r"\\?\C:\Users\ASUS",
+            r"\\?\UNC\server\share",
+            r"C:\a\b",
+            "/Users/x/proj",
+        ] {
+            let enc = encode_workspace(Path::new(p));
+            for bad in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
+                assert!(
+                    !enc.contains(bad),
+                    "{p} encoded to {enc}, which keeps {bad}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unix_paths_are_untouched_by_the_verbatim_strip() {
+        // The strip is a no-op off Windows: a Linux or macOS path never carries a
+        // prefix, and one that happens to contain a backslash is not a prefix.
+        assert_eq!(encode_workspace(Path::new("/home/u/proj")), "-home-u-proj");
+        assert_eq!(
+            encode_workspace(Path::new("/home/u/odd?name")),
+            "-home-u-odd?name",
+            "a legal Linux filename must not be rewritten"
+        );
     }
 
     #[test]

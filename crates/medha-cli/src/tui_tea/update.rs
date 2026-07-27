@@ -1071,29 +1071,36 @@ pub(super) fn handle_key<P, L>(
             // a nested menu: right descends, left backs out one level.
             KeyCode::Enter | KeyCode::Right => {
                 if matches!(picker.kind, PickerKind::ModelProtocol) {
-                    let selected = picker.selected;
-                    match selected {
-                        0 => {
-                            if let Some(setup) = model.model_setup.as_mut() {
-                                setup.protocol = kernel::Protocol::OpenAiChat;
-                            }
-                            model.picker = Some(Picker::new(PickerKind::ProviderPreset));
-                        }
-                        2 => {
+                    // Resolved through MODEL_PROTOCOLS rather than by index, so
+                    // reordering the list cannot select the wrong protocol.
+                    let Some(&(label, available, protocol)) = MODEL_PROTOCOLS.get(picker.selected)
+                    else {
+                        return;
+                    };
+                    if !available {
+                        model.push_notice(format!(
+                            "{label} is not wired up yet — pick an available protocol for now"
+                        ));
+                        return;
+                    }
+                    match protocol {
+                        kernel::Protocol::GeminiInteractions => {
                             model.picker = None;
                             if let Some(setup) = model.model_setup.as_mut() {
-                                setup.protocol = kernel::Protocol::GeminiInteractions;
+                                setup.protocol = protocol;
                                 setup.base_url =
                                     "https://generativelanguage.googleapis.com/v1".into();
                                 setup.step = ModelSetupStep::ApiKey;
                             }
-                            model.push_notice(
-                                "Gemini Interactions v1 — enter the Gemini API key",
-                            );
+                            model.push_notice("Gemini Interactions v1 — enter the Gemini API key");
                         }
-                        _ => model.push_notice(
-                            "that native protocol is shown for roadmap clarity but its adapter is not implemented yet",
-                        ),
+                        // Everything else reaches a base URL the same way.
+                        _ => {
+                            if let Some(setup) = model.model_setup.as_mut() {
+                                setup.protocol = protocol;
+                            }
+                            model.picker = Some(Picker::new(PickerKind::ProviderPreset));
+                        }
                     }
                     return;
                 }

@@ -140,10 +140,19 @@ pub(crate) mod theme {
         *CURRENT.read().unwrap()
     }
 
-    /// Pick a palette from the environment at startup. Precedence:
-    /// `MEDHA_THEME=light|dark|auto` (explicit) → the terminal's `COLORFGBG`
-    /// background hint → dark. Detection is best-effort and safe: an unknown
-    /// terminal simply keeps the dark default, and `/theme` always overrides.
+    /// Pick a palette at startup. Precedence:
+    /// `MEDHA_THEME=light|dark|auto` → an **OSC 11** query to the terminal →
+    /// the legacy `COLORFGBG` hint → dark.
+    ///
+    /// The OSC query matters: `COLORFGBG` is an xterm/rxvt convention that
+    /// macOS Terminal.app never sets, so a `COLORFGBG`-only probe fell through
+    /// to dark and painted the dark palette onto a white canvas — the wordmark
+    /// crowns at near-white and simply vanished. OSC 11 is what modern
+    /// terminals (Terminal.app, iTerm2, Ghostty, WezTerm, Kitty, Alacritty)
+    /// actually answer.
+    ///
+    /// Must run BEFORE `tty::init`, which redirects fd 1/2 to the stray-stdout
+    /// log — after that the query would be written to a file, not the terminal.
     pub fn detect() -> Palette {
         if let Ok(v) = std::env::var("MEDHA_THEME") {
             match v.trim().to_ascii_lowercase().as_str() {
@@ -151,6 +160,15 @@ pub(crate) mod theme {
                 "dark" => return Palette::dark(),
                 _ => {} // "auto"/anything else falls through to detection
             }
+        }
+        if let Some(luma) = query_background_luma() {
+            // Rec. 601 luma; the midpoint separates parchment from ink well
+            // enough that only a deliberately grey terminal is ambiguous.
+            return if luma > 0.5 {
+                Palette::light()
+            } else {
+                Palette::dark()
+            };
         }
         // COLORFGBG is "fg;bg" (occasionally "fg;def;bg"). The final field is the
         // background palette index; 7 (light grey) and 15 (white) are the standard
@@ -169,6 +187,107 @@ pub(crate) mod theme {
             }
         }
         Palette::dark()
+    }
+
+    /// Ask the terminal for its background colour and return its perceived
+    /// brightness in `0.0..=1.0`. `None` when there is no tty, the terminal
+    /// stays silent, or the reply cannot be parsed — every one of which falls
+    /// back to the next detection tier rather than guessing.
+    ///
+    /// Deliberately bounded: raw mode is held only for the round trip, and a
+    /// terminal that ignores OSC 11 costs one 120 ms timeout at startup, not a
+    /// hang.
+    fn query_background_luma() -> Option<f32> {
+        use std::io::{IsTerminal, Read, Write};
+
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            return None;
+        }
+
+        // Raw mode so the reply arrives unbuffered and is not echoed. Restored
+        // on every exit path, including the `?` early returns below.
+        struct RawGuard;
+        impl Drop for RawGuard {
+            fn drop(&mut self) {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+        crossterm::terminal::enable_raw_mode().ok()?;
+        let _raw = RawGuard;
+
+        let mut out = std::io::stdout();
+        out.write_all(b"\x1b]11;?\x1b\\").ok()?;
+        out.flush().ok()?;
+
+        // Reply shape: ESC ] 11 ; rgb:RRRR/GGGG/BBBB  terminated by BEL or ST.
+        let mut buf = Vec::with_capacity(64);
+        let mut byte = [0u8; 1];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
+        while std::time::Instant::now() < deadline && buf.len() < 64 {
+            if !stdin_ready(deadline) {
+                break;
+            }
+            match std::io::stdin().read(&mut byte) {
+                Ok(1) => {
+                    buf.push(byte[0]);
+                    // BEL, or the ST that closes a string terminator.
+                    if byte[0] == 0x07 || (byte[0] == b'\\' && buf.ends_with(b"\x1b\\")) {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        parse_osc11_luma(&String::from_utf8_lossy(&buf))
+    }
+
+    /// Perceived brightness of an OSC 11 reply, `0.0..=1.0`.
+    ///
+    /// Split out from the I/O so the parsing — the part that actually varies
+    /// between terminals — is unit-testable without a tty.
+    pub(super) fn parse_osc11_luma(reply: &str) -> Option<f32> {
+        let spec = reply.split("rgb:").nth(1)?;
+        let mut parts = spec.split('/');
+        // Components are hex of arbitrary width: xterm answers 4 nibbles, some
+        // terminals 2. Normalise each by its own width rather than assuming 16-bit.
+        let mut channel = || -> Option<f32> {
+            let raw: String = parts
+                .next()?
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect();
+            if raw.is_empty() {
+                return None;
+            }
+            let max = 16f32.powi(raw.len() as i32) - 1.0;
+            Some(u32::from_str_radix(&raw, 16).ok()? as f32 / max)
+        };
+        let (r, g, b) = (channel()?, channel()?, channel()?);
+        Some(0.299 * r + 0.587 * g + 0.114 * b)
+    }
+
+    /// `true` when stdin has a byte ready before `deadline`. Uses `poll(2)` so a
+    /// silent terminal cannot block the read.
+    #[cfg(unix)]
+    fn stdin_ready(deadline: std::time::Instant) -> bool {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: a single well-formed pollfd for stdin, with a bounded timeout.
+        unsafe { libc::poll(&mut fd, 1, remaining.as_millis() as i32) == 1 }
+    }
+
+    #[cfg(not(unix))]
+    fn stdin_ready(_deadline: std::time::Instant) -> bool {
+        // No poll(2); skip the query and fall through to COLORFGBG.
+        false
     }
 
     pub fn bg() -> Color {
@@ -1170,6 +1289,28 @@ pub(super) const THEME_MODES: &[(&str, &str)] = &[
 
 /// The autonomy levels offered by the `/mode` picker, with self-explanatory
 /// descriptions (the picker shows these verbatim). Order = increasing autonomy.
+/// The model protocols offered at setup: `(label, available, protocol)`.
+///
+/// One table, so the rendered list and the selection handler cannot drift. They
+/// were previously a literal `vec!` of labels matched against hardcoded indices
+/// in `update.rs` — reordering the labels silently selected the wrong protocol.
+/// Available ones come first because that is the useful ordering; the "coming
+/// soon" entries stay listed so the roadmap is visible.
+pub(crate) const MODEL_PROTOCOLS: &[(&str, bool, kernel::Protocol)] = &[
+    ("OpenAI-compatible Chat", true, kernel::Protocol::OpenAiChat),
+    (
+        "Gemini Interactions v1",
+        true,
+        kernel::Protocol::GeminiInteractions,
+    ),
+    (
+        "Anthropic Messages",
+        false,
+        kernel::Protocol::AnthropicMessages,
+    ),
+    ("OpenAI Responses", false, kernel::Protocol::OpenAiResponses),
+];
+
 const AUTONOMY_MODES: &[(kernel::AutonomyLevel, &str)] = &[
     (
         kernel::AutonomyLevel::Careful,
@@ -1380,12 +1521,19 @@ impl PickerKind {
             PickerKind::RemoveSkill(_) => {
                 vec!["Keep skill".to_string(), "Remove user skill".to_string()]
             }
-            PickerKind::ModelProtocol => vec![
-                "OpenAI-compatible Chat — available".into(),
-                "OpenAI Responses — planned (Stage 6)".into(),
-                "Gemini Interactions v1 — available".into(),
-                "Anthropic Messages — planned (Stage 5)".into(),
-            ],
+            PickerKind::ModelProtocol => MODEL_PROTOCOLS
+                .iter()
+                .map(|(label, available, _)| {
+                    format!(
+                        "{label} — {}",
+                        if *available {
+                            "available"
+                        } else {
+                            "coming soon"
+                        }
+                    )
+                })
+                .collect(),
             PickerKind::ProviderPreset => config::provider_presets()
                 .iter()
                 .enumerate()
@@ -2543,6 +2691,12 @@ where
         }));
     }
 
+    // Adapt colours to the terminal background BEFORE `tty::init`, which
+    // redirects fd 1/2 to the stray-stdout log — the OSC 11 query has to reach
+    // the real terminal, and its reply has to come back off the real stdin.
+    // `/theme` overrides whatever this picks.
+    theme::set(theme::detect());
+
     // Terminal setup with panic-safe restore hook (PART 0/2). Draws on a private
     // tty handle; a dependency's stray stdout is redirected to `stray_log` so it
     // can't corrupt the alternate screen. See tty.rs.
@@ -2564,9 +2718,6 @@ where
             )
         })
         .collect();
-    // Adapt colours to the terminal background before the first frame so light
-    // terminals aren't stuck with an invisible dark palette. `/theme` overrides.
-    theme::set(theme::detect());
     let mut model = Model::new(
         model_name,
         max_ctx,
@@ -3582,5 +3733,27 @@ mod tests {
             1,
             "Esc must not consume a pending approval"
         );
+    }
+
+    /// Real replies from xterm (4-nibble) and terminals that answer with 2.
+    /// Parsing is what varies between terminals, so it is tested without a tty.
+    #[test]
+    fn osc11_reply_parses_to_a_brightness() {
+        use super::theme::parse_osc11_luma;
+        // White background — must read as light.
+        let white = parse_osc11_luma("\x1b]11;rgb:ffff/ffff/ffff\x07").unwrap();
+        assert!(white > 0.9, "white read as {white}");
+        // Near-black — must read as dark.
+        let black = parse_osc11_luma("\x1b]11;rgb:0000/0000/0000\x1b\\").unwrap();
+        assert!(black < 0.1, "black read as {black}");
+        // Two-nibble form normalises by its own width, not a fixed 16 bits.
+        let short = parse_osc11_luma("\x1b]11;rgb:ff/ff/ff\x07").unwrap();
+        assert!(short > 0.9, "2-nibble white read as {short}");
+        // Terminal.app parchment stays on the light side of the midpoint.
+        let parchment = parse_osc11_luma("\x1b]11;rgb:f9f9/f6f6/efef\x07").unwrap();
+        assert!(parchment > 0.5, "parchment read as {parchment}");
+        // Garbage and silence fall through rather than guessing.
+        assert!(parse_osc11_luma("").is_none());
+        assert!(parse_osc11_luma("\x1b]11;not-a-colour\x07").is_none());
     }
 }

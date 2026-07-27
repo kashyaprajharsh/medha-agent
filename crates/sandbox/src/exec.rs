@@ -15,7 +15,7 @@
 //! native addition.
 
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A command to execute: argv + working directory + environment policy.
 #[derive(Debug, Clone)]
@@ -296,20 +296,7 @@ pub async fn run_shell_bounded_with(
     max_output: usize,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<ShellOutcome, ExecError> {
-    // Container/SSH backends target Unix-like execution environments even when
-    // the Medha client itself runs on Windows.
-    #[cfg(windows)]
-    let host_shell = matches!(backend.label(), "host" | "native");
-    #[cfg(not(windows))]
-    let host_shell = false;
-    let (program, args) = if host_shell {
-        (
-            "cmd.exe".to_string(),
-            vec!["/D".into(), "/S".into(), "/C".into(), command.into()],
-        )
-    } else {
-        ("sh".to_string(), vec!["-c".into(), command.into()])
-    };
+    let (program, args) = shell_argv(backend.label(), command);
     let request = ExecRequest {
         program,
         args,
@@ -319,6 +306,179 @@ pub async fn run_shell_bounded_with(
     };
     let cmd = backend.build_command(&request)?;
     run_command_bounded(cmd, limit, max_output, cancel).await
+}
+
+/// An interpreter that can run a command line on Windows.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum WinShell {
+    /// Git for Windows / MSYS bash. Preferred: the model writes Unix command
+    /// lines (`grep -rn`, `sed -i`), and PowerShell's same-named *aliases* take
+    /// different flags, so those would mangle arguments rather than fail.
+    Bash(PathBuf),
+    /// `pwsh` or `powershell.exe`.
+    PowerShell(PathBuf),
+    /// Always present, so the cascade can never come up empty.
+    Cmd,
+}
+
+impl WinShell {
+    /// `/D` skips AutoRun registry hooks and `-NoProfile` skips the user
+    /// profile, so neither can inject into a command that was already approved.
+    /// The command itself is passed through untouched: the policy scanner reads
+    /// that same string before this wrapping happens, and the two must never
+    /// disagree about what is going to run.
+    pub fn argv(&self, command: &str) -> (String, Vec<String>) {
+        let s = |p: &PathBuf| p.display().to_string();
+        match self {
+            Self::Bash(p) => (s(p), vec!["-c".into(), command.to_string()]),
+            Self::PowerShell(p) => (
+                s(p),
+                vec!["-NoProfile".into(), "-Command".into(), command.to_string()],
+            ),
+            Self::Cmd => (
+                "cmd.exe".into(),
+                vec!["/D".into(), "/S".into(), "/C".into(), command.to_string()],
+            ),
+        }
+    }
+}
+
+/// What this machine offers, probed once. Separated from [`choose_windows_shell`]
+/// so the policy stays a pure function, testable on any platform.
+#[derive(Default, Clone, Debug)]
+pub struct WindowsShellCandidates {
+    /// `MEDHA_SHELL`, already verified runnable. Wins outright.
+    pub override_shell: Option<PathBuf>,
+    pub bash: Option<PathBuf>,
+    pub powershell: Option<PathBuf>,
+}
+
+/// Pick the interpreter, honouring an explicit override before any detection.
+///
+/// No detection cascade fits every machine, so `MEDHA_SHELL` wins outright: it
+/// is the one thing a user with an unusual setup can reach for without waiting
+/// on a release.
+pub fn choose_windows_shell(c: &WindowsShellCandidates) -> WinShell {
+    if let Some(p) = &c.override_shell {
+        return classify_windows_shell(p);
+    }
+    if let Some(p) = &c.bash {
+        return WinShell::Bash(p.clone());
+    }
+    if let Some(p) = &c.powershell {
+        return WinShell::PowerShell(p.clone());
+    }
+    WinShell::Cmd
+}
+
+/// Which interpreter a path *is*, so an override is invoked with the flags that
+/// binary actually understands rather than assumed to be one kind.
+pub fn classify_windows_shell(path: &Path) -> WinShell {
+    // Split on both separators rather than using `file_stem`, which only knows
+    // the *host* platform's separator — a Windows path can be classified while
+    // running elsewhere, and there it would read as one long filename and match
+    // nothing.
+    let name = path.to_string_lossy().to_ascii_lowercase();
+    let name = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    match name.strip_suffix(".exe").unwrap_or(name) {
+        "bash" | "sh" | "zsh" => WinShell::Bash(path.to_path_buf()),
+        "cmd" => WinShell::Cmd,
+        // Anything else is assumed PowerShell-like; it is the only other
+        // interpreter Windows reliably has, and `-Command` is the safer guess
+        // than handing an unknown binary a bare `-c`.
+        _ => WinShell::PowerShell(path.to_path_buf()),
+    }
+}
+
+/// Git for Windows ships `bash.exe` beside `git.exe` but puts only `cmd\` on
+/// PATH, so a plain PATH lookup for bash misses it on a default install.
+/// Deriving it from `git.exe` needs neither configuration nor a hardcoded
+/// install location: `…\Git\cmd\git.exe` → `…\Git\bin\bash.exe`.
+pub fn bash_beside_git(git_exe: &Path) -> Option<PathBuf> {
+    let git_root = git_exe.parent()?.parent()?;
+    ["bin", "usr/bin"]
+        .iter()
+        .map(|d| git_root.join(d).join("bash.exe"))
+        .find(|p| p.is_file())
+}
+
+/// Whether a path is a shell that can actually be spawned.
+///
+/// `is_file()` alone is not enough on Windows: the Microsoft Store publishes
+/// zero-byte *app execution aliases* under `WindowsApps\` which satisfy it but
+/// cannot be executed. Accepting one is worse than finding nothing, because the
+/// PATH tier then reports success and the working absolute path below it is
+/// never tried.
+pub fn is_runnable_shell(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_file() && m.len() > 0,
+        Err(_) => false,
+    }
+}
+
+impl WindowsShellCandidates {
+    /// Probe: explicit override, then PATH, then known absolute locations.
+    /// Every candidate must pass [`is_runnable_shell`], not merely exist, and
+    /// bash is derived from `git.exe` when PATH does not carry it.
+    #[cfg(windows)]
+    pub fn probe() -> Self {
+        // Last resort only: these are where installers and CI images commonly
+        // put PowerShell, not where it is guaranteed to be.
+        const PWSH_FALLBACKS: [&str; 2] = [
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        ];
+
+        let runnable = |p: PathBuf| is_runnable_shell(&p).then_some(p);
+        let on_path = |name: &str| locate_on_path(name).and_then(runnable);
+
+        Self {
+            override_shell: std::env::var_os("MEDHA_SHELL")
+                .map(PathBuf::from)
+                .and_then(runnable),
+            bash: on_path("bash").or_else(|| {
+                locate_on_path("git")
+                    .as_deref()
+                    .and_then(bash_beside_git)
+                    .and_then(runnable)
+            }),
+            powershell: on_path("pwsh")
+                .or_else(|| on_path("powershell"))
+                .or_else(|| {
+                    PWSH_FALLBACKS
+                        .iter()
+                        .map(PathBuf::from)
+                        .find(|p| is_runnable_shell(p))
+                }),
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn probe() -> Self {
+        Self::default()
+    }
+}
+
+/// The interpreter for a backend with this label. Windows has no `sh`, so
+/// hardcoding one made *every* `shell.exec` fail with "program not found" — the
+/// missing program was always the shell, never the user's command, which is why
+/// `git`, `python` and even `cmd` failed identically.
+///
+/// Container and SSH backends execute on Unix-like hosts even when medha itself
+/// runs on Windows, so only the local backends switch interpreter.
+pub fn shell_argv(backend_label: &str, command: &str) -> (String, Vec<String>) {
+    if cfg!(windows) && matches!(backend_label, "host" | "native") {
+        #[cfg(windows)]
+        {
+            // Probed once: the cascade spawns processes to validate candidates,
+            // and shell.exec runs on every tool call.
+            static SHELL: std::sync::OnceLock<WinShell> = std::sync::OnceLock::new();
+            return SHELL
+                .get_or_init(|| choose_windows_shell(&WindowsShellCandidates::probe()))
+                .argv(command);
+        }
+    }
+    ("sh".to_string(), vec!["-c".into(), command.to_string()])
 }
 
 /// Run an already-configured command with the same bounded capture and process
@@ -944,6 +1104,34 @@ pub fn program_on_path(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Where `program` resolves on PATH, with the same Windows `PATHEXT` handling as
+/// [`program_on_path`]. Returns the path rather than a bool, so a caller can go
+/// on to inspect the binary it found.
+pub fn locate_on_path(program: &str) -> Option<PathBuf> {
+    let extensions = || -> Vec<String> {
+        if !cfg!(windows) {
+            return vec![String::new()];
+        }
+        let raw = std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+        std::iter::once(String::new())
+            .chain(
+                raw.to_string_lossy()
+                    .split(';')
+                    .filter(|e| !e.is_empty())
+                    .map(|e| e.to_string()),
+            )
+            .collect()
+    };
+    let paths = std::env::var_os("PATH")?;
+    let exts = extensions();
+    std::env::split_paths(&paths).find_map(|dir| {
+        exts.iter().find_map(|ext| {
+            let candidate = dir.join(format!("{program}{ext}"));
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
 /// The container runtime to use: honor `configured`, else prefer docker, then
 /// podman; fall back to "docker" as the name to report if neither is present.
 fn detect_container_runtime(configured: &Option<String>) -> String {
@@ -1261,26 +1449,48 @@ mod tests {
     async fn bounded_shell_cancellation_reaps_the_process_group() {
         let dir = std::env::temp_dir().join(format!("medha-cancelpg-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
+        let started = dir.join("started.txt");
         let marker = dir.join("survived.txt");
-        let script = format!("(sleep 1; touch {}) & wait", marker.display());
+        // The script announces that it is running, and its helper outlives the
+        // cancel by a wide margin. Cancelling on a fixed 100ms delay instead
+        // raced the script's own completion: under load the run finished first
+        // and `cancelled` came back false, which is why this flaked.
+        let script = format!(
+            "(sleep 3; touch {}) & touch {}; wait",
+            marker.display(),
+            started.display()
+        );
         let cancel = tokio_util::sync::CancellationToken::new();
         let trigger = cancel.clone();
+        let probe = started.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Bounded, so a script that never starts fails the assertion below
+            // rather than hanging the test forever.
+            for _ in 0..500 {
+                if probe.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             trigger.cancel();
         });
+        // Well above the helper's sleep, so `timed_out` cannot fire first.
         let output = run_shell_bounded(
             &script,
             &dir,
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             1024,
             Some(&cancel),
         )
         .await
         .unwrap();
-        assert!(output.cancelled);
+        assert!(
+            output.cancelled,
+            "cancel must land while the script is alive"
+        );
         assert!(!output.timed_out);
-        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        // Outlast the helper's own sleep, so a survivor would have left its mark.
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
         assert!(!marker.exists(), "cancelled verifier left a helper alive");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1445,5 +1655,182 @@ mod tests {
             remote.contains("'sh' '-c' 'echo done'"),
             "args single-quoted: {remote}"
         );
+    }
+
+    #[test]
+    fn a_shell_command_runs_through_an_interpreter_the_platform_actually_has() {
+        // `shell.exec` hardcoded `sh`, which Windows does not have, so every
+        // command failed with "program not found" before it ran — the missing
+        // program was always the shell, never the user's command.
+        for label in ["host", "native"] {
+            let (program, args) = shell_argv(label, "git status");
+            assert_eq!(args.last().unwrap(), "git status", "command must survive");
+            if !cfg!(windows) {
+                assert_eq!(program, "sh");
+                assert_eq!(&args[..1], ["-c"]);
+            }
+        }
+    }
+
+    fn bash_path() -> PathBuf {
+        PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")
+    }
+    fn ps_path() -> PathBuf {
+        PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    }
+
+    #[test]
+    fn windows_prefers_git_bash_then_powershell_then_cmd() {
+        // Bash wins: the model writes Unix command lines, and PowerShell's
+        // same-named aliases take different flags, so `grep -rn` would mangle
+        // its arguments rather than fail cleanly.
+        let both = WindowsShellCandidates {
+            override_shell: None,
+            bash: Some(bash_path()),
+            powershell: Some(ps_path()),
+        };
+        assert_eq!(choose_windows_shell(&both), WinShell::Bash(bash_path()));
+
+        let only_ps = WindowsShellCandidates {
+            powershell: Some(ps_path()),
+            ..Default::default()
+        };
+        assert_eq!(
+            choose_windows_shell(&only_ps),
+            WinShell::PowerShell(ps_path())
+        );
+
+        // cmd.exe always exists, so the cascade can never come up empty.
+        assert_eq!(
+            choose_windows_shell(&WindowsShellCandidates::default()),
+            WinShell::Cmd
+        );
+    }
+
+    #[test]
+    fn an_explicit_override_beats_every_detected_shell() {
+        // No cascade fits every machine, so the escape hatch has to be
+        // absolute — a user with an unusual setup cannot wait on a release.
+        let chosen = choose_windows_shell(&WindowsShellCandidates {
+            override_shell: Some(PathBuf::from(r"D:\msys64\usr\bin\bash.exe")),
+            bash: Some(bash_path()),
+            powershell: Some(ps_path()),
+        });
+        assert_eq!(
+            chosen,
+            WinShell::Bash(PathBuf::from(r"D:\msys64\usr\bin\bash.exe"))
+        );
+
+        // …and is invoked with the flags that binary understands, not assumed.
+        assert_eq!(
+            classify_windows_shell(Path::new(r"C:\Windows\System32\cmd.exe")),
+            WinShell::Cmd
+        );
+        assert!(matches!(
+            classify_windows_shell(Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe")),
+            WinShell::PowerShell(_)
+        ));
+        // Classification must not depend on the host's path separator, or a
+        // Windows path read anywhere else reads as one long filename.
+        for p in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            "C:/Program Files/Git/bin/bash.exe",
+            "bash.exe",
+            "BASH.EXE",
+        ] {
+            assert!(
+                matches!(classify_windows_shell(Path::new(p)), WinShell::Bash(_)),
+                "{p} was not recognised as bash"
+            );
+        }
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("medha-{tag}-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_store_alias_stub_is_not_accepted_as_a_shell() {
+        // Zero-byte app execution aliases under WindowsApps\ satisfy is_file()
+        // but cannot be spawned. Accepting one is worse than finding nothing:
+        // the PATH tier reports success and the working absolute path below it
+        // is never tried.
+        let dir = scratch_dir("shellprobe");
+
+        let stub = dir.join("pwsh.exe");
+        std::fs::write(&stub, b"").unwrap();
+        assert!(!is_runnable_shell(&stub), "a 0-byte alias must be rejected");
+
+        let real = dir.join("bash.exe");
+        std::fs::write(&real, b"MZ\x90\x00").unwrap();
+        assert!(is_runnable_shell(&real));
+
+        assert!(!is_runnable_shell(&dir.join("missing.exe")));
+        assert!(!is_runnable_shell(&dir), "a directory is not a shell");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bash_is_derived_from_git_when_path_lacks_it() {
+        // A default Git for Windows install puts only cmd\ on PATH, so looking
+        // up bash.exe there misses it even though it is sitting next door.
+        let dir = scratch_dir("gitbash");
+        let git_root = dir.join("Git");
+        std::fs::create_dir_all(git_root.join("cmd")).unwrap();
+        std::fs::create_dir_all(git_root.join("bin")).unwrap();
+        let git_exe = git_root.join("cmd").join("git.exe");
+        std::fs::write(&git_exe, b"MZ").unwrap();
+
+        assert_eq!(bash_beside_git(&git_exe), None, "no bash yet");
+
+        let bash = git_root.join("bin").join("bash.exe");
+        std::fs::write(&bash, b"MZ").unwrap();
+        assert_eq!(bash_beside_git(&git_exe), Some(bash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_windows_shell_receives_the_command_unmodified() {
+        // The policy scanner reads the model's raw command string and the
+        // wrapper is applied afterwards, so the two can never disagree about
+        // what will run. That holds only while wrapping leaves the command
+        // itself untouched — a scanner approving one string while a different
+        // one executes is the whole gate defeated.
+        let cmd = r#"git commit -m "a message with spaces && ;""#;
+        for shell in [
+            WinShell::Bash(bash_path()),
+            WinShell::PowerShell(ps_path()),
+            WinShell::Cmd,
+        ] {
+            let (_, args) = shell.argv(cmd);
+            assert_eq!(args.last().unwrap(), cmd, "{shell:?} rewrote the command");
+        }
+    }
+
+    #[test]
+    fn each_windows_shell_gets_the_flags_that_disable_ambient_startup_files() {
+        // AutoRun (cmd) and the user profile (PowerShell) both run before the
+        // command and could alter one that was already approved.
+        assert_eq!(WinShell::Cmd.argv("x").1[..3], ["/D", "/S", "/C"]);
+        assert_eq!(
+            WinShell::PowerShell(ps_path()).argv("x").1[..2],
+            ["-NoProfile", "-Command"]
+        );
+        assert_eq!(WinShell::Bash(bash_path()).argv("x").1[..1], ["-c"]);
+    }
+
+    #[test]
+    fn remote_backends_keep_sh_even_when_medha_runs_on_windows() {
+        // Container and SSH execute on Unix-like hosts, so the interpreter
+        // follows the target, not the machine medha happens to run on.
+        for label in ["container", "ssh"] {
+            let (program, args) = shell_argv(label, "ls");
+            assert_eq!(program, "sh", "{label} should target a Unix shell");
+            assert_eq!(args, vec!["-c".to_string(), "ls".to_string()]);
+        }
     }
 }

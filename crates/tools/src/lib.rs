@@ -1439,33 +1439,39 @@ impl Tool for FsRead {
         // (only model context was protected by the 16KB spill). Ranged reads
         // stay allowed; point the model at them.
         const MAX_WHOLE_READ: u64 = 2_000_000;
+        // Resolve ONCE and reuse. Resolving is what prompts for a path outside
+        // the workspace, so resolving per step asked the user to approve the
+        // same file once per step — three dialogs for one whole-file read.
+        let resolved = self
+            .sbx
+            .resolve(&path)
+            .await
+            .map_err(|e| ToolError::Failed(format!("read failed: {e}")))?;
         // A directory reaches the OS as "Is a directory (os error 21)", which
         // says nothing about what to do instead. Name the tools that answer the
         // question actually being asked.
-        if let Ok(resolved) = self.sbx.resolve(&path).await
-            && resolved.is_dir()
-        {
+        if resolved.is_dir() {
             return Err(ToolError::Args(format!(
                 "{path} is a directory — use `fs.list` for its entries, `tree` for a nested view, \
                  or `glob`/`grep` to find files inside it"
             )));
         }
-        if offset.is_none() && limit.is_none() {
-            if let Ok(p) = self.sbx.resolve(&path).await {
-                if let Ok(md) = std::fs::metadata(&p) {
-                    if md.len() > MAX_WHOLE_READ {
-                        return Err(ToolError::Failed(format!(
-                            "{path} is {} bytes — too large for a whole-file read (cap {MAX_WHOLE_READ}). \
-                             Read a range with offset/limit, or grep it.",
-                            md.len()
-                        )));
-                    }
-                }
-            }
+        // Size guard (P2): refuse a whole-file read of a huge file BEFORE
+        // loading it — otherwise it lands in memory and the event log intact.
+        if offset.is_none()
+            && limit.is_none()
+            && let Ok(md) = std::fs::metadata(&resolved)
+            && md.len() > MAX_WHOLE_READ
+        {
+            return Err(ToolError::Failed(format!(
+                "{path} is {} bytes — too large for a whole-file read (cap {MAX_WHOLE_READ}). \
+                 Read a range with offset/limit, or grep it.",
+                md.len()
+            )));
         }
         let content = self
             .sbx
-            .read(&path)
+            .read_resolved(&resolved)
             .await
             .map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
         // Whole-file read (default) — unchanged behavior.
@@ -1542,7 +1548,7 @@ impl Tool for FsWrite {
         // Capture the prior contents (empty for a new file) so surfaces can render
         // a proper diff: a new file shows as all-additions (empty left column),
         // an overwrite shows the real before/after — same view as fs.edit.
-        let (old, unreadable) = read_or_flag_unreadable(&self.sbx, &path).await;
+        let (old, unreadable) = read_or_flag_unreadable(&self.sbx, &path, true).await;
         let baseline = if unreadable {
             None
         } else {
@@ -1585,7 +1591,7 @@ impl Tool for FsWrite {
         // additions; an overwrite shows the real before→after change. An existing
         // but unreadable file must NOT masquerade as "new file" — that hides a
         // destructive overwrite from the approval card.
-        let (old, unreadable) = read_or_flag_unreadable(&self.sbx, path).await;
+        let (old, unreadable) = read_or_flag_unreadable(&self.sbx, path, false).await;
         let diff = cap_preview(&make_diff(path, &old, content));
         if unreadable {
             Some(format!(
@@ -1600,16 +1606,30 @@ impl Tool for FsWrite {
 /// Read a file's contents for diffing; distinguish "doesn't exist" (empty, false)
 /// from "exists but unreadable" (empty, true) so previews can't call a
 /// destructive overwrite a new file.
-async fn read_or_flag_unreadable(sbx: &WorkspaceSandbox, path: &str) -> (String, bool) {
-    match sbx.read(path).await {
+/// `may_prompt` is false for previews, which must not raise a permission dialog
+/// before the approval card explains what the operation is.
+async fn read_or_flag_unreadable(
+    sbx: &WorkspaceSandbox,
+    path: &str,
+    may_prompt: bool,
+) -> (String, bool) {
+    // Resolve once. Resolving is what prompts for an out-of-workspace path, so
+    // resolving again on the error path asked the user a second time for the
+    // very file that had just failed to read.
+    let resolved = if may_prompt {
+        sbx.resolve(path).await.ok()
+    } else {
+        sbx.resolve_if_permitted(path).await
+    };
+    let Some(resolved) = resolved else {
+        // A preview that may not ask cannot tell whether a file is there, and
+        // reporting a possible overwrite as a new file is the dangerous
+        // direction to be wrong in — so it reports "unreadable" instead.
+        return (String::new(), !may_prompt);
+    };
+    match sbx.read_resolved(&resolved).await {
         Ok(s) => (s, false),
-        Err(_) => {
-            let exists = match sbx.resolve(path).await {
-                Ok(p) => p.exists(),
-                Err(_) => false,
-            };
-            (String::new(), exists)
-        }
+        Err(_) => (String::new(), resolved.exists()),
     }
 }
 
@@ -1794,7 +1814,10 @@ impl Tool for FsEdit {
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let content = self.sbx.read(path).await.ok()?;
+        // Never prompts: a preview runs before the approval card, so asking to
+        // authorise the path here would question the user before telling them
+        // what it is for — and again when the edit actually runs.
+        let content = self.sbx.read_if_permitted(path).await?;
         // Pin what the approval card will show (P1-1).
         self.pins.pin(args, &content);
         let count = content.matches(old_s).count();
@@ -4142,12 +4165,7 @@ impl Tool for ShellExec {
         // tree — no orphans.
         let bg = self
             .sbx
-            .exec_background(
-                "sh",
-                &["-c".to_string(), command.clone()],
-                shell_env(),
-                true,
-            )
+            .shell_background(&command, shell_env(), true)
             .map_err(|e| ToolError::Failed(e.to_string()))?;
 
         // Register in the table BEFORE waiting. If the caller cancels (Esc) during
@@ -4491,7 +4509,8 @@ impl Tool for MultiEdit {
     async fn preview(&self, args: &Value) -> Option<String> {
         let path = args.get("path")?.as_str()?;
         let edits = args.get("edits")?.as_array()?;
-        let content = self.sbx.read(path).await.ok()?;
+        // Never prompts — see `fs.edit`'s preview.
+        let content = self.sbx.read_if_permitted(path).await?;
         // Pin what the approval card will show (P1-1).
         self.pins.pin(args, &content);
         match apply_edits(&content, edits) {
@@ -7098,6 +7117,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_a_missing_file_reports_it_rather_than_returning_empty() {
+        // Resolution failure used to fall through to the read for its error;
+        // it now returns early, so the message has to stay just as clear —
+        // silently succeeding with empty content would be far worse.
+        let dir = std::env::temp_dir().join(format!("medha-missing-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let tool = FsRead { sbx };
+
+        let error = tool
+            .execute(&json!({ "path": "nope.txt" }))
+            .await
+            .expect_err("a missing file must not read as empty");
+        assert!(
+            error.to_string().contains("read failed"),
+            "unclear: {error}"
+        );
+
+        // The same for an absolute path outside the workspace with no gate
+        // wired: denied, never silently empty.
+        let outside = std::env::temp_dir().join(format!("medha-missing-out-{}", ulid_like()));
+        assert!(
+            tool.execute(&json!({ "path": outside.to_string_lossy() }))
+                .await
+                .is_err(),
+            "an unauthorised path must not read as empty"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn agent_spawn_without_an_objective_is_rejected() {
         let (registry, _saw) = registry_with_agents();
         let observation = registry
@@ -7108,5 +7159,145 @@ mod tests {
             })
             .await;
         assert_ne!(observation.status, kernel::ObsStatus::Ok);
+    }
+
+    /// Counts how many times the user was asked, so "one file, one dialog" is
+    /// checked rather than assumed.
+    struct CountingGate(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl kernel::HumanGate for CountingGate {
+        async fn confirm(
+            &self,
+            _action: &str,
+            _detail: Option<&str>,
+            _escalated: bool,
+        ) -> kernel::Approval {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            kernel::Approval::Once
+        }
+    }
+
+    #[tokio::test]
+    async fn reading_one_file_outside_the_workspace_asks_exactly_once() {
+        // Resolving is what prompts, and fs.read resolved three times — a
+        // directory check, a size guard, then the read — so a single
+        // whole-file read raised three approval dialogs for the same path.
+        // Only out-of-workspace paths reach the permission system, which is why
+        // this stayed invisible while working inside the workspace.
+        let ws = std::env::temp_dir().join(format!("medha-ws-{}", ulid_like()));
+        let outside = std::env::temp_dir().join(format!("medha-out-{}", ulid_like()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("app.py");
+        std::fs::write(&target, "print('hi')\n").unwrap();
+
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sbx = Arc::new(
+            WorkspaceSandbox::new(
+                &ws,
+                ws.join("medha.lock"),
+                ws.join("audit.log"),
+                Some(Arc::new(CountingGate(asked.clone()))),
+            )
+            .unwrap(),
+        );
+        let tool = FsRead { sbx };
+
+        let out = tool
+            .execute(&json!({ "path": target.to_string_lossy() }))
+            .await
+            .unwrap();
+        assert_eq!(out["content"], "print('hi')\n");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one file should cost the user exactly one approval"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A preview renders the approval card, so it runs *before* the user has
+    /// been told what the operation is. Prompting there asks them to authorise
+    /// a path with no context, and asks again when the write actually runs.
+    #[tokio::test]
+    async fn a_preview_never_raises_a_permission_prompt() {
+        let ws = std::env::temp_dir().join(format!("medha-pv-ws-{}", ulid_like()));
+        let outside = std::env::temp_dir().join(format!("medha-pv-out-{}", ulid_like()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let existing = outside.join("existing.txt");
+        std::fs::write(&existing, "old contents\n").unwrap();
+
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sbx = Arc::new(
+            WorkspaceSandbox::new(
+                &ws,
+                ws.join("medha.lock"),
+                ws.join("audit.log"),
+                Some(Arc::new(CountingGate(asked.clone()))),
+            )
+            .unwrap(),
+        );
+
+        let card = read_or_flag_unreadable(&sbx, &existing.to_string_lossy(), false).await;
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a preview must not prompt"
+        );
+        // It cannot read the file, so it must NOT report it as new: calling a
+        // destructive overwrite a "new file" hides it from the approval card.
+        assert!(card.1, "an unreadable existing file must be flagged");
+
+        // The same call from execute may ask, and asks exactly once.
+        let (content, unreadable) =
+            read_or_flag_unreadable(&sbx, &existing.to_string_lossy(), true).await;
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "execute should ask once, not repeatedly"
+        );
+        assert_eq!(content, "old contents\n");
+        assert!(!unreadable);
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// In-workspace previews are the common case and must keep showing the real
+    /// before/after — the no-prompt path must not blind them.
+    #[tokio::test]
+    async fn an_in_workspace_preview_still_reads_the_file() {
+        let ws = std::env::temp_dir().join(format!("medha-pv-in-{}", ulid_like()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("a.txt"), "hello\n").unwrap();
+
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sbx = Arc::new(
+            WorkspaceSandbox::new(
+                &ws,
+                ws.join("medha.lock"),
+                ws.join("audit.log"),
+                Some(Arc::new(CountingGate(asked.clone()))),
+            )
+            .unwrap(),
+        );
+
+        let (content, unreadable) = read_or_flag_unreadable(&sbx, "a.txt", false).await;
+        assert_eq!(
+            content, "hello\n",
+            "an in-workspace preview must still read"
+        );
+        assert!(!unreadable);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A file that genuinely does not exist is a new file, not an overwrite.
+        let (content, unreadable) = read_or_flag_unreadable(&sbx, "brand-new.txt", false).await;
+        assert!(content.is_empty());
+        assert!(!unreadable, "a new in-workspace file must not warn");
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

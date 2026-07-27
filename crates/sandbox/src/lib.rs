@@ -196,6 +196,26 @@ impl WorkspaceSandbox {
         &self.root
     }
 
+    /// Label of the active execution backend, so callers can pick the shell that
+    /// backend actually provides — see [`crate::exec::shell_argv`].
+    pub fn backend_label(&self) -> &str {
+        self.exec.label()
+    }
+
+    /// Spawn a shell *command line* as a background task, choosing the
+    /// interpreter the active backend provides. Prefer this over passing `sh`
+    /// to [`exec_background`]: Windows has no `sh`, and hardcoding one made
+    /// every shell command fail before it ran.
+    pub fn shell_background(
+        &self,
+        command: &str,
+        env: Vec<(String, String)>,
+        clear_env: bool,
+    ) -> Result<crate::exec::BgProc, ExecError> {
+        let (program, args) = crate::exec::shell_argv(self.backend_label(), command);
+        self.exec_background(&program, &args, env, clear_env)
+    }
+
     /// Get the permission manager for advanced use cases
     pub fn permission_manager(&self) -> Arc<PermissionManager> {
         self.permission_manager.clone()
@@ -331,6 +351,46 @@ impl WorkspaceSandbox {
     /// Read a file - supports paths outside workspace via permission system
     pub async fn read(&self, path: &str) -> Result<String, SandboxError> {
         let resolved = self.resolve(path).await?;
+        self.read_resolved(&resolved).await
+    }
+
+    /// Resolve for reading only if the path is *already* permitted — never
+    /// prompts, returning `None` where [`resolve`](Self::resolve) would ask.
+    ///
+    /// For previews, which run *before* the approval card and so must not put a
+    /// permission dialog in front of a user who has not yet been told what the
+    /// operation is — and would then be asked again when it runs.
+    pub async fn resolve_if_permitted(&self, path: &str) -> Option<PathBuf> {
+        let p = Path::new(path);
+        let simple_relative = p.is_relative()
+            && !p.components().any(|c| {
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            });
+        if simple_relative {
+            // Stays inside the jail, so this never reaches the human gate.
+            return self.resolve(path).await.ok();
+        }
+        self.permission_manager
+            .resolve_if_permitted(p, permissions::PermissionType::Read)
+    }
+
+    /// Read a file only if it is already permitted, never prompting.
+    pub async fn read_if_permitted(&self, path: &str) -> Option<String> {
+        let resolved = self.resolve_if_permitted(path).await?;
+        self.read_resolved(&resolved).await.ok()
+    }
+
+    /// Read a path [`resolve`](Self::resolve) has already authorised.
+    ///
+    /// Resolving is what asks the user, so a caller that needs the path for
+    /// more than one step — a directory check, a size guard, then the read —
+    /// must resolve once and reuse it. Calling `resolve` per step prompts per
+    /// step, which is one approval dialog per step for the same file.
+    pub async fn read_resolved(&self, resolved: &Path) -> Result<String, SandboxError> {
+        let resolved = resolved.to_path_buf();
         tokio::task::spawn_blocking(move || {
             std::fs::read_to_string(&resolved).map_err(|e| SandboxError::Io(e.to_string()))
         })

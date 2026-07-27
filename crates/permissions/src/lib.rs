@@ -412,6 +412,23 @@ impl PermissionManager {
             .map_err(|e| PermissionError::Io(e.to_string()))
     }
 
+    /// Resolve a path only if it is *already* permitted — inside the workspace,
+    /// or previously trusted. Returns `None` where [`request_permission`] would
+    /// have asked the user.
+    ///
+    /// For callers that must not interrupt, above all previews: a preview runs
+    /// before the approval card is shown, so prompting there asks the user to
+    /// authorise a path before telling them what it is for, and then asks again
+    /// when the operation actually runs.
+    pub fn resolve_if_permitted(&self, path: &Path, permission: PermissionType) -> Option<PathBuf> {
+        let resolved = match permission {
+            PermissionType::Read => self.resolve_path_for_read(path).ok()?,
+            PermissionType::Write => self.resolve_path_for_write(path).ok()?,
+        };
+        (self.is_inside_workspace(&resolved) || self.is_trusted(&resolved, permission))
+            .then_some(resolved)
+    }
+
     /// Request permission for a path (the main entry point)
     pub async fn request_permission(
         &self,
@@ -573,6 +590,66 @@ mod tests {
         assert!(
             mgr2.request_read(&target).await.is_ok(),
             "persisted path should be trusted on reload"
+        );
+    }
+
+    /// Counts prompts, so "asked once" is measured rather than assumed.
+    struct CountingGate(Arc<AtomicU32>, Approval);
+    #[async_trait::async_trait]
+    impl HumanGate for CountingGate {
+        async fn confirm(&self, _: &str, _: Option<&str>, _: bool) -> Approval {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            self.1
+        }
+    }
+
+    /// "Always allow" must stop asking immediately, not only after a restart.
+    #[tokio::test]
+    async fn always_allow_stops_asking_within_the_same_session() {
+        let ws = unique_dir("ws_session");
+        let outside = unique_dir("out_session");
+        std::fs::write(outside.join("f.txt"), "x").unwrap();
+        let target = outside.join("f.txt");
+
+        let asked = Arc::new(AtomicU32::new(0));
+        let mut mgr =
+            PermissionManager::new(&ws, ws.join("medha.lock"), ws.join("audit.log")).unwrap();
+        mgr.set_human_gate(Arc::new(CountingGate(asked.clone(), Approval::Always)));
+
+        for _ in 0..3 {
+            assert!(mgr.request_read(&target).await.is_ok());
+        }
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "'always' must persist into the in-memory trust set, not just the lock file"
+        );
+    }
+
+    /// The stored path and the queried path both come from `canonicalize`, so
+    /// they must compare equal. On Windows that means both carry the `\\?\`
+    /// verbatim prefix; if one side kept it and the other did not, every lookup
+    /// would miss and "always allow" would silently behave like "allow once".
+    #[tokio::test]
+    async fn a_trusted_directory_covers_files_beneath_it() {
+        let ws = unique_dir("ws_tree");
+        let outside = unique_dir("out_tree");
+        let nested = outside.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("deep.txt"), "x").unwrap();
+
+        let asked = Arc::new(AtomicU32::new(0));
+        let mut mgr =
+            PermissionManager::new(&ws, ws.join("medha.lock"), ws.join("audit.log")).unwrap();
+        mgr.set_human_gate(Arc::new(CountingGate(asked.clone(), Approval::Always)));
+
+        // Trust the root, then read something several levels below it.
+        assert!(mgr.request_read(&outside).await.is_ok());
+        assert!(mgr.request_read(&nested.join("deep.txt")).await.is_ok());
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "trusting a directory must cover its descendants"
         );
     }
 

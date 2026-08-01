@@ -42,6 +42,23 @@ fn owner_marker(worktree: &Path) -> PathBuf {
     PathBuf::from(marker)
 }
 
+/// Rust's Windows `canonicalize` returns an extended-length (`\\?\\...`)
+/// spelling. The Win32 APIs accept that spelling, but Git for Windows does not
+/// consistently accept it as a `worktree add` destination on hosted runners.
+/// Keep the canonicalization (it prevents aliasing) while handing Git the
+/// ordinary drive/UNC spelling for paths that are within the normal path range.
+#[cfg(windows)]
+fn git_worktree_path(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    if let Some(local) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(local);
+    }
+    path
+}
+
 /// Marks a checkout whose work was never captured as a patch. A sibling, like
 /// the owner marker, so it stays out of the child's diff.
 fn keep_marker(worktree: &Path) -> PathBuf {
@@ -493,13 +510,17 @@ async fn run_git_program_observed(
             _ = task_cancellation.cancelled() => End::Cancelled,
         };
 
-        // Always reap the group. On a normal exit this only kills helpers that
-        // Git or a credential hook left behind; on timeout/cancellation it also
-        // reaches the leader.
-        if let Some(pid) = pid {
-            kill_git_process_tree(pid);
+        // Only tear down the process tree when the command did not finish
+        // normally. On Windows `git.exe` can be a launcher with helper
+        // processes still completing the operation after the leader exits;
+        // taskkill /T against the just-exited PID can terminate those helpers
+        // and turn a successful `git worktree add` into a partial failure.
+        if matches!(&end, End::TimedOut | End::Cancelled) {
+            if let Some(pid) = pid {
+                kill_git_process_tree(pid);
+            }
+            let _ = child.start_kill();
         }
-        let _ = child.start_kill();
 
         let (status, terminal_error) = match end {
             End::Exited(status) => (
@@ -530,8 +551,6 @@ async fn run_git_program_observed(
                 })?
                 .map_err(|error| WorktreeError::Spawn(error.to_string()))?,
         };
-        reaper.disarm();
-
         let (stdout, stderr, ()) = tokio::time::timeout(GIT_SETTLE_TIMEOUT, &mut io_task)
             .await
             .map_err(|_| {
@@ -539,6 +558,11 @@ async fn run_git_program_observed(
             })?
             .map_err(|error| WorktreeError::Spawn(format!("git pipe task failed: {error}")))?
             .map_err(|error| WorktreeError::Io(error.to_string()))?;
+
+        // All output pipes have settled, so a normally exited command has no
+        // descendants that can still hold inherited handles. Keep the guard
+        // armed until this point so an early error still tears down the tree.
+        reaper.disarm();
 
         if let Some(error) = terminal_error {
             return Err(error);
@@ -1062,6 +1086,8 @@ impl WorktreePool {
         // sandbox another leaves a worktree that cannot be removed by name.
         std::fs::create_dir_all(&self.dir).map_err(|e| WorktreeError::Io(e.to_string()))?;
         let dir = self.dir.canonicalize().unwrap_or_else(|_| self.dir.clone());
+        #[cfg(windows)]
+        let dir = git_worktree_path(dir);
         let name = session.to_string().to_lowercase();
         let path = dir.join(&name);
         let branch = format!("{BRANCH_PREFIX}/{name}");
@@ -1401,6 +1427,19 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let pool = WorktreePool::new(root, state.path().join("worktrees"));
         (state, pool)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_worktree_paths_drop_rusts_verbatim_prefix() {
+        assert_eq!(
+            git_worktree_path(PathBuf::from(r"\\?\C:\Users\runner\worktrees")),
+            PathBuf::from(r"C:\Users\runner\worktrees")
+        );
+        assert_eq!(
+            git_worktree_path(PathBuf::from(r"\\?\UNC\server\share\worktrees")),
+            PathBuf::from(r"\\server\share\worktrees")
+        );
     }
 
     #[tokio::test]
@@ -1837,7 +1876,24 @@ mod tests {
 
         // Checkout now holds the cross-process lock immediately after
         // `git worktree add`, before writing the owner marker.
-        after_add.wait().await;
+        if tokio::time::timeout(Duration::from_secs(10), after_add.wait())
+            .await
+            .is_err()
+        {
+            let checkout_result = if checkout.is_finished() {
+                match checkout.await {
+                    Ok(Ok(_)) => " result: checkout unexpectedly completed".into(),
+                    Ok(Err(error)) => format!(" result: {error}"),
+                    Err(error) => format!(" result: checkout task failed: {error}"),
+                }
+            } else {
+                " checkout task did not settle".into()
+            };
+            panic!(
+                "checkout did not reach the add/marker barrier within 10s;{}",
+                checkout_result
+            );
+        }
         let started = state.path().join("sweep-started");
         let done = state.path().join("sweep-done");
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())

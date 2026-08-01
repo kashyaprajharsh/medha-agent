@@ -1263,11 +1263,23 @@ async fn writable() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf
     run(vec!["init", "--initial-branch=main"]);
     run(vec!["config", "user.email", "t@example.com"]);
     run(vec!["config", "user.name", "t"]);
+    // The assertions below are about worktree and patch behavior, not Git's
+    // host-specific text checkout policy. Keep LF fixtures stable on Windows.
+    run(vec!["config", "core.autocrlf", "false"]);
     std::fs::write(root.join("a.txt"), "original\n").unwrap();
     run(vec!["add", "."]);
     run(vec!["commit", "-m", "base"]);
     let state = tempfile::tempdir().unwrap();
     (repo, state, root)
+}
+
+/// Git for Windows may check out text files with CRLF according to the
+/// machine's `core.autocrlf` setting. These tests assert logical file content,
+/// not the platform's newline convention.
+fn read_text(path: impl AsRef<std::path::Path>) -> String {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .replace("\r\n", "\n")
 }
 
 /// Isolation over a real repository. The executor is deliberately *not*
@@ -1388,7 +1400,7 @@ async fn a_writer_edits_its_own_checkout_and_never_the_parents() {
     assert_eq!(result.status, AgentStatus::Completed);
     // The parent's working tree is exactly as it was.
     assert_eq!(
-        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        read_text(root.join("a.txt")),
         "original\n"
     );
     assert!(!root.join("added.txt").exists());
@@ -1409,7 +1421,7 @@ async fn a_writer_returns_a_patch_rather_than_an_account_of_its_edits() {
     assert_eq!(control.check(&patch).await, Some(MergeCheck::Clean));
     control.merge(&patch, false).await.unwrap();
     assert_eq!(
-        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        read_text(root.join("a.txt")),
         "rewritten by the child\n"
     );
 }
@@ -1425,7 +1437,7 @@ async fn nothing_is_merged_until_someone_asks_for_it() {
     // child must never be what triggers it.
     assert!(result.patch.is_some());
     assert_eq!(
-        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        read_text(root.join("a.txt")),
         "original\n"
     );
 }
@@ -1589,7 +1601,7 @@ async fn a_patch_that_does_not_build_does_not_merge() {
         Err(Error::Unverified(_))
     ));
     assert_eq!(
-        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        read_text(root.join("a.txt")),
         "original\n"
     );
 }
@@ -1612,7 +1624,7 @@ async fn a_failing_patch_can_still_be_forced_deliberately() {
     // permanently unusable — but getting past it has to be an explicit act.
     control.merge(&patch, true).await.unwrap();
     assert_eq!(
-        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        read_text(root.join("a.txt")),
         "rewritten by the child\n"
     );
 }

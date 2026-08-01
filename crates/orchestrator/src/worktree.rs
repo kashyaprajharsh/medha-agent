@@ -1405,6 +1405,15 @@ async fn apply(
 mod tests {
     use super::*;
 
+    /// Git for Windows may check out text files with CRLF according to the
+    /// machine's `core.autocrlf` setting. These tests assert logical file
+    /// content, not the platform's newline convention.
+    fn read_text(path: impl AsRef<Path>) -> String {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .replace("\r\n", "\n")
+    }
+
     /// A real repository with one commit — worktrees are a git feature, so
     /// faking git here would test nothing that matters.
     async fn repo() -> (tempfile::TempDir, PathBuf) {
@@ -1417,6 +1426,12 @@ mod tests {
             .await
             .unwrap();
         git(&root, &["config", "user.name", "t"]).await.unwrap();
+        // These fixtures assert patch contents, not Git's user-selected text
+        // checkout policy. Pin the repository policy so Windows' usual
+        // core.autocrlf=true does not turn LF fixtures into CRLF assertions.
+        git(&root, &["config", "core.autocrlf", "false"])
+            .await
+            .unwrap();
         std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         git(&root, &["add", "."]).await.unwrap();
         git(&root, &["commit", "-m", "base"]).await.unwrap();
@@ -1567,7 +1582,7 @@ mod tests {
         assert_eq!(check(&root, &patch).await, MergeCheck::Clean);
         merge(&root, &patch).await.unwrap();
         assert_eq!(
-            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            read_text(root.join("a.txt")),
             "one\nEDITED\nthree\n"
         );
     }

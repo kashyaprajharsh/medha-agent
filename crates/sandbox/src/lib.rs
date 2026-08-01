@@ -2080,7 +2080,15 @@ impl WorkspaceSandbox {
                         resolved.with_extension(format!("medha-restore-{}", ulid::Ulid::new()));
                     std::fs::copy(&src, &temporary)
                         .map_err(|error| SandboxError::Io(error.to_string()))?;
-                    let temp_file = std::fs::File::open(&temporary)
+                    // Windows' FlushFileBuffers (used by `sync_all`) requires
+                    // a writable handle; a read-only `File::open` succeeds
+                    // but its flush returns ERROR_ACCESS_DENIED. The staged
+                    // copy is private, so opening it read/write preserves the
+                    // durability barrier without weakening publication.
+                    let temp_file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&temporary)
                         .map_err(|error| SandboxError::Io(error.to_string()))?;
                     if let Err(error) = temp_file.sync_all() {
                         drop(temp_file);

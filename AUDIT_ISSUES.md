@@ -1522,11 +1522,18 @@ authoritative current result.
 - **Failure:** The non-Unix write and restore paths staged a temporary file,
   flushed it, and called `ReplaceFileW`/`MoveFileExW` while the staging
   `std::fs::File` was still alive. Windows rejects moving an open source with
-  `ERROR_SHARING_VIOLATION`; editing an existing file and restoring a snapshot
-  therefore failed, while Unix's open-inode rename semantics masked it.
-- **Resolution (2026-08-02):** The staging handle is explicitly dropped after
-  `sync_all` and before either Windows publication call. This keeps the atomic
-  replacement and the existing target-preservation behavior intact.
+  `ERROR_SHARING_VIOLATION`. After that handle was closed, restore still
+  opened its staged copy read-only before `sync_all`; Windows then returned
+  `ERROR_ACCESS_DENIED` from `FlushFileBuffers`. Editing an existing file and
+  restoring a snapshot therefore failed, while Unix's open-inode rename and
+  read-only fsync semantics masked both defects.
+- **Hosted evidence:** The first failure was [job 91418076880](https://github.com/kashyaprajharsh/medha-agent/actions/runs/30718467602/job/91418076880);
+  after closing the staging handle, the diagnostic rerun isolated the
+  read-only flush failure in [job 91419020524](https://github.com/kashyaprajharsh/medha-agent/actions/runs/30718828341/job/91419020524).
+- **Resolution (2026-08-02):** Staging handles are explicitly dropped after
+  `sync_all` and before either Windows publication call, and restore opens its
+  private staging copy read/write so the durability flush is valid on Windows.
+  This keeps atomic replacement and target-metadata preservation intact.
 - **Acceptance criteria:** The hosted Windows workspace suite must pass through
   the rewind test and the later installer, worktree, and sandbox regressions.
   The source fix is present, but this remains `[~]` until that rerun completes.

@@ -44,10 +44,10 @@ Line links refer to the audited commit and may drift as fixes land. Keep the
 | Critical | 4 | 0 | 0 |
 | High | 29 | 1 (AUD-070) | 0 |
 | Medium | 28 | 2 (AUD-050, AUD-075) | 0 |
-| Low | 8 | 3 (AUD-060, AUD-071, AUD-073) | 0 |
-| **Total** | **69** | **6** | **0** |
+| Low | 8 | 4 (AUD-060, AUD-071, AUD-073, AUD-076) | 0 |
+| **Total** | **69** | **7** | **0** |
 
-There are **75 audited findings** in total. `[~]` here means that the production
+There are **76 audited findings** in total. `[~]` here means that the production
 fix and regression coverage exist, but the closure rule requiring execution on
 the relevant hosted/platform environment has not yet been met. It does not mean
 that a known production failure path remains unpatched.
@@ -1490,6 +1490,26 @@ authoritative current result.
 - **Acceptance criteria:** A hosted dry-run of the pushed remediation SHA must
   build/upload every platform artifact and create no tag or release. This stays
   `[~]` until that run is observed.
+
+### [~] AUD-076 — Workspace-state unit test compares a Windows path using Unix separators
+
+- **Severity:** Low
+- **Confidence:** Reproduced on hosted Windows
+- **Area:** Windows CI, configuration test portability
+- **Evidence:** [`crates/medha-cli/src/config.rs`](crates/medha-cli/src/config.rs),
+  [failed hosted Windows job](https://github.com/kashyaprajharsh/medha-agent/actions/runs/30690583764/job/91344467745)
+- **Failure:** `state_dir_is_per_workspace_under_home_projects` converted the
+  complete path to a string and required the Unix spelling
+  `/home/u/.medha/projects/-w-one--`. The production path was correct, but the
+  same path uses Windows separators on the hosted runner, so the test failed
+  after the other 158 CLI unit tests passed.
+- **Resolution (2026-08-01):** The regression now checks `Path` components:
+  the parent must equal `MEDHA_HOME/projects`, and only the final filename is
+  checked for the readable workspace-slug prefix. The focused test and all 161
+  CLI unit tests pass locally.
+- **Acceptance criteria:** The complete all-target workspace suite must pass on
+  a current hosted Windows runner. The source fix is present, but this remains
+  `[~]` until that rerun completes.
 
 ## Consolidated remediation record
 

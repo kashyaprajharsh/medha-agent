@@ -2107,9 +2107,20 @@ mod tests {
         let home = Path::new("/home/u/.medha");
         let a = state_dir_in(home, Path::new("/w/one"));
         let b = state_dir_in(home, Path::new("/w/two"));
+        let projects = home.join("projects");
+        let workspace_dir = a
+            .file_name()
+            .expect("workspace state directory has a final component")
+            .to_string_lossy();
+        assert_eq!(
+            a.parent(),
+            Some(projects.as_path()),
+            "workspace state is directly under MEDHA_HOME/projects"
+        );
         assert!(
-            a.to_string_lossy()
-                .starts_with("/home/u/.medha/projects/-w-one--")
+            workspace_dir.starts_with("-w-one--"),
+            "workspace state keeps its readable slug prefix: {}",
+            a.display()
         );
         assert_ne!(a, b, "different workspaces get different state dirs");
         assert!(

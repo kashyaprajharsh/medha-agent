@@ -1409,9 +1409,7 @@ mod tests {
     /// machine's `core.autocrlf` setting. These tests assert logical file
     /// content, not the platform's newline convention.
     fn read_text(path: impl AsRef<Path>) -> String {
-        std::fs::read_to_string(path)
-            .unwrap()
-            .replace("\r\n", "\n")
+        std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
     }
 
     /// A real repository with one commit — worktrees are a git feature, so
@@ -1581,10 +1579,7 @@ mod tests {
 
         assert_eq!(check(&root, &patch).await, MergeCheck::Clean);
         merge(&root, &patch).await.unwrap();
-        assert_eq!(
-            read_text(root.join("a.txt")),
-            "one\nEDITED\nthree\n"
-        );
+        assert_eq!(read_text(root.join("a.txt")), "one\nEDITED\nthree\n");
     }
 
     #[tokio::test]

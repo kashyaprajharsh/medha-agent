@@ -1277,9 +1277,7 @@ async fn writable() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf
 /// machine's `core.autocrlf` setting. These tests assert logical file content,
 /// not the platform's newline convention.
 fn read_text(path: impl AsRef<std::path::Path>) -> String {
-    std::fs::read_to_string(path)
-        .unwrap()
-        .replace("\r\n", "\n")
+    std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
 }
 
 /// Isolation over a real repository. The executor is deliberately *not*
@@ -1399,10 +1397,7 @@ async fn a_writer_edits_its_own_checkout_and_never_the_parents() {
     let result = run(&control, writer("rewrite a.txt"), 5).await.unwrap();
     assert_eq!(result.status, AgentStatus::Completed);
     // The parent's working tree is exactly as it was.
-    assert_eq!(
-        read_text(root.join("a.txt")),
-        "original\n"
-    );
+    assert_eq!(read_text(root.join("a.txt")), "original\n");
     assert!(!root.join("added.txt").exists());
 }
 
@@ -1420,10 +1415,7 @@ async fn a_writer_returns_a_patch_rather_than_an_account_of_its_edits() {
     // Which is reviewable *and* applicable — the point of a diff over prose.
     assert_eq!(control.check(&patch).await, Some(MergeCheck::Clean));
     control.merge(&patch, false).await.unwrap();
-    assert_eq!(
-        read_text(root.join("a.txt")),
-        "rewritten by the child\n"
-    );
+    assert_eq!(read_text(root.join("a.txt")), "rewritten by the child\n");
 }
 
 #[tokio::test]
@@ -1436,10 +1428,7 @@ async fn nothing_is_merged_until_someone_asks_for_it() {
     // Merging is a consequential action on the user's files. Finishing a
     // child must never be what triggers it.
     assert!(result.patch.is_some());
-    assert_eq!(
-        read_text(root.join("a.txt")),
-        "original\n"
-    );
+    assert_eq!(read_text(root.join("a.txt")), "original\n");
 }
 
 #[tokio::test]
@@ -1600,10 +1589,7 @@ async fn a_patch_that_does_not_build_does_not_merge() {
         control.merge(&patch, false).await,
         Err(Error::Unverified(_))
     ));
-    assert_eq!(
-        read_text(root.join("a.txt")),
-        "original\n"
-    );
+    assert_eq!(read_text(root.join("a.txt")), "original\n");
 }
 
 #[tokio::test]
@@ -1623,10 +1609,7 @@ async fn a_failing_patch_can_still_be_forced_deliberately() {
     // A pre-existing unrelated build failure must not make delegation
     // permanently unusable — but getting past it has to be an explicit act.
     control.merge(&patch, true).await.unwrap();
-    assert_eq!(
-        read_text(root.join("a.txt")),
-        "rewritten by the child\n"
-    );
+    assert_eq!(read_text(root.join("a.txt")), "rewritten by the child\n");
 }
 
 #[tokio::test]

@@ -1431,7 +1431,9 @@ mod tests {
     /// change instead of silently promising a stronger boundary.
     #[test]
     fn security_guide_matches_autonomy_and_backend_limits() {
-        let guide = include_str!("../../../docs/WHAT_IS_MEDHA.md");
+        // Git for Windows may materialize documentation with CRLF. The
+        // contract is about wording, not the checkout's newline convention.
+        let guide = include_str!("../../../docs/WHAT_IS_MEDHA.md").replace("\r\n", "\n");
         for statement in [
             "`host` deliberately provides no OS isolation",
             "`ssh`\ndelegates isolation to the remote host",

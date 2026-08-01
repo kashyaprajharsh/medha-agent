@@ -43,11 +43,11 @@ Line links refer to the audited commit and may drift as fixes land. Keep the
 |---|---:|---:|---:|
 | Critical | 4 | 0 | 0 |
 | High | 29 | 1 (AUD-070) | 0 |
-| Medium | 28 | 2 (AUD-050, AUD-075) | 0 |
+| Medium | 28 | 3 (AUD-050, AUD-075, AUD-077) | 0 |
 | Low | 8 | 4 (AUD-060, AUD-071, AUD-073, AUD-076) | 0 |
-| **Total** | **69** | **7** | **0** |
+| **Total** | **69** | **8** | **0** |
 
-There are **76 audited findings** in total. `[~]` here means that the production
+There are **77 audited findings** in total. `[~]` here means that the production
 fix and regression coverage exist, but the closure rule requiring execution on
 the relevant hosted/platform environment has not yet been met. It does not mean
 that a known production failure path remains unpatched.
@@ -1510,6 +1510,26 @@ authoritative current result.
 - **Acceptance criteria:** The complete all-target workspace suite must pass on
   a current hosted Windows runner. The source fix is present, but this remains
   `[~]` until that rerun completes.
+
+### [~] AUD-077 — Windows atomic replacement keeps its staging handle open
+
+- **Severity:** Medium
+- **Confidence:** Reproduced on hosted Windows
+- **Area:** Sandbox, Windows file mutation and rewind
+- **Evidence:** [`crates/sandbox/src/lib.rs`](crates/sandbox/src/lib.rs),
+  [`rewind_e2e.rs`](crates/medha-cli/tests/rewind_e2e.rs),
+  [failed hosted Windows job](https://github.com/kashyaprajharsh/medha-agent/actions/runs/30691175901/job/91346061222)
+- **Failure:** The non-Unix write and restore paths staged a temporary file,
+  flushed it, and called `ReplaceFileW`/`MoveFileExW` while the staging
+  `std::fs::File` was still alive. Windows rejects moving an open source with
+  `ERROR_SHARING_VIOLATION`; editing an existing file and restoring a snapshot
+  therefore failed, while Unix's open-inode rename semantics masked it.
+- **Resolution (2026-08-02):** The staging handle is explicitly dropped after
+  `sync_all` and before either Windows publication call. This keeps the atomic
+  replacement and the existing target-preservation behavior intact.
+- **Acceptance criteria:** The hosted Windows workspace suite must pass through
+  the rewind test and the later installer, worktree, and sandbox regressions.
+  The source fix is present, but this remains `[~]` until that rerun completes.
 
 ## Consolidated remediation record
 

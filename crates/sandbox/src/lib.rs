@@ -1930,12 +1930,17 @@ impl WorkspaceSandbox {
                     .and_then(|_| temp_file.sync_all())
                     .map_err(|error| SandboxError::Io(error.to_string()));
                 if let Err(error) = prepared {
+                    drop(temp_file);
                     let _ = std::fs::remove_file(&tmp);
                     if let Some(id) = &snapshot_id {
                         let _ = std::fs::remove_file(snapshots.join(id));
                     }
                     return Err(error);
                 }
+                // Windows cannot move/replace an open source file. Unix
+                // permits renaming an open inode, which hid this lifetime bug
+                // from the other hosted runners.
+                drop(temp_file);
 
                 // Revalidate immediately before the atomic OS publication.
                 let latest = match std::fs::File::open(&resolved) {
@@ -2078,9 +2083,14 @@ impl WorkspaceSandbox {
                     let temp_file = std::fs::File::open(&temporary)
                         .map_err(|error| SandboxError::Io(error.to_string()))?;
                     if let Err(error) = temp_file.sync_all() {
+                        drop(temp_file);
                         let _ = std::fs::remove_file(&temporary);
                         return Err(SandboxError::Io(error.to_string()));
                     }
+                    // `ReplaceFileW`/`MoveFileExW` reject an open source
+                    // handle with ERROR_SHARING_VIOLATION. Close the staged
+                    // snapshot before publishing it over the target.
+                    drop(temp_file);
                     #[cfg(windows)]
                     let publish = publish_windows_file(&temporary, resolved, resolved.exists());
                     #[cfg(not(windows))]

@@ -264,6 +264,12 @@ pub enum ContentPart {
 pub struct ModelMessage {
     pub role: Role,
     pub parts: Vec<ContentPart>,
+    /// Internal provenance carried through canonical replay and compaction.
+    /// Protocol adapters deliberately ignore this field; it exists so moving
+    /// from the legacy view to ordered content cannot upgrade injected
+    /// Web/Tool/Memory text into an operator-authored user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<TrustLabel>,
 }
 
 impl ModelMessage {
@@ -324,6 +330,7 @@ impl From<&Message> for ModelMessage {
         Self {
             role: message.role.clone(),
             parts,
+            trust: message.trust,
         }
     }
 }
@@ -372,7 +379,7 @@ impl TryFrom<&ModelMessage> for Message {
             content,
             tool_calls,
             tool_call_id,
-            trust: None,
+            trust: message.trust,
         })
     }
 }
@@ -418,6 +425,31 @@ mod ordered_message_tests {
     }
 
     #[test]
+    fn ordered_bridge_preserves_user_input_trust() {
+        let legacy = Message::user("background report").carrying(TrustLabel::Web);
+        let ordered = legacy.ordered();
+        assert_eq!(ordered.trust, Some(TrustLabel::Web));
+        assert_eq!(Message::try_from(&ordered).unwrap().trust, legacy.trust);
+    }
+
+    #[test]
+    fn ordered_trust_field_is_wire_compatible_with_older_payloads() {
+        let unlabelled = Message::user("operator input").ordered();
+        let encoded = serde_json::to_value(&unlabelled).unwrap();
+        assert!(
+            encoded.get("trust").is_none(),
+            "the common unlabelled form must retain its pre-field encoding"
+        );
+
+        let decoded: ModelMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "parts": []
+        }))
+        .unwrap();
+        assert_eq!(decoded.trust, None);
+    }
+
+    #[test]
     fn compatibility_bridge_refuses_to_destroy_interleaving_or_provider_state() {
         let state = ProviderState {
             protocol: crate::provider::Protocol::GeminiInteractions,
@@ -438,6 +470,7 @@ mod ordered_message_tests {
                     provider_state: Vec::new(),
                 }),
             ],
+            trust: None,
         };
         assert!(matches!(
             Message::try_from(&interleaved),

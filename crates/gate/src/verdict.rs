@@ -5,6 +5,9 @@
 //! the report shows *confidence*, not a coin flip dressed as a fact.
 
 use crate::checks::CheckOutcome;
+#[cfg(test)]
+use crate::checks::ValidationStatus;
+use std::path::PathBuf;
 
 /// The gate's decision for one scenario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,19 +30,93 @@ impl Verdict {
     }
 }
 
+/// How the evaluated Medha process terminated.
+///
+/// Keep this separate from deterministic check outcomes: a workspace can look
+/// correct after a crash, but only an ordinary zero exit is eligible to pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStatus {
+    /// The process exited normally with status zero.
+    Succeeded,
+    /// The process exited normally with a non-zero status.
+    ExitCode(i32),
+    /// The process was terminated by a signal or an equivalent platform event
+    /// that does not expose a numeric exit code.
+    Signaled,
+    /// Gate's hard wall-clock deadline expired and the whole process tree was
+    /// killed and reaped.
+    TimedOut,
+    /// The run was explicitly cancelled and its process tree was stopped.
+    Cancelled,
+    /// The configured Medha executable could not be launched or supervised.
+    LaunchError(String),
+    /// Gate failed before an agent process could produce an artifact.
+    HarnessError(String),
+}
+
+impl RunStatus {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    pub fn completed(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::ExitCode(_))
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::ExitCode(_) => "exit_code",
+            Self::Signaled => "signaled",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::LaunchError(_) => "launch_error",
+            Self::HarnessError(_) => "harness_error",
+        }
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Succeeded => Some(0),
+            Self::ExitCode(code) => Some(*code),
+            _ => None,
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::LaunchError(detail) | Self::HarnessError(detail) => Some(detail),
+            _ => None,
+        }
+    }
+
+    pub fn description(&self) -> String {
+        match self {
+            Self::Succeeded => "succeeded (exit 0)".into(),
+            Self::ExitCode(code) => format!("failed with exit code {code}"),
+            Self::Signaled => "terminated by signal".into(),
+            Self::TimedOut => "timed out; process tree stopped".into(),
+            Self::Cancelled => "cancelled; process tree stopped".into(),
+            Self::LaunchError(error) => format!("launch error: {error}"),
+            Self::HarnessError(error) => format!("harness error: {error}"),
+        }
+    }
+}
+
 /// One run of one scenario.
 #[derive(Debug, Clone)]
 pub struct SeedResult {
     pub checks: Vec<CheckOutcome>,
-    /// The agent process finished on its own (not timed out / failed to launch).
-    pub completed: bool,
+    pub status: RunStatus,
     pub wall_ms: u128,
+    /// Present only when the operator explicitly requested artifact retention.
+    pub artifact_path: Option<PathBuf>,
 }
 
 impl SeedResult {
-    /// A seed passes only if the run completed AND every check passed.
+    /// A seed passes only if the run exited zero AND every check passed.
     pub fn passed(&self) -> bool {
-        self.completed && self.checks.iter().all(|c| c.passed)
+        self.status.is_success() && self.checks.iter().all(|c| c.passed)
     }
 }
 
@@ -108,9 +185,14 @@ mod tests {
                 label: "x".into(),
                 passed: pass,
                 detail: String::new(),
+                normalized_target: None,
+                baseline_matches: None,
+                workspace_matches: None,
+                validation: ValidationStatus::NotApplicable,
             }],
-            completed: true,
+            status: RunStatus::Succeeded,
             wall_ms: 0,
+            artifact_path: None,
         }
     }
 
@@ -142,20 +224,33 @@ mod tests {
     }
 
     #[test]
-    fn a_timed_out_run_never_counts_as_passed() {
-        let s = SeedResult {
-            checks: vec![CheckOutcome {
-                label: "x".into(),
-                passed: true,
-                detail: String::new(),
-            }],
-            completed: false,
-            wall_ms: 0,
-        };
-        assert!(
-            !s.passed(),
-            "checks passing is moot if the run didn't finish"
-        );
+    fn every_abnormal_run_status_fails_even_when_checks_pass() {
+        let abnormal = [
+            RunStatus::ExitCode(7),
+            RunStatus::Signaled,
+            RunStatus::TimedOut,
+            RunStatus::Cancelled,
+            RunStatus::LaunchError("missing".into()),
+            RunStatus::HarnessError("copy failed".into()),
+        ];
+        for status in abnormal {
+            let description = status.description();
+            let s = SeedResult {
+                checks: vec![CheckOutcome {
+                    label: "x".into(),
+                    passed: true,
+                    detail: String::new(),
+                    normalized_target: None,
+                    baseline_matches: None,
+                    workspace_matches: None,
+                    validation: ValidationStatus::NotApplicable,
+                }],
+                status,
+                wall_ms: 0,
+                artifact_path: None,
+            };
+            assert!(!s.passed(), "{description} counted as a passing run");
+        }
     }
 
     #[test]

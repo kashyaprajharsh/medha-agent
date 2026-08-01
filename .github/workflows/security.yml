@@ -1,0 +1,56 @@
+name: Dependency security
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - deny.toml
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - deny.toml
+      - ".github/workflows/**"
+  schedule:
+    # Refresh RustSec even when the dependency graph has not changed.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # actions/checkout v4, pinned by commit rather than a mutable tag.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Reject mutable GitHub Action references
+        shell: bash
+        run: |
+          action_refs="$(grep -RInE '^[[:space:]]*(- )?uses:[[:space:]]+[^[:space:]]+@[^[:space:]#]+' .github/workflows || true)"
+          mutable="$(printf '%s\n' "$action_refs" | grep -Ev '@[0-9a-f]{40}([[:space:]]*#.*)?$' || true)"
+          if [ -n "$mutable" ]; then
+            printf 'GitHub Actions must use immutable 40-hex commit SHAs:\n%s\n' "$mutable" >&2
+            exit 1
+          fi
+
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: RustSec advisories and yanked crates
+        run: cargo deny --all-features check advisories
+
+      - name: Licenses and dependency sources
+        run: cargo deny --all-features check licenses sources

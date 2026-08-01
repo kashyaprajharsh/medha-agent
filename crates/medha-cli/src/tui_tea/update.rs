@@ -43,7 +43,7 @@ pub(super) fn update<P, L>(
             if let Some(f) = model.intro_frame {
                 model.intro_frame = if f >= 40 { None } else { Some(f + 1) };
             }
-            // Refresh the live background-task list a few times a second (cheap
+            // Refresh the live owned-shell-task list a few times a second (cheap
             // mutex read) so the status-line indicator tracks reality.
             if model.anim_frame % 16 == 0 {
                 model.bg_tasks = kernel.executor.background_tasks();
@@ -2435,6 +2435,22 @@ pub(super) fn handle_agent_event(
             }
             model.push_notice(notice);
         }
+        TuiEvent::MemoryMutationFinished { verb, result } => match result {
+            Ok(entries) => {
+                if let Some(picker) = model.picker.as_mut()
+                    && let PickerKind::Memory(current) = &mut picker.kind
+                {
+                    *current = entries;
+                    if current.is_empty() {
+                        model.picker = None;
+                    } else if picker.selected >= current.len() {
+                        picker.selected = current.len() - 1;
+                    }
+                }
+                model.push_notice(format!("✔ {verb}"));
+            }
+            Err(error) => model.push_notice(format!("memory change failed: {error}")),
+        },
         // A rewind finished. For conversation scopes `new_id` is the forked
         // branch: swap to it, rebuild the transcript (keeping the system message
         // at [0]), and drop the chosen prompt back into the input box to edit or
@@ -3807,8 +3823,7 @@ where
         memory::MemoryOp::Forget { .. } => format!("forgot '{}'", entry.name),
         _ => String::new(),
     };
-    apply_tui_memory_op(model, kernel, session, op, tx);
-    model.push_notice(format!("✔ {verb}"));
+    apply_tui_memory_op(model, kernel, session, op, verb, tx);
     true
 }
 
@@ -3819,6 +3834,7 @@ fn apply_tui_memory_op<P, L>(
     kernel: &Arc<Kernel<P, L>>,
     session: &Session,
     op: memory::MemoryOp,
+    verb: String,
     tx: &mpsc::UnboundedSender<TuiEvent>,
 ) where
     P: Provider + 'static,
@@ -3829,29 +3845,42 @@ fn apply_tui_memory_op<P, L>(
         return;
     };
     // Event is the source of truth; the projection is a rebuildable cache.
+    // Both operations happen in that order under one durable lease. The old
+    // path applied the projection synchronously while append ran detached,
+    // allowing an acknowledged UI change with no durable event.
     let log = kernel.log.clone();
     let session = session.clone();
     let event_op = op.clone();
-    let _ = tx;
+    let mutation_key = match &op {
+        memory::MemoryOp::Write { entry } | memory::MemoryOp::Update { entry } => {
+            format!("memory:{}:{}", entry.scope.as_str(), entry.name)
+        }
+        memory::MemoryOp::Forget { scope, name } | memory::MemoryOp::Pin { scope, name, .. } => {
+            format!("memory:{}:{name}", scope.as_str())
+        }
+    };
+    let tx = tx.clone();
     tokio::spawn(async move {
-        if let Ok(payload) = serde_json::to_value(&event_op) {
-            let _ = log
-                .append(kernel::Event::memory_write(&session, payload))
-                .await;
+        let result = async {
+            let _lease = log.acquire_mutation_lease(&mutation_key).await?;
+            let payload = serde_json::to_value(&event_op)
+                .map_err(|error| kernel::KernelError::Log(error.to_string()))?;
+            log.append(kernel::Event::memory_write(&session, payload))
+                .await?;
+            store
+                .apply_async(&event_op)
+                .await
+                .map_err(|error| kernel::KernelError::Log(error.to_string()))?;
+            store
+                .list_async()
+                .await
+                .map_err(|error| kernel::KernelError::Log(error.to_string()))
         }
+        .await
+        .map_err(|error| error.to_string());
+        let _ = tx.send(TuiEvent::MemoryMutationFinished { verb, result });
     });
-    let _ = store.apply(&op);
-    // Refresh the picker in place (or close it if nothing is left to show).
-    if let Some(picker) = model.picker.as_mut() {
-        if let PickerKind::Memory(entries) = &mut picker.kind {
-            *entries = store.list().unwrap_or_default();
-            if entries.is_empty() {
-                model.picker = None;
-            } else if picker.selected >= entries.len() {
-                picker.selected = entries.len() - 1;
-            }
-        }
-    }
+    model.push_notice("(saving memory change…)");
 }
 
 fn spawn_memory_provenance<L: EventLog + 'static>(
@@ -3983,6 +4012,18 @@ fn spawn_rewind<L: EventLog + 'static>(
     let log = kernel.log.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
+        // Keep planning, file restoration, and any conversation fork inside
+        // one writer lease. A second process therefore cannot commit a newer
+        // workspace mutation between reading the rollback plan and applying it.
+        let _rewind_lease = match log.acquire_mutation_lease("state:*").await {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = tx.send(TuiEvent::Error(format!(
+                    "rewind could not acquire the mutation lease: {error}"
+                )));
+                return;
+            }
+        };
         let events = log.events(session_id).await;
         let Some(idx) = kernel::cut_index(&events, at_event) else {
             return;
@@ -4069,6 +4110,17 @@ pub(super) fn spawn_turn<P, L>(
     P: Provider + 'static,
     L: EventLog + 'static,
 {
+    if model
+        .foreground_turn
+        .as_ref()
+        .is_some_and(|task| !task.is_finished())
+    {
+        model.push_notice("(previous turn is still settling — try again in a moment)");
+        return;
+    }
+    // Reap the completed handle before admitting the next foreground owner.
+    model.foreground_turn.take();
+
     model.welcome = false;
     let unprompted = line.is_none();
     if let Some(line) = &line {
@@ -4120,7 +4172,7 @@ pub(super) fn spawn_turn<P, L>(
     let needs_a_report = unprompted;
     let mut collected = 0usize;
 
-    tokio::spawn(async move {
+    model.foreground_turn = Some(tokio::spawn(async move {
         // Reports from background agents, delivered at the head of the turn.
         // Collecting here rather than on completion is what makes delivery
         // survive a restart: the outbox holds them until their owner next runs.
@@ -4140,7 +4192,10 @@ pub(super) fn spawn_turn<P, L>(
                 {
                     // Spill before trimming: the tail is the part worth keeping,
                     // and truncating first would discard it unrecoverably.
-                    let spilled = kernel.artifacts.put(summary.as_bytes()).ok();
+                    let spilled = Arc::clone(&kernel.artifacts)
+                        .put_async(summary.as_bytes().to_vec())
+                        .await
+                        .ok();
                     summary.truncate(cut);
                     summary.push_str(&match spilled {
                         Some(hash) => {
@@ -4196,7 +4251,7 @@ pub(super) fn spawn_turn<P, L>(
                 let _ = tx.send(TuiEvent::Error(e.to_string()));
             }
         }
-    });
+    }));
 }
 
 /// Monotonic sequence for tracing events across the agent→UI channel (PART 7).
@@ -5200,19 +5255,19 @@ pub(super) fn run_slash<P: kernel::Provider>(
         }
         "tasks" => {
             let text = if model.bg_tasks.is_empty() {
-                "background tasks: none".to_string()
+                "shell tasks: none".to_string()
             } else {
-                let mut lines = String::from("background tasks:");
+                let mut lines = String::from("shell tasks:");
                 for t in &model.bg_tasks {
                     let state = if t.running { "running" } else { "done" };
                     lines.push_str(&format!("\n  {} [{state}]  {}", t.id, t.command));
                 }
-                lines.push_str("\n\n(the agent polls with task.output and stops with task.kill)");
+                lines.push_str("\n\n(inspect with task.output; stop with task.kill)");
                 lines
             };
             // Live status: refresh the previous /tasks block instead of
             // stacking identical copies.
-            model.upsert_notice("background tasks", text);
+            model.upsert_notice("shell tasks", text);
         }
         "skills" => {
             // Re-scan live so a skill saved this session shows up; refresh the

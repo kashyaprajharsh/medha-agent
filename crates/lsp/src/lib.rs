@@ -1927,7 +1927,13 @@ impl LspClient {
             },
             ..SandboxConfig::default()
         };
-        let backend = select_backend(&sandbox_config, Vec::new());
+        // Language servers get no user-approved roots: an approval covers the
+        // agent's own commands, not a long-lived indexer subprocess.
+        let backend = select_backend(
+            &sandbox_config,
+            Vec::new(),
+            sandbox::ApprovedRoots::default(),
+        );
         if !config.allow_network && backend.label() == "host" {
             return Err(Error::Sandbox(
                 "network-denied native isolation is unavailable; explicitly set lsp.allow_network = true to run without it"
@@ -3689,6 +3695,27 @@ fn language_server_environment() -> Vec<(String, String)> {
         "NODE_PATH",
         "SystemRoot",
         "PATHEXT",
+        // Windows has no `HOME`. A server that loses these cannot resolve the
+        // user profile, so cargo, rustup, and npm look for `~/.cargo`, their
+        // toolchains, and their caches under a directory that does not exist —
+        // and then report an empty result instead of failing loudly.
+        "USERPROFILE",
+        "USERNAME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "SystemDrive",
+        "windir",
+        "COMSPEC",
+        // Apple toolchain selection. clangd resolves its SDK through `xcrun`,
+        // which honours these before the machine-wide `xcode-select` setting.
+        // Dropping them silently downgrades a server to whatever that global
+        // points at — a different SDK, or on a machine where it is stale, no
+        // usable toolchain at all and an empty diagnostic set.
+        "DEVELOPER_DIR",
+        "SDKROOT",
     ];
     let mut environment: Vec<(String, String)> = ALLOWED
         .iter()
@@ -4381,9 +4408,17 @@ mod tests {
         assert_eq!(resolved, Some(Vec::new()));
     }
 
+    /// A file URI needs a *platform* absolute path, and `/tmp/x.rs` is not one
+    /// on Windows — it has no drive, so `Url::from_file_path` rejects it. The
+    /// temp directory is absolute everywhere, so fixtures built from it keep
+    /// these parser tests about parsing.
+    fn fixture_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
     #[test]
     fn document_symbols_accept_both_result_shapes() {
-        let path = Path::new("/tmp/x.rs");
+        let path = &fixture_path("x.rs");
         let hierarchical = json!([{
             "name": "Parent", "kind": 5,
             "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 9, "character": 0 } },
@@ -4413,7 +4448,7 @@ mod tests {
 
     #[test]
     fn call_hierarchy_maps_incoming_and_outgoing() {
-        let uri = file_uri(Path::new("/tmp/x.rs")).unwrap();
+        let uri = file_uri(&fixture_path("x.rs")).unwrap();
         let incoming = json!([{
             "from": {
                 "name": "caller", "kind": 12, "uri": uri,
@@ -4826,19 +4861,47 @@ mod tests {
         assert!(manager.status().await.is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_rust_analyzer_end_to_end_when_available() {
-        let available = Command::new("rust-analyzer")
+    /// The two tests below drive real language servers, so what they prove
+    /// depends on the machine running them. Ambient `PATH` must not be what
+    /// decides: a runner image that happens to ship a server silently starts
+    /// executing them, which is exactly how they first ran — and failed — on
+    /// Windows. CI sets this in the same step that installs the servers, so
+    /// asking for the tests and providing what they need is one decision.
+    fn lsp_e2e_requested() -> bool {
+        std::env::var("MEDHA_LSP_E2E").as_deref() == Ok("1")
+    }
+
+    /// Once requested, a missing server is a provisioning failure. Skipping here
+    /// would report success for a run that verified nothing.
+    async fn require_server(server: &str) {
+        let started = Command::new(server)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .await
-            .is_ok_and(|status| status.success());
-        if !available {
-            eprintln!("skipping real rust-analyzer test: binary is unavailable");
+            .await;
+        assert!(
+            started.is_ok_and(|status| status.success()),
+            "MEDHA_LSP_E2E=1 requests the real-server tests, but `{server} --version` did not \
+             succeed — install {server}, or unset MEDHA_LSP_E2E to skip them"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_rust_analyzer_end_to_end() {
+        if !lsp_e2e_requested() {
+            eprintln!("skipping real rust-analyzer test: set MEDHA_LSP_E2E=1 to run it");
             return;
         }
+        require_server("rust-analyzer").await;
+        // Surface the server's own stderr (drained into `medha_lsp` debug
+        // events) in the test output: when the workspace fails to load inside
+        // the OS sandbox, rust-analyzer names the exact operation that was
+        // denied, which is otherwise invisible in a `got []` assertion.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("medha_lsp=debug")
+            .with_writer(std::io::stderr)
+            .try_init();
 
         let directory = tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join("src")).unwrap();
@@ -4851,19 +4914,28 @@ mod tests {
             "pub fn target() -> i32 { 1 }\n\npub fn caller() -> i32 { target() + missing_name }\n";
         let path = directory.path().join("src/lib.rs");
         std::fs::write(&path, source).unwrap();
+        // rust-analyzer must load the sysroot and run `cargo metadata` before it
+        // reports anything, and it answers requests with an empty set until that
+        // finishes. A 30s budget is ample on a developer machine (~4s) but not on
+        // a shared 2-core CI runner executing the rest of the suite in parallel,
+        // where a cold load legitimately exceeds it — and a premature timeout
+        // reads as "no diagnostics", which is indistinguishable from a real
+        // regression. Budget for the slow machine; the assertion below is what
+        // catches an actually broken toolchain.
         let manager = LspManager::new(
             directory.path().to_path_buf(),
             Config {
-                startup_timeout: Duration::from_secs(30),
-                request_timeout: Duration::from_secs(20),
-                diagnostics_timeout: Duration::from_secs(30),
+                startup_timeout: Duration::from_secs(90),
+                request_timeout: Duration::from_secs(60),
+                diagnostics_timeout: Duration::from_secs(90),
                 // The test environment can prohibit nested OS sandboxes.
                 allow_network: true,
                 ..Config::default()
             },
         );
 
-        timeout(Duration::from_secs(45), async {
+        timeout(Duration::from_secs(240), async {
+            let started = std::time::Instant::now();
             let diagnostics = manager.diagnostics(&path).await;
             let DiagnosticReport::Fresh { diagnostics, .. } = &diagnostics else {
                 panic!("rust-analyzer did not return fresh diagnostics: {diagnostics:?}");
@@ -4872,7 +4944,10 @@ mod tests {
                 diagnostics
                     .iter()
                     .any(|diagnostic| diagnostic.message.contains("missing_name")),
-                "expected unresolved-name diagnostic, got {diagnostics:?}"
+                "expected unresolved-name diagnostic after {:?}, got {diagnostics:?} — an empty \
+                 set here means rust-analyzer never loaded the workspace (sysroot or `cargo \
+                 metadata` unavailable, e.g. blocked by the sandbox), not that the code is clean",
+                started.elapsed()
             );
 
             let call_character = source.lines().nth(2).unwrap().find("target").unwrap() as u32;
@@ -4985,17 +5060,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_clangd_end_to_end_when_available() {
-        let available = Command::new("clangd")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .is_ok_and(|status| status.success());
-        if !available {
-            eprintln!("skipping real clangd test: binary is unavailable");
+    async fn real_clangd_end_to_end() {
+        if !lsp_e2e_requested() {
+            eprintln!("skipping real clangd test: set MEDHA_LSP_E2E=1 to run it");
             return;
+        }
+        require_server("clangd").await;
+        // A present clangd is not a working one: on macOS it resolves its SDK
+        // through `xcrun`, and a machine whose selected developer directory is
+        // missing leaves clangd unable to find even <stdlib.h>. It then returns
+        // an empty diagnostic set, indistinguishable from clean code. `xcrun
+        // --find clang` does not catch that — it succeeds while the SDK is gone
+        // — so require the SDK path itself and name it when it is unusable.
+        #[cfg(target_os = "macos")]
+        {
+            let probe = Command::new("xcrun")
+                .arg("--show-sdk-path")
+                .stderr(Stdio::null())
+                .output()
+                .await
+                .expect("xcrun should be present on macOS");
+            let sdk = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+            assert!(
+                probe.status.success() && !sdk.is_empty() && Path::new(&sdk).is_dir(),
+                "MEDHA_LSP_E2E=1 requests the real clangd test, but `xcrun --show-sdk-path` \
+                 resolved no usable SDK ({sdk:?}) — clangd cannot find the system headers"
+            );
         }
 
         let directory = tempdir().unwrap();

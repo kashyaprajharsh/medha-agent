@@ -15,7 +15,10 @@
 //! native addition.
 
 use async_trait::async_trait;
+use permissions::ApprovedRoots;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A command to execute: argv + working directory + environment policy.
 #[derive(Debug, Clone)]
@@ -38,6 +41,10 @@ pub struct ExecOutput {
     pub status: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// True when the retained stdout is only a tail of the complete stream.
+    pub stdout_truncated: bool,
+    /// True when the retained stderr is only a tail of the complete stream.
+    pub stderr_truncated: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,11 +114,11 @@ pub struct SandboxConfig {
 
 impl Default for SandboxConfig {
     fn default() -> Self {
-        // Default: OS-native containment where available, network allowed so
-        // ordinary builds/fetches keep working.
+        // Default: OS-native containment where available, with exfiltration
+        // closed. Projects that genuinely need downloads opt in explicitly.
         Self {
             backend: BackendKind::Native,
-            net: NetPolicy::Allow,
+            net: NetPolicy::Deny,
             image: None,
             runtime: None,
             memory: None,
@@ -157,15 +164,12 @@ fn base_command(program: &str, args: &[String], req: &ExecRequest) -> tokio::pro
     cmd
 }
 
-/// Fires a `SIGKILL` at a whole process group when dropped while still *armed*.
-/// This is the fix for the compounding-timeout bug: `kill_on_drop` only kills
-/// the direct child, so a timed-out `sh -c "cargo build"` orphaned its
-/// grandchildren (rustc jobs, a dev server) — which kept holding locks/ports,
-/// so the next attempt hung to the timeout too, forever. Because the child is
-/// spawned as its own group leader (`process_group(0)`), signalling the negative
-/// pid reaches the entire tree. When [`spawn_and_wait`] completes normally it
-/// disarms the reaper, so only an abnormal exit (the run future being dropped by
-/// an outer timeout/cancel) triggers the group kill.
+/// Fires a `SIGKILL` at a whole process group when dropped while still armed.
+///
+/// The owned supervisor keeps this guard until it has observed the leader exit
+/// without reaping it, quiesced the group, reaped the leader, and joined both
+/// output pumps. If the runtime aborts that supervisor, the guard is the final
+/// synchronous backstop.
 struct GroupReaper {
     pid: Option<u32>,
     armed: bool,
@@ -178,24 +182,13 @@ impl GroupReaper {
     fn disarm(&mut self) {
         self.armed = false;
     }
-
-    /// Tear down anything that is still attached to the command after its
-    /// leader returned. Build tools occasionally background helpers and close
-    /// their inherited pipes; treating the leader's zero exit as proof that the
-    /// whole tree is gone leaks those helpers past the verifier/install gate.
-    fn reap_remaining(&mut self) {
-        if let Some(pid) = self.pid {
-            kill_process_tree(pid);
-        }
-        self.disarm();
-    }
 }
 
 impl Drop for GroupReaper {
     fn drop(&mut self) {
         if self.armed {
             if let Some(pid) = self.pid {
-                kill_process_tree(pid);
+                quiesce_process_tree(pid);
             }
         }
     }
@@ -485,83 +478,51 @@ pub fn shell_argv(backend_label: &str, command: &str) -> (String, Vec<String>) {
 /// tree teardown as [`run_shell_bounded`]. This is used for fixed-argv package
 /// managers where round-tripping arguments through a shell would be unsafe.
 pub async fn run_command_bounded(
-    mut cmd: tokio::process::Command,
+    cmd: tokio::process::Command,
     limit: std::time::Duration,
     max_output: usize,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<ShellOutcome, ExecError> {
-    configure_for_spawn(&mut cmd, true);
-    // Spawned and reaped through `std`, deliberately, rather than through
-    // tokio's `Child`.
-    //
-    // Descendants are torn down by signalling the process group, and a group's
-    // id *is* its leader's pid. Tokio reaps children asynchronously off SIGCHLD,
-    // which frees that pid while the helpers are still alive — so by the time
-    // the kill goes out the number may already name an unrelated group, and the
-    // helper it was meant for survives. Owning the reap keeps the leader a
-    // zombie, and a zombie still holds its pid, so the group stays addressable
-    // until we have finished with it.
-    let mut child = cmd
-        .as_std_mut()
-        .spawn()
-        .map_err(|e| ExecError::Spawn(e.to_string()))?;
-    let leader = child.id();
-    let mut reaper = GroupReaper::new(Some(leader));
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    // Streamed into a rolling window rather than buffered whole: a runaway
-    // suite can emit gigabytes, and reading it all in only to throw most of it
-    // away is an out-of-memory waiting for a verbose test run.
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(Rolling::new(max_output)));
-    // Blocking reads on a worker thread: these are `std` pipes, and registering
-    // them with the reactor would mean handing the fds back to tokio.
-    let drains = {
-        let (out, err) = (captured.clone(), captured.clone());
-        async move {
-            let _ = tokio::join!(
-                tokio::task::spawn_blocking(move || drain_blocking(stdout, &out)),
-                tokio::task::spawn_blocking(move || drain_blocking(stderr, &err)),
-            );
+    // `max_output` is both the independent per-stream cap and the aggregate cap
+    // for this combined-output API. Capture happens under the cap while the
+    // process runs; it is never an after-the-fact truncation.
+    let process = spawn_background_with_limits(cmd, max_output, max_output, max_output)?;
+    let ended = match cancel {
+        Some(token) => {
+            let done = process.done_receiver();
+            tokio::select! {
+                finished = wait_done(done, limit) => {
+                    if finished { Ok(()) } else { Err(false) }
+                }
+                _ = token.cancelled() => Err(true),
+            }
+        }
+        None => {
+            if process.wait_until(limit).await {
+                Ok(())
+            } else {
+                Err(false)
+            }
         }
     };
 
-    let text = || {
-        captured
-            .lock()
-            .map(|buffer| buffer.text())
-            .unwrap_or_default()
-    };
-
-    tokio::pin!(drains);
-    // Both pipes closing means the leader and everything sharing its stdout are
-    // done, so its status is settled; a timeout or a cancel means it is not.
-    let ended = match cancel {
-        // Cancellation stops the run rather than waiting out the ceiling: a
-        // user who pressed Esc should not sit through a fifteen-minute build.
-        Some(token) => tokio::select! {
-            drained = tokio::time::timeout(limit, &mut drains) => drained.map_err(|_| false),
-            _ = token.cancelled() => Err(true),
-        },
-        None => tokio::time::timeout(limit, &mut drains)
-            .await
-            .map_err(|_| false),
-    };
-
-    // Unconditional, and always before the reap. On the settled path the leader
-    // is already a zombie, so this only reaches the helpers it left behind; on
-    // the other two it stops the leader as well.
-    kill_process_tree(leader);
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .map_err(|error| ExecError::Spawn(error.to_string()))?
-        .map_err(|error| ExecError::Spawn(error.to_string()))?;
-    reaper.disarm();
+    if ended.is_err() {
+        process.kill();
+        process.wait().await;
+    }
+    let (stdout, stderr) = process.snapshot();
+    let mut captured = Rolling::new(max_output);
+    captured.push(stdout.as_bytes());
+    if !stdout.is_empty() && !stderr.is_empty() {
+        captured.push(b"\n");
+    }
+    captured.push(stderr.as_bytes());
+    let text = captured.text();
 
     Ok(match ended {
         Ok(()) => ShellOutcome {
-            status: status.code(),
-            output: text(),
+            status: process.exit_code(),
+            output: text,
             timed_out: false,
             cancelled: false,
         },
@@ -569,7 +530,7 @@ pub async fn run_command_bounded(
             status: None,
             output: format!(
                 "{}\n[{}]",
-                text(),
+                text,
                 match cancelled {
                     true => "cancelled".to_string(),
                     false => format!("timed out after {}s and was stopped", limit.as_secs()),
@@ -579,25 +540,6 @@ pub async fn run_command_bounded(
             cancelled,
         },
     })
-}
-
-type SharedRolling = std::sync::Arc<std::sync::Mutex<Rolling>>;
-
-/// The same rolling capture over a blocking `std` pipe, for the path that owns
-/// its own reaping and therefore cannot hand its fds to the reactor.
-fn drain_blocking<R: std::io::Read>(pipe: Option<R>, into: &SharedRolling) {
-    let Some(mut pipe) = pipe else { return };
-    let mut chunk = [0u8; 8 * 1024];
-    loop {
-        match pipe.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(read) => {
-                if let Ok(mut buffer) = into.lock() {
-                    buffer.push(&chunk[..read]);
-                }
-            }
-        }
-    }
 }
 
 /// The last `cap` bytes seen, remembering that earlier output was dropped. The
@@ -633,72 +575,72 @@ impl Rolling {
     }
 }
 
-/// Spawn a command in its own process group, capture stdout/stderr, and wait for
-/// it. If the returned future is dropped before completion — which is exactly
-/// what an outer `tokio::time::timeout` or a cancellation does — the
-/// [`GroupReaper`] SIGKILLs the whole process tree, so nothing is orphaned.
-async fn spawn_and_wait(mut cmd: tokio::process::Command) -> Result<ExecOutput, ExecError> {
-    configure_for_spawn(&mut cmd, true); // reaper backstops the group; kill_on_drop the leader
-    let mut child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
-    let mut reaper = GroupReaper::new(child.id());
-    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-    let (stdout, stderr) = tokio::join!(read_to_end(stdout), read_to_end(stderr));
+/// Independent and aggregate foreground/background capture ceilings. The
+/// aggregate is lower than the sum of the two independent ceilings so a child
+/// flooding both descriptors cannot double the memory budget.
+const EXEC_STDOUT_CAP: usize = 1_000_000;
+const EXEC_STDERR_CAP: usize = 1_000_000;
+const EXEC_AGGREGATE_CAP: usize = 1_500_000;
 
-    // Both streams are at EOF, so the leader is done — reap the helpers it left
-    // behind. This must precede the wait, not follow it: a group is named by its
-    // leader's pid, and waiting releases that pid, so a kill afterwards signals
-    // a number the kernel no longer maps to this group (or has since recycled).
-    // Long-running work belongs in `spawn_background`, whose lifetime is
-    // explicit rather than an accidental orphan.
-    reaper.reap_remaining();
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| ExecError::Spawn(e.to_string()))?;
-    Ok(ExecOutput {
-        status: status.code(),
-        stdout,
-        stderr,
-    })
+#[derive(Clone, Copy)]
+enum CapturedStream {
+    Stdout,
+    Stderr,
 }
 
-/// Read a child pipe to EOF. A closed stream is the signal that the leader and
-/// everything still sharing its output are finished.
-async fn read_to_end<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
-    use tokio::io::AsyncReadExt;
-
-    let Some(mut pipe) = pipe else {
-        return Vec::new();
-    };
-    let mut buffer = Vec::new();
-    let _ = pipe.read_to_end(&mut buffer).await;
-    buffer
-}
-
-/// A cap on each retained stream of a background task; once exceeded, oldest
-/// bytes are dropped from the front (the tail is what matters for "what's it
-/// doing now"). Overflow is marked so a poll can't be mistaken for complete.
-const BG_BUF_CAP: usize = 1_000_000;
-
-/// A rolling capture of one output stream: keeps at most `BG_BUF_CAP` recent
-/// bytes and remembers whether anything older was dropped.
-#[derive(Default)]
-struct BgBuf {
-    data: Vec<u8>,
+/// A fixed-memory tail buffer. `VecDeque` avoids repeatedly moving a megabyte
+/// of retained output for every 8 KiB read after the cap has been reached.
+struct TailBuf {
+    data: VecDeque<u8>,
+    cap: usize,
     truncated: bool,
 }
 
-impl BgBuf {
+impl TailBuf {
+    fn new(cap: usize) -> Self {
+        Self {
+            data: VecDeque::with_capacity(cap.min(64 * 1024)),
+            cap,
+            truncated: false,
+        }
+    }
+
     fn push(&mut self, bytes: &[u8]) {
-        self.data.extend_from_slice(bytes);
-        if self.data.len() > BG_BUF_CAP {
-            let drop = self.data.len() - BG_BUF_CAP;
-            self.data.drain(..drop);
+        if self.cap == 0 {
+            self.truncated |= !bytes.is_empty();
+            return;
+        }
+        if bytes.len() >= self.cap {
+            self.data.clear();
+            self.data.extend(
+                bytes[bytes.len().saturating_sub(self.cap)..]
+                    .iter()
+                    .copied(),
+            );
+            self.truncated = true;
+            return;
+        }
+        self.data.extend(bytes.iter().copied());
+        if self.data.len() > self.cap {
+            self.discard_oldest(self.data.len() - self.cap);
+        }
+    }
+
+    fn discard_oldest(&mut self, amount: usize) {
+        let amount = amount.min(self.data.len());
+        if amount != 0 {
+            self.data.drain(..amount);
             self.truncated = true;
         }
     }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.data.iter().copied().collect()
+    }
+
     fn text(&self) -> String {
-        let body = String::from_utf8_lossy(&self.data);
+        let bytes = self.bytes();
+        let body = String::from_utf8_lossy(&bytes);
         if self.truncated {
             format!("[…earlier output dropped…]\n{body}")
         } else {
@@ -707,16 +649,65 @@ impl BgBuf {
     }
 }
 
-type SharedBuf = std::sync::Arc<std::sync::Mutex<BgBuf>>;
+/// Both streams live behind one lock so the aggregate ceiling is enforced at
+/// the moment bytes are retained, not after an unbounded capture has completed.
+struct CapturePair {
+    stdout: TailBuf,
+    stderr: TailBuf,
+    aggregate_cap: usize,
+}
 
-/// A backgrounded command: stdout/stderr stream into rolling buffers while it
-/// runs, and it can be polled, awaited briefly, or killed (whole group). This is
-/// what `shell.exec` promotes a slow command into, so the model gets partial
-/// output + a task id immediately instead of blocking (§2).
+impl CapturePair {
+    fn new(stdout_cap: usize, stderr_cap: usize, aggregate_cap: usize) -> Self {
+        Self {
+            stdout: TailBuf::new(stdout_cap),
+            stderr: TailBuf::new(stderr_cap),
+            aggregate_cap,
+        }
+    }
+
+    fn push(&mut self, stream: CapturedStream, bytes: &[u8]) {
+        match stream {
+            CapturedStream::Stdout => self.stdout.push(bytes),
+            CapturedStream::Stderr => self.stderr.push(bytes),
+        }
+        let excess = self
+            .stdout
+            .data
+            .len()
+            .saturating_add(self.stderr.data.len())
+            .saturating_sub(self.aggregate_cap);
+        if excess == 0 {
+            return;
+        }
+        // Preserve useful tails from both streams: trim the currently larger
+        // retained stream first, then the other if one alone was insufficient.
+        let stdout_first = self.stdout.data.len() >= self.stderr.data.len();
+        let first_len = if stdout_first {
+            self.stdout.data.len()
+        } else {
+            self.stderr.data.len()
+        };
+        let first_drop = excess.min(first_len);
+        if stdout_first {
+            self.stdout.discard_oldest(first_drop);
+            self.stderr.discard_oldest(excess - first_drop);
+        } else {
+            self.stderr.discard_oldest(first_drop);
+            self.stdout.discard_oldest(excess - first_drop);
+        }
+    }
+}
+
+type SharedCapture = std::sync::Arc<std::sync::Mutex<CapturePair>>;
+
+/// An owned command task: stdout/stderr stream into rolling buffers while it
+/// runs, and it can be polled, awaited, or killed as a whole process group.
+/// `shell.exec` uses this ownership even for foreground runs so cancellation
+/// has a synchronous process-tree kill handle before its future is dropped.
 pub struct BgProc {
     pub pid: Option<u32>,
-    stdout: SharedBuf,
-    stderr: SharedBuf,
+    capture: SharedCapture,
     done_rx: tokio::sync::watch::Receiver<bool>,
     code: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
 }
@@ -724,9 +715,30 @@ pub struct BgProc {
 impl BgProc {
     /// Current buffered stdout / stderr (tails, with a marker if truncated).
     pub fn snapshot(&self) -> (String, String) {
-        let o = self.stdout.lock().map(|b| b.text()).unwrap_or_default();
-        let e = self.stderr.lock().map(|b| b.text()).unwrap_or_default();
-        (o, e)
+        self.capture
+            .lock()
+            .map(|capture| (capture.stdout.text(), capture.stderr.text()))
+            .unwrap_or_default()
+    }
+    /// Whether either returned stream is a bounded tail rather than complete.
+    pub fn truncation(&self) -> (bool, bool) {
+        self.capture
+            .lock()
+            .map(|capture| (capture.stdout.truncated, capture.stderr.truncated))
+            .unwrap_or_default()
+    }
+    fn raw_snapshot(&self) -> (Vec<u8>, Vec<u8>, bool, bool) {
+        self.capture
+            .lock()
+            .map(|capture| {
+                (
+                    capture.stdout.bytes(),
+                    capture.stderr.bytes(),
+                    capture.stdout.truncated,
+                    capture.stderr.truncated,
+                )
+            })
+            .unwrap_or_default()
     }
     /// Still running?
     pub fn is_running(&self) -> bool {
@@ -745,10 +757,23 @@ impl BgProc {
     pub async fn wait_until(&self, dur: std::time::Duration) -> bool {
         wait_done(self.done_rx.clone(), dur).await
     }
+    /// Wait without a deadline for the child waiter to confirm settlement.
+    /// Callers use this only after sending an unconditional tree kill.
+    pub async fn wait(&self) {
+        wait_done_unbounded(self.done_rx.clone()).await;
+    }
     /// SIGKILL the whole process group.
     pub fn kill(&self) {
         if let Some(pid) = self.pid {
-            kill_process_tree(pid);
+            quiesce_process_tree(pid);
+        }
+    }
+}
+
+impl Drop for BgProc {
+    fn drop(&mut self) {
+        if self.is_running() {
+            self.kill();
         }
     }
 }
@@ -763,75 +788,417 @@ pub async fn wait_done(
     tokio::time::timeout(dur, async {
         while !*rx.borrow_and_update() {
             if rx.changed().await.is_err() {
-                break;
+                return *rx.borrow();
             }
         }
+        true
     })
     .await
-    .is_ok()
+    .unwrap_or(false)
 }
 
-/// Spawn a command as a background task: it keeps running after this returns,
-/// with stdout/stderr pumped into rolling buffers and its exit status recorded.
-/// `kill_on_drop` is off — the process must outlive the spawn call — so callers
-/// are responsible for `kill()` (or session-end cleanup).
-pub fn spawn_background(mut cmd: tokio::process::Command) -> Result<BgProc, ExecError> {
-    use std::sync::{Arc, Mutex};
-    configure_for_spawn(&mut cmd, false);
-    let mut child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
-    let pid = child.id();
-    let out_pipe = child.stdout.take();
-    let err_pipe = child.stderr.take();
-    let stdout: SharedBuf = Arc::new(Mutex::new(BgBuf::default()));
-    let stderr: SharedBuf = Arc::new(Mutex::new(BgBuf::default()));
-    let code = Arc::new(Mutex::new(None));
-    let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+async fn wait_done_unbounded(mut rx: tokio::sync::watch::Receiver<bool>) -> bool {
+    while !*rx.borrow_and_update() {
+        if rx.changed().await.is_err() {
+            return *rx.borrow();
+        }
+    }
+    true
+}
 
-    async fn pump<R: tokio::io::AsyncRead + Unpin>(mut r: R, buf: SharedBuf) {
-        use tokio::io::AsyncReadExt;
-        let mut chunk = [0u8; 8192];
-        loop {
-            match r.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if let Ok(mut b) = buf.lock() {
-                        b.push(&chunk[..n]);
+#[cfg(unix)]
+fn leader_exited_without_reap(pid: u32) -> std::io::Result<bool> {
+    // WNOWAIT is the crucial part: it lets the supervisor observe exit while
+    // the zombie leader continues to reserve the process-group id. Descendants
+    // therefore cannot race a recycled id before teardown.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == 0 {
+        Ok(unsafe { info.si_pid() } != 0)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+trait PumpPipe: std::io::Read {
+    fn make_nonblocking(&self);
+}
+
+macro_rules! impl_pump_pipe {
+    ($pipe:ty) => {
+        impl PumpPipe for $pipe {
+            fn make_nonblocking(&self) {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    let fd = self.as_raw_fd();
+                    unsafe {
+                        let flags = libc::fcntl(fd, libc::F_GETFL);
+                        if flags >= 0 {
+                            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                        }
                     }
                 }
             }
         }
+    };
+}
+
+impl_pump_pipe!(std::process::ChildStdout);
+impl_pump_pipe!(std::process::ChildStderr);
+
+#[cfg(target_os = "macos")]
+fn process_snapshot() -> Vec<(i32, i32, i32)> {
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
     }
-    let out_handle = out_pipe.map(|o| tokio::spawn(pump(o, stdout.clone())));
-    let err_handle = err_pipe.map(|e| tokio::spawn(pump(e, stderr.clone())));
+    let mut pids = vec![0i32; count as usize + 64];
+    let listed = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(pids.as_slice()) as i32,
+        )
+    };
+    if listed <= 0 {
+        return Vec::new();
+    }
+    pids.truncate((listed as usize).min(pids.len()));
+    pids.into_iter()
+        .filter(|pid| *pid > 0)
+        .filter_map(|pid| {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    size,
+                )
+            };
+            (read == size).then_some((pid, info.pbi_ppid as i32, info.pbi_pgid as i32))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn process_snapshot() -> Vec<(i32, i32, i32)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // `comm` may contain spaces and parentheses. Everything after its
+            // final ')' starts at field 3: state, ppid, process-group.
+            let tail = stat.get(stat.rfind(')')? + 1..)?.trim();
+            let mut fields = tail.split_whitespace();
+            fields.next()?; // state
+            let ppid = fields.next()?.parse::<i32>().ok()?;
+            let pgid = fields.next()?.parse::<i32>().ok()?;
+            Some((pid, ppid, pgid))
+        })
+        .collect()
+}
+
+// Only the Unix group-kill path reads this; Windows has no process groups to
+// enumerate, so defining it there is dead code.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn process_snapshot() -> Vec<(i32, i32, i32)> {
+    Vec::new()
+}
+
+/// Snapshot both the process group and descendants, including descendants that
+/// created a nested group. The root is still alive (or an unreaped zombie) when
+/// this runs, so parent links have not yet been lost to orphan reparenting.
+#[cfg(unix)]
+fn process_tree_members(root: u32) -> Vec<(i32, i32)> {
+    let snapshot = process_snapshot();
+    let root = root as i32;
+    let mut selected = std::collections::HashSet::from([root]);
+    loop {
+        let before = selected.len();
+        for (pid, parent, group) in &snapshot {
+            if *group == root || selected.contains(parent) {
+                selected.insert(*pid);
+            }
+        }
+        if selected.len() == before {
+            break;
+        }
+    }
+    snapshot
+        .into_iter()
+        .filter(|(pid, _, _)| *pid != root && selected.contains(pid))
+        .map(|(pid, parent, _)| (pid, parent))
+        .collect()
+}
+
+/// Stop the leader first so it cannot launch another command, snapshot and
+/// signal every known descendant parent-first, then signal the original group
+/// as a whole. This ordering avoids waking a shell after only its `sleep`
+/// child was killed and also closes cancellation races before the supervisor
+/// can observe and reap the leader.
+#[cfg(unix)]
+fn kill_group_parent_first(group: u32) {
+    unsafe {
+        libc::kill(group as i32, libc::SIGSTOP);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let mut members = process_tree_members(group);
+    let snapshot = members.clone();
+    let depth = |pid: i32| {
+        let mut current = pid;
+        let mut depth = 0usize;
+        for _ in 0..snapshot.len() {
+            let Some((_, parent)) = snapshot.iter().find(|(candidate, _)| *candidate == current)
+            else {
+                break;
+            };
+            depth += 1;
+            if *parent == group as i32 {
+                break;
+            }
+            current = *parent;
+        }
+        depth
+    };
+    members.sort_by_key(|(pid, _)| depth(*pid));
+    unsafe {
+        libc::kill(group as i32, libc::SIGKILL);
+    }
+    for (pid, _) in members {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    kill_process_tree(group);
+}
+
+/// Signal more than once while the unreaped leader pins the group id. Once
+/// `waitid(WNOWAIT)` reports the leader dead it cannot create another child,
+/// but an already-running descendant can be concurrent with the first signal.
+fn quiesce_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        for delay_ms in [0, 2, 5, 10, 20] {
+            if delay_ms != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            kill_group_parent_first(pid);
+        }
+    }
+    #[cfg(not(unix))]
+    kill_process_tree(pid);
+}
+
+/// Spawn an owned command task with bounded output and an independent lifecycle
+/// supervisor. Completion means: leader exit observed, process group quiesced
+/// while its id was still pinned, leader reaped, and both pipe pumps joined.
+fn spawn_background_with_limits(
+    mut cmd: tokio::process::Command,
+    stdout_cap: usize,
+    stderr_cap: usize,
+    aggregate_cap: usize,
+) -> Result<BgProc, ExecError> {
+    use std::sync::{Arc, Mutex};
+    configure_for_spawn(&mut cmd, false);
+    // Keep a std Child rather than a tokio Child. The leader must remain
+    // unreaped (and therefore keep its PID reserved) until we have killed any
+    // helpers left in its process group. Reaping first makes a later group kill
+    // race PID reuse and, on Windows, loses taskkill's parent-tree anchor.
+    let mut child = cmd
+        .as_std_mut()
+        .spawn()
+        .map_err(|e| ExecError::Spawn(e.to_string()))?;
+    let pid = child.id();
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let capture: SharedCapture = Arc::new(Mutex::new(CapturePair::new(
+        stdout_cap,
+        stderr_cap,
+        aggregate_cap,
+    )));
+    let code = Arc::new(Mutex::new(None));
+    let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+    let stop_pumps = Arc::new(AtomicBool::new(false));
+    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+
+    fn pump<R: PumpPipe>(
+        mut pipe: R,
+        capture: SharedCapture,
+        stream: CapturedStream,
+        stop: std::sync::Arc<AtomicBool>,
+    ) {
+        pipe.make_nonblocking();
+        let mut chunk = [0u8; 8192];
+        loop {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut pair) = capture.lock() {
+                        pair.push(stream, &chunk[..n]);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    let out_handle = out_pipe.map(|out| {
+        let capture = capture.clone();
+        let stop = stop_pumps.clone();
+        tokio::task::spawn_blocking(move || {
+            pump(out, capture, CapturedStream::Stdout, stop);
+        })
+    });
+    let err_handle = err_pipe.map(|err| {
+        let capture = capture.clone();
+        let stop = stop_pumps.clone();
+        tokio::task::spawn_blocking(move || {
+            pump(err, capture, CapturedStream::Stderr, stop);
+        })
+    });
+    // Lifecycle observation must not compete with the async runtime that is
+    // executing the command's caller. Under high fan-out a runtime worker can
+    // be starved long enough for a freshly orphaned helper to perform work
+    // before an async poll notices the leader died. A small-stack native
+    // supervisor begins monitoring immediately and owns the unreaped child.
+    let child_slot = Arc::new(Mutex::new(Some(child)));
+    let supervisor_child = child_slot.clone();
+    let supervisor = std::thread::Builder::new()
+        .name(format!("medha-proc-{pid}"))
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            let mut child = supervisor_child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("supervisor owns child");
+            let mut reaper = GroupReaper::new(Some(pid));
+            let pre_reaped_status = loop {
+                #[cfg(unix)]
+                {
+                    match leader_exited_without_reap(pid) {
+                        Ok(true) => break None,
+                        Ok(false) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        // Conservative portability fallback: `try_wait` can
+                        // reap the leader, so use it only if WNOWAIT failed.
+                        Err(_) => match child.try_wait() {
+                            Ok(Some(status)) => break Some(status),
+                            Ok(None) => {}
+                            Err(_) => break None,
+                        },
+                    }
+                }
+                #[cfg(not(unix))]
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => {}
+                    Err(_) => break None,
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+
+            // Do not infer process completion from pipe EOF. Redirected helpers
+            // can close both pipes before the group leader has finished.
+            quiesce_process_tree(pid);
+            let status = match pre_reaped_status {
+                Some(status) => Some(status),
+                None => child.wait().ok(),
+            };
+            reaper.disarm();
+            let _ = status_tx.send(status.and_then(|status| status.code()));
+        });
+    if let Err(error) = supervisor {
+        quiesce_process_tree(pid);
+        if let Some(mut child) = child_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = child.wait();
+        }
+        stop_pumps.store(true, Ordering::Release);
+        return Err(ExecError::Spawn(format!(
+            "failed to start process supervisor: {error}"
+        )));
+    }
+
     let code2 = code.clone();
     tokio::spawn(async move {
-        let status = child.wait().await.ok().and_then(|s| s.code());
+        let status = status_rx.await.unwrap_or(None);
+
+        // A killed group should close both pipes promptly. If an escaped fd
+        // holder does not, ask the nonblocking pumps to close their descriptors
+        // and then explicitly join them before publishing `done`.
+        let joins = async {
+            if let Some(handle) = out_handle {
+                let _ = handle.await;
+            }
+            if let Some(handle) = err_handle {
+                let _ = handle.await;
+            }
+        };
+        tokio::pin!(joins);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut joins)
+            .await
+            .is_err()
+        {
+            stop_pumps.store(true, Ordering::Release);
+            joins.await;
+        }
         if let Ok(mut c) = code2.lock() {
             *c = status;
         }
-        // Let the pumps drain the final chunk before signalling done — otherwise
-        // a command that prints then exits immediately can be snapshotted before
-        // the last read lands, losing the output tail (K21). Bounded by a short
-        // grace: a grandchild holding the pipe open must NOT block `done` forever
-        // (the very hang the process-group design avoids), so we cap the wait.
-        let drain = async {
-            if let Some(h) = out_handle {
-                let _ = h.await;
-            }
-            if let Some(h) = err_handle {
-                let _ = h.await;
-            }
-        };
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), drain).await;
         let _ = done_tx.send(true);
     });
 
     Ok(BgProc {
-        pid,
-        stdout,
-        stderr,
+        pid: Some(pid),
+        capture,
         done_rx,
         code,
+    })
+}
+
+/// Spawn an owned command task using the standard independent and aggregate
+/// output ceilings.
+pub fn spawn_background(cmd: tokio::process::Command) -> Result<BgProc, ExecError> {
+    spawn_background_with_limits(cmd, EXEC_STDOUT_CAP, EXEC_STDERR_CAP, EXEC_AGGREGATE_CAP)
+}
+
+/// Spawn, supervise, and capture a foreground command using fixed-memory
+/// rolling tails. Dropping this future drops its `BgProc`, which immediately
+/// signals the group; the detached owner still reaps and joins every resource.
+async fn spawn_and_wait(cmd: tokio::process::Command) -> Result<ExecOutput, ExecError> {
+    let process = spawn_background(cmd)?;
+    process.wait().await;
+    let (stdout, stderr, stdout_truncated, stderr_truncated) = process.raw_snapshot();
+    Ok(ExecOutput {
+        status: process.exit_code(),
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
     })
 }
 
@@ -848,6 +1215,345 @@ impl ExecBackend for HostBackend {
     }
 }
 
+/// A credential-free HOME/TMP tree for native-sandbox children. It is separate
+/// from the process HOME even when a caller passes the latter in `ExecRequest`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct IsolatedHome {
+    path: PathBuf,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl IsolatedHome {
+    /// The one isolated HOME for this process, shared by every native backend.
+    ///
+    /// Shared deliberately, and never dropped while the process lives: a
+    /// backend can be dropped seconds after it spawns a long-lived child
+    /// (LSP/MCP servers), and a per-backend home died with its backend — the
+    /// still-running server's toolchain proxies then found `$HOME/.rustup`
+    /// missing, tried to recreate it under the system temp dir, and the jail
+    /// correctly denied that write, so every `cargo`/`rustc` invocation
+    /// failed and workspaces silently never loaded.
+    fn shared() -> std::sync::Arc<Self> {
+        static SHARED: std::sync::OnceLock<std::sync::Arc<IsolatedHome>> =
+            std::sync::OnceLock::new();
+        std::sync::Arc::clone(SHARED.get_or_init(Self::new))
+    }
+
+    fn new() -> std::sync::Arc<Self> {
+        let requested = std::env::temp_dir().join(format!(
+            "medha-native-home-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let _ = std::fs::create_dir_all(&requested);
+        let path = requested.canonicalize().unwrap_or(requested);
+        let home = std::sync::Arc::new(Self { path });
+        home.prepare();
+        home
+    }
+
+    fn prepare(&self) {
+        for relative in [
+            "",
+            "tmp",
+            ".cache",
+            ".config",
+            ".local/share",
+            ".cargo",
+            ".rustup",
+            ".npm",
+        ] {
+            let _ = std::fs::create_dir_all(self.path.join(relative));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700));
+            if let Some(real_home) = home_dir_from_env() {
+                // Read-only toolchain payloads remain usable. Native policies
+                // grant their real targets read/execute, never write; credential
+                // files such as ~/.cargo/credentials are not linked or allowed.
+                for (source, destination) in [
+                    (
+                        real_home.join(".cargo/registry"),
+                        self.path.join(".cargo/registry"),
+                    ),
+                    (real_home.join(".cargo/git"), self.path.join(".cargo/git")),
+                    (
+                        real_home.join(".rustup/toolchains"),
+                        self.path.join(".rustup/toolchains"),
+                    ),
+                    (
+                        real_home.join(".rustup/update-hashes"),
+                        self.path.join(".rustup/update-hashes"),
+                    ),
+                    (
+                        real_home.join(".rustup/settings.toml"),
+                        self.path.join(".rustup/settings.toml"),
+                    ),
+                ] {
+                    if source.exists() && !destination.exists() {
+                        let _ = symlink(source, destination);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for IsolatedHome {
+    fn drop(&mut self) {
+        // Exact generated child beneath the system temp directory; no glob or
+        // user-controlled path participates in cleanup.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn home_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn native_sensitive_paths() -> Vec<PathBuf> {
+    let Some(home) = home_dir_from_env() else {
+        return Vec::new();
+    };
+    [
+        ".ssh",
+        ".aws",
+        ".azure",
+        ".medha",
+        ".gnupg",
+        ".docker",
+        ".kube",
+        ".config/gcloud",
+        ".config/gh",
+        ".config/pip",
+        ".config/pnpm",
+        ".git-credentials",
+        ".gitconfig",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".yarnrc",
+        ".yarnrc.yml",
+        ".gem/credentials",
+        ".gradle/gradle.properties",
+        ".m2/settings.xml",
+        ".nuget/NuGet.Config",
+        ".bash_history",
+        ".zsh_history",
+        ".python_history",
+        ".node_repl_history",
+        ".local/share/fish/fish_history",
+        ".cargo/credentials",
+        ".cargo/credentials.toml",
+    ]
+    .iter()
+    .map(|relative| home.join(relative))
+    .collect()
+}
+
+/// Resolve an absolute policy path through its deepest existing ancestor.
+///
+/// `canonicalize()` alone is insufficient for write roots that have not been
+/// created yet, while a lexical-only comparison misses aliases such as a
+/// symlink to `~/.ssh`. Combining both keeps future paths usable and makes
+/// security comparisons against their physical parent identity.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_native_policy_path(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    let mut ancestor = normalized.as_path();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        missing.push(ancestor.file_name()?.to_os_string());
+        ancestor = ancestor.parent()?;
+    }
+    let mut resolved = ancestor.canonicalize().ok()?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Some(resolved)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn safe_extra_writable_against(paths: &[PathBuf], sensitive: &[PathBuf]) -> Vec<PathBuf> {
+    let sensitive: Vec<PathBuf> = sensitive
+        .iter()
+        .filter_map(|path| resolve_native_policy_path(path))
+        .collect();
+    paths
+        .iter()
+        .filter_map(|path| resolve_native_policy_path(path))
+        .filter(|path| {
+            path.parent().is_some()
+                && !sensitive
+                    .iter()
+                    .any(|secret| secret.starts_with(path) || path.starts_with(secret))
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn safe_extra_writable(paths: &[PathBuf]) -> Vec<PathBuf> {
+    safe_extra_writable_against(paths, &native_sensitive_paths())
+}
+
+/// Absolute-path tokens in a line of tool output or an argv entry. Utilities
+/// report denials as `prog: /path: message`, so split on the separators that
+/// bound a path and keep what still looks absolute.
+fn absolute_path_tokens(text: &str) -> impl Iterator<Item = PathBuf> + '_ {
+    text.split([' ', '\t', ':', '\'', '"', '`'])
+        .map(str::trim)
+        .filter(|token| token.len() > 1 && token.starts_with('/'))
+        .map(PathBuf::from)
+}
+
+/// Out-of-workspace roots a failed sandboxed command was plausibly denied on —
+/// the input to the exec escalation prompt. Denial lines in stderr name the
+/// actual target, so they are preferred; argv is the fallback. Files widen to
+/// their parent directory (one approval covers the sibling files the same task
+/// touches next), credential paths are never offered, and already-approved
+/// roots are excluded because they cannot be the cause.
+pub(crate) fn escalation_candidates(
+    output: &ExecOutput,
+    args: &[String],
+    workspace: &Path,
+    approved: &ApprovedRoots,
+) -> Vec<PathBuf> {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let denial_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| {
+            line.contains("Operation not permitted") || line.contains("Permission denied")
+        })
+        .collect();
+    if denial_lines.is_empty() {
+        return Vec::new();
+    }
+    let mut tokens: Vec<PathBuf> = denial_lines
+        .iter()
+        .flat_map(|line| absolute_path_tokens(line))
+        .collect();
+    if tokens.is_empty() {
+        tokens = args
+            .iter()
+            .flat_map(|arg| absolute_path_tokens(arg))
+            .collect();
+    }
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let sensitive = native_sensitive_paths();
+    let mut candidates = Vec::new();
+    for token in tokens {
+        let Ok(resolved) = token.canonicalize() else {
+            continue;
+        };
+        let root = if resolved.is_file() {
+            match resolved.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => continue,
+            }
+        } else {
+            resolved
+        };
+        if root.starts_with(&workspace)
+            || approved.is_allowed(&root, permissions::PermissionType::Read)
+            || sensitive
+                .iter()
+                .any(|secret| secret.starts_with(&root) || root.starts_with(secret))
+            || candidates.contains(&root)
+        {
+            continue;
+        }
+        candidates.push(root);
+    }
+    candidates
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn workspace_contains_native_credentials(workspace: &Path) -> bool {
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    native_sensitive_paths()
+        .iter()
+        .any(|secret| secret.starts_with(&workspace))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn apply_isolated_environment(cmd: &mut tokio::process::Command, home: &IsolatedHome) {
+    let home_path = &home.path;
+    cmd.env("HOME", home_path)
+        .env("TMPDIR", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("XDG_CACHE_HOME", home_path.join(".cache"))
+        .env("XDG_CONFIG_HOME", home_path.join(".config"))
+        .env("XDG_DATA_HOME", home_path.join(".local/share"))
+        .env("CARGO_HOME", home_path.join(".cargo"))
+        .env("RUSTUP_HOME", home_path.join(".rustup"))
+        .env("NPM_CONFIG_USERCONFIG", home_path.join(".npmrc"))
+        .env("NPM_CONFIG_CACHE", home_path.join(".npm"));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn native_toolchain_read_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = home_dir_from_env() {
+        for relative in [
+            ".cargo/bin",
+            ".cargo/registry",
+            ".cargo/git",
+            ".rustup/toolchains",
+            ".rustup/update-hashes",
+            ".rustup/settings.toml",
+            ".npm/_cacache",
+            ".gradle/caches",
+            ".m2/repository",
+            "go/pkg",
+        ] {
+            let path = home.join(relative);
+            if path.exists() {
+                roots.push(path);
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        let sensitive = native_sensitive_paths();
+        roots.extend(std::env::split_paths(&path).filter(|directory| {
+            directory.is_absolute()
+                && !sensitive
+                    .iter()
+                    .any(|secret| secret.starts_with(directory) || directory.starts_with(secret))
+        }));
+    }
+    roots
+}
+
 /// Escape a path for embedding in an SBPL string literal (macOS Seatbelt only).
 #[cfg(target_os = "macos")]
 fn sbpl_escape(s: &str) -> String {
@@ -857,50 +1563,121 @@ fn sbpl_escape(s: &str) -> String {
 /// macOS Seatbelt backend: confines the command with `sandbox-exec` and a
 /// generated SBPL profile.
 ///
-/// Profile shape (validated empirically): **allow by default, then deny all
-/// file writes, then re-allow writes only under the workspace + system temp +
-/// `/dev`**. Reads stay allowed (v1) so tools that legitimately read still work;
-/// network is allowed unless [`NetPolicy::Deny`]. This blocks the real threats
-/// (writing `~/.ssh`, `~/.zshrc`, `/etc`, anywhere under `$HOME`) without the
-/// brittleness of a deny-by-default profile that must enumerate every syscall.
+/// Non-filesystem syscalls remain compatible, while file reads and writes are
+/// deny-by-default and reopened only for the workspace, an isolated HOME/TMP,
+/// system runtimes, and narrowly selected read-only toolchain payloads.
 #[cfg(target_os = "macos")]
 pub struct SeatbeltBackend {
     net: NetPolicy,
-    /// Extra writable roots beyond the workspace (e.g. an out-of-tree build dir).
     extra_writable: Vec<PathBuf>,
+    approved: ApprovedRoots,
+    home: std::sync::Arc<IsolatedHome>,
 }
 
 #[cfg(target_os = "macos")]
 impl SeatbeltBackend {
-    pub fn new(net: NetPolicy, extra_writable: Vec<PathBuf>) -> Self {
+    pub fn new(net: NetPolicy, extra_writable: Vec<PathBuf>, approved: ApprovedRoots) -> Self {
         Self {
             net,
-            extra_writable,
+            extra_writable: safe_extra_writable(&extra_writable),
+            approved,
+            home: IsolatedHome::shared(),
         }
+    }
+
+    fn readable_paths(&self, cwd: &Path) -> Vec<PathBuf> {
+        let ws = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let mut readable = vec![
+            ws,
+            self.home.path.clone(),
+            PathBuf::from("/System"),
+            PathBuf::from("/usr"),
+            PathBuf::from("/bin"),
+            PathBuf::from("/sbin"),
+            PathBuf::from("/opt/homebrew"),
+            PathBuf::from("/usr/local"),
+            PathBuf::from("/private/etc/ssl"),
+            // `/bin/sh` resolves its real interpreter through this indirection;
+            // without it every command spews "Operation not permitted" noise.
+            PathBuf::from("/private/var/select"),
+            // Apple developer toolchain: /usr/bin/clang etc. are shims that
+            // re-exec the selected toolchain through this link and root.
+            PathBuf::from("/private/var/db/xcode_select_link"),
+            PathBuf::from("/Library/Developer"),
+            PathBuf::from("/Applications/Xcode.app"),
+        ];
+        readable.extend(native_toolchain_read_roots());
+        readable.extend(self.extra_writable.iter().cloned());
+        // Live user approvals: a write grant implies read, or editing under it
+        // would be impossible. Sensitive-path denies appended later still win.
+        readable.extend(self.approved.read_roots());
+        readable.extend(self.approved.write_roots());
+        readable.sort();
+        readable.dedup();
+        readable
     }
 
     fn profile(&self, cwd: &std::path::Path) -> String {
         // Canonicalize so the subpath match survives /var → /private/var etc.
         let ws = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let mut writable: Vec<PathBuf> = vec![ws];
+        let mut writable: Vec<PathBuf> = vec![ws, self.home.path.clone()];
         writable.extend(self.extra_writable.iter().cloned());
-        if let Ok(tmp) = std::env::var("TMPDIR") {
-            writable.push(PathBuf::from(tmp));
-        }
-        writable.push(PathBuf::from("/private/tmp"));
-        writable.push(PathBuf::from("/private/var/folders"));
+        writable.extend(safe_extra_writable(&self.approved.write_roots()));
+        writable.sort();
+        writable.dedup();
 
-        let mut p =
-            String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n");
+        let mut p = String::from(
+            "(version 1)\n(allow default)\n\
+             (deny file-read*)\n(allow file-read*\n",
+        );
+        for path in self.readable_paths(cwd) {
+            let filter = if path.is_file() { "literal" } else { "subpath" };
+            p.push_str(&format!(
+                "    ({filter} \"{}\")\n",
+                sbpl_escape(&path.to_string_lossy())
+            ));
+        }
+        for device in [
+            "/dev/null",
+            "/dev/zero",
+            "/dev/random",
+            "/dev/urandom",
+            "/dev/tty",
+        ] {
+            p.push_str(&format!("    (literal \"{device}\")\n"));
+        }
+        p.push_str(")\n");
+        // Deny-by-default reads still require path *traversal*: the kernel
+        // stats every component during resolution, and a subpath rule does not
+        // cover the root inode or the ancestors of an allowed root. Grant the
+        // literal root plus directory/symlink metadata (stat/lstat and link
+        // resolution — /var, /tmp and /etc are symlinks on macOS — but not
+        // readdir or file contents) so resolution works while directory
+        // listings stay denied.
+        p.push_str(
+            "(allow file-read* (literal \"/\"))\n\
+             (allow file-read-metadata (vnode-type DIRECTORY) (vnode-type SYMLINK))\n",
+        );
+        p.push_str("(deny file-write*)\n(allow file-write*\n");
         for w in &writable {
             p.push_str(&format!(
                 "    (subpath \"{}\")\n",
                 sbpl_escape(&w.to_string_lossy())
             ));
         }
-        // Devices (/dev/null, /dev/tty, …) must stay writable or ordinary
-        // programs break.
-        p.push_str("    (regex #\"^/dev/\"))\n");
+        for device in ["/dev/null", "/dev/zero", "/dev/tty"] {
+            p.push_str(&format!("    (literal \"{device}\")\n"));
+        }
+        p.push_str(")\n");
+        // A workspace that is nested near HOME cannot accidentally broaden a
+        // more-specific credential path through the workspace subpath rule.
+        for secret in native_sensitive_paths() {
+            let secret = sbpl_escape(&secret.to_string_lossy());
+            p.push_str(&format!(
+                "(deny file-read* (literal \"{secret}\") (subpath \"{secret}\"))\n\
+                 (deny file-write* (literal \"{secret}\") (subpath \"{secret}\"))\n"
+            ));
+        }
         if self.net == NetPolicy::Deny {
             p.push_str("(deny network*)\n");
         }
@@ -912,6 +1689,12 @@ impl SeatbeltBackend {
 #[async_trait]
 impl ExecBackend for SeatbeltBackend {
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
+        if workspace_contains_native_credentials(&req.cwd) {
+            return Err(ExecError::Unavailable(
+                "native sandbox workspace contains host credential directories; choose a narrower workspace"
+                    .into(),
+            ));
+        }
         let profile = self.profile(&req.cwd);
         // sandbox-exec -p <profile> <program> <args...>
         let mut wrapped = Vec::with_capacity(req.args.len() + 3);
@@ -919,7 +1702,9 @@ impl ExecBackend for SeatbeltBackend {
         wrapped.push(profile);
         wrapped.push(req.program.clone());
         wrapped.extend(req.args.iter().cloned());
-        Ok(base_command("/usr/bin/sandbox-exec", &wrapped, req))
+        let mut command = base_command("/usr/bin/sandbox-exec", &wrapped, req);
+        apply_isolated_environment(&mut command, &self.home);
+        Ok(command)
     }
     fn label(&self) -> &str {
         "native"
@@ -934,49 +1719,111 @@ impl ExecBackend for SeatbeltBackend {
 
 /// Linux Landlock backend: confines the child with the Landlock LSM (kernel
 /// ≥5.13), applied in a `pre_exec` hook so it affects the spawned command, not
-/// the agent. Filesystem writes are jailed to the workspace + temp + dev caches
-/// (reads stay allowed, matching the macOS profile). The ruleset is built in
+/// the agent. Reads and writes are both allowlisted. The ruleset is built in
 /// the parent — only the (allocation-free) `restrict_self` syscall runs in the
 /// post-fork child, which is the safe pattern in a threaded runtime.
-///
-/// Best-effort compatibility: on a kernel without Landlock the jail simply
-/// isn't applied (the command still runs — never break the user); the CLI's
-/// startup probe warns when that's the case. Network confinement (Landlock ABI
-/// ≥v4 / kernel 6.7) is a follow-up; `NetPolicy::Deny` is not yet enforced here.
 #[cfg(target_os = "linux")]
 pub struct LandlockBackend {
     net: NetPolicy,
     extra_writable: Vec<PathBuf>,
+    approved: ApprovedRoots,
+    home: std::sync::Arc<IsolatedHome>,
 }
 
 #[cfg(target_os = "linux")]
 impl LandlockBackend {
-    pub fn new(net: NetPolicy, extra_writable: Vec<PathBuf>) -> Self {
+    pub fn new(net: NetPolicy, extra_writable: Vec<PathBuf>, approved: ApprovedRoots) -> Self {
         Self {
             net,
-            extra_writable,
+            extra_writable: safe_extra_writable(&extra_writable),
+            approved,
+            home: IsolatedHome::shared(),
         }
     }
 
     fn writable_paths(&self, cwd: &std::path::Path) -> Vec<PathBuf> {
         let ws = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let mut v = vec![ws];
+        let mut v = vec![ws, self.home.path.clone()];
         v.extend(self.extra_writable.iter().cloned());
-        v.push(PathBuf::from("/tmp"));
-        v.push(PathBuf::from("/var/tmp"));
-        v.push(PathBuf::from("/dev"));
+        v.extend(safe_extra_writable(&self.approved.write_roots()));
+        // Common shell redirections need a sink, but granting all of `/dev`
+        // would expose unrelated devices. A file-scoped Landlock rule is
+        // added for this exact node.
+        if Path::new("/dev/null").exists() {
+            v.push(PathBuf::from("/dev/null"));
+        }
+        v.sort();
+        v.dedup();
         v
+    }
+
+    fn readable_paths(&self, cwd: &Path) -> Vec<PathBuf> {
+        let ws = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let mut paths = vec![
+            ws,
+            self.home.path.clone(),
+            PathBuf::from("/usr"),
+            PathBuf::from("/bin"),
+            PathBuf::from("/sbin"),
+            PathBuf::from("/lib"),
+            PathBuf::from("/lib64"),
+            PathBuf::from("/nix/store"),
+            PathBuf::from("/run/current-system/sw"),
+            PathBuf::from("/etc/ssl"),
+            PathBuf::from("/etc/ca-certificates"),
+            // Toolchains locate themselves through procfs: rustc resolves its
+            // sysroot from /proc/self/exe, so without this `cargo metadata`
+            // fails, no workspace loads, and every Rust/Go/Python toolchain
+            // degrades silently. /sys carries the cgroup limits runtimes size
+            // their pools from.
+            //
+            // CAVEAT: procfs is process-wide, so a sandboxed child can read
+            // /proc/<pid>/environ of other same-UID processes — including this
+            // agent's own API keys. Landlock is allowlist-only and hierarchical,
+            // so a narrower grant is not expressible. This is strictly tighter
+            // than the read-everything policy it replaced, and the credential
+            // *files* AUD-006 targets stay denied, but closing the environ path
+            // needs either PR_SET_DUMPABLE on the agent or a PID namespace with
+            // a private /proc (the bubblewrap direction noted in AUD-006).
+            PathBuf::from("/proc"),
+            PathBuf::from("/sys"),
+        ];
+        for file in [
+            "/etc/ld.so.cache",
+            "/etc/resolv.conf",
+            "/etc/hosts",
+            "/etc/nsswitch.conf",
+            "/etc/localtime",
+            "/etc/passwd",
+            "/etc/group",
+            "/dev/null",
+            "/dev/zero",
+            "/dev/random",
+            "/dev/urandom",
+        ] {
+            if Path::new(file).exists() {
+                paths.push(PathBuf::from(file));
+            }
+        }
+        paths.extend(native_toolchain_read_roots());
+        paths.extend(self.extra_writable.iter().cloned());
+        paths.extend(self.approved.read_roots());
+        paths.extend(self.approved.write_roots());
+        paths.retain(|path| path.exists());
+        paths.sort();
+        paths.dedup();
+        paths
     }
 }
 
-/// Build a Landlock ruleset (in the parent) that allows read+exec everywhere
-/// and read-write only under `writable`. Returns `None` if the kernel doesn't
-/// support Landlock, so the caller can run unconfined rather than fail.
+/// Build a deny-by-default Landlock ruleset in the parent. Failure is closed:
+/// selecting a native jail must never silently turn into host execution.
 #[cfg(target_os = "linux")]
 fn build_landlock_ruleset(
+    readable: &[PathBuf],
     writable: &[PathBuf],
     net: NetPolicy,
-) -> Option<landlock::RulesetCreated> {
+) -> Result<landlock::RulesetCreated, ExecError> {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
         RulesetAttr, RulesetCreatedAttr,
@@ -985,33 +1832,64 @@ fn build_landlock_ruleset(
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(abi))
-        .ok()?;
+        .map_err(|error| ExecError::Unavailable(error.to_string()))?;
     // Deny network by *handling* net access and then adding no net rules — with
     // Landlock, a handled access with no matching rule is denied. Best-effort:
     // silently a no-op on kernels < 6.7 (Landlock ABI < v4), so it never breaks
     // the run; enforcement is real only where the kernel supports it.
     if net == NetPolicy::Deny {
-        ruleset = ruleset.handle_access(AccessNet::from_all(abi)).ok()?;
+        ruleset = ruleset
+            .handle_access(AccessNet::from_all(abi))
+            .map_err(|error| ExecError::Unavailable(error.to_string()))?;
     }
-    let mut created = ruleset.create().ok()?;
-    // Read + execute across the whole filesystem.
-    created = created
-        .add_rule(PathBeneath::new(
-            PathFd::new("/").ok()?,
-            AccessFs::from_read(abi),
-        ))
-        .ok()?;
-    // Read-write only under the jailed roots. A path that can't be opened is
-    // skipped; a ruleset-level failure abandons the jail (run unconfined rather
-    // than apply a half-built, wrongly-restrictive ruleset).
-    for p in writable {
-        let Ok(fd) = PathFd::new(p) else { continue };
-        created = match created.add_rule(PathBeneath::new(fd, AccessFs::from_all(abi))) {
-            Ok(next) => next,
-            Err(_) => return None,
+    let mut created = ruleset
+        .create()
+        .map_err(|error| ExecError::Unavailable(error.to_string()))?;
+    for path in readable {
+        let fd = PathFd::new(path).map_err(|error| {
+            ExecError::Unavailable(format!(
+                "cannot authorize native read root {}: {error}",
+                path.display()
+            ))
+        })?;
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            ExecError::Unavailable(format!(
+                "cannot inspect native read root {}: {error}",
+                path.display()
+            ))
+        })?;
+        let access = if metadata.is_dir() {
+            AccessFs::from_read(abi)
+        } else {
+            AccessFs::from_read(abi) & AccessFs::from_file(abi)
         };
+        created = created
+            .add_rule(PathBeneath::new(fd, access))
+            .map_err(|error| ExecError::Unavailable(error.to_string()))?;
     }
-    Some(created)
+    for p in writable {
+        let fd = PathFd::new(p).map_err(|error| {
+            ExecError::Unavailable(format!(
+                "cannot authorize native write root {}: {error}",
+                p.display()
+            ))
+        })?;
+        let metadata = std::fs::metadata(p).map_err(|error| {
+            ExecError::Unavailable(format!(
+                "cannot inspect native write root {}: {error}",
+                p.display()
+            ))
+        })?;
+        let access = if metadata.is_dir() {
+            AccessFs::from_all(abi)
+        } else {
+            AccessFs::from_file(abi)
+        };
+        created = created
+            .add_rule(PathBeneath::new(fd, access))
+            .map_err(|error| ExecError::Unavailable(error.to_string()))?;
+    }
+    Ok(created)
 }
 
 #[cfg(target_os = "linux")]
@@ -1020,7 +1898,17 @@ impl ExecBackend for LandlockBackend {
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
         use std::os::unix::process::CommandExt;
 
-        let ruleset = build_landlock_ruleset(&self.writable_paths(&req.cwd), self.net);
+        if workspace_contains_native_credentials(&req.cwd) {
+            return Err(ExecError::Unavailable(
+                "native sandbox workspace contains host credential directories; choose a narrower workspace"
+                    .into(),
+            ));
+        }
+        let ruleset = build_landlock_ruleset(
+            &self.readable_paths(&req.cwd),
+            &self.writable_paths(&req.cwd),
+            self.net,
+        )?;
 
         let mut cmd = std::process::Command::new(&req.program);
         cmd.args(&req.args).current_dir(&req.cwd);
@@ -1031,20 +1919,20 @@ impl ExecBackend for LandlockBackend {
 
         // Apply Landlock in the child (post-fork, pre-exec): only restrict_self
         // runs here — no allocation, so it's safe under the threaded runtime.
-        if let Some(ruleset) = ruleset {
-            let mut slot = Some(ruleset);
-            unsafe {
-                cmd.pre_exec(move || {
-                    if let Some(r) = slot.take() {
-                        r.restrict_self()
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    }
-                    Ok(())
-                });
-            }
+        let mut slot = Some(ruleset);
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Some(r) = slot.take() {
+                    r.restrict_self()
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                Ok(())
+            });
         }
 
-        Ok(tokio::process::Command::from(cmd))
+        let mut command = tokio::process::Command::from(cmd);
+        apply_isolated_environment(&mut command, &self.home);
+        Ok(command)
     }
     fn label(&self) -> &str {
         "native"
@@ -1159,6 +2047,12 @@ pub struct ContainerBackend {
     net: NetPolicy,
     memory: Option<String>,
     pids: Option<u32>,
+    /// Stronger posture for repository-authored verification: never pull,
+    /// ignore an image-provided entrypoint, and make the image root read-only.
+    hermetic: bool,
+    /// Operator-independent name used by Gate to force-remove the daemon-owned
+    /// workload if the attached runtime client is timed out or cancelled.
+    container_name: Option<String>,
 }
 
 impl ContainerBackend {
@@ -1175,15 +2069,36 @@ impl ContainerBackend {
             net,
             memory,
             pids,
+            hermetic: false,
+            container_name: None,
         }
     }
 
-    /// Build the `run …` argv for the container runtime. Pure, for testing.
-    fn build_argv(&self, req: &ExecRequest) -> Vec<String> {
+    /// A fail-closed container for repository-authored checks. Unlike the
+    /// interactive container backend, this never causes an implicit registry
+    /// fetch and does not run an image-controlled entrypoint before `program`.
+    pub fn new_hermetic(
+        runtime: String,
+        image: String,
+        memory: Option<String>,
+        pids: Option<u32>,
+        container_name: String,
+    ) -> Self {
+        Self {
+            runtime,
+            image,
+            net: NetPolicy::Deny,
+            memory,
+            pids,
+            hermetic: true,
+            container_name: Some(container_name),
+        }
+    }
+
+    /// Options shared by interactive `run` and hermetic `create`.
+    fn isolation_argv(&self, req: &ExecRequest) -> Vec<String> {
         let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
-        let mut a: Vec<String> = vec![
-            "run".into(),
-            "--rm".into(),
+        let mut a = vec![
             "-v".into(),
             format!("{}:/workspace", ws.display()),
             "-w".into(),
@@ -1205,6 +2120,14 @@ impl ContainerBackend {
             a.push("--pids-limit".into());
             a.push(p.to_string());
         }
+        a
+    }
+
+    /// Build the interactive `run …` argv. Pure, for testing.
+    fn build_run_argv(&self, req: &ExecRequest) -> Vec<String> {
+        debug_assert!(!self.hermetic);
+        let mut a = vec!["run".into(), "--rm".into()];
+        a.extend(self.isolation_argv(req));
         // Host env is intentionally NOT forwarded (no `--env`): API keys stay on
         // the host and never reach the containerized command.
         a.push(self.image.clone());
@@ -1212,14 +2135,94 @@ impl ContainerBackend {
         a.extend(req.args.iter().cloned());
         a
     }
+
+    /// Build only the inert registration phase for a hermetic check.
+    ///
+    /// `create` applies every isolation option and records the unique name, but
+    /// it never starts the image entrypoint or repository code. Keeping this
+    /// separate from `start` lets Gate finish registration before deciding
+    /// whether cancellation permits the workload to begin.
+    fn build_create_argv(&self, req: &ExecRequest) -> Vec<String> {
+        debug_assert!(self.hermetic);
+        let mut a = vec!["create".into()];
+        a.extend(self.isolation_argv(req));
+        a.extend([
+            "--pull".into(),
+            "never".into(),
+            "--read-only".into(),
+            // An image-declared healthcheck is separate from ENTRYPOINT and
+            // would otherwise execute image-controlled code after `start`.
+            "--no-healthcheck".into(),
+            "--name".into(),
+            self.container_name
+                .clone()
+                .expect("hermetic containers always have an owned name"),
+            "--entrypoint".into(),
+            req.program.clone(),
+            self.image.clone(),
+        ]);
+        a.extend(req.args.iter().cloned());
+        a
+    }
+
+    /// Build the attach/start phase for the exact name registered by
+    /// [`Self::build_create_command`]. Pure argv is kept separate so tests can
+    /// prove no repository-controlled value can alter this command.
+    fn build_start_argv(&self) -> Vec<String> {
+        debug_assert!(self.hermetic);
+        vec![
+            "start".into(),
+            "-a".into(),
+            self.container_name
+                .clone()
+                .expect("hermetic containers always have an owned name"),
+        ]
+    }
+
+    /// Build the bounded, non-starting registration command for a hermetic
+    /// container.
+    pub fn build_create_command(
+        &self,
+        req: &ExecRequest,
+    ) -> Result<tokio::process::Command, ExecError> {
+        if !self.hermetic {
+            return Err(ExecError::Unavailable(
+                "container create lifecycle is only available in hermetic mode".into(),
+            ));
+        }
+        let mut command = tokio::process::Command::new(&self.runtime);
+        command.args(self.build_create_argv(req));
+        Ok(command)
+    }
+
+    /// Build `runtime start -a <owned-name>` for a previously registered
+    /// hermetic container.
+    pub fn build_start_command(&self) -> Result<tokio::process::Command, ExecError> {
+        if !self.hermetic {
+            return Err(ExecError::Unavailable(
+                "container start lifecycle is only available in hermetic mode".into(),
+            ));
+        }
+        let mut command = tokio::process::Command::new(&self.runtime);
+        command.args(self.build_start_argv());
+        Ok(command)
+    }
 }
 
 #[async_trait]
 impl ExecBackend for ContainerBackend {
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
-        let argv = self.build_argv(req);
+        if self.hermetic {
+            // Returning `create` here would be dangerously ambiguous: generic
+            // callers would treat its zero exit as the check having run. Gate
+            // must explicitly own both lifecycle phases and cleanup.
+            return Err(ExecError::Unavailable(
+                "hermetic containers require the explicit create/start lifecycle".into(),
+            ));
+        }
+        let argv = self.build_run_argv(req);
         // The runtime CLIENT runs with our host env (it needs PATH/DOCKER_HOST);
-        // the containerized command gets none of it (see build_argv).
+        // the containerized command gets none of it (see build_run_argv).
         let mut cmd = tokio::process::Command::new(&self.runtime);
         cmd.args(&argv);
         Ok(cmd)
@@ -1300,6 +2303,7 @@ impl ExecBackend for SshBackend {
 pub fn select_backend(
     cfg: &SandboxConfig,
     _extra_writable: Vec<PathBuf>,
+    _approved: ApprovedRoots,
 ) -> std::sync::Arc<dyn ExecBackend> {
     use std::sync::Arc;
     match cfg.backend {
@@ -1308,7 +2312,7 @@ pub fn select_backend(
             #[cfg(target_os = "macos")]
             {
                 if native_backend_available() {
-                    Arc::new(SeatbeltBackend::new(cfg.net, _extra_writable))
+                    Arc::new(SeatbeltBackend::new(cfg.net, _extra_writable, _approved))
                 } else {
                     Arc::new(HostBackend)
                 }
@@ -1316,7 +2320,7 @@ pub fn select_backend(
             #[cfg(target_os = "linux")]
             {
                 if native_backend_available() {
-                    Arc::new(LandlockBackend::new(cfg.net, _extra_writable))
+                    Arc::new(LandlockBackend::new(cfg.net, _extra_writable, _approved))
                 } else {
                     Arc::new(HostBackend)
                 }
@@ -1345,21 +2349,59 @@ pub fn select_backend(
     }
 }
 
-/// True if a native OS sandbox backend is actually usable on this platform.
-/// On macOS, `sandbox-exec` can be present while host policy rejects
-/// `sandbox_apply`, so probe a harmless profile rather than treating its path
-/// as proof. On Linux we probe live Landlock support (kernel ≥5.13 with
-/// Landlock enabled).
+/// True if this *machine* can apply an OS sandbox at all, probed with a
+/// maximally permissive profile. A `false` here is a genuine platform
+/// property (managed or nested environments that reject `sandbox_apply`),
+/// never a statement about our own policy.
+pub fn native_sandbox_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", "(version 1)\n(allow default)\n", "/usr/bin/true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        landlock_supported()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// True if the native backend's *real* generated profile applies and can run a
+/// command. Probing the production builder rather than a hand-copied replica
+/// keeps one source of policy: a profile defect fails here loudly instead of
+/// masquerading as a platform limitation. Given [`native_sandbox_supported`],
+/// a `false` here is a bug in our profile.
 pub fn native_backend_available() -> bool {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("/usr/bin/sandbox-exec")
-            .args(["-p", "(version 1) (allow default)", "/usr/bin/true"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            let ws = std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|_| std::env::temp_dir());
+            let backend = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default());
+            // `cd` exercises path traversal through the workspace's ancestors,
+            // which a broken profile fails even when plain exec succeeds.
+            let script = format!("cd {} && /usr/bin/true", shell_quote(&ws.to_string_lossy()));
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &backend.profile(&ws), "/bin/sh", "-c", &script])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
     }
     #[cfg(target_os = "linux")]
     {
@@ -1495,23 +2537,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Known-flaky (~50% on macOS), so it does not gate CI. Run it explicitly
-    /// with `cargo test -p sandbox -- --ignored`.
-    ///
-    /// The gap is real, not a bad assertion: on the success path the group kill
-    /// fires the instant both pipes reach EOF, and pipe closure says nothing
-    /// about whether every descendant has joined the process group yet. A
-    /// helper that redirects its output away — `>/dev/null 2>&1 &`, exactly what
-    /// build tools do — releases the pipes immediately, so the kill can race it.
-    ///
-    /// Not a regression: before `run_command_bounded` existed there was no
-    /// success-path reap at all, so this leaked 100% of the time and silently.
-    /// Fixing it properly means not deciding teardown on a single instant —
-    /// confirm the group drained while the zombie leader still holds its pid,
-    /// and only then reap. Left ignored rather than deleted so the gap stays
-    /// visible.
+    /// A successful leader can leave a redirected helper behind. Completion is
+    /// based on waitid(WNOWAIT), not pipe EOF, and the group is quiesced while
+    /// the zombie leader still pins its id.
     #[cfg(unix)]
-    #[ignore = "flaky: success-path group kill races a helper that has not yet joined the group"]
     #[tokio::test]
     async fn bounded_shell_reaps_helpers_after_a_successful_leader_exit() {
         let dir = std::env::temp_dir().join(format!("medha-successpg-{}", ulid::Ulid::new()));
@@ -1531,18 +2560,145 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_shell_success_reap_survives_high_contention() {
+        let dir =
+            std::env::temp_dir().join(format!("medha-successpg-stress-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut runs = Vec::new();
+        for n in 0..128 {
+            let cwd = dir.clone();
+            let marker = dir.join(format!("survived-{n}.txt"));
+            runs.push(tokio::spawn(async move {
+                let script = format!("(sleep 1; touch {}) >/dev/null 2>&1 &", marker.display());
+                run_shell_bounded(
+                    &script,
+                    &cwd,
+                    std::time::Duration::from_secs(30),
+                    1024,
+                    None,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        for run in runs {
+            let outcome = run.await.unwrap();
+            // The invariant under test is group reaping, not scheduler
+            // throughput: under full-suite load a leader can overrun its bound
+            // and be killed, and that killed group must be reaped exactly like
+            // a completed one — the survivor count below is the real check.
+            // Anything besides clean completion or the bounded kill is a
+            // genuine failure.
+            assert!(
+                outcome.passed() || outcome.timed_out,
+                "run neither completed nor timed out: status={:?} cancelled={}",
+                outcome.status,
+                outcome.cancelled
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let survivors = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("survived-"))
+            .count();
+        assert_eq!(survivors, 0, "redirected helpers escaped under load");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_task_waits_for_pipe_holding_descendants_to_be_reaped() {
+        let dir = std::env::temp_dir().join(format!("medha-bg-pipe-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("survived.txt");
+        let script = format!("(sleep 0.5; touch {}) & exit 0", marker.display());
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", &script]).current_dir(&dir);
+        let process = spawn_background(command).unwrap();
+        assert!(
+            process.wait_until(std::time::Duration::from_secs(2)).await,
+            "completion was held hostage by a descendant's pipe"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !marker.exists(),
+            "pipe-holding descendant survived completion"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waitid_does_not_report_a_running_leader_as_exited() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sh");
+        child.args(["-c", "sleep 1"]).process_group(0);
+        let mut child = child.spawn().unwrap();
+        assert!(!leader_exited_without_reap(child.id()).unwrap());
+        kill_process_tree(child.id());
+        let _ = child.wait();
+    }
+
     #[tokio::test]
     async fn host_backend_runs_and_captures() {
+        #[cfg(unix)]
+        let request = req("/bin/sh", &["-c", "printf hello"], std::env::temp_dir());
+        #[cfg(windows)]
+        let request = req(
+            "cmd.exe",
+            &["/D", "/S", "/C", "echo hello"],
+            std::env::temp_dir(),
+        );
+
+        let out = HostBackend.run(request).await.unwrap();
+        assert_eq!(out.status, Some(0));
+        // `cmd.exe echo` terminates with CRLF; the capture contract is the
+        // payload, not a platform-specific shell's line ending.
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+        assert!(!out.stdout_truncated);
+        assert!(!out.stderr_truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_capture_has_independent_and_aggregate_limits() {
         let out = HostBackend
             .run(req(
                 "/bin/sh",
-                &["-c", "printf hello"],
+                &[
+                    "-c",
+                    "head -c 2000000 /dev/zero; head -c 2000000 /dev/zero >&2",
+                ],
                 std::env::temp_dir(),
             ))
             .await
             .unwrap();
         assert_eq!(out.status, Some(0));
-        assert_eq!(out.stdout, b"hello");
+        assert!(out.stdout.len() <= EXEC_STDOUT_CAP);
+        assert!(out.stderr.len() <= EXEC_STDERR_CAP);
+        assert!(out.stdout.len() + out.stderr.len() <= EXEC_AGGREGATE_CAP);
+        assert!(out.stdout_truncated);
+        assert!(out.stderr_truncated);
+    }
+
+    /// The guard for the guards: wherever the OS can sandbox at all, our own
+    /// generated profile must apply and run commands. Without this implication
+    /// a profile defect reads as "platform unsupported", every gated security
+    /// test skips, and the whole suite passes vacuously.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn native_profile_applies_wherever_the_platform_supports_sandboxing() {
+        if !native_sandbox_supported() {
+            return;
+        }
+        assert!(
+            native_backend_available(),
+            "the platform sandbox works but our generated profile does not apply — \
+             the profile is broken"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1550,8 +2706,9 @@ mod tests {
     async fn seatbelt_jails_writes_outside_workspace() {
         // Managed/nested macOS environments may expose sandbox-exec but deny
         // sandbox_apply. Selection degrades to HostBackend and the CLI warns;
-        // only exercise the jail where the OS can actually apply it.
-        if !native_backend_available() {
+        // only exercise the jail where the OS can actually apply it. Gating on
+        // *platform* support keeps a broken profile from skipping this test.
+        if !native_sandbox_supported() {
             eprintln!(
                 "Seatbelt unavailable on this host; native backend correctly degrades to host"
             );
@@ -1559,31 +2716,297 @@ mod tests {
         }
         let ws = std::env::temp_dir().join(format!("medha-seatbelt-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&ws).unwrap();
-        let backend = SeatbeltBackend::new(NetPolicy::Allow, vec![]);
+        let backend = SeatbeltBackend::new(NetPolicy::Allow, vec![], ApprovedRoots::default());
 
         // Writing INSIDE the workspace is allowed.
         let inside = backend
             .run(req("/bin/sh", &["-c", "touch ok.txt"], ws.clone()))
             .await
             .unwrap();
-        assert_eq!(inside.status, Some(0), "in-workspace write should succeed");
+        assert_eq!(
+            inside.status,
+            Some(0),
+            "in-workspace write should succeed; stderr={}",
+            String::from_utf8_lossy(&inside.stderr)
+        );
         assert!(ws.join("ok.txt").exists());
 
-        // Writing to $HOME is denied by the jail (the command exits non-zero).
+        // HOME is an isolated writable tree, not the user's real home.
+        let reported_home = backend
+            .run(req("/bin/sh", &["-c", "printf %s \"$HOME\""], ws.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&reported_home.stdout),
+            backend.home.path.to_string_lossy()
+        );
+
+        // Writing to the real HOME by absolute path is denied.
         let escape_marker = format!(".medha-seatbelt-escape-{}", ulid::Ulid::new());
-        let cmd = format!("touch \"$HOME/{escape_marker}\"");
+        let home = std::env::var("HOME").unwrap();
+        let escape = std::path::Path::new(&home).join(&escape_marker);
+        let cmd = format!("touch {}", shell_quote(&escape.to_string_lossy()));
         let outside = backend
             .run(req("/bin/sh", &["-c", &cmd], ws.clone()))
             .await
             .unwrap();
         assert_ne!(outside.status, Some(0), "write to HOME must be blocked");
-        let home = std::env::var("HOME").unwrap();
-        assert!(
-            !std::path::Path::new(&home).join(&escape_marker).exists(),
-            "escape file must not exist"
-        );
+        assert!(!escape.exists(), "escape file must not exist");
 
         std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_children_cannot_read_host_credentials() {
+        if !native_sandbox_supported() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("medha-seatbelt-read-{}", ulid::Ulid::new()));
+        let ws = base.join("workspace");
+        let host_home = base.join("host-home");
+        std::fs::create_dir_all(&ws).unwrap();
+        let credentials = [
+            ".ssh/id_ed25519",
+            ".aws/credentials",
+            ".medha/credentials",
+            ".npmrc",
+            ".git-credentials",
+            ".docker/config.json",
+            ".kube/config",
+            ".zsh_history",
+        ];
+        for relative in credentials {
+            let path = host_home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "TOP-SECRET").unwrap();
+        }
+        let backend = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default());
+        for relative in credentials {
+            let path = host_home.join(relative);
+            let command = format!("cat {}", shell_quote(&path.to_string_lossy()));
+            let output = backend
+                .run(req("/bin/sh", &["-c", &command], ws.clone()))
+                .await
+                .unwrap();
+            assert_ne!(
+                output.status,
+                Some(0),
+                "native child read host credential {}",
+                path.display()
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("TOP-SECRET"));
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_profile_is_read_deny_by_default_and_filters_sensitive_writes() {
+        let sensitive = home_dir_from_env()
+            .unwrap_or_else(|| PathBuf::from("/Users/example"))
+            .join(".ssh");
+        let backend =
+            SeatbeltBackend::new(NetPolicy::Deny, vec![sensitive], ApprovedRoots::default());
+        assert!(backend.extra_writable.is_empty());
+        let workspace =
+            std::env::temp_dir().join(format!("medha-seatbelt-profile-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let profile = backend.profile(&workspace);
+        assert!(profile.contains("(deny file-read*)"));
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("(deny network*)"));
+        assert!(!profile.contains("(allow file-read* (subpath \"/\")"));
+        // Traversal grants: the literal root and directory metadata only —
+        // never a readable subtree.
+        assert!(profile.contains("(allow file-read* (literal \"/\"))"));
+        assert!(
+            profile
+                .contains("(allow file-read-metadata (vnode-type DIRECTORY) (vnode-type SYMLINK))")
+        );
+        assert!(profile.contains("/private/var/select"));
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// A root approved at runtime opens the exec jail on the very next spawn —
+    /// and only that root: an unapproved sibling stays denied.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_honours_runtime_approved_roots_without_restart() {
+        if !native_sandbox_supported() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("medha-seatbelt-live-{}", ulid::Ulid::new()));
+        let ws = base.join("workspace");
+        let granted = base.join("granted");
+        let sibling = base.join("sibling");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&granted).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(granted.join("notes.md"), "granted-content").unwrap();
+        std::fs::write(sibling.join("notes.md"), "sibling-content").unwrap();
+
+        let approved = ApprovedRoots::default();
+        let backend = SeatbeltBackend::new(NetPolicy::Allow, vec![], approved.clone());
+        let read_granted = format!(
+            "cat {}",
+            shell_quote(&granted.join("notes.md").to_string_lossy())
+        );
+        let read_sibling = format!(
+            "cat {}",
+            shell_quote(&sibling.join("notes.md").to_string_lossy())
+        );
+
+        let before = backend
+            .run(req("/bin/sh", &["-c", &read_granted], ws.clone()))
+            .await
+            .unwrap();
+        assert_ne!(before.status, Some(0), "unapproved root must start denied");
+
+        approved.allow_read(granted.canonicalize().unwrap());
+
+        let after = backend
+            .run(req("/bin/sh", &["-c", &read_granted], ws.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            after.status,
+            Some(0),
+            "approved root must open without restart; stderr={}",
+            String::from_utf8_lossy(&after.stderr)
+        );
+        assert!(String::from_utf8_lossy(&after.stdout).contains("granted-content"));
+
+        let still_denied = backend
+            .run(req("/bin/sh", &["-c", &read_sibling], ws.clone()))
+            .await
+            .unwrap();
+        assert_ne!(
+            still_denied.status,
+            Some(0),
+            "an unapproved sibling must stay denied"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn native_sandbox_defaults_to_network_deny() {
+        assert_eq!(SandboxConfig::default().net, NetPolicy::Deny);
+    }
+
+    #[cfg(unix)]
+    fn denied_output(stderr: &str) -> ExecOutput {
+        ExecOutput {
+            status: Some(1),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escalation_candidates_come_from_denial_lines_and_widen_files_to_parents() {
+        let base = std::env::temp_dir().join(format!("medha-escal-{}", ulid::Ulid::new()));
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("notes.md");
+        std::fs::write(&target, "x").unwrap();
+
+        let stderr = format!("cat: {}: Operation not permitted", target.display());
+        let candidates = escalation_candidates(
+            &denied_output(&stderr),
+            &["-c".into(), format!("cat {}", target.display())],
+            &ws,
+            &ApprovedRoots::default(),
+        );
+        assert_eq!(
+            candidates,
+            vec![outside.canonicalize().unwrap()],
+            "a denied file must widen to its parent directory"
+        );
+
+        // Success output or unrelated stderr must never produce candidates.
+        assert!(
+            escalation_candidates(
+                &denied_output("cat: /nonexistent-dir-zz/f: No such file or directory"),
+                &[],
+                &ws,
+                &ApprovedRoots::default(),
+            )
+            .is_empty()
+        );
+
+        // An in-workspace denial is not escalatable (nothing to approve).
+        let inside = ws.join("f.txt");
+        std::fs::write(&inside, "x").unwrap();
+        let stderr = format!("cat: {}: Operation not permitted", inside.display());
+        assert!(
+            escalation_candidates(&denied_output(&stderr), &[], &ws, &ApprovedRoots::default())
+                .is_empty()
+        );
+
+        // An already-approved root cannot be the cause; it is excluded.
+        let approved = ApprovedRoots::default();
+        approved.allow_read(outside.canonicalize().unwrap());
+        let stderr = format!("cat: {}: Operation not permitted", target.display());
+        assert!(escalation_candidates(&denied_output(&stderr), &[], &ws, &approved).is_empty());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escalation_candidates_never_offer_credential_paths() {
+        let Some(home) = home_dir_from_env() else {
+            return;
+        };
+        let ssh = home.join(".ssh");
+        if !ssh.exists() {
+            return;
+        }
+        let ws = std::env::temp_dir();
+        let stderr = format!(
+            "cat: {}: Operation not permitted",
+            ssh.join("id_rsa").display()
+        );
+        assert!(
+            escalation_candidates(&denied_output(&stderr), &[], &ws, &ApprovedRoots::default())
+                .is_empty(),
+            "credential paths must never reach an approval card"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_extra_write_roots_resolve_symlink_aliases_before_filtering() {
+        let base = std::env::temp_dir().join(format!("medha-native-extra-{}", ulid::Ulid::new()));
+        let sensitive = base.join("sensitive");
+        let alias = base.join("apparently-safe");
+        std::fs::create_dir_all(&sensitive).unwrap();
+        std::os::unix::fs::symlink(&sensitive, &alias).unwrap();
+
+        assert!(
+            safe_extra_writable_against(
+                &[alias.join("future-child")],
+                std::slice::from_ref(&sensitive),
+            )
+            .is_empty(),
+            "a symlink alias must not turn a sensitive subtree into a writable root"
+        );
+
+        let allowed = base.join("allowed/future-child");
+        let expected_allowed = resolve_native_policy_path(&allowed).unwrap();
+        assert_eq!(
+            safe_extra_writable_against(
+                std::slice::from_ref(&allowed),
+                std::slice::from_ref(&sensitive),
+            ),
+            vec![expected_allowed]
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[cfg(target_os = "macos")]
@@ -1592,7 +3015,7 @@ mod tests {
         if native_backend_available() {
             return;
         }
-        let backend = select_backend(&SandboxConfig::default(), vec![]);
+        let backend = select_backend(&SandboxConfig::default(), vec![], ApprovedRoots::default());
         assert_eq!(backend.label(), "host");
     }
 
@@ -1608,7 +3031,7 @@ mod tests {
         let mut r = req("sh", &["-c", "echo hi"], std::env::temp_dir());
         r.env = vec![("TAVILY_API_KEY".into(), "supersecret".into())];
         r.clear_env = true;
-        let argv = be.build_argv(&r);
+        let argv = be.build_run_argv(&r);
         let joined = argv.join(" ");
 
         assert!(argv.contains(&"--rm".to_string()));
@@ -1631,9 +3054,67 @@ mod tests {
     }
 
     #[test]
+    fn hermetic_container_never_pulls_or_runs_image_entrypoint() {
+        let be = ContainerBackend::new_hermetic(
+            "/usr/bin/docker".into(),
+            "local-check-image".into(),
+            Some("4g".into()),
+            Some(256),
+            "medha-gate-test".into(),
+        );
+        let argv = be.build_create_argv(&req(
+            "env",
+            &["-i", "HOME=/workspace/home", "sh", "-c", "true"],
+            std::env::temp_dir(),
+        ));
+        let joined = argv.join(" ");
+        assert_eq!(argv.first().map(String::as_str), Some("create"));
+        assert!(!argv.iter().any(|argument| argument == "run"));
+        assert!(!argv.iter().any(|argument| argument == "--rm"));
+        assert!(joined.contains("-v ") && joined.contains(":/workspace"));
+        assert!(joined.contains("-w /workspace"));
+        assert!(joined.contains("--cap-drop ALL"));
+        assert!(joined.contains("--security-opt no-new-privileges"));
+        assert!(joined.contains("--pull never"));
+        assert!(joined.contains("--read-only"));
+        assert!(joined.contains("--no-healthcheck"));
+        assert!(joined.contains("--network none"));
+        assert!(joined.contains("--name medha-gate-test"));
+        assert!(joined.contains("--entrypoint env"));
+        assert!(joined.contains("--memory 4g"));
+        assert!(joined.contains("--pids-limit 256"));
+        let image = argv
+            .iter()
+            .position(|argument| argument == "local-check-image")
+            .unwrap();
+        assert_eq!(
+            &argv[image + 1..],
+            &[
+                "-i".to_string(),
+                "HOME=/workspace/home".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "true".to_string(),
+            ]
+        );
+        assert_eq!(
+            be.build_start_argv(),
+            ["start", "-a", "medha-gate-test"].map(String::from)
+        );
+        let error = be
+            .build_command(&req("sh", &["-c", "true"], std::env::temp_dir()))
+            .expect_err("generic execution must not confuse create with a completed check");
+        assert!(
+            error
+                .to_string()
+                .contains("explicit create/start lifecycle")
+        );
+    }
+
+    #[test]
     fn container_argv_allows_network_by_default() {
         let be = ContainerBackend::new("podman".into(), "img".into(), NetPolicy::Allow, None, None);
-        let argv = be.build_argv(&req("sh", &["-c", "true"], std::env::temp_dir()));
+        let argv = be.build_run_argv(&req("sh", &["-c", "true"], std::env::temp_dir()));
         assert!(
             !argv.join(" ").contains("--network"),
             "net=allow leaves networking default"

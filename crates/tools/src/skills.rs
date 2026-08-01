@@ -711,7 +711,13 @@ impl SkillStore {
         // scanned at install exactly as a command is scanned at exec. A
         // dangerous verdict aborts (nothing is written); caution installs but
         // its findings ride back in the report so the surface can warn.
-        let scan = scan_staged(&stage);
+        let scan = match scan_staged(&stage) {
+            Ok(scan) => scan,
+            Err(error) => {
+                std::fs::remove_dir_all(&stage).ok();
+                return Err(error);
+            }
+        };
         let scan_findings = format_findings(&scan.findings);
         if scan.verdict == policy::guard::ScanVerdict::Dangerous {
             std::fs::remove_dir_all(&stage).ok();
@@ -742,6 +748,13 @@ impl SkillStore {
                                     o.reason
                                 ));
                             }
+                            crate::judge::JudgeVerdict::Safe if scan.requires_explicit_review => {
+                                // A model can interpret prose, but it cannot
+                                // prove opaque bytes, archives, or executable
+                                // modes safe. Structural review is never
+                                // silently downgraded.
+                                "caution"
+                            }
                             crate::judge::JudgeVerdict::Safe => "safe",
                             crate::judge::JudgeVerdict::Caution => "caution",
                         },
@@ -753,6 +766,10 @@ impl SkillStore {
         } else {
             "safe"
         };
+        if let Err(error) = quarantine_executable_modes(&stage) {
+            std::fs::remove_dir_all(&stage).ok();
+            return Err(error);
+        }
         // Write provenance now that the verdict is known (the sidecar is a
         // dotfile, so it is excluded from both the hash and the scan above).
         let provenance = SkillProvenance {
@@ -848,16 +865,72 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
 /// Screen every file in a staged package with the Skills Guard before it is
 /// committed. `collect_files` omits `SKILL.md` (it lists *bundled* extras), so
 /// it is added back explicitly — the procedure body is the first thing to scan.
-/// Binary files are read but skipped by the guard (non-UTF-8 → inert).
-fn scan_staged(stage: &Path) -> policy::guard::ScanReport {
+/// Opaque and executable files are structural review findings; no staged file
+/// may disappear from the scan because a read failed.
+fn scan_staged(stage: &Path) -> Result<policy::guard::ScanReport, String> {
     let mut rels = Vec::new();
     collect_files(stage, stage, &mut rels);
     rels.push("SKILL.md".to_string());
-    let files: Vec<(String, Vec<u8>)> = rels
-        .into_iter()
-        .filter_map(|rel| std::fs::read(stage.join(&rel)).ok().map(|b| (rel, b)))
-        .collect();
-    policy::guard::scan_package(files.iter().map(|(p, b)| (p.as_str(), b.as_slice())))
+    rels.sort();
+    rels.dedup();
+    let mut files = Vec::with_capacity(rels.len());
+    for rel in rels {
+        let path = stage.join(&rel);
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("cannot security-scan staged file '{rel}': {error}"))?;
+        files.push((rel, bytes, is_executable_file(&path)?));
+    }
+    Ok(policy::guard::scan_package_with_modes(files.iter().map(
+        |(path, bytes, executable)| (path.as_str(), bytes.as_slice(), *executable),
+    )))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("reading staged file mode '{}': {error}", path.display()))?;
+    Ok(metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(_path: &Path) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// Installed skill assets are data until a reviewed interpreter invocation
+/// consumes them. Removing execute bits prevents a bundled launcher from being
+/// run directly after installation; directories retain traversal permissions.
+#[cfg(unix)]
+fn quarantine_executable_modes(stage: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut rels = Vec::new();
+    collect_files(stage, stage, &mut rels);
+    rels.push("SKILL.md".to_string());
+    rels.sort();
+    rels.dedup();
+    for rel in rels {
+        let path = stage.join(&rel);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("reading staged file mode '{}': {error}", path.display()))?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o111 != 0 {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(mode & !0o111);
+            std::fs::set_permissions(&path, permissions).map_err(|error| {
+                format!(
+                    "quarantining executable skill file '{}': {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn quarantine_executable_modes(_stage: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// Deterministic content hash of a package directory (`sha256:<hex>`). Every
@@ -1930,6 +2003,116 @@ mod tests {
                 .scan_verdict,
             "caution"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_and_opaque_assets_are_quarantined_and_never_judge_cleared() {
+        use crate::judge::{JudgeOutcome, JudgeRequest, JudgeVerdict, SkillJudge};
+        use std::os::unix::fs::PermissionsExt;
+
+        struct AlwaysSafe;
+        #[async_trait]
+        impl SkillJudge for AlwaysSafe {
+            async fn judge(&self, _request: JudgeRequest) -> Result<JudgeOutcome, String> {
+                Ok(JudgeOutcome {
+                    verdict: JudgeVerdict::Safe,
+                    reason: "looks fine".into(),
+                })
+            }
+        }
+
+        let root = tmp();
+        let src = root.join("src");
+        let user = root.join("user");
+        std::fs::create_dir_all(src.join("scripts")).unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: quarantined\ndescription: structural scan\n---\n\nRun the helper.\n",
+        )
+        .unwrap();
+        let payload = src.join("scripts/payload.dat");
+        std::fs::write(&payload, "echo deploy\n").unwrap();
+        let mut permissions = std::fs::metadata(&payload).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&payload, permissions).unwrap();
+
+        let store = SkillStore::new(root.join("project"), Some(user.clone()))
+            .with_judge(Arc::new(AlwaysSafe));
+        let report =
+            futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
+        assert_eq!(
+            report.scan_verdict, "caution",
+            "an LLM cannot clear structural executable evidence"
+        );
+        assert!(
+            report
+                .scan_findings
+                .iter()
+                .any(|finding| finding.contains("executable package file"))
+        );
+        let installed = user.join("quarantined/scripts/payload.dat");
+        assert_eq!(
+            std::fs::metadata(installed).unwrap().permissions().mode() & 0o111,
+            0,
+            "installed skill payload must have execute bits stripped"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn executable_binary_payload_is_refused_even_when_renamed() {
+        let root = tmp();
+        let src = root.join("src");
+        let user = root.join("user");
+        std::fs::create_dir_all(src.join("assets")).unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: binary-payload\ndescription: structural scan\n---\n\nRun the asset.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("assets/logo.png"),
+            b"\x7fELF\x02\x01\x01\0renamed executable",
+        )
+        .unwrap();
+        let store = SkillStore::new(root.join("project"), Some(user.clone()));
+        let error =
+            futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap_err();
+        assert!(error.contains("executable binary payload"), "{error}");
+        assert!(!user.join("binary-payload").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn nested_archive_and_unknown_text_payload_cannot_report_safe() {
+        let root = tmp();
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("bundle")).unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: archived\ndescription: structural scan\n---\n\nInspect the assets.\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("bundle/payload.dat"), "print('hello')").unwrap();
+        std::fs::write(src.join("bundle/nested.txt"), b"PK\x03\x04archive").unwrap();
+        let store = SkillStore::new(root.join("project"), Some(root.join("user")));
+        let report =
+            futures::executor::block_on(store.install_from(src.to_str().unwrap())).unwrap();
+        assert_eq!(report.scan_verdict, "caution");
+        assert!(
+            report
+                .scan_findings
+                .iter()
+                .any(|finding| finding.contains("nested archive"))
+        );
+        assert!(
+            report
+                .scan_findings
+                .iter()
+                .any(|finding| finding.contains("unrecognized text asset"))
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

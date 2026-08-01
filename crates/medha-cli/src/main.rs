@@ -60,6 +60,21 @@ pub(crate) fn task_budget(base: &kernel::Budget, slot: &kernel::BudgetHandle) ->
     budget
 }
 
+/// Build the first provider request for every surface from the same inputs.
+///
+/// Keeping this in one place prevents ACP, TUI, REPL, and headless resume from
+/// silently diverging: the current system prompt is followed by the hydrated
+/// event-log projection without reordering or rewriting it.
+pub(crate) fn session_transcript(
+    system: String,
+    resumed: Vec<kernel::Message>,
+) -> Vec<kernel::Message> {
+    let mut transcript = Vec::with_capacity(resumed.len().saturating_add(1));
+    transcript.push(kernel::Message::system(system));
+    transcript.extend(resumed);
+    transcript
+}
+
 fn apply_budget_env(mut b: kernel::Budget) -> kernel::Budget {
     if let Some(t) = env_u32("MEDHA_MAX_TURNS") {
         b.max_turns = Some(t);
@@ -142,7 +157,7 @@ struct GateCli {
     /// (overrides `[gate] seeds`)
     #[arg(long)]
     seeds: Option<u32>,
-    /// Promote threshold, 0.0–1.0 (overrides `[gate] pass_threshold`)
+    /// Promote threshold, greater than 0.0 through 1.0 (overrides `[gate] pass_threshold`)
     #[arg(long)]
     threshold: Option<f64>,
     /// Machine-readable JSON output for CI
@@ -151,6 +166,15 @@ struct GateCli {
     /// Only load and validate the scenario(s) — no model runs. Cheap CI lint.
     #[arg(long)]
     validate: bool,
+    /// Confirm a run above the guarded seed count (potentially substantial API cost).
+    #[arg(long)]
+    yes: bool,
+    /// Keep temporary workspaces only for failed runs/checks.
+    #[arg(long, conflicts_with = "keep_runs")]
+    keep_failures: bool,
+    /// Keep every temporary workspace for debugging.
+    #[arg(long, conflicts_with = "keep_failures")]
+    keep_runs: bool,
 }
 
 /// Resolve the operator's model + gate policy, then run the scenarios. The gate
@@ -177,6 +201,12 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
+    let lock = lockfile::MedhaLock::load_default()?;
+    let seeds = gc.seeds.unwrap_or(lock.gate.seeds);
+    let threshold = gc.threshold.unwrap_or(lock.gate.pass_threshold);
+    gate::validate_run_inputs(seeds, threshold, gc.yes)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
     let cfg = config::load()?;
     let resolved = config::resolve(cfg.as_ref(), None, None)?
         .filter(|resolved| !resolved.provider.base_url.is_empty())
@@ -186,10 +216,6 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
                  MEDHA_BASE_URL / MEDHA_MODEL / MEDHA_API_KEY"
             )
         })?;
-
-    let lock = lockfile::MedhaLock::load_default();
-    let seeds = gc.seeds.unwrap_or(lock.gate.seeds).max(1);
-    let threshold = gc.threshold.unwrap_or(lock.gate.pass_threshold);
 
     let mut provider_env = vec![
         (
@@ -224,12 +250,21 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("locating the medha binary: {e}"))?,
         provider_env,
         default_wall_s: 600,
+        check_sandbox: lock.sandbox.to_config(),
+        preserve: if gc.keep_runs {
+            gate::PreserveRuns::Always
+        } else if gc.keep_failures {
+            gate::PreserveRuns::Failures
+        } else {
+            gate::PreserveRuns::Never
+        },
     };
 
     let results = gate::run_gate(gate::GateOptions {
         path: gc.path,
         seeds,
         threshold,
+        confirm_costly: gc.yes,
         run,
     })
     .await
@@ -379,11 +414,18 @@ async fn run_memory_command(args: Vec<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);
     let state = config::state_dir(&cwd)?;
-    let log = store::SqliteLog::open(state.join("events.db"))?;
-    let projection = memory::MemoryProjection::open(
-        state.join("memory.db"),
-        config::medha_home()?.join("memory.db"),
+    let medha_home = config::medha_home()?;
+    let log = store::SqliteLog::open_with_mutation_lock(
+        state.join("events.db"),
+        medha_home.join("mutations.db"),
     )?;
+    // The command includes read/modify/write operations (and user memory is
+    // shared by every workspace). Holding one global lease for the short-lived
+    // command is deliberately conservative and also makes projection rebuilds
+    // a stable basis for a following edit/pin/forget.
+    let _memory_lease = log.acquire_mutation_lease("memory:*").await?;
+    let projection =
+        memory::MemoryProjection::open(state.join("memory.db"), medha_home.join("memory.db"))?;
     projection.rebuild_project(
         log.all_events()?
             .into_iter()
@@ -624,7 +666,11 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);
     let state = config::state_dir(&cwd)?;
-    let log = store::SqliteLog::open(state.join("events.db"))?;
+    let medha_home = config::medha_home()?;
+    let log = store::SqliteLog::open_with_mutation_lock(
+        state.join("events.db"),
+        medha_home.join("mutations.db"),
+    )?;
 
     if uc.list {
         let writes = recent_writes(&log, 10).await;
@@ -646,6 +692,11 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
         println!("\nUndo one:  medha undo --event <id>");
         return Ok(());
     }
+
+    // Serialize planning + restore as one mutation. Otherwise another MEDHA
+    // process can write after the rollback plan is read and have its newer
+    // state silently overwritten by this command.
+    let _undo_lease = log.acquire_mutation_lease("state:*").await?;
 
     let (session_id, target) = if let Some(idstr) = &uc.event {
         let target = ulid::Ulid::from_string(idstr.trim())
@@ -760,7 +811,7 @@ async fn main() -> Result<()> {
         let cwd = std::env::current_dir()?;
         let cwd = cwd.canonicalize().unwrap_or(cwd);
         let state = config::state_dir(&cwd)?;
-        migrate_legacy_state(&cwd, &state);
+        warn_legacy_state(&cwd, &state);
         print_sessions(&store::SqliteLog::open(state.join("events.db"))?)?;
         return Ok(());
     }
@@ -891,7 +942,7 @@ async fn main() -> Result<()> {
     // medha.lock (§6): the harness artifact. Absent file = built-in defaults
     // (identical to MEDHA's behavior before this existed); env vars below layer
     // on top as session-level overrides. `./medha.lock` in the workspace root.
-    let lock = lockfile::MedhaLock::load_default();
+    let lock = lockfile::MedhaLock::load_default()?;
 
     // Reasoning/thinking request-side control (§4.4): config-file default,
     // further adjustable live via /think.
@@ -911,14 +962,16 @@ async fn main() -> Result<()> {
     }
 
     // Runtime state lives OUT of the working tree, under
-    // ~/.medha/projects/<encoded-cwd>/ — event log,
+    // ~/.medha/projects/<readable-cwd>--<path-hash>/ — event log,
     // artifacts, snapshots, logs. Only committed config (.medha/skills,
     // medha.lock) stays in the workspace. See config::state_dir.
     let cwd = std::env::current_dir()?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);
     let state = config::state_dir(&cwd)?;
-    // One-time move of any pre-relocation state from <workspace>/.medha.
-    migrate_legacy_state(&cwd, &state);
+    let medha_home = config::medha_home()?;
+    // Repository-local runtime state is never imported automatically; warn if
+    // an old layout is present so the operator knows it was left untouched.
+    warn_legacy_state(&cwd, &state);
 
     // Structured logging to a file, never stdout — a TUI owns the screen (spec §7).
     // state/logs/medha.log; level via RUST_LOG (default info).
@@ -936,7 +989,10 @@ async fn main() -> Result<()> {
         .init();
 
     let db_path = state.join("events.db");
-    let log = Arc::new(store::SqliteLog::open(&db_path)?);
+    let log = Arc::new(store::SqliteLog::open_with_mutation_lock(
+        &db_path,
+        medha_home.join("mutations.db"),
+    )?);
 
     // Verify the tamper-evident hash chain on resume. A break means the log was
     // edited/corrupted since it was written — warn loudly but don't refuse to
@@ -965,8 +1021,11 @@ async fn main() -> Result<()> {
     };
     let acp_bridge = if use_acp { Some(acp::bridge()) } else { None };
 
-    let gate: Arc<dyn kernel::HumanGate> = if let Some((writer, pending)) = &acp_bridge {
-        Arc::new(acp::AcpGate::new(writer.clone(), pending.clone()))
+    let gate: Arc<dyn kernel::HumanGate> = if let Some(bridge) = &acp_bridge {
+        Arc::new(acp::AcpGate::new(
+            bridge.writer.clone(),
+            bridge.pending.clone(),
+        ))
     } else if let Some((tx, _)) = &tui_channel {
         Arc::new(tui_tea::TuiGate { tx: tx.clone() })
     } else if is_tty {
@@ -990,10 +1049,18 @@ async fn main() -> Result<()> {
     let lock_path = cwd.join("medha.lock");
     // Machine-local permission grants live in the per-workspace state dir, NOT in
     // the portable medha.lock (§13.3): absolute per-machine paths must not travel
-    // with the harness artifact. One-time migration moves any legacy
-    // [permissions] block out.
+    // with the harness artifact. A repository-provided [permissions] block is
+    // untrusted input and is never migrated — each requested path must pass the
+    // human gate before an `Always` decision can reach this trust file.
     let trust_path = state.join("trust.lock");
-    lockfile::migrate_permissions_to_trust_file(&lock_path, &trust_path).ok();
+    if !lock.permissions.trusted_paths.is_empty() {
+        eprintln!(
+            "warning: ignoring {} repository-provided permission grant(s) in {}; \
+             out-of-workspace paths require explicit path-specific approval",
+            lock.permissions.trusted_paths.len(),
+            lock_path.display()
+        );
+    }
     // No workspace .gitignore is written any more: runtime state now lives under
     // ~/.medha/projects/, so the only thing left in <workspace>/.medha is
     // committed config (skills), which the user *wants* in version control.
@@ -1050,30 +1117,29 @@ async fn main() -> Result<()> {
         _ => {}
     }
     if sbx_cfg.backend == sandbox::BackendKind::Native && !sandbox::native_backend_available() {
-        eprintln!(
-            "warning: OS-native sandbox unavailable here (needs macOS Seatbelt, or Linux \
-             Landlock on kernel ≥5.13) — shell commands run on the host; the scanner + \
-             approval gate still apply. Set [sandbox] backend = \"host\" to silence."
-        );
-    }
-    // Built-in writable dev caches so ordinary builds work inside the jail
-    // (these are non-secret; ~/.ssh, ~/.aws, etc. stay denied by omission).
-    let mut extra_writable = lock.sandbox.extra_writable_paths();
-    if let Some(home) = dirs::home_dir() {
-        for cache in [
-            ".cargo",
-            ".rustup",
-            ".npm",
-            ".cache",
-            ".pnpm-store",
-            ".gradle",
-            ".m2",
-            "go/pkg",
-        ] {
-            extra_writable.push(home.join(cache));
+        if sandbox::native_sandbox_supported() {
+            eprintln!(
+                "warning: the OS sandbox works on this machine but Medha's own profile failed \
+                 to apply — this is a Medha bug, please report it. Shell commands run on the \
+                 host; the scanner + approval gate still apply."
+            );
+        } else {
+            eprintln!(
+                "warning: OS-native sandbox unavailable here (needs macOS Seatbelt, or Linux \
+                 Landlock on kernel ≥5.13) — shell commands run on the host; the scanner + \
+                 approval gate still apply. Set [sandbox] backend = \"host\" to silence."
+            );
         }
     }
-    let exec_backend = sandbox::select_backend(&sbx_cfg, extra_writable);
+    // Native backends remap HOME/TMP and expose only narrow read-only
+    // toolchain payloads. Never make whole package-manager homes writable:
+    // several contain registry tokens or executable shims alongside caches.
+    // `approved` is the live bridge between the permission manager and the OS
+    // exec sandbox: a user approval lands in it and the very next spawned
+    // command's profile includes the granted root.
+    let approved = sandbox::ApprovedRoots::default();
+    let extra_writable = lock.sandbox.extra_writable_paths();
+    let exec_backend = sandbox::select_backend(&sbx_cfg, extra_writable, approved.clone());
     let verifier_exec = Arc::clone(&exec_backend);
 
     // Kept so a writing sub-agent's sandbox can be rebuilt at its own worktree
@@ -1086,15 +1152,22 @@ async fn main() -> Result<()> {
         exec: Arc::clone(&exec_backend),
         snapshots: state.join("snapshots"),
         readable: vec![config::user_skills_dir()?],
+        approved: approved.clone(),
     };
     let workspace = Arc::new(
-        WorkspaceSandbox::new(cwd.clone(), trust_path, audit_path, Some(gate.clone()))?
-            .with_exec_backend(exec_backend)
-            // Skills bundle reference files the model reads on demand; the
-            // user skills root lives outside the workspace, so without this
-            // every bundled-file read would raise a permission card.
-            .with_readable_roots(&[config::user_skills_dir()?])
-            .with_snapshots_dir(state.join("snapshots")),
+        WorkspaceSandbox::new_with_roots(
+            cwd.clone(),
+            trust_path,
+            audit_path,
+            Some(gate.clone()),
+            approved,
+        )?
+        .with_exec_backend(exec_backend)
+        // Skills bundle reference files the model reads on demand; the
+        // user skills root lives outside the workspace, so without this
+        // every bundled-file read would raise a permission card.
+        .with_readable_roots(&[config::user_skills_dir()?])
+        .with_snapshots_dir(state.join("snapshots")),
     );
     // Skills (Phase A, §4.11 consumption side): discover project + user skills
     // and register `skill.load`/`skill.save`. The store reads the harness's own
@@ -1112,7 +1185,6 @@ async fn main() -> Result<()> {
                 .max_chars
                 .min(context::ctxfiles::PROGRESSIVE_MAX_CHARS),
         );
-    let medha_home = config::medha_home()?;
     let startup_context = if lock.context_files.enabled {
         context_file_loader
             .discover_startup(&cwd, &medha_home)
@@ -1123,10 +1195,10 @@ async fn main() -> Result<()> {
     let persona_file = context_file_loader.load_persona(&medha_home).await?;
     let progressive_context =
         (lock.context_files.enabled && lock.context_files.progressive_discovery).then(|| {
-            Arc::new(context::ctxfiles::ProgressiveContextFiles::new(
-                context_file_loader,
-                cwd.clone(),
-            ))
+            Arc::new(
+                context::ctxfiles::ProgressiveContextFiles::new(context_file_loader, cwd.clone())
+                    .with_authorizer(workspace.clone()),
+            )
         });
     let skill_store = Arc::new(
         tools::SkillStore::new(
@@ -1136,7 +1208,7 @@ async fn main() -> Result<()> {
         .with_judge(security_judge),
     );
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
-    if lock.lsp.enabled {
+    let lsp_manager = if lock.lsp.enabled {
         let mut lsp_config = lsp::Config {
             enabled: true,
             startup_timeout: std::time::Duration::from_millis(lock.lsp.startup_timeout_ms),
@@ -1195,8 +1267,12 @@ async fn main() -> Result<()> {
                 .retain(|existing| existing.id != adapter.id);
             lsp_config.servers.push(adapter);
         }
-        registry.register_lsp(Arc::new(lsp::LspManager::new(cwd.clone(), lsp_config)));
-    }
+        let manager = Arc::new(lsp::LspManager::new(cwd.clone(), lsp_config));
+        registry.register_lsp(manager.clone());
+        Some(manager)
+    } else {
+        None
+    };
     // MCP servers live in the user config (~/.medha/config.toml); their keys live
     // in the credential store and are substituted into explicit env at spawn. The
     // lockfile only carries runtime tuning (timeouts, allow_network) + the switch.
@@ -1252,7 +1328,7 @@ async fn main() -> Result<()> {
     // entries in the user-global store — recall merges both.
     let memory_store = Arc::new(memory::MemoryProjection::open(
         state.join("memory.db"),
-        config::medha_home()?.join("memory.db"),
+        medha_home.join("memory.db"),
     )?);
     let k3_budget_tokens = lock.memory.k3_budget_tokens;
     let stale_after_days = lock.memory.stale_after_days;
@@ -1314,7 +1390,19 @@ async fn main() -> Result<()> {
     // Filled once the session budget is resolved, below. Children read it at
     // spawn time, which is always after that.
     let agent_budget: kernel::BudgetHandle = Arc::new(std::sync::Mutex::new(None));
+    let agent_log_outbox = if lock.agents.enabled {
+        Some(Arc::new(
+            agents::LogOutbox::new(log.clone(), state.join("agent-process-leases"))
+                .context("creating the agent process lease")?,
+        ))
+    } else {
+        None
+    };
     let agent_control = lock.agents.enabled.then(|| {
+        let log_outbox = agent_log_outbox
+            .as_ref()
+            .expect("enabled agents have a process lease")
+            .clone();
         let mut control = orchestrator::AgentControl::new(
             agent_runner.clone(),
             tokio_util::sync::CancellationToken::new(),
@@ -1331,11 +1419,11 @@ async fn main() -> Result<()> {
         ))
         // Delivery rides the event log, so a background report survives a
         // restart and reaches the session that dispatched it.
-        .with_outbox(Arc::new(agents::LogOutbox::new(log.clone())))
+        .with_outbox(log_outbox.clone())
         // Same fold, read as conversation rather than as delivery: a forked
         // child starts with what the caller already knows instead of paying to
         // rediscover it.
-        .with_transcripts(Arc::new(agents::LogOutbox::new(log.clone())))
+        .with_transcripts(log_outbox)
         // Durable patch records live on the owning session's chain, so the
         // control plane shares the same session slot the agent tools use —
         // filled once the session id exists.
@@ -1599,6 +1687,11 @@ async fn main() -> Result<()> {
             &file.path.display().to_string(),
             &file.content,
             file.blocked(),
+            if file.global {
+                kernel::TrustLabel::User
+            } else {
+                kernel::TrustLabel::Workspace
+            },
         ))
         .await?;
     }
@@ -1616,18 +1709,28 @@ async fn main() -> Result<()> {
 
     // Editor bridge mode: hand the whole session to the ACP loop over stdio and
     // return when the editor disconnects. Takes priority over TUI/headless.
-    if let Some((writer, pending)) = acp_bridge {
-        acp::run(
+    if let Some(bridge) = acp_bridge {
+        let surface_result = acp::run(
             kernel.clone(),
             session,
             system,
             model_name,
             base_budget.clone(),
             Arc::clone(&agent_budget),
-            writer,
-            pending,
+            resumed,
+            bridge,
         )
-        .await?;
+        .await;
+        if let Some(control) = &agent_control {
+            control.shutdown().await;
+        }
+        if let Some(manager) = &lsp_manager {
+            manager.shutdown_all().await;
+        }
+        if let Some(manager) = &mcp_manager {
+            manager.shutdown().await;
+        }
+        surface_result?;
         return Ok(());
     }
 
@@ -1635,7 +1738,7 @@ async fn main() -> Result<()> {
     // --plain for the scrolling REPL, usage if there's no terminal at all).
     // A task always runs headless (scripting/CI).
     if !has_task {
-        if let Some((tx, rx)) = tui_channel {
+        let surface_result = if let Some((tx, rx)) = tui_channel {
             tui_tea::run_tea(
                 kernel.clone(),
                 session,
@@ -1662,7 +1765,7 @@ async fn main() -> Result<()> {
                 tx,
                 rx,
             )
-            .await?;
+            .await
         } else if is_tty {
             run_repl(
                 &kernel,
@@ -1674,10 +1777,11 @@ async fn main() -> Result<()> {
                 Arc::clone(&agent_budget),
                 resumed,
             )
-            .await?;
+            .await
         } else {
             eprintln!("usage: medha \"<task>\"   (run `medha --setup` to reconfigure)");
-        }
+            Ok(())
+        };
         // A backgrounded agent outlives the turn that spawned it, so leaving the
         // session without settling it would let a child keep spending against the
         // user's account with nothing watching. Its partial result is persisted
@@ -1685,13 +1789,19 @@ async fn main() -> Result<()> {
         if let Some(control) = &agent_control {
             control.shutdown().await;
         }
+        if let Some(manager) = &lsp_manager {
+            manager.shutdown_all().await;
+        }
+        if let Some(manager) = &mcp_manager {
+            manager.shutdown().await;
+        }
+        surface_result?;
         return Ok(());
     }
 
     // Headless one-shot: stream the run live via the sink, then a trailing
     // newline. (Structured NDJSON output for CI is a separate `--json` mode.)
-    let mut messages = vec![Message::system(system)];
-    messages.extend(resumed);
+    let mut messages = session_transcript(system, resumed);
     // Reports from agents an earlier run left behind. Delivery is durable, so a
     // child that finished after its session ended is picked up here rather than
     // only in the TUI.
@@ -1730,16 +1840,20 @@ async fn main() -> Result<()> {
         )
         .await;
     let committed = run.is_ok();
-    match run {
-        Ok((_t, kernel::StopReason::Budget(stop))) => {
-            eprintln!(
-                "\n(stopped: {} reached — raise the limit to continue)",
-                stop.label()
-            );
+    let outcome = match run {
+        Ok((_t, kernel::StopReason::Budget(stop))) => Err(anyhow::anyhow!(
+            "headless run stopped because the {} limit was reached; raise the limit to continue",
+            stop.label()
+        )),
+        Ok((_t, kernel::StopReason::Interrupted)) => {
+            Err(anyhow::anyhow!("headless run was interrupted"))
         }
-        Ok(_) => println!(),
-        Err(e) => eprintln!("error: {e}"),
-    }
+        Ok((_t, kernel::StopReason::Finished)) => {
+            println!();
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!("headless run failed: {error}")),
+    };
     if let Some(control) = &agent_control {
         // After the run: the reports are in the log by then. Acknowledging at
         // collection time lost them whenever the run that took them failed.
@@ -1748,7 +1862,13 @@ async fn main() -> Result<()> {
         }
         control.shutdown().await;
     }
-    Ok(())
+    if let Some(manager) = &lsp_manager {
+        manager.shutdown_all().await;
+    }
+    if let Some(manager) = &mcp_manager {
+        manager.shutdown().await;
+    }
+    outcome
 }
 
 /// Tool classes that require human approval, from `medha.lock`'s `[policy]
@@ -2001,7 +2121,7 @@ fn lsp_install_hint(id: &str) -> &'static str {
 /// silently unavailable is to notice that answers look like text matches.
 async fn run_lsp_command(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let lock = lockfile::MedhaLock::load(&cwd).unwrap_or_default();
+    let lock = lockfile::MedhaLock::load(cwd.join("medha.lock"))?.unwrap_or_default();
     let mut config = lsp::Config {
         enabled: lock.lsp.enabled,
         ..lsp::Config::default()
@@ -2482,18 +2602,19 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
     }
 }
 
-/// One-time move of pre-relocation runtime state from `<workspace>/.medha` into
-/// the new per-workspace state dir (`~/.medha/projects/<enc>`). Non-destructive:
-/// each item moves only if the destination does not already exist, so a fresh
-/// state dir wins and re-running never clobbers. Committed config (`skills`,
-/// `agents`, …) is deliberately NOT moved — it belongs in the workspace.
-fn migrate_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
+/// Detect pre-relocation runtime state in `<workspace>/.medha`, but never import
+/// it automatically.
+///
+/// A checkout is repository-controlled input. It can contain forged event
+/// chains or symlinks named `events.db`, `artifacts`, `logs`, or `trust.lock`.
+/// Moving any of those beneath machine-local state would turn untrusted
+/// repository data into an authority source and can redirect later SQLite,
+/// artifact, or log I/O outside the workspace. There is no reliable way to
+/// distinguish a legitimate old local directory from one supplied by a clone,
+/// so recovery must be an explicit, separately validated operator action.
+fn warn_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
     let legacy = cwd.join(".medha");
-    if !legacy.exists() {
-        return;
-    }
-    // events.db carries WAL/SHM sidecars — move them together or the log breaks.
-    for name in [
+    let runtime_entries = [
         "events.db",
         "events.db-wal",
         "events.db-shm",
@@ -2501,82 +2622,25 @@ fn migrate_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
         "snapshots",
         "logs",
         "trust.lock",
-    ] {
-        let (from, to) = (legacy.join(name), state.join(name));
-        if from.exists() && !to.exists() {
-            if let Err(e) = move_path(&from, &to) {
-                // Don't silently swallow — surface it so a failed move never
-                // looks like lost history (the source is left in place).
-                eprintln!(
-                    "warning: could not migrate {} → {} ({e}). Move it manually to keep the old history.",
-                    from.display(),
-                    to.display()
-                );
-            }
-        }
+    ];
+    let found = runtime_entries
+        .iter()
+        // `symlink_metadata` also detects dangling links without following
+        // them. Detection itself must not dereference repository-controlled
+        // paths.
+        .filter(|name| std::fs::symlink_metadata(legacy.join(name)).is_ok())
+        .copied()
+        .collect::<Vec<_>>();
+    if !found.is_empty() {
+        eprintln!(
+            "warning: ignored repository-local legacy runtime state in {} ({}) — \
+             automatic import is disabled because a checkout cannot authenticate \
+             event, artifact, log, or trust data; fresh machine-local state is in {}",
+            legacy.display(),
+            found.join(", "),
+            state.display()
+        );
     }
-    // Remove the blanket ".medha/.gitignore" older builds wrote (content "*"): it
-    // would now wrongly ignore committed project skills. Only delete our own file.
-    let gi = legacy.join(".gitignore");
-    if let Ok(text) = std::fs::read_to_string(&gi) {
-        if text.contains("MEDHA local state") {
-            std::fs::remove_file(&gi).ok();
-        }
-    }
-    // If nothing committed is left (no skills/agents/etc.), remove the empty dir
-    // so a migrated workspace carries no stray .medha at all.
-    if std::fs::read_dir(&legacy)
-        .map(|mut d| d.next().is_none())
-        .unwrap_or(false)
-    {
-        std::fs::remove_dir(&legacy).ok();
-    }
-}
-
-/// Move a file or directory, bulletproof across filesystems: try the atomic
-/// `rename` first (same volume), and on ANY failure — cross-device `EXDEV` is the
-/// common one when `~/.medha` and the workspace sit on different drives — fall
-/// back to a recursive copy-then-delete so the migration never gives up silently.
-fn move_path(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    if std::fs::rename(from, to).is_ok() {
-        return Ok(());
-    }
-    move_by_copy(from, to)
-}
-
-/// The cross-device fallback for [`move_path`]: copy the tree, then delete the
-/// source. Only leaves the source behind if the *delete* fails (data is already
-/// safe at `to` by then). Factored out so this branch is unit-testable without
-/// actually needing two filesystems.
-fn move_by_copy(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    if from.is_dir() {
-        copy_dir_all(from, to)?;
-        std::fs::remove_dir_all(from)?;
-    } else {
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(from, to)?;
-        std::fs::remove_file(from)?;
-    }
-    Ok(())
-}
-
-/// Recursively copy a directory tree (regular files + nested dirs). Symlinks are
-/// followed (their target content is copied) — MEDHA's state dirs hold regular
-/// files, so this is safe and keeps the copy self-contained on the destination.
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let target = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
 }
 
 /// Print the workspace's past sessions (newest first) for `--sessions`.
@@ -2654,8 +2718,7 @@ where
 
     println!("MEDHA — interactive session. /help for commands, /exit to quit.\n");
     let mut rl = DefaultEditor::new()?;
-    let mut transcript = vec![Message::system(system)];
-    transcript.extend(resumed); // prior conversation when resuming (else empty)
+    let mut transcript = session_transcript(system, resumed);
 
     // Real prompt-token count from the provider's last response (0 until the
     // first turn). The pressure meter reflects this — actual tokens, not a guess.
@@ -2884,98 +2947,94 @@ mod migration_tests {
         d
     }
 
-    /// Legacy <workspace>/.medha state moves to the new state dir, the stale
-    /// blanket gitignore is dropped, and an emptied legacy dir is removed —
-    /// while committed config (skills) is left untouched.
+    /// Every old runtime entry is repository-controlled on first checkout.
+    /// None may cross into the machine-local state directory automatically,
+    /// even when the destination is empty.
     #[test]
-    fn migrates_state_out_of_workspace_and_keeps_committed_config() {
+    fn never_imports_repository_local_runtime_state() {
         let root = tmp();
         let (cwd, state) = (root.join("ws"), root.join("state"));
         let legacy = cwd.join(".medha");
         std::fs::create_dir_all(legacy.join("logs")).unwrap();
+        std::fs::create_dir_all(legacy.join("artifacts")).unwrap();
+        std::fs::create_dir_all(legacy.join("snapshots")).unwrap();
         std::fs::create_dir_all(legacy.join("skills").join("mine")).unwrap();
         std::fs::write(legacy.join("events.db"), b"DB").unwrap();
+        std::fs::write(legacy.join("events.db-wal"), b"WAL").unwrap();
+        std::fs::write(legacy.join("events.db-shm"), b"SHM").unwrap();
         std::fs::write(legacy.join("logs").join("medha.log"), b"log").unwrap();
-        std::fs::write(
-            legacy.join(".gitignore"),
-            "# MEDHA local state — never commit\n*\n",
-        )
-        .unwrap();
+        std::fs::write(legacy.join("artifacts").join("deadbeef"), b"artifact").unwrap();
+        std::fs::write(legacy.join("snapshots").join("snapshot"), b"snapshot").unwrap();
+        std::fs::write(legacy.join("trust.lock"), b"repository grant").unwrap();
         std::fs::write(legacy.join("skills").join("mine").join("SKILL.md"), "x").unwrap();
         std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("sentinel"), b"machine local").unwrap();
 
-        migrate_legacy_state(&cwd, &state);
+        warn_legacy_state(&cwd, &state);
 
-        // State moved out.
-        assert_eq!(std::fs::read(state.join("events.db")).unwrap(), b"DB");
-        assert!(state.join("logs").join("medha.log").exists());
-        assert!(!legacy.join("events.db").exists());
-        // Stale auto-gitignore dropped; committed skills kept in the workspace.
-        assert!(!legacy.join(".gitignore").exists());
-        assert!(
-            legacy.join("skills").join("mine").join("SKILL.md").exists(),
-            "committed config must stay"
-        );
-        // Legacy dir NOT removed because skills/ remains.
-        assert!(legacy.exists());
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// Non-destructive: a file already present in the new state dir is never
-    /// clobbered by an older legacy copy.
-    #[test]
-    fn does_not_clobber_existing_state() {
-        let root = tmp();
-        let (cwd, state) = (root.join("ws"), root.join("state"));
-        std::fs::create_dir_all(cwd.join(".medha")).unwrap();
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(cwd.join(".medha").join("events.db"), b"OLD").unwrap();
-        std::fs::write(state.join("events.db"), b"NEW").unwrap();
-
-        migrate_legacy_state(&cwd, &state);
-
+        for name in [
+            "events.db",
+            "events.db-wal",
+            "events.db-shm",
+            "artifacts",
+            "snapshots",
+            "logs",
+            "trust.lock",
+        ] {
+            assert!(
+                std::fs::symlink_metadata(legacy.join(name)).is_ok(),
+                "untrusted source {name} must remain untouched"
+            );
+            assert!(
+                std::fs::symlink_metadata(state.join(name)).is_err(),
+                "untrusted {name} reached machine-local state"
+            );
+        }
         assert_eq!(
-            std::fs::read(state.join("events.db")).unwrap(),
-            b"NEW",
-            "existing state wins"
+            std::fs::read(state.join("sentinel")).unwrap(),
+            b"machine local"
         );
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The cross-device fallback (used when rename hits EXDEV) must faithfully
-    /// copy a nested directory tree and then remove the source. We call it
-    /// directly so the branch is covered without needing two real filesystems.
+    #[cfg(unix)]
     #[test]
-    fn move_by_copy_relocates_nested_tree_and_removes_source() {
+    fn legacy_symlinks_are_detected_without_being_followed() {
+        use std::os::unix::fs::symlink;
+
         let root = tmp();
-        let (from, to) = (root.join("from"), root.join("to"));
-        std::fs::create_dir_all(from.join("sub")).unwrap();
-        std::fs::write(from.join("a.txt"), b"A").unwrap();
-        std::fs::write(from.join("sub").join("b.txt"), b"B").unwrap();
+        let cwd = root.join("ws");
+        let state = root.join("state");
+        let legacy = cwd.join(".medha");
+        let outside_db = root.join("outside.db");
+        let outside_artifacts = root.join("outside-artifacts");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&outside_artifacts).unwrap();
+        std::fs::write(&outside_db, b"not a Medha database").unwrap();
+        std::fs::write(outside_artifacts.join("secret"), b"host data").unwrap();
+        symlink(&outside_db, legacy.join("events.db")).unwrap();
+        symlink(&outside_artifacts, legacy.join("artifacts")).unwrap();
 
-        move_by_copy(&from, &to).unwrap();
+        warn_legacy_state(&cwd, &state);
 
-        assert_eq!(std::fs::read(to.join("a.txt")).unwrap(), b"A");
-        assert_eq!(std::fs::read(to.join("sub").join("b.txt")).unwrap(), b"B");
         assert!(
-            !from.exists(),
-            "source is removed after a successful copy-move"
+            std::fs::symlink_metadata(legacy.join("events.db"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// A single file goes through the same fallback (creating the parent).
-    #[test]
-    fn move_by_copy_relocates_single_file() {
-        let root = tmp();
-        let from = root.join("db");
-        std::fs::write(&from, b"DB").unwrap();
-        let to = root.join("nested").join("db");
-
-        move_by_copy(&from, &to).unwrap();
-
-        assert_eq!(std::fs::read(&to).unwrap(), b"DB");
-        assert!(!from.exists());
+        assert!(
+            std::fs::symlink_metadata(legacy.join("artifacts"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!state.exists(), "detection must not create trusted state");
+        assert_eq!(std::fs::read(&outside_db).unwrap(), b"not a Medha database");
+        assert_eq!(
+            std::fs::read(outside_artifacts.join("secret")).unwrap(),
+            b"host data"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

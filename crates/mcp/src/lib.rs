@@ -1513,7 +1513,13 @@ impl McpManager {
         if let Some(dir) = &cache {
             let _ = std::fs::create_dir_all(dir);
         }
-        let backend = select_backend(&sandbox_config, cache.clone().into_iter().collect());
+        // Servers get no user-approved roots: an approval covers the agent's
+        // own commands, not a long-lived package-manager subprocess.
+        let backend = select_backend(
+            &sandbox_config,
+            cache.clone().into_iter().collect(),
+            sandbox::ApprovedRoots::default(),
+        );
         if !allow_network && backend.label() == "host" {
             return Err(Error::Sandbox(format!(
                 "network-denied isolation is unavailable for '{}'; allow network for it or the host",
@@ -1778,7 +1784,7 @@ fn kill_process_group(pid: Option<u32>) {
 fn mcp_cache_dir() -> Option<PathBuf> {
     let base = std::env::var_os("MEDHA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".medha")))?;
+        .or_else(|| dirs::home_dir().map(|home| home.join(".medha")))?;
     Some(base.join("mcp-cache"))
 }
 
@@ -1799,6 +1805,18 @@ fn sanitized_environment() -> Vec<(String, String)> {
         "XDG_CACHE_HOME",
         "SystemRoot",
         "PATHEXT",
+        // Windows has no `HOME`; without the user profile, uvx and npx cannot
+        // find the package roots and caches they install servers into.
+        "USERPROFILE",
+        "USERNAME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "SystemDrive",
+        "windir",
+        "COMSPEC",
     ];
     ALLOWED
         .iter()

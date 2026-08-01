@@ -49,10 +49,15 @@ pub struct Finding {
 pub struct ScanReport {
     pub verdict: ScanVerdict,
     pub findings: Vec<Finding>,
+    /// True when a structural property (opaque bytes, archive, executable bit,
+    /// or unrecognized runnable-looking file) requires a human decision. An LLM
+    /// content judge must not downgrade this to Safe because it cannot inspect
+    /// or prove the runtime behavior of those bytes.
+    pub requires_explicit_review: bool,
 }
 
 impl ScanReport {
-    fn from_findings(findings: Vec<Finding>) -> Self {
+    fn from_findings(findings: Vec<Finding>, requires_explicit_review: bool) -> Self {
         let verdict = findings
             .iter()
             .map(|f| f.severity)
@@ -62,33 +67,102 @@ impl ScanReport {
                 Severity::Caution => ScanVerdict::Caution,
             })
             .unwrap_or(ScanVerdict::Safe);
-        Self { verdict, findings }
+        Self {
+            verdict,
+            findings,
+            requires_explicit_review,
+        }
     }
 }
 
-/// Scan a whole package: an iterator of `(relative_path, contents)`. Binary
-/// files are noted but not pattern-scanned — they are inert until referenced,
-/// and byte-pattern matching on them is noise. Text files are screened for
-/// dangerous/ambiguous commands (shared runtime scanner) and for authoring
-/// attacks (prompt injection, hidden Unicode).
+/// Scan a whole package: an iterator of `(relative_path, contents)`. Callers
+/// without filesystem mode information use this convenience wrapper; staged
+/// package installation uses [`scan_package_with_modes`] so executable bits
+/// also become review evidence.
 pub fn scan_package<'a, I>(files: I) -> ScanReport
 where
     I: IntoIterator<Item = (&'a str, &'a [u8])>,
 {
+    scan_package_with_modes(files.into_iter().map(|(path, bytes)| (path, bytes, false)))
+}
+
+/// Scan package bytes plus the executable bit observed on disk. Opaque binaries,
+/// archives, executable files, and unrecognized assets never receive a `Safe`
+/// verdict. Known executable binary formats are refused outright.
+pub fn scan_package_with_modes<'a, I>(files: I) -> ScanReport
+where
+    I: IntoIterator<Item = (&'a str, &'a [u8], bool)>,
+{
     let mut findings = Vec::new();
-    for (path, bytes) in files {
-        // A binary asset is inert until referenced and has no text to scan.
-        if let Ok(text) = std::str::from_utf8(bytes) {
-            scan_text(path, text, &mut findings);
+    let mut requires_explicit_review = false;
+    for (path, bytes, executable) in files {
+        if is_executable_binary(bytes) {
+            findings.push(Finding {
+                file: path.to_string(),
+                line: None,
+                severity: Severity::Dangerous,
+                reason: "executable binary payload is not permitted in a skill package".into(),
+            });
+            requires_explicit_review = true;
+            continue;
+        }
+        if is_archive(path, bytes) {
+            findings.push(Finding {
+                file: path.to_string(),
+                line: None,
+                severity: Severity::Caution,
+                reason: "nested archive requires explicit review before use".into(),
+            });
+            requires_explicit_review = true;
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                let recognized = is_markdown(path)
+                    || is_script(path, text, executable)
+                    || is_known_data_text(path);
+                if executable {
+                    findings.push(Finding {
+                        file: path.to_string(),
+                        line: None,
+                        severity: Severity::Caution,
+                        reason: "executable package file requires explicit review".into(),
+                    });
+                    requires_explicit_review = true;
+                } else if !recognized {
+                    findings.push(Finding {
+                        file: path.to_string(),
+                        line: None,
+                        severity: Severity::Caution,
+                        reason: "unrecognized text asset requires explicit review before execution"
+                            .into(),
+                    });
+                    requires_explicit_review = true;
+                }
+                scan_text_with_mode(path, text, executable, &mut findings);
+            }
+            Err(_) => {
+                findings.push(Finding {
+                    file: path.to_string(),
+                    line: None,
+                    severity: Severity::Caution,
+                    reason: "opaque binary asset requires explicit review and cannot be executed"
+                        .into(),
+                });
+                requires_explicit_review = true;
+            }
         }
     }
-    ScanReport::from_findings(findings)
+    ScanReport::from_findings(findings, requires_explicit_review)
 }
 
 /// Scan one text file's contents, pushing any findings. Public so a caller can
 /// screen a single staged file (e.g. a lone `SKILL.md`) without collecting a
 /// package first.
 pub fn scan_text(path: &str, text: &str, out: &mut Vec<Finding>) {
+    scan_text_with_mode(path, text, false, out);
+}
+
+fn scan_text_with_mode(path: &str, text: &str, executable: bool, out: &mut Vec<Finding>) {
     scan_hidden_unicode(path, text, out);
     scan_injection(path, text, out);
     // Command-danger scanning applies only where a command could actually be —
@@ -104,7 +178,7 @@ pub fn scan_text(path: &str, text: &str, out: &mut Vec<Finding>) {
     // skill's reference.md drowns in false cautions). Scripts get both.
     let (commands, docs_only) = if is_markdown(path) {
         (extract_markdown_code(text), true)
-    } else if is_script(path, text) {
+    } else if is_script(path, text, executable) {
         (
             text.lines()
                 .enumerate()
@@ -125,7 +199,7 @@ pub fn scan_text(path: &str, text: &str, out: &mut Vec<Finding>) {
                 reason,
             });
         } else if !docs_only {
-            if let Some(reason) = crate::needs_review(&c) {
+            if let Some(reason) = crate::needs_review(&c, None) {
                 out.push(Finding {
                     file: path.to_string(),
                     line: Some(line),
@@ -137,10 +211,10 @@ pub fn scan_text(path: &str, text: &str, out: &mut Vec<Finding>) {
     }
 }
 
-/// Whether a file is a script worth command-scanning: a known script extension,
-/// a known shell-ish filename, or an extensionless file opening with a shebang.
-/// Everything else is treated as data/prose (command scan skipped).
-fn is_script(path: &str, text: &str) -> bool {
+/// Whether a file is runnable-looking and therefore command-scanned: a known
+/// script name/extension, any shebang regardless of extension, or an executable
+/// filesystem mode. This catches renamed `payload.dat` scripts.
+fn is_script(path: &str, text: &str, executable: bool) -> bool {
     let p = path.to_ascii_lowercase();
     let base = p.rsplit('/').next().unwrap_or(&p);
     if matches!(
@@ -163,13 +237,57 @@ fn is_script(path: &str, text: &str) -> bool {
     if SCRIPT_EXT.iter().any(|e| base.ends_with(e)) {
         return true;
     }
-    // Extensionless file with a shebang (e.g. `bin/deploy` starting `#!/bin/sh`).
-    !base.contains('.') && text.trim_start().starts_with("#!")
+    executable || text.trim_start().starts_with("#!")
 }
 
 fn is_markdown(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     p.ends_with(".md") || p.ends_with(".markdown")
+}
+
+fn is_known_data_text(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    let base = p.rsplit('/').next().unwrap_or(&p);
+    if matches!(
+        base,
+        "readme" | "license" | "notice" | "changelog" | "authors" | "copying"
+    ) {
+        return true;
+    }
+    const DATA_EXT: &[&str] = &[
+        ".txt", ".rst", ".adoc", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".xml", ".xsd",
+        ".csv", ".tsv", ".html", ".htm", ".css", ".svg", ".sql", ".graphql", ".proto", ".ini",
+        ".cfg", ".conf", ".lock",
+    ];
+    DATA_EXT.iter().any(|ext| base.ends_with(ext))
+}
+
+fn is_executable_binary(bytes: &[u8]) -> bool {
+    const MAGICS: &[&[u8]] = &[
+        b"\x7fELF",
+        b"MZ",
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\0asm",
+    ];
+    MAGICS.iter().any(|magic| bytes.starts_with(magic))
+}
+
+fn is_archive(path: &str, bytes: &[u8]) -> bool {
+    let p = path.to_ascii_lowercase();
+    const ARCHIVE_EXT: &[&str] = &[
+        ".zip", ".tar", ".tgz", ".tar.gz", ".gz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war",
+    ];
+    ARCHIVE_EXT.iter().any(|ext| p.ends_with(ext))
+        || bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"\x1f\x8b")
+        || bytes.starts_with(b"7z\xbc\xaf\x27\x1c")
+        || bytes.starts_with(b"Rar!\x1a\x07")
+        || bytes.get(257..262) == Some(b"ustar")
 }
 
 /// Pull runnable code out of markdown as `(line, code)` pairs: the interior of
@@ -551,9 +669,41 @@ mod tests {
     }
 
     #[test]
-    fn binary_files_are_not_scanned() {
-        // Arbitrary bytes (not valid UTF-8) must not panic or false-positive.
+    fn opaque_binary_files_require_explicit_review() {
+        // Arbitrary bytes must not panic, but they also cannot be silently
+        // trusted as inert: a renamed launcher is indistinguishable here.
         let r = scan_package([("assets/logo.png", &[0xff, 0xfe, 0x00, 0x01][..])]);
-        assert_eq!(r.verdict, ScanVerdict::Safe);
+        assert_eq!(r.verdict, ScanVerdict::Caution);
+        assert!(r.requires_explicit_review);
+    }
+
+    #[test]
+    fn runnable_and_opaque_skill_assets_never_pass_as_safe() {
+        let renamed =
+            scan_package([("scripts/payload.dat", b"#!/bin/sh\nrm -f -r /\n".as_slice())]);
+        assert_eq!(renamed.verdict, ScanVerdict::Dangerous);
+
+        let extensionless =
+            scan_package_with_modes([("bin/deploy", b"echo deploy\n".as_slice(), true)]);
+        assert_eq!(extensionless.verdict, ScanVerdict::Caution);
+        assert!(extensionless.requires_explicit_review);
+
+        let elf = scan_package([(
+            "assets/logo.png",
+            b"\x7fELF\x02\x01\x01\0opaque launcher".as_slice(),
+        )]);
+        assert_eq!(elf.verdict, ScanVerdict::Dangerous);
+        assert!(elf.requires_explicit_review);
+
+        let archive = scan_package([(
+            "references/notes.txt",
+            b"PK\x03\x04nested archive bytes".as_slice(),
+        )]);
+        assert_eq!(archive.verdict, ScanVerdict::Caution);
+        assert!(archive.requires_explicit_review);
+
+        let unknown_text = scan_package([("scripts/payload.dat", b"print('hello')".as_slice())]);
+        assert_eq!(unknown_text.verdict, ScanVerdict::Caution);
+        assert!(unknown_text.requires_explicit_review);
     }
 }

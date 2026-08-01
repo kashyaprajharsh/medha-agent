@@ -965,6 +965,7 @@ mod tests {
                 source: MediaSource::Url("https://example.test/image.png".into()),
                 provider_state: Vec::new(),
             })],
+            trust: None,
         }];
 
         let error = lower_chat_messages(&messages, &HashMap::new())
@@ -990,6 +991,7 @@ mod tests {
                 text: "hello".into(),
                 provider_state: vec![state(Protocol::OpenAiChat)],
             })],
+            trust: None,
         }];
         let error = lower_chat_messages(&own, &HashMap::new())
             .err()
@@ -1002,6 +1004,7 @@ mod tests {
                 text: "hello".into(),
                 provider_state: vec![state(Protocol::AnthropicMessages)],
             })],
+            trust: None,
         }];
         let lowered = lower_chat_messages(&foreign, &HashMap::new()).unwrap();
         assert_eq!(lowered[0].content, "hello");
@@ -1023,6 +1026,7 @@ mod tests {
                     provider_state: Vec::new(),
                 }),
             ],
+            trust: None,
         }];
 
         let lowered = lower_chat_messages(&messages, &HashMap::new()).unwrap();
@@ -1047,6 +1051,7 @@ mod tests {
                     provider_state: Vec::new(),
                 }),
             ],
+            trust: None,
         }];
 
         let error = lower_chat_messages(&messages, &HashMap::new())

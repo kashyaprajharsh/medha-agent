@@ -7,8 +7,11 @@ use crate::entry::{MemoryEntry, Scope};
 use kernel::{Event, EventKind};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
@@ -105,12 +108,14 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
     })
 }
 
-fn upsert(conn: &Connection, entry: &MemoryEntry) -> Result<(), MemoryError> {
+fn upsert_into(conn: &Connection, table: &str, entry: &MemoryEntry) -> Result<(), MemoryError> {
+    let unqualified_table = table.rsplit('.').next().unwrap_or(table);
     let provenance = serde_json::to_string(&entry.provenance).unwrap_or_default();
     let sessions = serde_json::to_string(&entry.sessions).unwrap_or_default();
     let links = serde_json::to_string(&entry.links).unwrap_or_default();
     conn.execute(
-        "INSERT INTO entries
+        &format!(
+            "INSERT INTO {table}
             (scope, name, claim, description, kind, trust, confidence, provenance,
              sessions, version, pinned, links, created, updated, tombstoned)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14, 0)
@@ -118,7 +123,9 @@ fn upsert(conn: &Connection, entry: &MemoryEntry) -> Result<(), MemoryError> {
             claim=excluded.claim, description=excluded.description, kind=excluded.kind,
             trust=excluded.trust, confidence=excluded.confidence, provenance=excluded.provenance,
             sessions=excluded.sessions, version=excluded.version, pinned=excluded.pinned,
-            links=excluded.links, created=entries.created, updated=excluded.updated, tombstoned=0",
+            links=excluded.links, created={unqualified_table}.created,
+            updated=excluded.updated, tombstoned=0"
+        ),
         rusqlite::params![
             entry.scope.as_str(),
             entry.name,
@@ -137,7 +144,11 @@ fn upsert(conn: &Connection, entry: &MemoryEntry) -> Result<(), MemoryError> {
         ],
     )
     .map_err(|e| MemoryError::Db(e.to_string()))?;
+    Ok(())
+}
 
+fn upsert(conn: &Connection, entry: &MemoryEntry) -> Result<(), MemoryError> {
+    upsert_into(conn, "entries", entry)?;
     // FTS mirror: delete-then-reinsert is simplest to keep in sync (no
     // external-content triggers needed at this size).
     conn.execute(
@@ -173,12 +184,17 @@ fn fts_match_expr(raw: &str) -> Option<String> {
     }
 }
 
-fn forget(conn: &Connection, scope: Scope, name: &str) -> Result<(), MemoryError> {
+fn forget_in(conn: &Connection, table: &str, scope: Scope, name: &str) -> Result<(), MemoryError> {
     conn.execute(
-        "UPDATE entries SET tombstoned = 1 WHERE scope = ?1 AND name = ?2",
+        &format!("UPDATE {table} SET tombstoned = 1 WHERE scope = ?1 AND name = ?2"),
         rusqlite::params![scope.as_str(), name],
     )
     .map_err(|e| MemoryError::Db(e.to_string()))?;
+    Ok(())
+}
+
+fn forget(conn: &Connection, scope: Scope, name: &str) -> Result<(), MemoryError> {
+    forget_in(conn, "entries", scope, name)?;
     conn.execute(
         "DELETE FROM entries_fts WHERE scope = ?1 AND name = ?2",
         rusqlite::params![scope.as_str(), name],
@@ -187,20 +203,128 @@ fn forget(conn: &Connection, scope: Scope, name: &str) -> Result<(), MemoryError
     Ok(())
 }
 
-fn pin(conn: &Connection, scope: Scope, name: &str, pinned: bool) -> Result<(), MemoryError> {
+fn pin_in(
+    conn: &Connection,
+    table: &str,
+    scope: Scope,
+    name: &str,
+    pinned: bool,
+) -> Result<(), MemoryError> {
     conn.execute(
-        "UPDATE entries SET pinned = ?1 WHERE scope = ?2 AND name = ?3",
+        &format!("UPDATE {table} SET pinned = ?1 WHERE scope = ?2 AND name = ?3"),
         rusqlite::params![pinned as i64, scope.as_str(), name],
     )
     .map_err(|e| MemoryError::Db(e.to_string()))?;
     Ok(())
 }
 
+fn pin(conn: &Connection, scope: Scope, name: &str, pinned: bool) -> Result<(), MemoryError> {
+    pin_in(conn, "entries", scope, name, pinned)
+}
+
+const ENTRY_COLUMNS: &str = "scope, name, claim, description, kind, trust, confidence, provenance,
+     sessions, version, pinned, links, created, updated, tombstoned";
+
+fn replay_into_staging(
+    conn: &Connection,
+    schema: &str,
+    scope: Option<Scope>,
+    preserve_other_scope: bool,
+    ops: &[MemoryOp],
+) -> Result<(), MemoryError> {
+    let stage = format!("{schema}entries_rebuild");
+    let entries = format!("{schema}entries");
+    let fts = format!("{schema}entries_fts");
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {stage} (
+            scope       TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            claim       TEXT NOT NULL,
+            description TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            trust       TEXT NOT NULL,
+            confidence  TEXT NOT NULL,
+            provenance  TEXT NOT NULL,
+            sessions    TEXT NOT NULL DEFAULT '[]',
+            version     INTEGER NOT NULL,
+            pinned      INTEGER NOT NULL,
+            links       TEXT NOT NULL,
+            created     REAL NOT NULL,
+            updated     REAL NOT NULL,
+            tombstoned  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (scope, name)
+         );
+         DELETE FROM {stage};"
+    ))
+    .map_err(|error| MemoryError::Db(error.to_string()))?;
+    if preserve_other_scope {
+        let rebuilt_scope = scope.expect("preserving the other scope requires one target scope");
+        conn.execute(
+            &format!(
+                "INSERT INTO {stage} ({ENTRY_COLUMNS})
+                 SELECT {ENTRY_COLUMNS} FROM {entries} WHERE scope != ?1"
+            ),
+            [rebuilt_scope.as_str()],
+        )
+        .map_err(|error| MemoryError::Db(error.to_string()))?;
+    }
+
+    for op in ops
+        .iter()
+        .filter(|op| scope.is_none_or(|scope| op.scope() == scope))
+    {
+        match op {
+            MemoryOp::Write { entry } | MemoryOp::Update { entry } => {
+                upsert_into(conn, &stage, entry)?
+            }
+            MemoryOp::Forget { scope, name } => forget_in(conn, &stage, *scope, name)?,
+            MemoryOp::Pin {
+                scope,
+                name,
+                pinned,
+            } => pin_in(conn, &stage, *scope, name, *pinned)?,
+        }
+    }
+
+    // The live projection changes only after the complete replay exists. Every
+    // statement below is in the caller's transaction, including the FTS mirror.
+    conn.execute_batch(&format!(
+        "DELETE FROM {entries};
+         INSERT INTO {entries} ({ENTRY_COLUMNS}) SELECT {ENTRY_COLUMNS} FROM {stage};
+         DELETE FROM {fts};
+         INSERT INTO {fts} (scope, name, description, claim)
+            SELECT scope, name, description, claim FROM {stage} WHERE tombstoned = 0;
+         DELETE FROM {stage};"
+    ))
+    .map_err(|error| MemoryError::Db(error.to_string()))
+}
+
+fn memory_ops(events: impl Iterator<Item = Event>) -> Result<Vec<MemoryOp>, MemoryError> {
+    events
+        .filter(|event| event.kind == EventKind::MemoryWrite)
+        .map(|event| {
+            serde_json::from_value::<MemoryOp>(event.payload).map_err(|error| {
+                MemoryError::Db(format!(
+                    "malformed durable memory event {}: {error}",
+                    event.id
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Two SQLite targets (D9): project entries live in the workspace projection,
 /// user entries in the user-global store. Recall merges both, project-first.
+#[derive(Clone)]
 pub struct MemoryProjection {
-    project: Mutex<Connection>,
-    user: Mutex<Connection>,
+    project: Arc<Mutex<Connection>>,
+    user: Arc<Mutex<Connection>>,
+    /// Async callers serialize before entering Tokio's blocking pool. This
+    /// prevents one locked SQLite database from occupying many blocking
+    /// workers and lets queued requests be cancelled before they start.
+    runtime_gate: Arc<tokio::sync::Semaphore>,
+    user_path: PathBuf,
+    same_database: bool,
 }
 
 impl MemoryProjection {
@@ -213,84 +337,137 @@ impl MemoryProjection {
                 std::fs::create_dir_all(parent).map_err(|e| MemoryError::Io(e.to_string()))?;
             }
             let conn = Connection::open(path).map_err(|e| MemoryError::Db(e.to_string()))?;
-            conn.pragma_update(None, "journal_mode", "WAL").ok();
+            conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+                .map_err(|e| MemoryError::Db(e.to_string()))?;
+            // DELETE journal mode gives SQLite a super-journal for the
+            // project+attached-user transaction used by a full rebuild.
+            conn.pragma_update(None, "journal_mode", "DELETE")
+                .map_err(|e| MemoryError::Db(e.to_string()))?;
             init_schema(&conn).map_err(|e| MemoryError::Db(e.to_string()))?;
             Ok(conn)
         };
+        let project_path = project_path.as_ref().to_path_buf();
+        let user_path = user_path.as_ref().to_path_buf();
+        let project = open_one(&project_path)?;
+        let user = open_one(&user_path)?;
+        let same_database = match (
+            std::fs::canonicalize(&project_path),
+            std::fs::canonicalize(&user_path),
+        ) {
+            (Ok(project), Ok(user)) => project == user,
+            _ => false,
+        };
         Ok(Self {
-            project: Mutex::new(open_one(project_path.as_ref())?),
-            user: Mutex::new(open_one(user_path.as_ref())?),
+            project: Arc::new(Mutex::new(project)),
+            user: Arc::new(Mutex::new(user)),
+            runtime_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            user_path,
+            same_database,
         })
     }
 
     fn conn_for(&self, scope: Scope) -> &Mutex<Connection> {
         match scope {
-            Scope::Project => &self.project,
-            Scope::User => &self.user,
+            Scope::Project => self.project.as_ref(),
+            Scope::User => self.user.as_ref(),
         }
     }
 
+    pub(crate) async fn run_blocking<T, F>(&self, operation: F) -> Result<T, MemoryError>
+    where
+        T: Send + 'static,
+        F: FnOnce(MemoryProjection) -> Result<T, MemoryError> + Send + 'static,
+    {
+        let permit = self
+            .runtime_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| MemoryError::Db(format!("SQLite worker closed: {error}")))?;
+        let projection = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation(projection)
+        })
+        .await
+        .map_err(|error| MemoryError::Db(format!("SQLite worker failed: {error}")))?
+    }
+
     pub fn apply(&self, op: &MemoryOp) -> Result<(), MemoryError> {
-        let conn = self
+        let mut conn = self
             .conn_for(op.scope())
             .lock()
             .map_err(|_| MemoryError::Poisoned)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| MemoryError::Db(error.to_string()))?;
         match op {
-            MemoryOp::Write { entry } | MemoryOp::Update { entry } => upsert(&conn, entry),
-            MemoryOp::Forget { scope, name } => forget(&conn, *scope, name),
+            MemoryOp::Write { entry } | MemoryOp::Update { entry } => upsert(&tx, entry)?,
+            MemoryOp::Forget { scope, name } => forget(&tx, *scope, name)?,
             MemoryOp::Pin {
                 scope,
                 name,
                 pinned,
-            } => pin(&conn, *scope, name, *pinned),
-        }
+            } => pin(&tx, *scope, name, *pinned)?,
+        };
+        tx.commit()
+            .map_err(|error| MemoryError::Db(error.to_string()))
     }
 
     /// Drop every row in both tables — the starting state `rebuild` replays onto.
     pub fn clear(&self) -> Result<(), MemoryError> {
-        for conn in [&self.project, &self.user] {
-            let conn = conn.lock().map_err(|_| MemoryError::Poisoned)?;
-            conn.execute_batch("DELETE FROM entries; DELETE FROM entries_fts;")
-                .map_err(|e| MemoryError::Db(e.to_string()))?;
-        }
-        Ok(())
+        self.rebuild(std::iter::empty())
     }
 
     pub fn clear_project(&self) -> Result<(), MemoryError> {
-        let conn = self.project.lock().map_err(|_| MemoryError::Poisoned)?;
-        conn.execute_batch("DELETE FROM entries; DELETE FROM entries_fts;")
-            .map_err(|error| MemoryError::Db(error.to_string()))
+        self.rebuild_project(std::iter::empty())
     }
 
-    /// Replay every `EventKind::MemoryWrite` in `events` (append order) onto a
-    /// freshly cleared projection. Rebuild ≡ the same incremental `apply` calls
-    /// — the replay-determinism invariant M1 exists to prove (Vol 3 §9).
+    /// Replay into staging tables, then replace primary + FTS projections in one
+    /// transaction. Malformed durable events fail before either live database
+    /// changes.
     pub fn rebuild(&self, events: impl Iterator<Item = Event>) -> Result<(), MemoryError> {
-        self.clear()?;
-        for e in events {
-            if e.kind != EventKind::MemoryWrite {
-                continue;
-            }
-            if let Ok(op) = serde_json::from_value::<MemoryOp>(e.payload) {
-                self.apply(&op)?;
-            }
+        let ops = memory_ops(events)?;
+        let mut project = self.project.lock().map_err(|_| MemoryError::Poisoned)?;
+        let _user = self.user.lock().map_err(|_| MemoryError::Poisoned)?;
+        if self.same_database {
+            let tx = project
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| MemoryError::Db(error.to_string()))?;
+            replay_into_staging(&tx, "", None, false, &ops)?;
+            return tx
+                .commit()
+                .map_err(|error| MemoryError::Db(error.to_string()));
         }
-        Ok(())
+
+        let user_path = self.user_path.to_string_lossy().into_owned();
+        project
+            .execute("ATTACH DATABASE ?1 AS rebuild_user", [&user_path])
+            .map_err(|error| MemoryError::Db(error.to_string()))?;
+        let result = (|| {
+            let tx = project
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| MemoryError::Db(error.to_string()))?;
+            replay_into_staging(&tx, "", Some(Scope::Project), false, &ops)?;
+            replay_into_staging(&tx, "rebuild_user.", Some(Scope::User), false, &ops)?;
+            tx.commit()
+                .map_err(|error| MemoryError::Db(error.to_string()))
+        })();
+        let detached = project
+            .execute_batch("DETACH DATABASE rebuild_user")
+            .map_err(|error| MemoryError::Db(error.to_string()));
+        result.and(detached)
     }
 
     pub fn rebuild_project(&self, events: impl Iterator<Item = Event>) -> Result<(), MemoryError> {
-        self.clear_project()?;
-        for event in events {
-            if event.kind != EventKind::MemoryWrite {
-                continue;
-            }
-            if let Ok(op) = serde_json::from_value::<MemoryOp>(event.payload) {
-                if op.scope() == Scope::Project {
-                    self.apply(&op)?;
-                }
-            }
-        }
-        Ok(())
+        let ops = memory_ops(events)?;
+        let mut project = self.project.lock().map_err(|_| MemoryError::Poisoned)?;
+        let tx = project
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| MemoryError::Db(error.to_string()))?;
+        replay_into_staging(&tx, "", Some(Scope::Project), self.same_database, &ops)?;
+        tx.commit()
+            .map_err(|error| MemoryError::Db(error.to_string()))
     }
 
     pub fn get(&self, scope: Scope, name: &str) -> Result<Option<MemoryEntry>, MemoryError> {
@@ -384,6 +561,46 @@ impl MemoryProjection {
         out.truncate(limit);
         Ok(out)
     }
+
+    pub async fn apply_async(&self, op: &MemoryOp) -> Result<(), MemoryError> {
+        let op = op.clone();
+        self.run_blocking(move |projection| projection.apply(&op))
+            .await
+    }
+
+    pub async fn rebuild_async(&self, events: Vec<Event>) -> Result<(), MemoryError> {
+        self.run_blocking(move |projection| projection.rebuild(events.into_iter()))
+            .await
+    }
+
+    pub async fn rebuild_project_async(&self, events: Vec<Event>) -> Result<(), MemoryError> {
+        self.run_blocking(move |projection| projection.rebuild_project(events.into_iter()))
+            .await
+    }
+
+    pub async fn get_async(
+        &self,
+        scope: Scope,
+        name: &str,
+    ) -> Result<Option<MemoryEntry>, MemoryError> {
+        let name = name.to_string();
+        self.run_blocking(move |projection| projection.get(scope, &name))
+            .await
+    }
+
+    pub async fn list_async(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+        self.run_blocking(|projection| projection.list()).await
+    }
+
+    pub async fn search_async(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>, MemoryError> {
+        let query = query.to_string();
+        self.run_blocking(move |projection| projection.search(&query, limit))
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +649,7 @@ mod tests {
                 source: "test".into(),
             },
             prev_hash: [0u8; 32],
+            hash_version: kernel::events::EVENT_HASH_VERSION,
             ts: 0.0,
         }
     }
@@ -475,6 +693,79 @@ mod tests {
             "forget hides from list"
         );
 
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn locked_projection_does_not_block_timers_or_queued_cancellation() {
+        use crate::MemoryStore;
+
+        let (p, u) = temp_paths("async-lock");
+        let projection = Arc::new(MemoryProjection::open(&p, &u).unwrap());
+        let blocker = Connection::open(&p).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let first = tokio::spawn({
+            let projection = Arc::clone(&projection);
+            async move {
+                MemoryStore::write(
+                    projection.as_ref(),
+                    entry("first-blocked-write", Scope::Project, 1),
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::time::sleep(Duration::from_millis(25)),
+        )
+        .await
+        .expect("a locked projection must not starve independent runtime timers");
+        assert!(
+            !first.is_finished(),
+            "the external writer lock was ineffective"
+        );
+
+        let queued = tokio::spawn({
+            let projection = Arc::clone(&projection);
+            async move {
+                MemoryStore::write(
+                    projection.as_ref(),
+                    entry("cancelled-before-start", Scope::Project, 1),
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        queued.abort();
+        let cancelled = tokio::time::timeout(Duration::from_millis(250), queued)
+            .await
+            .expect("a request queued on SQLite serialization must cancel promptly");
+        assert!(cancelled.unwrap_err().is_cancelled());
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("write should finish after releasing the database")
+            .unwrap()
+            .unwrap();
+        assert!(
+            projection
+                .get_async(Scope::Project, "first-blocked-write")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            projection
+                .get_async(Scope::Project, "cancelled-before-start")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(blocker);
+        drop(projection);
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
@@ -529,6 +820,12 @@ mod tests {
             ),
             memory_event(
                 &s,
+                MemoryOp::Update {
+                    entry: entry("b", Scope::User, 2),
+                },
+            ),
+            memory_event(
+                &s,
                 MemoryOp::Pin {
                     scope: Scope::User,
                     name: "b".into(),
@@ -554,6 +851,146 @@ mod tests {
 
         std::fs::remove_dir_all(p1.parent().unwrap()).ok();
         std::fs::remove_dir_all(p2.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn mutation_failure_rolls_back_primary_and_fts_together() {
+        let (p, u) = temp_paths("mutation-rollback");
+        let proj = MemoryProjection::open(&p, &u).unwrap();
+        let original = entry("atomic", Scope::Project, 1);
+        proj.apply(&MemoryOp::Write {
+            entry: original.clone(),
+        })
+        .unwrap();
+        proj.project
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_memory_update
+                 AFTER UPDATE ON entries
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected mutation failure');
+                 END;",
+            )
+            .unwrap();
+
+        let mut updated = entry("atomic", Scope::Project, 2);
+        updated.claim = "replacement searchable claim".into();
+        assert!(
+            proj.apply(&MemoryOp::Update {
+                entry: updated.clone()
+            })
+            .is_err()
+        );
+        assert_eq!(
+            proj.get(Scope::Project, "atomic").unwrap().unwrap(),
+            original
+        );
+        assert_eq!(proj.search("replacement", 10).unwrap().len(), 0);
+        assert_eq!(proj.search("claim body", 10).unwrap().len(), 1);
+
+        proj.project
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_memory_update")
+            .unwrap();
+        proj.apply(&MemoryOp::Update { entry: updated }).unwrap();
+        assert_eq!(proj.search("replacement", 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn malformed_rebuild_event_preserves_the_prior_projection() {
+        let (p, u) = temp_paths("malformed-rebuild");
+        let proj = MemoryProjection::open(&p, &u).unwrap();
+        let original = entry("prior-valid", Scope::Project, 1);
+        proj.apply(&MemoryOp::Write {
+            entry: original.clone(),
+        })
+        .unwrap();
+        let session = Session::new();
+        let mut malformed = memory_event(
+            &session,
+            MemoryOp::Forget {
+                scope: Scope::Project,
+                name: "prior-valid".into(),
+            },
+        );
+        malformed.payload = serde_json::json!({"op": "write", "entry": "not an entry"});
+
+        let error = proj
+            .rebuild(std::iter::once(malformed))
+            .expect_err("malformed durable events must fail visibly");
+        assert!(error.to_string().contains("malformed durable memory event"));
+        assert_eq!(
+            proj.get(Scope::Project, "prior-valid").unwrap().unwrap(),
+            original
+        );
+        assert_eq!(proj.search("prior-valid", 10).unwrap().len(), 1);
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn full_rebuild_failure_rolls_back_both_attached_scopes() {
+        let (p, u) = temp_paths("cross-db-rebuild");
+        let proj = MemoryProjection::open(&p, &u).unwrap();
+        let old_project = entry("old-project", Scope::Project, 1);
+        let old_user = entry("old-user", Scope::User, 1);
+        proj.apply(&MemoryOp::Write {
+            entry: old_project.clone(),
+        })
+        .unwrap();
+        proj.apply(&MemoryOp::Write {
+            entry: old_user.clone(),
+        })
+        .unwrap();
+        proj.user
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_user_swap
+                 BEFORE DELETE ON entries
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected user swap failure');
+                 END;",
+            )
+            .unwrap();
+        let session = Session::new();
+        let events = vec![
+            memory_event(
+                &session,
+                MemoryOp::Write {
+                    entry: entry("new-project", Scope::Project, 1),
+                },
+            ),
+            memory_event(
+                &session,
+                MemoryOp::Write {
+                    entry: entry("new-user", Scope::User, 1),
+                },
+            ),
+        ];
+
+        assert!(proj.rebuild(events.clone().into_iter()).is_err());
+        assert_eq!(
+            proj.get(Scope::Project, "old-project").unwrap(),
+            Some(old_project)
+        );
+        assert_eq!(proj.get(Scope::User, "old-user").unwrap(), Some(old_user));
+        assert!(proj.get(Scope::Project, "new-project").unwrap().is_none());
+        assert!(proj.get(Scope::User, "new-user").unwrap().is_none());
+
+        proj.user
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_user_swap")
+            .unwrap();
+        proj.rebuild(events.into_iter()).unwrap();
+        assert!(proj.get(Scope::Project, "old-project").unwrap().is_none());
+        assert!(proj.get(Scope::User, "old-user").unwrap().is_none());
+        assert!(proj.get(Scope::Project, "new-project").unwrap().is_some());
+        assert!(proj.get(Scope::User, "new-user").unwrap().is_some());
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]

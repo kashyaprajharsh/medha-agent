@@ -111,6 +111,23 @@ pub fn assess_write_configured(
     )
 }
 
+/// Runtime-safe form used by async tools. Tokenization and both SQLite reads
+/// run on the projection's serialized blocking worker.
+pub async fn assess_write_configured_async(
+    store: &MemoryProjection,
+    incoming: &MemoryEntry,
+    budget_tokens: u32,
+    now: f64,
+    stale_after_days: u32,
+) -> Result<BudgetAssessment, MemoryError> {
+    let incoming = incoming.clone();
+    store
+        .run_blocking(move |projection| {
+            assess_write_configured(&projection, &incoming, budget_tokens, now, stale_after_days)
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

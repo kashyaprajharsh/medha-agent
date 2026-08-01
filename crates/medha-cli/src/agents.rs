@@ -5,6 +5,8 @@
 //! child's transcript is durable, resumable and independently addressable with
 //! no extra persistence — the parent only ever sees the bounded result.
 
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -133,6 +135,9 @@ pub struct SandboxTemplate {
     pub exec: Arc<dyn sandbox::ExecBackend>,
     pub snapshots: PathBuf,
     pub readable: Vec<PathBuf>,
+    /// The session-wide live approval set; a sub-agent's grants must reach the
+    /// same exec sandbox the parent shares.
+    pub approved: sandbox::ApprovedRoots,
 }
 
 /// Shared slot for the registry a child's tools are rebased from.
@@ -215,11 +220,12 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
             .checkout(session)
             .await
             .map_err(|error| error.to_string())?;
-        let sandbox = sandbox::WorkspaceSandbox::new(
+        let sandbox = sandbox::WorkspaceSandbox::new_with_roots(
             worktree.path(),
             self.template.trust.clone(),
             self.template.audit.clone(),
             Some(Arc::clone(&self.template.gate)),
+            self.template.approved.clone(),
         )
         .map_err(|error| error.to_string())?
         .with_exec_backend(Arc::clone(&self.template.exec))
@@ -279,6 +285,175 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
     }
 }
 
+enum LockAttempt {
+    Acquired,
+    Busy,
+}
+
+/// One OS-backed process/recovery lease. The lock, not the file's existence,
+/// carries liveness; stale files from a killed process are safe to acquire.
+struct LeaseFile {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl LeaseFile {
+    fn open(path: &Path, create_new: bool) -> std::io::Result<Option<Self>> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        if create_new {
+            options.create_new(true);
+        } else {
+            options.create(true);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        match try_lock_file(&file)? {
+            LockAttempt::Acquired => Ok(Some(Self {
+                path: path.to_path_buf(),
+                file: Some(file),
+            })),
+            LockAttempt::Busy => Ok(None),
+        }
+    }
+
+    fn open_existing(path: &Path) -> std::io::Result<Option<Self>> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        match try_lock_file(&file)? {
+            LockAttempt::Acquired => Ok(Some(Self {
+                path: path.to_path_buf(),
+                file: Some(file),
+            })),
+            LockAttempt::Busy => Ok(None),
+        }
+    }
+}
+
+impl Drop for LeaseFile {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            unlock_file(&file);
+            drop(file);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_file(file: &File) -> std::io::Result<LockAttempt> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(LockAttempt::Acquired);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+    ) {
+        Ok(LockAttempt::Busy)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) {
+    use std::os::fd::AsRawFd;
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[cfg(windows)]
+fn try_lock_file(file: &File) -> std::io::Result<LockAttempt> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        return Ok(LockAttempt::Acquired);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(LockAttempt::Busy)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn unlock_file(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let _ = unsafe {
+        UnlockFileEx(
+            file.as_raw_handle() as _,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+}
+
+struct ProcessLease {
+    instance: ulid::Ulid,
+    _lock: LeaseFile,
+}
+
+impl ProcessLease {
+    fn acquire(directory: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+        loop {
+            let instance = ulid::Ulid::new();
+            let path = directory.join(format!("{instance}.live"));
+            match LeaseFile::open(&path, true) {
+                Ok(Some(lock)) => {
+                    return Ok(Self {
+                        instance,
+                        _lock: lock,
+                    });
+                }
+                Ok(None) => continue,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 /// Durable delivery folded from the dispatching session's own event chain.
 ///
 /// Medha's log is append-only, hash-chained and already per-session, so the
@@ -288,19 +463,45 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
 /// cannot disagree with the audit trail.
 pub struct LogOutbox<L: EventLog> {
     log: Arc<L>,
-    /// Identifies this process for the lifetime of the run. Stamped on every
-    /// dispatch: a dispatch carrying a different instance belongs to a process
-    /// that is no longer here, which is what makes an abandoned child
-    /// recognisable without asking the OS about a pid it may have recycled.
-    instance: ulid::Ulid,
+    lease_directory: PathBuf,
+    /// Identifies this process and owns its OS lock for the lifetime of every
+    /// dispatch. A foreign id is not assumed dead: recovery must prove this
+    /// lease is no longer held.
+    lease: ProcessLease,
 }
 
 impl<L: EventLog> LogOutbox<L> {
-    pub fn new(log: Arc<L>) -> Self {
-        Self {
+    pub fn new(log: Arc<L>, lease_directory: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let lease_directory = lease_directory.into();
+        let lease = ProcessLease::acquire(&lease_directory)?;
+        Ok(Self {
             log,
-            instance: ulid::Ulid::new(),
+            lease_directory,
+            lease,
+        })
+    }
+
+    fn owner_is_live(&self, instance: &str) -> std::io::Result<bool> {
+        let Ok(instance) = instance.parse::<ulid::Ulid>() else {
+            return Ok(false);
+        };
+        let path = self.lease_directory.join(format!("{instance}.live"));
+        match LeaseFile::open_existing(&path) {
+            Ok(Some(_dead_owner_claim)) => Ok(false),
+            Ok(None) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
         }
+    }
+
+    fn claim_recovery(&self, dispatch: &str) -> std::io::Result<Option<LeaseFile>> {
+        let dispatch = dispatch
+            .parse::<ulid::Ulid>()
+            .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "invalid dispatch id"))?;
+        LeaseFile::open(
+            &self.lease_directory.join(format!("{dispatch}.recovery")),
+            false,
+        )
     }
 }
 
@@ -353,7 +554,7 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                 &dispatch.agent,
                 dispatch.child,
                 &dispatch.objective,
-                self.instance,
+                self.lease.instance,
             ))
             .await
             .is_ok()
@@ -511,9 +712,9 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
 
     async fn reap_abandoned(&self, parent: ulid::Ulid) -> usize {
         // One pass over the owner's chain: every dispatch, every terminal event.
-        // A dispatch with no terminal event and a foreign instance is a child
-        // whose process died — nobody is going to report for it.
-        let mut open: Vec<(String, String, String, String)> = Vec::new();
+        // A foreign instance is only a candidate. Its OS lease must be
+        // provably unlocked before recovery can claim the dispatch.
+        let mut open: Vec<(String, String, String, String, String)> = Vec::new();
         let mut closed: Vec<String> = Vec::new();
         for event in self.log.events(parent).await {
             let Some(child) = field(&event, "child") else {
@@ -522,10 +723,7 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
             match event.kind {
                 EventKind::AgentSpawned => {
                     let instance = event.payload["instance"].as_str().unwrap_or_default();
-                    // Ours means the child is still running in this process —
-                    // it will write its own terminal event. Only a dispatch
-                    // from a process that is gone can be abandoned.
-                    if instance != self.instance.to_string() {
+                    if instance != self.lease.instance.to_string() {
                         let agent = event.payload["agent"].as_str().unwrap_or("agent");
                         let objective = event.payload["objective"].as_str().unwrap_or_default();
                         open.push((
@@ -533,6 +731,7 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                             child,
                             agent.to_string(),
                             objective.to_string(),
+                            instance.to_string(),
                         ));
                     }
                 }
@@ -542,9 +741,48 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                 _ => {}
             }
         }
-        open.retain(|(dispatch, _, _, _)| !closed.contains(dispatch));
+        open.retain(|(dispatch, _, _, _, _)| !closed.contains(dispatch));
 
-        for (dispatch, child, agent, objective) in &open {
+        let mut recovered = 0;
+        for (dispatch, child, agent, objective, instance) in &open {
+            match self.owner_is_live(instance) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "medha_agents",
+                        %error, %instance,
+                        "could not validate agent process lease; leaving dispatch open"
+                    );
+                    continue;
+                }
+            }
+            // Only one process may recover this dispatch. A second reaper
+            // either sees this lock busy or, after it is released, re-folds
+            // the terminal event written below.
+            let Some(_claim) = (match self.claim_recovery(dispatch) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "medha_agents",
+                        %error, %dispatch,
+                        "could not claim abandoned-agent recovery"
+                    );
+                    continue;
+                }
+            }) else {
+                continue;
+            };
+            let now_closed = self.log.events(parent).await.into_iter().any(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::AgentCompleted | EventKind::AgentFailed | EventKind::AgentCancelled
+                ) && handout(&event) == *dispatch
+            });
+            if now_closed {
+                continue;
+            }
+
             let (Ok(id), Ok(handout)) =
                 (child.parse::<ulid::Ulid>(), dispatch.parse::<ulid::Ulid>())
             else {
@@ -574,7 +812,7 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
             let payload = serde_json::to_value(&result).unwrap_or_default();
             // Writing the terminal event is what makes this idempotent: the
             // next pass sees the dispatch as closed.
-            let _ = self
+            if self
                 .log
                 .append(Event::agent_report(
                     &chain(parent),
@@ -584,9 +822,13 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                     payload,
                     kernel::TrustLabel::Tool,
                 ))
-                .await;
+                .await
+                .is_ok()
+            {
+                recovered += 1;
+            }
         }
-        open.len()
+        recovered
     }
 
     async fn undelivered(&self, parent: ulid::Ulid) -> Vec<orchestrator::AgentResult> {
@@ -871,6 +1113,10 @@ mod tests {
         }
     }
 
+    fn outbox(log: &Arc<store::SqliteLog>, directory: &Path) -> LogOutbox<store::SqliteLog> {
+        LogOutbox::new(log.clone(), directory.join("agent-leases")).unwrap()
+    }
+
     fn report(dispatch: &Dispatch, summary: &str) -> orchestrator::AgentResult {
         orchestrator::AgentResult {
             agent: "reporter".into(),
@@ -887,22 +1133,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_process_lease_child() {
+        if std::env::var_os("MEDHA_AGENT_LEASE_CHILD").is_none() {
+            return;
+        }
+        let directory = PathBuf::from(std::env::var_os("MEDHA_AGENT_LOG_DIR").unwrap());
+        let parent = std::env::var("MEDHA_AGENT_PARENT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let dispatch_id = std::env::var("MEDHA_AGENT_DISPATCH")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let child = std::env::var("MEDHA_AGENT_CHILD").unwrap().parse().unwrap();
+        let ready = PathBuf::from(std::env::var_os("MEDHA_AGENT_READY").unwrap());
+        let stop = PathBuf::from(std::env::var_os("MEDHA_AGENT_STOP").unwrap());
+        let log = Arc::new(store::SqliteLog::open(directory.join("events.db")).unwrap());
+        let outbox = outbox(&log, &directory);
+        let dispatch = Dispatch {
+            id: dispatch_id,
+            agent: "live-child".into(),
+            child,
+            parent,
+            objective: "stay alive while another process reaps".into(),
+        };
+        assert!(outbox.dispatched(&dispatch).await);
+        std::fs::write(&ready, b"ready").unwrap();
+        while !stop.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// A second `LogOutbox` over the same log is a restart: new process
     /// instance, same durable record.
     #[tokio::test]
     async fn a_child_abandoned_by_a_dead_process_is_reported_not_forgotten() {
-        let (log, _dir) = log_at("orphan");
+        let (log, dir) = log_at("orphan");
         let parent = Ulid::new();
 
         // The process that dispatched this one never came back.
-        let died = LogOutbox::new(log.clone());
+        let died = outbox(&log, &dir);
         let abandoned = dispatch(parent, "surveyor");
         died.dispatched(&abandoned).await;
         // Nothing resolves it while only the dispatch exists — this is exactly
         // the state in which the parent would wait forever.
         assert!(died.undelivered(parent).await.is_empty());
+        drop(died);
 
-        let restarted = LogOutbox::new(log.clone());
+        let restarted = outbox(&log, &dir);
         assert_eq!(restarted.reap_abandoned(parent).await, 1);
 
         let reported = restarted.undelivered(parent).await;
@@ -920,13 +1200,14 @@ mod tests {
 
     #[tokio::test]
     async fn reaping_is_idempotent_and_leaves_live_children_alone() {
-        let (log, _dir) = log_at("orphan-idem");
+        let (log, dir) = log_at("orphan-idem");
         let parent = Ulid::new();
 
-        let died = LogOutbox::new(log.clone());
+        let died = outbox(&log, &dir);
         died.dispatched(&dispatch(parent, "abandoned")).await;
+        drop(died);
 
-        let live = LogOutbox::new(log.clone());
+        let live = outbox(&log, &dir);
         // This one belongs to the *current* instance: it is still running and
         // will write its own terminal event. Reaping it would report a running
         // agent as dead.
@@ -943,11 +1224,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_foreign_process_is_never_reaped_and_a_killed_one_is_recovered_once() {
+        let directory =
+            std::env::temp_dir().join(format!("medha-agent-two-process-{}", Ulid::new()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let parent = Ulid::new();
+        let dispatch_id = Ulid::new();
+        let child_id = Ulid::new();
+        let ready = directory.join("ready");
+        let stop = directory.join("stop");
+        let executable = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(executable)
+            .arg("--exact")
+            .arg("agents::tests::live_process_lease_child")
+            .arg("--nocapture")
+            .env("MEDHA_AGENT_LEASE_CHILD", "1")
+            .env("MEDHA_AGENT_LOG_DIR", &directory)
+            .env("MEDHA_AGENT_PARENT", parent.to_string())
+            .env("MEDHA_AGENT_DISPATCH", dispatch_id.to_string())
+            .env("MEDHA_AGENT_CHILD", child_id.to_string())
+            .env("MEDHA_AGENT_READY", &ready)
+            .env("MEDHA_AGENT_STOP", &stop)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !ready.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("lease-holder child exited before readiness: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lease-holder child never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let log = Arc::new(store::SqliteLog::open(directory.join("events.db")).unwrap());
+        let reaper = outbox(&log, &directory);
+        assert_eq!(
+            reaper.reap_abandoned(parent).await,
+            0,
+            "a second live Medha instance marked the first one's child abandoned"
+        );
+        assert!(reaper.undelivered(parent).await.is_empty());
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(reaper.reap_abandoned(parent).await, 1);
+        assert_eq!(reaper.reap_abandoned(parent).await, 0);
+        let reports = reaper.undelivered(parent).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].dispatch, dispatch_id.to_string());
+        assert!(reports[0].summary.contains("outcome unknown"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_reapers_claim_one_terminal_result() {
+        let (log, directory) = log_at("concurrent-reapers");
+        let parent = Ulid::new();
+        let abandoned = dispatch(parent, "abandoned");
+        let owner = outbox(&log, &directory);
+        owner.dispatched(&abandoned).await;
+        drop(owner);
+
+        let first = outbox(&log, &directory);
+        let second = outbox(&log, &directory);
+        let (left, right) =
+            tokio::join!(first.reap_abandoned(parent), second.reap_abandoned(parent));
+        assert_eq!(left + right, 1);
+        let reports = first.undelivered(parent).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].dispatch, abandoned.id.to_string());
+    }
+
+    #[tokio::test]
     async fn a_child_that_did_report_is_never_reaped() {
-        let (log, _dir) = log_at("orphan-finished");
+        let (log, dir) = log_at("orphan-finished");
         let parent = Ulid::new();
 
-        let first = LogOutbox::new(log.clone());
+        let first = outbox(&log, &dir);
         let finished = dispatch(parent, "reporter");
         first.dispatched(&finished).await;
         first
@@ -956,7 +1314,7 @@ mod tests {
 
         // Across a restart a completed child keeps its real report: reaping
         // must never overwrite an outcome that was genuinely recorded.
-        let restarted = LogOutbox::new(log.clone());
+        let restarted = outbox(&log, &dir);
         assert_eq!(restarted.reap_abandoned(parent).await, 0);
         let reported = restarted.undelivered(parent).await;
         assert_eq!(reported.len(), 1);
@@ -965,13 +1323,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_abandoned_child_is_delivered_once_like_any_other() {
-        let (log, _dir) = log_at("orphan-once");
+        let (log, dir) = log_at("orphan-once");
         let parent = Ulid::new();
-        LogOutbox::new(log.clone())
+        outbox(&log, &dir)
             .dispatched(&dispatch(parent, "surveyor"))
             .await;
 
-        let restarted = LogOutbox::new(log.clone());
+        let restarted = outbox(&log, &dir);
         restarted.reap_abandoned(parent).await;
         let handout: Ulid = restarted.undelivered(parent).await[0]
             .dispatch
@@ -988,9 +1346,9 @@ mod tests {
     /// work reported into silence.
     #[tokio::test]
     async fn a_follow_up_on_the_same_session_still_reports() {
-        let (log, _dir) = log_at("followup-delivery");
+        let (log, dir) = log_at("followup-delivery");
         let parent = Ulid::new();
-        let outbox = LogOutbox::new(log.clone());
+        let outbox = outbox(&log, &dir);
 
         let first = dispatch(parent, "writer");
         outbox.dispatched(&first).await;

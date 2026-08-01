@@ -14,12 +14,18 @@
 //! because an orphaned worktree wedges the next `git worktree add` on that path.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::future::Future;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use fd_lock::RwLock as FileRwLock;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use ulid::Ulid;
 
 /// Branch prefix for agent worktrees. Namespaced so a sweep can recognise its
@@ -54,6 +60,114 @@ fn keeps_work(worktree: &Path) -> bool {
     keep_marker(worktree).exists()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnerRecord {
+    pid: u32,
+    /// Windows process creation time in 100ns FILETIME ticks. Pairing this
+    /// with the PID distinguishes the process that created the checkout from a
+    /// later, unrelated process which inherited the recycled PID.
+    creation_time: Option<u64>,
+}
+
+fn parse_owner_record(text: &str) -> Option<OwnerRecord> {
+    let mut fields = text.split_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    let creation_time = fields.next().and_then(|field| field.parse().ok());
+    Some(OwnerRecord { pid, creation_time })
+}
+
+#[cfg(windows)]
+fn windows_process_creation_time(process: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    let ok = unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+    (ok != 0).then_some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+}
+
+#[cfg(windows)]
+fn owner_record_for_current_process() -> OwnerRecord {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    OwnerRecord {
+        pid: std::process::id(),
+        creation_time: windows_process_creation_time(unsafe { GetCurrentProcess() }),
+    }
+}
+
+#[cfg(not(windows))]
+fn owner_record_for_current_process() -> OwnerRecord {
+    OwnerRecord {
+        pid: std::process::id(),
+        creation_time: None,
+    }
+}
+
+fn owner_record_text() -> String {
+    let record = owner_record_for_current_process();
+    match record.creation_time {
+        Some(creation_time) => format!("{} {creation_time}", record.pid),
+        None => record.pid.to_string(),
+    }
+}
+
+#[cfg(windows)]
+fn windows_owner_alive(record: OwnerRecord) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    };
+    // SYNCHRONIZE is a standard access right shared by every securable object,
+    // and windows-sys files those under Storage::FileSystem — it is not in the
+    // Threading module despite being needed to wait on a process handle.
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
+
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            0,
+            record.pid,
+        )
+    };
+    if process.is_null() {
+        return match unsafe { GetLastError() } {
+            ERROR_INVALID_PARAMETER => false,
+            // Protected processes can refuse a query even while alive. An
+            // uncertain owner is retained; only a proven-dead or mismatched
+            // identity may be reaped.
+            ERROR_ACCESS_DENIED => true,
+            _ => true,
+        };
+    }
+
+    let creation_matches = record.creation_time.is_none_or(|expected| {
+        windows_process_creation_time(process).is_none_or(|actual| actual == expected)
+    });
+    let wait = unsafe { WaitForSingleObject(process, 0) };
+    unsafe {
+        CloseHandle(process);
+    }
+    if !creation_matches {
+        return false;
+    }
+    match wait {
+        WAIT_TIMEOUT => true,
+        WAIT_OBJECT_0 => false,
+        // WAIT_FAILED/unknown is not evidence that the owner died.
+        _ => true,
+    }
+}
+
 /// Whether the process that claimed `worktree` is still running.
 ///
 /// A worktree is only abandoned if its owner is gone. Without this check a
@@ -66,18 +180,19 @@ fn owner_alive(worktree: &Path) -> bool {
         // which is the same behaviour as before and safe for both.
         return false;
     };
-    let Ok(pid) = text.trim().parse::<u32>() else {
+    let Some(record) = parse_owner_record(&text) else {
         return false;
     };
-    if pid == std::process::id() {
-        return true;
-    }
     #[cfg(unix)]
     {
         // Signal 0 tests for existence without delivering anything.
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        unsafe { libc::kill(record.pid as i32, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_owner_alive(record)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         // No cheap portable liveness test; err towards keeping a checkout that
         // might be live, since the cost of a leaked directory is far below the
@@ -95,6 +210,20 @@ pub const LARGE_PATCH_BYTES: usize = 64 * 1024;
 /// result and durable event, so allowing it to grow with the checkout makes a
 /// single generated file an OOM vector.
 pub const DEFAULT_MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
+/// A credential helper, hook, filesystem, or Git itself must never hold agent
+/// settlement forever. This is intentionally long enough for a large local
+/// diff while still being a hard operational ceiling.
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// Once a process tree has been killed, pipes and the direct child should
+/// settle promptly. A second bound prevents cleanup from becoming a new hang.
+const GIT_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ordinary Git metadata is bounded independently from patches. Patch output
+/// uses the caller's stricter configured ceiling.
+const GIT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const GIT_STDERR_LIMIT: usize = 64 * 1024;
+/// A structural checkout/sweep lock is normally held for milliseconds, but it
+/// shares Git's outer ceiling so a crashed or wedged peer cannot block forever.
+const STRUCTURE_LOCK_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Error)]
 pub enum WorktreeError {
@@ -108,23 +237,193 @@ pub enum WorktreeError {
     Git { command: String, message: String },
     #[error("could not run git: {0}")]
     Spawn(String),
+    #[error("git {command} timed out after {seconds}s and its process tree was stopped")]
+    GitTimeout { command: String, seconds: u64 },
+    #[error("git {command} was cancelled and its process tree was stopped")]
+    GitCancelled { command: String },
+    #[error("git {command} produced more than the configured {limit}-byte output limit")]
+    GitOutputTooLarge { command: String, limit: usize },
+    #[error("timed out waiting for the repository worktree lock")]
+    WorktreeLockTimeout,
     #[error("io error: {0}")]
     Io(String),
     #[error("patch exceeds the configured {limit}-byte limit; the checkout was preserved instead")]
     PatchTooLarge { limit: usize },
 }
 
-/// Run a fixed git command while reading at most `limit + 1` stdout bytes.
-/// Seeing the extra byte is a distinct error; callers must never truncate a
-/// patch because a truncated binary/unified diff is not safely applicable.
-async fn git_bounded(dir: &Path, args: &[&str], limit: usize) -> Result<String, WorktreeError> {
-    let mut command = tokio::process::Command::new("git");
+#[derive(Debug)]
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+async fn drain_bounded<R>(mut reader: R, limit: usize) -> std::io::Result<BoundedCapture>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut total = 0usize;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read);
+        if bytes.len() < limit {
+            let keep = (limit - bytes.len()).min(read);
+            bytes.extend_from_slice(&chunk[..keep]);
+        }
+    }
+    Ok(BoundedCapture {
+        bytes,
+        overflowed: total > limit,
+    })
+}
+
+/// A whole process group is the cancellation unit. `kill_on_drop` only reaches
+/// the leader, so this synchronous guard covers every abnormal future/task
+/// drop; the owned supervisor performs the awaited reap on ordinary paths.
+struct GitGroupReaper {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl GitGroupReaper {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GitGroupReaper {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(pid) = self.pid
+        {
+            kill_git_process_tree(pid);
+        }
+    }
+}
+
+fn kill_git_process_tree(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let taskkill = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("System32")
+            .join("taskkill.exe");
+        if let Ok(mut child) = std::process::Command::new(taskkill)
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let deadline = std::time::Instant::now() + GIT_SETTLE_TIMEOUT;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn configure_git_process(command: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command
+            .as_std_mut()
+            .creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
     command
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+}
+
+struct CancelGitOnDrop(Option<CancellationToken>);
+
+impl CancelGitOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelGitOnDrop {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            token.cancel();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GitOutput {
+    status: std::process::ExitStatus,
+    stdout: BoundedCapture,
+    stderr: BoundedCapture,
+}
+
+/// Run one fixed Git subprocess under an owned, cancellation-safe supervisor.
+/// The supervisor outlives a dropped caller long enough to kill/reap the whole
+/// process group and drain bounded pipes.
+async fn run_git_program(
+    program: PathBuf,
+    dir: PathBuf,
+    args: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    env: Option<(OsString, OsString)>,
+    stdout_limit: usize,
+    deadline: Duration,
+) -> Result<GitOutput, WorktreeError> {
+    run_git_program_observed(program, dir, args, stdin, env, stdout_limit, deadline, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_git_program_observed(
+    program: PathBuf,
+    dir: PathBuf,
+    args: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    env: Option<(OsString, OsString)>,
+    stdout_limit: usize,
+    deadline: Duration,
+    completion: Option<Arc<tokio::sync::Semaphore>>,
+) -> Result<GitOutput, WorktreeError> {
+    let command_name = args.join(" ");
+    let mut command = tokio::process::Command::new(program);
+    command.args(&args).current_dir(dir);
+    if let Some((key, value)) = env {
+        command.env(key, value);
+    }
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    configure_git_process(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| WorktreeError::Spawn(error.to_string()))?;
@@ -132,73 +431,251 @@ async fn git_bounded(dir: &Path, args: &[&str], limit: usize) -> Result<String, 
         .stdout
         .take()
         .ok_or_else(|| WorktreeError::Spawn("git stdout was not captured".into()))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| WorktreeError::Spawn("git stderr was not captured".into()))?;
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes).await;
-        bytes
+    let child_stdin = child.stdin.take();
+    let pid = child.id();
+    let reaper = GitGroupReaper::new(pid);
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let task_command = command_name.clone();
+
+    let supervisor = tokio::spawn(async move {
+        struct NotifyCompletion(Option<Arc<tokio::sync::Semaphore>>);
+        impl Drop for NotifyCompletion {
+            fn drop(&mut self) {
+                if let Some(semaphore) = self.0.take() {
+                    semaphore.add_permits(1);
+                }
+            }
+        }
+        let _completion = NotifyCompletion(completion);
+        let mut reaper = reaper;
+        // If any child-wait/settle branch returns early, dropping a bare
+        // JoinHandle would detach these pipe pumps forever. Keep them
+        // abort-on-drop so the supervisor owns their complete lifetime.
+        let mut io_task = AbortOnDropHandle::new(tokio::spawn(async move {
+            let stdout = drain_bounded(stdout, stdout_limit);
+            let stderr = drain_bounded(stderr, GIT_STDERR_LIMIT);
+            let write_stdin = async move {
+                if let (Some(mut writer), Some(body)) = (child_stdin, stdin) {
+                    if let Err(error) = writer.write_all(&body).await {
+                        // Git may reject a patch and close stdin before the
+                        // producer finishes. Preserve its exit status/stderr;
+                        // BrokenPipe is the expected consequence, not the root
+                        // diagnostic.
+                        if error.kind() != ErrorKind::BrokenPipe {
+                            return Err(error);
+                        }
+                    }
+                    if let Err(error) = writer.shutdown().await
+                        && error.kind() != ErrorKind::BrokenPipe
+                    {
+                        return Err(error);
+                    }
+                }
+                Ok::<(), std::io::Error>(())
+            };
+            let (stdout, stderr, stdin) = tokio::join!(stdout, stderr, write_stdin);
+            Ok::<_, std::io::Error>((stdout?, stderr?, stdin?))
+        }));
+
+        enum End {
+            Exited(std::io::Result<std::process::ExitStatus>),
+            TimedOut,
+            Cancelled,
+        }
+        let end = tokio::select! {
+            status = child.wait() => End::Exited(status),
+            _ = tokio::time::sleep(deadline) => End::TimedOut,
+            _ = task_cancellation.cancelled() => End::Cancelled,
+        };
+
+        // Always reap the group. On a normal exit this only kills helpers that
+        // Git or a credential hook left behind; on timeout/cancellation it also
+        // reaches the leader.
+        if let Some(pid) = pid {
+            kill_git_process_tree(pid);
+        }
+        let _ = child.start_kill();
+
+        let (status, terminal_error) = match end {
+            End::Exited(status) => (
+                Some(status.map_err(|e| WorktreeError::Spawn(e.to_string()))?),
+                None,
+            ),
+            End::TimedOut => (
+                None,
+                Some(WorktreeError::GitTimeout {
+                    command: task_command.clone(),
+                    seconds: deadline.as_secs(),
+                }),
+            ),
+            End::Cancelled => (
+                None,
+                Some(WorktreeError::GitCancelled {
+                    command: task_command.clone(),
+                }),
+            ),
+        };
+
+        let status = match status {
+            Some(status) => status,
+            None => tokio::time::timeout(GIT_SETTLE_TIMEOUT, child.wait())
+                .await
+                .map_err(|_| {
+                    WorktreeError::Spawn("git did not settle after process-tree kill".into())
+                })?
+                .map_err(|error| WorktreeError::Spawn(error.to_string()))?,
+        };
+        reaper.disarm();
+
+        let (stdout, stderr, ()) = tokio::time::timeout(GIT_SETTLE_TIMEOUT, &mut io_task)
+            .await
+            .map_err(|_| {
+                WorktreeError::Spawn("git pipes did not settle after process-tree kill".into())
+            })?
+            .map_err(|error| WorktreeError::Spawn(format!("git pipe task failed: {error}")))?
+            .map_err(|error| WorktreeError::Io(error.to_string()))?;
+
+        if let Some(error) = terminal_error {
+            return Err(error);
+        }
+        Ok(GitOutput {
+            status,
+            stdout,
+            stderr,
+        })
     });
-    let mut bytes = Vec::with_capacity(limit.min(1024 * 1024).saturating_add(1));
-    let read_limit = limit.saturating_add(1) as u64;
-    stdout
-        .take(read_limit)
-        .read_to_end(&mut bytes)
+
+    let mut cancel_on_drop = CancelGitOnDrop(Some(cancellation));
+    let result = supervisor
         .await
-        .map_err(|error| WorktreeError::Io(error.to_string()))?;
-    if bytes.len() > limit {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        stderr_task.abort();
-        return Err(WorktreeError::PatchTooLarge { limit });
-    }
-    let status = child
-        .wait()
-        .await
-        .map_err(|error| WorktreeError::Spawn(error.to_string()))?;
-    let stderr = stderr_task.await.unwrap_or_default();
-    if !status.success() {
-        let message = String::from_utf8_lossy(&stderr).trim().to_string();
-        return Err(WorktreeError::Git {
-            command: args.join(" "),
-            message: if message.is_empty() {
-                format!("exit {:?}", status.code())
-            } else {
-                message
-            },
-        });
-    }
-    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+        .map_err(|error| WorktreeError::Spawn(format!("git supervisor failed: {error}")))?;
+    cancel_on_drop.disarm();
+    result
 }
 
-/// Run git in `dir` and return stdout, or the failure with git's own stderr —
-/// which is far more actionable than an exit code ("fatal: not a git
-/// repository" tells the model what to do; "status 128" does not).
-async fn git(dir: &Path, args: &[&str]) -> Result<String, WorktreeError> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        // git needs $HOME (config, credentials) and $PATH, so the environment is
-        // inherited. These are fixed subcommands, not an arbitrary-command
-        // surface, so there is nothing here for a model to inject into.
-        .output()
-        .await
-        .map_err(|error| WorktreeError::Spawn(error.to_string()))?;
+async fn run_git(
+    dir: &Path,
+    args: &[&str],
+    stdin: Option<Vec<u8>>,
+    env: Option<(OsString, OsString)>,
+    stdout_limit: usize,
+) -> Result<GitOutput, WorktreeError> {
+    run_git_program(
+        PathBuf::from("git"),
+        dir.to_path_buf(),
+        args.iter().map(|arg| (*arg).to_string()).collect(),
+        stdin,
+        env,
+        stdout_limit,
+        GIT_COMMAND_TIMEOUT,
+    )
+    .await
+}
+
+fn git_failure(args: &[&str], output: &GitOutput) -> WorktreeError {
+    let mut message = String::from_utf8_lossy(&output.stderr.bytes)
+        .trim()
+        .to_string();
+    if output.stderr.overflowed {
+        message.push_str("\n[git stderr truncated at 65536 bytes]");
+    }
+    WorktreeError::Git {
+        command: args.join(" "),
+        message: if message.is_empty() {
+            format!("exit {:?}", output.status.code())
+        } else {
+            message
+        },
+    }
+}
+
+/// Run a fixed git command while draining all output and retaining at most the
+/// patch limit. A patch is either complete or rejected; it is never truncated.
+async fn git_bounded(dir: &Path, args: &[&str], limit: usize) -> Result<String, WorktreeError> {
+    let output = run_git(dir, args, None, None, limit).await?;
+    if output.stdout.overflowed {
+        return Err(WorktreeError::PatchTooLarge { limit });
+    }
     if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(WorktreeError::Git {
+        return Err(git_failure(args, &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout.bytes)
+        .trim()
+        .to_string())
+}
+
+/// Run git in `dir` with bounded output, a deadline, and process-tree teardown.
+async fn git(dir: &Path, args: &[&str]) -> Result<String, WorktreeError> {
+    let output = run_git(dir, args, None, None, GIT_OUTPUT_LIMIT).await?;
+    if output.stdout.overflowed {
+        return Err(WorktreeError::GitOutputTooLarge {
             command: args.join(" "),
-            message: if message.is_empty() {
-                format!("exit {:?}", output.status.code())
-            } else {
-                message
-            },
+            limit: GIT_OUTPUT_LIMIT,
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    if !output.status.success() {
+        return Err(git_failure(args, &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout.bytes)
+        .trim()
+        .to_string())
+}
+
+async fn repository_structure_lock_path(repo: &Path) -> Result<PathBuf, WorktreeError> {
+    let common = PathBuf::from(git(repo, &["rev-parse", "--git-common-dir"]).await?);
+    let common = if common.is_absolute() {
+        common
+    } else {
+        repo.join(common)
+    };
+    let common = common
+        .canonicalize()
+        .map_err(|error| WorktreeError::Io(error.to_string()))?;
+    Ok(common.join("medha-worktrees.lock"))
+}
+
+/// Serialize Git's worktree registry and the matching owner markers across
+/// every Medha process using this repository, even when two instances use
+/// different `MEDHA_HOME` state roots. The lock lives in Git's common metadata
+/// directory, is crash-released by the OS, and is polled asynchronously.
+async fn with_structure_lock<T, F, Fut>(lock_path: &Path, operation: F) -> Result<T, WorktreeError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, WorktreeError>>,
+{
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| WorktreeError::Io(error.to_string()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| WorktreeError::Io(error.to_string()))?;
+    let mut lock = FileRwLock::new(file);
+    let started = tokio::time::Instant::now();
+    let guard = loop {
+        match lock.try_write() {
+            Ok(guard) => break guard,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if started.elapsed() >= STRUCTURE_LOCK_TIMEOUT {
+                    return Err(WorktreeError::WorktreeLockTimeout);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(WorktreeError::Io(error.to_string())),
+        }
+    };
+    let result = operation().await;
+    drop(guard);
+    result
 }
 
 /// What a writer child hands back instead of a prose summary of its edits.
@@ -260,6 +737,7 @@ pub struct Worktree {
     path: PathBuf,
     branch: String,
     base: String,
+    structure_lock: PathBuf,
     /// Shared with the pool, so the lease is released by the same guard that
     /// removes the directory and cannot drift out of step with it.
     leases: Leases,
@@ -271,6 +749,67 @@ pub struct Worktree {
 }
 
 type Leases = Arc<Mutex<HashSet<PathBuf>>>;
+
+struct LeaseReservation {
+    leases: Leases,
+    path: PathBuf,
+    committed: bool,
+}
+
+impl LeaseReservation {
+    fn acquire(leases: &Leases, path: PathBuf) -> Result<Self, WorktreeError> {
+        let mut table = leases
+            .lock()
+            .map_err(|_| WorktreeError::Io("lease table poisoned".into()))?;
+        if !table.insert(path.clone()) {
+            return Err(WorktreeError::AlreadyLeased(path));
+        }
+        drop(table);
+        Ok(Self {
+            leases: Arc::clone(leases),
+            path,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for LeaseReservation {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Ok(mut leases) = self.leases.lock()
+        {
+            leases.remove(&self.path);
+        }
+    }
+}
+
+async fn cleanup_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    lock_path: &Path,
+) -> Result<(), WorktreeError> {
+    with_structure_lock(lock_path, || async {
+        if path.exists() {
+            git(
+                repo,
+                &["worktree", "remove", "--force", &path.to_string_lossy()],
+            )
+            .await?;
+        }
+        // A missing checkout may still be registered; prune before deleting
+        // the private branch. Every command has its own lifecycle deadline.
+        let _ = git(repo, &["worktree", "prune"]).await;
+        let _ = git(repo, &["branch", "-D", branch]).await;
+        let _ = std::fs::remove_file(owner_marker(path));
+        Ok(())
+    })
+    .await
+}
 
 impl Worktree {
     /// Where the child works. Both its cwd and its sandbox root must be this —
@@ -391,34 +930,30 @@ impl Worktree {
             return;
         }
         // `--force` because the child is expected to leave uncommitted work:
-        // the patch has already been taken, and refusing to clean up a dirty
-        // worktree would strand every writer that did its job.
-        let _ = git(
-            &self.repo,
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                &self.path.to_string_lossy(),
-            ],
-        )
-        .await;
-        let _ = git(&self.repo, &["worktree", "prune"]).await;
-        let _ = git(&self.repo, &["branch", "-D", &self.branch]).await;
-        // The marker is a sibling of the checkout, so removing the worktree does
-        // not take it with it.
-        let _ = std::fs::remove_file(owner_marker(&self.path));
-        if let Ok(mut leases) = self.leases.lock() {
-            leases.remove(&self.path);
+        // the patch has already been taken. Keep the lease on failure so Drop
+        // can make one final bounded cleanup attempt.
+        match cleanup_worktree(&self.repo, &self.path, &self.branch, &self.structure_lock).await {
+            Ok(()) => {
+                if let Ok(mut leases) = self.leases.lock() {
+                    leases.remove(&self.path);
+                }
+            }
+            Err(error) => tracing::warn!(
+                target: "medha_orchestrator",
+                path = %self.path.display(), %error,
+                "worktree cleanup did not complete; leaving it for the drop/startup sweep"
+            ),
         }
     }
 }
 
 impl Drop for Worktree {
     /// Last-resort cleanup for the paths `reap` never reaches — a panic, or a
-    /// run future dropped mid-cancellation. `Drop` cannot await, so this hands
-    /// the removal to a detached blocking command; the lease is released here so
-    /// the pool's view is correct immediately either way.
+    /// run future dropped mid-cancellation. `Drop` cannot await, so it hands
+    /// removal to an owned Tokio task whose Git children retain the same
+    /// deadline/process-tree guarantees. Without a runtime it leaves the owner
+    /// marker intact for the next startup sweep instead of launching an
+    /// unbounded blocking subprocess.
     fn drop(&mut self) {
         // Preserved: hold the lease as well as the directory. Releasing it would
         // let this process's own sweep treat the checkout as abandoned and
@@ -435,22 +970,20 @@ impl Drop for Worktree {
             return;
         }
         let repo = self.repo.clone();
-        let path = self.path.to_string_lossy().to_string();
+        let path = self.path.clone();
         let branch = self.branch.clone();
-        std::thread::spawn(move || {
-            let run = |args: &[&str]| {
-                let _ = std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(&repo)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            };
-            run(&["worktree", "remove", "--force", &path]);
-            run(&["worktree", "prune"]);
-            run(&["branch", "-D", &branch]);
-        });
+        let structure_lock = self.structure_lock.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = cleanup_worktree(&repo, &path, &branch, &structure_lock).await {
+                    tracing::warn!(
+                        target: "medha_orchestrator",
+                        path = %path.display(), %error,
+                        "drop-time worktree cleanup did not complete; startup sweep will retry"
+                    );
+                }
+            });
+        }
     }
 }
 
@@ -464,6 +997,15 @@ pub struct WorktreePool {
     dir: PathBuf,
     leases: Leases,
     max_patch_bytes: usize,
+    #[cfg(test)]
+    checkout_hook: Option<CheckoutHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CheckoutHook {
+    after_add: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
 }
 
 impl WorktreePool {
@@ -475,6 +1017,8 @@ impl WorktreePool {
             dir: dir.into(),
             leases: Arc::new(Mutex::new(HashSet::new())),
             max_patch_bytes: DEFAULT_MAX_PATCH_BYTES,
+            #[cfg(test)]
+            checkout_hook: None,
         }
     }
 
@@ -521,68 +1065,64 @@ impl WorktreePool {
         let name = session.to_string().to_lowercase();
         let path = dir.join(&name);
         let branch = format!("{BRANCH_PREFIX}/{name}");
-
-        {
-            // Structural, not conventional: the lease is taken before the
-            // directory exists, so two callers racing on one path cannot both
-            // believe they own it.
-            let mut leases = self
-                .leases
-                .lock()
-                .map_err(|_| WorktreeError::Io("lease table poisoned".into()))?;
-            if !leases.insert(path.clone()) {
-                return Err(WorktreeError::AlreadyLeased(path));
-            }
-        }
-        // From here on any failure must release the lease, or the path is
-        // wedged for the rest of the process.
-        let created = git(
-            &self.repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch,
-                &path.to_string_lossy(),
-                &base,
-            ],
-        )
-        .await;
-        if let Err(error) = created {
-            if let Ok(mut leases) = self.leases.lock() {
-                leases.remove(&path);
-            }
-            return Err(error);
-        }
-        // Claim it on disk as well as in memory. The lease table is per-process,
-        // so a second Medha running in the same repository would otherwise see a
-        // live worktree as abandoned and force-remove it mid-edit — two
-        // terminals in one project is ordinary, and the child's uncommitted work
-        // would go with it.
-        if let Err(error) = std::fs::write(owner_marker(&path), std::process::id().to_string()) {
-            let _ = git(
+        // Structural, not conventional: reserve the path before it exists.
+        // The RAII reservation releases itself if cancellation/error occurs at
+        // any await before the Worktree guard takes ownership.
+        let reservation = LeaseReservation::acquire(&self.leases, path.clone())?;
+        let lock_path = repository_structure_lock_path(&self.repo).await?;
+        with_structure_lock(&lock_path, || async {
+            git(
                 &self.repo,
-                &["worktree", "remove", "--force", &path.to_string_lossy()],
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch,
+                    &path.to_string_lossy(),
+                    &base,
+                ],
             )
-            .await;
-            let _ = git(&self.repo, &["worktree", "prune"]).await;
-            let _ = git(&self.repo, &["branch", "-D", &branch]).await;
-            if let Ok(mut leases) = self.leases.lock() {
-                leases.remove(&path);
+            .await?;
+
+            #[cfg(test)]
+            if let Some(hook) = &self.checkout_hook {
+                // Deterministic coverage of the exact historical race: another
+                // pool starts sweeping after Git publishes the checkout but
+                // before this process publishes its owner marker.
+                hook.after_add.wait().await;
+                hook.release.wait().await;
             }
-            return Err(WorktreeError::Io(format!(
-                "could not record the worktree owner: {error}"
-            )));
-        }
-        Ok(Worktree {
+
+            // The cross-process lock spans Git registration through marker
+            // publication, so a sweep can never observe the old dangerous gap.
+            if let Err(error) = std::fs::write(owner_marker(&path), owner_record_text()) {
+                let _ = git(
+                    &self.repo,
+                    &["worktree", "remove", "--force", &path.to_string_lossy()],
+                )
+                .await;
+                let _ = git(&self.repo, &["worktree", "prune"]).await;
+                let _ = git(&self.repo, &["branch", "-D", &branch]).await;
+                return Err(WorktreeError::Io(format!(
+                    "could not record the worktree owner: {error}"
+                )));
+            }
+            Ok(())
+        })
+        .await?;
+
+        let worktree = Worktree {
             preserve: std::sync::atomic::AtomicBool::new(false),
             repo: self.repo.clone(),
             path,
             branch,
             base,
+            structure_lock: lock_path,
             leases: Arc::clone(&self.leases),
             max_patch_bytes: self.max_patch_bytes,
-        })
+        };
+        reservation.commit();
+        Ok(worktree)
     }
 
     /// Remove agent worktrees left by a previous process.
@@ -592,9 +1132,22 @@ impl WorktreePool {
     /// that already exists — so without this the *next* run of the same agent
     /// fails for a reason that has nothing to do with it.
     pub async fn sweep(&self) {
-        let listed = git(&self.repo, &["worktree", "list", "--porcelain"])
-            .await
-            .unwrap_or_default();
+        if let Err(error) = self.sweep_locked().await {
+            tracing::warn!(
+                target: "medha_orchestrator",
+                %error,
+                "worktree sweep did not complete; keeping uncertain checkouts"
+            );
+        }
+    }
+
+    async fn sweep_locked(&self) -> Result<(), WorktreeError> {
+        let lock_path = repository_structure_lock_path(&self.repo).await?;
+        with_structure_lock(&lock_path, || async { self.sweep_under_lock().await }).await
+    }
+
+    async fn sweep_under_lock(&self) -> Result<(), WorktreeError> {
+        let listed = git(&self.repo, &["worktree", "list", "--porcelain"]).await?;
         let mut current: Option<String> = None;
         let mut stale: Vec<String> = Vec::new();
         for line in listed.lines() {
@@ -678,6 +1231,7 @@ impl WorktreePool {
                 let _ = git(&self.repo, &["branch", "-D", branch]).await;
             }
         }
+        Ok(())
     }
 }
 
@@ -794,39 +1348,31 @@ async fn apply(
     flags: &[&str],
     index: Option<&Path>,
 ) -> Result<(), WorktreeError> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut command = tokio::process::Command::new("git");
-    command.arg("apply").args(flags).current_dir(repo);
-    if let Some(index) = index {
-        command.env("GIT_INDEX_FILE", index);
+    let mut args = Vec::with_capacity(flags.len() + 1);
+    args.push("apply");
+    args.extend_from_slice(flags);
+    // A diff that does not end in a newline is rejected as corrupt.
+    let mut body = patch.diff.clone();
+    if !body.ends_with('\n') {
+        body.push('\n');
     }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| WorktreeError::Spawn(error.to_string()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        // A diff that does not end in a newline is rejected as corrupt.
-        let mut body = patch.diff.clone();
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-        let _ = stdin.write_all(body.as_bytes()).await;
-        drop(stdin);
+    let env = index.map(|path| {
+        (
+            OsString::from("GIT_INDEX_FILE"),
+            path.as_os_str().to_os_string(),
+        )
+    });
+    let output = run_git(repo, &args, Some(body.into_bytes()), env, 0).await?;
+    if output.stdout.overflowed {
+        return Err(WorktreeError::GitOutputTooLarge {
+            command: args.join(" "),
+            limit: 0,
+        });
     }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| WorktreeError::Spawn(error.to_string()))?;
     if output.status.success() {
         return Ok(());
     }
-    Err(WorktreeError::Git {
-        command: format!("apply {}", flags.join(" ")),
-        message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+    Err(git_failure(&args, &output))
 }
 
 #[cfg(test)]
@@ -1136,12 +1682,90 @@ mod tests {
     /// A pid that has certainly exited: spawn something trivial and reap it.
     /// Inventing a large number would be a guess that some CI box falsifies.
     fn dead_pid() -> u32 {
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn a short-lived process");
+        #[cfg(not(windows))]
         let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn a short-lived process");
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_liveness_rejects_dead_and_pid_reused_owners() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("agent-worktree");
+        let current_creation =
+            windows_process_creation_time(unsafe { GetCurrentProcess() }).unwrap();
+        std::fs::write(
+            owner_marker(&worktree),
+            format!("{} {current_creation}", std::process::id()),
+        )
+        .unwrap();
+        assert!(owner_alive(&worktree), "the current owner must be live");
+
+        // A live process with a recycled PID is not the recorded owner. This
+        // deterministic identity mismatch exercises PID reuse without waiting
+        // for Windows to recycle a particular numeric PID.
+        std::fs::write(
+            owner_marker(&worktree),
+            format!(
+                "{} {}",
+                std::process::id(),
+                current_creation.wrapping_add(1)
+            ),
+        )
+        .unwrap();
+        assert!(
+            !owner_alive(&worktree),
+            "creation identity must reject a reused PID"
+        );
+
+        // Keep the process itself alive rather than asking `cmd.exe` to spawn
+        // a helper such as ping.exe. Killing only cmd would otherwise leave the
+        // helper behind until its own timer expired on the Windows CI runner.
+        let mut child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live Windows owner");
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.id()) };
+        assert!(!process.is_null(), "open the child process");
+        let child_creation = windows_process_creation_time(process).unwrap();
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(process);
+        }
+        std::fs::write(
+            owner_marker(&worktree),
+            format!("{} {child_creation}", child.id()),
+        )
+        .unwrap();
+        assert!(owner_alive(&worktree), "a live foreign owner must be kept");
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            !owner_alive(&worktree),
+            "a killed Windows owner must be reaped"
+        );
     }
 
     /// Two Medha processes in one repository is ordinary — two terminals. The
@@ -1168,6 +1792,206 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path.join("work-in-progress.txt")).unwrap(),
             "half an edit"
+        );
+    }
+
+    /// A repository-wide OS lock must cover the exact interval between Git
+    /// publishing a worktree and Medha publishing its owner marker. This uses a
+    /// second test-harness process, not merely another pool in this process, so
+    /// it proves the cross-process contract that failed in AUD-028.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cross_process_sweep_cannot_enter_the_add_marker_gap() {
+        const ROOT_ENV: &str = "MEDHA_TEST_SWEEP_ROOT";
+        const STATE_ENV: &str = "MEDHA_TEST_SWEEP_STATE";
+        const STARTED_ENV: &str = "MEDHA_TEST_SWEEP_STARTED";
+        const DONE_ENV: &str = "MEDHA_TEST_SWEEP_DONE";
+
+        if let (Ok(root), Ok(state), Ok(started), Ok(done)) = (
+            std::env::var(ROOT_ENV),
+            std::env::var(STATE_ENV),
+            std::env::var(STARTED_ENV),
+            std::env::var(DONE_ENV),
+        ) {
+            std::fs::write(started, b"started").unwrap();
+            WorktreePool::new(root, state).sweep().await;
+            std::fs::write(done, b"done").unwrap();
+            return;
+        }
+
+        let (_repo, root) = repo().await;
+        let state = tempfile::tempdir().unwrap();
+        let worktree_dir = state.path().join("worktrees");
+        let other_state_dir = state.path().join("other-medha-home").join("worktrees");
+        let after_add = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let mut pool = WorktreePool::new(&root, &worktree_dir);
+        pool.checkout_hook = Some(CheckoutHook {
+            after_add: Arc::clone(&after_add),
+            release: Arc::clone(&release),
+        });
+        let pool = Arc::new(pool);
+        let checkout = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move { pool.checkout(Ulid::new()).await })
+        };
+
+        // Checkout now holds the cross-process lock immediately after
+        // `git worktree add`, before writing the owner marker.
+        after_add.wait().await;
+        let started = state.path().join("sweep-started");
+        let done = state.path().join("sweep-done");
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "worktree::tests::a_cross_process_sweep_cannot_enter_the_add_marker_gap",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(ROOT_ENV, &root)
+            // A distinct state root proves the lock is repository-wide rather
+            // than accidentally coordinating only one MEDHA_HOME.
+            .env(STATE_ENV, &other_state_dir)
+            .env(STARTED_ENV, &started)
+            .env(DONE_ENV, &done)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sweep process did not start");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !done.exists(),
+            "second process swept while checkout lacked its owner marker"
+        );
+
+        // Marker publication completes while the same lock is still held.
+        release.wait().await;
+        let tree = tokio::time::timeout(Duration::from_secs(10), checkout)
+            .await
+            .expect("checkout did not finish")
+            .expect("checkout task failed")
+            .expect("checkout failed");
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("sweep process did not finish")
+            .expect("could not wait for sweep process");
+        assert!(status.success());
+        assert!(done.exists());
+        assert!(
+            tree.path().exists(),
+            "sweep removed a checkout after its live owner was published"
+        );
+        tree.reap().await;
+    }
+
+    #[cfg(unix)]
+    fn executable_script(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-git");
+        std::fs::write(&path, body).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hung_git_deadline_reaps_its_descendant_process_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let started = temp.path().join("started");
+        let release = temp.path().join("release");
+        let survived = temp.path().join("survived");
+        let script = executable_script(
+            temp.path(),
+            "#!/bin/sh\n\
+             printf started > \"$1\"\n\
+             (while [ ! -f \"$2\" ]; do sleep 0.05; done; printf survived > \"$3\") &\n\
+             sleep 30\n",
+        );
+        let result = run_git_program(
+            script,
+            temp.path().to_path_buf(),
+            vec![
+                started.to_string_lossy().to_string(),
+                release.to_string_lossy().to_string(),
+                survived.to_string_lossy().to_string(),
+            ],
+            None,
+            None,
+            1024,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(WorktreeError::GitTimeout { .. })));
+        assert!(started.exists());
+        std::fs::write(&release, b"go").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !survived.exists(),
+            "a descendant survived the Git command deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_git_future_still_reaps_its_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let started = temp.path().join("started");
+        let release = temp.path().join("release");
+        let survived = temp.path().join("survived");
+        let script = executable_script(
+            temp.path(),
+            "#!/bin/sh\n\
+             printf started > \"$1\"\n\
+             (while [ ! -f \"$2\" ]; do sleep 0.05; done; printf survived > \"$3\") &\n\
+             sleep 30\n",
+        );
+        let completion = Arc::new(tokio::sync::Semaphore::new(0));
+        let run = tokio::spawn(run_git_program_observed(
+            script,
+            temp.path().to_path_buf(),
+            vec![
+                started.to_string_lossy().to_string(),
+                release.to_string_lossy().to_string(),
+                survived.to_string_lossy().to_string(),
+            ],
+            None,
+            None,
+            1024,
+            Duration::from_secs(30),
+            Some(Arc::clone(&completion)),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake Git process did not start");
+        run.abort();
+        let _ = run.await;
+        // The production supervisor itself permits a full settle grace. Give
+        // this observation a scheduling margin instead of racing the exact
+        // same five-second boundary under a busy all-targets test run.
+        let observation_deadline = GIT_SETTLE_TIMEOUT + Duration::from_secs(5);
+        let _permit = tokio::time::timeout(observation_deadline, completion.acquire())
+            .await
+            .expect("owned Git supervisor did not settle after caller cancellation")
+            .expect("completion semaphore unexpectedly closed");
+        std::fs::write(&release, b"go").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !survived.exists(),
+            "a descendant survived cancellation of the Git future"
         );
     }
 

@@ -22,11 +22,14 @@ pub mod kernel_loop;
 pub use artifacts::ArtifactStore;
 pub use budgets::{Budget, BudgetHandle, BudgetStop, DEFAULT_MAX_TURNS, Governor, Pooled};
 pub use clarify::{Answer, Asker, NoAsker, QOption, Question};
-pub use context::{CompileResult, ContextEngine, DiscoveredContext, ProgressiveContext};
+pub use context::{
+    AuthorizedContextPath, CompileControl, CompileResult, ContextCompileError, ContextEngine,
+    DiscoveredContext, ProgressiveContext, ProgressiveContextPathAuthorizer,
+};
 pub use errors::KernelError;
 pub use events::{
-    Event, EventKind, EventLog, FileRollback, InMemoryLog, Provenance, SessionMeta, cut_index,
-    project_messages, project_ordered_messages, rollback_plan,
+    Event, EventKind, EventLog, FileRollback, InMemoryLog, MutationLease, Provenance, SessionMeta,
+    cut_index, project_messages, project_ordered_messages, rollback_plan,
 };
 pub use executor::{BackgroundTask, Executor};
 pub use gate::{Approval, AutoDeny, HumanGate};

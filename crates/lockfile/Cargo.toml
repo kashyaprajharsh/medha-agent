@@ -10,6 +10,7 @@ kernel.workspace = true
 context.workspace = true
 sandbox = { path = "../sandbox" }
 serde.workspace = true
+thiserror.workspace = true
 toml = "0.8"
 
 [dev-dependencies]

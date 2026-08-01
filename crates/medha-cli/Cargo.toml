@@ -63,3 +63,14 @@ base64 = "0.22"
 # TUI stdout-corruption fix: dup/dup2 the real tty so the terminal draws on a
 # private handle while a dependency's stray println! is redirected to a log.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+] }
+
+[dev-dependencies]
+flate2 = "1"
+tempfile = "3"

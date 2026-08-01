@@ -1178,11 +1178,27 @@ impl AgentControl {
     /// running one.
     pub async fn transcript(&self, from: &AgentPath, child: &str) -> Result<Vec<String>, Error> {
         let outbox = self.outbox.as_ref().ok_or(Error::Unavailable)?;
-        let agent = self.reach(from, child)?;
-        let id = agent
-            .session
-            .parse()
-            .map_err(|_| Error::UnknownAgent(child.to_string()))?;
+        // Session id is the documented durable address returned by spawn.
+        // Root surfaces may use it directly after roster eviction or restart,
+        // when no in-memory Agent remains to rediscover the same id. Descendant
+        // agents still resolve through the registry so they cannot read a
+        // sibling's transcript merely by learning its session id.
+        let id = if from.is_root() {
+            child.parse().ok()
+        } else {
+            None
+        }
+        .or_else(|| self.reach(from, child).ok()?.session.parse::<Ulid>().ok())
+        // Roster eviction must not orphan a durable transcript: the archive
+        // answers with the same under-`from` containment as `reach`, so a
+        // nested parent keeps its child readable while siblings stay opaque.
+        .or_else(|| {
+            self.registry
+                .archived_session(from, child)?
+                .parse::<Ulid>()
+                .ok()
+        })
+        .ok_or_else(|| Error::UnknownAgent(child.to_string()))?;
         Ok(outbox.transcript(id).await)
     }
 
@@ -1411,11 +1427,12 @@ impl AgentControl {
         if text.trim().is_empty() {
             return Err(Error::NoObjective);
         }
-        let agent = self.reach(&caller.path, reference)?;
-        if agent.is_running() {
-            self.registry.steer(&agent.path, text);
-            return Ok(agent);
-        }
+        let found = self.reach(&caller.path, reference)?;
+        let agent = match self.registry.followup(&found.path, text) {
+            Some(registry::Followup::Delivered(agent)) => return Ok(agent),
+            Some(registry::Followup::Resume(agent)) => agent,
+            None => return Err(Error::UnknownAgent(reference.to_string())),
+        };
         let spec = AgentSpec {
             name: agent.path.name().to_string(),
             objective: text.to_string(),
@@ -1621,8 +1638,6 @@ async fn execute(
             },
         }
     };
-    drop(permit);
-
     // The patch is taken on *every* exit path, cancellation and failure
     // included. A writer killed halfway has usually still changed something,
     // and throwing that away is the same partial-output loss §6.5 forbids for
@@ -1780,6 +1795,11 @@ async fn execute(
     registry.settled(&path, result.status);
     // After the registry and the outbox, so anything woken here can read both.
     settled.notify_waiters();
+    // Capacity covers the complete admitted lifecycle, including patch
+    // extraction, verification, durable reporting, worktree cleanup, and
+    // roster settlement. Releasing it after the runner alone allowed an
+    // unbounded number of expensive post-run phases to overlap.
+    drop(permit);
     result
 }
 

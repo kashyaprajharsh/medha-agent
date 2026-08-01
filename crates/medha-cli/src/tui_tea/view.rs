@@ -1180,8 +1180,8 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         ));
     }
     // Live background-task indicator: an animated glyph + count, so the user sees
-    // what's still running (a promoted `shell.exec`) even when no turn is active.
-    // `/tasks` lists them; `task.kill` (or the model) stops them.
+    // what's still running in an owned `shell.exec` even when no turn is active.
+    // `/tasks` lists them; `task.kill` can stop a concurrent session's command.
     let running_bg = model.bg_running();
     if running_bg > 0 {
         let g = super::spin::secondary(model.anim_frame);

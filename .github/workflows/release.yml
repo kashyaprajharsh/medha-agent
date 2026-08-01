@@ -8,52 +8,90 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to build (e.g. v0.1.0)"
+      ref:
+        description: "Git ref or SHA to validate; publishing requires an existing v* tag"
         required: true
+        type: string
+      publish:
+        description: "Publish the validated existing tag"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+  RELEASE_PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
 
 jobs:
-  # A tag must not be able to publish a broken binary. Without this the build
-  # matrix ran regardless of CI's verdict — and did, for three commits while CI
-  # was red. Costs a few minutes per release; buys not shipping a broken build.
-  gate:
-    name: lint + test
-    runs-on: ubuntu-22.04
+  # Resolve one immutable release identity before any compilation. A manual
+  # dispatch may dry-run any ref/SHA, but publishing additionally requires an
+  # existing version-matching tag that resolves to the exact checked-out SHA.
+  validate:
+    name: validate release identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.release_ref.outputs.sha }}
+      tag: ${{ steps.release_ref.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
-      - id: toolchain
-        run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      # actions/checkout v4, pinned to an immutable upstream commit.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: gate
-      - name: Install build and language-server dependencies
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Match tag, commit, and package version
+        id: release_ref
+        shell: bash
         run: |
-          mkdir -p "$HOME/.local/bin"
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
-          sudo apt-get install -y clangd || sudo apt-get install -y clang-tools
-          command -v clangd >/dev/null \
-            || ln -sf "$(ls -1 /usr/bin/clangd-* | sort -V | tail -1)" "$HOME/.local/bin/clangd"
-          ln -sf "$(rustup which rust-analyzer)" "$HOME/.local/bin/rust-analyzer"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+          version="$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          sha="$(git rev-parse HEAD)"
+          tag="v$version"
+
+          if [ "$RELEASE_PUBLISH" = "true" ]; then
+            requested="$RELEASE_REF"
+            case "$requested" in
+              refs/tags/*) tag="${requested#refs/tags/}" ;;
+              *) tag="$requested" ;;
+            esac
+            if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+              echo "publishing requires an existing semantic-version tag, got: $tag" >&2
+              exit 1
+            fi
+            if [ "$tag" != "v$version" ]; then
+              echo "tag $tag does not match workspace version $version" >&2
+              exit 1
+            fi
+            tag_sha="$(git rev-parse "refs/tags/$tag^{commit}" 2>/dev/null)" \
+              || { echo "release tag does not exist: $tag" >&2; exit 1; }
+            if [ "$sha" != "$tag_sha" ]; then
+              echo "$tag points at $tag_sha, not checked-out SHA $sha" >&2
+              exit 1
+            fi
+          fi
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # Run the same lint and Linux/macOS/Windows test matrix as ordinary CI, but
+  # against the exact validated tag commit. Build cannot start unless every
+  # called-workflow job succeeds.
+  verify:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    with:
+      checkout_ref: ${{ needs.validate.outputs.sha }}
 
   build:
     name: ${{ matrix.target }}
-    needs: gate
+    needs: [validate, verify]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -64,15 +102,18 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
 
       # Version comes from rust-toolchain.toml, so a published binary is built
       # by the same compiler CI linted with — not whatever stable happens to be.
@@ -80,12 +121,14 @@ jobs:
         shell: bash
         run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@master
+      # Third-party actions are commit-pinned because this workflow produces
+      # release binaries and its final job has repository write permission.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           key: ${{ matrix.target }}
 
@@ -99,15 +142,15 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p medha-cli
 
+      # The reusable verify job has already tested this exact SHA on Linux,
+      # macOS and Windows, including both installer suites.
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           staging="medha-${{ matrix.target }}"
-          mkdir -p "$staging"
-          cp "target/${{ matrix.target }}/release/medha" "$staging/"
-          cp README.md medha.lock.example "$staging/" 2>/dev/null || true
-          tar czf "$staging.tar.gz" "$staging"
+          cp "target/${{ matrix.target }}/release/medha" medha
+          tar czf "$staging.tar.gz" medha
           shasum -a 256 "$staging.tar.gz" > "$staging.tar.gz.sha256"
 
       - name: Package (windows)
@@ -115,13 +158,11 @@ jobs:
         shell: bash
         run: |
           staging="medha-${{ matrix.target }}"
-          mkdir -p "$staging"
-          cp "target/${{ matrix.target }}/release/medha.exe" "$staging/"
-          cp README.md medha.lock.example "$staging/" 2>/dev/null || true
-          7z a "$staging.zip" "$staging"
+          cp "target/${{ matrix.target }}/release/medha.exe" medha.exe
+          7z a "$staging.zip" medha.exe
           certutil -hashfile "$staging.zip" SHA256 | sed -n 2p > "$staging.zip.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: medha-${{ matrix.target }}
           path: |
@@ -130,18 +171,22 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [validate, build]
+    if: ${{ github.event_name == 'push' || inputs.publish }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           merge-multiple: true
           path: dist
 
       - name: Publish
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.validate.outputs.tag }}
           draft: false
           generate_release_notes: true
           files: dist/*

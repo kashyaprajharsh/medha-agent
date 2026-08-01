@@ -834,8 +834,8 @@ impl Outbox for MemoryOutbox {
             row.2 = true;
         }
     }
-    async fn transcript(&self, _child: Ulid) -> Vec<String> {
-        Vec::new()
+    async fn transcript(&self, child: Ulid) -> Vec<String> {
+        vec![format!("transcript:{child}")]
     }
     async fn recorded(
         &self,
@@ -1280,6 +1280,33 @@ struct Isolation {
     verification: Option<Verification>,
 }
 
+struct BlockingVerification {
+    inner: Arc<Isolation>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Workspaces for BlockingVerification {
+    async fn checkout(&self, session: Ulid) -> Result<Workspace, String> {
+        self.inner.checkout(session).await
+    }
+
+    async fn verify(&self, _root: &Path, _cancel: &CancellationToken) -> Option<Verification> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Some(Verification {
+            command: "blocked verifier".into(),
+            passed: true,
+            output: "released".into(),
+        })
+    }
+
+    fn repo(&self) -> std::path::PathBuf {
+        self.inner.repo()
+    }
+}
+
 #[async_trait]
 impl Workspaces for Isolation {
     async fn checkout(&self, session: Ulid) -> Result<Workspace, String> {
@@ -1425,6 +1452,52 @@ async fn a_patch_carries_the_verification_the_runtime_ran_itself() {
     let patch = result.patch.unwrap();
     assert!(!patch.verified());
     assert_eq!(patch.verification.unwrap().output, "2 failed");
+}
+
+#[tokio::test]
+async fn capacity_is_held_through_verification_and_terminal_settlement() {
+    let (_repo, state, root) = writable().await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let workspaces = Arc::new(BlockingVerification {
+        inner: isolation(&root, &state),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    let control = AgentControl::new(Arc::new(Edits), CancellationToken::new())
+        .with_outbox(Arc::new(MemoryOutbox::default()))
+        .with_workspaces(workspaces)
+        .with_limits(1, 1);
+    let caller = Caller::root(Ulid::new());
+
+    control
+        .spawn_background(
+            writer("first writer"),
+            &caller,
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("the first writer never reached verification");
+
+    let second = control
+        .spawn_background(
+            spec("second child"),
+            &caller,
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
+        .await;
+    release.notify_one();
+    control.drain().await;
+
+    assert!(
+        matches!(second, Err(Error::AtCapacity(1))),
+        "post-run verification escaped the configured lifecycle capacity"
+    );
 }
 
 #[tokio::test]
@@ -1626,6 +1699,55 @@ async fn finished_children_stay_visible_after_they_leave_the_roster() {
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0].state, State::Settled(AgentStatus::Completed));
     assert_eq!(agents[0].objective, "rewrite a.txt");
+}
+
+#[tokio::test]
+async fn durable_session_ids_keep_transcripts_addressable_after_eviction_and_restart() {
+    let outbox = Arc::new(MemoryOutbox::default());
+    let runner = Arc::new(Recorder {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let owner = Ulid::new();
+    let control =
+        AgentControl::new(runner.clone(), CancellationToken::new()).with_outbox(outbox.clone());
+    control.adopt(owner);
+
+    let mut oldest = None;
+    for index in 0..100 {
+        let result = run(&control, spec(&format!("agent number {index}")), 2)
+            .await
+            .unwrap();
+        oldest.get_or_insert(result.session);
+    }
+    let oldest = oldest.unwrap();
+    assert!(
+        control.agents().iter().all(|agent| agent.session != oldest),
+        "the test did not exceed the settled-roster cache"
+    );
+    assert_eq!(
+        control
+            .transcript(&AgentPath::root(), &oldest)
+            .await
+            .unwrap(),
+        [format!("transcript:{oldest}")]
+    );
+
+    let restarted = AgentControl::new(runner, CancellationToken::new()).with_outbox(outbox.clone());
+    assert!(restarted.agents().is_empty());
+    assert_eq!(
+        restarted
+            .transcript(&AgentPath::root(), &oldest)
+            .await
+            .unwrap(),
+        [format!("transcript:{oldest}")]
+    );
+    assert!(
+        restarted
+            .transcript(&AgentPath::parse("/another-agent").unwrap(), &oldest)
+            .await
+            .is_err(),
+        "a descendant must not bypass reachability with a learned session id"
+    );
 }
 
 #[tokio::test]

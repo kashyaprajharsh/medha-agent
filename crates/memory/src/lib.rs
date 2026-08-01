@@ -27,38 +27,40 @@ pub trait MemoryStore: Send + Sync {
 #[async_trait]
 impl MemoryStore for MemoryProjection {
     async fn write(&self, entry: MemoryEntry) -> Result<(), MemoryError> {
-        self.apply(&MemoryOp::Write { entry })
+        self.apply_async(&MemoryOp::Write { entry }).await
     }
 
     async fn update(&self, entry: MemoryEntry) -> Result<(), MemoryError> {
-        self.apply(&MemoryOp::Update { entry })
+        self.apply_async(&MemoryOp::Update { entry }).await
     }
 
     async fn forget(&self, scope: Scope, name: &str) -> Result<(), MemoryError> {
-        self.apply(&MemoryOp::Forget {
+        self.apply_async(&MemoryOp::Forget {
             scope,
             name: name.to_string(),
         })
+        .await
     }
 
     async fn pin(&self, scope: Scope, name: &str, pinned: bool) -> Result<(), MemoryError> {
-        self.apply(&MemoryOp::Pin {
+        self.apply_async(&MemoryOp::Pin {
             scope,
             name: name.to_string(),
             pinned,
         })
+        .await
     }
 
     async fn get(&self, scope: Scope, name: &str) -> Result<Option<MemoryEntry>, MemoryError> {
-        MemoryProjection::get(self, scope, name)
+        self.get_async(scope, name).await
     }
 
     async fn list(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
-        MemoryProjection::list(self)
+        self.list_async().await
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, MemoryError> {
-        MemoryProjection::search(self, query, limit)
+        self.search_async(query, limit).await
     }
 }
 

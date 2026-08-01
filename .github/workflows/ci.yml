@@ -4,16 +4,36 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: Exact Git ref or SHA to verify
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Real language-server tests are opt-in below on the one runner that also
+  # provisions the servers. An ambient binary on another image must not decide
+  # whether a test runs.
+  MEDHA_LSP_E2E: "0"
 
 jobs:
-  test:
+  # Formatting and lints are platform-independent, so they run once on the
+  # cheapest runner rather than three times.
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4, pinned to an immutable upstream commit.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
 
       # rust-toolchain.toml is the single source of truth, but the action needs
       # the version as an input — so read it out rather than duplicating it.
@@ -22,20 +42,76 @@ jobs:
         run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        # dtolnay/rust-toolchain, pinned from upstream master.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
-          components: rustfmt, clippy, rust-analyzer
+          components: rustfmt, clippy
+
+      # keyring's Linux backend (sync-secret-service) links against D-Bus, so
+      # libdbus-sys needs the headers and pkg-config to find them.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      # Swatinem/rust-cache v2, pinned to the dereferenced tag commit.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Every host OS we publish for is built and tested here on every push. The
+  # release workflow separately builds each target architecture; this matrix
+  # catches host-specific Rust, shell, PowerShell, and installer defects before
+  # a tag exists.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # One platform failing must not hide the state of the others: the whole
+      # point of the matrix is learning about every platform in one run.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+
+      - name: Read pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      # No rust-analyzer component here: installing it on every platform puts a
+      # server on PATH everywhere, and the LSP end-to-end tests used to start
+      # themselves wherever they found one. Linux adds it below.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
 
       # Real language servers so the LSP end-to-end tests exercise the protocol
-      # path instead of silently skipping when a binary is absent.
-      - name: Install build and language-server dependencies
+      # path for real. This is the only platform that provisions them, and it is
+      # therefore the only platform that asks for the tests — MEDHA_LSP_E2E is
+      # set here so requesting them and supplying what they need is one decision.
+      # Once set, a missing server fails the run instead of skipping it.
+      - name: Install language servers
+        if: runner.os == 'Linux'
         run: |
           mkdir -p "$HOME/.local/bin"
-          sudo apt-get update
-          # keyring's Linux backend (sync-secret-service) links against D-Bus,
-          # so libdbus-sys needs the headers and pkg-config to find them.
-          sudo apt-get install -y libdbus-1-dev pkg-config
           # `clangd`, not `clang-tools`: the latter installs only versioned
           # binaries (clangd-14, …) and no unversioned symlink, so a bare
           # `clangd` is not on PATH. Fall back to symlinking whichever
@@ -45,21 +121,22 @@ jobs:
           command -v clangd >/dev/null \
             || ln -sf "$(ls -1 /usr/bin/clangd-* | sort -V | tail -1)" "$HOME/.local/bin/clangd"
           # rust-analyzer ships as a rustup component; expose it on PATH.
+          rustup component add rust-analyzer
           ln -sf "$(rustup which rust-analyzer)" "$HOME/.local/bin/rust-analyzer"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "MEDHA_LSP_E2E=1" >> "$GITHUB_ENV"
 
       - name: Verify servers are on PATH
+        if: runner.os == 'Linux'
         run: |
           rust-analyzer --version
           clangd --version
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: ${{ matrix.os }}
 
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
+      # The installer end-to-end tests are `#![cfg(windows)]` / `#![cfg(unix)]`,
+      # so each platform runs its own here and neither waits for a release.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-targets

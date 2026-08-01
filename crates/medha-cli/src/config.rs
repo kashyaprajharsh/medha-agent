@@ -644,16 +644,41 @@ pub fn skills_lock_path() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join("medha-skills.lock"))
 }
 
-/// Per-workspace runtime state directory: `~/.medha/projects/<encoded-cwd>/`
+/// Per-workspace runtime state directory:
+/// `~/.medha/projects/<readable-cwd>--<path-hash>/`
 /// Runtime state — the event log, artifacts, snapshots,
 /// logs — lives HERE, out of the working tree, so it never clutters or gets
 /// committed to the user's repos. Only committed config (`.medha/skills`,
-/// `medha.lock`) stays in the workspace. Creates the dir. `workspace` should be
-/// the canonicalized cwd so the same project always maps to the same dir.
+/// `medha.lock`) stays in the workspace. Creates the dir. `workspace` must be
+/// an existing directory; it is canonicalized here so aliases of one workspace
+/// share an identity while distinct paths cannot collide through punctuation.
 pub fn state_dir(workspace: &std::path::Path) -> Result<PathBuf> {
-    let dir = state_dir_in(&medha_home()?, workspace);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
+    let workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("canonicalizing workspace {}", workspace.display()))?;
+    let home = medha_home()?;
+    let projects = home.join("projects");
+    std::fs::create_dir_all(&projects)
+        .with_context(|| format!("creating {}", projects.display()))?;
+
+    // Older releases used only the readable, separator-replaced name. That
+    // mapping was ambiguous (`/w/a-b` and `/w/a/b` both became `-w-a-b`), so
+    // importing it could expose another workspace's event history or, more
+    // importantly, its prompt-free trust grants. Leave the old state untouched
+    // for manual recovery and start from the collision-resistant identity.
+    let legacy = home
+        .join("projects")
+        .join(readable_workspace_slug(&workspace));
+    let current = state_dir_in(&home, &workspace);
+    if legacy.exists() && !current.exists() && legacy != current {
+        eprintln!(
+            "warning: legacy workspace state at {} has an ambiguous path identity and was not \
+             imported automatically; re-approve external paths and recover non-trust data manually",
+            legacy.display()
+        );
+    }
+
+    select_state_dir(&home, &workspace)
 }
 
 /// Pure path computation behind [`state_dir`] (no I/O) — testable without env.
@@ -661,10 +686,85 @@ fn state_dir_in(home: &std::path::Path, workspace: &std::path::Path) -> PathBuf 
     home.join("projects").join(encode_workspace(workspace))
 }
 
-/// Encode an absolute workspace path into one readable directory name: every
-/// path separator becomes `-`, so
-/// `/Users/x/proj` → `-Users-x-proj`. Existing hyphens are left as-is; a
-/// Windows drive colon becomes `-`.
+const WORKSPACE_ID_MARKER: &str = ".medha-workspace-id-v2";
+
+/// Select and bind a directory to this exact canonical path.
+///
+/// The marker is essential even though the name contains a strong hash. An old
+/// separator-only name could itself end in text that looks like `--<hash>`.
+/// Adopting an existing unmarked directory would then reintroduce the legacy
+/// cross-workspace trust collision during the migration.
+fn select_state_dir(home: &std::path::Path, workspace: &std::path::Path) -> Result<PathBuf> {
+    let projects = home.join("projects");
+    std::fs::create_dir_all(&projects)
+        .with_context(|| format!("creating {}", projects.display()))?;
+    let candidate = projects.join(encode_workspace(workspace));
+    let identity = workspace_path_identity(workspace);
+    match std::fs::create_dir(&candidate) {
+        Ok(()) => {
+            let marker = candidate.join(WORKSPACE_ID_MARKER);
+            if let Err(error) = std::fs::write(&marker, &identity) {
+                // No caller can use this directory until this function returns.
+                // Best-effort removal avoids leaving an unbound directory after
+                // a disk/permission failure.
+                let _ = std::fs::remove_dir(&candidate);
+                return Err(error).with_context(|| format!("writing {}", marker.display()));
+            }
+            Ok(candidate)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let marker = candidate.join(WORKSPACE_ID_MARKER);
+            // Another first launch may have won `create_dir` and be between
+            // directory creation and its marker write. Briefly wait for that
+            // exact marker; never allocate a second state directory, which
+            // would make later launches abandon whichever history lost.
+            let attempts = if cfg!(test) { 2 } else { 50 };
+            for attempt in 0..attempts {
+                match std::fs::read_to_string(&marker) {
+                    Ok(stored) if stored == identity => return Ok(candidate),
+                    Ok(_) => break,
+                    Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
+                        if attempt + 1 < attempts {
+                            std::thread::sleep(std::time::Duration::from_millis(if cfg!(test) {
+                                1
+                            } else {
+                                20
+                            }));
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            anyhow::bail!(
+                "refusing unbound or mismatched workspace state at {}; move it aside after \
+                 inspection, then restart so trust/history cannot cross projects",
+                candidate.display()
+            )
+        }
+        Err(error) => Err(error).with_context(|| format!("creating {}", candidate.display())),
+    }
+}
+
+/// Encode an absolute workspace path into a readable but collision-resistant
+/// directory name. The readable prefix is diagnostic only; authority and state
+/// separation come from a 128-bit SHA-256 prefix over the canonical OS path.
+fn encode_workspace(p: &std::path::Path) -> String {
+    let readable = readable_workspace_slug(p);
+    // Keep one path component comfortably below common 255-byte limits. The
+    // digest preserves identity even when the human-readable prefix is cut.
+    let mut prefix = String::with_capacity(readable.len().min(96));
+    for character in readable.chars() {
+        if prefix.len() + character.len_utf8() > 96 {
+            break;
+        }
+        prefix.push(character);
+    }
+    format!("{prefix}--{}", workspace_path_fingerprint(p))
+}
+
+/// Produce the non-authoritative readable part of a workspace state name:
+/// every path separator becomes `-`, so `/Users/x/proj` becomes
+/// `-Users-x-proj`. Existing hyphens are intentionally left as-is.
 ///
 /// Windows `canonicalize` hands back a *verbatim* path — `\\?\C:\Users\x`, or
 /// `\\?\UNC\server\share` for a network drive — and its `?` is one of the
@@ -672,7 +772,7 @@ fn state_dir_in(home: &std::path::Path, workspace: &std::path::Path) -> PathBuf 
 /// `--?-C--Users-x`, so creating the state dir failed with os error 123 and
 /// medha could not start at all. The prefix is stripped first; on Unix, where
 /// `canonicalize` returns a plain absolute path, there is nothing to strip.
-fn encode_workspace(p: &std::path::Path) -> String {
+fn readable_workspace_slug(p: &std::path::Path) -> String {
     let raw = p.to_string_lossy();
     let path = raw
         .strip_prefix(r"\\?\UNC\")
@@ -687,6 +787,43 @@ fn encode_workspace(p: &std::path::Path) -> String {
             }
         })
         .collect()
+}
+
+fn workspace_path_fingerprint(p: &std::path::Path) -> String {
+    workspace_path_digest(p)[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn workspace_path_identity(p: &std::path::Path) -> String {
+    let digest: String = workspace_path_digest(p)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("medha-workspace-v2\nsha256={digest}\n")
+}
+
+fn workspace_path_digest(p: &std::path::Path) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(p.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in p.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(p.as_os_str().to_string_lossy().as_bytes());
+
+    hasher.finalize().into()
 }
 
 pub fn load() -> Result<Option<Config>> {
@@ -966,7 +1103,10 @@ pub fn pulse(
     let cwd_lock = std::env::current_dir().ok().map(|d| d.join("medha.lock"));
     let (project_lock, lock_executor) = match cwd_lock {
         Some(p) if p.exists() => {
-            let executor = lockfile::MedhaLock::load(&p).and_then(|l| l.routing.executor);
+            let executor = lockfile::MedhaLock::load(&p)
+                .ok()
+                .flatten()
+                .and_then(|lock| lock.routing.executor);
             (Some(p.display().to_string()), executor)
         }
         _ => (None, None),
@@ -1809,17 +1949,105 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn encodes_workspace_path_claude_code_style() {
-        // Leading separator and every '/' become '-'; existing hyphens survive.
+    fn encodes_workspace_path_with_readable_prefix_and_hash() {
+        let encoded = encode_workspace(Path::new("/Users/x/proj"));
+        assert!(encoded.starts_with("-Users-x-proj--"));
         assert_eq!(
-            encode_workspace(Path::new("/Users/x/proj")),
-            "-Users-x-proj"
+            encoded.rsplit_once("--").unwrap().1.len(),
+            32,
+            "workspace identity uses 128 bits of SHA-256"
+        );
+        assert!(
+            encode_workspace(Path::new("/a/my-repo")).starts_with("-a-my-repo--"),
+            "existing hyphens remain readable"
+        );
+    }
+
+    #[test]
+    fn formerly_colliding_workspace_paths_have_distinct_state_identity() {
+        let flat = Path::new("/w/a-b");
+        let nested = Path::new("/w/a/b");
+        assert_eq!(
+            readable_workspace_slug(flat),
+            readable_workspace_slug(nested),
+            "documents the old ambiguous mapping"
+        );
+        assert_ne!(encode_workspace(flat), encode_workspace(nested));
+        assert_ne!(
+            state_dir_in(Path::new("/home/u/.medha"), flat),
+            state_dir_in(Path::new("/home/u/.medha"), nested),
+            "different workspaces must never share event state or trust.lock"
+        );
+    }
+
+    #[test]
+    fn colliding_legacy_workspace_cannot_inherit_machine_local_trust() {
+        let home = std::env::temp_dir().join(format!("medha-state-id-{}", ulid::Ulid::new()));
+        let legitimate = Path::new("/w/a-b");
+        let other = Path::new("/w/a/b");
+        let legitimate_state = state_dir_in(&home, legitimate);
+        let other_state = state_dir_in(&home, other);
+        std::fs::create_dir_all(&legitimate_state).unwrap();
+        std::fs::write(
+            legitimate_state.join("trust.lock"),
+            "[[permissions.trusted_paths]]\npath = \"/\"\npermission = \"Read\"\n",
+        )
+        .unwrap();
+
+        assert_ne!(legitimate_state, other_state);
+        assert!(
+            !other_state.join("trust.lock").exists(),
+            "another canonical workspace identity must not inherit prompt-free grants"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn state_directory_is_bound_to_the_full_workspace_identity() {
+        let home = std::env::temp_dir().join(format!("medha-state-marker-{}", ulid::Ulid::new()));
+        let workspace = Path::new("/workspace/marker-test");
+
+        let selected = select_state_dir(&home, workspace).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(selected.join(WORKSPACE_ID_MARKER)).unwrap(),
+            workspace_path_identity(workspace)
         );
         assert_eq!(
-            encode_workspace(Path::new("/Users/reeturajharsh/Personal/files/medha")),
-            "-Users-reeturajharsh-Personal-files-medha"
+            select_state_dir(&home, workspace).unwrap(),
+            selected,
+            "a directory is reused only after its exact identity marker matches"
         );
-        assert_eq!(encode_workspace(Path::new("/a/my-repo")), "-a-my-repo");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unmarked_hash_looking_legacy_directory_is_never_adopted() {
+        let home = std::env::temp_dir().join(format!("medha-state-unmarked-{}", ulid::Ulid::new()));
+        let workspace = Path::new("/workspace/unmarked-test");
+        let unbound = state_dir_in(&home, workspace);
+        std::fs::create_dir_all(&unbound).unwrap();
+        std::fs::write(
+            unbound.join("trust.lock"),
+            "[[permissions.trusted_paths]]\npath = \"/\"\npermission = \"Read\"\n",
+        )
+        .unwrap();
+
+        let error = select_state_dir(&home, workspace).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing unbound or mismatched"),
+            "{error:#}"
+        );
+        assert!(
+            !unbound.join(WORKSPACE_ID_MARKER).exists(),
+            "Medha must not claim an existing directory by adding its own marker"
+        );
+        assert_eq!(
+            std::fs::read_to_string(unbound.join("trust.lock")).unwrap(),
+            "[[permissions.trusted_paths]]\npath = \"/\"\npermission = \"Read\"\n"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -1828,16 +2056,17 @@ mod tests {
         // produced `--?-C--Users-ASUS`, and `?` is forbidden in a Windows
         // filename, so the state dir could not be created (os error 123) and
         // medha failed to start on every Windows machine.
-        let enc = encode_workspace(Path::new(r"\\?\C:\Users\ASUS"));
+        let enc = readable_workspace_slug(Path::new(r"\\?\C:\Users\ASUS"));
         assert_eq!(enc, "C--Users-ASUS");
 
         // A drive path that was never verbatim encodes the same way, so the two
-        // forms of the same directory share one state dir.
-        assert_eq!(encode_workspace(Path::new(r"C:\Users\ASUS")), enc);
+        // forms retain the same readable portion. Runtime callers canonicalize
+        // first, so the hashed identity receives one stable OS spelling.
+        assert_eq!(readable_workspace_slug(Path::new(r"C:\Users\ASUS")), enc);
 
         // Network drives come back as `\\?\UNC\server\share`.
         assert_eq!(
-            encode_workspace(Path::new(r"\\?\UNC\server\share\proj")),
+            readable_workspace_slug(Path::new(r"\\?\UNC\server\share\proj")),
             "server-share-proj"
         );
 
@@ -1848,7 +2077,7 @@ mod tests {
             r"C:\a\b",
             "/Users/x/proj",
         ] {
-            let enc = encode_workspace(Path::new(p));
+            let enc = readable_workspace_slug(Path::new(p));
             for bad in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
                 assert!(
                     !enc.contains(bad),
@@ -1862,9 +2091,12 @@ mod tests {
     fn unix_paths_are_untouched_by_the_verbatim_strip() {
         // The strip is a no-op off Windows: a Linux or macOS path never carries a
         // prefix, and one that happens to contain a backslash is not a prefix.
-        assert_eq!(encode_workspace(Path::new("/home/u/proj")), "-home-u-proj");
         assert_eq!(
-            encode_workspace(Path::new("/home/u/odd?name")),
+            readable_workspace_slug(Path::new("/home/u/proj")),
+            "-home-u-proj"
+        );
+        assert_eq!(
+            readable_workspace_slug(Path::new("/home/u/odd?name")),
             "-home-u-odd?name",
             "a legal Linux filename must not be rewritten"
         );
@@ -1875,7 +2107,10 @@ mod tests {
         let home = Path::new("/home/u/.medha");
         let a = state_dir_in(home, Path::new("/w/one"));
         let b = state_dir_in(home, Path::new("/w/two"));
-        assert_eq!(a, Path::new("/home/u/.medha/projects/-w-one"));
+        assert!(
+            a.to_string_lossy()
+                .starts_with("/home/u/.medha/projects/-w-one--")
+        );
         assert_ne!(a, b, "different workspaces get different state dirs");
         assert!(
             a.starts_with(home),

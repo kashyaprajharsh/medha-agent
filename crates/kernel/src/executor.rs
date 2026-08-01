@@ -6,9 +6,8 @@
 use crate::types::{BlastRadius, Containment, Observation, ToolCategory, ToolIntent, ToolSpec};
 use async_trait::async_trait;
 
-/// A background command the executor is tracking (a promoted `shell.exec`), for
-/// surfaces to display — so the *user* can see what's running, not just the
-/// model (§2 / §4.13).
+/// An owned command the executor is currently tracking, for surfaces to display
+/// while it runs — so the *user* can see what's active, not just the model.
 #[derive(Debug, Clone)]
 pub struct BackgroundTask {
     pub id: String,
@@ -36,6 +35,25 @@ pub trait Executor: Send + Sync {
         None
     }
 
+    /// Stable identity of state this intent mutates, or `None` for a
+    /// side-effect-free call.
+    ///
+    /// Mutation identity is deliberately separate from [`BlastRadius`].
+    /// Blast radius is an authorization/verification classification, while
+    /// this method drives execution ordering. Some durable operations (notably
+    /// project-scoped memory writes) are intentionally low-risk enough to carry
+    /// a `Read` radius but still mutate a replayable projection.
+    ///
+    /// The default is conservative: every non-read tool shares one global
+    /// mutation lane. Executors with low-risk mutations declared as `Read`
+    /// must override this method.
+    fn mutation_key(&self, intent: &ToolIntent) -> Option<String> {
+        match self.blast_radius(&intent.tool) {
+            Some(BlastRadius::Read) | None => None,
+            Some(_) => Some("state:*".to_string()),
+        }
+    }
+
     /// How strongly this executor confines command execution (§4.8). Drives the
     /// kernel's trust-flow escalation — a web-tainted action is gated unless the
     /// containment blocks exfiltration. Defaults to no containment.
@@ -53,8 +71,8 @@ pub trait Executor: Send + Sync {
         None
     }
 
-    /// Background commands currently tracked (promoted `shell.exec` tasks), for a
-    /// surface to show the user. Default: none (executors without a task table).
+    /// Owned commands currently running, for a surface to show the user.
+    /// Default: none (executors without a task table).
     fn background_tasks(&self) -> Vec<BackgroundTask> {
         Vec::new()
     }

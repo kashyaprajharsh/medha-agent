@@ -94,6 +94,13 @@ impl Executor for NarrowedExecutor {
         self.inner.category(tool)
     }
 
+    fn mutation_key(&self, intent: &ToolIntent) -> Option<String> {
+        if !self.allows(&intent.tool) {
+            return None;
+        }
+        self.inner.mutation_key(intent)
+    }
+
     fn containment(&self) -> Containment {
         self.inner.containment()
     }

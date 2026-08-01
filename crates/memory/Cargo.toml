@@ -13,8 +13,8 @@ serde_json.workspace = true
 ulid = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 async-trait.workspace = true
+tokio.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 futures.workspace = true

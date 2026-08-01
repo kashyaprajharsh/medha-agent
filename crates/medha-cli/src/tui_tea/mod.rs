@@ -43,6 +43,8 @@ const MAX_TOOL_OUTPUT_LINES: usize = 500;
 const PASTE_COLLAPSE_THRESHOLD: usize = 1000;
 /// Redraw interval (16-33ms for 60-30fps)
 const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+const TURN_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const TURN_ABORT_GRACE: Duration = Duration::from_secs(2);
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
@@ -78,7 +80,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "/rewind",
         "time-travel: branch from an earlier turn (undoes later edits)",
     ),
-    ("/tasks", "list background shell tasks (running/finished)"),
+    ("/tasks", "list currently owned shell tasks"),
     ("/lsp", "language-server sessions and health"),
     (
         "/mcp",
@@ -317,6 +319,12 @@ pub(crate) enum TuiEvent {
     /// `/rewind` completed loading this session's rewind points from the log.
     RewindPointsLoaded(Vec<RewindPoint>),
     MemoryProvenance(Box<memory::MemoryEntry>, Option<kernel::Event>),
+    /// A picker pin/forget completed under the same durable mutation lease used
+    /// by kernel-dispatched memory tools.
+    MemoryMutationFinished {
+        verb: String,
+        result: Result<Vec<memory::MemoryEntry>, String>,
+    },
     /// A rewind finished. `new_id` is `Some` for conversation scopes (swap to
     /// the forked branch); `None` for code-only (conversation untouched). `msgs`
     /// is the branch's replayed conversation, `rolled` the files reverted,
@@ -1670,6 +1678,10 @@ struct Model {
     /// Interrupt handle for the running turn: Esc → graceful cancel_turn,
     /// Enter mid-turn → steer (applied at the next turn boundary).
     interrupt: Option<kernel::InterruptHandle>,
+    /// Owned foreground turn. The surface retains this handle until the turn
+    /// has settled, and shutdown cancels then joins it before restoring the
+    /// terminal or tearing down shared LSP/MCP/agent services.
+    foreground_turn: Option<tokio::task::JoinHandle<()>>,
     /// An Esc was sent and the kernel is settling in-flight tools — used to
     /// show one "stopping…" notice instead of one per Esc press.
     cancelling: bool,
@@ -1723,8 +1735,8 @@ struct Model {
     /// (code time-travel). File ops still go through the executor for turns;
     /// this is the out-of-band restore path.
     restore: Arc<WorkspaceSandbox>,
-    /// Live background shell tasks (promoted `shell.exec` runs), polled from the
-    /// executor so the *user* sees what's running — not just the model.
+    /// Live owned shell tasks, polled from the executor so the *user* sees a
+    /// foreground command that is still running in a concurrent session.
     bg_tasks: Vec<kernel::BackgroundTask>,
     /// Running-task count last reflected on screen, so the status line only
     /// forces an idle redraw when the number actually changes.
@@ -1799,6 +1811,7 @@ impl Model {
             current_tool: None,
             turn_started: None,
             interrupt: None,
+            foreground_turn: None,
             cancelling: false,
             pending_approvals: VecDeque::new(),
             clarify: None,
@@ -1965,7 +1978,7 @@ impl Model {
         out
     }
 
-    /// How many background tasks are still running.
+    /// How many owned shell tasks are still running.
     fn bg_running(&self) -> usize {
         self.bg_tasks.iter().filter(|t| t.running).count()
     }
@@ -2327,6 +2340,48 @@ enum Msg {
     Tick,
 }
 
+/// Stop and settle the foreground owner before the TUI releases its terminal
+/// and before main tears down shared services.
+async fn shutdown_foreground_turn(
+    model: &mut Model,
+    rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
+    grace: Duration,
+) -> bool {
+    // Stop admitting new gate/question requests, then deny both already-rendered
+    // prompts and those queued behind a final burst of stream events.
+    rx.close();
+    if let Some(handle) = model.interrupt.take() {
+        handle.cancel_turn();
+    }
+    model.deny_pending_approvals();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            TuiEvent::Approval(_, _, _, responder) => {
+                let _ = responder.send(kernel::Approval::Deny);
+            }
+            TuiEvent::Clarify(_, responder) => {
+                let _ = responder.send(None);
+            }
+            _ => {}
+        }
+    }
+
+    let Some(mut task) = model.foreground_turn.take() else {
+        model.running = false;
+        return true;
+    };
+    let graceful = tokio::time::timeout(grace, &mut task).await.is_ok();
+    if !graceful {
+        task.abort();
+        let _ = tokio::time::timeout(TURN_ABORT_GRACE, task).await;
+    }
+    model.running = false;
+    model.current_tool = None;
+    model.turn_started = None;
+    model.cancelling = false;
+    graceful
+}
+
 /// Update function — pure state transition
 /// Main entry point (PART 0). Uses `ratatui::init`/`restore` (which install a
 /// panic hook that restores the terminal) rather than `ratatui::run` + `block_on`:
@@ -2435,8 +2490,7 @@ where
     if open_setup {
         update::open_model_setup_quiet(&mut model);
     }
-    let mut transcript = vec![Message::system(system)];
-    transcript.extend(resumed); // prior conversation when resuming (else empty)
+    let mut transcript = crate::session_transcript(system, resumed);
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(REDRAW_INTERVAL);
     let mut redraw_needed = true;
@@ -2539,6 +2593,8 @@ where
         }
     }
 
+    shutdown_foreground_turn(&mut model, &mut rx, TURN_SHUTDOWN_GRACE).await;
+
     // Restore terminal on exit (PART 2): leave the alternate screen on the
     // private handle, then undo the fd 1/2 redirection.
     tty::restore(&mut terminal, &mut redirect);
@@ -2577,6 +2633,60 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-tui-test-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap())
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_active_turn_and_denies_all_approvals() {
+        let mut model = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            lockfile::UiConfig::default(),
+            HashMap::new(),
+            test_sbx(),
+        );
+        let (surface_tx, mut surface_rx) = channel();
+        let (interrupt, queue) = kernel::InterruptQueue::pair();
+        let cancel = queue.token();
+        model.interrupt = Some(interrupt);
+        model.running = true;
+
+        let (visible_tx, visible_rx) = oneshot::channel();
+        model.pending_approvals.push_back(PendingApproval {
+            action: "fs.write".into(),
+            detail: None,
+            escalated: false,
+            responder: visible_tx,
+        });
+        let (queued_tx, queued_rx) = oneshot::channel();
+        surface_tx
+            .send(TuiEvent::Approval(
+                "shell.exec".into(),
+                None,
+                false,
+                queued_tx,
+            ))
+            .unwrap();
+
+        let (settled_tx, settled_rx) = oneshot::channel();
+        model.foreground_turn = Some(tokio::spawn(async move {
+            cancel.cancelled().await;
+            let visible = visible_rx.await.unwrap();
+            let queued = queued_rx.await.unwrap();
+            let _ = settled_tx.send((visible, queued));
+        }));
+
+        let graceful =
+            shutdown_foreground_turn(&mut model, &mut surface_rx, Duration::from_secs(1)).await;
+        assert!(graceful, "cooperative turn should join within the grace");
+        assert_eq!(
+            settled_rx.await.unwrap(),
+            (kernel::Approval::Deny, kernel::Approval::Deny)
+        );
+        assert!(model.foreground_turn.is_none());
+        assert!(model.pending_approvals.is_empty());
+        assert!(!model.running);
+        assert!(surface_tx.is_closed(), "new prompts must be refused");
     }
 
     #[test]
@@ -3054,14 +3164,8 @@ mod tests {
             HashMap::new(),
             test_sbx(),
         );
-        m.upsert_notice(
-            "background tasks",
-            "background tasks:\n  t1 [running] find".into(),
-        );
-        m.upsert_notice(
-            "background tasks",
-            "background tasks:\n  t1 [done] find".into(),
-        );
+        m.upsert_notice("shell tasks", "shell tasks:\n  t1 [running] find".into());
+        m.upsert_notice("shell tasks", "shell tasks:\n  t1 [done] find".into());
         let notices: Vec<&Item> = m.items.iter().map(|e| &e.item).collect();
         assert_eq!(
             notices.len(),
@@ -3071,7 +3175,7 @@ mod tests {
         assert!(matches!(notices[0], Item::Notice(n) if n.contains("[done]")));
         // A different item in between → a fresh block is appended, not merged.
         m.push_item(Item::User("hi".into()));
-        m.upsert_notice("background tasks", "background tasks: none".into());
+        m.upsert_notice("shell tasks", "shell tasks: none".into());
         assert_eq!(m.items.len(), 3);
     }
 

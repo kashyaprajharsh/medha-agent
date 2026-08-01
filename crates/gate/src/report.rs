@@ -30,9 +30,35 @@ pub fn human(results: &[ScenarioResult], seeds: u32) -> String {
             for c in &first.checks {
                 let mark = if c.passed { "✔" } else { "✗" };
                 out.push_str(&format!("    {mark} {}  ({})\n", c.label, c.detail));
+                if c.normalized_target.is_some()
+                    || c.baseline_matches.is_some()
+                    || c.workspace_matches.is_some()
+                    || c.validation.as_str() != "not_applicable"
+                {
+                    out.push_str(&format!(
+                        "        validation={} target={} baseline_matches={} workspace_matches={}\n",
+                        c.validation.as_str(),
+                        c.normalized_target.as_deref().unwrap_or("n/a"),
+                        c.baseline_matches
+                            .map(|count| count.to_string())
+                            .unwrap_or_else(|| "n/a".into()),
+                        c.workspace_matches
+                            .map(|count| count.to_string())
+                            .unwrap_or_else(|| "n/a".into()),
+                    ));
+                }
             }
-            if !first.completed {
-                out.push_str("    ⚠ run did not complete (timeout or launch failure)\n");
+            if !first.status.is_success() {
+                out.push_str(&format!("    ⚠ agent run {}\n", first.status.description()));
+            }
+        }
+        for (index, seed) in r.seeds.iter().enumerate() {
+            if let Some(path) = &seed.artifact_path {
+                out.push_str(&format!(
+                    "    kept seed {} artifacts: {}\n",
+                    index + 1,
+                    path.display()
+                ));
             }
         }
         if r.seeds.len() > 1 {
@@ -70,10 +96,20 @@ pub fn json(results: &[ScenarioResult]) -> String {
                 "ci": r.ci.map(|(lo, hi)| json!([lo, hi])),
                 "seeds": r.seeds.iter().map(|s| json!({
                     "passed": s.passed(),
-                    "completed": s.completed,
+                    "completed": s.status.completed(),
+                    "run_status": s.status.kind(),
+                    "exit_code": s.status.exit_code(),
+                    "run_error": s.status.detail(),
                     "wall_ms": s.wall_ms,
+                    "artifact_path": s.artifact_path,
                     "checks": s.checks.iter().map(|c| json!({
-                        "label": c.label, "passed": c.passed, "detail": c.detail
+                        "label": c.label,
+                        "passed": c.passed,
+                        "detail": c.detail,
+                        "normalized_target": c.normalized_target,
+                        "baseline_matches": c.baseline_matches,
+                        "workspace_matches": c.workspace_matches,
+                        "validation": c.validation.as_str(),
                     })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
             })
@@ -86,4 +122,69 @@ pub fn json(results: &[ScenarioResult]) -> String {
         "scenarios": scenarios,
     });
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checks::{CheckOutcome, ValidationStatus};
+    use crate::verdict::{RunStatus, SeedResult};
+
+    fn result_with_filesystem_metadata() -> ScenarioResult {
+        ScenarioResult {
+            id: "metadata".into(),
+            seeds: vec![SeedResult {
+                checks: vec![
+                    CheckOutcome {
+                        label: "unchanged: tests/**".into(),
+                        passed: false,
+                        detail: "zero baseline matches are forbidden".into(),
+                        normalized_target: Some("tests/**".into()),
+                        baseline_matches: Some(0),
+                        workspace_matches: Some(0),
+                        validation: ValidationStatus::Validated,
+                    },
+                    CheckOutcome {
+                        label: "exists: ../outside".into(),
+                        passed: false,
+                        detail: "validation failed: parent traversal".into(),
+                        normalized_target: None,
+                        baseline_matches: None,
+                        workspace_matches: None,
+                        validation: ValidationStatus::Invalid,
+                    },
+                ],
+                status: RunStatus::Succeeded,
+                wall_ms: 12,
+                artifact_path: None,
+            }],
+            pass_rate: 0.0,
+            ci: None,
+            verdict: Verdict::Reject,
+        }
+    }
+
+    #[test]
+    fn human_and_json_reports_expose_match_and_containment_metadata() {
+        let result = result_with_filesystem_metadata();
+        let human = human(std::slice::from_ref(&result), 1);
+        assert!(human.contains("validation=validated"), "{human}");
+        assert!(human.contains("target=tests/**"), "{human}");
+        assert!(human.contains("baseline_matches=0"), "{human}");
+        assert!(human.contains("workspace_matches=0"), "{human}");
+        assert!(human.contains("validation=invalid"), "{human}");
+        assert!(human.contains("exists: ../outside"), "{human}");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&json(std::slice::from_ref(&result))).unwrap();
+        let checks = document["scenarios"][0]["seeds"][0]["checks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(checks[0]["validation"], "validated");
+        assert_eq!(checks[0]["normalized_target"], "tests/**");
+        assert_eq!(checks[0]["baseline_matches"], 0);
+        assert_eq!(checks[0]["workspace_matches"], 0);
+        assert_eq!(checks[1]["validation"], "invalid");
+        assert!(checks[1]["normalized_target"].is_null());
+    }
 }

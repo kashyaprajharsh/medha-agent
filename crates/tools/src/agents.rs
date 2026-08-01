@@ -143,6 +143,13 @@ impl kernel::Executor for Rebound {
         self.inner.category(tool)
     }
 
+    fn mutation_key(&self, intent: &kernel::ToolIntent) -> Option<String> {
+        match self.tools.get(&intent.tool) {
+            Some(tool) => tool.mutation_key(&intent.args),
+            None => self.inner.mutation_key(intent),
+        }
+    }
+
     fn containment(&self) -> kernel::Containment {
         self.inner.containment()
     }

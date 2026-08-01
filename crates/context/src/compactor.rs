@@ -235,19 +235,37 @@ fn tail_start_index(
     policy: &CompactionPolicy,
     counter: &dyn TokenCounter,
 ) -> usize {
+    tail_start_index_by(items.len(), head_end, budget, policy, |index| {
+        counter.count(&items[index].content)
+    })
+}
+
+/// The one protected-tail walk, shared by the standalone compactor and the
+/// production engine so their off-by-one behaviour can never diverge again.
+/// Callers supply only the per-item token cost; the invariants live here:
+/// a candidate joins the tail *before* the threshold check (`kept` and `acc`
+/// include it — checking first protected one item fewer than `protect_last_n`
+/// promises), and the result never crosses into the head.
+pub(crate) fn tail_start_index_by(
+    len: usize,
+    head_end: usize,
+    budget: &ContextBudget,
+    policy: &CompactionPolicy,
+    cost: impl Fn(usize) -> u32,
+) -> usize {
     let tail_budget = (budget.usable() as f32 * policy.tail_ratio) as u32;
     let mut acc = 0u32;
-    let mut start = items.len();
+    let mut start = len;
     while start > head_end {
         let candidate = start - 1;
-        acc += counter.count(&items[candidate].content);
-        let kept = items.len() - candidate;
+        acc = acc.saturating_add(cost(candidate));
+        start = candidate;
+        let kept = len - candidate;
         // Stop growing the tail once we've met both the count floor and the
         // token budget.
         if kept >= policy.protect_last_n && acc >= tail_budget {
             break;
         }
-        start = candidate;
     }
     start.max(head_end)
 }
@@ -260,6 +278,10 @@ fn tail_start_index(
 pub struct LlmSummarizer<P: kernel::Provider> {
     provider: std::sync::Arc<P>,
 }
+
+const MAX_SUMMARY_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SUMMARY_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_SUMMARY_STREAM_BLOCKS: usize = 4_096;
 
 impl<P: kernel::Provider> LlmSummarizer<P> {
     pub fn new(provider: std::sync::Arc<P>) -> Self {
@@ -288,11 +310,26 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
 
         let mut body = String::new();
         if let Some(prev) = previous {
+            if prev.len() > MAX_SUMMARY_INPUT_BYTES {
+                return Err(SummarizeError::Unavailable(
+                    "previous summary exceeds the compactor input limit".into(),
+                ));
+            }
             body.push_str("=== previous summary (update it) ===\n");
             body.push_str(prev);
             body.push_str("\n=== conversation to fold in ===\n");
         }
         for it in items {
+            let additional = it
+                .content
+                .len()
+                .saturating_add(role_label(&it.role).len())
+                .saturating_add(3);
+            if body.len().saturating_add(additional) > MAX_SUMMARY_INPUT_BYTES {
+                return Err(SummarizeError::Unavailable(
+                    "compaction input exceeds the summarizer byte limit".into(),
+                ));
+            }
             body.push_str(role_label(&it.role));
             body.push_str(": ");
             body.push_str(&it.content);
@@ -314,9 +351,23 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
             .await
             .map_err(|e| SummarizeError::Unavailable(e.to_string()))?;
         let mut text = String::new();
+        let mut blocks = 0usize;
         while let Some(block) = stream.next().await {
+            blocks = blocks.saturating_add(1);
+            if blocks > MAX_SUMMARY_STREAM_BLOCKS {
+                return Err(SummarizeError::Unavailable(
+                    "summary stream exceeded the block limit".into(),
+                ));
+            }
             match block {
-                Ok(Block::Text(t)) => text.push_str(&t),
+                Ok(Block::Text(t)) => {
+                    if text.len().saturating_add(t.len()) > MAX_SUMMARY_OUTPUT_BYTES {
+                        return Err(SummarizeError::Unavailable(
+                            "summary stream exceeded the byte limit".into(),
+                        ));
+                    }
+                    text.push_str(&t);
+                }
                 Ok(_) => {} // ignore reasoning/tool/usage blocks
                 Err(e) => return Err(SummarizeError::Unavailable(e.to_string())),
             }
@@ -352,25 +403,42 @@ impl Summarizer for ExtractiveSummarizer {
             items.len()
         ));
 
-        let user_gists: Vec<String> = items
-            .iter()
-            .filter(|i| i.role == Role::User)
-            .map(|i| {
-                let g: String = i.content.chars().take(160).collect();
-                format!("- {}", g.trim())
-            })
-            .collect();
+        let mut user_gists = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if index % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+            if item.role == Role::User && user_gists.len() < 128 {
+                let g: String = item.content.chars().take(160).collect();
+                user_gists.push(format!("- {}", g.trim()));
+                if user_gists.len() == 128 {
+                    break;
+                }
+            }
+        }
         if !user_gists.is_empty() {
             out.push_str("User asks:\n");
             out.push_str(&user_gists.join("\n"));
             out.push('\n');
         }
 
-        let mut files: Vec<&str> = items
-            .iter()
-            .flat_map(|i| i.content.split_whitespace())
-            .filter(|t| t.contains('/') && t.contains('.') && !t.contains("://"))
-            .collect();
+        let mut files: Vec<&str> = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if index % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+            for token in item.content.split_whitespace() {
+                if token.contains('/') && token.contains('.') && !token.contains("://") {
+                    files.push(token);
+                    if files.len() >= 1_024 {
+                        break;
+                    }
+                }
+            }
+            if files.len() >= 1_024 {
+                break;
+            }
+        }
         files.sort_unstable();
         files.dedup();
         if !files.is_empty() {
@@ -401,6 +469,62 @@ mod tests {
             decide(&items, &budget, &policy, &counter),
             CompactionAction::None
         );
+    }
+
+    #[tokio::test]
+    async fn extractive_fallback_cooperates_with_cancellation() {
+        let items = (0..100_000)
+            .map(|_| HistoryItem::text(Role::Assistant, "plain"))
+            .collect::<Vec<_>>();
+        let control = kernel::CompileControl::unlimited();
+        let cancel = control.cancellation_token().clone();
+        let task = tokio::spawn(async move {
+            control
+                .run(ExtractiveSummarizer.summarize(None, &items))
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        assert!(matches!(
+            task.await.expect("fallback task"),
+            Err(kernel::ContextCompileError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn tail_walk_always_retains_the_protected_floor_including_the_last_item() {
+        let counter = HeuristicCounter;
+        for len in 1..24 {
+            let items = (0..len)
+                .map(|index| {
+                    HistoryItem::text(
+                        Role::User,
+                        "x".repeat(if index + 1 == len { 4_000 } else { index + 1 }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for protected in 0..=len + 2 {
+                for max_ctx in [701, 2_000, 100_000, u32::MAX] {
+                    let policy = CompactionPolicy {
+                        protect_last_n: protected,
+                        tail_ratio: 0.1,
+                        ..CompactionPolicy::default()
+                    };
+                    let start = tail_start_index(
+                        &items,
+                        0,
+                        &ContextBudget::from_max_ctx(max_ctx),
+                        &policy,
+                        &counter,
+                    );
+                    assert!(
+                        len - start >= protected.min(len),
+                        "len={len}, protected={protected}, max_ctx={max_ctx}, start={start}"
+                    );
+                    assert!(start < len, "a non-empty history must retain its last item");
+                }
+            }
+        }
     }
 
     #[tokio::test]

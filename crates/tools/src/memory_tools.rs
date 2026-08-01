@@ -80,6 +80,21 @@ fn parse_scope(args: &Value) -> Result<Scope, ToolError> {
     }
 }
 
+/// Identity used by the kernel's mutation scheduler. Invalid/incomplete
+/// arguments share a conservative wildcard lane; validation will reject them
+/// later, but they must not accidentally look side-effect free beforehand.
+fn memory_mutation_key(args: &Value) -> String {
+    let scope = args
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("project");
+    let name = args.get("name").and_then(Value::as_str);
+    match (Scope::parse(scope), name.filter(|name| !name.is_empty())) {
+        (Some(scope), Some(name)) => format!("memory:{}:{name}", scope.as_str()),
+        _ => "memory:*".to_string(),
+    }
+}
+
 fn parse_links(args: &Value) -> Vec<String> {
     args.get("links")
         .and_then(Value::as_array)
@@ -232,6 +247,9 @@ impl Tool for MemoryWrite {
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
     }
+    fn mutation_key(&self, args: &Value) -> Option<String> {
+        Some(memory_mutation_key(args))
+    }
     fn category(&self) -> ToolCategory {
         ToolCategory::Plan
     }
@@ -260,7 +278,13 @@ impl Tool for MemoryWrite {
         let scope = parse_scope(args)?;
         guard_scan(name, claim, description)?;
 
-        if self.store.get(scope, name).map_err(store_err)?.is_some() {
+        if self
+            .store
+            .get_async(scope, name)
+            .await
+            .map_err(store_err)?
+            .is_some()
+        {
             return Err(ToolError::Failed(format!(
                 "memory '{name}' already exists in {} scope — use memory.update",
                 scope.as_str()
@@ -268,7 +292,8 @@ impl Tool for MemoryWrite {
         }
         if let Some(dup) = self
             .store
-            .list()
+            .list_async()
+            .await
             .map_err(store_err)?
             .iter()
             .find(|e| e.claim == claim)
@@ -301,13 +326,14 @@ impl Tool for MemoryWrite {
             created: now,
             updated: now,
         };
-        let assessment = memory::consolidate::assess_write_configured(
+        let assessment = memory::consolidate::assess_write_configured_async(
             &self.store,
             &entry,
             self.budget_tokens,
             now,
             self.stale_after_days,
         )
+        .await
         .map_err(store_err)?;
         if assessment.over_budget() {
             return Err(self.consolidation_error((inj.session, turn), assessment));
@@ -317,7 +343,7 @@ impl Tool for MemoryWrite {
         }
         let usage_tokens = assessment.projected_tokens;
         let op = MemoryOp::Write { entry };
-        self.store.apply(&op).map_err(store_err)?;
+        self.store.apply_async(&op).await.map_err(store_err)?;
         let mut response = saved_response(
             op,
             &format!(
@@ -353,6 +379,9 @@ impl Tool for MemoryUpdate {
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
     }
+    fn mutation_key(&self, args: &Value) -> Option<String> {
+        Some(memory_mutation_key(args))
+    }
     fn category(&self) -> ToolCategory {
         ToolCategory::Plan
     }
@@ -373,7 +402,7 @@ impl Tool for MemoryUpdate {
         let inj = injected(args)?;
         let name = arg_str(args, "name")?;
         let scope = parse_scope(args)?;
-        let Some(existing) = self.store.get(scope, name).map_err(store_err)? else {
+        let Some(existing) = self.store.get_async(scope, name).await.map_err(store_err)? else {
             return Err(ToolError::Failed(format!(
                 "no memory '{name}' in {} scope — use memory.write for a new fact",
                 scope.as_str()
@@ -434,7 +463,7 @@ impl Tool for MemoryUpdate {
             updated: now_secs(),
         };
         let op = MemoryOp::Update { entry };
-        self.store.apply(&op).map_err(store_err)?;
+        self.store.apply_async(&op).await.map_err(store_err)?;
         let mut response =
             saved_response(op, "Updated. This write is complete — do not repeat it.");
         if contradiction {
@@ -465,6 +494,9 @@ impl Tool for MemoryForget {
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
     }
+    fn mutation_key(&self, args: &Value) -> Option<String> {
+        Some(memory_mutation_key(args))
+    }
     fn category(&self) -> ToolCategory {
         ToolCategory::Plan
     }
@@ -482,7 +514,13 @@ impl Tool for MemoryForget {
         injected(args)?; // kernel dispatch required, even though nothing is computed from it here
         let name = arg_str(args, "name")?;
         let scope = parse_scope(args)?;
-        if self.store.get(scope, name).map_err(store_err)?.is_none() {
+        if self
+            .store
+            .get_async(scope, name)
+            .await
+            .map_err(store_err)?
+            .is_none()
+        {
             return Err(ToolError::Failed(format!(
                 "no memory '{name}' in {} scope",
                 scope.as_str()
@@ -492,7 +530,7 @@ impl Tool for MemoryForget {
             scope,
             name: name.to_string(),
         };
-        self.store.apply(&op).map_err(store_err)?;
+        self.store.apply_async(&op).await.map_err(store_err)?;
         Ok(saved_response(op, "Forgotten."))
     }
 }
@@ -507,7 +545,7 @@ pub struct SessionsSearch {
 }
 
 impl SessionsSearch {
-    fn event_record(&self, event: Event) -> Value {
+    async fn event_record(&self, event: Event) -> Value {
         let role = match &event.kind {
             EventKind::UserMessage => "user",
             EventKind::ModelText => "assistant",
@@ -532,7 +570,10 @@ impl SessionsSearch {
             _ => event.payload.to_string(),
         };
         let text = if text.len() > 16_000 {
-            match self.artifacts.put(text.as_bytes()) {
+            match Arc::clone(&self.artifacts)
+                .put_async(text.into_bytes())
+                .await
+            {
                 Ok(hash) => format!(
                     "[oversized event stored as an artifact — read_artifact hash=\"{hash}\"]"
                 ),
@@ -600,7 +641,8 @@ impl Tool for SessionsSearch {
                 .clamp(1, 20) as usize;
             let hits = self
                 .log
-                .search(query, limit.saturating_mul(10))
+                .search_async(query, limit.saturating_mul(10))
+                .await
                 .map_err(|error| ToolError::Failed(format!("session search store: {error}")))?;
             let mut seen = std::collections::HashSet::new();
             let mut sessions = Vec::new();
@@ -608,20 +650,24 @@ impl Tool for SessionsSearch {
                 if !seen.insert(hit.session_id) {
                     continue;
                 }
-                let window = self
+                let window_events = self
                     .log
-                    .window(hit.session_id, hit.event_id, 5)
-                    .map_err(|error| ToolError::Failed(format!("session window: {error}")))?
-                    .into_iter()
-                    .map(|event| self.event_record(event))
-                    .collect::<Vec<_>>();
-                let bookends = self
+                    .window_async(hit.session_id, hit.event_id, 5)
+                    .await
+                    .map_err(|error| ToolError::Failed(format!("session window: {error}")))?;
+                let mut window = Vec::with_capacity(window_events.len());
+                for event in window_events {
+                    window.push(self.event_record(event).await);
+                }
+                let bookend_events = self
                     .log
-                    .bookends(hit.session_id, 3)
-                    .map_err(|error| ToolError::Failed(format!("session bookends: {error}")))?
-                    .into_iter()
-                    .map(|event| self.event_record(event))
-                    .collect::<Vec<_>>();
+                    .bookends_async(hit.session_id, 3)
+                    .await
+                    .map_err(|error| ToolError::Failed(format!("session bookends: {error}")))?;
+                let mut bookends = Vec::with_capacity(bookend_events.len());
+                for event in bookend_events {
+                    bookends.push(self.event_record(event).await);
+                }
                 sessions.push(json!({
                     "session_id": hit.session_id,
                     "hit": hit,
@@ -650,13 +696,15 @@ impl Tool for SessionsSearch {
                 .and_then(Value::as_u64)
                 .unwrap_or(5)
                 .clamp(1, 50) as usize;
-            let events = self
+            let window_events = self
                 .log
-                .window(session_id, around_event_id, radius)
-                .map_err(|error| ToolError::Failed(format!("session window: {error}")))?
-                .into_iter()
-                .map(|event| self.event_record(event))
-                .collect::<Vec<_>>();
+                .window_async(session_id, around_event_id, radius)
+                .await
+                .map_err(|error| ToolError::Failed(format!("session window: {error}")))?;
+            let mut events = Vec::with_capacity(window_events.len());
+            for event in window_events {
+                events.push(self.event_record(event).await);
+            }
             return Ok(json!({
                 "mode": "scroll",
                 "session_id": session_id,
@@ -672,7 +720,8 @@ impl Tool for SessionsSearch {
             .clamp(1, 20) as usize;
         let sessions = self
             .log
-            .list_sessions()
+            .list_sessions_async()
+            .await
             .map_err(|error| ToolError::Failed(format!("session browse: {error}")))?
             .into_iter()
             .take(limit)
@@ -729,7 +778,8 @@ impl Tool for MemorySearch {
         let now = now_secs();
         let results = self
             .store
-            .search(query, limit)
+            .search_async(query, limit)
+            .await
             .map_err(store_err)?
             .into_iter()
             .map(|entry| {
@@ -780,6 +830,49 @@ mod tests {
 
     fn write_args(name: &str) -> Value {
         json!({ "name": name, "claim": format!("claim {name}"), "description": "hook", "kind": "project" })
+    }
+
+    #[test]
+    fn registry_exposes_memory_mutations_to_the_kernel_scheduler() {
+        let mut registry = crate::ToolRegistry::new();
+        registry.register_memory(store());
+        let key = |tool: &str, args: Value| {
+            registry.mutation_key(&kernel::ToolIntent {
+                id: "call".into(),
+                tool: tool.into(),
+                args,
+            })
+        };
+
+        assert_eq!(
+            key(
+                "memory.write",
+                json!({ "scope": "project", "name": "shared" })
+            )
+            .as_deref(),
+            Some("memory:project:shared")
+        );
+        assert_eq!(
+            key(
+                "memory.update",
+                json!({ "scope": "project", "name": "shared" })
+            )
+            .as_deref(),
+            Some("memory:project:shared")
+        );
+        assert_eq!(
+            key(
+                "memory.forget",
+                json!({ "scope": "project", "name": "shared" })
+            )
+            .as_deref(),
+            Some("memory:project:shared")
+        );
+        assert_eq!(
+            key("memory.search", json!({ "query": "shared" })),
+            None,
+            "read-only recall remains parallelizable"
+        );
     }
 
     #[tokio::test]

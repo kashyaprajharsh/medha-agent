@@ -96,6 +96,7 @@ impl ContextEngine for Passthrough {
     async fn compile(&self, messages: &[Message], _max_ctx: Option<u32>) -> CompileResult {
         CompileResult {
             messages: messages.to_vec(),
+            source_indices: (0..messages.len()).map(Some).collect(),
             compacted: false,
             summarized: false,
             before_tokens: 0,

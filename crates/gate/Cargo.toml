@@ -9,13 +9,20 @@ rust-version.workspace = true
 kernel.workspace = true
 store = { path = "../store" }
 lockfile = { path = "../lockfile" }
+sandbox = { path = "../sandbox" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 ulid = { workspace = true }
 glob = "0.3"
+tempfile = "3"
 
 [dev-dependencies]
+fd-lock = "4"
 tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

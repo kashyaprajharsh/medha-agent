@@ -8,6 +8,7 @@ license.workspace = true
 kernel = { path = "../kernel" }
 async-trait.workspace = true
 futures.workspace = true
+fd-lock = "4"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -24,3 +25,11 @@ tempfile = "3"
 # Liveness test for a worktree's owning process, so a second Medha in the same
 # repository cannot remove a checkout that is still being written to.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  # Only for the SYNCHRONIZE access right, which windows-sys files here.
+  "Win32_Storage_FileSystem",
+] }

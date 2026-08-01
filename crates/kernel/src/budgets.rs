@@ -6,7 +6,9 @@
 //! turn cap: the *user* sets the ceiling; turn-count is just one dimension.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::types::{Pricing, Usage};
 
 /// Generous anti-runaway backstop on turns when the user sets nothing.
 pub const DEFAULT_MAX_TURNS: u32 = 200;
@@ -27,6 +29,8 @@ pub type BudgetHandle = Arc<Mutex<Option<Budget>>>;
 pub struct Pooled {
     tokens: u64,
     cost_usd: f64,
+    reserved_tokens: u64,
+    reserved_cost_usd: f64,
     started: Option<Instant>,
 }
 
@@ -35,11 +39,8 @@ impl Pooled {
         Arc::new(Mutex::new(Self::default()))
     }
 
-    fn elapsed_s(&mut self) -> u64 {
-        self.started
-            .get_or_insert_with(Instant::now)
-            .elapsed()
-            .as_secs()
+    fn started(&mut self) -> Instant {
+        *self.started.get_or_insert_with(Instant::now)
     }
 }
 
@@ -131,20 +132,45 @@ impl BudgetStop {
 /// kernel calls `check()` before each turn and records usage as it goes.
 pub struct Governor {
     budget: Budget,
-    start: Instant,
+    allowance: Allowance,
+    local: Arc<Mutex<LocalSpend>>,
     turns: u32,
+}
+
+#[derive(Debug, Default)]
+struct LocalSpend {
     tokens: u64,
     cost_usd: f64,
 }
 
+/// An atomic worst-case reservation for one provider request.
+///
+/// Dropping an unreconciled reservation charges its full amount. Once a
+/// request has been admitted, losing the connection or receiving no usage
+/// block is uncertain spend, never free spend.
+pub struct ModelReservation {
+    allowance: Allowance,
+    local: Arc<Mutex<LocalSpend>>,
+    tokens: u64,
+    cost_usd: f64,
+    enforce_tokens: bool,
+    enforce_cost: bool,
+    settled: bool,
+}
+
 impl Governor {
     pub fn new(budget: Budget) -> Self {
+        let allowance = budget.pooled.clone().unwrap_or_default();
+        // Starting a descendant must not reset the tree's wall clock.
+        allowance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .started();
         Self {
             budget,
-            start: Instant::now(),
+            allowance,
+            local: Arc::new(Mutex::new(LocalSpend::default())),
             turns: 0,
-            tokens: 0,
-            cost_usd: 0.0,
         }
     }
 
@@ -156,14 +182,14 @@ impl Governor {
         if matches!(self.budget.max_turns, Some(m) if self.turns >= m) {
             return Some(BudgetStop::Turns);
         }
-        let (tokens, cost_usd, elapsed_s) = self.spent();
+        let (tokens, cost_usd, elapsed) = self.spent();
         if matches!(self.budget.max_tokens, Some(m) if tokens >= m) {
             return Some(BudgetStop::Tokens);
         }
         if matches!(self.budget.max_cost_usd, Some(m) if cost_usd >= m) {
             return Some(BudgetStop::Cost);
         }
-        if matches!(self.budget.max_wall_s, Some(m) if elapsed_s >= m) {
+        if matches!(self.budget.max_wall_s, Some(m) if elapsed >= Duration::from_secs(m)) {
             return Some(BudgetStop::Wall);
         }
         None
@@ -172,45 +198,204 @@ impl Governor {
     /// What counts against the ceilings: the pool's totals where one is shared,
     /// this session's own otherwise. A poisoned pool falls back to local rather
     /// than removing the ceiling.
-    fn spent(&self) -> (u64, f64, u64) {
-        match self
-            .budget
-            .pooled
-            .as_ref()
-            .and_then(|pool| pool.lock().ok())
-        {
-            Some(mut pool) => (pool.tokens, pool.cost_usd, pool.elapsed_s()),
-            None => (self.tokens, self.cost_usd, self.start.elapsed().as_secs()),
-        }
+    fn spent(&self) -> (u64, f64, Duration) {
+        let mut allowance = self
+            .allowance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            allowance.tokens.saturating_add(allowance.reserved_tokens),
+            allowance.cost_usd + allowance.reserved_cost_usd,
+            allowance.started().elapsed(),
+        )
     }
 
     pub fn record_turn(&mut self) {
         self.turns = self.turns.saturating_add(1);
     }
 
-    /// Record real token spend (and cost, when a price is known; 0.0 otherwise).
-    pub fn record_tokens(&mut self, total_tokens: u64, cost_usd: f64) {
-        self.tokens = self.tokens.saturating_add(total_tokens);
-        self.cost_usd += cost_usd;
-        if let Some(mut pool) = self
-            .budget
-            .pooled
-            .as_ref()
-            .and_then(|pool| pool.lock().ok())
+    /// Absolute task deadline, shared by descendants using the same pool.
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
+        let wall = self.budget.max_wall_s?;
+        let started = self
+            .allowance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .started();
+        let deadline = started
+            .checked_add(Duration::from_secs(wall))
+            .unwrap_or(started);
+        Some(tokio::time::Instant::from_std(deadline))
+    }
+
+    /// Atomically reserve the maximum charge of one provider request.
+    ///
+    /// A hard token/cost ceiling requires exact prepared-input accounting and a
+    /// finite output cap. Otherwise there is no safe upper bound to admit.
+    pub fn reserve_model(
+        &mut self,
+        prompt_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        pricing: Option<Pricing>,
+    ) -> Result<ModelReservation, BudgetStop> {
+        if self.budget.max_tokens.is_some() && (prompt_tokens.is_none() || output_tokens.is_none())
         {
-            pool.tokens = pool.tokens.saturating_add(total_tokens);
-            pool.cost_usd += cost_usd;
+            return Err(BudgetStop::Tokens);
         }
+        if self.budget.max_cost_usd.is_some()
+            && (prompt_tokens.is_none() || output_tokens.is_none() || pricing.is_none())
+        {
+            return Err(BudgetStop::Cost);
+        }
+
+        let prompt = prompt_tokens.unwrap_or(0);
+        let output = output_tokens.unwrap_or(0);
+        let tokens = prompt.saturating_add(output);
+        let cost_usd = pricing
+            .map(|price| {
+                (prompt as f64 * price.input_per_mtok + output as f64 * price.output_per_mtok)
+                    / 1_000_000.0
+            })
+            .unwrap_or(0.0);
+        if !cost_usd.is_finite() || cost_usd.is_sign_negative() {
+            return Err(BudgetStop::Cost);
+        }
+
+        let mut allowance = self
+            .allowance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            self.budget.max_tokens,
+            Some(max)
+                if allowance
+                    .tokens
+                    .saturating_add(allowance.reserved_tokens)
+                    .saturating_add(tokens)
+                    > max
+        ) {
+            return Err(BudgetStop::Tokens);
+        }
+        if matches!(
+            self.budget.max_cost_usd,
+            Some(max)
+                if allowance.cost_usd + allowance.reserved_cost_usd + cost_usd
+                    > max
+        ) {
+            return Err(BudgetStop::Cost);
+        }
+        allowance.reserved_tokens = allowance.reserved_tokens.saturating_add(tokens);
+        allowance.reserved_cost_usd += cost_usd;
+        drop(allowance);
+
+        Ok(ModelReservation {
+            allowance: Arc::clone(&self.allowance),
+            local: Arc::clone(&self.local),
+            tokens,
+            cost_usd,
+            enforce_tokens: self.budget.max_tokens.is_some(),
+            enforce_cost: self.budget.max_cost_usd.is_some(),
+            settled: false,
+        })
+    }
+
+    /// Record real token spend outside request reservation (kept for callers
+    /// which meter a known non-provider charge).
+    pub fn record_tokens(&mut self, total_tokens: u64, cost_usd: f64) {
+        let mut local = self
+            .local
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        local.tokens = local.tokens.saturating_add(total_tokens);
+        local.cost_usd += cost_usd;
+        drop(local);
+        let mut allowance = self
+            .allowance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        allowance.tokens = allowance.tokens.saturating_add(total_tokens);
+        allowance.cost_usd += cost_usd;
     }
 
     pub fn turns(&self) -> u32 {
         self.turns
     }
     pub fn tokens(&self) -> u64 {
-        self.tokens
+        self.local
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tokens
     }
     pub fn cost_usd(&self) -> f64 {
-        self.cost_usd
+        self.local
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cost_usd
+    }
+}
+
+impl ModelReservation {
+    /// Reconcile with authoritative usage. `None` charges the reserved
+    /// worst-case amount (the provider call may have run even if metering was
+    /// absent or the transport failed).
+    pub fn reconcile(
+        mut self,
+        usage: Option<Usage>,
+        pricing: Option<Pricing>,
+    ) -> Result<(), BudgetStop> {
+        let (tokens, cost_usd) = usage.map_or((self.tokens, self.cost_usd), |usage| {
+            (
+                u64::from(
+                    usage
+                        .total_tokens
+                        .max(usage.prompt_tokens.saturating_add(usage.completion_tokens)),
+                ),
+                pricing
+                    .map(|price| price.cost(usage.prompt_tokens, usage.completion_tokens))
+                    .unwrap_or(self.cost_usd),
+            )
+        });
+        let token_overrun = self.enforce_tokens && tokens > self.tokens;
+        let cost_overrun = self.enforce_cost && cost_usd > self.cost_usd + f64::EPSILON;
+        self.settle(tokens, cost_usd);
+        if token_overrun {
+            Err(BudgetStop::Tokens)
+        } else if cost_overrun {
+            Err(BudgetStop::Cost)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn settle(&mut self, tokens: u64, cost_usd: f64) {
+        if self.settled {
+            return;
+        }
+        let mut allowance = self
+            .allowance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        allowance.reserved_tokens = allowance.reserved_tokens.saturating_sub(self.tokens);
+        allowance.reserved_cost_usd = (allowance.reserved_cost_usd - self.cost_usd).max(0.0);
+        allowance.tokens = allowance.tokens.saturating_add(tokens);
+        allowance.cost_usd += cost_usd;
+        drop(allowance);
+
+        let mut local = self
+            .local
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        local.tokens = local.tokens.saturating_add(tokens);
+        local.cost_usd += cost_usd;
+        self.settled = true;
+    }
+}
+
+impl Drop for ModelReservation {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle(self.tokens, self.cost_usd);
+        }
     }
 }
 
@@ -324,5 +509,111 @@ mod tests {
             pooled: None,
         });
         assert_eq!(g.check(), None);
+    }
+
+    #[test]
+    fn missing_usage_commits_the_worst_case_reservation() {
+        let mut governor = Governor::new(Budget {
+            max_turns: None,
+            max_tokens: Some(500),
+            max_cost_usd: None,
+            max_wall_s: None,
+            pooled: None,
+        });
+        let reservation = governor
+            .reserve_model(Some(400), Some(100), None)
+            .expect("exactly the remaining allowance is admissible");
+        reservation.reconcile(None, None).unwrap();
+        assert_eq!(governor.tokens(), 500);
+        assert_eq!(governor.check(), Some(BudgetStop::Tokens));
+    }
+
+    #[test]
+    fn a_single_request_cannot_overshoot_at_admission() {
+        let mut governor = Governor::new(Budget {
+            max_turns: None,
+            max_tokens: Some(100),
+            max_cost_usd: None,
+            max_wall_s: None,
+            pooled: None,
+        });
+        assert!(matches!(
+            governor.reserve_model(Some(80), Some(21), None),
+            Err(BudgetStop::Tokens)
+        ));
+        assert_eq!(governor.tokens(), 0);
+    }
+
+    #[test]
+    fn provider_usage_above_the_reserved_wire_cap_is_reported() {
+        let mut governor = Governor::new(Budget {
+            max_turns: None,
+            max_tokens: Some(1_000),
+            max_cost_usd: None,
+            max_wall_s: None,
+            pooled: None,
+        });
+        let reservation = governor.reserve_model(Some(40), Some(10), None).unwrap();
+        let result = reservation.reconcile(
+            Some(Usage {
+                prompt_tokens: 40,
+                completion_tokens: 20,
+                total_tokens: 60,
+            }),
+            None,
+        );
+        assert_eq!(result, Err(BudgetStop::Tokens));
+        assert_eq!(governor.tokens(), 60, "meter the provider's real report");
+    }
+
+    #[test]
+    fn concurrent_reservations_share_one_atomic_ceiling() {
+        let budget = Budget {
+            max_turns: None,
+            max_tokens: Some(100),
+            max_cost_usd: None,
+            max_wall_s: None,
+            pooled: None,
+        }
+        .pooling();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let budget = budget.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut governor = Governor::new(budget);
+                    barrier.wait();
+                    let reservation = governor.reserve_model(Some(40), Some(20), None);
+                    let admitted = reservation.is_ok();
+                    // Keep an admitted reservation alive long enough for the
+                    // competing thread to observe it.
+                    barrier.wait();
+                    drop(reservation);
+                    admitted
+                })
+            })
+            .collect::<Vec<_>>();
+        let admitted = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("reservation thread"))
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 1);
+    }
+
+    #[test]
+    fn a_cost_ceiling_without_pricing_fails_closed() {
+        let mut governor = Governor::new(Budget {
+            max_turns: None,
+            max_tokens: None,
+            max_cost_usd: Some(1.0),
+            max_wall_s: None,
+            pooled: None,
+        });
+        assert!(matches!(
+            governor.reserve_model(Some(10), Some(10), None),
+            Err(BudgetStop::Cost)
+        ));
     }
 }

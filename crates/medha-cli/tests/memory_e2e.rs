@@ -1,10 +1,34 @@
 use kernel::{Event, EventLog, Session, TrustLabel};
 use memory::{ConfidenceRung, MemoryEntry, MemoryKind, MemoryOp, MemoryProjection, Scope};
+use sha2::{Digest, Sha256};
 use std::process::Command;
 use ulid::Ulid;
 
+fn workspace_digest(path: &std::path::Path) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in path.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(path.as_os_str().to_string_lossy().as_bytes());
+    hasher.finalize().into()
+}
+
 fn encoded_workspace(path: &std::path::Path) -> String {
-    path.to_string_lossy()
+    let raw = path.to_string_lossy();
+    let readable: String = raw
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| raw.strip_prefix(r"\\?\"))
+        .unwrap_or(&raw)
         .chars()
         .map(|ch| {
             if matches!(ch, '/' | '\\' | ':') {
@@ -13,7 +37,35 @@ fn encoded_workspace(path: &std::path::Path) -> String {
                 ch
             }
         })
-        .collect()
+        .collect();
+    let mut prefix = String::with_capacity(readable.len().min(96));
+    for character in readable.chars() {
+        if prefix.len() + character.len_utf8() > 96 {
+            break;
+        }
+        prefix.push(character);
+    }
+
+    let hash: String = workspace_digest(path)[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{prefix}--{hash}")
+}
+
+fn prepared_state(home: &std::path::Path, workspace: &std::path::Path) -> std::path::PathBuf {
+    let state = home.join("projects").join(encoded_workspace(workspace));
+    std::fs::create_dir_all(&state).unwrap();
+    let digest: String = workspace_digest(workspace)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    std::fs::write(
+        state.join(".medha-workspace-id-v2"),
+        format!("medha-workspace-v2\nsha256={digest}\n"),
+    )
+    .unwrap();
+    state
 }
 
 fn run_memory(workspace: &std::path::Path, home: &std::path::Path, args: &[&str]) -> String {
@@ -40,8 +92,7 @@ async fn write_recall_show_and_fork_excludes_post_cut_memory() {
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&home).unwrap();
     let workspace = workspace.canonicalize().unwrap();
-    let state = home.join("projects").join(encoded_workspace(&workspace));
-    std::fs::create_dir_all(&state).unwrap();
+    let state = prepared_state(&home, &workspace);
 
     let log = store::SqliteLog::open(state.join("events.db")).unwrap();
     let projection =
@@ -150,8 +201,7 @@ async fn cli_edit_appends_a_user_trust_update_before_projection() {
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&home).unwrap();
     let workspace = workspace.canonicalize().unwrap();
-    let state = home.join("projects").join(encoded_workspace(&workspace));
-    std::fs::create_dir_all(&state).unwrap();
+    let state = prepared_state(&home, &workspace);
     let log = store::SqliteLog::open(state.join("events.db")).unwrap();
     let projection =
         MemoryProjection::open(state.join("memory.db"), home.join("memory.db")).unwrap();

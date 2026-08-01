@@ -430,6 +430,7 @@ fn decode_steps(
     Ok(ModelMessage {
         role: Role::Assistant,
         parts,
+        trust: None,
     })
 }
 
@@ -799,6 +800,7 @@ impl ResponseDecoder {
         blocks.push(Block::CompletedMessage(ModelMessage {
             role: Role::Assistant,
             parts,
+            trust: None,
         }));
         if let Some(usage) = self.usage.take().or_else(|| usage_from(value)) {
             blocks.push(usage_block(usage));
@@ -854,6 +856,7 @@ mod tests {
                     args: json!({"path": "a"}),
                     provider_state: vec![sig],
                 })],
+                trust: None,
             },
             ModelMessage {
                 role: Role::Tool,
@@ -862,6 +865,7 @@ mod tests {
                     content: "x".into(),
                     provider_state: Vec::new(),
                 })],
+                trust: None,
             },
         ];
         let context = CompiledContext {
@@ -905,6 +909,7 @@ mod tests {
                         provider_state: Vec::new(),
                     }),
                 ],
+                trust: None,
             },
             Message::user("now pick one").ordered(),
         ];
@@ -959,6 +964,7 @@ mod tests {
                         provider_state: Vec::new(),
                     }),
                 ],
+                trust: None,
             },
             ModelMessage {
                 role: Role::Tool,
@@ -967,6 +973,7 @@ mod tests {
                     content: "contents".into(),
                     provider_state: Vec::new(),
                 })],
+                trust: None,
             },
         ];
         let context = CompiledContext {
@@ -1187,6 +1194,7 @@ mod tests {
                         value: json!("sig"),
                     }],
                 })],
+                trust: None,
             }]),
             tools: Vec::new(),
         };
@@ -1353,6 +1361,7 @@ mod tests {
                     value: json!("foreign"),
                 }],
             })],
+            trust: None,
         };
         let context = CompiledContext {
             model: String::new(),

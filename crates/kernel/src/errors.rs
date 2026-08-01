@@ -9,6 +9,12 @@ pub enum KernelError {
     #[error("event log error: {0}")]
     Log(String),
 
+    #[error("task interrupted")]
+    Interrupted,
+
+    #[error("budget stopped: {}", .0.label())]
+    Budget(crate::budgets::BudgetStop),
+
     /// The provider rejected the request as too long for the model's context
     /// window. Distinct from `Provider` so the loop can respond by compacting
     /// harder and retrying once (P0-6) instead of surfacing a fatal error.

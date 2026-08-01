@@ -22,9 +22,32 @@ need tar
 if command -v curl >/dev/null 2>&1; then
   fetch() { curl -fsSL "$1"; }
   fetch_to() { curl -fsSL "$1" -o "$2"; }
+  # Return 0 = downloaded, 2 = precise HTTP 404, 1 = transport/other HTTP
+  # failure. Only a real 404 means "this release did not publish a checksum."
+  fetch_optional_to() {
+    status="$(curl -sSL -o "$2" -w '%{http_code}' "$1")" || return 1
+    case "$status" in
+      2??) return 0 ;;
+      404) rm -f "$2"; return 2 ;;
+      *) rm -f "$2"; return 1 ;;
+    esac
+  }
 elif command -v wget >/dev/null 2>&1; then
   fetch() { wget -qO- "$1"; }
   fetch_to() { wget -qO "$2" "$1"; }
+  fetch_optional_to() {
+    headers="$2.headers"
+    if wget -S -qO "$2" "$1" 2>"$headers"; then
+      rm -f "$headers"
+      return 0
+    fi
+    if awk '$1 ~ /^HTTP\// { status = $2 } END { exit !(status == 404) }' "$headers"; then
+      rm -f "$2" "$headers"
+      return 2
+    fi
+    rm -f "$2" "$headers"
+    return 1
+  }
 else
   die "either curl or wget is required"
 fi
@@ -86,19 +109,58 @@ say "Downloading medha $VERSION for ${TARGET}..."
 fetch_to "$URL" "$tmp/$ASSET" || die "download failed: $URL
 This platform may not have a published build for $VERSION."
 
-# Verify the checksum when the release publishes one.
-if fetch_to "$URL.sha256" "$tmp/$ASSET.sha256" 2>/dev/null; then
-  if command -v shasum >/dev/null 2>&1; then
-    expected="$(cut -d' ' -f1 < "$tmp/$ASSET.sha256")"
-    actual="$(shasum -a 256 "$tmp/$ASSET" | cut -d' ' -f1)"
+# A precise 404 means an older release omitted a checksum and may continue.
+# Every other fetch failure is uncertain and therefore fails closed.
+checksum_status=0
+fetch_optional_to "$URL.sha256" "$tmp/$ASSET.sha256" || checksum_status=$?
+case "$checksum_status" in
+  0)
+    records="$(awk 'NF { count += 1 } END { print count + 0 }' "$tmp/$ASSET.sha256")"
+    [ "$records" = "1" ] \
+      || die "checksum file must contain exactly one non-empty record"
+    expected="$(awk 'NF { print $1; exit }' "$tmp/$ASSET.sha256")"
+    [ "${#expected}" = "64" ] \
+      || die "checksum file did not contain one 64-hex SHA-256 digest"
+    case "$expected" in
+      *[!0-9A-Fa-f]*) die "checksum file contained a malformed SHA-256 digest" ;;
+    esac
+    expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual="$(sha256sum "$tmp/$ASSET" | awk '{ print $1; exit }')"
+    elif command -v shasum >/dev/null 2>&1; then
+      actual="$(shasum -a 256 "$tmp/$ASSET" | awk '{ print $1; exit }')"
+    else
+      die "checksum verification requires sha256sum or shasum"
+    fi
+    actual="$(printf '%s' "$actual" | tr 'A-F' 'a-f')"
     [ "$expected" = "$actual" ] || die "checksum mismatch -- refusing to install"
     say "Checksum verified."
-  fi
-fi
+    ;;
+  2) say "No checksum was published for this release; continuing without one." ;;
+  *) die "checksum download failed: $URL.sha256 -- refusing an unverifiable install" ;;
+esac
 
-tar xzf "$tmp/$ASSET" -C "$tmp"
-binary="$(find "$tmp" -type f -name medha -perm -u+x 2>/dev/null | head -n1)"
-[ -n "$binary" ] || die "the archive did not contain a medha binary"
+# Require one regular root entry with the release's exact layout. Validating
+# before extraction rejects traversal, absolute paths, duplicates, links,
+# devices, FIFOs, and "first executable named medha wins" ambiguity.
+entries="$(tar tzf "$tmp/$ASSET")" \
+  || die "could not inspect the downloaded archive"
+[ "$entries" = "medha" ] \
+  || die "archive layout is invalid; expected exactly one root regular file named medha"
+detail="$(tar tvzf "$tmp/$ASSET")" \
+  || die "could not inspect archive entry types"
+case "$detail" in
+  -*) ;;
+  *) die "archive medha entry is not a regular file" ;;
+esac
+
+mkdir "$tmp/extracted" || die "could not prepare the extraction directory"
+tar xzf "$tmp/$ASSET" -C "$tmp/extracted" medha \
+  || die "could not extract the validated medha binary"
+binary="$tmp/extracted/medha"
+[ -f "$binary" ] && [ ! -L "$binary" ] \
+  || die "the validated archive did not produce a regular medha binary"
 
 install -m 755 "$binary" "$INSTALL_DIR/medha" 2>/dev/null \
   || { cp "$binary" "$INSTALL_DIR/medha" && chmod 755 "$INSTALL_DIR/medha"; }

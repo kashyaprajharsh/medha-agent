@@ -115,6 +115,15 @@ full_transparency = false
 # Deterministic check run after file-modifying turns (§4.7). Empty = none.
 # command = "cargo check"
 
+[gate]
+# Eval scenario defaults (§4.11–4.12). `seeds` must be 1–100; counts above 10
+# require an explicit `medha gate ... --yes` acknowledgement because every seed
+# may spend the scenario's full model budget.
+scenarios_dir = "scenarios"
+pass_threshold = 1.0 # finite value greater than 0.0 and at most 1.0
+seeds = 1
+regression_epsilon = 0.0
+
 [reasoning]
 # Request-side thinking control for reasoning-capable models (§4.4) — sent as
 # chat_template_kwargs (vLLM/SGLang-style servers). Both fields optional; a

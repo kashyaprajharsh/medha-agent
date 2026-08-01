@@ -49,7 +49,7 @@ One binary. No Python, no Node, no Docker daemon — SQLite is compiled in and T
 <summary>Pin a version, change the location, or build from source</summary>
 
 ```bash
-MEDHA_VERSION=v0.1.5     curl -fsSL .../install.sh | sh   # pin a release
+MEDHA_VERSION=v0.1.6     curl -fsSL .../install.sh | sh   # pin a release
 MEDHA_INSTALL_DIR=~/bin  curl -fsSL .../install.sh | sh   # choose the destination
 
 git clone https://github.com/kashyaprajharsh/medha-agent   # build it yourself (Rust 1.85+)
@@ -117,7 +117,11 @@ Just run `medha`. The first launch opens model setup right in the TUI: pick an e
 
 Setup suggests Ollama, LM Studio, llama.cpp, vLLM/SGLang, OpenRouter, Together, Groq and OpenAI. **Google Gemini** works through its native Interactions API.
 
-Everything lands under `~/.medha/` (or `$MEDHA_HOME`): model profiles in `config.toml`, and **API keys in `credentials.toml` with `0600` permissions** — or your OS keychain — never in a config file you might commit. Per-workspace session state lives under `~/.medha/projects/`, so nothing is written into your repo.
+Everything lands under `~/.medha/` (or `$MEDHA_HOME`): model profiles in `config.toml`, and **API keys in `credentials.toml` with `0600` permissions** — or your OS keychain — never in a config file you might commit. Per-workspace session state lives under a canonical-path-hashed identity in `~/.medha/projects/`, so different workspaces cannot share trust or history and nothing is written into your repo.
+
+Older runtime files found inside a checkout's `.medha/` directory are left
+untouched and are never imported automatically: repository content cannot
+authenticate event history, artifacts, logs, or permission grants.
 
 <details>
 <summary>Configuring without the TUI (CI, scripts, containers)</summary>
@@ -165,7 +169,7 @@ approve  = ["fs.write", "fs.edit", "multi_edit", "skill.save"]
 
 [sandbox]
 backend = "native"            # native · container · ssh · host
-network = "allow"
+network = "deny"              # opt in to "allow" only when builds need downloads
 
 [budget]
 max_turns = 200
@@ -203,7 +207,7 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
 
 ## Status
 
-Pre-1.0 (`0.1.5`) — interfaces may still change.
+Pre-1.0 (`0.1.6`) — interfaces may still change.
 
 **Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 52 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation, graceful interrupts, the ACP bridge, and the Eval Gate.
 

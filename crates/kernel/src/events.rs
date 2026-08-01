@@ -7,9 +7,15 @@ use crate::types::{
     ToolIntent, ToolResultPart, TrustLabel,
 };
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Mutex;
 use ulid::Ulid;
+
+/// Current canonical event-chain encoding. Version 1 was the original
+/// `(prev, kind, session, payload, ts)` encoding; version 2 authenticates every
+/// persisted event field with unambiguous length framing.
+pub const EVENT_HASH_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
@@ -22,6 +28,11 @@ pub enum EventKind {
     ModelMessage,
     ToolObs,
     PolicyDecision,
+    /// Durable write-ahead marker emitted after authorization and immediately
+    /// before a state-changing executor call. If the process/log fails before
+    /// the final observation, replay still shows that the effect may have
+    /// committed and includes the complete admitted intent.
+    ToolEffectPrepared,
     Compaction,
     Session,
     /// Full reasoning/thinking content for a turn — logged for complete
@@ -67,6 +78,7 @@ impl EventKind {
             EventKind::ModelMessage => "model.message",
             EventKind::ToolObs => "tool.observation",
             EventKind::PolicyDecision => "policy.decision",
+            EventKind::ToolEffectPrepared => "tool.effect_prepared",
             EventKind::Compaction => "context.compaction",
             EventKind::Session => "session",
             EventKind::ModelReasoning => "model.reasoning",
@@ -92,6 +104,7 @@ impl EventKind {
             "model.message" => EventKind::ModelMessage,
             "tool.observation" => EventKind::ToolObs,
             "policy.decision" => EventKind::PolicyDecision,
+            "tool.effect_prepared" => EventKind::ToolEffectPrepared,
             "context.compaction" => EventKind::Compaction,
             "session" => EventKind::Session,
             "model.reasoning" => EventKind::ModelReasoning,
@@ -128,6 +141,7 @@ pub struct Event {
     pub trust: TrustLabel,
     pub provenance: Provenance,
     pub prev_hash: [u8; 32],
+    pub hash_version: u8,
     pub ts: f64,
 }
 
@@ -141,6 +155,11 @@ impl std::fmt::Debug for Event {
             .field("kind", &self.kind);
         if self.kind == EventKind::ModelMessage {
             debug.field("payload", &"<redacted ordered model message>");
+        } else if self.kind == EventKind::Compaction && self.payload.get("snapshot").is_some() {
+            // A canonical snapshot can contain opaque provider replay state.
+            // Treat it like `model.message`: it is durable, but never diagnostic
+            // output.
+            debug.field("payload", &"<redacted compacted context snapshot>");
         } else {
             debug.field("payload", &self.payload);
         }
@@ -148,6 +167,7 @@ impl std::fmt::Debug for Event {
             .field("trust", &self.trust)
             .field("provenance", &self.provenance)
             .field("prev_hash", &self.prev_hash)
+            .field("hash_version", &self.hash_version)
             .field("ts", &self.ts)
             .finish()
     }
@@ -166,6 +186,7 @@ impl Event {
                 source: "kernel".into(),
             },
             prev_hash: [0u8; 32],
+            hash_version: EVENT_HASH_VERSION,
             ts: now_ts(),
         }
     }
@@ -185,6 +206,20 @@ impl Event {
     /// up survived the turn but not a resume.
     pub fn user_input(s: &Session, text: &str, trust: TrustLabel) -> Self {
         Self::new(s, EventKind::UserMessage, json!({ "text": text }), trust)
+    }
+
+    /// An explicit retry of one already-admitted user-channel event.
+    ///
+    /// Replay may coalesce this record only when `retry_of` resolves to a prior
+    /// event with identical text, trust, and provenance. Ordinary repeated
+    /// text is never guessed to be a retry.
+    pub fn user_input_retry(s: &Session, text: &str, trust: TrustLabel, retry_of: Ulid) -> Self {
+        Self::new(
+            s,
+            EventKind::UserMessage,
+            json!({ "text": text, "retry_of": retry_of.to_string() }),
+            trust,
+        )
     }
 
     /// A sub-agent starting, recorded on the child's own chain so its session is
@@ -209,9 +244,9 @@ impl Event {
     /// follow-up reuses the child session, so folding on `child` would read the
     /// first report's delivery as closing every later one.
     ///
-    /// `instance` identifies the owning process. Identity rather than a pid
-    /// liveness check, because pids are reused and a recycled one reads as
-    /// "still running" forever.
+    /// `instance` identifies the owning process and names its OS-backed lease.
+    /// The durable identity avoids pid-reuse ambiguity; recovery must prove the
+    /// corresponding process lock is no longer held before closing the row.
     pub fn agent_dispatched(
         s: &Session,
         dispatch: Ulid,
@@ -351,7 +386,13 @@ impl Event {
         Self::new(s, EventKind::MemoryWrite, op, TrustLabel::Memory)
     }
 
-    pub fn context_file(s: &Session, path: &str, content: &str, blocked: bool) -> Self {
+    pub fn context_file(
+        s: &Session,
+        path: &str,
+        content: &str,
+        blocked: bool,
+        trust: TrustLabel,
+    ) -> Self {
         Self::new(
             s,
             if blocked {
@@ -360,7 +401,7 @@ impl Event {
                 EventKind::ContextFileLoaded
             },
             json!({ "path": path, "content": content }),
-            TrustLabel::Workspace,
+            trust,
         )
     }
 
@@ -374,6 +415,20 @@ impl Event {
             s,
             EventKind::PolicyDecision,
             json!({ "tool": intent.tool, "intent_id": intent.id, "decision": verdict, "reason": reason }),
+            TrustLabel::System,
+        )
+    }
+
+    pub fn tool_effect_prepared(s: &Session, intent: &ToolIntent, mutation_key: &str) -> Self {
+        Self::new(
+            s,
+            EventKind::ToolEffectPrepared,
+            json!({
+                "intent_id": intent.id,
+                "tool": intent.tool,
+                "args": intent.args,
+                "mutation_key": mutation_key,
+            }),
             TrustLabel::System,
         )
     }
@@ -394,12 +449,44 @@ impl Event {
         after_tokens: u32,
         summary: Option<&str>,
     ) -> Self {
-        // Persist the summary text so a resumed session reconstructs the exact
-        // working set the model saw (K12), not a re-derived one.
+        // Compatibility constructor for old callers and old summary-only
+        // records. New kernel compactions use `compaction_snapshot` below.
         Self::new(
             s,
             EventKind::Compaction,
             json!({ "before_tokens": before_tokens, "after_tokens": after_tokens, "summary": summary }),
+            TrustLabel::System,
+        )
+    }
+
+    /// Persist the exact post-compaction request views.
+    ///
+    /// `messages` is the legacy/control representation consumed by the context
+    /// engine. `ordered` is the canonical provider representation, including
+    /// opaque replay state. Keeping both avoids deriving either lossy view on
+    /// resume and makes a compaction event a true projection checkpoint rather
+    /// than merely a copy of its middle summary.
+    pub fn compaction_snapshot(
+        s: &Session,
+        before_tokens: u32,
+        after_tokens: u32,
+        summary: Option<&str>,
+        messages: &[Message],
+        ordered: &[ModelMessage],
+    ) -> Self {
+        Self::new(
+            s,
+            EventKind::Compaction,
+            json!({
+                "before_tokens": before_tokens,
+                "after_tokens": after_tokens,
+                "summary": summary,
+                "snapshot": {
+                    "version": 1,
+                    "messages": messages,
+                    "ordered": ordered,
+                },
+            }),
             TrustLabel::System,
         )
     }
@@ -417,11 +504,56 @@ pub struct SessionMeta {
     pub events: u64,
 }
 
+/// An owned, RAII mutation lease.
+///
+/// The kernel deliberately knows nothing about how a durable backend
+/// coordinates writers. In-memory logs return an empty lease; persistent logs
+/// can keep an OS/file/database lock alive inside this value. Dropping the
+/// value releases the lease, which makes it possible to hold coordination
+/// across the tool side effect and every event that records that effect.
+#[must_use = "dropping a mutation lease allows another state change to begin"]
+pub struct MutationLease {
+    _guard: Option<Box<dyn MutationLeaseGuard>>,
+}
+
+trait MutationLeaseGuard: Send {}
+impl<T: Send> MutationLeaseGuard for T {}
+
+impl MutationLease {
+    /// A lease for an ephemeral log. The kernel's shared in-process mutex still
+    /// provides ordering between kernels derived from the same root.
+    pub fn in_process() -> Self {
+        Self { _guard: None }
+    }
+
+    /// Keep a backend-owned guard alive until this lease is dropped.
+    pub fn guarded<T: Send + 'static>(guard: T) -> Self {
+        Self {
+            _guard: Some(Box::new(guard)),
+        }
+    }
+}
+
 /// The log interface. Append computes the hash chain; replay/projection read it.
 #[async_trait]
 pub trait EventLog: Send + Sync {
     async fn append(&self, e: Event) -> Result<Event, KernelError>;
     async fn events(&self, session: Ulid) -> Vec<Event>;
+
+    /// Acquire the durable writer lane for one state identity.
+    ///
+    /// The lease must remain alive from immediately before the tool side
+    /// effect through its `ToolObs` and any derived projection event. Backends
+    /// that cannot be shared between processes may use this no-op default;
+    /// [`crate::Kernel`] also holds its in-memory mutation mutex over the same
+    /// region.
+    async fn acquire_mutation_lease(
+        &self,
+        _mutation_key: &str,
+    ) -> Result<MutationLease, KernelError> {
+        Ok(MutationLease::in_process())
+    }
+
     /// Every session in the log, newest activity first — for the resume picker.
     /// Default: none (in-memory/ephemeral logs need not implement it).
     async fn sessions(&self) -> Vec<SessionMeta> {
@@ -594,14 +726,34 @@ fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// The canonical tamper-evident link: SHA-256 over
-/// (prev_hash ‖ kind ‖ session ‖ payload ‖ ts). Any change to a past event
-/// breaks every subsequent hash. This is the single source of truth for the
-/// chain — persistence backends (the SQLite log) call this exact function so
-/// an in-memory and an on-disk log produce identical hashes for the same
-/// events (Vol 3 §3). `id`, `parent_id`, and `provenance` are intentionally
-/// excluded so the chain covers content and ordering, not storage bookkeeping.
+/// The canonical tamper-evident link. Persistence backends call this exact
+/// function so in-memory and on-disk logs produce identical hashes.
+///
+/// Version 2 uses a domain-separated, length-framed encoding and authenticates
+/// every stored event field: chain version, prior hash, event/session/parent
+/// ids, kind, payload, trust, provenance, and timestamp. Store migration code
+/// upgrades valid version-1 rows transactionally before exposing the log.
 pub fn chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
+    match e.hash_version {
+        1 => legacy_chain_hash(prev, e),
+        EVENT_HASH_VERSION => full_chain_hash(prev, e),
+        // Unknown versions must never accidentally verify as a known format.
+        // Hashing a version-specific rejection domain gives callers a stable
+        // mismatch while store verification reports the unsupported version.
+        version => {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"medha.event-chain.unsupported");
+            h.update([version]);
+            h.update(prev);
+            h.finalize().into()
+        }
+    }
+}
+
+/// Compatibility decoder for pre-v2 databases. It is public only so the store
+/// can verify the old chain before rewriting it to the complete v2 encoding.
+pub fn legacy_chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(prev);
@@ -614,18 +766,260 @@ pub fn chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
     out
 }
 
+fn full_chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    fn framed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut h = Sha256::new();
+    h.update(b"medha.event-chain.v2\0");
+    h.update([e.hash_version]);
+    h.update(prev);
+    // Cover the value stored on the event as well as the running chain input.
+    // Verification requires them to agree; framing both makes the contract
+    // explicit and prevents a future caller from silently omitting the field.
+    h.update(e.prev_hash);
+    framed(&mut h, e.id.to_string().as_bytes());
+    framed(&mut h, e.session_id.to_string().as_bytes());
+    match e.parent_id {
+        Some(parent) => {
+            h.update([1]);
+            framed(&mut h, parent.to_string().as_bytes());
+        }
+        None => h.update([0]),
+    }
+    framed(&mut h, e.kind.as_str().as_bytes());
+    let payload = serde_json::to_vec(&e.payload).unwrap_or_else(|_| b"null".to_vec());
+    framed(&mut h, &payload);
+    framed(&mut h, e.trust.as_str().as_bytes());
+    framed(&mut h, e.provenance.source.as_bytes());
+    h.update(e.ts.to_bits().to_le_bytes());
+    h.finalize().into()
+}
+
+#[derive(Deserialize)]
+struct CompactionSnapshotV1 {
+    version: u64,
+    messages: Vec<Message>,
+    ordered: Vec<ModelMessage>,
+}
+
+fn same_snapshot_message(left: &Message, right: &Message) -> bool {
+    left.role == right.role
+        && left.content == right.content
+        && left.tool_call_id == right.tool_call_id
+        && left.trust == right.trust
+        && left.tool_calls.len() == right.tool_calls.len()
+        && left
+            .tool_calls
+            .iter()
+            .zip(&right.tool_calls)
+            .all(|(a, b)| a.id == b.id && a.tool == b.tool && a.args == b.args)
+}
+
+/// The lossy legacy/control view represented by one canonical message. Opaque
+/// reasoning and media parts intentionally have no legacy equivalent.
+fn snapshot_legacy_views(message: &ModelMessage) -> Vec<Message> {
+    if message.role == crate::types::Role::Tool {
+        let mut results = Vec::new();
+        let mut fallback = String::new();
+        for part in &message.parts {
+            match part {
+                ContentPart::ToolResult(part) => {
+                    let mut result = Message::tool_result(&part.tool_call_id, &part.content);
+                    result.trust = message.trust;
+                    results.push(result);
+                }
+                ContentPart::Text(part) => fallback.push_str(&part.text),
+                _ => {}
+            }
+        }
+        return if results.is_empty() {
+            let mut fallback_message = Message::new(crate::types::Role::Tool, fallback);
+            fallback_message.trust = message.trust;
+            vec![fallback_message]
+        } else {
+            results
+        };
+    }
+
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    for part in &message.parts {
+        match part {
+            ContentPart::Text(part) => text.push_str(&part.text),
+            ContentPart::ToolCall(part) => calls.push(ToolIntent {
+                id: part.id.clone(),
+                tool: part.tool.clone(),
+                args: part.args.clone(),
+            }),
+            _ => {}
+        }
+    }
+    let mut legacy = if message.role == crate::types::Role::Assistant {
+        Message::assistant_calls(text, calls)
+    } else {
+        Message::new(message.role.clone(), text)
+    };
+    legacy.trust = message.trust;
+    vec![legacy]
+}
+
+/// A persisted request checkpoint must already be provider-sendable. Repairing
+/// a dangling or mismatched tool turn during projection would mean resume no
+/// longer reproduces the bytes represented by the checkpoint.
+fn snapshot_tool_grammar_is_closed(messages: &[Message]) -> bool {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut pending = VecDeque::<&str>::new();
+    let mut passed_system_prefix = false;
+    for message in messages {
+        if message.role == crate::types::Role::System {
+            if passed_system_prefix || !pending.is_empty() {
+                return false;
+            }
+            continue;
+        }
+        passed_system_prefix = true;
+
+        if let Some(expected) = pending.pop_front() {
+            if message.role != crate::types::Role::Tool
+                || message.tool_call_id.as_deref() != Some(expected)
+                || !message.tool_calls.is_empty()
+            {
+                return false;
+            }
+            continue;
+        }
+
+        if message.role == crate::types::Role::Tool {
+            return false;
+        }
+        if !message.tool_calls.is_empty() {
+            if message.role != crate::types::Role::Assistant {
+                return false;
+            }
+            let mut turn_ids = HashSet::new();
+            for call in &message.tool_calls {
+                if call.id.is_empty() || !turn_ids.insert(call.id.as_str()) {
+                    return false;
+                }
+                pending.push_back(&call.id);
+            }
+        }
+    }
+    pending.is_empty()
+}
+
+/// Decode one checkpoint as an atomic pair of views. A half-valid snapshot is
+/// not a checkpoint: accepting one side while the other falls back makes the
+/// context engine and provider consume different histories on resume.
+fn compaction_snapshot(payload: &Value) -> Option<CompactionSnapshotV1> {
+    let snapshot: CompactionSnapshotV1 =
+        serde_json::from_value(payload.get("snapshot")?.clone()).ok()?;
+    if snapshot.version != 1
+        || snapshot.messages.len() != snapshot.ordered.len()
+        || !snapshot_tool_grammar_is_closed(&snapshot.messages)
+        || !snapshot
+            .messages
+            .iter()
+            .zip(&snapshot.ordered)
+            .all(|(legacy, canonical)| {
+                let views = snapshot_legacy_views(canonical);
+                matches!(
+                    views.as_slice(),
+                    [candidate] if same_snapshot_message(candidate, legacy)
+                )
+            })
+    {
+        return None;
+    }
+    Some(snapshot)
+}
+
+pub(crate) fn has_valid_compaction_snapshot(payload: &Value) -> bool {
+    compaction_snapshot(payload).is_some()
+}
+
+fn compacted_legacy_snapshot(payload: &Value) -> Option<Vec<Message>> {
+    Some(compaction_snapshot(payload)?.messages)
+}
+
+fn compacted_ordered_snapshot(payload: &Value) -> Option<Vec<ModelMessage>> {
+    Some(compaction_snapshot(payload)?.ordered)
+}
+
 /// Reconstruct the conversation as `Vec<Message>` from a session's events — the
 /// projection P3 promises ("state is a projection of the log"). A model turn's
 /// text + tool intents collapse into one assistant message, followed by its
 /// tool-result messages. The system prompt is omitted (regenerated fresh each
 /// run); reasoning / policy / compaction events are skipped (scratch/governance,
 /// not conversation). This is what a resumed session is rebuilt from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserAdmission {
+    session_id: Ulid,
+    text: String,
+    trust: TrustLabel,
+    provenance: String,
+}
+
+/// Return whether this event represents a new admitted input.
+///
+/// Text equality is intentionally irrelevant unless the durable event
+/// explicitly points at the identity it retries. The complete admission tuple
+/// must also match, so a forged/malformed retry marker cannot erase a weaker
+/// trust label or different provenance.
+fn is_new_user_admission(
+    event: &Event,
+    admissions: &mut std::collections::HashMap<Ulid, UserAdmission>,
+) -> bool {
+    let admission = UserAdmission {
+        session_id: event.session_id,
+        text: event
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        trust: event.trust,
+        provenance: event.provenance.source.clone(),
+    };
+    let is_exact_retry = event
+        .payload
+        .get("retry_of")
+        .and_then(Value::as_str)
+        .and_then(|id| Ulid::from_string(id).ok())
+        .and_then(|id| admissions.get(&id))
+        .is_some_and(|original| original == &admission);
+
+    // Record even a coalesced retry's identity so an explicit retry chain
+    // remains deterministic.
+    admissions.insert(event.id, admission);
+    !is_exact_retry
+}
+
 pub fn project_messages(events: &[Event]) -> Vec<Message> {
+    project_messages_impl(events, false)
+}
+
+/// Rebuild the exact legacy model-request view. Unlike the public transcript
+/// projection, this retains the system sheath stored in a compaction checkpoint
+/// so resume cannot silently substitute a different date/persona/instruction
+/// set.
+pub(crate) fn project_request_messages(events: &[Event]) -> Vec<Message> {
+    project_messages_impl(events, true)
+}
+
+fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::new();
     let mut text = String::new();
     let mut intents: Vec<ToolIntent> = Vec::new();
     let mut assistant_open = false;
     let mut canonical_call_ids = std::collections::HashSet::new();
+    let mut user_admissions = std::collections::HashMap::new();
 
     // Emit the pending assistant turn (text + its tool calls) if one is building.
     fn flush(
@@ -653,14 +1047,7 @@ pub fn project_messages(events: &[Event]) -> Vec<Message> {
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                // An Esc-interrupted turn logs the prompt, then the re-send logs
-                // it again with no assistant turn in between (K20) — collapse
-                // consecutive identical user turns so resume shows one.
-                let duplicate = matches!(
-                    out.last(),
-                    Some(m) if matches!(m.role, crate::types::Role::User) && m.content == t
-                );
-                if !duplicate {
+                if is_new_user_admission(e, &mut user_admissions) {
                     // Carry the recorded label back onto the message so a
                     // resumed session taints exactly as the live one did.
                     let mut message = Message::user(t);
@@ -724,11 +1111,13 @@ pub fn project_messages(events: &[Event]) -> Vec<Message> {
                     }
                     canonical_call_ids.clear();
                     canonical_call_ids.extend(calls.iter().map(|call| call.id.clone()));
-                    out.push(if message.role == crate::types::Role::Assistant {
+                    let mut legacy = if message.role == crate::types::Role::Assistant {
                         Message::assistant_calls(content, calls)
                     } else {
                         Message::new(message.role, content)
-                    });
+                    };
+                    legacy.trust = message.trust;
+                    out.push(legacy);
                 }
             }
             EventKind::ToolObs => {
@@ -748,19 +1137,42 @@ pub fn project_messages(events: &[Event]) -> Vec<Message> {
                 out.push(Message::tool_result(id, content));
             }
             EventKind::Compaction => {
-                canonical_call_ids.clear();
-                // A Full compaction carries a summary: replay the compacted view
-                // the live session actually saw — collapse everything so far into
-                // the summary — instead of re-inflating the full pre-compaction
-                // history (completes K12). Prune-only compactions carry no summary
-                // and are skipped (their messages replay verbatim, spill-bounded).
+                if let Some(mut snapshot) = compacted_legacy_snapshot(&e.payload) {
+                    canonical_call_ids.clear();
+                    if !retain_checkpoint_system {
+                        // Transcript surfaces regenerate their system prompt;
+                        // exact model-request replay uses the sibling projector.
+                        snapshot.retain(|message| message.role != crate::types::Role::System);
+                    }
+                    out = snapshot;
+                    text.clear();
+                    intents.clear();
+                    assistant_open = false;
+                    continue;
+                }
+                // A versioned checkpoint is one atomic pair of legacy and
+                // canonical views. If either half is malformed, the entire
+                // event is inert; its diagnostic `summary` must not fall
+                // through to the lossy pre-v1 compatibility path.
+                if e.payload.get("snapshot").is_some() {
+                    continue;
+                }
+                // Backward compatibility for summary-only compaction events.
+                // Their protected boundaries cannot be recovered, but the
+                // summary itself still belongs on the assistant channel, just
+                // as it did in the live compacted request.
                 if let Some(summary) = e.payload.get("summary").and_then(Value::as_str) {
                     if !summary.trim().is_empty() {
-                        out.clear();
+                        canonical_call_ids.clear();
+                        if retain_checkpoint_system {
+                            out.retain(|message| message.role == crate::types::Role::System);
+                        } else {
+                            out.clear();
+                        }
                         text.clear();
                         intents.clear();
                         assistant_open = false;
-                        out.push(Message::system(summary));
+                        out.push(Message::new(crate::types::Role::Assistant, summary));
                     }
                 }
             }
@@ -775,15 +1187,30 @@ pub fn project_messages(events: &[Event]) -> Vec<Message> {
 /// deterministic compatibility order; `model.message` payloads retain their
 /// exact part ordering and opaque provider state.
 pub fn project_ordered_messages(events: &[Event]) -> Vec<ModelMessage> {
+    project_ordered_messages_impl(events, false)
+}
+
+/// Rebuild the exact canonical model-request view, including a checkpoint's
+/// system sheath.
+pub(crate) fn project_request_ordered_messages(events: &[Event]) -> Vec<ModelMessage> {
+    project_ordered_messages_impl(events, true)
+}
+
+fn project_ordered_messages_impl(
+    events: &[Event],
+    retain_checkpoint_system: bool,
+) -> Vec<ModelMessage> {
     let mut out = Vec::new();
     let mut assistant_parts = Vec::new();
     let mut canonical_call_ids = std::collections::HashSet::new();
+    let mut user_admissions = std::collections::HashMap::new();
 
     fn flush(out: &mut Vec<ModelMessage>, parts: &mut Vec<ContentPart>) {
         if !parts.is_empty() {
             out.push(ModelMessage {
                 role: crate::types::Role::Assistant,
                 parts: std::mem::take(parts),
+                trust: None,
             });
         }
     }
@@ -798,15 +1225,12 @@ pub fn project_ordered_messages(events: &[Event]) -> Vec<ModelMessage> {
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let duplicate = out.last().is_some_and(|message| {
-                    message.role == crate::types::Role::User
-                        && matches!(
-                            message.parts.as_slice(),
-                            [ContentPart::Text(part)] if part.text == text
-                        )
-                });
-                if !duplicate {
-                    out.push(Message::user(text).ordered());
+                if is_new_user_admission(event, &mut user_admissions) {
+                    let mut message = Message::user(text);
+                    if event.trust != TrustLabel::User {
+                        message.trust = Some(event.trust);
+                    }
+                    out.push(message.ordered());
                 }
             }
             EventKind::ModelText => {
@@ -891,15 +1315,32 @@ pub fn project_ordered_messages(events: &[Event]) -> Vec<ModelMessage> {
                         content,
                         provider_state: Vec::new(),
                     })],
+                    trust: None,
                 });
             }
             EventKind::Compaction => {
-                canonical_call_ids.clear();
+                if let Some(mut snapshot) = compacted_ordered_snapshot(&event.payload) {
+                    canonical_call_ids.clear();
+                    if !retain_checkpoint_system {
+                        snapshot.retain(|message| message.role != crate::types::Role::System);
+                    }
+                    out = snapshot;
+                    assistant_parts.clear();
+                    continue;
+                }
+                if event.payload.get("snapshot").is_some() {
+                    continue;
+                }
                 if let Some(summary) = event.payload.get("summary").and_then(Value::as_str) {
                     if !summary.trim().is_empty() {
-                        out.clear();
+                        canonical_call_ids.clear();
+                        if retain_checkpoint_system {
+                            out.retain(|message| message.role == crate::types::Role::System);
+                        } else {
+                            out.clear();
+                        }
                         assistant_parts.clear();
-                        out.push(Message::system(summary).ordered());
+                        out.push(Message::new(crate::types::Role::Assistant, summary).ordered());
                     }
                 }
             }
@@ -953,6 +1394,7 @@ fn close_dangling_ordered_tool_calls(messages: Vec<ModelMessage>) -> Vec<ModelMe
                         content: "[interrupted]".into(),
                         provider_state: Vec::new(),
                     })],
+                    trust: None,
                 });
             }
         }
@@ -1041,12 +1483,23 @@ mod tests {
     #[test]
     fn context_file_events_are_workspace_trusted_and_round_trip_kinds() {
         let session = Session::new();
-        let loaded =
-            Event::context_file(&session, "sub/AGENTS.md", "use quotes-and-hyphens", false);
+        let loaded = Event::context_file(
+            &session,
+            "sub/AGENTS.md",
+            "use quotes-and-hyphens",
+            false,
+            TrustLabel::Workspace,
+        );
         assert_eq!(loaded.kind, EventKind::ContextFileLoaded);
         assert_eq!(loaded.trust, TrustLabel::Workspace);
         assert_eq!(loaded.payload["path"], "sub/AGENTS.md");
-        let blocked = Event::context_file(&session, "CLAUDE.md", "[blocked context file]", true);
+        let blocked = Event::context_file(
+            &session,
+            "CLAUDE.md",
+            "[blocked context file]",
+            true,
+            TrustLabel::Workspace,
+        );
         assert_eq!(blocked.kind, EventKind::ContextFileBlocked);
         for kind in [EventKind::ContextFileLoaded, EventKind::ContextFileBlocked] {
             assert_eq!(EventKind::parse(kind.as_str()), Some(kind));
@@ -1116,6 +1569,314 @@ mod tests {
     }
 
     #[test]
+    fn legacy_compaction_snapshot_replays_byte_equivalent_model_input() {
+        use crate::types::Role;
+
+        let session = Session::new();
+        let head_call = ToolIntent {
+            id: "head-call".into(),
+            tool: "fs.read".into(),
+            args: json!({"path": "requirements.md"}),
+        };
+        let tail_call = ToolIntent {
+            id: "tail-call".into(),
+            tool: "fs.read".into(),
+            args: json!({"path": "recent.rs"}),
+        };
+        // This is the exact live request after Full compaction: protected head,
+        // middle summary, then a protected recent tool-call/result pair.
+        let live = vec![
+            Message::system("SYSTEM"),
+            Message::user("original instructions"),
+            Message::assistant_calls("I will inspect the requirements.", vec![head_call]),
+            Message::tool_result("head-call", "requirements"),
+            Message::new(
+                Role::Assistant,
+                "HANDOFF: completed work and open questions",
+            ),
+            Message::user("check the latest file"),
+            Message::assistant_calls("", vec![tail_call]),
+            Message::tool_result("tail-call", "recent contents"),
+        ];
+        let ordered: Vec<ModelMessage> = live.iter().map(Message::ordered).collect();
+        let checkpoint = Event::compaction_snapshot(
+            &session,
+            12_000,
+            2_000,
+            Some("HANDOFF: completed work and open questions"),
+            &live,
+            &ordered,
+        );
+        let events = vec![
+            Event::user_message(&session, "discarded old history"),
+            Event::model_text(&session, "also discarded"),
+            checkpoint,
+        ];
+
+        let mut replayed_input = vec![live[0].clone()];
+        replayed_input.extend(project_messages(&events));
+        assert_eq!(
+            serde_json::to_vec(&replayed_input).unwrap(),
+            serde_json::to_vec(&live).unwrap(),
+            "resume must send the exact legacy post-compaction request"
+        );
+        assert_eq!(
+            serde_json::to_vec(&project_request_messages(&events)).unwrap(),
+            serde_json::to_vec(&live).unwrap(),
+            "the kernel request projector must retain the checkpoint system"
+        );
+        let call_index = replayed_input
+            .iter()
+            .position(|message| message.tool_calls.iter().any(|call| call.id == "tail-call"))
+            .unwrap();
+        assert_eq!(replayed_input[call_index + 1].role, Role::Tool);
+        assert_eq!(
+            replayed_input[call_index + 1].tool_call_id.as_deref(),
+            Some("tail-call")
+        );
+    }
+
+    #[test]
+    fn ordered_compaction_snapshot_replays_byte_equivalent_model_input() {
+        use crate::types::{ProviderState, ReasoningPart, Role};
+
+        let session = Session::new();
+        let state = ProviderState {
+            protocol: crate::provider::Protocol::GeminiInteractions,
+            kind: "thought-signature".into(),
+            value: json!({"signature": "opaque-compaction-state"}),
+        };
+        let legacy = vec![
+            Message::system("SYSTEM"),
+            Message::user("original instructions"),
+            Message::new(Role::Assistant, "HANDOFF"),
+            Message::user("recent request"),
+            Message::assistant_calls(
+                "",
+                vec![ToolIntent {
+                    id: "canonical-tail".into(),
+                    tool: "fs.read".into(),
+                    args: json!({"path": "recent.rs"}),
+                }],
+            ),
+            Message::tool_result("canonical-tail", "recent contents"),
+        ];
+        let mut live: Vec<ModelMessage> = legacy.iter().map(Message::ordered).collect();
+        live[4] = ModelMessage {
+            role: Role::Assistant,
+            parts: vec![
+                ContentPart::Reasoning(ReasoningPart {
+                    text: Some("checking the recent file".into()),
+                    provider_state: vec![state.clone()],
+                }),
+                ContentPart::ToolCall(ToolCallPart {
+                    id: "canonical-tail".into(),
+                    tool: "fs.read".into(),
+                    args: json!({"path": "recent.rs"}),
+                    provider_state: vec![state.clone()],
+                }),
+            ],
+            trust: None,
+        };
+        live[5] = ModelMessage {
+            role: Role::Tool,
+            parts: vec![ContentPart::ToolResult(ToolResultPart {
+                tool_call_id: "canonical-tail".into(),
+                content: "recent contents".into(),
+                provider_state: vec![state],
+            })],
+            trust: None,
+        };
+        let checkpoint =
+            Event::compaction_snapshot(&session, 12_000, 2_000, Some("HANDOFF"), &legacy, &live);
+        assert!(
+            !format!("{checkpoint:?}").contains("opaque-compaction-state"),
+            "opaque provider state must stay out of diagnostics"
+        );
+        let events = vec![
+            Event::model_message(
+                &session,
+                &ModelMessage {
+                    role: Role::Assistant,
+                    parts: vec![ContentPart::Text(TextPart {
+                        text: "discarded canonical history".into(),
+                        provider_state: Vec::new(),
+                    })],
+                    trust: None,
+                },
+            ),
+            checkpoint,
+        ];
+
+        let mut replayed_input = vec![live[0].clone()];
+        replayed_input.extend(project_ordered_messages(&events));
+        assert_eq!(
+            serde_json::to_vec(&replayed_input).unwrap(),
+            serde_json::to_vec(&live).unwrap(),
+            "resume must send the exact ordered post-compaction request"
+        );
+        assert_eq!(
+            serde_json::to_vec(&project_request_ordered_messages(&events)).unwrap(),
+            serde_json::to_vec(&live).unwrap(),
+            "the canonical request projector must retain the checkpoint system"
+        );
+        assert!(replayed_input.iter().any(ModelMessage::has_provider_state));
+        let call_index = replayed_input
+            .iter()
+            .position(|message| {
+                message.parts.iter().any(|part| {
+                    matches!(part, ContentPart::ToolCall(call) if call.id == "canonical-tail")
+                })
+            })
+            .unwrap();
+        assert_eq!(replayed_input[call_index + 1].role, Role::Tool);
+        assert!(matches!(
+            replayed_input[call_index + 1].parts.as_slice(),
+            [ContentPart::ToolResult(result)] if result.tool_call_id == "canonical-tail"
+        ));
+    }
+
+    #[test]
+    fn compaction_snapshot_rejects_grouped_or_dangling_tool_results_atomically() {
+        use crate::types::Role;
+
+        let session = Session::new();
+        let calls = vec![
+            ToolIntent {
+                id: "a".into(),
+                tool: "fs.read".into(),
+                args: json!({"path": "a"}),
+            },
+            ToolIntent {
+                id: "b".into(),
+                tool: "fs.read".into(),
+                args: json!({"path": "b"}),
+            },
+        ];
+        let legacy = vec![
+            Message::assistant_calls("", calls.clone()),
+            Message::tool_result("a", "result a"),
+        ];
+        let ordered = vec![
+            legacy[0].ordered(),
+            ModelMessage {
+                role: Role::Tool,
+                parts: vec![
+                    ContentPart::ToolResult(ToolResultPart {
+                        tool_call_id: "a".into(),
+                        content: "result a".into(),
+                        provider_state: Vec::new(),
+                    }),
+                    ContentPart::ToolResult(ToolResultPart {
+                        tool_call_id: "b".into(),
+                        content: "result b".into(),
+                        provider_state: Vec::new(),
+                    }),
+                ],
+                trust: None,
+            },
+        ];
+        let grouped = Event::compaction_snapshot(
+            &session,
+            100,
+            50,
+            Some("must not become a legacy fallback"),
+            &legacy,
+            &ordered,
+        );
+        assert!(
+            !has_valid_compaction_snapshot(&grouped.payload),
+            "one canonical row cannot shadow only one of several tool results"
+        );
+        assert!(
+            project_request_messages(std::slice::from_ref(&grouped)).is_empty(),
+            "an invalid versioned checkpoint must be inert, including its summary"
+        );
+        assert!(project_request_ordered_messages(std::slice::from_ref(&grouped)).is_empty());
+
+        let dangling_legacy = vec![Message::assistant_calls("", calls[..1].to_vec())];
+        let dangling_ordered = dangling_legacy
+            .iter()
+            .map(Message::ordered)
+            .collect::<Vec<_>>();
+        let dangling = Event::compaction_snapshot(
+            &session,
+            100,
+            50,
+            Some("dangling"),
+            &dangling_legacy,
+            &dangling_ordered,
+        );
+        assert!(
+            !has_valid_compaction_snapshot(&dangling.payload),
+            "resume must not repair a checkpoint that claimed to be an exact request"
+        );
+    }
+
+    #[test]
+    fn malformed_checkpoint_after_valid_checkpoint_cannot_drop_system_sheath() {
+        let session = Session::new();
+        let live = vec![Message::system("SYSTEM"), Message::user("retained")];
+        let ordered = live.iter().map(Message::ordered).collect::<Vec<_>>();
+        let valid = Event::compaction_snapshot(&session, 100, 50, Some("valid"), &live, &ordered);
+        let mut malformed = Event::compaction(&session, 50, 10, Some("DROP EVERYTHING"));
+        malformed.payload["snapshot"] = json!({
+            "version": 1,
+            "messages": [Message::system("FORGED")],
+            "ordered": {"not": "an array"}
+        });
+        let events = vec![
+            valid,
+            malformed,
+            Event::user_message(&session, "after malformed"),
+        ];
+
+        let mut expected = live;
+        expected.push(Message::user("after malformed"));
+        assert_eq!(
+            serde_json::to_vec(&project_request_messages(&events)).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert_eq!(
+            project_request_ordered_messages(&events),
+            expected.iter().map(Message::ordered).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            project_request_messages(&events)
+                .iter()
+                .filter(|message| message.role == crate::types::Role::System)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_summary_after_checkpoint_preserves_the_checkpoint_system() {
+        let session = Session::new();
+        let live = vec![Message::system("SYSTEM"), Message::user("old")];
+        let ordered = live.iter().map(Message::ordered).collect::<Vec<_>>();
+        let events = vec![
+            Event::compaction_snapshot(&session, 100, 50, Some("first"), &live, &ordered),
+            Event::compaction(&session, 50, 10, Some("legacy handoff")),
+            Event::user_message(&session, "new"),
+        ];
+        let expected = vec![
+            Message::system("SYSTEM"),
+            Message::new(crate::types::Role::Assistant, "legacy handoff"),
+            Message::user("new"),
+        ];
+
+        assert_eq!(
+            serde_json::to_vec(&project_request_messages(&events)).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert_eq!(
+            project_request_ordered_messages(&events),
+            expected.iter().map(Message::ordered).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn prune_compaction_without_summary_keeps_history() {
         let s = Session::new();
         let events = vec![
@@ -1173,25 +1934,102 @@ mod tests {
     }
 
     #[test]
-    fn projection_collapses_the_duplicate_prompt_an_interrupt_leaves_behind() {
+    fn projection_preserves_legitimate_repeated_text_and_its_trust() {
         use crate::types::Role;
         let s = Session::new();
-        // Esc mid-turn: the prompt was logged before the turn, then re-sent —
-        // logged again with nothing in between (K20).
         let events = vec![
             Event::user_message(&s, "build the feature"),
             Event::user_message(&s, "build the feature"),
-            Event::model_text(&s, "on it"),
-            // A *later* identical prompt after an assistant turn is legitimate.
-            Event::user_message(&s, "build the feature"),
+            Event::user_input(&s, "build the feature", TrustLabel::Web),
         ];
         let msgs = project_messages(&events);
         let users: Vec<_> = msgs.iter().filter(|m| m.role == Role::User).collect();
-        assert_eq!(
-            users.len(),
-            2,
-            "consecutive duplicate collapsed, later repeat kept: {msgs:?}"
+        assert_eq!(users.len(), 3, "every admitted input must replay: {msgs:?}");
+        assert_eq!(users[0].trust, None);
+        assert_eq!(users[1].trust, None);
+        assert_eq!(users[2].trust, Some(TrustLabel::Web));
+
+        let ordered = project_ordered_messages(&events);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].trust, None);
+        assert_eq!(ordered[1].trust, None);
+        assert_eq!(ordered[2].trust, Some(TrustLabel::Web));
+    }
+
+    #[test]
+    fn projection_coalesces_only_an_exact_explicit_retry_identity() {
+        let s = Session::new();
+        let original = Event::user_input(&s, "same report", TrustLabel::Tool);
+        let retry = Event::user_input_retry(&s, "same report", TrustLabel::Tool, original.id);
+        let retry_chain = Event::user_input_retry(&s, "same report", TrustLabel::Tool, retry.id);
+        let different_trust =
+            Event::user_input_retry(&s, "same report", TrustLabel::Web, original.id);
+        let mut different_provenance =
+            Event::user_input_retry(&s, "same report", TrustLabel::Tool, original.id);
+        different_provenance.provenance.source = "connector".into();
+        let events = vec![
+            original,
+            retry,
+            retry_chain,
+            different_trust,
+            different_provenance,
+        ];
+
+        let replayed = project_messages(&events);
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].trust, Some(TrustLabel::Tool));
+        assert_eq!(replayed[1].trust, Some(TrustLabel::Web));
+        assert_eq!(replayed[2].trust, Some(TrustLabel::Tool));
+
+        let ordered = project_ordered_messages(&events);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].trust, Some(TrustLabel::Tool));
+        assert_eq!(ordered[1].trust, Some(TrustLabel::Web));
+        assert_eq!(ordered[2].trust, Some(TrustLabel::Tool));
+    }
+
+    #[test]
+    fn compaction_checkpoint_preserves_user_trust_in_both_views() {
+        let s = Session::new();
+        let legacy = vec![
+            Message::system("system"),
+            Message::user("untrusted report").carrying(TrustLabel::Web),
+        ];
+        let ordered = legacy.iter().map(Message::ordered).collect::<Vec<_>>();
+        let checkpoint = Event::compaction_snapshot(&s, 1_000, 500, None, &legacy, &ordered);
+
+        let legacy_replay = project_messages(std::slice::from_ref(&checkpoint));
+        assert_eq!(legacy_replay.len(), 1);
+        assert_eq!(legacy_replay[0].trust, Some(TrustLabel::Web));
+        let ordered_replay = project_ordered_messages(&[checkpoint]);
+        assert_eq!(ordered_replay.len(), 1);
+        assert_eq!(ordered_replay[0].trust, Some(TrustLabel::Web));
+
+        let mut mismatched_ordered = ordered;
+        mismatched_ordered[1].trust = None;
+        let mismatched =
+            Event::compaction_snapshot(&s, 1_000, 500, None, &legacy, &mismatched_ordered);
+        assert!(
+            !has_valid_compaction_snapshot(&mismatched.payload),
+            "a checkpoint must not authenticate two views with different trust"
         );
+        assert!(project_request_messages(std::slice::from_ref(&mismatched)).is_empty());
+        assert!(project_request_ordered_messages(&[mismatched]).is_empty());
+    }
+
+    #[test]
+    fn canonical_user_event_keeps_trust_in_legacy_projection() {
+        let s = Session::new();
+        let canonical = Message::user("connector report")
+            .carrying(TrustLabel::Web)
+            .ordered();
+        let event = Event::model_message(&s, &canonical);
+
+        let replayed = project_messages(&[event]);
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].role, crate::types::Role::User);
+        assert_eq!(replayed[0].content, "connector report");
+        assert_eq!(replayed[0].trust, Some(TrustLabel::Web));
     }
 
     #[test]
@@ -1233,9 +2071,44 @@ mod tests {
         let h0 = chain_hash(&[0u8; 32], &base);
         // Different prev_hash → different link (chain property).
         assert_ne!(h0, chain_hash(&[1u8; 32], &base));
+        let mut altered = base.clone();
+        altered.prev_hash[0] ^= 1;
+        assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
         // Different payload → different hash.
         let mut altered = base.clone();
         altered.payload = json!({ "text": "HELLO" });
+        assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
+
+        let mut altered = base.clone();
+        altered.id = Ulid::new();
+        assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
+
+        let mut altered = base.clone();
+        altered.session_id = Ulid::new();
+        assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
+
+        let mut altered = base.clone();
+        altered.parent_id = Some(Ulid::new());
+        assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
+
+        let mut altered = base.clone();
+        altered.kind = EventKind::UserMessage;
+        assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
+
+        let mut altered = base.clone();
+        altered.trust = TrustLabel::Web;
+        assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
+
+        let mut altered = base.clone();
+        altered.provenance.source = "automation".into();
+        assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
+
+        let mut altered = base.clone();
+        altered.ts = f64::from_bits(base.ts.to_bits() ^ 1);
+        assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
+
+        let mut altered = base;
+        altered.hash_version ^= 1;
         assert_ne!(h0, chain_hash(&[0u8; 32], &altered));
     }
 
@@ -1357,6 +2230,7 @@ mod tests {
                     provider_state: vec![state],
                 }),
             ],
+            trust: None,
         };
         let model_event = Event::model_message(&session, &message);
         assert_eq!(model_event.kind, EventKind::ModelMessage);

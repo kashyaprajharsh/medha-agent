@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Barrier;
 use ulid::Ulid;
 
 fn registry() -> Arc<AgentRegistry> {
@@ -103,6 +104,55 @@ fn a_settled_agent_no_longer_accepts_control() {
 }
 
 #[test]
+fn followup_and_settlement_choose_one_atomic_path() {
+    let registry = registry();
+    let path = start(&registry, "survey", 1);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let followup_registry = Arc::clone(&registry);
+    let followup_path = path.clone();
+    let followup_barrier = Arc::clone(&barrier);
+    let followup = std::thread::spawn(move || {
+        followup_barrier.wait();
+        followup_registry.followup(&followup_path, "check the lexer")
+    });
+
+    let settle_registry = Arc::clone(&registry);
+    let settle_path = path.clone();
+    let settle_barrier = Arc::clone(&barrier);
+    let settle = std::thread::spawn(move || {
+        settle_barrier.wait();
+        settle_registry.settled(&settle_path, AgentStatus::Completed);
+    });
+
+    barrier.wait();
+    let choice = followup.join().unwrap();
+    settle.join().unwrap();
+    let queued = QUEUES.with(|queues| {
+        queues
+            .borrow_mut()
+            .last_mut()
+            .unwrap()
+            .drain_steers()
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<Vec<_>>()
+    });
+
+    match choice {
+        Some(Followup::Delivered(agent)) => {
+            assert_eq!(agent.path, path);
+            assert_eq!(queued, ["check the lexer"]);
+        }
+        Some(Followup::Resume(agent)) => {
+            assert_eq!(agent.path, path);
+            assert!(queued.is_empty());
+        }
+        None => panic!("the settle race silently lost the follow-up"),
+    }
+}
+
+#[test]
 fn agents_are_found_by_path_or_session_never_by_bare_name() {
     let registry = registry();
     let path = start(&registry, "survey", 1);
@@ -159,6 +209,55 @@ fn settled_history_is_bounded() {
     assert_eq!(registry.all().len(), 2);
     assert!(registry.find(&AgentPath::root(), "agent-0").is_none());
     assert!(registry.find(&AgentPath::root(), "agent-3").is_some());
+}
+
+/// Roster eviction must not orphan a durable transcript: a nested parent
+/// still resolves its own child's session id through the archive — by name
+/// and by the documented stable id — while a sibling can do neither.
+#[test]
+fn evicted_agents_stay_resolvable_by_their_parent_through_the_archive() {
+    let registry = Arc::new(AgentRegistry {
+        tree: Mutex::new(Tree::default()),
+        max_settled: 2,
+    });
+    let (parent, reservation) = registry.claim(&AgentPath::root(), "parent").unwrap();
+    reservation.commit(agent(&parent, 0), live());
+    let (sibling, reservation) = registry.claim(&AgentPath::root(), "sibling").unwrap();
+    reservation.commit(agent(&sibling, 0), live());
+    let (child, reservation) = registry.claim(&parent, "child").unwrap();
+    let child_agent = agent(&child, 1);
+    let child_session = child_agent.session.clone();
+    reservation.commit(child_agent, live());
+
+    registry.settled(&child, AgentStatus::Completed);
+    for n in 0..3 {
+        let path = start(&registry, &format!("late-{n}"), 10 + n);
+        registry.settled(&path, AgentStatus::Completed);
+    }
+    assert!(
+        registry.find(&parent, "child").is_none(),
+        "the roster entry must be evicted for this test to mean anything"
+    );
+
+    assert_eq!(
+        registry.archived_session(&parent, "child").as_deref(),
+        Some(child_session.as_str()),
+        "a nested parent must still resolve its child by name"
+    );
+    assert_eq!(
+        registry
+            .archived_session(&parent, &child_session)
+            .as_deref(),
+        Some(child_session.as_str()),
+        "the documented stable id must answer under the same containment"
+    );
+    assert!(registry.archived_session(&sibling, "child").is_none());
+    assert!(
+        registry
+            .archived_session(&sibling, &child_session)
+            .is_none(),
+        "learning a session id must not open a sibling's transcript"
+    );
 }
 
 /// A follow-up revives a settled agent before admission can fail. Without a

@@ -22,8 +22,8 @@ use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 pub use skills::{InstallReport, SkillScope, SkillStore};
-use std::collections::HashMap;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
 /// Build a compact unified-style diff (with a few lines of context) for display.
@@ -52,6 +52,10 @@ const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 pub enum ToolError {
     #[error("missing or invalid argument: {0}")]
     Args(String),
+    /// A trust-boundary refusal. Callers must not route around this error via a
+    /// remote extraction fallback.
+    #[error("security policy: {0}")]
+    Security(String),
     #[error("{0}")]
     Failed(String),
     #[error("structured tool error")]
@@ -63,6 +67,20 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn blast_radius(&self) -> BlastRadius;
+
+    /// Stable identity of state changed by this invocation, or `None` when the
+    /// tool is side-effect free. This is independent of blast radius: memory
+    /// writes are low-risk for policy purposes but still mutate durable state.
+    ///
+    /// Non-read tools default to one conservative global lane. A tool declared
+    /// `Read` that nevertheless updates replayable state must override this.
+    fn mutation_key(&self, _args: &Value) -> Option<String> {
+        match self.blast_radius() {
+            BlastRadius::Read => None,
+            _ => Some("state:*".to_string()),
+        }
+    }
+
     /// JSON Schema for the parameters (what the model is told it can pass).
     fn schema(&self) -> Value;
     async fn execute(&self, args: &Value) -> Result<Value, ToolError>;
@@ -103,8 +121,8 @@ pub trait Tool: Send + Sync {
 
     /// Hard wall-clock ceiling for one call. Default `Some(60s)` protects against
     /// a stuck tool. Tools that legitimately run long or self-manage their own
-    /// bound return a larger value or `None` (no cap): `shell.exec` promotes a
-    /// slow command to a background task instead of being killed, and
+    /// bound return a larger value or `None` (no outer cap): `shell.exec` owns
+    /// a stricter foreground deadline and process-tree teardown, while
     /// `diagnostics`/`web.crawl` can exceed 60s on a big workspace/site. A `None`
     /// here means the tool is trusted to bound itself.
     fn timeout(&self) -> Option<std::time::Duration> {
@@ -128,8 +146,8 @@ fn cap_preview(s: &str) -> String {
 /// Run one tool under its own timeout and shape the result into an observation.
 ///
 /// The ceiling is the tool's own (default 60s); tools that self-manage a longer
-/// run (`shell.exec` promotes to background; `diagnostics`, `web.crawl`,
-/// `agent.*`) return a larger value or `None` for no cap. On timeout the run
+/// run (`shell.exec` has an internal kill-and-settle deadline; `diagnostics`,
+/// `web.crawl`, `agent.*`) return a larger value or `None` for no outer cap. On timeout the run
 /// future is dropped — and for exec-backed tools that drop tears down the whole
 /// process group (see `GroupReaper`), so nothing is orphaned.
 pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observation {
@@ -220,20 +238,26 @@ async fn post_edit_lsp(
             .await,
         artifacts,
     )
+    .await
     .ok()
 }
 
-fn attach_artifact(value: &mut Value, bytes: Vec<u8>, store: &dyn kernel::ArtifactStore) {
-    let Ok(hash) = store.put(&bytes) else {
+async fn attach_artifact(
+    value: &mut Value,
+    bytes: Vec<u8>,
+    store: &Arc<dyn kernel::ArtifactStore>,
+) {
+    let byte_len = bytes.len();
+    let Ok(hash) = Arc::clone(store).put_async(bytes).await else {
         return;
     };
     if let Some(object) = value.as_object_mut() {
         object.insert("artifact_hash".into(), Value::String(hash));
-        object.insert("artifact_bytes".into(), json!(bytes.len()));
+        object.insert("artifact_bytes".into(), json!(byte_len));
     }
 }
 
-fn lsp_query_value<T: serde::Serialize>(
+async fn lsp_query_value<T: serde::Serialize>(
     report: lsp::QueryReport<T>,
     artifacts: &Arc<dyn kernel::ArtifactStore>,
 ) -> Result<Value, ToolError> {
@@ -262,12 +286,12 @@ fn lsp_query_value<T: serde::Serialize>(
     let mut value =
         serde_json::to_value(report).map_err(|error| ToolError::Failed(error.to_string()))?;
     if let Some(bytes) = artifact {
-        attach_artifact(&mut value, bytes, artifacts.as_ref());
+        attach_artifact(&mut value, bytes, artifacts).await;
     }
     Ok(value)
 }
 
-fn lsp_diagnostic_value(
+async fn lsp_diagnostic_value(
     report: lsp::DiagnosticReport,
     artifacts: &Arc<dyn kernel::ArtifactStore>,
 ) -> Result<Value, ToolError> {
@@ -304,7 +328,7 @@ fn lsp_diagnostic_value(
     let mut value =
         serde_json::to_value(report).map_err(|error| ToolError::Failed(error.to_string()))?;
     if let Some(bytes) = artifact {
-        attach_artifact(&mut value, bytes, artifacts.as_ref());
+        attach_artifact(&mut value, bytes, artifacts).await;
     }
     Ok(value)
 }
@@ -488,7 +512,7 @@ impl Tool for LspDiagnostics {
             .resolve(&path)
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?;
-        lsp_diagnostic_value(self.manager.diagnostics(absolute).await, &self.artifacts)
+        lsp_diagnostic_value(self.manager.diagnostics(absolute).await, &self.artifacts).await
     }
 }
 
@@ -555,6 +579,7 @@ impl Tool for LspDefinition {
             self.manager.definition(absolute, lsp_position(args)?).await,
             &self.artifacts,
         )
+        .await
     }
 }
 
@@ -607,6 +632,7 @@ impl Tool for LspReferences {
                 .await,
             &self.artifacts,
         )
+        .await
     }
 }
 
@@ -648,6 +674,7 @@ impl Tool for LspHover {
             self.manager.hover(absolute, lsp_position(args)?).await,
             &self.artifacts,
         )
+        .await
     }
 }
 
@@ -693,6 +720,7 @@ impl Tool for LspSymbols {
             self.manager.workspace_symbols(absolute, &query).await,
             &self.artifacts,
         )
+        .await
     }
 }
 
@@ -736,6 +764,7 @@ impl Tool for LspImplementation {
                 .await,
             &self.artifacts,
         )
+        .await
     }
 }
 
@@ -779,6 +808,7 @@ impl Tool for LspDocumentSymbols {
             self.manager.document_symbols(absolute).await,
             &self.artifacts,
         )
+        .await
     }
 }
 
@@ -829,6 +859,7 @@ impl Tool for LspCallHierarchy {
                 .await,
             &self.artifacts,
         )
+        .await
     }
 }
 
@@ -913,8 +944,10 @@ pub struct ToolRegistry {
     /// level (§4.8) to the kernel's trust-flow escalation. `None` for a bare
     /// registry built via [`ToolRegistry::new`].
     sandbox: Option<Arc<WorkspaceSandbox>>,
-    /// Shared background-task table (promoted `shell.exec` runs), kept so the
-    /// executor can report live tasks to a surface. `None` for a bare registry.
+    /// Shared owned-process table. Foreground `shell.exec` calls live here while
+    /// running, giving cancellation and concurrent surfaces a stable process-
+    /// tree kill handle; a bounded TTL/LRU cache retains recent settled output.
+    /// `None` for a bare registry.
     tasks: Option<Arc<TaskTable>>,
     /// Live web-search configuration shared with the `web.*` tools. The TUI's
     /// `/search` writes it; the tools read it per call, so a provider change
@@ -1165,6 +1198,7 @@ impl ToolRegistry {
         }));
         r.register(Arc::new(FsWrite {
             sbx: sandbox.clone(),
+            pins: Default::default(),
             lsp: r.lsp.clone(),
             artifacts: artifacts.clone(),
         }));
@@ -1209,9 +1243,9 @@ impl ToolRegistry {
         r.register(Arc::new(Diagnostics {
             sbx: sandbox.clone(),
         }));
-        // Background-task facility (§2): a slow `shell.exec` promotes to a task in
-        // this shared table; `task.output`/`task.kill`/`task.list` operate on it,
-        // and the executor exposes it to surfaces via `background_tasks()`.
+        // Owned-process facility: shell commands never detach. Admission is
+        // reserved before spawn; cancellation has a stable whole-tree kill
+        // handle, and only a bounded TTL/LRU tail remains after settlement.
         let tasks = Arc::new(TaskTable::default());
         r.tasks = Some(tasks.clone());
         r.register(Arc::new(ShellExec {
@@ -1222,6 +1256,9 @@ impl ToolRegistry {
             tasks: tasks.clone(),
         }));
         r.register(Arc::new(TaskKill {
+            tasks: tasks.clone(),
+        }));
+        r.register(Arc::new(TaskRemove {
             tasks: tasks.clone(),
         }));
         r.register(Arc::new(TaskList { tasks }));
@@ -1340,6 +1377,17 @@ impl Executor for ToolRegistry {
         self.tools.get(tool).map(|t| t.category())
     }
 
+    fn mutation_key(&self, intent: &ToolIntent) -> Option<String> {
+        if mcp::McpManager::is_mcp_tool(&intent.tool) {
+            // MCP calls cross a process/trust boundary and may mutate state even
+            // when a remote server's schema does not say so.
+            return Some("state:*".to_string());
+        }
+        self.tools
+            .get(&intent.tool)
+            .and_then(|tool| tool.mutation_key(&intent.args))
+    }
+
     fn containment(&self) -> kernel::Containment {
         self.sandbox
             .as_ref()
@@ -1369,7 +1417,7 @@ impl Executor for ToolRegistry {
                         "truncated": cut.is_some(),
                     });
                     if let (Some(_), Some(store)) = (cut, &self.artifacts) {
-                        attach_artifact(&mut payload, out.text.into_bytes(), store.as_ref());
+                        attach_artifact(&mut payload, out.text.into_bytes(), store).await;
                     }
                     if out.is_error {
                         Observation {
@@ -1404,6 +1452,14 @@ impl Executor for ToolRegistry {
 struct FsRead {
     sbx: Arc<WorkspaceSandbox>,
 }
+
+const FS_READ_MAX_WHOLE_BYTES: u64 = 2_000_000;
+/// Directory entries retained by one `fs.list` call; the count of what was
+/// left out is still reported, so truncation is visible rather than silent.
+const FS_LIST_MAX_ENTRIES: usize = 2_000;
+const FS_READ_MAX_RANGE_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+const FS_READ_MAX_RANGE_OUTPUT_BYTES: usize = 2_000_000;
+
 #[async_trait]
 impl Tool for FsRead {
     fn name(&self) -> &str {
@@ -1424,21 +1480,26 @@ impl Tool for FsRead {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Workspace-relative or absolute path" },
-                "offset": { "type": "integer", "description": "1-based line to start at (optional; default whole file)" },
-                "limit": { "type": "integer", "description": "Max lines to return from offset (optional)" }
+                "offset": { "type": "integer", "minimum": 1, "description": "1-based line to start at (optional; default whole file)" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Max lines to return from offset (optional)" }
             },
             "required": ["path"]
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
-        let offset = args.get("offset").and_then(Value::as_u64);
-        let limit = args.get("limit").and_then(Value::as_u64);
-        // Size guard (P2): refuse a whole-file read of a huge file BEFORE
-        // loading it — otherwise it lands in memory and the event log intact
-        // (only model context was protected by the 16KB spill). Ranged reads
-        // stay allowed; point the model at them.
-        const MAX_WHOLE_READ: u64 = 2_000_000;
+        let numeric_arg = |name: &str| -> Result<Option<u64>, ToolError> {
+            match args.get(name) {
+                None => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .filter(|value| *value > 0)
+                    .map(Some)
+                    .ok_or_else(|| ToolError::Args(format!("{name} must be a positive integer"))),
+            }
+        };
+        let offset = numeric_arg("offset")?;
+        let limit = numeric_arg("limit")?;
         // Resolve ONCE and reuse. Resolving is what prompts for a path outside
         // the workspace, so resolving per step asked the user to approve the
         // same file once per step — three dialogs for one whole-file read.
@@ -1461,58 +1522,59 @@ impl Tool for FsRead {
         if offset.is_none()
             && limit.is_none()
             && let Ok(md) = std::fs::metadata(&resolved)
-            && md.len() > MAX_WHOLE_READ
+            && md.len() > FS_READ_MAX_WHOLE_BYTES
         {
             return Err(ToolError::Failed(format!(
-                "{path} is {} bytes — too large for a whole-file read (cap {MAX_WHOLE_READ}). \
+                "{path} is {} bytes — too large for a whole-file read (cap {FS_READ_MAX_WHOLE_BYTES}). \
                  Read a range with offset/limit, or grep it.",
                 md.len()
             )));
         }
+        if offset.is_some() || limit.is_some() {
+            let range = self
+                .sbx
+                .read_line_range_resolved(
+                    &resolved,
+                    offset.unwrap_or(1),
+                    limit,
+                    FS_READ_MAX_RANGE_SCAN_BYTES,
+                    FS_READ_MAX_RANGE_OUTPUT_BYTES,
+                )
+                .await
+                .map_err(|error| ToolError::Failed(format!("read failed: {error}")))?;
+            let note = if range.beyond_eof {
+                Some(format!(
+                    "offset {} is past end of file ({} lines)",
+                    offset.unwrap_or(1),
+                    range.total_lines.unwrap_or(0)
+                ))
+            } else {
+                None
+            };
+            return Ok(json!({
+                "path": path,
+                "content": range.content,
+                "start_line": range.start_line,
+                "end_line": range.end_line,
+                "total_lines": range.total_lines,
+                "has_more": range.has_more,
+                "bytes_scanned": range.bytes_scanned,
+                "note": note,
+            }));
+        }
+
         let content = self
             .sbx
             .read_resolved(&resolved)
             .await
-            .map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
-        // Whole-file read (default) — unchanged behavior.
-        if offset.is_none() && limit.is_none() {
-            return Ok(json!({ "path": path, "content": content }));
-        }
-        // Line-range read: return just the requested slice plus positioning info.
-        // Split with `split_inclusive` so each line KEEPS its terminator — CRLF
-        // stays CRLF and the final line keeps (or lacks) its trailing newline.
-        // `content.lines()` used to strip `\r` and the last `\n`, so the model
-        // copied LF-only text that then failed byte-exact against a CRLF file in
-        // `fs.edit`/`multi_edit` ("old_string not found"). Raw slices fix that.
-        let lines: Vec<&str> = content.split_inclusive('\n').collect();
-        let total = lines.len();
-        let start = (offset.unwrap_or(1).max(1) as usize - 1).min(total);
-        // `saturating_add` so `start + limit` can't wrap in release and silently
-        // return empty content for a large `limit`.
-        let end = limit
-            .map(|l| start.saturating_add(l as usize).min(total))
-            .unwrap_or(total);
-        let slice = lines.get(start..end).unwrap_or(&[]).concat();
-        // Flag an offset that lands past EOF, so an empty slice isn't read as
-        // "the file ends here" when really the offset overshot.
-        let beyond_eof = offset.is_some() && start >= total && total > 0;
-        Ok(json!({
-            "path": path,
-            "content": slice,
-            "start_line": start + 1,
-            "end_line": end,
-            "total_lines": total,
-            "note": if beyond_eof {
-                Some(format!("offset {} is past end of file ({total} lines)", offset.unwrap_or(0)))
-            } else {
-                None
-            },
-        }))
+            .map_err(|error| ToolError::Failed(format!("read failed: {error}")))?;
+        Ok(json!({ "path": path, "content": content }))
     }
 }
 
 struct FsWrite {
     sbx: Arc<WorkspaceSandbox>,
+    pins: PreviewPins,
     lsp: LspHandle,
     artifacts: Arc<dyn kernel::ArtifactStore>,
 }
@@ -1543,12 +1605,29 @@ impl Tool for FsWrite {
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
         let content = arg_str(args, "content")?;
-        // Serialize same-file writes within a turn (P0-4).
-        let _guard = self.sbx.path_guard(&path).await;
-        // Capture the prior contents (empty for a new file) so surfaces can render
-        // a proper diff: a new file shows as all-additions (empty left column),
-        // an overwrite shows the real before/after — same view as fs.edit.
-        let (old, unreadable) = read_or_flag_unreadable(&self.sbx, &path, true).await;
+        // Resolve/authorise first, then serialize on the canonical physical
+        // target. Keep that exact target pinned through the write.
+        let guard = self
+            .sbx
+            .path_guard(&path)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let inspection = self
+            .sbx
+            .inspect_guarded(&guard)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        self.pins.check(args, &path, &inspection.state)?;
+        // Capture the prior contents (empty for a new file) so surfaces can
+        // render a proper diff. Existing non-UTF-8 data is never presented as
+        // proof that the target was absent.
+        let (old, unreadable) = match inspection.bytes.as_deref() {
+            None => (String::new(), false),
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => (text.to_owned(), false),
+                Err(_) => (String::new(), true),
+            },
+        };
         let baseline = if unreadable {
             None
         } else {
@@ -1556,7 +1635,7 @@ impl Tool for FsWrite {
         };
         let snapshot = self
             .sbx
-            .write(&path, &content)
+            .write_guarded_checked(&guard, &content, Some(&inspection.state))
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
         let mut out = json!({ "path": path, "written": true, "snapshot": snapshot, "old": old, "new": content });
@@ -1591,7 +1670,23 @@ impl Tool for FsWrite {
         // additions; an overwrite shows the real before→after change. An existing
         // but unreadable file must NOT masquerade as "new file" — that hides a
         // destructive overwrite from the approval card.
-        let (old, unreadable) = read_or_flag_unreadable(&self.sbx, path, false).await;
+        let inspection = self.sbx.inspect_if_permitted(path).await.ok().flatten();
+        let (old, unreadable) = match inspection.as_ref().and_then(|value| value.bytes.as_deref()) {
+            None if inspection
+                .as_ref()
+                .is_some_and(|value| value.state == sandbox::GuardedFileState::Missing) =>
+            {
+                (String::new(), false)
+            }
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => (text.to_owned(), false),
+                Err(_) => (String::new(), true),
+            },
+            None => (String::new(), true),
+        };
+        if let Some(inspection) = &inspection {
+            self.pins.pin(args, &inspection.state);
+        }
         let diff = cap_preview(&make_diff(path, &old, content));
         if unreadable {
             Some(format!(
@@ -1608,6 +1703,7 @@ impl Tool for FsWrite {
 /// destructive overwrite a new file.
 /// `may_prompt` is false for previews, which must not raise a permission dialog
 /// before the approval card explains what the operation is.
+#[cfg(test)]
 async fn read_or_flag_unreadable(
     sbx: &WorkspaceSandbox,
     path: &str,
@@ -1660,51 +1756,54 @@ impl Tool for FsList {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let entries = self
+        let listing = self
             .sbx
-            .list(path)
+            .list_bounded(path, FS_LIST_MAX_ENTRIES)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
-        Ok(json!({ "path": path, "entries": entries }))
+        let mut out = json!({ "path": path, "entries": listing.entries });
+        if listing.total > FS_LIST_MAX_ENTRIES {
+            out["truncated"] = json!(true);
+            out["total_entries"] = json!(listing.total);
+            out["note"] = json!(format!(
+                "showing {FS_LIST_MAX_ENTRIES} of {} entries — use `glob` with a pattern to narrow",
+                listing.total
+            ));
+        }
+        Ok(out)
     }
 }
 
-/// Preview→execute content pins (P1-1). `preview` records a hash of the file
-/// content the approval card was rendered from, keyed by the exact tool args;
-/// `execute` takes the pin and refuses if the file changed in between — the
-/// approved diff and the applied diff must be the same diff.
+/// Preview→execute revision pins. A revision includes SHA-256 content and file
+/// identity, so create/delete, edits, and same-content replacement all
+/// invalidate an approval. Keys are the complete serialized args rather than a
+/// 64-bit hash, avoiding an approval-pin collision surface.
 #[derive(Default)]
-struct PreviewPins(std::sync::Mutex<std::collections::HashMap<u64, u64>>);
+struct PreviewPins(std::sync::Mutex<std::collections::HashMap<String, sandbox::GuardedFileState>>);
 
 impl PreviewPins {
-    fn pin(&self, args: &Value, content: &str) {
+    fn pin(&self, args: &Value, state: &sandbox::GuardedFileState) {
         let mut map = self.0.lock().unwrap();
         if map.len() > 64 {
             map.clear(); // bound stale pins from denied/abandoned previews
         }
-        map.insert(content_hash(&args.to_string()), content_hash(content));
+        map.insert(args.to_string(), state.clone());
     }
-    /// Take the pin for these args (if any) and verify the content still matches.
-    fn check(&self, args: &Value, path: &str, content: &str) -> Result<(), ToolError> {
-        let pinned = self
-            .0
-            .lock()
-            .unwrap()
-            .remove(&content_hash(&args.to_string()));
+    /// Take the pin for these args (if any) and verify the guarded revision.
+    fn check(
+        &self,
+        args: &Value,
+        path: &str,
+        state: &sandbox::GuardedFileState,
+    ) -> Result<(), ToolError> {
+        let pinned = self.0.lock().unwrap().remove(&args.to_string());
         match pinned {
-            Some(h) if h != content_hash(content) => Err(ToolError::Failed(format!(
+            Some(pinned) if pinned != *state => Err(ToolError::Failed(format!(
                 "{path} changed after the approved preview; re-run the edit to preview the current content"
             ))),
             _ => Ok(()),
         }
     }
-}
-
-fn content_hash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
 }
 
 struct FsEdit {
@@ -1746,16 +1845,27 @@ impl Tool for FsEdit {
             .unwrap_or(false);
         validate_edit(&old_s, &new_s)?;
 
-        // Serialize same-file edits within a turn so a concurrent edit can't read
-        // the same original and clobber this one (P0-4).
-        let _guard = self.sbx.path_guard(&path).await;
-        let content = self
+        // Resolve/authorise first, then serialize on the canonical physical
+        // target so raw aliases cannot read the same original concurrently.
+        let guard = self
             .sbx
-            .read(&path)
+            .path_guard(&path)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let inspection = self
+            .sbx
+            .inspect_guarded(&guard)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let content = String::from_utf8(
+            inspection
+                .bytes
+                .clone()
+                .ok_or_else(|| ToolError::Failed(format!("{path} does not exist")))?,
+        )
+        .map_err(|_| ToolError::Failed(format!("{path} is not valid UTF-8")))?;
         // Refuse if the file changed since the approved preview (P1-1).
-        self.pins.check(args, &path, &content)?;
+        self.pins.check(args, &path, &inspection.state)?;
         // CRLF-tolerant byte-exact match (see `resolve_edit`).
         let (old_s, new_s) = resolve_edit(&content, &old_s, &new_s)
             .ok_or_else(|| ToolError::Failed(format!("old_string not found in {path}")))?;
@@ -1773,7 +1883,7 @@ impl Tool for FsEdit {
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
         let snapshot = self
             .sbx
-            .write(&path, &updated)
+            .write_guarded_checked(&guard, &updated, Some(&inspection.state))
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
         let diff = make_diff(&path, &content, &updated);
@@ -1817,9 +1927,10 @@ impl Tool for FsEdit {
         // Never prompts: a preview runs before the approval card, so asking to
         // authorise the path here would question the user before telling them
         // what it is for — and again when the edit actually runs.
-        let content = self.sbx.read_if_permitted(path).await?;
+        let inspection = self.sbx.inspect_if_permitted(path).await.ok()??;
         // Pin what the approval card will show (P1-1).
-        self.pins.pin(args, &content);
+        self.pins.pin(args, &inspection.state);
+        let content = String::from_utf8(inspection.bytes.unwrap_or_default()).ok()?;
         let count = content.matches(old_s).count();
         if count == 0 {
             return Some(format!(
@@ -1875,23 +1986,97 @@ impl Tool for WordCount {
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
-        let content = self
+        // Resolve through the sandbox (this is what prompts for an
+        // out-of-workspace path), then stream the counts: unlike a whole-file
+        // read, a multi-gigabyte file costs one fixed buffer, which also keeps
+        // this tool from bypassing the fs.read whole-file cap.
+        let resolved = self
             .sbx
-            .read(&path)
+            .resolve(&path)
             .await
-            .map_err(|e| ToolError::Failed(format!("read failed: {}", e)))?;
-        let lines: Vec<&str> = content.lines().collect();
-        let line_count = lines.len();
-        let char_count = content.chars().count();
-        // Word count: split on whitespace
-        let word_count = content.split_whitespace().count();
+            .map_err(|e| ToolError::Failed(format!("read failed: {e}")))?;
+        let counts = tokio::task::spawn_blocking(move || stream_text_counts(&resolved))
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?
+            .map_err(|e| ToolError::Failed(format!("read failed: {e}")))?;
         Ok(json!({
             "path": path,
-            "lines": line_count,
-            "words": word_count,
-            "chars": char_count,
+            "lines": counts.lines,
+            "words": counts.words,
+            "chars": counts.chars,
         }))
     }
+}
+
+struct TextCounts {
+    lines: u64,
+    words: u64,
+    chars: u64,
+}
+
+/// Line/word/char counts computed in one 64 KiB-buffered pass. Semantics match
+/// `str::lines` / `split_whitespace` / `chars` on the whole file; a UTF-8
+/// sequence split across chunk boundaries is carried over, never miscounted.
+fn stream_text_counts(path: &std::path::Path) -> Result<TextCounts, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut carry: Vec<u8> = Vec::with_capacity(8);
+    let mut counts = TextCounts {
+        lines: 0,
+        words: 0,
+        chars: 0,
+    };
+    let mut in_word = false;
+    let mut last_was_newline = true;
+    let mut any_content = false;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        let valid_up_to = match std::str::from_utf8(&carry) {
+            Ok(_) => carry.len(),
+            Err(error) => {
+                if error.error_len().is_some() {
+                    return Err(format!("{} is not valid UTF-8", path.display()));
+                }
+                error.valid_up_to()
+            }
+        };
+        // Safe: valid_up_to bounds the checked prefix.
+        let text = unsafe { std::str::from_utf8_unchecked(&carry[..valid_up_to]) };
+        for ch in text.chars() {
+            counts.chars += 1;
+            any_content = true;
+            if ch == '\n' {
+                counts.lines += 1;
+                last_was_newline = true;
+            } else {
+                last_was_newline = false;
+            }
+            if ch.is_whitespace() {
+                in_word = false;
+            } else if !in_word {
+                in_word = true;
+                counts.words += 1;
+            }
+        }
+        carry.drain(..valid_up_to);
+        if carry.len() >= 4 {
+            return Err(format!("{} is not valid UTF-8", path.display()));
+        }
+    }
+    if !carry.is_empty() {
+        return Err(format!("{} is not valid UTF-8", path.display()));
+    }
+    // `str::lines` counts a trailing segment without a final newline.
+    if any_content && !last_was_newline {
+        counts.lines += 1;
+    }
+    Ok(counts)
 }
 
 // ── search family ────────────────────────────────────────────────────────────
@@ -2629,34 +2814,48 @@ impl Tool for ReadArtifact {
             "properties": {
                 "hash": { "type": "string", "description": "Artifact content hash" },
                 "offset": { "type": "integer", "description": "Start byte (default 0)" },
-                "length": { "type": "integer", "description": "Bytes to read (default: to end)" }
+                "length": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1048576,
+                    "description": "Bytes to read (default/max: one 1 MiB page)"
+                }
             },
             "required": ["hash"]
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let hash = arg_str(args, "hash")?;
-        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let offset = args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+            .unwrap_or(0);
         let length = args
             .get("length")
             .and_then(Value::as_u64)
-            .map(|l| l as usize);
+            .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+            .unwrap_or(store::MAX_ARTIFACT_READ_BYTES)
+            .min(store::MAX_ARTIFACT_READ_BYTES);
         // Name the actual failure. A raw `No such file` from the store reads as a
         // transient IO fault, so a model that guessed a hash guesses again rather
         // than changing approach — the observed failure mode is several invented
         // hashes in a row. Say that the hash is the problem, and where real ones
         // come from.
-        let total = self.store.size(&hash).map_err(|err| {
-            ToolError::Failed(format!(
-                "no artifact stored under hash {hash} ({err}). Artifact hashes are only \
-                 valid if a tool result printed one — they cannot be guessed or \
-                 constructed. To read a file from disk use `fs.read`; to search it use \
-                 `grep`."
-            ))
-        })?;
-        let bytes = self
-            .store
-            .get(&hash, offset, length)
+        let total = Arc::clone(&self.store)
+            .size_async(hash.clone())
+            .await
+            .map_err(|err| {
+                ToolError::Failed(format!(
+                    "no artifact stored under hash {hash} ({err}). Artifact hashes are only \
+                     valid if a tool result printed one — they cannot be guessed or \
+                     constructed. To read a file from disk use `fs.read`; to search it use \
+                     `grep`."
+                ))
+            })?;
+        let bytes = Arc::clone(&self.store)
+            .get_async(hash.clone(), offset, Some(length))
+            .await
             .map_err(ToolError::Failed)?;
         // Snap page edges to char boundaries (P2): a byte offset can land
         // mid-UTF-8-sequence; lossy decoding put U+FFFD at the edges and made
@@ -2720,35 +2919,67 @@ fn http_client() -> Result<reqwest::Client, ToolError> {
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let octets = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
                 || v4.is_multicast()
-                || v4.octets()[0] == 0
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40) // 100.64.0.0/10 CGNAT
+                || octets[0] == 0
+                || (octets[0] == 100 && (octets[1] & 0xc0) == 0x40) // 100.64.0.0/10 CGNAT
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // IETF protocol assignments
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2) // TEST-NET-1
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)) // benchmark
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100) // TEST-NET-2
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113) // TEST-NET-3
+                || octets[0] >= 240 // reserved / limited broadcast
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_blocked_ip(IpAddr::V4(v4));
             }
-            let seg0 = v6.segments()[0];
+            let segments = v6.segments();
+            let seg0 = segments[0];
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
+                || segments[..6] == [0, 0, 0, 0, 0, 0] // deprecated IPv4-compatible ::/96
+                || (seg0 == 0x0064 && segments[1] == 0xff9b) // NAT64 translation prefixes
+                || (seg0 == 0x0100 && segments[1..4] == [0, 0, 0]) // discard-only 100::/64
+                || (seg0 == 0x2001 && segments[1] <= 0x01ff) // IETF special-purpose space
+                || seg0 == 0x2002 // 6to4 can encode private IPv4 destinations
                 || (seg0 & 0xffc0) == 0xfe80 // link-local  fe80::/10
+                || (seg0 & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
                 || (seg0 & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || segments[0..2] == [0x2001, 0x0db8] // documentation
+                || (seg0 & 0xfff0) == 0x3ff0 // documentation 3fff::/20
         }
     }
 }
 
-/// SSRF guard: require http/https and confirm the host does not resolve to any
-/// non-public address. Called before the initial request AND re-checked on
-/// every redirect hop (a redirect to `http://169.254.169.254/…` is the classic
-/// bypass). DNS is resolved here so a hostname pointing at an internal IP is
-/// caught; the per-hop re-check is the pragmatic defense against rebinding.
-fn validate_public_url(url: &reqwest::Url) -> Result<(), String> {
+#[derive(Debug, Clone)]
+struct PublicTarget {
+    host: String,
+    addrs: Vec<SocketAddr>,
+}
+
+fn parse_host_ip(host: &str) -> Option<IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+/// Validate a concrete resolution result and retain exactly those addresses for
+/// the subsequent connection. Rejecting the whole set when even one answer is
+/// private prevents resolver ordering and Happy-Eyeballs from selecting a
+/// different trust class than the address the guard happened to inspect first.
+fn validate_resolved_target(
+    url: &reqwest::Url,
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> Result<PublicTarget, String> {
     match url.scheme() {
         "http" | "https" => {}
         other => {
@@ -2760,35 +2991,69 @@ fn validate_public_url(url: &reqwest::Url) -> Result<(), String> {
     let host = url
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
-
-    // IP literal: check directly, no DNS.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return if is_blocked_ip(ip) {
-            Err(format!("blocked non-public address: {ip}"))
-        } else {
-            Ok(())
-        };
-    }
-
-    // Hostname: reject if ANY resolved address is non-public.
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS resolution failed for '{host}': {e}"))?;
-    let mut saw_any = false;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no usable port".to_string())?;
+    let mut public = Vec::new();
     for addr in addrs {
-        saw_any = true;
+        let addr = SocketAddr::new(addr.ip(), port);
         if is_blocked_ip(addr.ip()) {
             return Err(format!(
                 "blocked non-public address {} for host '{host}'",
                 addr.ip()
             ));
         }
+        if !public.contains(&addr) {
+            public.push(addr);
+        }
     }
-    if !saw_any {
+    if public.is_empty() {
         return Err(format!("no addresses resolved for host '{host}'"));
     }
-    Ok(())
+    Ok(PublicTarget {
+        host: host.to_string(),
+        addrs: public,
+    })
+}
+
+/// Resolve once, validate every answer, and return the address set that must be
+/// pinned into the HTTP connector. The injected resolver makes rebinding tests
+/// deterministic without touching the host's DNS configuration.
+fn resolve_public_url_with<F>(url: &reqwest::Url, mut resolve: F) -> Result<PublicTarget, String>
+where
+    F: FnMut(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+{
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "blocked URL scheme '{other}' (only http/https allowed)"
+            ));
+        }
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no usable port".to_string())?;
+
+    // IP literal: validate directly and never ask a resolver.
+    if let Some(ip) = parse_host_ip(host) {
+        return validate_resolved_target(url, [SocketAddr::new(ip, port)]);
+    }
+
+    let addrs =
+        resolve(host, port).map_err(|e| format!("DNS resolution failed for '{host}': {e}"))?;
+    validate_resolved_target(url, addrs)
+}
+
+fn resolve_public_url(url: &reqwest::Url) -> Result<PublicTarget, String> {
+    resolve_public_url_with(url, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect())
+    })
 }
 
 /// Read a response body into memory, but abort as soon as it exceeds `max`
@@ -2819,27 +3084,68 @@ async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>
     Ok(buf)
 }
 
-/// Like [`http_client`], but for agent-supplied `web.fetch` targets: redirects
-/// are NOT auto-followed — `fetch_plain` follows them manually so each hop's
-/// target passes [`validate_public_url`] with DNS resolved off the async
-/// workers (a redirect policy closure is sync, which forced blocking DNS onto
-/// the runtime, P2). A public URL still can't 30x-bounce into the internal net.
-fn fetch_client() -> Result<reqwest::Client, ToolError> {
-    reqwest::Client::builder()
+/// Build a one-hop client whose resolver override is the exact public address
+/// set already validated above. Environment proxies are disabled: a proxy
+/// would otherwise perform its own, unvalidated DNS lookup for the target.
+fn fetch_client(target: &PublicTarget) -> Result<reqwest::Client, ToolError> {
+    let mut builder = reqwest::Client::builder()
         .user_agent(BROWSER_UA)
         .timeout(std::time::Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if parse_host_ip(&target.host).is_none() {
+        builder = builder.resolve_to_addrs(&target.host, &target.addrs);
+    }
+    builder
         .build()
         .map_err(|e| ToolError::Failed(e.to_string()))
 }
 
-/// Validate a URL as public with DNS resolution on the blocking pool.
-async fn validate_public_url_async(url: &reqwest::Url) -> Result<(), ToolError> {
+/// Resolve and validate a URL on the blocking pool. The returned addresses, not
+/// the hostname, are what the caller connects to.
+async fn resolve_public_url_async(url: &reqwest::Url) -> Result<PublicTarget, ToolError> {
     let u = url.clone();
-    tokio::task::spawn_blocking(move || validate_public_url(&u))
+    tokio::task::spawn_blocking(move || resolve_public_url(&u))
         .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?
-        .map_err(ToolError::Failed)
+        .map_err(|e| ToolError::Security(format!("DNS validation task failed: {e}")))?
+        .map_err(ToolError::Security)
+}
+
+fn normalized_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
+/// Defense in depth after reqwest connects: the observed peer must be one of
+/// the pinned public sockets. Missing peer metadata fails closed rather than
+/// silently weakening the check.
+fn validate_connected_peer(
+    peer: Option<SocketAddr>,
+    target: &PublicTarget,
+) -> Result<(), ToolError> {
+    let peer = peer.ok_or_else(|| {
+        ToolError::Security("HTTP transport did not report its connected peer".into())
+    })?;
+    if is_blocked_ip(peer.ip()) {
+        return Err(ToolError::Security(format!(
+            "connected peer is non-public: {}",
+            peer.ip()
+        )));
+    }
+    let matches_pin = target.addrs.iter().any(|pinned| {
+        normalized_ip(pinned.ip()) == normalized_ip(peer.ip()) && pinned.port() == peer.port()
+    });
+    if !matches_pin {
+        return Err(ToolError::Security(format!(
+            "connected peer {peer} did not match the validated DNS address set"
+        )));
+    }
+    Ok(())
 }
 
 /// Which backend `web.search` uses. `DuckDuckGo` needs no key and is always the
@@ -3457,6 +3763,7 @@ impl Tool for WebFetch {
         let url = arg_str(args, "url")?;
         match fetch_plain(&url).await {
             Ok(v) => Ok(v),
+            Err(error @ ToolError::Security(_)) => Err(error),
             Err(e) => {
                 // Plain fetch failed or the page blocked us — fall back to Tavily's
                 // LLM-optimized extractor when a key is configured (via /search or env).
@@ -3479,22 +3786,19 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
     let parsed =
         reqwest::Url::parse(url).map_err(|e| ToolError::Failed(format!("invalid URL: {e}")))?;
 
-    // SSRF guard: reject internal/non-public targets before connecting. DNS is
-    // blocking, so resolve off the async workers.
-    validate_public_url_async(&parsed).await?;
-
-    // Follow redirects manually (max 5) so EVERY hop is validated the same way
-    // — the classic bypass is a public URL that 30x-redirects to
-    // http://169.254.169.254/… — with per-hop DNS off the async workers (P2).
-    let client = fetch_client()?;
     let mut current = parsed;
+    // Resolve once for this hop. The resulting address set is both validated
+    // and pinned into its one-hop client, closing the DNS check/use gap.
+    let mut target = resolve_public_url_async(&current).await?;
     let mut hops = 0u8;
     let resp = loop {
+        let client = fetch_client(&target)?;
         let r = client
             .get(current.clone())
             .send()
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
+        validate_connected_peer(r.remote_addr(), &target)?;
         if !r.status().is_redirection() {
             break r;
         }
@@ -3510,9 +3814,14 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
         let next = current
             .join(loc)
             .map_err(|e| ToolError::Failed(format!("bad redirect target: {e}")))?;
-        validate_public_url_async(&next)
+        target = resolve_public_url_async(&next)
             .await
-            .map_err(|e| ToolError::Failed(format!("blocked redirect: {e}")))?;
+            .map_err(|error| match error {
+                ToolError::Security(message) => {
+                    ToolError::Security(format!("blocked redirect: {message}"))
+                }
+                other => other,
+            })?;
         current = next;
     };
     let status = resp.status();
@@ -3839,8 +4148,8 @@ fn extract_title(html: &str) -> String {
 }
 
 /// Strip script/style noise, then convert to Markdown (free, no headless
-/// browser). `html2md` is a recursive descent over the DOM, so two guards keep
-/// it from overflowing the stack and aborting the process: the input is capped,
+/// browser). The converter walks the DOM recursively, so two guards keep it
+/// from overflowing the stack and aborting the process: the input is capped,
 /// and the parse runs on a thread with a large stack (deeply nested but valid
 /// HTML would otherwise blow the default 2 MB worker stack).
 fn html_to_markdown(html: &str) -> String {
@@ -3864,9 +4173,10 @@ fn html_to_markdown(html: &str) -> String {
 
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || html2md::parse_html(&cleaned))
+        .spawn(move || htmd::convert(&cleaned).unwrap_or_default())
         .ok()
         .and_then(|h| h.join().ok())
+        .filter(|markdown| !markdown.trim().is_empty())
         .unwrap_or_else(|| "[web.fetch: page too complex to convert to Markdown]".to_string())
 }
 
@@ -3968,19 +4278,57 @@ struct ShellExec {
     tasks: Arc<TaskTable>,
 }
 
-/// Seconds a `shell.exec` runs in the foreground before it's promoted to a
-/// background task (returns partial output + a task id, keeps running). Chosen
-/// below the default tool ceiling so promotion — not a kill — is what happens to
-/// a slow command.
-const PROMOTE_AFTER_SECS: u64 = 50;
+/// Default and maximum foreground deadlines. On expiry the whole process tree
+/// is killed and awaited before the tool returns an error; it is never detached.
+const SHELL_TIMEOUT_SECS: u64 = 50;
+const SHELL_TIMEOUT_MAX_SECS: u64 = 600;
 
-/// Shared registry of promoted background commands (§2). One per session,
-/// created in [`ToolRegistry::with_workspace`] and shared by `shell.exec` and
-/// the `task.*` tools.
-#[derive(Default)]
+/// A process retains at most 1.5 MB across stdout/stderr in `sandbox::exec`.
+/// Admission control therefore bounds live shell capture to about 48 MB, and
+/// the separate completed-result cache below retains at most another 8 MiB.
+const MAX_ACTIVE_SHELL_TASKS: usize = 32;
+const MAX_RECENT_SHELL_TASKS: usize = 64;
+const MAX_RECENT_SHELL_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const RECENT_SHELL_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const MAX_TASK_COMMAND_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+struct TaskLimits {
+    max_active: usize,
+    max_recent: usize,
+    max_recent_bytes: usize,
+    recent_ttl: std::time::Duration,
+}
+
+impl Default for TaskLimits {
+    fn default() -> Self {
+        Self {
+            max_active: MAX_ACTIVE_SHELL_TASKS,
+            max_recent: MAX_RECENT_SHELL_TASKS,
+            max_recent_bytes: MAX_RECENT_SHELL_OUTPUT_BYTES,
+            recent_ttl: RECENT_SHELL_TASK_TTL,
+        }
+    }
+}
+
+/// Shared registry of owned shell processes. One per session, created in
+/// [`ToolRegistry::with_workspace`] and shared by `shell.exec` and the `task.*`
+/// inspection/stop tools.
 struct TaskTable {
-    inner: std::sync::Mutex<HashMap<String, TaskEntry>>,
+    inner: std::sync::Mutex<TaskTableState>,
     seq: std::sync::atomic::AtomicU64,
+    limits: TaskLimits,
+}
+
+#[derive(Default)]
+struct TaskTableState {
+    /// Reservations count before process spawn, so a burst cannot create
+    /// thousands of children and discover the limit only afterwards.
+    reservations: HashMap<String, String>,
+    active: HashMap<String, TaskEntry>,
+    recent: HashMap<String, CompletedTask>,
+    recent_lru: VecDeque<String>,
+    recent_bytes: usize,
 }
 
 struct TaskEntry {
@@ -3988,37 +4336,249 @@ struct TaskEntry {
     command: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalTaskStatus {
+    Exited,
+    TimedOut,
+}
+
+impl TerminalTaskStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exited => "exited",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+struct CompletedTask {
+    command: String,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    status: TerminalTaskStatus,
+    finished_at: std::time::Instant,
+}
+
+impl CompletedTask {
+    fn capture(entry: TaskEntry, status: TerminalTaskStatus) -> Self {
+        let (stdout, stderr) = entry.proc.snapshot();
+        let (stdout_truncated, stderr_truncated) = entry.proc.truncation();
+        Self {
+            command: entry.command,
+            exit_code: entry.proc.exit_code(),
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            status,
+            finished_at: std::time::Instant::now(),
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.command
+            .len()
+            .saturating_add(self.stdout.len())
+            .saturating_add(self.stderr.len())
+    }
+
+    fn snapshot(&self, id: &str) -> Value {
+        json!({
+            "task_id": id,
+            "command": self.command,
+            "status": self.status.as_str(),
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "stdout_truncated": self.stdout_truncated,
+            "stderr_truncated": self.stderr_truncated,
+        })
+    }
+
+    fn summary(&self, id: &str) -> Value {
+        json!({
+            "task_id": id,
+            "command": self.command,
+            "status": self.status.as_str(),
+            "exit_code": self.exit_code,
+        })
+    }
+}
+
+fn bounded_task_command(command: &str) -> String {
+    if command.len() <= MAX_TASK_COMMAND_BYTES {
+        return command.to_owned();
+    }
+    let mut end = MAX_TASK_COMMAND_BYTES;
+    while !command.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}[…truncated…]", &command[..end])
+}
+
+impl Default for TaskTable {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(TaskTableState::default()),
+            seq: std::sync::atomic::AtomicU64::new(0),
+            limits: TaskLimits::default(),
+        }
+    }
+}
+
 impl TaskTable {
-    fn register(&self, command: String, proc: sandbox::exec::BgProc) -> String {
+    #[cfg(test)]
+    fn with_limits(limits: TaskLimits) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(TaskTableState::default()),
+            seq: std::sync::atomic::AtomicU64::new(0),
+            limits,
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, command: &str) -> Result<TaskReservation, String> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_recent_locked(&mut state, std::time::Instant::now());
+        let active = state.reservations.len().saturating_add(state.active.len());
+        if active >= self.limits.max_active {
+            return Err(format!(
+                "shell task limit reached ({}/{} active); wait for a running command or stop it \
+                 with task.kill",
+                active, self.limits.max_active
+            ));
+        }
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let id = format!("t{n}");
-        if let Ok(mut m) = self.inner.lock() {
-            m.insert(id.clone(), TaskEntry { proc, command });
-        }
-        id
+        state
+            .reservations
+            .insert(id.clone(), bounded_task_command(command));
+        drop(state);
+        Ok(TaskReservation {
+            tasks: self.clone(),
+            id: Some(id),
+        })
     }
+
+    fn attach(&self, id: &str, proc: sandbox::exec::BgProc) -> Result<(), sandbox::exec::BgProc> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(command) = state.reservations.remove(id) else {
+            return Err(proc);
+        };
+        state
+            .active
+            .insert(id.to_owned(), TaskEntry { proc, command });
+        Ok(())
+    }
+
+    fn release_reservation(&self, id: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reservations
+            .remove(id);
+    }
+
+    fn prune_recent_locked(&self, state: &mut TaskTableState, now: std::time::Instant) {
+        let expired: Vec<String> = state
+            .recent
+            .iter()
+            .filter(|(_, task)| {
+                now.saturating_duration_since(task.finished_at) >= self.limits.recent_ttl
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &expired {
+            if let Some(task) = state.recent.remove(id) {
+                state.recent_bytes = state.recent_bytes.saturating_sub(task.retained_bytes());
+            }
+        }
+        state
+            .recent_lru
+            .retain(|id| !expired.iter().any(|expired| expired == id));
+    }
+
+    fn evict_recent_locked(&self, state: &mut TaskTableState) {
+        while state.recent.len() > self.limits.max_recent
+            || state.recent_bytes > self.limits.max_recent_bytes
+        {
+            let Some(id) = state.recent_lru.pop_front() else {
+                break;
+            };
+            if let Some(task) = state.recent.remove(&id) {
+                state.recent_bytes = state.recent_bytes.saturating_sub(task.retained_bytes());
+            }
+        }
+    }
+
+    fn remember(&self, id: String, task: CompletedTask) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_recent_locked(&mut state, std::time::Instant::now());
+        if self.limits.max_recent == 0 || task.retained_bytes() > self.limits.max_recent_bytes {
+            return;
+        }
+        if let Some(previous) = state.recent.insert(id.clone(), task) {
+            state.recent_bytes = state.recent_bytes.saturating_sub(previous.retained_bytes());
+            state.recent_lru.retain(|candidate| candidate != &id);
+        }
+        state.recent_bytes = state.recent_bytes.saturating_add(
+            state
+                .recent
+                .get(&id)
+                .map(CompletedTask::retained_bytes)
+                .unwrap_or_default(),
+        );
+        state.recent_lru.push_back(id);
+        self.evict_recent_locked(&mut state);
+    }
+
     /// A JSON snapshot of one task (status + current output), or `None` if the id
     /// is unknown.
     fn snapshot(&self, id: &str) -> Option<Value> {
-        let m = self.inner.lock().ok()?;
-        let t = m.get(id)?;
-        let (stdout, stderr) = t.proc.snapshot();
-        let running = t.proc.is_running();
-        Some(json!({
-            "task_id": id,
-            "command": t.command,
-            "status": if running { "running" } else { "exited" },
-            "exit_code": t.proc.exit_code(),
-            "stdout": stdout,
-            "stderr": stderr,
-        }))
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_recent_locked(&mut state, std::time::Instant::now());
+        if let Some(task) = state.active.get(id) {
+            let (stdout, stderr) = task.proc.snapshot();
+            let (stdout_truncated, stderr_truncated) = task.proc.truncation();
+            let running = task.proc.is_running();
+            return Some(json!({
+                "task_id": id,
+                "command": task.command,
+                "status": if running { "running" } else { "exited" },
+                "exit_code": task.proc.exit_code(),
+                "stdout": stdout,
+                "stderr": stderr,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            }));
+        }
+        let snapshot = state.recent.get(id)?.snapshot(id);
+        state.recent_lru.retain(|candidate| candidate != id);
+        state.recent_lru.push_back(id.to_owned());
+        Some(snapshot)
     }
+
     /// Kill a task's process group; returns false if the id is unknown.
     fn kill(&self, id: &str) -> bool {
-        let Ok(m) = self.inner.lock() else {
-            return false;
-        };
-        match m.get(id) {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.active.get(id) {
             Some(t) => {
                 t.proc.kill();
                 true
@@ -4026,12 +4586,23 @@ impl TaskTable {
             None => false,
         }
     }
+
+    fn is_active(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .contains_key(id)
+    }
     /// One-line summaries of every task (for `task.list` / status).
     fn list(&self) -> Vec<Value> {
-        let Ok(m) = self.inner.lock() else {
-            return Vec::new();
-        };
-        let mut out: Vec<Value> = m
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_recent_locked(&mut state, std::time::Instant::now());
+        let mut out: Vec<Value> = state
+            .active
             .iter()
             .map(|(id, t)| {
                 json!({
@@ -4042,6 +4613,7 @@ impl TaskTable {
                 })
             })
             .collect();
+        out.extend(state.recent.iter().map(|(id, task)| task.summary(id)));
         out.sort_by(|a, b| a["task_id"].as_str().cmp(&b["task_id"].as_str()));
         out
     }
@@ -4050,10 +4622,11 @@ impl TaskTable {
     /// finished in time. Unknown id → false.
     async fn wait_until(&self, id: &str, dur: std::time::Duration) -> bool {
         let rx = {
-            let Ok(m) = self.inner.lock() else {
-                return false;
-            };
-            match m.get(id) {
+            let state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.active.get(id) {
                 Some(t) => t.proc.done_receiver(),
                 None => return false,
             }
@@ -4061,30 +4634,52 @@ impl TaskTable {
         sandbox::exec::wait_done(rx, dur).await
     }
 
-    /// Remove a finished task and return its `(exit_code, stdout, stderr)` — used
-    /// when a promoted command actually completed inside the foreground window,
-    /// so it doesn't linger in the table.
-    fn take_finished(&self, id: &str) -> Option<(Option<i32>, String, String)> {
-        let mut m = self.inner.lock().ok()?;
-        let entry = m.remove(id)?;
-        let (o, e) = entry.proc.snapshot();
-        Some((entry.proc.exit_code(), o, e))
+    /// Transfer ownership out without holding the table lock across a wait.
+    fn take(&self, id: &str) -> Option<TaskEntry> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .remove(id)
     }
 
-    /// `(pid, stdout_so_far, stderr_so_far)` for a still-running task.
-    fn running_view(&self, id: &str) -> Option<(Option<u32>, String, String)> {
-        let m = self.inner.lock().ok()?;
-        let t = m.get(id)?;
-        let (o, e) = t.proc.snapshot();
-        Some((t.proc.pid, o, e))
+    /// Cancellation-safe synchronous cleanup. Sending SIGKILL happens before
+    /// the execution future returns from `Drop`, and therefore before the
+    /// kernel can release its mutation lease.
+    fn cancel_and_remove(&self, id: &str) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.reservations.remove(id);
+        if let Some(entry) = state.active.get(id) {
+            entry.proc.kill();
+        }
+        state.active.remove(id);
+    }
+
+    fn remove_recent(&self, id: &str) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_recent_locked(&mut state, std::time::Instant::now());
+        let Some(task) = state.recent.remove(id) else {
+            return false;
+        };
+        state.recent_bytes = state.recent_bytes.saturating_sub(task.retained_bytes());
+        state.recent_lru.retain(|candidate| candidate != id);
+        true
     }
 
     /// Structured task list for surfaces (the TUI status line / `/tasks`).
     fn info(&self) -> Vec<kernel::BackgroundTask> {
-        let Ok(m) = self.inner.lock() else {
-            return Vec::new();
-        };
-        let mut out: Vec<kernel::BackgroundTask> = m
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out: Vec<kernel::BackgroundTask> = state
+            .active
             .iter()
             .map(|(id, t)| kernel::BackgroundTask {
                 id: id.clone(),
@@ -4099,15 +4694,80 @@ impl TaskTable {
     /// Kill every still-running task — called at session end so nothing is left
     /// running detached.
     fn kill_all(&self) {
-        if let Ok(m) = self.inner.lock() {
-            for t in m.values() {
-                if t.proc.is_running() {
-                    t.proc.kill();
-                }
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for t in state.active.values() {
+            if t.proc.is_running() {
+                t.proc.kill();
             }
         }
     }
 }
+
+/// Reserves one admission slot before process creation. Dropping a failed
+/// spawn or panicked call releases the slot without leaving table metadata.
+struct TaskReservation {
+    tasks: Arc<TaskTable>,
+    id: Option<String>,
+}
+
+impl TaskReservation {
+    fn attach(
+        mut self,
+        proc: sandbox::exec::BgProc,
+    ) -> Result<RegisteredTask, sandbox::exec::BgProc> {
+        let id = self.id.take().expect("task reservation still owned");
+        self.tasks.attach(&id, proc)?;
+        Ok(RegisteredTask::new(self.tasks.clone(), id))
+    }
+}
+
+impl Drop for TaskReservation {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.tasks.release_reservation(&id);
+        }
+    }
+}
+
+/// Owns one table registration across every await in `shell.exec`.
+///
+/// Normal completion transfers the entry out. Cancellation drops this guard,
+/// which synchronously kills and unregisters the task before control returns to
+/// the kernel and its durable mutation lease can be released.
+struct RegisteredTask {
+    tasks: Arc<TaskTable>,
+    id: Option<String>,
+}
+
+impl RegisteredTask {
+    fn new(tasks: Arc<TaskTable>, id: String) -> Self {
+        Self {
+            tasks,
+            id: Some(id),
+        }
+    }
+
+    fn id(&self) -> &str {
+        self.id.as_deref().expect("registered task still owned")
+    }
+
+    fn take(&mut self) -> Option<(String, TaskEntry)> {
+        let id = self.id.take()?;
+        self.tasks.take(&id).map(|entry| (id, entry))
+    }
+}
+
+impl Drop for RegisteredTask {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.tasks.cancel_and_remove(&id);
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for ShellExec {
     fn name(&self) -> &str {
@@ -4119,7 +4779,9 @@ impl Tool for ShellExec {
     fn description(&self) -> &str {
         "Run any shell command in the workspace root and capture stdout/stderr/exit \
          code — sed, awk, cat, diff, git, curl, build/test commands, pipelines, \
-         anything the shell provides. Prefer fs.edit for exact string-replace edits \
+         anything the shell provides. Commands run only in the foreground; on \
+         timeout or cancellation MEDHA kills and settles the whole process tree \
+         before reporting the result. Prefer fs.edit for exact string-replace edits \
          (it produces a reviewable diff) and glob/grep for finding files — use this \
          for everything else, including multi-step shell pipelines."
     }
@@ -4129,10 +4791,8 @@ impl Tool for ShellExec {
         BlastRadius::IrreversibleLocal
     }
     fn timeout(&self) -> Option<std::time::Duration> {
-        // Self-managed: `execute` runs the command in the foreground only up to
-        // `promote_after` (default 50s, or the caller's `timeout_s`), then
-        // promotes it to a background task — so the call always returns promptly
-        // and never needs the registry's wall-clock kill. `None` = no outer cap.
+        // Self-managed: `execute` owns a bounded foreground wait and does not
+        // return from its timeout path until the killed process has settled.
         None
     }
     fn schema(&self) -> Value {
@@ -4140,70 +4800,95 @@ impl Tool for ShellExec {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Command line to run via the shell" },
-                "background": { "type": "boolean", "description": "Start detached immediately and return a task_id (for servers/watchers). Poll with task.output, stop with task.kill." },
-                "timeout_s": { "type": "integer", "description": "Seconds to wait before promoting a slow command to a background task (default 50)." }
+                "timeout_s": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": SHELL_TIMEOUT_MAX_SECS,
+                    "description": "Hard foreground deadline in seconds (default 50, maximum 600). Expiry kills the whole process tree and returns an error."
+                }
             },
             "required": ["command"]
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let command = arg_str(args, "command")?;
-        let background = args
-            .get("background")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let promote_after = std::time::Duration::from_secs(
-            args.get("timeout_s")
-                .and_then(Value::as_u64)
-                .unwrap_or(PROMOTE_AFTER_SECS),
-        );
+        if args.get("background").and_then(Value::as_bool) == Some(true) {
+            return Err(ToolError::Args(
+                "background shell execution is disabled: run a bounded foreground command".into(),
+            ));
+        }
+        let timeout_s = match args.get("timeout_s") {
+            None => SHELL_TIMEOUT_SECS,
+            Some(value) => value.as_u64().ok_or_else(|| {
+                ToolError::Args("timeout_s must be an integer from 1 to 600".into())
+            })?,
+        };
+        if !(1..=SHELL_TIMEOUT_MAX_SECS).contains(&timeout_s) {
+            return Err(ToolError::Args(
+                "timeout_s must be an integer from 1 to 600".into(),
+            ));
+        }
+        let deadline = std::time::Duration::from_secs(timeout_s);
+        // Reserve capacity before process creation. The reservation is
+        // synchronous and RAII-owned, so rejection, spawn failure, panic, or
+        // cancellation cannot leak a slot or briefly exceed the process cap.
+        let reservation = self.tasks.reserve(&command).map_err(ToolError::Failed)?;
         // Spawn through the sandbox's execution backend (host or OS-native jail),
-        // rooted at the workspace, as a background task from the start. `clear_env`
+        // rooted at the workspace, as an owned task. `clear_env`
         // + the allowlist keep injected API keys out of the child so a command
         // can't exfiltrate them via `printenv`. The process is its own group
-        // leader, so `task.kill` (or session-end cleanup) tears down the whole
-        // tree — no orphans.
+        // leader, so timeout, cancellation, or `task.kill` tears down the whole
+        // tree.
         let bg = self
             .sbx
             .shell_background(&command, shell_env(), true)
             .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-        // Register in the table BEFORE waiting. If the caller cancels (Esc) during
-        // the foreground window, this future is dropped mid-wait — and because the
-        // task is already tracked, it stays pollable/listable and is reaped by the
-        // table's session-end `kill_all`, instead of leaking an untracked process
-        // group (the timeout path was fixed by GroupReaper; this closes the cancel
-        // path).
-        let task_id = self.tasks.register(command.clone(), bg);
-
-        // Foreground window (skipped for explicit background): if it finishes in
-        // time, unregister and return the full output like an ordinary command.
-        if !background && self.tasks.wait_until(&task_id, promote_after).await {
-            if let Some((exit_code, stdout, stderr)) = self.tasks.take_finished(&task_id) {
-                return Ok(json!({
-                    "command": command,
-                    "exit_code": exit_code,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                }));
-            }
+        let mut registered = reservation.attach(bg).map_err(|proc| {
+            proc.kill();
+            ToolError::Failed("shell task reservation was lost before registration".into())
+        })?;
+        // Install the Drop guard before the first await. A dropped execute future
+        // synchronously signals the registered process group before the kernel
+        // can release its mutation lease.
+        if self.tasks.wait_until(registered.id(), deadline).await {
+            let (task_id, entry) = registered
+                .take()
+                .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
+            let completed = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
+            let result = json!({
+                "command": command,
+                "exit_code": completed.exit_code,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "stdout_truncated": completed.stdout_truncated,
+                "stderr_truncated": completed.stderr_truncated,
+            });
+            self.tasks.remember(task_id, completed);
+            return Ok(result);
         }
 
-        // Still running past the deadline (or explicitly backgrounded): leave it
-        // tracked and hand back the task id + partial output.
-        let (pid, stdout, stderr) =
-            self.tasks
-                .running_view(&task_id)
-                .unwrap_or((None, String::new(), String::new()));
-        Ok(json!({
+        // Deadline: transfer ownership, kill the whole tree, and wait for the
+        // child waiter to settle before returning. The durable mutation lease
+        // remains held throughout this path.
+        let (task_id, entry) = registered
+            .take()
+            .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
+        entry.proc.kill();
+        entry.proc.wait().await;
+        let completed = CompletedTask::capture(entry, TerminalTaskStatus::TimedOut);
+        let error = ToolError::Structured(json!({
+            "error": format!("shell command timed out after {timeout_s}s; process tree was stopped"),
             "command": command,
-            "status": "running",
-            "task_id": task_id,
-            "pid": pid,
-            "stdout_so_far": stdout,
-            "stderr_so_far": stderr,
-            "hint": "still running — poll with task.output {task_id}, stop with task.kill {task_id}",
-        }))
+            "timed_out": true,
+            "exit_code": completed.exit_code,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "stdout_truncated": completed.stdout_truncated,
+            "stderr_truncated": completed.stderr_truncated,
+        }));
+        self.tasks.remember(task_id, completed);
+        Err(error)
     }
 
     async fn preview(&self, args: &Value) -> Option<String> {
@@ -4213,10 +4898,10 @@ impl Tool for ShellExec {
     }
 }
 
-// ── background tasks: task.output / task.kill / task.list ────────────────────
+// ── live owned tasks: task.output / task.kill / task.list ────────────────────
 
 /// Kill every still-running task when the table (and thus the session's tool
-/// registry) is dropped — no detached command outlives the session.
+/// registry) is dropped.
 impl Drop for TaskTable {
     fn drop(&mut self) {
         self.kill_all();
@@ -4236,10 +4921,9 @@ impl Tool for TaskOutput {
         ToolCategory::Shell
     }
     fn description(&self) -> &str {
-        "Check a background shell task — one that a slow `shell.exec` was promoted \
-         into, or that you started with `background: true`. Returns its current \
-         stdout/stderr, whether it's still running, and the exit code once it \
-         finishes. Omit `task_id` to list every task."
+        "Inspect a running foreground shell task or a recent bounded terminal \
+         result. Returns current stdout/stderr and status. Omit `task_id` to list \
+         running and retained recent tasks."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -4247,7 +4931,7 @@ impl Tool for TaskOutput {
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "task_id": { "type": "string", "description": "Task id from shell.exec (omit to list all tasks)" } }
+            "properties": { "task_id": { "type": "string", "description": "Task id from task.list (omit to list all tasks)" } }
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
@@ -4274,12 +4958,18 @@ impl Tool for TaskKill {
         ToolCategory::Shell
     }
     fn description(&self) -> &str {
-        "Stop a background shell task — SIGKILLs its whole process group (so any \
-         child processes, e.g. a dev server's workers, die too)."
+        "Stop a foreground shell task owned by a concurrent MEDHA session — \
+         SIGKILLs its whole process group."
     }
     fn blast_radius(&self) -> BlastRadius {
         // A local, expected action on a task this agent started — no approval nag.
         BlastRadius::ReversibleLocal
+    }
+    fn mutation_key(&self, _args: &Value) -> Option<String> {
+        // A shell task holds the mutation lane until it settles. Requiring that
+        // same lane before task.kill could run would make the only escape path
+        // wait behind the process it is supposed to stop.
+        None
     }
     fn schema(&self) -> Value {
         json!({
@@ -4298,6 +4988,49 @@ impl Tool for TaskKill {
     }
 }
 
+struct TaskRemove {
+    tasks: Arc<TaskTable>,
+}
+
+#[async_trait]
+impl Tool for TaskRemove {
+    fn name(&self) -> &str {
+        "task.remove"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Shell
+    }
+    fn description(&self) -> &str {
+        "Remove a completed shell task and its retained output from MEDHA's bounded \
+         recent-result cache. A running task must be stopped with task.kill first."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::ReversibleLocal
+    }
+    fn mutation_key(&self, _args: &Value) -> Option<String> {
+        None
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "task_id": { "type": "string", "description": "Completed task id to forget" } },
+            "required": ["task_id"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let id = arg_str(args, "task_id")?;
+        if self.tasks.remove_recent(&id) {
+            Ok(json!({ "task_id": id, "removed": true }))
+        } else if self.tasks.is_active(&id) {
+            Err(ToolError::Failed(format!(
+                "task '{id}' is still running; stop it with task.kill before removing it"
+            )))
+        } else {
+            Err(ToolError::Failed(format!("no such completed task '{id}'")))
+        }
+    }
+}
+
 struct TaskList {
     tasks: Arc<TaskTable>,
 }
@@ -4311,7 +5044,7 @@ impl Tool for TaskList {
         ToolCategory::Shell
     }
     fn description(&self) -> &str {
-        "List all background shell tasks with their status and exit codes."
+        "List running foreground shell tasks and bounded recent terminal results."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -4466,20 +5199,32 @@ impl Tool for MultiEdit {
         if edits.is_empty() {
             return Err(ToolError::Args("'edits' is empty".into()));
         }
-        // Serialize same-file edits within a turn (P0-4).
-        let _guard = self.sbx.path_guard(&path).await;
-        let content = self
+        // Resolve/authorise first, then serialize on the canonical physical
+        // target so raw aliases converge on one read-modify-write lane.
+        let guard = self
             .sbx
-            .read(&path)
+            .path_guard(&path)
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let inspection = self
+            .sbx
+            .inspect_guarded(&guard)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let content = String::from_utf8(
+            inspection
+                .bytes
+                .clone()
+                .ok_or_else(|| ToolError::Failed(format!("{path} does not exist")))?,
+        )
+        .map_err(|_| ToolError::Failed(format!("{path} is not valid UTF-8")))?;
         // Refuse if the file changed since the approved preview (P1-1).
-        self.pins.check(args, &path, &content)?;
+        self.pins.check(args, &path, &inspection.state)?;
         let updated = apply_edits(&content, edits)?;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
         let snapshot = self
             .sbx
-            .write(&path, &updated)
+            .write_guarded_checked(&guard, &updated, Some(&inspection.state))
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?;
         let diff = make_diff(&path, &content, &updated);
@@ -4510,9 +5255,10 @@ impl Tool for MultiEdit {
         let path = args.get("path")?.as_str()?;
         let edits = args.get("edits")?.as_array()?;
         // Never prompts — see `fs.edit`'s preview.
-        let content = self.sbx.read_if_permitted(path).await?;
+        let inspection = self.sbx.inspect_if_permitted(path).await.ok()??;
         // Pin what the approval card will show (P1-1).
-        self.pins.pin(args, &content);
+        self.pins.pin(args, &inspection.state);
+        let content = String::from_utf8(inspection.bytes.unwrap_or_default()).ok()?;
         match apply_edits(&content, edits) {
             Ok(updated) => Some(cap_preview(&make_diff(path, &content, &updated))),
             Err(e) => Some(format!("({e} — this multi_edit would fail)")),
@@ -4654,8 +5400,10 @@ impl Tool for Git {
             "subcommand": sub,
             "exit_code": output.status,
             "stdout": capped,
-            "truncated": total_lines > 400,
+            "truncated": output.stdout_truncated || total_lines > 400,
+            "stdout_truncated": output.stdout_truncated,
             "stderr": String::from_utf8_lossy(&output.stderr),
+            "stderr_truncated": output.stderr_truncated,
         }))
     }
 
@@ -5188,6 +5936,12 @@ impl Tool for Diagnostics {
             };
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.stdout_truncated || output.stderr_truncated {
+                notes.push(format!(
+                    "{} output exceeded the capture limit (stdout truncated: {}, stderr truncated: {}); diagnostics are a bounded tail",
+                    c.label, output.stdout_truncated, output.stderr_truncated
+                ));
+            }
             let mut found = (c.parse)(&stdout, &stderr);
             // A non-zero exit with nothing parsed usually means the checker itself
             // failed (bad config, a missing sub-tool via npx) — surface stderr
@@ -5407,14 +6161,109 @@ mod tests {
             "file:///etc/passwd",       // disallowed scheme
         ] {
             let u = reqwest::Url::parse(bad).unwrap();
-            assert!(validate_public_url(&u).is_err(), "should block {bad}");
+            assert!(
+                resolve_public_url_with(&u, |_, _| panic!("IP literals must not resolve")).is_err(),
+                "should block {bad}"
+            );
         }
         // A public IP literal passes the guard.
         let ok = reqwest::Url::parse("http://1.1.1.1/").unwrap();
         assert!(
-            validate_public_url(&ok).is_ok(),
+            resolve_public_url_with(&ok, |_, _| panic!("IP literals must not resolve")).is_ok(),
             "public address should pass"
         );
+    }
+
+    #[test]
+    fn ssrf_resolution_rejects_rebinding_mixed_answers_and_metadata() {
+        let url = reqwest::Url::parse("https://attacker.example/path").unwrap();
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let private: SocketAddr = "10.0.0.7:443".parse().unwrap();
+        let loopback_v6: SocketAddr = "[::1]:443".parse().unwrap();
+        let nat64_metadata: SocketAddr = "[64:ff9b::a9fe:a9fe]:443".parse().unwrap();
+        let six_to_four_loopback: SocketAddr = "[2002:7f00:1::]:443".parse().unwrap();
+        let metadata: SocketAddr = "169.254.169.254:443".parse().unwrap();
+
+        for answers in [
+            vec![public, private],
+            vec![public, loopback_v6],
+            vec![public, nat64_metadata],
+            vec![six_to_four_loopback],
+            vec![metadata],
+        ] {
+            assert!(
+                resolve_public_url_with(&url, |_, _| Ok(answers.clone())).is_err(),
+                "every answer set containing a non-public address must fail"
+            );
+        }
+
+        // A rebinding resolver would return public during validation and private
+        // during reqwest's lookup. Resolution now happens exactly once and that
+        // result is retained for ClientBuilder::resolve_to_addrs.
+        let calls = std::cell::Cell::new(0usize);
+        let target = resolve_public_url_with(&url, |_, _| {
+            let call = calls.get();
+            calls.set(call + 1);
+            Ok(if call == 0 {
+                vec![public]
+            } else {
+                vec![private]
+            })
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(target.addrs, vec![public]);
+        fetch_client(&target).expect("a pinned client can be constructed");
+        assert_eq!(
+            calls.get(),
+            1,
+            "building the client must not invoke the validating resolver again"
+        );
+
+        let public_v6: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        let v6_target =
+            resolve_public_url_with(&url, |_, _| Ok(vec![public_v6])).expect("public IPv6");
+        assert_eq!(v6_target.addrs, vec![public_v6]);
+    }
+
+    #[test]
+    fn ssrf_redirect_hops_are_independently_resolved_and_pinned() {
+        let first = reqwest::Url::parse("https://public.example/start").unwrap();
+        let next = first.join("https://redirect.example/final").unwrap();
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let rebound: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let mut resolver = |host: &str, _port: u16| {
+            calls.borrow_mut().push(host.to_string());
+            if host == "public.example" {
+                Ok(vec![public])
+            } else {
+                Ok(vec![rebound])
+            }
+        };
+        let first_target = resolve_public_url_with(&first, &mut resolver).unwrap();
+        assert_eq!(first_target.addrs, vec![public]);
+        assert!(
+            resolve_public_url_with(&next, &mut resolver).is_err(),
+            "redirect target resolving to loopback must be blocked"
+        );
+        assert_eq!(
+            calls.into_inner(),
+            vec!["public.example", "redirect.example"]
+        );
+    }
+
+    #[test]
+    fn ssrf_connected_peer_must_match_the_pinned_public_socket() {
+        let target = PublicTarget {
+            host: "public.example".into(),
+            addrs: vec!["93.184.216.34:443".parse().unwrap()],
+        };
+        assert!(validate_connected_peer(Some(target.addrs[0]), &target).is_ok());
+        assert!(validate_connected_peer(Some("127.0.0.1:443".parse().unwrap()), &target).is_err());
+        assert!(validate_connected_peer(Some("1.1.1.1:443".parse().unwrap()), &target).is_err());
+        assert!(validate_connected_peer(None, &target).is_err());
     }
 
     #[tokio::test]
@@ -5537,11 +6386,14 @@ mod tests {
     }
 
     /// End-to-end proof that `shell.exec`, routed through a native-backed
-    /// workspace, is actually confined: an in-workspace write succeeds, a write
-    /// to $HOME is blocked by the OS jail.
+    /// workspace, is actually confined: an in-workspace write succeeds, HOME is
+    /// remapped, and an absolute write to the host HOME is blocked.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn shell_exec_is_jailed_under_native_backend() {
+        if !sandbox::native_sandbox_supported() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("medha-shelljail-{}", ulid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let backend = sandbox::select_backend(
@@ -5551,6 +6403,7 @@ mod tests {
                 ..Default::default()
             },
             vec![],
+            sandbox::ApprovedRoots::default(),
         );
         let sbx = Arc::new(
             WorkspaceSandbox::new_jailed(&dir)
@@ -5574,23 +6427,22 @@ mod tests {
         assert!(dir.join("inside.txt").exists());
 
         let marker = format!(".medha-shelljail-escape-{}", ulid_like());
+        let home = std::env::var("HOME").unwrap();
+        let host_marker = std::path::Path::new(&home).join(&marker);
+        let escaped_path = host_marker.to_string_lossy().replace('"', "\\\"");
         let outside = reg
             .execute(&ToolIntent {
                 id: "2".into(),
                 tool: "shell.exec".into(),
-                args: json!({ "command": format!("touch \"$HOME/{marker}\"") }),
+                args: json!({ "command": format!("touch \"{escaped_path}\"") }),
             })
             .await;
         assert_ne!(
             outside.payload["exit_code"].as_i64(),
             Some(0),
-            "shell write to HOME must be blocked"
+            "shell write to the host HOME must be blocked"
         );
-        let home = std::env::var("HOME").unwrap();
-        assert!(
-            !std::path::Path::new(&home).join(&marker).exists(),
-            "escape file must not exist"
-        );
+        assert!(!host_marker.exists(), "escape file must not exist");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5753,13 +6605,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fs_read_refuses_whole_read_of_a_huge_file_but_allows_ranges() {
+    async fn read_artifact_caps_omitted_and_oversized_page_lengths() {
+        let store = mem_artifacts();
+        let bytes = vec![b'x'; store::MAX_ARTIFACT_READ_BYTES + 17];
+        let hash = store.put(&bytes).unwrap();
+        let tool = ReadArtifact {
+            store: store.clone(),
+        };
+
+        for args in [
+            json!({ "hash": hash }),
+            json!({ "hash": hash, "length": u64::MAX }),
+        ] {
+            let page = tool.execute(&args).await.unwrap();
+            assert_eq!(
+                page["length"],
+                store::MAX_ARTIFACT_READ_BYTES,
+                "every tool page must stay within the hard allocation ceiling"
+            );
+            assert_eq!(
+                page["content"].as_str().unwrap().len(),
+                store::MAX_ARTIFACT_READ_BYTES
+            );
+            assert_eq!(
+                page["next_offset"],
+                store::MAX_ARTIFACT_READ_BYTES,
+                "the caller can continue without losing bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_read_streams_a_tiny_range_from_a_sparse_multigigabyte_file() {
         let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
-        // 3MB file, over the 2MB whole-read cap.
-        std::fs::write(dir.join("big.txt"), "line\n".repeat(600_000)).unwrap();
+        let path = dir.join("big.txt");
+        std::fs::write(&path, "line\n".repeat(20)).unwrap();
+        // A sparse 5 GiB tail makes this an actual multi-gigabyte input without
+        // consuming disk space. The range reader must stop after three lines;
+        // loading the file first would attempt a multi-gigabyte allocation.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(5 * 1024 * 1024 * 1024)
+            .unwrap();
 
         let whole = reg
             .execute(&ToolIntent {
@@ -5790,6 +6682,10 @@ mod tests {
             kernel::ObsStatus::Ok,
             "ranged read still works"
         );
+        assert_eq!(ranged.payload["content"], "line\n".repeat(3));
+        assert_eq!(ranged.payload["bytes_scanned"], 15);
+        assert_eq!(ranged.payload["has_more"], true);
+        assert_eq!(ranged.payload["total_lines"], Value::Null);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6141,6 +7037,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fs_write_rejects_every_intervening_preview_state_change() {
+        let dir = std::env::temp_dir().join(format!("medha-write-pin-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+
+        let attempt = |id: &str, path: &str, content: &str| ToolIntent {
+            id: id.into(),
+            tool: "fs.write".into(),
+            args: json!({ "path": path, "content": content }),
+        };
+
+        // Content edit.
+        std::fs::write(dir.join("content.txt"), "previewed").unwrap();
+        let intent = attempt("content", "content.txt", "approved");
+        reg.preview(&intent).await.expect("write preview");
+        std::fs::write(dir.join("content.txt"), "changed").unwrap();
+        assert_eq!(reg.execute(&intent).await.status, kernel::ObsStatus::Error);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("content.txt")).unwrap(),
+            "changed"
+        );
+
+        // Deletion.
+        std::fs::write(dir.join("deleted.txt"), "previewed").unwrap();
+        let intent = attempt("delete", "deleted.txt", "approved");
+        reg.preview(&intent).await.expect("write preview");
+        std::fs::remove_file(dir.join("deleted.txt")).unwrap();
+        assert_eq!(reg.execute(&intent).await.status, kernel::ObsStatus::Error);
+        assert!(!dir.join("deleted.txt").exists());
+
+        // Same-content replacement: the digest is unchanged, so file identity
+        // must be part of the pin.
+        std::fs::write(dir.join("replaced.txt"), "same bytes").unwrap();
+        let intent = attempt("replace", "replaced.txt", "approved");
+        reg.preview(&intent).await.expect("write preview");
+        std::fs::write(dir.join("replacement.tmp"), "same bytes").unwrap();
+        std::fs::rename(dir.join("replacement.tmp"), dir.join("replaced.txt")).unwrap();
+        assert_eq!(reg.execute(&intent).await.status, kernel::ObsStatus::Error);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("replaced.txt")).unwrap(),
+            "same bytes"
+        );
+
+        // Creation after a new-file preview.
+        let intent = attempt("create", "created.txt", "approved");
+        reg.preview(&intent).await.expect("new-file preview");
+        std::fs::write(dir.join("created.txt"), "appeared").unwrap();
+        assert_eq!(reg.execute(&intent).await.status, kernel::ObsStatus::Error);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("created.txt")).unwrap(),
+            "appeared"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn word_count_counts_lines_words_chars() {
         let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6211,8 +7165,8 @@ mod tests {
         Arc::new(MemArtifacts::default())
     }
 
-    #[test]
-    fn truncated_lsp_results_spill_losslessly_to_artifacts() {
+    #[tokio::test]
+    async fn truncated_lsp_results_spill_losslessly_to_artifacts() {
         let artifacts = mem_artifacts();
         let location = |line| lsp::Location {
             path: std::path::PathBuf::from("src/lib.rs"),
@@ -6234,6 +7188,7 @@ mod tests {
             },
             &artifacts,
         )
+        .await
         .unwrap();
         let hash = value["artifact_hash"].as_str().expect("artifact hash");
         assert!(artifacts.size(hash).unwrap() > 0);
@@ -6491,108 +7446,278 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_background_promotes_and_is_pollable_and_killable() {
-        let dir = std::env::temp_dir().join(format!("medha-sh-bg-{}", ulid_like()));
+    async fn completed_shell_output_is_bounded_inspectable_and_explicitly_removable() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-recent-{}", ulid_like()));
         let reg = reg_in(&dir);
-        // background:true → returns a task id immediately, keeps running.
-        let started = run(
-            &reg,
-            "shell.exec",
-            json!({
-                "command": "sleep 30; echo done", "background": true
-            }),
-        )
-        .await;
-        assert_eq!(started.payload["status"], "running");
-        let id = started.payload["task_id"]
-            .as_str()
-            .expect("task id")
-            .to_string();
+        let obs = run(&reg, "shell.exec", json!({ "command": "printf recent" })).await;
+        assert_eq!(obs.status, kernel::ObsStatus::Ok);
 
-        // task.output reports it running.
-        let poll = run(&reg, "task.output", json!({ "task_id": id })).await;
-        assert_eq!(poll.payload["status"], "running", "{:?}", poll.payload);
-
-        // task.list shows it.
         let list = run(&reg, "task.list", json!({})).await;
+        let tasks = list.payload["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1, "{:?}", list.payload);
+        assert_eq!(tasks[0]["status"], "exited");
+        let id = tasks[0]["task_id"].as_str().unwrap();
+
+        let output = run(&reg, "task.output", json!({ "task_id": id })).await;
+        assert_eq!(output.status, kernel::ObsStatus::Ok);
+        assert_eq!(output.payload["stdout"], "recent");
+
+        let removed = run(&reg, "task.remove", json!({ "task_id": id })).await;
+        assert_eq!(removed.status, kernel::ObsStatus::Ok);
+        assert_eq!(removed.payload["removed"], true);
+        let missing = run(&reg, "task.output", json!({ "task_id": id })).await;
+        assert_eq!(missing.status, kernel::ObsStatus::Error);
         assert!(
-            list.payload["tasks"]
+            run(&reg, "task.list", json!({})).await.payload["tasks"]
                 .as_array()
                 .unwrap()
-                .iter()
-                .any(|t| t["task_id"] == id.as_str())
-        );
-
-        // The executor exposes it to surfaces (what the TUI status line polls).
-        {
-            use kernel::Executor;
-            let live = reg.background_tasks();
-            assert!(
-                live.iter().any(|t| t.id == id && t.running),
-                "executor should report the running task"
-            );
-        }
-
-        // task.kill stops it.
-        let killed = run(&reg, "task.kill", json!({ "task_id": id })).await;
-        assert_eq!(killed.payload["killed"], true);
-
-        // Give the reaper a moment; the task is no longer running.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let after = run(&reg, "task.output", json!({ "task_id": id })).await;
-        assert_eq!(
-            after.payload["status"], "exited",
-            "killed task should no longer run"
-        );
-
-        // Unknown task ids are errors, not silent success.
-        assert_eq!(
-            run(&reg, "task.kill", json!({ "task_id": "nope" }))
-                .await
-                .status,
-            kernel::ObsStatus::Error
+                .is_empty()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // (The wait-based promote path — `wait_until` timing out then registering —
-    // is the same registration code as the deterministic `background: true` case
-    // above; a real-clock variant flakes under heavy parallel test load, so it's
-    // intentionally not a separate test.)
+    #[test]
+    fn task_admission_and_recent_output_stay_bounded_under_fifty_thousand_results() {
+        let limits = TaskLimits {
+            max_active: 2,
+            max_recent: 32,
+            max_recent_bytes: 4096,
+            recent_ttl: std::time::Duration::from_secs(60),
+        };
+        let table = Arc::new(TaskTable::with_limits(limits));
+
+        let first = table
+            .reserve(&"x".repeat(MAX_TASK_COMMAND_BYTES * 2))
+            .unwrap();
+        let second = table.reserve("second").unwrap();
+        let full = table
+            .reserve("must-not-spawn")
+            .err()
+            .expect("third reservation exceeded the configured cap");
+        assert!(full.contains("2/2 active"), "{full}");
+        {
+            let state = table
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.reservations.len(), 2);
+            assert!(
+                state
+                    .reservations
+                    .values()
+                    .all(|command| command.len() <= MAX_TASK_COMMAND_BYTES + 32)
+            );
+        }
+        drop(first);
+        let replacement = table.reserve("replacement").unwrap();
+        drop(replacement);
+        drop(second);
+
+        for n in 0..50_000 {
+            table.remember(
+                format!("synthetic-{n}"),
+                CompletedTask {
+                    command: "true".into(),
+                    exit_code: Some(0),
+                    stdout: format!("{n:05}-{}", "o".repeat(120)),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    status: TerminalTaskStatus::Exited,
+                    finished_at: std::time::Instant::now(),
+                },
+            );
+        }
+
+        let state = table
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.reservations.is_empty());
+        assert!(state.active.is_empty());
+        assert!(state.recent.len() <= limits.max_recent);
+        assert!(state.recent_bytes <= limits.max_recent_bytes);
+        assert!(state.recent.contains_key("synthetic-49999"));
+        assert!(!state.recent.contains_key("synthetic-0"));
+    }
+
+    #[test]
+    fn expired_terminal_tasks_are_evicted_on_the_next_table_operation() {
+        let table = TaskTable::with_limits(TaskLimits {
+            max_active: 1,
+            max_recent: 4,
+            max_recent_bytes: 1024,
+            recent_ttl: std::time::Duration::from_secs(1),
+        });
+        table.remember(
+            "old".into(),
+            CompletedTask {
+                command: "true".into(),
+                exit_code: Some(0),
+                stdout: "old".into(),
+                stderr: String::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                status: TerminalTaskStatus::Exited,
+                finished_at: std::time::Instant::now() - std::time::Duration::from_secs(2),
+            },
+        );
+        assert!(table.list().is_empty());
+        let state = table
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.recent_bytes, 0);
+        assert!(state.recent_lru.is_empty());
+    }
 
     #[tokio::test]
-    async fn cancelling_shell_exec_mid_wait_still_tracks_the_task() {
-        // If the caller cancels (Esc) during the foreground window, the shell.exec
-        // future is dropped mid-wait. Because the task is registered BEFORE the
-        // wait, it must remain tracked (pollable/killable/reaped) — not leak an
-        // invisible process group.
+    async fn shell_background_request_is_rejected_before_spawn() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-bg-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        let marker = dir.join("must-not-exist");
+        let started = run(
+            &reg,
+            "shell.exec",
+            json!({
+                "command": format!("touch {}", marker.display()),
+                "background": true
+            }),
+        )
+        .await;
+        assert_eq!(started.status, kernel::ObsStatus::Error);
+        assert!(
+            started.payload.to_string().contains("background"),
+            "{:?}",
+            started.payload
+        );
+        assert!(
+            !marker.exists(),
+            "rejected background command still spawned"
+        );
+        let oversized = run(
+            &reg,
+            "shell.exec",
+            json!({
+                "command": format!("touch {}", marker.display()),
+                "timeout_s": SHELL_TIMEOUT_MAX_SECS + 1
+            }),
+        )
+        .await;
+        assert_eq!(oversized.status, kernel::ObsStatus::Error);
+        assert!(!marker.exists(), "invalid timeout still spawned a command");
+        let shell_spec = reg
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "shell.exec")
+            .unwrap();
+        assert!(shell_spec.schema["properties"].get("background").is_none());
+        assert_eq!(
+            shell_spec.schema["properties"]["timeout_s"]["maximum"],
+            SHELL_TIMEOUT_MAX_SECS
+        );
+        let list = run(&reg, "task.list", json!({})).await;
+        assert!(list.payload["tasks"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_kills_and_settles_the_whole_tree_before_error() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-timeout-{}", ulid_like()));
+        let marker = dir.join("survived");
+        let reg = reg_in(&dir);
+        let obs = run(
+            &reg,
+            "shell.exec",
+            json!({
+                "command": format!("(sleep 2; touch {}) & wait", marker.display()),
+                "timeout_s": 1
+            }),
+        )
+        .await;
+        assert_eq!(obs.status, kernel::ObsStatus::Error);
+        assert_eq!(obs.payload["timed_out"], true, "{:?}", obs.payload);
+        assert!(reg.background_tasks().is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(!marker.exists(), "timed-out process tree kept mutating");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_success_reaps_a_self_backgrounded_child_before_returning() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-daemon-{}", ulid_like()));
+        let marker = dir.join("survived");
+        let reg = reg_in(&dir);
+        let obs = run(
+            &reg,
+            "shell.exec",
+            json!({
+                "command": format!(
+                    "(sleep 1; touch {}) >/dev/null 2>&1 &",
+                    marker.display()
+                ),
+                "timeout_s": 5
+            }),
+        )
+        .await;
+        assert_eq!(obs.status, kernel::ObsStatus::Ok, "{:?}", obs.payload);
+        assert!(reg.background_tasks().is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            !marker.exists(),
+            "a self-backgrounded child mutated after shell.exec returned"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_shell_exec_kills_and_unregisters_the_task() {
         let dir = std::env::temp_dir().join(format!("medha-sh-cancel-{}", ulid_like()));
+        let marker = dir.join("survived");
         let reg = Arc::new(reg_in(&dir));
-        // Long foreground window so the call is definitely mid-wait when dropped.
         let fut = run(
             &reg,
             "shell.exec",
-            json!({ "command": "sleep 30", "timeout_s": 30 }),
+            json!({
+                "command": format!("(sleep 1; touch {}) & wait", marker.display()),
+                "timeout_s": 30
+            }),
         );
-        // Drop the future partway through the wait — this is what a cancel does.
+        // Timeout drops the tool future exactly as the kernel does after its
+        // cancellation settle window.
         let _ = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
-
-        // The task is still tracked (register-before-wait), not leaked.
         let list = run(&reg, "task.list", json!({})).await;
         let tasks = list.payload["tasks"].as_array().unwrap();
         assert_eq!(
             tasks.len(),
-            1,
-            "cancelled shell.exec must stay tracked: {:?}",
+            0,
+            "cancelled shell.exec must unregister its killed task: {:?}",
             list.payload
         );
-        let id = tasks[0]["task_id"].as_str().unwrap().to_string();
-        // And it's reapable via the table (also what session-end kill_all does).
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            !marker.exists(),
+            "dropped shell future left a mutating child"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn task_kill_does_not_wait_behind_the_task_mutation_lane() {
+        use kernel::Executor;
+        let dir = std::env::temp_dir().join(format!("medha-task-kill-lane-{}", ulid_like()));
+        let reg = reg_in(&dir);
         assert_eq!(
-            run(&reg, "task.kill", json!({ "task_id": id }))
-                .await
-                .payload["killed"],
-            true
+            reg.mutation_key(&ToolIntent {
+                id: "kill".into(),
+                tool: "task.kill".into(),
+                args: json!({ "task_id": "t1" }),
+            }),
+            None,
+            "task.kill must remain callable while shell.exec owns the mutation lease"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6603,7 +7728,7 @@ mod tests {
         let default = TOOL_TIMEOUT;
         // A quick local tool keeps the default 60s.
         assert_eq!(WordCount { sbx: mk_sbx() }.timeout(), Some(default));
-        // shell.exec self-manages (promotes to background) → no outer cap.
+        // shell.exec self-manages a bounded kill-and-settle deadline → no outer cap.
         assert_eq!(
             ShellExec {
                 sbx: mk_sbx(),
@@ -6654,11 +7779,12 @@ mod tests {
             )
             .await
         });
+        let absolute_alias = dir.join("f.txt").to_string_lossy().into_owned();
         let e2 = tokio::spawn(async move {
             run(
                 &b,
                 "fs.edit",
-                json!({ "path": "f.txt", "old_string": "beta", "new_string": "B" }),
+                json!({ "path": absolute_alias, "old_string": "beta", "new_string": "B" }),
             )
             .await
         });
@@ -7195,7 +8321,7 @@ mod tests {
         let sbx = Arc::new(
             WorkspaceSandbox::new(
                 &ws,
-                ws.join("medha.lock"),
+                outside.join("trust.lock"),
                 ws.join("audit.log"),
                 Some(Arc::new(CountingGate(asked.clone()))),
             )
@@ -7234,7 +8360,7 @@ mod tests {
         let sbx = Arc::new(
             WorkspaceSandbox::new(
                 &ws,
-                ws.join("medha.lock"),
+                outside.join("trust.lock"),
                 ws.join("audit.log"),
                 Some(Arc::new(CountingGate(asked.clone()))),
             )
@@ -7273,12 +8399,13 @@ mod tests {
         let ws = std::env::temp_dir().join(format!("medha-pv-in-{}", ulid_like()));
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("a.txt"), "hello\n").unwrap();
+        let trust = std::env::temp_dir().join(format!("medha-pv-trust-{}.lock", ulid_like()));
 
         let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sbx = Arc::new(
             WorkspaceSandbox::new(
                 &ws,
-                ws.join("medha.lock"),
+                trust,
                 ws.join("audit.log"),
                 Some(Arc::new(CountingGate(asked.clone()))),
             )

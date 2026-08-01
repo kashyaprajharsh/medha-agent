@@ -1,0 +1,65 @@
+# Dependency policy enforced by `.github/workflows/security.yml`.
+# Keep advisory exceptions empty unless an entry includes a concrete,
+# reviewed explanation and an expiry/removal condition.
+
+[advisories]
+# All four are `unmaintained` notices (no vulnerability, no exploit path) in
+# transitive dependencies of pinned, widely-used direct deps. Remove each
+# entry when the named parent ships a release that drops the crate.
+ignore = [
+    # bincode 1.x via syntect (syntax highlighting). Drop when syntect
+    # migrates off bincode 1.
+    "RUSTSEC-2025-0141",
+    # fxhash via scraper → selectors (HTML parsing for web tools). Drop when
+    # selectors replaces fxhash (already done upstream in newer selectors).
+    "RUSTSEC-2025-0057",
+    # ttf-parser via pdf-extract → lopdf (PDF text extraction). Drop when
+    # lopdf updates its font stack.
+    "RUSTSEC-2026-0192",
+    # yaml-rust via syntect. Drop when syntect moves to a maintained YAML
+    # parser.
+    "RUSTSEC-2024-0320",
+]
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    # Mozilla's CA root store shipped as data by webpki-roots. Permissive, no
+    # copyleft, and it covers data rather than code.
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

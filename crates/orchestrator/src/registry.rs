@@ -33,6 +33,11 @@ pub enum State {
     Settled(AgentStatus),
 }
 
+pub(crate) enum Followup {
+    Delivered(Agent),
+    Resume(Agent),
+}
+
 impl Agent {
     pub fn is_running(&self) -> bool {
         matches!(self.state, State::Running)
@@ -56,6 +61,11 @@ struct Tree {
     /// Names taken but not yet started. Held apart from `agents` so a listing
     /// never has to know about a half-built entry to skip it.
     reserved: HashSet<AgentPath>,
+    /// Path→session for agents whose full entry was evicted from `agents`
+    /// (AUD-066). Two strings per agent, so a nested parent can still resolve
+    /// its child's durable transcript id long after 32 newer agents settled,
+    /// without keeping live-agent state around. FIFO-capped.
+    archived: Vec<(AgentPath, String)>,
 }
 
 impl Tree {
@@ -71,9 +81,14 @@ pub struct AgentRegistry {
     max_settled: usize,
 }
 
-/// Settled agents kept addressable. A transcript stays readable past this; only
-/// the listing forgets.
+/// Settled agents kept addressable by path in the live roster. Their stable
+/// session ids continue to address durable transcripts after this cache evicts
+/// the full entry and after a process restart.
 const MAX_SETTLED: usize = 32;
+
+/// Evicted path→session pairs retained for transcript resolution. Far larger
+/// than `MAX_SETTLED` because an entry is two strings, not an agent.
+const MAX_ARCHIVED: usize = 4_096;
 
 impl AgentRegistry {
     pub fn new() -> Self {
@@ -160,8 +175,33 @@ impl AgentRegistry {
         tree.settled.push(path.clone());
         while tree.settled.len() > self.max_settled {
             let oldest = tree.settled.remove(0);
-            tree.agents.remove(&oldest);
+            if let Some(evicted) = tree.agents.remove(&oldest) {
+                tree.archived.retain(|(path, _)| path != &oldest);
+                tree.archived.push((oldest, evicted.session));
+                if tree.archived.len() > MAX_ARCHIVED {
+                    tree.archived.remove(0);
+                }
+            }
         }
+    }
+
+    /// Durable session id of an evicted agent, resolved with the same
+    /// containment as [`Coordinator::reach`]: `reference` resolves from
+    /// `from`, and only descendants strictly under `from` answer — an evicted
+    /// sibling's transcript stays as unreachable as a live one's.
+    pub fn archived_session(&self, from: &AgentPath, reference: &str) -> Option<String> {
+        let tree = self.lock();
+        if let Ok(path) = from.resolve(reference)
+            && path.under(from)
+            && &path != from
+            && let Some((_, session)) = tree.archived.iter().find(|(entry, _)| entry == &path)
+        {
+            return Some(session.clone());
+        }
+        tree.archived
+            .iter()
+            .find(|(path, session)| session == reference && path.under(from) && path != from)
+            .map(|(_, session)| session.clone())
     }
 
     pub fn running(&self) -> Vec<Agent> {
@@ -231,6 +271,23 @@ impl AgentRegistry {
 
     pub(crate) fn steer(&self, path: &AgentPath, text: &str) -> bool {
         self.steer_labelled(path, text, kernel::TrustLabel::User)
+    }
+
+    /// Atomically choose between delivering to a live run and resuming a
+    /// settled one. Splitting the state check from `steer` loses a follow-up
+    /// when settlement removes the live handle in between.
+    pub(crate) fn followup(&self, path: &AgentPath, text: &str) -> Option<Followup> {
+        let tree = self.lock();
+        let agent = tree.agents.get(path)?.clone();
+        match agent.state {
+            State::Settled(_) => Some(Followup::Resume(agent)),
+            State::Running => {
+                let live = tree.live.get(path)?;
+                live.steer
+                    .steer_labelled(text, kernel::TrustLabel::User)
+                    .then_some(Followup::Delivered(agent))
+            }
+        }
     }
 
     /// Queue text that did not come from the operator — a child's report above

@@ -13,15 +13,20 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use thiserror::Error;
 
-/// Permission type for trusted paths
+/// Legacy permission type accepted while parsing old `medha.lock` files.
+///
+/// Portable permission entries are never a source of runtime authority. The
+/// CLI only retains this shape so it can detect and warn about obsolete,
+/// repository-provided grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PermissionType {
     Read,
     Write,
 }
 
-/// A trusted path entry in medha.lock
+/// A legacy repository-provided permission entry. It is untrusted input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedPath {
     pub path: PathBuf,
@@ -50,7 +55,10 @@ mod serde_ts {
     }
 }
 
-/// Permissions configuration section in medha.lock
+/// Legacy `[permissions]` section in `medha.lock`.
+///
+/// These entries are parsed only so surfaces can warn that they were ignored.
+/// Explicit approvals are stored separately in machine-local `trust.lock`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PermissionsConfig {
     #[serde(default)]
@@ -334,12 +342,13 @@ impl Default for ContextFilesConfig {
 pub struct GateConfig {
     /// Where `medha gate` looks when handed a bare id or no path. Relative to cwd.
     pub scenarios_dir: String,
-    /// Minimum pass-rate (0.0–1.0) for a `promote` verdict. Goldens default to
+    /// Minimum pass-rate in (0.0, 1.0] for a `promote` verdict. Goldens default to
     /// 1.0 — a golden that regresses at all is a regression.
     pub pass_threshold: f64,
     /// Repeats per scenario. Agents are stochastic; >1 turns a single noisy
-    /// verdict into a pass-rate with a confidence interval (Vol 5 §5). Kept at 1
-    /// by default so local runs stay cheap; CI raises it.
+    /// verdict into a pass-rate with a confidence interval (Vol 5 §5). Gate
+    /// caps this at 100 and requires `--yes` above 10. Kept at 1 by default so
+    /// local runs stay cheap; CI raises it.
     pub seeds: u32,
     /// Max tolerated per-scenario pass-rate drop vs a baseline before a
     /// regression is called (reserved for the global non-inferiority check).
@@ -371,7 +380,7 @@ pub struct PricingConfig {
 
 /// Execution sandbox for shell/build/VCS commands (§4.8). This makes the
 /// containment posture part of the portable harness artifact: "this repo runs
-/// shell in an OS-native jail with network allowed" travels, diffs, and is
+/// shell in an OS-native jail with network denied" travels, diffs, and is
 /// ablatable — security-as-artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -380,8 +389,8 @@ pub struct SandboxLockConfig {
     /// no OS isolation; `"container"` = throwaway docker/podman container (opt-in
     /// heavy tier); `"ssh"` = run on a remote host.
     pub backend: String,
-    /// `"allow"` (default — builds/fetches work) or `"deny"` (stronger
-    /// containment; blocks all network from confined commands).
+    /// `"deny"` (default; blocks exfiltration) or explicit `"allow"` for
+    /// projects whose confined commands genuinely need downloads.
     pub network: String,
     /// Extra absolute paths the jail may write to, beyond the workspace + temp
     /// + the built-in dev-cache set (e.g. a shared build directory).
@@ -404,7 +413,7 @@ impl Default for SandboxLockConfig {
         // platforms without a native backend (the CLI warns when it does).
         Self {
             backend: "native".into(),
-            network: "allow".into(),
+            network: "deny".into(),
             extra_writable: Vec::new(),
             image: None,
             runtime: None,
@@ -425,8 +434,8 @@ impl SandboxLockConfig {
             _ => sandbox::BackendKind::Native,
         };
         let net = match self.network.trim().to_lowercase().as_str() {
-            "deny" | "off" | "none" => sandbox::NetPolicy::Deny,
-            _ => sandbox::NetPolicy::Allow,
+            "allow" | "on" => sandbox::NetPolicy::Allow,
+            _ => sandbox::NetPolicy::Deny,
         };
         // `backend = "docker"/"podman"` is shorthand that also picks the runtime.
         let runtime =
@@ -661,17 +670,36 @@ impl MedhaLock {
         toml::from_str(text).map_err(|e| e.to_string())
     }
 
-    /// Load from an explicit path, if it exists.
-    pub fn load(path: impl AsRef<Path>) -> Option<Self> {
-        let text = std::fs::read_to_string(path).ok()?;
-        Self::parse(&text).ok()
+    /// Load from an explicit path. Absence is optional; a present file that
+    /// cannot be read or parsed is a hard configuration error because silently
+    /// falling back would relax budgets, sandboxing, approvals, and network
+    /// policy the operator intended to enforce.
+    pub fn load(path: impl AsRef<Path>) -> Result<Option<Self>, LockfileError> {
+        let path = path.as_ref();
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(LockfileError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        Self::parse(&text)
+            .map(Some)
+            .map_err(|message| LockfileError::Parse {
+                path: path.to_path_buf(),
+                message,
+            })
     }
 
-    /// Load `./medha.lock` from the current directory (the conventional
-    /// project-root location), or fall back to defaults if absent/unparsable
-    /// — never an error; `medha.lock` is optional (§6).
-    pub fn load_default() -> Self {
-        Self::load(default_path()).unwrap_or_default()
+    /// Load `./medha.lock` from the current directory. Only a genuinely absent
+    /// file falls back to defaults.
+    pub fn load_default() -> Result<Self, LockfileError> {
+        let directory =
+            std::env::current_dir().map_err(|source| LockfileError::CurrentDirectory { source })?;
+        Ok(Self::load(directory.join("medha.lock"))?.unwrap_or_default())
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), String> {
@@ -680,57 +708,21 @@ impl MedhaLock {
     }
 }
 
-fn default_path() -> PathBuf {
-    PathBuf::from("medha.lock")
-}
-
-/// Move a legacy `[permissions]` block out of the portable `medha.lock` into a
-/// machine-local trust file (§13.3). Runtime permission grants are per-machine
-/// absolute paths — they must not travel with the portable, diffable harness
-/// artifact. Runs once: if `trust_path` already exists, nothing happens.
-///
-/// After migration, `medha.lock` no longer carries `[permissions]` and the
-/// trust file holds them in the identical shape the permission manager reads.
-pub fn migrate_permissions_to_trust_file(
-    medha_lock: &Path,
-    trust_path: &Path,
-) -> Result<(), String> {
-    if trust_path.exists() {
-        return Ok(()); // already migrated / trust file is the source of truth
-    }
-    let Ok(content) = std::fs::read_to_string(medha_lock) else {
-        return Ok(()); // no lock file → nothing to migrate
-    };
-    let Ok(mut value) = toml::from_str::<toml::Value>(&content) else {
-        return Ok(());
-    };
-    let Some(table) = value.as_table_mut() else {
-        return Ok(());
-    };
-    let Some(perms) = table.remove("permissions") else {
-        return Ok(()); // no permissions block → nothing to migrate
-    };
-
-    // Write the permissions into the trust file (same [permissions] shape).
-    let mut trust_root = toml::Table::new();
-    trust_root.insert("permissions".into(), perms);
-    let trust_doc = toml::Value::Table(trust_root);
-    if let Some(parent) = trust_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(
-        trust_path,
-        toml::to_string_pretty(&trust_doc).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-
-    // Rewrite medha.lock without the permissions table so the portable artifact
-    // stays clean and machine-independent.
-    std::fs::write(
-        medha_lock,
-        toml::to_string_pretty(&value).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
+#[derive(Debug, Error)]
+pub enum LockfileError {
+    #[error("could not resolve the current directory while locating medha.lock: {source}")]
+    CurrentDirectory {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not read medha.lock at {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not parse medha.lock at {}: {message}", path.display())]
+    Parse { path: PathBuf, message: String },
 }
 
 #[cfg(test)]
@@ -738,40 +730,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrates_permissions_out_of_portable_lock() {
-        let dir = std::env::temp_dir().join(format!("medha-migrate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let lock = dir.join("medha.lock");
-        let trust = dir.join(".medha").join("trust.lock");
-        std::fs::write(
-            &lock,
-            "[budget]\nmax_turns = 50\n\n[[permissions.trusted_paths]]\npath = \"/some/abs/path\"\npermission = \"Read\"\ngranted_at = 123\n",
+    fn portable_permissions_parse_only_for_an_ignored_grant_warning() {
+        let lock = MedhaLock::parse(
+            "[[permissions.trusted_paths]]\n\
+             path = \"/\"\n\
+             permission = \"Read\"\n\
+             granted_at = 123\n",
         )
         .unwrap();
 
-        migrate_permissions_to_trust_file(&lock, &trust).unwrap();
-
-        // Grants moved into the machine-local trust file...
-        let trust_txt = std::fs::read_to_string(&trust).unwrap();
-        assert!(trust_txt.contains("trusted_paths") && trust_txt.contains("/some/abs/path"));
-        // ...and out of the portable lock (which keeps its real config).
-        let lock_txt = std::fs::read_to_string(&lock).unwrap();
-        assert!(lock_txt.contains("max_turns"), "real config preserved");
-        assert!(
-            !lock_txt.contains("permissions"),
-            "portable lock must not carry grants"
-        );
-
-        // Idempotent: a second run is a no-op because the trust file now exists.
-        migrate_permissions_to_trust_file(&lock, &trust).unwrap();
-        assert_eq!(std::fs::read_to_string(&trust).unwrap(), trust_txt);
-
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(lock.permissions.trusted_paths.len(), 1);
+        assert_eq!(lock.permissions.trusted_paths[0].path, PathBuf::from("/"));
     }
 
     #[test]
-    fn absent_file_yields_defaults_matching_prior_hardcoded_behavior() {
+    fn absent_file_yields_secure_defaults() {
         let lock = MedhaLock::default();
         // Matches kernel::Budget::default() / context::CompactionPolicy::default()
         // exactly, so introducing this artifact changes nothing by default.
@@ -796,6 +769,8 @@ mod tests {
         assert!(lock.context_files.enabled);
         assert_eq!(lock.context_files.max_chars, 20_000);
         assert!(lock.context_files.progressive_discovery);
+        assert_eq!(lock.sandbox.network, "deny");
+        assert_eq!(lock.sandbox.to_config().net, sandbox::NetPolicy::Deny);
         assert!(
             lock.lsp.enabled,
             "LSP code intelligence is automatic unless explicitly disabled"
@@ -861,21 +836,46 @@ mod tests {
         lock.policy.approve = vec!["fs.edit".to_string()]; // explicit opt-down from the default set
         lock.save(&path).unwrap();
 
-        let loaded = MedhaLock::load(&path).unwrap();
+        let loaded = MedhaLock::load(&path).unwrap().unwrap();
         assert_eq!(loaded.budget.max_turns, Some(999));
         assert_eq!(loaded.policy.approve, vec!["fs.edit"]);
     }
 
     #[test]
     fn missing_file_falls_back_to_defaults_not_an_error() {
-        let loaded = MedhaLock::load("/nonexistent/path/medha.lock");
+        let loaded = MedhaLock::load("/nonexistent/path/medha.lock").unwrap();
         assert!(loaded.is_none()); // load() is explicit Option; load_default() covers the fallback
-        let default_used = MedhaLock::load("/nonexistent/path/medha.lock").unwrap_or_default();
+        let default_used = MedhaLock::load("/nonexistent/path/medha.lock")
+            .unwrap()
+            .unwrap_or_default();
         // Deny-first default applies even when no file exists at all.
         assert_eq!(
             default_used.policy.approve,
             vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]
         );
+    }
+
+    #[test]
+    fn malformed_present_file_fails_with_its_path_and_parse_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("medha.lock");
+        std::fs::write(&path, "[sandbox\nnetwork = \"deny\"\n").unwrap();
+
+        let error = MedhaLock::load(&path).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("could not parse"));
+        assert!(error.contains("line"));
+    }
+
+    #[test]
+    fn unreadable_present_path_is_not_treated_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("medha.lock");
+        std::fs::create_dir(&path).unwrap();
+
+        let error = MedhaLock::load(&path).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("could not read"));
     }
 
     #[test]

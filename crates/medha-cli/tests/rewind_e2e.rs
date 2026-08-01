@@ -64,9 +64,15 @@ async fn rewind_branches_the_session_and_rolls_files_back_to_the_cut() {
     let plan = kernel::rollback_plan(&events, cut.id);
     let mut rolled = 0usize;
     for fr in &plan {
-        if sbx.restore(&fr.path, fr.snapshot.as_deref()).await.is_ok() {
-            rolled += 1;
-        }
+        sbx.restore(&fr.path, fr.snapshot.as_deref())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "rewind restore failed for {} (snapshot {:?}): {error}",
+                    fr.path, fr.snapshot
+                )
+            });
+        rolled += 1;
     }
     let msgs = kernel::project_messages(&events[..idx]);
 

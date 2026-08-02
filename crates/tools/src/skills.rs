@@ -375,7 +375,7 @@ impl SkillStore {
         };
         Ok(json!({
             "name": name,
-            "file": relative.display().to_string(),
+            "file": crate::portable_rel(relative),
             "content": page.join("\n"),
             "line_start": start,
             "line_end": end,
@@ -853,7 +853,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
             collect_files(root, &path, out);
         } else if ty.is_file() {
             if let Ok(rel) = path.strip_prefix(root) {
-                let rel = rel.display().to_string();
+                let rel = crate::portable_rel(rel);
                 if rel != "SKILL.md" {
                     out.push(rel);
                 }

@@ -2014,6 +2014,18 @@ struct TextCounts {
     chars: u64,
 }
 
+/// Render a relative path as a portable, forward-slash string so directory
+/// walks (grep, glob, tree) and skill bundles list identically on Windows and
+/// Unix. Only relative paths pass through here; each component carries its
+/// filename bytes verbatim, so a Unix name containing a backslash is preserved
+/// rather than rewritten into a separator.
+pub(crate) fn portable_rel(path: &std::path::Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Line/word/char counts computed in one 64 KiB-buffered pass. Semantics match
 /// `str::lines` / `split_whitespace` / `chars` on the whole file; a UTF-8
 /// sequence split across chunk boundaries is carried over, never miscounted.
@@ -2162,7 +2174,7 @@ impl Tool for Grep {
                 let Ok(content) = std::fs::read_to_string(dent.path()) else {
                     continue; // skip binaries (non-UTF-8)
                 };
-                let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
+                let rel = portable_rel(dent.path().strip_prefix(&root).unwrap_or(dent.path()));
                 let lines: Vec<&str> = content.lines().collect();
                 for (i, line) in lines.iter().enumerate() {
                     if re.is_match(line) {
@@ -2268,7 +2280,7 @@ impl Tool for Glob {
                 if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
-                let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
+                let rel = portable_rel(dent.path().strip_prefix(&root).unwrap_or(dent.path()));
                 // `require_literal_separator` so `*` and `?` do NOT cross `/`:
                 // `*.rs` matches `main.rs` but not `src/main.rs`, and `src/*.rs`
                 // doesn't reach `src/a/b.rs`. Use `**` to span directories. Without
@@ -2642,7 +2654,7 @@ impl Tool for References {
                     continue;
                 }
                 let Ok(content) = std::fs::read_to_string(dent.path()) else { continue };
-                let rel = dent.path().strip_prefix(&root).unwrap_or(dent.path()).to_string_lossy().into_owned();
+                let rel = portable_rel(dent.path().strip_prefix(&root).unwrap_or(dent.path()));
                 for (i, line) in content.lines().enumerate() {
                     if let Some(found) = word.find(line) {
                         if refs.len() >= max {

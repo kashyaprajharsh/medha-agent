@@ -38,8 +38,8 @@ jobs:
       sha: ${{ steps.release_ref.outputs.sha }}
       tag: ${{ steps.release_ref.outputs.tag }}
     steps:
-      # actions/checkout v4, pinned to an immutable upstream commit.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/checkout v5.1.0, pinned to an immutable upstream commit.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ env.RELEASE_REF }}
           fetch-depth: 0
@@ -110,7 +110,7 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false

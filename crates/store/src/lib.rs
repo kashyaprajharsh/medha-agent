@@ -291,6 +291,26 @@ fn open_verified_artifact(path: &Path, expected_hash: &str) -> Result<File, Stri
     Ok(file)
 }
 
+/// Open an already-published artifact with write access before flushing it.
+///
+/// On Windows `File::sync_all` maps to `FlushFileBuffers`, which rejects a
+/// read-only handle with `ERROR_ACCESS_DENIED`. Reads should stay read-only,
+/// but the post-publication durability barrier needs this separate handle.
+fn open_verified_artifact_for_sync(path: &Path, expected_hash: &str) -> Result<File, String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let actual = file_digest(&mut file)?;
+    if !actual.eq_ignore_ascii_case(expected_hash) {
+        return Err(format!(
+            "artifact integrity check failed: expected {expected_hash}, found {actual}"
+        ));
+    }
+    Ok(file)
+}
+
 struct TemporaryArtifact(PathBuf);
 
 impl Drop for TemporaryArtifact {
@@ -382,7 +402,7 @@ impl ArtifactStore for FileArtifactStore {
                 return Err(format!("could not atomically publish artifact: {error}"));
             }
         }
-        let final_file = open_verified_artifact(&path, &hash)?;
+        let final_file = open_verified_artifact_for_sync(&path, &hash)?;
         final_file.sync_all().map_err(|e| e.to_string())?;
         #[cfg(unix)]
         File::open(&self.dir)

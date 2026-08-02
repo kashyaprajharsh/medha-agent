@@ -849,8 +849,53 @@ pub fn save(cfg: &Config) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let text = toml::to_string_pretty(cfg).context("serializing config")?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    with_config_lock(&path, || write_config_file(&path, &text))
+}
+
+fn write_config_file(path: &std::path::Path, text: &str) -> Result<()> {
+    let temporary = path.with_extension(format!("tmp{}-{}", std::process::id(), ulid::Ulid::new()));
+    let write_result = (|| {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&temporary)
+            .with_context(|| format!("opening {}", temporary.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {}", temporary.display()))?;
+        drop(file);
+        atomic_replace_file(&temporary, path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .with_context(|| format!("syncing {}", parent.display()))?;
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+/// Serialize complete-config writes across Medha processes. The lock is a
+/// stable sibling because atomic publication replaces the config-file inode.
+fn with_config_lock<T>(path: &std::path::Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(std::path::PathBuf::from(lock_path))
+        .with_context(|| format!("opening config lock beside {}", path.display()))?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock
+        .write()
+        .with_context(|| format!("locking config beside {}", path.display()))?;
+    operation()
 }
 
 /// Resolve effective provider settings from (in order) CLI flags → env → config
@@ -1634,12 +1679,57 @@ fn write_credentials_file(path: &std::path::Path, creds: &CredentialsFile) -> Re
             .ok();
         f.write_all(text.as_bytes())
             .with_context(|| format!("writing {}", temporary.display()))?;
-        f.sync_all().ok();
+        f.sync_all()
+            .with_context(|| format!("syncing {}", temporary.display()))?;
     }
     #[cfg(not(unix))]
-    std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, path).with_context(|| format!("writing {}", path.display()))?;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&temporary)
+            .with_context(|| format!("opening {}", temporary.display()))?;
+        f.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        f.sync_all()
+            .with_context(|| format!("syncing {}", temporary.display()))?;
+    }
+    atomic_replace_file(&temporary, path).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Serializes the read-modify-write on the credentials file.
@@ -2281,6 +2371,25 @@ mod tests {
         let mut cfg: Config = toml::from_str(dup).unwrap();
         assert!(migrate_legacy_provider(&mut cfg));
         assert_eq!(cfg.models.len(), 1, "duplicate connection not re-added");
+    }
+
+    #[test]
+    fn config_write_replaces_existing_content_atomically() {
+        let dir = std::env::temp_dir().join(format!("medha-config-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "old = true\n").unwrap();
+
+        write_config_file(&path, "new = true\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new = true\n");
+        assert!(
+            !std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

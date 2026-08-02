@@ -1769,11 +1769,19 @@ fn kill_process_group(pid: Option<u32>) {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        // Do not resolve a process-kill primitive through the inherited PATH:
+        // an MCP server/project can control that PATH.  Also wait for the
+        // helper to finish so reconnect/retire cannot overlap the old tree.
+        let taskkill = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+            .join("System32")
+            .join("taskkill.exe");
+        let _ = std::process::Command::new(taskkill)
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .status();
     }
 }
 

@@ -135,31 +135,35 @@ impl TapStore {
     /// Register a tap. Idempotent by [`Tap::key`]: re-adding the same repo+path
     /// updates its ref rather than duplicating. Returns `true` if it was new.
     pub fn add(&self, tap: Tap) -> Result<bool, String> {
-        let mut taps = self.list()?;
-        let key = tap.key();
-        let is_new = if let Some(existing) = taps.iter_mut().find(|t| t.key() == key) {
-            *existing = tap;
-            false
-        } else {
-            taps.push(tap);
-            true
-        };
-        self.write(&taps)?;
-        Ok(is_new)
+        with_file_lock(&self.path, || {
+            let mut taps = self.list()?;
+            let key = tap.key();
+            let is_new = if let Some(existing) = taps.iter_mut().find(|t| t.key() == key) {
+                *existing = tap;
+                false
+            } else {
+                taps.push(tap);
+                true
+            };
+            self.write(&taps)?;
+            Ok(is_new)
+        })
     }
 
     /// Remove every tap matching `repo` (any subpath) or an exact `repo/path`
     /// key. Returns the number removed.
     pub fn remove(&self, spec: &str) -> Result<usize, String> {
         let spec = spec.trim().trim_matches('/');
-        let mut taps = self.list()?;
-        let before = taps.len();
-        taps.retain(|t| t.repo != spec && t.key() != spec);
-        let removed = before - taps.len();
-        if removed > 0 {
-            self.write(&taps)?;
-        }
-        Ok(removed)
+        with_file_lock(&self.path, || {
+            let mut taps = self.list()?;
+            let before = taps.len();
+            taps.retain(|t| t.repo != spec && t.key() != spec);
+            let removed = before - taps.len();
+            if removed > 0 {
+                self.write(&taps)?;
+            }
+            Ok(removed)
+        })
     }
 
     fn write(&self, taps: &[Tap]) -> Result<(), String> {
@@ -179,14 +183,78 @@ impl TapStore {
 fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let parent = target.parent().ok_or("taps file has no parent")?;
-    let tmp = parent.join(format!(".taps-{}.tmp", std::process::id()));
+    let tmp = parent.join(format!(
+        ".taps-{}-{}.tmp",
+        std::process::id(),
+        ulid::Ulid::new()
+    ));
     let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
     f.write_all(bytes).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, target).map_err(|e| {
+    // Close the source before publication: Windows rejects a rename while the
+    // staging handle is alive, even though Unix allows it.
+    drop(f);
+    atomic_replace(&tmp, target).inspect_err(|_| {
         std::fs::remove_file(&tmp).ok();
-        e.to_string()
     })
+}
+
+/// Serialize read-modify-write updates across Medha processes. The lock is a
+/// stable sibling because atomic publication replaces the data-file inode.
+fn with_file_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let parent = path.parent().ok_or("persistent file has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(PathBuf::from(lock_path))
+        .map_err(|e| e.to_string())?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock.write().map_err(|e| e.to_string())?;
+    operation()
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::rename(source, target).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, target: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
 }
 
 // ── search ────────────────────────────────────────────────────────────────
@@ -426,10 +494,12 @@ impl SkillLock {
 
     /// Write the lock, sorted by name for a stable, review-friendly diff.
     pub fn write(&self, mut entries: Vec<LockEntry>) -> Result<(), String> {
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        let body = toml::to_string_pretty(&LockDoc { skills: entries })
-            .map_err(|e| format!("serializing lockfile: {e}"))?;
-        atomic_write(&self.path, body.as_bytes())
+        with_file_lock(&self.path, || {
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let body = toml::to_string_pretty(&LockDoc { skills: entries })
+                .map_err(|e| format!("serializing lockfile: {e}"))?;
+            atomic_write(&self.path, body.as_bytes())
+        })
     }
 }
 
@@ -544,6 +614,28 @@ mod tests {
         assert_eq!(store.list().unwrap().len(), 1);
         assert_eq!(store.remove("nope/nope").unwrap(), 0);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_adds_preserve_every_tap() {
+        let dir = tmp();
+        let path = dir.join("taps.toml");
+        let count = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(count));
+        std::thread::scope(|scope| {
+            for index in 0..count {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    TapStore::new(path)
+                        .add(Tap::parse(&format!("org/tool-{index}"), None).unwrap())
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(TapStore::new(path).list().unwrap().len(), count);
         std::fs::remove_dir_all(&dir).ok();
     }
 

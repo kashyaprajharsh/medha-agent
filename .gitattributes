@@ -1,0 +1,7 @@
+# Normalize all text to LF in the repo and on checkout, every platform. Windows
+# CI runners default to autocrlf, which materializes CRLF and breaks tests that
+# read the repo's own text (include_str! docs, Git fixtures, worktree files).
+* text=auto eol=lf
+
+# Binary assets: never touch their bytes.
+*.gif binary

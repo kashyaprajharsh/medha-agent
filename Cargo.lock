@@ -4320,6 +4320,7 @@ name = "tools"
 version = "0.1.6"
 dependencies = [
  "async-trait",
+ "fd-lock",
  "futures",
  "glob",
  "htmd",
@@ -4347,6 +4348,7 @@ dependencies = [
  "toml",
  "ulid",
  "urlencoding",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

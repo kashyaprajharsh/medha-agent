@@ -1101,6 +1101,9 @@ fn atomic_write(target: &Path, content: &[u8]) -> Result<(), String> {
     let mut file = std::fs::File::create(&temp).map_err(|e| e.to_string())?;
     file.write_all(content).map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())?;
+    // Windows refuses to rename an open source file. Unix permits renaming an
+    // open inode, which otherwise hides this lifetime bug from local tests.
+    drop(file);
     let backup = unique_sibling(parent, ".previous-skill");
     let had_old = target.exists();
     if had_old {

@@ -10,7 +10,7 @@ use mcp::{
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
 };
 
 /// A minimal Streamable HTTP MCP endpoint: one JSON-RPC POST in, one JSON
@@ -33,11 +33,9 @@ async fn spawn_with_challenge(
                 return;
             };
             tokio::spawn(async move {
-                let mut buffer = vec![0u8; 16 * 1024];
-                let Ok(read) = stream.read(&mut buffer).await else {
+                let Some(request) = read_http_request(&mut stream).await else {
                     return;
                 };
-                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
                 let authorized = match required_bearer {
                     Some(token) => request.lines().any(|line| {
                         line.to_ascii_lowercase().starts_with("authorization:")
@@ -77,6 +75,38 @@ async fn spawn_with_challenge(
         }
     });
     format!("http://127.0.0.1:{port}/mcp")
+}
+
+/// Read one complete HTTP request: headers plus any `Content-Length` body. A
+/// single `read` can return a partial request when TCP splits the segment under
+/// load, dropping the auth header or JSON body — the source of the intermittent
+/// handshake failures this mock otherwise produced.
+async fn read_http_request(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return Some(String::from_utf8_lossy(&buf).into_owned());
+        }
+        buf.extend_from_slice(&chunk[..read]);
+        let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+            continue;
+        };
+        let content_length = String::from_utf8_lossy(&buf[..head_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if buf.len() >= head_end + 4 + content_length {
+            return Some(String::from_utf8_lossy(&buf).into_owned());
+        }
+    }
 }
 
 fn reply(body: &str) -> Value {

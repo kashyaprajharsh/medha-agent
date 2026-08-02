@@ -19,13 +19,19 @@ need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not instal
 need uname
 need tar
 
+# GitHub serves release assets from several anycast addresses, and one that is
+# unreachable from the caller's network must not stall the install: bound each
+# connect attempt so the next address is tried promptly, then retry transient
+# failures. The asset download also reports progress, because a slow network
+# must not be indistinguishable from a hung one.
 if command -v curl >/dev/null 2>&1; then
-  fetch() { curl -fsSL "$1"; }
-  fetch_to() { curl -fsSL "$1" -o "$2"; }
+  NET_OPTS="--connect-timeout 5 --retry 3 --proto =https --proto-redir =https"
+  fetch() { curl -fsSL $NET_OPTS "$1"; }
+  fetch_to() { curl -fSL $NET_OPTS --progress-bar "$1" -o "$2"; }
   # Return 0 = downloaded, 2 = precise HTTP 404, 1 = transport/other HTTP
   # failure. Only a real 404 means "this release did not publish a checksum."
   fetch_optional_to() {
-    status="$(curl -sSL -o "$2" -w '%{http_code}' "$1")" || return 1
+    status="$(curl -sSL $NET_OPTS -o "$2" -w '%{http_code}' "$1")" || return 1
     case "$status" in
       2??) return 0 ;;
       404) rm -f "$2"; return 2 ;;
@@ -33,11 +39,12 @@ if command -v curl >/dev/null 2>&1; then
     esac
   }
 elif command -v wget >/dev/null 2>&1; then
-  fetch() { wget -qO- "$1"; }
-  fetch_to() { wget -qO "$2" "$1"; }
+  NET_OPTS="--connect-timeout=5 --tries=3"
+  fetch() { wget $NET_OPTS -qO- "$1"; }
+  fetch_to() { wget $NET_OPTS -qO "$2" "$1"; }
   fetch_optional_to() {
     headers="$2.headers"
-    if wget -S -qO "$2" "$1" 2>"$headers"; then
+    if wget $NET_OPTS -S -qO "$2" "$1" 2>"$headers"; then
       rm -f "$headers"
       return 0
     fi

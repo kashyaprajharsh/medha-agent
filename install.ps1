@@ -156,10 +156,19 @@ if ([Environment]::Is64BitOperatingSystem -eq $false) {
 }
 $Target = 'x86_64-pc-windows-msvc'
 
+# GitHub serves release assets from several anycast addresses, and one that is
+# unreachable from the caller's network must not stall the install: bound the
+# wait for a response, and retry transient failures where the host supports it.
+$WebArgs = @{ UseBasicParsing = $true; TimeoutSec = 30 }
+if ($PSVersionTable.PSVersion.Major -ge 6) {
+    $WebArgs['MaximumRetryCount'] = 3
+    $WebArgs['RetryIntervalSec'] = 2
+}
+
 if ($Version -eq 'latest') {
     Write-Host "Resolving the latest release..."
     try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'medha-installer' }
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'medha-installer' } @WebArgs
         $Version = $release.tag_name
     } catch {
         throw "Could not resolve the latest release of $Repo. Set `$env:MEDHA_VERSION to a tag, or check that the repository has a published release."
@@ -175,7 +184,7 @@ try {
     Write-Host "Downloading medha $Version for $Target..."
     $archive = Join-Path $Tmp $Asset
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $archive -UseBasicParsing
+        Invoke-WebRequest -Uri $Url -OutFile $archive @WebArgs
     } catch {
         throw "Download failed: $Url`nThis platform may not have a published build for $Version."
     }
@@ -185,7 +194,7 @@ try {
     $sumFile = "$archive.sha256"
     $checksumMissing = $false
     try {
-        Invoke-WebRequest -Uri "$Url.sha256" -OutFile $sumFile -UseBasicParsing
+        Invoke-WebRequest -Uri "$Url.sha256" -OutFile $sumFile @WebArgs
     } catch {
         $status = Get-HttpStatusCode $_
         if ($status -eq 404) {

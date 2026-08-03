@@ -18,3 +18,6 @@ medha.lock
 
 # macOS
 .DS_Store
+
+# local, per-developer working ledgers (audit + post-release gaps) — kept out of the repo
+/audit/

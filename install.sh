@@ -12,9 +12,28 @@ REPO="${MEDHA_REPO:-kashyaprajharsh/medha-agent}"
 VERSION="${MEDHA_VERSION:-latest}"
 INSTALL_DIR="${MEDHA_INSTALL_DIR:-}"
 
-say() { printf '%s\n' "$*"; }
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+# ── presentation ─────────────────────────────────────────────────────────────
+# Colour and glyphs only when stdout is a real terminal, never when piped into a
+# log or when NO_COLOR is set, so the output stays clean and readable anywhere.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+  c_reset=$(printf '\033[0m'); c_dim=$(printf '\033[2m'); c_bold=$(printf '\033[1m')
+  c_accent=$(printf '\033[36m'); c_ok=$(printf '\033[32m'); c_err=$(printf '\033[31m')
+  g_step='→'; g_ok='✓'; g_err='✗'
+else
+  c_reset=''; c_dim=''; c_bold=''; c_accent=''; c_ok=''; c_err=''
+  g_step='>'; g_ok='-'; g_err='x'
+fi
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '  %s%s%s %s\n' "$c_accent" "$g_step" "$c_reset" "$*"; }
+ok()   { printf '  %s%s%s %s\n' "$c_ok" "$g_ok" "$c_reset" "$*"; }
+note() { printf '  %s%s%s\n' "$c_dim" "$*" "$c_reset"; }
+die()  { printf '  %s%s error:%s %s\n' "$c_err" "$g_err" "$c_reset" "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed"; }
+
+printf '\n  %s%smedha%s %s· verification-first agent harness%s\n' \
+  "$c_bold" "$c_accent" "$c_reset" "$c_dim" "$c_reset"
+printf '  %s────────────────────────────────────────%s\n\n' "$c_dim" "$c_reset"
 
 need uname
 need tar
@@ -84,12 +103,13 @@ TARGET="${arch_part}-${os_part}"
 # ---- resolve the version ----------------------------------------------------
 
 if [ "$VERSION" = "latest" ]; then
-  say "Resolving the latest release..."
+  step "resolving latest release"
   VERSION="$(fetch "https://api.github.com/repos/$REPO/releases/latest" \
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     | head -n1)"
   [ -n "$VERSION" ] || die "could not resolve the latest release of $REPO.
 Set MEDHA_VERSION to a tag, or check that the repository has a published release."
+  ok "resolved $VERSION"
 fi
 
 ASSET="medha-${TARGET}.tar.gz"
@@ -112,7 +132,7 @@ mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-say "Downloading medha $VERSION for ${TARGET}..."
+step "downloading medha $VERSION  ($TARGET)"
 fetch_to "$URL" "$tmp/$ASSET" || die "download failed: $URL
 This platform may not have a published build for $VERSION."
 
@@ -142,9 +162,9 @@ case "$checksum_status" in
     fi
     actual="$(printf '%s' "$actual" | tr 'A-F' 'a-f')"
     [ "$expected" = "$actual" ] || die "checksum mismatch -- refusing to install"
-    say "Checksum verified."
+    ok "checksum verified"
     ;;
-  2) say "No checksum was published for this release; continuing without one." ;;
+  2) note "no checksum published for this release; continuing without one" ;;
   *) die "checksum download failed: $URL.sha256 -- refusing an unverifiable install" ;;
 esac
 
@@ -172,14 +192,17 @@ binary="$tmp/extracted/medha"
 install -m 755 "$binary" "$INSTALL_DIR/medha" 2>/dev/null \
   || { cp "$binary" "$INSTALL_DIR/medha" && chmod 755 "$INSTALL_DIR/medha"; }
 
-say ""
-say "medha $VERSION installed to $INSTALL_DIR/medha"
+ok "installed  ${c_dim}${g_step}${c_reset}  $INSTALL_DIR/medha"
+printf '\n'
 
 case ":$PATH:" in
-  *":$INSTALL_DIR:"*) say "Run 'medha' to get started." ;;
+  *":$INSTALL_DIR:"*)
+    printf '  %smedha %s is ready.%s  run %smedha%s to begin.\n\n' \
+      "$c_bold" "$VERSION" "$c_reset" "$c_accent" "$c_reset"
+    ;;
   *)
-    say ""
-    say "$INSTALL_DIR is not on your PATH. Add it:"
-    say "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    printf '  %smedha %s installed.%s\n' "$c_bold" "$VERSION" "$c_reset"
+    note "$INSTALL_DIR is not on your PATH yet — add it:"
+    printf '    %sexport PATH="%s:$PATH"%s\n\n' "$c_dim" "$INSTALL_DIR" "$c_reset"
     ;;
 esac

@@ -147,6 +147,47 @@ if ($env:MEDHA_INSTALLER_TEST_MODE -eq '1') {
     return
 }
 
+# ── presentation ─────────────────────────────────────────────────────────────
+# Colour and glyphs only for an interactive console, never when the output is
+# redirected to a file or pipeline, and never when NO_COLOR is set.
+$UseStyle  = (-not [Console]::IsOutputRedirected) -and [string]::IsNullOrEmpty($env:NO_COLOR)
+$GlyphStep = if ($UseStyle) { [char]0x2192 } else { '>' }
+$GlyphOk   = if ($UseStyle) { [char]0x2713 } else { '-' }
+$MidDot    = [char]0x00B7
+
+function Write-Step {
+    param([string] $Message)
+    if ($UseStyle) {
+        Write-Host '  ' -NoNewline
+        Write-Host $GlyphStep -ForegroundColor Cyan -NoNewline
+        Write-Host " $Message"
+    } else { Write-Host "  $GlyphStep $Message" }
+}
+function Write-Ok {
+    param([string] $Message)
+    if ($UseStyle) {
+        Write-Host '  ' -NoNewline
+        Write-Host $GlyphOk -ForegroundColor Green -NoNewline
+        Write-Host " $Message"
+    } else { Write-Host "  $GlyphOk $Message" }
+}
+function Write-Note {
+    param([string] $Message)
+    if ($UseStyle) { Write-Host "  $Message" -ForegroundColor DarkGray }
+    else { Write-Host "  $Message" }
+}
+
+Write-Host ''
+if ($UseStyle) {
+    Write-Host '  ' -NoNewline
+    Write-Host 'medha' -ForegroundColor Cyan -NoNewline
+    Write-Host " $MidDot verification-first agent harness" -ForegroundColor DarkGray
+} else {
+    Write-Host "  medha $MidDot verification-first agent harness"
+}
+Write-Host '  ----------------------------------------' -ForegroundColor DarkGray
+Write-Host ''
+
 $Repo    = if ($env:MEDHA_REPO)    { $env:MEDHA_REPO }    else { 'kashyaprajharsh/medha-agent' }
 $Version = if ($env:MEDHA_VERSION) { $env:MEDHA_VERSION } else { 'latest' }
 $Dest    = if ($env:MEDHA_INSTALL_DIR) { $env:MEDHA_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\medha" }
@@ -166,13 +207,14 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
 }
 
 if ($Version -eq 'latest') {
-    Write-Host "Resolving the latest release..."
+    Write-Step 'resolving latest release'
     try {
         $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'medha-installer' } @WebArgs
         $Version = $release.tag_name
     } catch {
         throw "Could not resolve the latest release of $Repo. Set `$env:MEDHA_VERSION to a tag, or check that the repository has a published release."
     }
+    Write-Ok "resolved $Version"
 }
 
 $Asset = "medha-$Target.zip"
@@ -181,7 +223,7 @@ $Tmp   = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRando
 New-Item -ItemType Directory -Path $Tmp -Force | Out-Null
 
 try {
-    Write-Host "Downloading medha $Version for $Target..."
+    Write-Step "downloading medha $Version  ($Target)"
     $archive = Join-Path $Tmp $Asset
     try {
         Invoke-WebRequest -Uri $Url -OutFile $archive @WebArgs
@@ -199,7 +241,7 @@ try {
         $status = Get-HttpStatusCode $_
         if ($status -eq 404) {
             $checksumMissing = $true
-            Write-Host "No checksum was published for this release; continuing without one."
+            Write-Note 'no checksum published for this release; continuing without one'
         } else {
             throw "Checksum download failed: $Url.sha256 - refusing an unverifiable install. $($_.Exception.Message)"
         }
@@ -210,7 +252,7 @@ try {
         if ($expected -cne $actual) {
             throw "Checksum mismatch - refusing to install."
         }
-        Write-Host "Checksum verified."
+        Write-Ok 'checksum verified'
     }
 
     $binary = Join-Path $Tmp 'medha.exe'
@@ -224,15 +266,19 @@ try {
     if (-not (Test-PathContains -PathValue $userPath -Expected $Dest)) {
         $newUserPath = if ([string]::IsNullOrEmpty($userPath)) { $Dest } else { "$userPath;$Dest" }
         [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
-        Write-Host "Added $Dest to your PATH."
+        Write-Note "added $Dest to your PATH"
     }
     if (-not (Test-PathContains -PathValue $env:Path -Expected $Dest)) {
         $env:Path = if ([string]::IsNullOrEmpty($env:Path)) { $Dest } else { "$env:Path;$Dest" }
     }
 
-    Write-Host ""
-    Write-Host "medha $Version installed to $Dest\medha.exe"
-    Write-Host "Run 'medha' to get started. (Open a new terminal if the command is not found.)"
+    Write-Ok "installed  $Dest\medha.exe"
+    Write-Host ''
+    Write-Host "  medha $Version is ready.  run " -NoNewline
+    Write-Host 'medha' -ForegroundColor Cyan -NoNewline
+    Write-Host ' to begin.'
+    Write-Note 'open a new terminal if medha is not found yet.'
+    Write-Host ''
 }
 finally {
     Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue

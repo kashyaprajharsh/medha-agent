@@ -732,11 +732,13 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
 
     let trust_path = state.join("trust.lock");
     let audit_path = state.join("logs").join("audit.log");
-    let sandbox = WorkspaceSandbox::new(
+    let sandbox = WorkspaceSandbox::new_with_state_root(
         cwd.clone(),
         trust_path,
         audit_path,
         Some(Arc::new(kernel::AutoDeny)),
+        sandbox::ApprovedRoots::default(),
+        medha_home.clone(),
     )?
     .with_snapshots_dir(state.join("snapshots"));
 
@@ -1155,12 +1157,13 @@ async fn main() -> Result<()> {
         approved: approved.clone(),
     };
     let workspace = Arc::new(
-        WorkspaceSandbox::new_with_roots(
+        WorkspaceSandbox::new_with_state_root(
             cwd.clone(),
             trust_path,
             audit_path,
             Some(gate.clone()),
             approved,
+            medha_home.clone(),
         )?
         .with_exec_backend(exec_backend)
         // Skills bundle reference files the model reads on demand; the

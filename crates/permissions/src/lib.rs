@@ -459,13 +459,54 @@ impl PermissionManager {
         audit_path: impl Into<PathBuf>,
         trusted: ApprovedRoots,
     ) -> Result<Self, PermissionError> {
+        Self::new_scoped(workspace_root, trust_path, audit_path, trusted, None)
+    }
+
+    /// Like [`new_with_roots`](Self::new_with_roots), but `state_root` names the
+    /// machine-local state directory (`$MEDHA_HOME`). A trust file inside it is
+    /// accepted even when the workspace is an ancestor of it — e.g. running with
+    /// `$HOME` as the workspace — because that directory is medha-managed and no
+    /// checked-out repository can populate it. A trust file inside the workspace
+    /// but outside `state_root` is still rejected: that repository-trust boundary
+    /// does not move.
+    pub fn new_with_state_root(
+        workspace_root: impl Into<PathBuf>,
+        trust_path: impl Into<PathBuf>,
+        audit_path: impl Into<PathBuf>,
+        trusted: ApprovedRoots,
+        state_root: impl Into<PathBuf>,
+    ) -> Result<Self, PermissionError> {
+        Self::new_scoped(
+            workspace_root,
+            trust_path,
+            audit_path,
+            trusted,
+            Some(state_root.into()),
+        )
+    }
+
+    fn new_scoped(
+        workspace_root: impl Into<PathBuf>,
+        trust_path: impl Into<PathBuf>,
+        audit_path: impl Into<PathBuf>,
+        trusted: ApprovedRoots,
+        state_root: Option<PathBuf>,
+    ) -> Result<Self, PermissionError> {
         let workspace_root = workspace_root.into();
         let workspace_root = workspace_root.canonicalize().map_err(|e| {
             PermissionError::Resolution(format!("Failed to canonicalize workspace root: {e}"))
         })?;
 
         let trust_path = resolve_path_allowing_missing_leaf(&trust_path.into())?;
-        if trust_path.starts_with(&workspace_root) {
+        // The trust file must be machine-local so a checked-out repository can
+        // never supply prompt-free grants. "Inside the workspace" is the proxy
+        // for that, but medha's own state root ($MEDHA_HOME) stays machine-local
+        // even when the workspace is an ancestor of it, so exempt paths under it.
+        let inside_state_root = match state_root {
+            Some(root) => trust_path.starts_with(resolve_path_allowing_missing_leaf(&root)?),
+            None => false,
+        };
+        if trust_path.starts_with(&workspace_root) && !inside_state_root {
             return Err(PermissionError::RepositoryTrustFile { path: trust_path });
         }
         let audit_path = audit_path.into();
@@ -1423,6 +1464,51 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("repository-controlled trust source was accepted"),
+        }
+    }
+
+    #[test]
+    fn state_root_under_the_workspace_accepts_its_trust_file() {
+        // Running with $HOME (or any ancestor of $MEDHA_HOME) as the workspace:
+        // the machine-local state root lives inside the workspace, and the trust
+        // file lives inside that state root. It must be accepted, since no
+        // checked-out repository can populate the state root.
+        let home = unique_dir("home_ws");
+        let state_root = home.join(".medha");
+        let trust = state_root.join("projects").join("slug").join("trust.lock");
+        std::fs::create_dir_all(trust.parent().unwrap()).unwrap();
+        let mgr = PermissionManager::new_with_state_root(
+            &home,
+            &trust,
+            state_root.join("audit.log"),
+            ApprovedRoots::default(),
+            &state_root,
+        );
+        assert!(
+            mgr.is_ok(),
+            "trust under the state root must be accepted: {:?}",
+            mgr.err()
+        );
+    }
+
+    #[test]
+    fn trust_inside_the_workspace_but_outside_the_state_root_is_still_rejected() {
+        // The repository-trust boundary does not move: a trust file embedded in
+        // the workspace tree is rejected even when a state root is declared,
+        // because it does not live under that machine-local root.
+        let ws = unique_dir("ws_scoped_boundary");
+        let state_root = unique_dir("state_scoped_boundary");
+        let result = PermissionManager::new_with_state_root(
+            &ws,
+            ws.join("medha.lock"),
+            ws.join("audit.log"),
+            ApprovedRoots::default(),
+            &state_root,
+        );
+        match result {
+            Err(PermissionError::RepositoryTrustFile { .. }) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("repo-embedded trust must stay rejected with a state root"),
         }
     }
 

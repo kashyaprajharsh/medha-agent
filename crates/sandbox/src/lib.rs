@@ -1326,12 +1326,51 @@ impl WorkspaceSandbox {
         human_gate: Option<Arc<dyn HumanGate>>,
         approved: ApprovedRoots,
     ) -> Result<Self, SandboxError> {
+        Self::build(root, trust_path, audit_path, human_gate, approved, None)
+    }
+
+    /// Like [`new_with_roots`](Self::new_with_roots), but `state_root` names the
+    /// machine-local state directory (`$MEDHA_HOME`). A trust file under it is
+    /// accepted even when the workspace is an ancestor of it — e.g. running with
+    /// `$HOME` as the workspace — because no checked-out repository can populate
+    /// that directory. Trust inside the workspace but outside `state_root` is
+    /// still rejected.
+    pub fn new_with_state_root(
+        root: impl Into<PathBuf>,
+        trust_path: impl Into<PathBuf>,
+        audit_path: impl Into<PathBuf>,
+        human_gate: Option<Arc<dyn HumanGate>>,
+        approved: ApprovedRoots,
+        state_root: impl Into<PathBuf>,
+    ) -> Result<Self, SandboxError> {
+        Self::build(
+            root,
+            trust_path,
+            audit_path,
+            human_gate,
+            approved,
+            Some(state_root.into()),
+        )
+    }
+
+    fn build(
+        root: impl Into<PathBuf>,
+        trust_path: impl Into<PathBuf>,
+        audit_path: impl Into<PathBuf>,
+        human_gate: Option<Arc<dyn HumanGate>>,
+        approved: ApprovedRoots,
+        state_root: Option<PathBuf>,
+    ) -> Result<Self, SandboxError> {
         let root = root.into();
         let root = root.canonicalize().unwrap_or(root);
         let snapshots = root.join(".medha").join("snapshots");
 
-        let mut permission_manager =
-            PermissionManager::new_with_roots(&root, trust_path, audit_path, approved)?;
+        let mut permission_manager = match state_root {
+            Some(state_root) => PermissionManager::new_with_state_root(
+                &root, trust_path, audit_path, approved, state_root,
+            )?,
+            None => PermissionManager::new_with_roots(&root, trust_path, audit_path, approved)?,
+        };
         if let Some(gate) = human_gate {
             permission_manager.set_human_gate(gate);
         }

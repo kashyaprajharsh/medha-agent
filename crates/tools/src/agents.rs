@@ -250,6 +250,24 @@ impl Tool for AgentSpawn {
         // above a plain read.
         BlastRadius::ReversibleLocal
     }
+    /// Consequential enough to need approval, but it changes nothing in the
+    /// shared tree — so it must not hold the writer lane.
+    ///
+    /// The default derives a mutation key from the blast radius, which took
+    /// `mutation_serial` and a durable cross-process lease for the whole
+    /// admission, including a writer's `git worktree add`. Every other session's
+    /// mutating tool blocked for that window, a second process blocked on the
+    /// lease, and two spawns could never overlap. Nothing here needed it: the
+    /// worktree has its own structure lock, the dispatch record is ordered by the
+    /// event log's single-writer chain and already refuses the spawn if it cannot
+    /// be written, and an orphaned child is recovered from `agent.spawned` plus
+    /// its process lease rather than from an effect record.
+    ///
+    /// It is also what made a blocking spawn impossible: holding the writer lane
+    /// across a child's run deadlocks the first thing that child writes.
+    fn mutation_key(&self, _args: &Value) -> Option<String> {
+        None
+    }
     fn timeout(&self) -> Option<std::time::Duration> {
         // No tool-level cap. A child is a whole session — it runs to its own
         // turn budget, which is the bound that means anything here. The default
@@ -1017,3 +1035,4 @@ impl Tool for AgentApply {
         }
     }
 }
+

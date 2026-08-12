@@ -8112,6 +8112,38 @@ mod tests {
         observation.payload
     }
 
+    /// Asked through the executor, because that is who the kernel asks.
+    ///
+    /// Delegating is consequential — real spend, and it can start a writer — so
+    /// it keeps its approval card. But it writes nothing to the shared tree, and
+    /// the default derived a mutation key from that blast radius, which held
+    /// `mutation_serial` and a durable cross-process lease for the whole
+    /// admission including a writer's `git worktree add`. Every other session's
+    /// mutating tool waited through it, a second process blocked on the lease,
+    /// and two spawns could never overlap. It is also what made a blocking spawn
+    /// impossible: holding the writer lane across a child's run deadlocks the
+    /// first thing that child writes.
+    #[tokio::test]
+    async fn delegating_is_gated_but_never_holds_the_writer_lane() {
+        let (registry, _outbox, _owner) = registry_with_outbox();
+        let intent = kernel::ToolIntent {
+            id: "x".into(),
+            tool: "agent.spawn".into(),
+            args: json!({ "objective": "anything" }),
+        };
+        assert_eq!(
+            registry.blast_radius("agent.spawn"),
+            Some(kernel::BlastRadius::ReversibleLocal),
+            "delegation must still raise an approval card"
+        );
+        assert_eq!(
+            kernel::Executor::mutation_key(registry.as_ref(), &intent),
+            None,
+            "the worktree has its own structure lock and the dispatch record is \
+             ordered by the event log, so nothing here needs the writer lane"
+        );
+    }
+
     #[tokio::test]
     async fn waiting_hands_back_the_reports_it_waited_for() {
         let (registry, _outbox, _owner) = registry_with_outbox();

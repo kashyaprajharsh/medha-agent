@@ -1,15 +1,5 @@
-//! `medha` — Phase 0 entrypoint.
-//!
-//! Config is *resolved*, never hardcoded (see `config.rs`):
-//!   CLI flag  >  env override  >  ~/.medha/config.toml  >  TUI first-run model setup
-//!
-//! Usage:
-//!   medha                        interactive TUI (first run opens model setup)
-//!   medha --setup                open the TUI straight into model setup
-//!   medha "your task"            run one turn headless
-//!   medha --model X "your task"  one-off model override
-//!
-//! Env overrides: MEDHA_BASE_URL, MEDHA_MODEL, MEDHA_API_KEY
+//! Medha CLI entrypoint. Configuration resolves from flags, environment,
+//! saved user settings, and finally first-run TUI setup.
 
 mod acp;
 mod agents;
@@ -26,8 +16,6 @@ use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use tools::ToolRegistry;
 
-/// Env var name → setter, for the small overrides that apply on top of
-/// whatever `medha.lock` (or its built-in default) already specified.
 fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|s| s.parse().ok())
 }
@@ -41,30 +29,16 @@ fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok().and_then(|s| s.parse().ok())
 }
 
-/// Apply the per-task budget overrides from the environment on top of a base
-/// budget (from `medha.lock`, §4.1/§18.5). Precedence: env > lock > built-in
-/// default. Only fields whose env var is actually set are overridden — an
-/// absent var must never wipe out a value the lock file specified.
-///   MEDHA_MAX_TURNS · MEDHA_MAX_TOKENS · MEDHA_MAX_COST (usd) · MEDHA_MAX_WALL (s)
-/// The budget for one task, with a pool of its own, published so any sub-agent
-/// this task spawns draws tokens, cost and wall-clock from the same tally.
-///
-/// Per task, not per process: a pool built once at startup never resets, so a
-/// long-running surface would exhaust the ceiling and stay exhausted.
+/// Apply environment overrides to one task's shared budget pool.
 pub(crate) fn task_budget(base: &kernel::Budget, slot: &kernel::BudgetHandle) -> kernel::Budget {
     let budget = base.clone().with_fresh_pool();
     if let Ok(mut published) = slot.lock() {
-        // A clone shares the pool, so a child's spend lands on the same tally.
         *published = Some(budget.clone());
     }
     budget
 }
 
-/// Build the first provider request for every surface from the same inputs.
-///
-/// Keeping this in one place prevents ACP, TUI, REPL, and headless resume from
-/// silently diverging: the current system prompt is followed by the hydrated
-/// event-log projection without reordering or rewriting it.
+/// Build the same initial transcript for every UI surface.
 pub(crate) fn session_transcript(
     system: String,
     resumed: Vec<kernel::Message>,
@@ -115,8 +89,7 @@ struct Cli {
     #[arg(long)]
     plain: bool,
 
-    /// Editor bridge: expose the session over line-delimited JSON-RPC on stdio
-    /// for an editor extension to embed (Vol 4 §5, Agent Client Protocol).
+    /// Expose the session over line-delimited Agent Client Protocol JSON-RPC.
     #[arg(long)]
     acp: bool,
 
@@ -142,9 +115,7 @@ struct Cli {
     prompt: Vec<String>,
 }
 
-/// `medha gate <scenario>` — the Eval Gate (§4.11–4.12, Vol 5). Runs the real
-/// agent against fixture scenarios in isolation and scores each run with
-/// deterministic checks over the event log + filesystem. Exit code gates CI.
+/// Run isolated fixture scenarios and score their event logs and filesystems.
 #[derive(Parser)]
 #[command(
     name = "medha gate",
@@ -177,15 +148,11 @@ struct GateCli {
     keep_runs: bool,
 }
 
-/// Resolve the operator's model + gate policy, then run the scenarios. The gate
-/// injects the provider as env into each isolated child run, so a run reaches a
-/// model without seeing the operator's real `~/.medha` (its `MEDHA_HOME` is a
-/// throwaway). Exit code: 0 all promote · 1 any reject · 2 any hold.
+/// Run scenarios with an isolated `MEDHA_HOME`; exit 0/1/2 means
+/// promote/reject/hold respectively.
 async fn run_gate_command(args: Vec<String>) -> Result<()> {
     let gc = GateCli::parse_from(std::iter::once("medha-gate".to_string()).chain(args));
 
-    // `--validate` never runs the agent, so it needs no provider — a fast lint
-    // for CI (and safe to run without spending API budget).
     if gc.validate {
         let paths = gate::discover(&gc.path).map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut ok = true;
@@ -278,10 +245,7 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
     std::process::exit(gate::report::exit_code(&results));
 }
 
-/// `medha pulse [--fix]` — the configuration health check (the `/pulse` command
-/// outside the TUI). Reports which model/endpoint/credential medha resolves and
-/// from where, flags mismatches, and — with `--fix` — applies the safe repairs.
-/// Static and offline: no keychain prompt, no network, no API spend.
+/// Inspect configuration offline and optionally apply safe repairs.
 fn run_pulse_command(args: &[String]) -> Result<()> {
     let fix = args.iter().any(|a| a == "--fix" || a == "fix");
     let cfg = config::load()?;
@@ -419,10 +383,7 @@ async fn run_memory_command(args: Vec<String>) -> Result<()> {
         state.join("events.db"),
         medha_home.join("mutations.db"),
     )?;
-    // The command includes read/modify/write operations (and user memory is
-    // shared by every workspace). Holding one global lease for the short-lived
-    // command is deliberately conservative and also makes projection rebuilds
-    // a stable basis for a following edit/pin/forget.
+    // Serialize global user-memory projection with the requested mutation.
     let _memory_lease = log.acquire_mutation_lease("memory:*").await?;
     let projection =
         memory::MemoryProjection::open(state.join("memory.db"), medha_home.join("memory.db"))?;
@@ -630,6 +591,9 @@ struct WriteEvent {
 /// Write-family observations (same `snapshot`-key check as `rollback_plan`),
 /// newest first across all sessions.
 async fn recent_writes(log: &store::SqliteLog, limit: usize) -> Vec<WriteEvent> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for meta in log.list_sessions().unwrap_or_default() {
         let events = kernel::EventLog::events(log, meta.id).await;
@@ -652,11 +616,11 @@ async fn recent_writes(log: &store::SqliteLog, limit: usize) -> Vec<WriteEvent> 
                 path: path.to_string(),
                 ts: e.ts,
             });
-            if out.len() >= limit {
-                return out;
-            }
         }
     }
+    // Storage order can differ from timestamps, so truncate only after merging.
+    out.sort_by(|a, b| b.ts.total_cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
+    out.truncate(limit);
     out
 }
 
@@ -693,9 +657,7 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    // Serialize planning + restore as one mutation. Otherwise another MEDHA
-    // process can write after the rollback plan is read and have its newer
-    // state silently overwritten by this command.
+    // Hold the mutation lease from planning through restore.
     let _undo_lease = log.acquire_mutation_lease("state:*").await?;
 
     let (session_id, target) = if let Some(idstr) = &uc.event {
@@ -722,7 +684,7 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
     };
 
     let events = kernel::EventLog::events(&log, session_id).await;
-    let plan = kernel::events::rollback_plan(&events, target);
+    let plan = kernel::events::rollback_plan_in(&events, target, &cwd);
     if plan.is_empty() {
         println!(
             "Nothing to undo at event {target} (not a write, or already at the workspace's HEAD state)."
@@ -761,22 +723,10 @@ async fn run_undo_command(args: Vec<String>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // medha deliberately does NOT auto-load a project `.env`. As a roaming
-    // harness it runs inside repos it doesn't own, and dotenv walks up ancestors
-    // — so a project's own `.env` (its `OPENAI_*` / `OPENAI_COMPATIBLE_*` LLM
-    // settings) silently hijacked medha's model and credentials, and could send
-    // one program's secrets through another. medha's configuration is a function
-    // of medha's own state only: `~/.medha/config.toml`, the OS keychain /
-    // credentials file, `medha.lock [routing]`, and the `MEDHA_*` env namespace.
-    // The workspace's `.env` still reaches child tool processes through normal
-    // inheritance — medha simply never reads it for its own config. `medha nadi`
-    // (or `/nadi` in the TUI) shows exactly where each value resolved from.
+    // Never let repository `.env` files override Medha's provider or secrets.
+    // Child processes still receive their normally inherited environment.
 
-    // `medha gate <scenario>` is an operator subcommand (the Eval Gate, §4.11–4.12).
-    // It's dispatched by hand *before* the main clap parse: the interactive/headless
-    // CLI uses a trailing free-form prompt positional, which cannot coexist with a
-    // clap subcommand — so we peel `gate` off argv and parse it with its own parser
-    // (real --help/validation), leaving the existing `medha "task"` UX untouched.
+    // Parse subcommands before the trailing free-form prompt consumes them.
     let raw: Vec<String> = std::env::args().collect();
     if raw.get(1).map(|s| s == "gate").unwrap_or(false) {
         return run_gate_command(raw[2..].to_vec()).await;
@@ -799,16 +749,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // `--setup` is only a doorway: it opens the normal TUI directly in the
-    // model-setup form (the exact surface `/model add` uses — one
-    // implementation, never a second wizard). Handled below with use_tui.
     if cli.setup && !std::io::stdin().is_terminal() {
         anyhow::bail!("--setup opens the interactive TUI and needs a terminal");
     }
 
-    // --sessions only reads the local event log — handle it here, before the
-    // provider is resolved, so listing sessions never touches the API key /
-    // keychain (it shouldn't need to prompt for a read-only list).
+    // Session listing must not resolve credentials.
     if cli.sessions {
         let cwd = std::env::current_dir()?;
         let cwd = cwd.canonicalize().unwrap_or(cwd);
@@ -818,10 +763,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve provider from flags → env → saved config. Nothing resolvable +
-    // interactive TUI = first-run: start unconfigured and open the model-setup
-    // form inside the TUI. Headless callers get an actionable error instead —
-    // scripts must never hang on interactive prompts.
+    // Headless callers fail instead of hanging on first-run setup.
     let cfg = config::load()?;
     let is_tty_early = std::io::stdin().is_terminal();
     let tui_possible =
@@ -845,30 +787,17 @@ async fn main() -> Result<()> {
              or set MEDHA_BASE_URL / MEDHA_MODEL / MEDHA_API_KEY."
         ),
     };
-    // Open the TUI in model setup on explicit --setup or an unconfigured start.
     let open_setup = cli.setup || resolved.provider.base_url.is_empty();
 
     let prompt = cli.prompt.join(" ");
     let use_plain_repl = cli.plain;
 
     let model_name = resolved.provider.model.clone();
-    // Keep a mutable, persisted profile registry available to the TUI. A
-    // session started purely from flags/environment (or still unconfigured)
-    // begins with an empty registry; `/model add` writes the first profile.
     let model_profiles = Arc::new(std::sync::Mutex::new(cfg.unwrap_or_default()));
     let active_profile = resolved.name.clone();
 
-    // Resolve the context window so compaction sizes itself — without the user
-    // ever typing a number, and without fabricating one. Precedence:
-    //   1. explicit (MEDHA_MAX_CTX / config)        — override, wins
-    //   2. /v1/models discovery (server-authoritative — the endpoint itself)
-    //   3. models.dev (real, externally maintained model metadata; cached
-    //      locally from a real, externally maintained metadata source — NOT a
-    //      hardcoded table baked into this binary)
-    //   4. otherwise unknown → compaction off, say so (never guess, §4.3)
+    // Context limits resolve from config, server metadata, then models.dev.
     let (mut max_ctx, mut ctx_source) = (resolved.provider.max_ctx, "config/env");
-    // Unconfigured first-run start: no endpoint to ask yet — the TUI's model
-    // setup captures the context window when the first profile is saved.
     if max_ctx.is_none()
         && !resolved.provider.base_url.is_empty()
         && matches!(
@@ -930,10 +859,7 @@ async fn main() -> Result<()> {
     let mut runtime_profile = resolved.provider;
     runtime_profile.max_ctx = max_ctx;
     let provider = if open_setup && runtime_profile.base_url.is_empty() {
-        // The first-run TUI needs a provider handle so it can atomically switch
-        // to the profile saved by setup. Keep this explicit inert state out of
-        // `from_profile`, where accepting an empty endpoint would weaken
-        // validation for every real profile.
+        // Keep empty endpoints out of normal profile validation.
         OpenAiCompat::unconfigured()
     } else {
         OpenAiCompat::from_profile(runtime_profile, resolved.credential)
@@ -941,13 +867,8 @@ async fn main() -> Result<()> {
     };
     let provider = Arc::new(provider);
 
-    // medha.lock (§6): the harness artifact. Absent file = built-in defaults
-    // (identical to MEDHA's behavior before this existed); env vars below layer
-    // on top as session-level overrides. `./medha.lock` in the workspace root.
     let lock = lockfile::MedhaLock::load_default()?;
 
-    // Reasoning/thinking request-side control (§4.4): config-file default,
-    // further adjustable live via /think.
     let reasoning = lock.reasoning.to_config();
     if let Err(error) = provider.set_reasoning(reasoning.clone()) {
         eprintln!("note: saved reasoning setting was not applied: {error}");
@@ -958,25 +879,18 @@ async fn main() -> Result<()> {
             "note: reasoning effort was requested, but this profile marks model support as unverified"
         );
     }
-    // Streaming default from the lock; live-toggle via /stream. Absent → on.
     if let Some(stream) = lock.reasoning.stream {
         provider.set_streaming(stream);
     }
 
-    // Runtime state lives OUT of the working tree, under
-    // ~/.medha/projects/<readable-cwd>--<path-hash>/ — event log,
-    // artifacts, snapshots, logs. Only committed config (.medha/skills,
-    // medha.lock) stays in the workspace. See config::state_dir.
+    // Runtime state stays outside the repository.
     let cwd = std::env::current_dir()?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);
     let state = config::state_dir(&cwd)?;
     let medha_home = config::medha_home()?;
-    // Repository-local runtime state is never imported automatically; warn if
-    // an old layout is present so the operator knows it was left untouched.
     warn_legacy_state(&cwd, &state);
 
-    // Structured logging to a file, never stdout — a TUI owns the screen (spec §7).
-    // state/logs/medha.log; level via RUST_LOG (default info).
+    // Never write logs over the TUI.
     let logs_dir = state.join("logs");
     std::fs::create_dir_all(&logs_dir).ok();
     let (log_writer, _log_guard) =
@@ -996,21 +910,14 @@ async fn main() -> Result<()> {
         medha_home.join("mutations.db"),
     )?);
 
-    // Verify the tamper-evident hash chain on resume. A break means the log was
-    // edited/corrupted since it was written — warn loudly but don't refuse to
-    // start (the operator may be intentionally recovering a damaged log).
+    // A damaged log remains recoverable, but never silently trusted.
     if let Err(e) = log.verify() {
         eprintln!("warning: event log integrity check failed: {e}");
     }
 
-    // Content-addressed artifact store at state/artifacts (§4.5).
     let artifacts = Arc::new(store::FileArtifactStore::open(state.join("artifacts"))?);
 
-    // Human gate (§4.7): the editor's approval card in ACP mode, the TUI's modal
-    // in TUI mode, a y/N prompt in the terminal REPL/one-shot, auto-deny headless.
-    // Created early so it can be passed to WorkspaceSandbox for permission prompts.
-    // --setup always lands in the TUI's model-setup form; it outranks a stray
-    // trailing task string (there is nothing to run against mid-setup).
+    // The active surface supplies the human gate; non-interactive runs deny.
     let has_task = !cli.setup && !prompt.trim().is_empty();
     let is_tty = std::io::stdin().is_terminal();
     let use_acp = cli.acp;
@@ -1036,24 +943,15 @@ async fn main() -> Result<()> {
         Arc::new(kernel::AutoDeny)
     };
 
-    // The `clarify` tool's question-asker: only the full TUI renders the form;
-    // every other surface has no interactive question UI, so `clarify` reports
-    // "skipped" and the agent proceeds on best judgment (never blocks).
+    // Only the TUI can render structured questions.
     let asker: Arc<dyn kernel::Asker> = if let Some((tx, _)) = &tui_channel {
         Arc::new(tui_tea::TuiAsker { tx: tx.clone() })
     } else {
         Arc::new(kernel::NoAsker)
     };
 
-    // Workspace = current directory; fs/shell tools use permission system for out-of-workspace access (§4.8).
-    // medha.lock stays at the project root (committed, user-editable); runtime
-    // state (logs/db/artifacts/trust) lives in the per-workspace state dir.
     let lock_path = cwd.join("medha.lock");
-    // Machine-local permission grants live in the per-workspace state dir, NOT in
-    // the portable medha.lock (§13.3): absolute per-machine paths must not travel
-    // with the harness artifact. A repository-provided [permissions] block is
-    // untrusted input and is never migrated — each requested path must pass the
-    // human gate before an `Always` decision can reach this trust file.
+    // Machine-local grants never inherit authority from repository config.
     let trust_path = state.join("trust.lock");
     if !lock.permissions.trusted_paths.is_empty() {
         eprintln!(
@@ -1063,18 +961,11 @@ async fn main() -> Result<()> {
             lock_path.display()
         );
     }
-    // No workspace .gitignore is written any more: runtime state now lives under
-    // ~/.medha/projects/, so the only thing left in <workspace>/.medha is
-    // committed config (skills), which the user *wants* in version control.
     let audit_path = logs_dir.join("audit.log");
-    // Migrate an audit log written by an older build at the project root.
     let legacy_audit = cwd.join("medha_audit.log");
     if legacy_audit.exists() && !audit_path.exists() {
         std::fs::rename(&legacy_audit, &audit_path).ok();
     }
-    // Execution sandbox (§4.8): pick the backend from medha.lock's [sandbox],
-    // with `--no-sandbox` / MEDHA_SANDBOX=host|native|off as session overrides.
-    // Default is the OS-native jail where available.
     let mut sbx_cfg = lock.sandbox.to_config();
     match std::env::var("MEDHA_SANDBOX")
         .ok()
@@ -1088,8 +979,7 @@ async fn main() -> Result<()> {
     if cli.no_sandbox {
         sbx_cfg.backend = sandbox::BackendKind::Host;
     }
-    // Validate the opt-in heavy tiers; if misconfigured or unavailable, fall
-    // back to the native jail with a warning rather than break the user.
+    // Misconfigured optional backends fall back to native isolation.
     match sbx_cfg.backend {
         sandbox::BackendKind::Container => {
             let runtime = sbx_cfg.runtime.clone().unwrap_or_else(|| "docker".into());
@@ -1133,20 +1023,17 @@ async fn main() -> Result<()> {
             );
         }
     }
-    // Native backends remap HOME/TMP and expose only narrow read-only
-    // toolchain payloads. Never make whole package-manager homes writable:
-    // several contain registry tokens or executable shims alongside caches.
-    // `approved` is the live bridge between the permission manager and the OS
-    // exec sandbox: a user approval lands in it and the very next spawned
-    // command's profile includes the granted root.
+    // Approved roots update native profiles without exposing whole tool homes.
     let approved = sandbox::ApprovedRoots::default();
+    // Shared network grant: the exec backend enforces it, the permission manager
+    // flips and persists it. One handle so a session/persistent grant reaches both.
+    let net_grant = sandbox::NetworkGrant::default();
     let extra_writable = lock.sandbox.extra_writable_paths();
-    let exec_backend = sandbox::select_backend(&sbx_cfg, extra_writable, approved.clone());
+    let exec_backend =
+        sandbox::select_backend(&sbx_cfg, extra_writable, approved.clone(), net_grant.clone());
     let verifier_exec = Arc::clone(&exec_backend);
 
-    // Kept so a writing sub-agent's sandbox can be rebuilt at its own worktree
-    // root with exactly these settings — same permissions, same audit log, same
-    // execution backend. Anything reconstructed by hand would drift.
+    // Writers re-root this template in their isolated worktrees.
     let sandbox_template = agents::SandboxTemplate {
         trust: trust_path.clone(),
         audit: audit_path.clone(),
@@ -1155,6 +1042,7 @@ async fn main() -> Result<()> {
         snapshots: state.join("snapshots"),
         readable: vec![config::user_skills_dir()?],
         approved: approved.clone(),
+        net_grant: net_grant.clone(),
     };
     let workspace = Arc::new(
         WorkspaceSandbox::new_with_state_root(
@@ -1166,19 +1054,12 @@ async fn main() -> Result<()> {
             medha_home.clone(),
         )?
         .with_exec_backend(exec_backend)
-        // Skills bundle reference files the model reads on demand; the
-        // user skills root lives outside the workspace, so without this
-        // every bundled-file read would raise a permission card.
+        .with_network_grant(net_grant)?
+        // Bundled user-skill files are trusted configuration, not workspace data.
         .with_readable_roots(&[config::user_skills_dir()?])
         .with_snapshots_dir(state.join("snapshots")),
     );
-    // Skills (Phase A, §4.11 consumption side): discover project + user skills
-    // and register `skill.load`/`skill.save`. The store reads the harness's own
-    // `.medha/skills` config dirs directly (not via the sandbox), so scanning
-    // never prompts for permission.
-    // The skill store gets the two-tier guard: the deterministic regex scanner
-    // (in the store) plus an LLM judge (MEDHA's own model) that reviews the
-    // ambiguous Caution cases. See `skill_judge`.
+    // Ambiguous skill content receives both deterministic and model review.
     let security_judge = Arc::new(skill_judge::LlmJudge::new(provider.clone()));
     let context_file_loader = context::ctxfiles::ContextFileLoader::new()
         .with_judge(security_judge.clone())
@@ -1276,18 +1157,14 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    // MCP servers live in the user config (~/.medha/config.toml); their keys live
-    // in the credential store and are substituted into explicit env at spawn. The
-    // lockfile only carries runtime tuning (timeouts, allow_network) + the switch.
+    // MCP definitions are portable; credentials remain in the user store.
     let mcp_servers: Vec<mcp::ServerConfig> = model_profiles
         .lock()
         .ok()
         .map(|cfg| {
             cfg.mcp
                 .iter()
-                // A remote server has no command; requiring one dropped every
-                // url-only server at startup, so one added with `/mcp add
-                // <url>` connected once and was gone after the next launch.
+                // Remote servers intentionally have no command.
                 .filter(|(id, server)| {
                     let reachable = !server.command.is_empty() || !server.url.is_empty();
                     !id.trim().is_empty() && reachable
@@ -1296,8 +1173,7 @@ async fn main() -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    // Always build the host, even with zero servers configured: it costs nothing
-    // idle and is what lets `/mcp add` connect live instead of asking for a restart.
+    // An idle manager allows live additions without a restart.
     let mcp_manager = {
         let had_servers = !mcp_servers.is_empty();
         let mcp_config = mcp::Config {
@@ -1317,8 +1193,6 @@ async fn main() -> Result<()> {
         let manager = Arc::new(mcp::McpManager::new(cwd.clone(), mcp_config));
         registry.register_mcp(manager.clone());
         if had_servers {
-            // Connect in the background: tools are re-projected every turn, so a
-            // slow or broken server surfaces in status without delaying turn one.
             tokio::spawn({
                 let manager = manager.clone();
                 async move { manager.connect_startup().await }
@@ -1327,8 +1201,6 @@ async fn main() -> Result<()> {
         Some(manager)
     };
     registry.register_skills(skill_store.clone());
-    // Typed memory (D9): project entries in the workspace state dir, user
-    // entries in the user-global store — recall merges both.
     let memory_store = Arc::new(memory::MemoryProjection::open(
         state.join("memory.db"),
         medha_home.join("memory.db"),
@@ -1344,37 +1216,22 @@ async fn main() -> Result<()> {
     }
     registry.register_session_search(log.clone(), artifacts.clone());
     let known_tools = registry.tool_names();
-    // Live web-search settings, shared with the `web.*` tools. Seed from the
-    // saved config (provider choice + stored keys, env fallback); the TUI's
-    // `/search` writes this same handle so a change applies without a restart.
     let search_handle = registry.search_handle();
     if let Ok(cfg_guard) = model_profiles.lock() {
         *search_handle.lock().expect("search settings lock") = config::resolve_search(&cfg_guard);
     }
-    // Hand the `clarify` tool the surface's question-asker (TUI form, or NoAsker).
     if let Ok(mut slot) = registry.clarify_handle().lock() {
         *slot = Some(asker);
     }
-    // Deterministic verifier (§4.7): medha.lock's [verify] command, overridden
-    // by MEDHA_VERIFY="cargo check" if set. Empty/absent = no verifier. Resolved
-    // here rather than with the kernel's verifier because a writing sub-agent
-    // runs the same command inside its own checkout — one source of truth for
-    // "does this build", whether the edit was made here or delegated.
+    // Parent and writer worktrees use the same verifier command.
     let verify_cmd = std::env::var("MEDHA_VERIFY")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or(lock.verify.command.clone());
 
-    // Sub-agents (Stage 3). The control plane must exist before the kernel,
-    // because the kernel owns the registry that hosts `agent.spawn`; the runner,
-    // the parent executor and the registry children rebase from are installed
-    // once the kernel is built.
     let agent_runner = Arc::new(orchestrator::DeferredRunner::default());
     let agent_registry = agents::WorktreeWorkspaces::registry_handle();
-    // Writer isolation (O3). `None` outside a git repository — writers are then
-    // refused rather than silently allowed to edit the user's tree. Checkouts
-    // live in Medha's state dir: one inside the repo would show up in the
-    // user's own status, greps and builds.
+    // Without a repository, writer isolation is unavailable and writes are refused.
     let agent_workspaces = if lock.agents.enabled && lock.agents.write {
         agents::WorktreeWorkspaces::discover(
             &cwd,
@@ -1390,8 +1247,6 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    // Filled once the session budget is resolved, below. Children read it at
-    // spawn time, which is always after that.
     let agent_budget: kernel::BudgetHandle = Arc::new(std::sync::Mutex::new(None));
     let agent_log_outbox = if lock.agents.enabled {
         Some(Arc::new(
@@ -1420,19 +1275,9 @@ async fn main() -> Result<()> {
         .with_cancel_grace(std::time::Duration::from_secs(
             lock.agents.cancel_grace_secs,
         ))
-        // Delivery rides the event log, so a background report survives a
-        // restart and reaches the session that dispatched it.
         .with_outbox(log_outbox.clone())
-        // Same fold, read as conversation rather than as delivery: a forked
-        // child starts with what the caller already knows instead of paying to
-        // rediscover it.
         .with_transcripts(log_outbox)
-        // Durable patch records live on the owning session's chain, so the
-        // control plane shares the same session slot the agent tools use —
-        // filled once the session id exists.
         .with_owner(registry.agent_session_handle())
-        // Children inherit the root's token/cost/wall ceilings and spend
-        // against the same pool, so delegating cannot multiply the budget.
         .with_budget(Arc::clone(&agent_budget));
         if let Some(workspaces) = agent_workspaces {
             control = control.with_workspaces(workspaces);
@@ -1444,18 +1289,11 @@ async fn main() -> Result<()> {
     let agent_parent = registry.agent_parent_handle();
     let agent_session = registry.agent_session_handle();
     let executor = Arc::new(registry);
-    // The concrete registry, kept for rebasing a writer's tools onto its
-    // worktree. `agent_parent` cannot serve: it is type-erased to
-    // `dyn Executor`, and re-rooting the workspace tools needs the registry.
+    // Writer worktrees need the concrete registry, not its erased executor.
     if let Ok(mut slot) = agent_registry.lock() {
         *slot = Some(Arc::downgrade(&executor));
     }
 
-    // Context engine: budget-aware two-phase compaction (§4.3), tuned from
-    // medha.lock's [context] section (or its built-in-matching default).
-    // LLM summarizer for Full compaction (falls back to extractive on failure),
-    // so a compacted session keeps a real handoff summary instead of a keyword
-    // scrape that invites hallucination.
     let recall_store = memory_store.clone();
     let memory_enabled = lock.memory.enabled;
     let context_engine = Arc::new(
@@ -1482,9 +1320,6 @@ async fn main() -> Result<()> {
             })),
     );
 
-    // Deny-first policy + shell command scanner (§4.6). Approval set comes from
-    // medha.lock's [policy] approve list, extended by MEDHA_APPROVE (e.g.
-    // "writes", "shell", "all").
     let policy = Arc::new(
         policy::DefaultPolicy::requiring_approval(approve_list(lock.policy.approve.clone()))
             .with_memory_write_approval(&lock.memory.write_approval),
@@ -1500,15 +1335,11 @@ async fn main() -> Result<()> {
         None => Arc::new(kernel::NoVerify),
     };
 
-    // Env overrides applied once, here: children read this budget too, and
-    // applying them only at each task's own call site left every sub-agent
-    // running against the lockfile value with MEDHA_MAX_* ignored.
+    // Children inherit this already-resolved budget.
     let base_budget = apply_budget_env(lock.budget.to_budget());
     let ui_config = lock.ui.clone();
 
-    // Cost meter (P1-12): the operator's configured rate wins; else the model's
-    // models.dev list price as an *indicative* figure (self-hosted routes don't
-    // bill list price); else the meter stays off — never a silent $0.00.
+    // models.dev prices are advisory for self-hosted routes.
     let pricing = match (lock.pricing.input_per_mtok, lock.pricing.output_per_mtok) {
         (Some(i), Some(o)) => Some(kernel::Pricing {
             input_per_mtok: i,
@@ -1560,17 +1391,12 @@ async fn main() -> Result<()> {
         kernel = kernel.with_progressive_context(progressive_context);
     }
     let kernel = Arc::new(kernel);
-    // Close the loop: children narrow from the finished registry, and the runner
-    // holds the kernel weakly so the cycle does not leak it.
+    // A weak back-reference avoids retaining the entire tool graph.
     if let Ok(mut slot) = agent_parent.lock() {
-        // Weak: this slot is reachable from the registry it points at, and a
-        // strong handle would keep the whole tool graph alive for the process.
         *slot = Some(Arc::downgrade(&kernel.executor));
     }
     agent_runner.install(Arc::new(agents::KernelRunner::new(&kernel)));
 
-    // K1 Identity sheath is assembled by the context compiler, not hardcoded
-    // here; config may override the persona (§4.3).
     let configured_persona = model_profiles
         .lock()
         .ok()
@@ -1584,8 +1410,7 @@ async fn main() -> Result<()> {
         eprintln!("{}", file.content);
     }
     let mut system = context::identity::system_prompt(persona);
-    // Ground the model in the real current date + workspace — without this it
-    // guesses a stale year for time-sensitive queries ("latest news" → 2024).
+    // Give time-sensitive requests an explicit clock and workspace.
     let today = chrono::Local::now().format("%A, %-d %B %Y").to_string();
     system.push_str(&format!(
         "\n\nEnvironment:\n- Today's date: {today}\n- Workspace: {}\n\nFor anything \
@@ -1598,10 +1423,6 @@ async fn main() -> Result<()> {
         system.push_str("\n\n");
         system.push_str(&project_context);
     }
-    // K2 skills manifest: one compact line per installed skill so the model knows
-    // what it can `skill.load`. Empty (no section) when no skills exist — zero
-    // behaviour change for workspaces without skills. In headless mode the task
-    // narrows the list when there are many; the interactive session lists all.
     let skills_manifest = skill_store.manifest(
         &known_tools,
         if has_task {
@@ -1614,9 +1435,7 @@ async fn main() -> Result<()> {
         system.push_str("\n\n");
         system.push_str(&skills_manifest);
     }
-    // Resume (--continue / --resume <id>): rebuild the prior conversation from
-    // the event log and continue the SAME session (new events append onward).
-    // Empty `resumed` = a fresh session.
+    // Resumed turns append to the original session.
     let (mut session, resumed) = match resolve_resume(&log, &cli).await {
         Ok(Some((id, msgs))) => {
             eprintln!("resumed session {id} ({} prior messages)", msgs.len());
@@ -1635,15 +1454,10 @@ async fn main() -> Result<()> {
             (Session::new(), Vec::new())
         }
     };
-    // Background reports are addressed to this session at dispatch time, so the
-    // id has to be known before any agent can be launched.
     if let Ok(mut slot) = agent_session.lock() {
         *slot = Some(session.id);
     }
-    // Close out any child abandoned by a previous run. A dispatch is written
-    // before the child starts, so a process that died mid-run leaves one with
-    // no terminal event — and nothing else in the fold ever looks at those, so
-    // without this the parent waits forever on a child that cannot report.
+    // Settle durable dispatches left without a terminal event after a crash.
     if let Some(control) = &agent_control {
         match control.reap_abandoned(session.id).await {
             0 => {}
@@ -1679,8 +1493,6 @@ async fn main() -> Result<()> {
         )?;
         system = memory::recall::replace_k3(&system, &k3);
     }
-    // Starting autonomy dial: medha.lock's [policy] autonomy, overridable by
-    // MEDHA_MODE. The TUI can change it live via /mode; headless keeps this.
     session.autonomy = kernel::AutonomyLevel::from_id(
         &std::env::var("MEDHA_MODE").unwrap_or_else(|_| lock.policy.autonomy.clone()),
     );
@@ -1710,8 +1522,6 @@ async fn main() -> Result<()> {
     };
     tracing::info!(model = %model_name, mode, "medha session start");
 
-    // Editor bridge mode: hand the whole session to the ACP loop over stdio and
-    // return when the editor disconnects. Takes priority over TUI/headless.
     if let Some(bridge) = acp_bridge {
         let surface_result = acp::run(
             kernel.clone(),
@@ -1737,9 +1547,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // No task on the command line → interactive session (full TUI by default,
-    // --plain for the scrolling REPL, usage if there's no terminal at all).
-    // A task always runs headless (scripting/CI).
     if !has_task {
         let surface_result = if let Some((tx, rx)) = tui_channel {
             tui_tea::run_tea(
@@ -1785,10 +1592,7 @@ async fn main() -> Result<()> {
             eprintln!("usage: medha \"<task>\"   (run `medha --setup` to reconfigure)");
             Ok(())
         };
-        // A backgrounded agent outlives the turn that spawned it, so leaving the
-        // session without settling it would let a child keep spending against the
-        // user's account with nothing watching. Its partial result is persisted
-        // on the way down, so what it had found is delivered next run.
+        // Shutdown persists partial child results before releasing the surface.
         if let Some(control) = &agent_control {
             control.shutdown().await;
         }
@@ -1802,19 +1606,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Headless one-shot: stream the run live via the sink, then a trailing
-    // newline. (Structured NDJSON output for CI is a separate `--json` mode.)
     let mut messages = session_transcript(system, resumed);
-    // Reports from agents an earlier run left behind. Delivery is durable, so a
-    // child that finished after its session ended is picked up here rather than
-    // only in the TUI.
     let mut taken: Vec<orchestrator::AgentResult> = Vec::new();
     if let Some(control) = &agent_control {
         taken = control.collect(session.id).await;
         for result in &taken {
-            // Labelled with what the child touched, exactly as the TUI does: a
-            // report is not the user speaking, and headless is where an
-            // unescalated consequential action is least likely to be noticed.
+            // Preserve the child's trust label; a report is not user speech.
             messages.push(
                 Message::new(
                     kernel::Role::User,
@@ -1858,8 +1655,7 @@ async fn main() -> Result<()> {
         Err(error) => Err(anyhow::anyhow!("headless run failed: {error}")),
     };
     if let Some(control) = &agent_control {
-        // After the run: the reports are in the log by then. Acknowledging at
-        // collection time lost them whenever the run that took them failed.
+        // Acknowledge only after the consuming turn is durable.
         if committed {
             control.settle(session.id, &taken).await;
         }
@@ -1874,19 +1670,7 @@ async fn main() -> Result<()> {
     outcome
 }
 
-/// Tool classes that require human approval, from `medha.lock`'s `[policy]
-/// approve` list, extended by MEDHA_APPROVE (comma list, with shortcuts:
-/// `all`, `writes`, `shell`, and `none`).
-///
-/// Secure-by-default per spec §4.7 (P5, blast-radius → verification): `shell.exec`
-/// is IRREVERSIBLE_LOCAL, so it is gated by the human/verifier by default — the
-/// deterministic scanner still hard-denies dangerous commands before that. Set
-/// `MEDHA_APPROVE=none` (or `[policy] autonomous = true` intent) to opt out for
-/// CI/headless autonomy, where the gate is `AutoDeny` and shell would otherwise
-/// be blocked entirely.
-/// `medha mcp add|list|remove` — manage MCP servers in the user config
-/// (`~/.medha/config.toml`). Secrets never touch a file: `--key` goes to the
-/// credential store and an environment value references it as `${key}`.
+/// Manage MCP server definitions and credentials.
 async fn run_mcp_command(args: Vec<String>) -> Result<()> {
     let mut cfg = config::load()?.unwrap_or_default();
     match args.first().map(String::as_str).unwrap_or("list") {
@@ -1956,13 +1740,8 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             }
         }
         "add" => {
-            // medha mcp add <id> [--url U [--bearer T | --oauth]] [--key K]
-            //   [--trust trusted] [--env K=V] [--allow-tool P] [--deny-tool P]
-            //   [--no-network] [--parallel] [--] <command>
             let parsed = config::parse_mcp_add_args(args[1..].iter().cloned())?;
             let (id, definition, key) = (parsed.id, parsed.server, parsed.key);
-            // After the definition exists: the credential is filed against what
-            // this server points at, so the target has to be known first.
             if let Some(k) = &key {
                 config::store_mcp_key(&id, &definition, k)?;
             }
@@ -1976,10 +1755,6 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                     ""
                 }
             );
-
-            // Connect once for immediate feedback. When the server answers with
-            // an OAuth challenge, run the browser flow right here rather than
-            // making the user discover a second command.
             print!("connecting… ");
             let _ = std::io::Write::flush(&mut std::io::stdout());
             let manager = one_shot_mcp(&id, &cfg)?;
@@ -2007,8 +1782,6 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             manager.shutdown().await;
         }
         "auth" => {
-            // Re-run the browser sign-in for a configured remote server, e.g.
-            // after revoking access or when the refresh token has expired.
             let id = args
                 .get(1)
                 .ok_or_else(|| anyhow::anyhow!("usage: medha mcp auth <id>"))?;
@@ -2028,7 +1801,6 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
             }
             manager.shutdown().await;
         }
-        // Park a server without losing its definition or credentials.
         subcommand @ ("enable" | "disable") => {
             let id = args
                 .get(1)
@@ -2048,8 +1820,6 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                 }
             );
         }
-        // Inspect and filter a server's catalogue: 52 tool schemas in every
-        // request is real context cost, so switching some off matters.
         "tools" => {
             let id = args.get(1).ok_or_else(|| {
                 anyhow::anyhow!("usage: medha mcp tools <id> [--on <tool>] [--off <tool>]")
@@ -2077,7 +1847,6 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
                 }
                 config::save(&cfg)?;
             }
-            // Connect to read the live catalogue; the filter is applied to it.
             let manager = one_shot_mcp(id, &cfg)?;
             manager.connect_startup().await;
             let tools = manager.server_tools(id);
@@ -2102,10 +1871,7 @@ async fn run_mcp_command(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// Where to get the servers Medha cannot fetch itself — those need a language
-/// toolchain rather than one command, and guessing wrong breaks a user's setup.
-/// The fetchable ones live in `lsp::install_recipe`, shared with the runtime so
-/// the CLI and the gated tool can never disagree about what would run.
+/// Installation guidance for servers without a safe one-command recipe.
 fn lsp_install_hint(id: &str) -> &'static str {
     match id {
         "clangd" => "install LLVM (brew install llvm, apt install clangd)",
@@ -2119,9 +1885,7 @@ fn lsp_install_hint(id: &str) -> &'static str {
     }
 }
 
-/// `medha lsp list|status|install` — which language servers this machine can
-/// actually run. Without this the only way to discover that code intelligence is
-/// silently unavailable is to notice that answers look like text matches.
+/// List, inspect, or install language servers.
 async fn run_lsp_command(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let lock = lockfile::MedhaLock::load(cwd.join("medha.lock"))?.unwrap_or_default();
@@ -2129,8 +1893,6 @@ async fn run_lsp_command(args: &[String]) -> Result<()> {
         enabled: lock.lsp.enabled,
         ..lsp::Config::default()
     };
-    // Project-defined servers replace a built-in of the same id, so the listing
-    // shows what would actually run rather than the defaults.
     for configured in &lock.lsp.servers {
         if configured.command.is_empty() || configured.languages.is_empty() {
             continue;
@@ -2158,7 +1920,6 @@ async fn run_lsp_command(args: &[String]) -> Result<()> {
             println!("language servers ({}):", config.servers.len());
             for adapter in &config.servers {
                 let program = adapter.command.first().cloned().unwrap_or_default();
-                // Counts Medha's own install directory, not just the shell PATH.
                 let installed = lsp::server_on_path(&program);
                 ready += usize::from(installed);
                 let extensions: Vec<&str> = adapter
@@ -2218,8 +1979,6 @@ async fn run_lsp_command(args: &[String]) -> Result<()> {
                     lsp_install_hint(id)
                 ));
             };
-            // Show it before running it: this executes a package manager, and the
-            // user should see exactly what runs and where it writes.
             println!("$ {runner} {}", arguments.join(" "));
             if let Some(into) = lsp::server_install_dir() {
                 println!("  installing into {}", into.display());
@@ -2245,8 +2004,7 @@ async fn run_lsp_command(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// A throwaway host holding exactly one configured server — used by the CLI for
-/// immediate connect/auth feedback, with no supervisor and no reconnect budget.
+/// Build a short-lived MCP manager for CLI connectivity checks.
 fn one_shot_mcp(id: &str, cfg: &config::Config) -> Result<mcp::McpManager> {
     let server = cfg
         .mcp
@@ -2266,8 +2024,7 @@ fn one_shot_mcp(id: &str, cfg: &config::Config) -> Result<mcp::McpManager> {
     ))
 }
 
-/// Run the interactive OAuth flow, printing the URL as the browser opens so a
-/// headless or restricted machine can still complete it.
+/// Run OAuth while also printing the URL for restricted terminals.
 async fn authorize_mcp(manager: &mcp::McpManager, id: &str) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let printer = tokio::spawn(async move {
@@ -2282,7 +2039,6 @@ async fn authorize_mcp(manager: &mcp::McpManager, id: &str) {
     let _ = printer.await;
 }
 
-/// Convert a lockfile LSP `settings` table to JSON; empty = server defaults.
 fn toml_table_to_json(table: &toml::Table) -> serde_json::Value {
     if table.is_empty() {
         serde_json::Value::Null
@@ -2295,10 +2051,7 @@ fn approve_list(base: Vec<String>) -> Vec<String> {
     approve_list_from(base, &std::env::var("MEDHA_APPROVE").unwrap_or_default())
 }
 
-/// The set with the override supplied rather than read.
-///
-/// Split so the decision is testable: reading the environment inside made every
-/// assertion about the default set depend on the machine running it.
+/// Resolve approval aliases from an explicit value for deterministic tests.
 fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
     let parts: Vec<&str> = raw
         .split(',')
@@ -2306,20 +2059,11 @@ fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Explicit autonomous escape hatch: no gating at all.
     if parts.contains(&"none") {
         return Vec::new();
     }
 
-    // Default: gate the one IRREVERSIBLE_LOCAL surface (shell), plus delegation,
-    // plus the lock file's list.
-    //
-    // Delegation sits beside shell rather than beside an edit. Its blast radius
-    // is `ReversibleLocal`, which is a true statement about *files* and the
-    // wrong reading of the action: what a spawn spends is tokens, several
-    // agents' worth, and cancelling a child refunds none of it. The radius enum
-    // has no axis for that, which is the same gap `agent.apply` needed its own
-    // rule to cover.
+    // Delegation is gated for irreversible token spend, not filesystem radius.
     let mut out = base;
     out.push("shell.exec".into());
     out.extend(["agent.spawn", "agent.followup"].map(String::from));
@@ -2337,12 +2081,10 @@ fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
     out
 }
 
-/// How much verifier output reaches the model. The tail, because that is where
-/// a failing build says what failed.
+/// Keep the verifier's diagnostic tail bounded.
 const VERIFY_MAX_OUTPUT: usize = 8_192;
 
-/// Deterministic verifier: runs a shell check (e.g. `cargo check`) in the
-/// workspace after edits and reports pass/fail (§4.7).
+/// Run the configured verification command after edits.
 struct CommandVerifier {
     command: String,
     dir: std::path::PathBuf,
@@ -2356,9 +2098,6 @@ impl kernel::Verifier for CommandVerifier {
         &self,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<kernel::VerifyReport> {
-        // Bounded in time and output, and group-reaped: this runs whatever the
-        // project's check command is, and an unbounded one wedges the gate
-        // while its orphaned compiler jobs hold the locks the retry needs.
         let out = match sandbox::run_shell_bounded_with(
             self.exec.as_ref(),
             &self.command,
@@ -2370,9 +2109,7 @@ impl kernel::Verifier for CommandVerifier {
         .await
         {
             Ok(out) => out,
-            // Configured means mandatory. Treating a missing shell, invalid
-            // cwd, or spawn failure as `None` is indistinguishable from
-            // "verification disabled" and silently waves a broken edit on.
+            // A configured verifier fails closed when it cannot start.
             Err(error) => {
                 return Some(kernel::VerifyReport {
                     ok: false,
@@ -2393,7 +2130,7 @@ impl kernel::Verifier for CommandVerifier {
     }
 }
 
-/// Terminal human gate: print the action + preview, prompt y/N (§4.7).
+/// Terminal approval prompt.
 struct TerminalGate;
 
 #[async_trait::async_trait]
@@ -2421,7 +2158,6 @@ impl kernel::HumanGate for TerminalGate {
                 }
             }
         }
-        // A trust-flow-escalated action is never remembered: offer only once/no.
         if escalated {
             print!("  [1] once  [3] no (default): ");
         } else {
@@ -2438,13 +2174,9 @@ impl kernel::HumanGate for TerminalGate {
     }
 }
 
-/// Clean live-output sink: streams text token-by-token, shows each tool call as
-/// one concise line (salient arg only, never a raw JSON dump), notes compaction,
-/// and records the provider's *real* token usage. Designed to read well during
-/// long runs (§4.13).
+/// Compact streaming output for the plain and headless surfaces.
 struct PrintSink {
-    /// Updated with the real prompt-token count from the provider (for the
-    /// REPL's live pressure meter). `None` in headless mode.
+    /// Last provider-reported prompt size for the REPL pressure meter.
     usage: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
@@ -2463,7 +2195,6 @@ impl kernel::StreamSink for PrintSink {
         let _ = std::io::stdout().flush();
     }
     fn reasoning(&self, delta: &str) {
-        // Dim italic so thinking is visually distinct from the final answer.
         print!("\x1b[2;3m{delta}\x1b[0m");
         let _ = std::io::stdout().flush();
     }
@@ -2471,8 +2202,6 @@ impl kernel::StreamSink for PrintSink {
         println!("\n⏺ {tool}{}", salient_arg(tool, args));
     }
     fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) {
-        // Edit → render the +/- diff; error → show it; otherwise a concise
-        // one-line output summary (in/out visibility, like the good agents).
         if let Some(diff) = payload.get("diff").and_then(|v| v.as_str()) {
             for line in diff.lines() {
                 if line.starts_with('+') && !line.starts_with("+++") {
@@ -2511,8 +2240,7 @@ impl kernel::StreamSink for PrintSink {
     }
 }
 
-/// The one input argument worth showing per tool (the "in"), so the surface
-/// reads clearly without dumping the whole args object.
+/// Pick one useful input value for a compact tool label.
 fn salient_arg(tool: &str, args: &serde_json::Value) -> String {
     let key = match tool {
         t if t.starts_with("fs.") => "path",
@@ -2521,17 +2249,11 @@ fn salient_arg(tool: &str, args: &serde_json::Value) -> String {
         "web.fetch" => "url",
         "read_artifact" => "hash",
         "grep" => "pattern",
-        // Skill rows read by their name; the description is prose and makes
-        // an unreadable label ("Save(Guidance for distinctive, intent…)").
         t if t.starts_with("skill.") => "name",
-        // What the agent was asked to do, not the shape its answer must take —
-        // without this the row labels itself with whichever string happens to
-        // come first, which was the contract.
         "agent.spawn" => "objective",
         "agent.cancel" | "agent.transcript" => "agent",
         _ => "",
     };
-    // Preferred key, else the first string argument as a fallback.
     let val = args.get(key).and_then(|v| v.as_str()).or_else(|| {
         args.as_object()
             .and_then(|o| o.values().find_map(|v| v.as_str()))
@@ -2546,7 +2268,6 @@ fn salient_arg(tool: &str, args: &serde_json::Value) -> String {
     }
 }
 
-/// A concise one-line summary of a tool's output (the "out").
 fn result_summary(tool: &str, p: &serde_json::Value) -> String {
     let u = |k: &str| p.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let s = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("");
@@ -2588,7 +2309,6 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
             }
         }
         "shell.exec" => {
-            // Show exit code + a peek at the first non-empty stdout line.
             let first = s("stdout")
                 .lines()
                 .find(|l| !l.trim().is_empty())
@@ -2605,16 +2325,8 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
     }
 }
 
-/// Detect pre-relocation runtime state in `<workspace>/.medha`, but never import
-/// it automatically.
-///
-/// A checkout is repository-controlled input. It can contain forged event
-/// chains or symlinks named `events.db`, `artifacts`, `logs`, or `trust.lock`.
-/// Moving any of those beneath machine-local state would turn untrusted
-/// repository data into an authority source and can redirect later SQLite,
-/// artifact, or log I/O outside the workspace. There is no reliable way to
-/// distinguish a legitimate old local directory from one supplied by a clone,
-/// so recovery must be an explicit, separately validated operator action.
+/// Detect legacy repository-local state without importing untrusted logs,
+/// artifacts, databases, or symlink targets into machine-local authority.
 fn warn_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
     let legacy = cwd.join(".medha");
     let runtime_entries = [
@@ -2628,9 +2340,7 @@ fn warn_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
     ];
     let found = runtime_entries
         .iter()
-        // `symlink_metadata` also detects dangling links without following
-        // them. Detection itself must not dereference repository-controlled
-        // paths.
+        // Detect dangling links without following repository-controlled paths.
         .filter(|name| std::fs::symlink_metadata(legacy.join(name)).is_ok())
         .copied()
         .collect::<Vec<_>>();
@@ -2646,7 +2356,6 @@ fn warn_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
     }
 }
 
-/// Print the workspace's past sessions (newest first) for `--sessions`.
 fn print_sessions(log: &store::SqliteLog) -> Result<()> {
     let sessions = log.list_sessions()?;
     if sessions.is_empty() {
@@ -2669,9 +2378,7 @@ fn print_sessions(log: &store::SqliteLog) -> Result<()> {
     Ok(())
 }
 
-/// Resolve `--continue` / `--resume <id>` into the session to reopen and its
-/// reconstructed conversation (projected from the event log). `None` when
-/// neither flag is set — a fresh session.
+/// Rebuild the requested session, or return `None` for a fresh start.
 async fn resolve_resume(
     log: &store::SqliteLog,
     cli: &Cli,
@@ -2690,8 +2397,6 @@ async fn resolve_resume(
     } else {
         return Ok(None);
     };
-    // `events()` is the EventLog trait method; call fully-qualified so the trait
-    // needn't be imported here.
     let events = kernel::EventLog::events(log, id).await;
     if events.is_empty() {
         anyhow::bail!("session {id} has no events (not found)");
@@ -2699,8 +2404,7 @@ async fn resolve_resume(
     Ok(Some((id, kernel::project_messages(&events))))
 }
 
-/// readline editing, history, and slash commands. The transcript accrues across
-/// turns, so compaction engages naturally on long sessions.
+/// Run the scrolling terminal session.
 #[allow(clippy::too_many_arguments)]
 async fn run_repl<P, L>(
     kernel: &Kernel<P, L>,
@@ -2723,12 +2427,9 @@ where
     let mut rl = DefaultEditor::new()?;
     let mut transcript = session_transcript(system, resumed);
 
-    // Real prompt-token count from the provider's last response (0 until the
-    // first turn). The pressure meter reflects this — actual tokens, not a guess.
     let usage = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     loop {
-        // Live context-pressure meter in the prompt, from real token usage.
         let actual = usage.load(std::sync::atomic::Ordering::Relaxed);
         let prompt_str = pressure_prompt(actual, max_ctx);
         match rl.readline(&prompt_str) {
@@ -2767,11 +2468,7 @@ where
                 }
 
                 transcript.push(Message::user(line));
-                // Output (streamed text, ⏺ tool lines, ↯ compaction) renders live
-                // through the sink, which also records real token usage.
                 let sink = PrintSink::tracking(usage.clone());
-                // Each user message is a fresh task → fresh budget contract,
-                // published for any children it delegates.
                 let budget = task_budget(&base_budget, &agent_budget);
                 match kernel
                     .run_session(session, transcript.clone(), budget, &sink, None)
@@ -2817,9 +2514,7 @@ fn print_help() {
     );
 }
 
-/// Apply a `/think` command against the live provider; returns the notice to
-/// show. Shared by the plain REPL and the full TUI. Unsupported controls are
-/// returned visibly by the provider rather than being silently ignored.
+/// Display label for a reasoning-effort setting.
 pub(crate) fn effort_label(e: Option<kernel::ReasoningEffort>) -> &'static str {
     match e {
         Some(kernel::ReasoningEffort::Minimal) => "minimal",
@@ -2830,9 +2525,7 @@ pub(crate) fn effort_label(e: Option<kernel::ReasoningEffort>) -> &'static str {
     }
 }
 
-/// `/think [on|off|status]` — enable/disable reasoning only. Effort level is
-/// a separate concern (`/effort`), since "on vs off" and "how hard" are
-/// different knobs some servers only partially support.
+/// Apply `/think`; reasoning effort remains a separate setting.
 fn apply_think_command<P: kernel::Provider>(provider: &P, args: &str) -> String {
     match args.trim() {
         "" | "status" => think_status(provider),
@@ -2874,10 +2567,7 @@ fn think_status<P: kernel::Provider>(provider: &P) -> String {
     )
 }
 
-/// `/effort [minimal|low|medium|high]` — set reasoning depth; also turns thinking on
-/// (an effort level only means anything once thinking is enabled). In the
-/// full TUI, calling this with no args opens an arrow-key picker instead of
-/// requiring the name to be typed.
+/// Set reasoning depth and enable reasoning.
 pub(crate) fn apply_effort_command<P: kernel::Provider>(provider: &P, args: &str) -> String {
     match args.trim() {
         "minimal" | "low" | "medium" | "high" => {
@@ -2904,9 +2594,7 @@ pub(crate) fn apply_effort_command<P: kernel::Provider>(provider: &P, args: &str
     }
 }
 
-/// Prompt string with a context-pressure gauge from the provider's *real* last
-/// prompt-token count, e.g. `medha [23% ctx]› `. Plain prompt until the first
-/// response reports usage (no fabricated number).
+/// Add provider-reported context pressure to the prompt when available.
 fn pressure_prompt(actual_tokens: u32, max_ctx: Option<u32>) -> String {
     match max_ctx {
         Some(mc) if actual_tokens > 0 => {
@@ -2950,9 +2638,6 @@ mod migration_tests {
         d
     }
 
-    /// Every old runtime entry is repository-controlled on first checkout.
-    /// None may cross into the machine-local state directory automatically,
-    /// even when the destination is empty.
     #[test]
     fn never_imports_repository_local_runtime_state() {
         let root = tmp();
@@ -3050,22 +2735,16 @@ mod approve_list_tests {
         approve_list_from(Vec::new(), override_)
     }
 
-    /// The policy only gates what is in the set, so the set is where delegation
-    /// being gated at all is decided.
     #[test]
     fn delegation_is_gated_out_of_the_box() {
         let approved = approved("");
         assert!(approved.contains(&"agent.spawn".to_string()));
         assert!(approved.contains(&"agent.followup".to_string()));
-        // Beside shell, because both spend and both reach outside this turn.
         assert!(approved.contains(&"shell.exec".to_string()));
     }
 
     #[test]
     fn messaging_and_listing_are_never_gated() {
-        // Reading the roster or passing a note to an agent costs nothing that
-        // needs a decision; a prompt there is noise that trains people to
-        // approve without looking.
         let approved = approved("");
         for free in ["agent.list", "agent.message", "agent.steer", "agent.wait"] {
             assert!(!approved.contains(&free.to_string()), "{free} was gated");
@@ -3075,5 +2754,64 @@ mod approve_list_tests {
     #[test]
     fn the_autonomous_escape_hatch_still_clears_everything() {
         assert!(approved("none").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod recent_write_tests {
+    use super::*;
+    use kernel::{Event, EventLog, Observation, Session, TrustLabel};
+    use serde_json::json;
+
+    async fn append_write(
+        log: &store::SqliteLog,
+        session: &Session,
+        path: &str,
+        ts: f64,
+    ) -> ulid::Ulid {
+        let observation = Observation::ok(
+            ulid::Ulid::new().to_string(),
+            json!({ "path": path, "snapshot": "snapshot" }),
+        );
+        let mut event = Event::tool_obs(session, &observation, TrustLabel::Tool);
+        event.ts = ts;
+        log.append(event).await.unwrap().id
+    }
+
+    #[tokio::test]
+    async fn recent_writes_orders_globally_before_applying_limit() {
+        let dir = std::env::temp_dir().join(format!("medha-recent-writes-{}", ulid::Ulid::new()));
+        let log = store::SqliteLog::open(dir.join("events.db")).unwrap();
+        let older_active_session = Session::new();
+        let newer_write_session = Session::new();
+
+        append_write(&log, &older_active_session, "old.txt", 1.0).await;
+        let newest = append_write(&log, &newer_write_session, "new.txt", 3.0).await;
+
+        let mut later_non_write = Event::user_message(&older_active_session, "still active");
+        later_non_write.ts = 4.0;
+        log.append(later_non_write).await.unwrap();
+
+        let writes = recent_writes(&log, 1).await;
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].id, newest);
+        assert_eq!(writes[0].path, "new.txt");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn recent_writes_does_not_assume_row_order_matches_timestamp_order() {
+        let dir = std::env::temp_dir().join(format!("medha-recent-writes-{}", ulid::Ulid::new()));
+        let log = store::SqliteLog::open(dir.join("events.db")).unwrap();
+        let session = Session::new();
+
+        let newest = append_write(&log, &session, "newest-by-time.txt", 10.0).await;
+        append_write(&log, &session, "later-row-older-time.txt", 1.0).await;
+
+        let writes = recent_writes(&log, 1).await;
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].id, newest);
+        assert_eq!(writes[0].path, "newest-by-time.txt");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -15,7 +15,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -37,6 +37,12 @@ type BoxReader = Box<dyn AsyncRead + Send + Unpin>;
 type BoxWriter = Box<dyn AsyncWrite + Send + Unpin>;
 type Pending = Arc<StdMutex<HashMap<i64, oneshot::Sender<Value>>>>;
 type ClientCell = Arc<OnceCell<Result<Arc<LspClient>, Arc<str>>>>;
+
+fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct ClientTransport {
     reader: BoxReader,
@@ -372,8 +378,34 @@ struct ClientEntry {
     cell: ClientCell,
     created_at: Instant,
     last_used: Instant,
+    /// Manager operations currently using this entry. LRU and idle retirement
+    /// must not shut a server down until the operation releases its lease.
+    active: Arc<AtomicUsize>,
     /// Consecutive failed (re)starts; caps the retry rate and parks past the limit.
     failures: u32,
+}
+
+struct ClientLease {
+    client: Arc<LspClient>,
+    _active: ActiveLease,
+}
+
+struct ActiveLease {
+    active: Arc<AtomicUsize>,
+}
+
+impl std::ops::Deref for ClientLease {
+    type Target = LspClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+impl Drop for ActiveLease {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Ceiling for the exponential restart backoff.
@@ -556,11 +588,8 @@ pub struct Diagnostic {
     pub data: Option<Value>,
 }
 
-/// Diagnostic identity ignores enrichment (related spans, tags, `data`,
-/// documentation link). Two diagnostics with the same span, severity, code,
-/// source, and message are the same finding, so dedup and introduced/resolved
-/// deltas key only on what the compiler reports as the error itself. Attaching
-/// this to equality also keeps line-shifted baselines matching across edits.
+/// Identity ignores enrichment: same span, severity, code, source and message is
+/// the same finding, which keeps line-shifted baselines matching across edits.
 impl PartialEq for Diagnostic {
     fn eq(&self, other: &Self) -> bool {
         self.range == other.range
@@ -793,11 +822,7 @@ impl LspManager {
         let path = normalize_path_from(&self.inner.workspace, path.as_ref());
         let (adapter, root, key) = self.resolve_start_server(&path, server_id)?;
         self.inner.approved_servers.lock().await.insert(key.clone());
-        // An explicit start is also the manual refresh: drop a parked entry so it
-        // starts clean. Without this, a server that exhausted its restart budget
-        // — a few transient crashes during a heavy build is enough — keeps
-        // returning its cached error for the rest of the session, with no way
-        // back short of restarting Medha.
+        // An explicit start resets a parked server's exhausted failure budget.
         let parked = {
             let mut clients = self.inner.clients.lock().await;
             match clients.get(&key) {
@@ -1137,7 +1162,13 @@ impl LspManager {
         let mut calls = Vec::new();
         for result in clients {
             match result {
-                Ok(client) => calls.push(operation(client)),
+                Ok(lease) => {
+                    let call = operation(Arc::clone(&lease.client));
+                    calls.push(async move {
+                        let _lease = lease;
+                        call.await
+                    });
+                }
                 Err(error) => reports.push(unavailable_query(error)),
             }
         }
@@ -1167,12 +1198,9 @@ impl LspManager {
             .any(|adapter| adapter_language_id(adapter, path).is_some())
     }
 
-    /// Every configured adapter and whether its binary is resolvable here.
-    ///
-    /// Running sessions alone cannot answer "why did this come back as a text
-    /// match" — servers start lazily, so an empty session list is equally
-    /// consistent with "nothing asked yet" and "nothing is installed". This
-    /// distinguishes them.
+    /// Every configured adapter and whether its binary resolves here. Servers
+    /// start lazily, so an empty session list cannot distinguish "nothing asked
+    /// yet" from "nothing installed"; this can.
     pub fn inventory(&self) -> Vec<ServerAvailability> {
         self.inner
             .config
@@ -1261,7 +1289,7 @@ impl LspManager {
         }
     }
 
-    async fn clients_for(&self, path: &Path) -> Vec<Result<Arc<LspClient>, Error>> {
+    async fn clients_for(&self, path: &Path) -> Vec<Result<ClientLease, Error>> {
         self.ensure_reaper();
         self.reap_idle().await;
         let resolved = match self.resolve_servers(path) {
@@ -1281,7 +1309,7 @@ impl LspManager {
         adapter: ServerAdapter,
         root: PathBuf,
         key: ClientKey,
-    ) -> Result<Arc<LspClient>, Error> {
+    ) -> Result<ClientLease, Error> {
         if adapter.requires_approval && !self.inner.approved_servers.lock().await.contains(&key) {
             return Err(Error::ApprovalRequired {
                 server: adapter.id,
@@ -1291,7 +1319,7 @@ impl LspManager {
         }
         let now = Instant::now();
         let mut evicted = None;
-        let (cell, retired) = {
+        let (cell, active, retired) = {
             let mut clients = self.inner.clients.lock().await;
             let config = &self.inner.config;
             // Replace a broken server only once its escalating backoff has elapsed;
@@ -1323,14 +1351,13 @@ impl LspManager {
             if !clients.contains_key(&key) && clients.len() >= config.max_servers {
                 let victim = clients
                     .iter()
-                    .filter(|(_, entry)| entry.cell.get().is_some())
+                    .filter(|(_, entry)| entry.active.load(Ordering::Acquire) == 0)
                     .min_by_key(|(_, entry)| entry.last_used)
                     .map(|(key, _)| key.clone());
                 match victim.and_then(|key| clients.remove(&key)) {
                     Some(entry) => evicted = Some(entry),
-                    // Every slot is held by a server still starting up; refusing
-                    // is right here, since evicting one would abort a spawn the
-                    // caller is waiting on.
+                    // Leased slots cannot be evicted. An unleased unfinished
+                    // startup is a cancelled attempt and can be reclaimed.
                     None => return Err(Error::Capacity(config.max_servers)),
                 }
             }
@@ -1338,11 +1365,15 @@ impl LspManager {
                 cell: Arc::new(OnceCell::new()),
                 created_at: now,
                 last_used: now,
+                active: Arc::new(AtomicUsize::new(0)),
                 failures: next_failures,
             });
             entry.last_used = now;
-            (Arc::clone(&entry.cell), retired)
+            // Acquire the lease under the map lock so eviction cannot race it.
+            entry.active.fetch_add(1, Ordering::AcqRel);
+            (Arc::clone(&entry.cell), Arc::clone(&entry.active), retired)
         };
+        let active_lease = ActiveLease { active };
         // Shut the outgoing servers down outside the map lock — both the broken
         // one being replaced and any evicted to make room.
         for entry in [retired, evicted].into_iter().flatten() {
@@ -1359,10 +1390,13 @@ impl LspManager {
                     .map_err(|error| Arc::<str>::from(error.to_string()))
             })
             .await;
-        result
-            .as_ref()
-            .cloned()
-            .map_err(|error| Error::Protocol(error.to_string()))
+        match result {
+            Ok(client) => Ok(ClientLease {
+                client: Arc::clone(client),
+                _active: active_lease,
+            }),
+            Err(error) => Err(Error::Protocol(error.to_string())),
+        }
     }
 
     fn resolve_start_server(
@@ -1835,6 +1869,7 @@ async fn reap_idle_inner(inner: &Arc<ManagerInner>) {
             .filter_map(|(key, entry)| {
                 let ready = matches!(entry.cell.get(), Some(Ok(_)));
                 (ready
+                    && entry.active.load(Ordering::Acquire) == 0
                     && now.saturating_duration_since(entry.last_used) >= inner.config.idle_timeout)
                     .then(|| key.clone())
             })
@@ -1933,6 +1968,7 @@ impl LspClient {
             &sandbox_config,
             Vec::new(),
             sandbox::ApprovedRoots::default(),
+            sandbox::NetworkGrant::default(),
         );
         if !config.allow_network && backend.label() == "host" {
             return Err(Error::Sandbox(
@@ -1946,6 +1982,8 @@ impl LspClient {
             cwd: root.clone(),
             env: language_server_environment(),
             clear_env: true,
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
         };
         let mut command = backend
             .build_command(&request)
@@ -2316,10 +2354,7 @@ impl LspClient {
                 .map(|document| document.version)
         };
         if let Some(version) = cached_version {
-            let cached = self
-                .diagnostics
-                .lock()
-                .expect("diagnostics lock poisoned")
+            let cached = lock_unpoisoned(&self.diagnostics)
                 .get(&protocol_path(path))
                 .filter(|snapshot| {
                     snapshot
@@ -2429,10 +2464,7 @@ impl LspClient {
                 break;
             };
             documents.remove(&victim);
-            self.diagnostics
-                .lock()
-                .expect("diagnostics lock poisoned")
-                .remove(&protocol_path(&victim));
+            lock_unpoisoned(&self.diagnostics).remove(&protocol_path(&victim));
             if let Ok(uri) = file_uri(&victim) {
                 let _ = self
                     .notify(
@@ -2678,7 +2710,7 @@ impl LspClient {
         sequence: u64,
         version: i64,
     ) -> Option<DiagnosticSnapshot> {
-        let diagnostics = self.diagnostics.lock().expect("diagnostics lock poisoned");
+        let diagnostics = lock_unpoisoned(&self.diagnostics);
         diagnostics.get(&protocol_path(path)).and_then(|snapshot| {
             let fresh_sequence = snapshot.sequence > sequence;
             let fresh_version = snapshot
@@ -2697,30 +2729,21 @@ impl LspClient {
     ) -> Result<Value, Error> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("pending request lock poisoned")
-            .insert(id, sender);
+        lock_unpoisoned(&self.pending).insert(id, sender);
         if let Err(error) = self
             .send(json!({
                 "jsonrpc": "2.0", "id": id, "method": method, "params": params
             }))
             .await
         {
-            self.pending
-                .lock()
-                .expect("pending request lock poisoned")
-                .remove(&id);
+            lock_unpoisoned(&self.pending).remove(&id);
             return Err(error);
         }
         let response = match timeout(duration, receiver).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => return Err(Error::Disconnected),
             Err(_) => {
-                self.pending
-                    .lock()
-                    .expect("pending request lock poisoned")
-                    .remove(&id);
+                lock_unpoisoned(&self.pending).remove(&id);
                 let _ = self.notify("$/cancelRequest", json!({ "id": id })).await;
                 return Err(Error::Timeout(method));
             }
@@ -2890,10 +2913,7 @@ async fn reader_loop(reader: BoxReader, state: ReaderState) {
         };
         if message.get("method").is_none()
             && let Some(id) = message.get("id").and_then(Value::as_i64)
-            && let Some(sender) = pending
-                .lock()
-                .expect("pending request lock poisoned")
-                .remove(&id)
+            && let Some(sender) = lock_unpoisoned(&pending).remove(&id)
         {
             let _ = sender.send(message.clone());
         }
@@ -2971,24 +2991,18 @@ async fn reader_loop(reader: BoxReader, state: ReaderState) {
             let parsed = parse_diagnostics(items);
             let next = sequence.fetch_add(1, Ordering::AcqRel) + 1;
             let version = params.get("version").and_then(Value::as_i64);
-            diagnostics
-                .lock()
-                .expect("diagnostics lock poisoned")
-                .insert(
-                    normalize_path(&path),
-                    DiagnosticSnapshot {
-                        sequence: next,
-                        version,
-                        diagnostics: parsed,
-                    },
-                );
+            lock_unpoisoned(&diagnostics).insert(
+                normalize_path(&path),
+                DiagnosticSnapshot {
+                    sequence: next,
+                    version,
+                    diagnostics: parsed,
+                },
+            );
             diagnostic_notify.notify_waiters();
         }
     }
-    pending
-        .lock()
-        .expect("pending request lock poisoned")
-        .clear();
+    lock_unpoisoned(&pending).clear();
     alive.store(false, Ordering::Release);
     kill_process_group(process_group.swap(0, Ordering::AcqRel));
 }
@@ -3785,12 +3799,9 @@ fn server_install_hint(server: &str) -> String {
     .to_string()
 }
 
-/// Packages Medha can fetch for a server, as `(fetcher, args…)`. Only servers
-/// with one unambiguous recipe appear — anything needing a language toolchain is
-/// left to the toolchain, because guessing wrong there breaks a user's setup.
-///
-/// This is metadata, not payload: the servers are downloaded at run time into
-/// Medha's own directory and nothing is bundled into the binary.
+/// Packages Medha can fetch for a server, as `(fetcher, args…)`. Only servers with
+/// one unambiguous recipe; anything needing a language toolchain is left to it.
+/// Metadata only — servers download at run time, nothing is bundled.
 pub fn install_recipe(server: &str) -> Option<&'static [&'static str]> {
     Some(match server {
         "typescript-language-server" => {
@@ -3859,6 +3870,16 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncWrite, duplex, split};
     use tokio::process::Command;
+
+    #[test]
+    fn protocol_state_locks_recover_after_poisoning() {
+        let state = StdMutex::new(7_u8);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.lock().unwrap();
+            panic!("poison fixture");
+        }));
+        assert_eq!(*lock_unpoisoned(&state), 7);
+    }
 
     fn fake_languages() -> HashMap<String, String> {
         HashMap::from([("rs".to_string(), "rust".to_string())])
@@ -4809,7 +4830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_clients_are_reaped_and_removed_from_status() {
+    async fn idle_clients_are_reaped_only_after_in_flight_work_finishes() {
         let directory = tempdir().unwrap();
         let (client_stream, server_stream) = duplex(1024);
         drop(server_stream);
@@ -4845,6 +4866,7 @@ mod tests {
         );
         let cell = Arc::new(OnceCell::new());
         assert!(cell.set(Ok(client)).is_ok());
+        let active = Arc::new(AtomicUsize::new(1));
         manager.inner.clients.lock().await.insert(
             ClientKey {
                 server: "fake-rust-analyzer".into(),
@@ -4854,11 +4876,154 @@ mod tests {
                 cell,
                 created_at: Instant::now(),
                 last_used: Instant::now(),
+                active: Arc::clone(&active),
                 failures: 0,
             },
         );
 
+        assert_eq!(
+            manager.status().await.len(),
+            1,
+            "an expired entry must stay live while a request holds its lease"
+        );
+        active.fetch_sub(1, Ordering::AcqRel);
         assert!(manager.status().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lru_capacity_never_evicts_an_in_flight_entry() {
+        let directory = tempdir().unwrap();
+        let manager = LspManager::new(
+            directory.path().to_path_buf(),
+            Config {
+                max_servers: 1,
+                ..Config::default()
+            },
+        );
+        let occupied_key = ClientKey {
+            server: "occupied".into(),
+            root: directory.path().to_path_buf(),
+        };
+        let cell = Arc::new(OnceCell::new());
+        assert!(cell.set(Err(Arc::<str>::from("fixture"))).is_ok());
+        manager.inner.clients.lock().await.insert(
+            occupied_key.clone(),
+            ClientEntry {
+                cell,
+                created_at: Instant::now(),
+                last_used: Instant::now() - Duration::from_secs(60),
+                active: Arc::new(AtomicUsize::new(1)),
+                failures: 0,
+            },
+        );
+
+        let adapter = missing_adapter();
+        let requested_key = ClientKey {
+            server: adapter.id.clone(),
+            root: directory.path().join("other-root"),
+        };
+        assert!(matches!(
+            manager
+                .client_for_resolved(adapter, requested_key.root.clone(), requested_key)
+                .await,
+            Err(Error::Capacity(1))
+        ));
+        assert!(
+            manager
+                .inner
+                .clients
+                .lock()
+                .await
+                .contains_key(&occupied_key),
+            "capacity pressure must leave the leased entry installed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capacity_reclaims_a_slot_left_by_a_cancelled_startup() {
+        let directory = tempdir().unwrap();
+        let manager = LspManager::new(
+            directory.path().to_path_buf(),
+            Config {
+                max_servers: 1,
+                startup_timeout: Duration::from_secs(60),
+                // Permit the host fallback on platforms without a native
+                // sandbox; this fixture never performs network I/O.
+                allow_network: true,
+                ..Config::default()
+            },
+        );
+        let mut stalled = ServerAdapter::rust_analyzer();
+        stalled.id = "stalled".into();
+        stalled.command = vec!["/bin/sh".into(), "-c".into(), "exec /bin/sleep 60".into()];
+        let stalled_key = ClientKey {
+            server: stalled.id.clone(),
+            root: directory.path().to_path_buf(),
+        };
+
+        let starting_manager = manager.clone();
+        let starting_key = stalled_key.clone();
+        let starting_root = directory.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            starting_manager
+                .client_for_resolved(stalled, starting_root, starting_key)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let is_starting = manager
+                    .inner
+                    .clients
+                    .lock()
+                    .await
+                    .get(&stalled_key)
+                    .is_some_and(|entry| {
+                        entry.cell.get().is_none() && entry.active.load(Ordering::Acquire) == 1
+                    });
+                if is_starting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stalled server should occupy its startup slot");
+
+        task.abort();
+        let _ = task.await;
+        assert!(
+            manager
+                .inner
+                .clients
+                .lock()
+                .await
+                .get(&stalled_key)
+                .is_some_and(|entry| {
+                    entry.cell.get().is_none() && entry.active.load(Ordering::Acquire) == 0
+                }),
+            "cancellation should leave an unleased, uninitialized slot"
+        );
+
+        let replacement = missing_adapter();
+        let replacement_key = ClientKey {
+            server: replacement.id.clone(),
+            root: directory.path().join("replacement-root"),
+        };
+        let result = manager
+            .client_for_resolved(
+                replacement,
+                replacement_key.root.clone(),
+                replacement_key.clone(),
+            )
+            .await;
+        assert!(
+            !matches!(result, Err(Error::Capacity(1))),
+            "a cancelled startup must not permanently consume capacity"
+        );
+        let clients = manager.inner.clients.lock().await;
+        assert!(!clients.contains_key(&stalled_key));
+        assert!(clients.contains_key(&replacement_key));
     }
 
     /// The two tests below drive real language servers, so what they prove
@@ -4914,14 +5079,8 @@ mod tests {
             "pub fn target() -> i32 { 1 }\n\npub fn caller() -> i32 { target() + missing_name }\n";
         let path = directory.path().join("src/lib.rs");
         std::fs::write(&path, source).unwrap();
-        // rust-analyzer must load the sysroot and run `cargo metadata` before it
-        // reports anything, and it answers requests with an empty set until that
-        // finishes. A 30s budget is ample on a developer machine (~4s) but not on
-        // a shared 2-core CI runner executing the rest of the suite in parallel,
-        // where a cold load legitimately exceeds it — and a premature timeout
-        // reads as "no diagnostics", which is indistinguishable from a real
-        // regression. Budget for the slow machine; the assertion below is what
-        // catches an actually broken toolchain.
+        // rust-analyzer returns an empty set while loading the sysroot and Cargo
+        // metadata, which can take longer on a shared CI runner.
         let manager = LspManager::new(
             directory.path().to_path_buf(),
             Config {

@@ -1,17 +1,6 @@
-//! Writer isolation (§6.4) — a child that modifies code gets its own checkout.
-//!
-//! Read-only children may share the parent's tree; writers may not. Two agents
-//! editing one working tree collide through files, the index and cwd, and the
-//! damage is silent: whichever wrote last wins and neither knows. So a writer is
-//! given a `git worktree` cut from the parent's HEAD, works only there, and
-//! returns a patch. Nothing it does touches the parent's tree until a human
-//! approves the merge.
-//!
-//! Two writers cannot share a worktree *structurally*: the path is derived from
-//! the child's session ULID, and [`WorktreePool`] refuses a second lease on a
-//! path it already owns. Reaping is a [`Drop`] responsibility plus a sweep at
-//! startup — the same reap-on-drop discipline the MCP and LSP managers use,
-//! because an orphaned worktree wedges the next `git worktree add` on that path.
+//! Writer isolation through per-child Git worktrees. Repository-wide locks and
+//! owner markers prevent concurrent processes from sharing or reaping a live
+//! checkout; drop and startup cleanup remove abandoned checkouts.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -28,25 +17,19 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use ulid::Ulid;
 
-/// Branch prefix for agent worktrees. Namespaced so a sweep can recognise its
-/// own leftovers without guessing, and so `git branch` reads intelligibly.
 pub const BRANCH_PREFIX: &str = "medha/agent";
 
-/// Where the owning process is recorded for a checkout: a *sibling* of the
-/// worktree, never a file inside it. Anything inside is part of the child's
-/// tree and lands in its diff — an ownership marker would make every patch
-/// non-empty, including an idle child's.
+/// Where the owning process is recorded: a sibling of the worktree, never inside
+/// it — a file inside lands in the child's diff and makes every patch non-empty.
 fn owner_marker(worktree: &Path) -> PathBuf {
     let mut marker = worktree.as_os_str().to_os_string();
     marker.push(".owner");
     PathBuf::from(marker)
 }
 
-/// Rust's Windows `canonicalize` returns an extended-length (`\\?\\...`)
-/// spelling. The Win32 APIs accept that spelling, but Git for Windows does not
-/// consistently accept it as a `worktree add` destination on hosted runners.
-/// Keep the canonicalization (it prevents aliasing) while handing Git the
-/// ordinary drive/UNC spelling for paths that are within the normal path range.
+/// Windows `canonicalize` returns an extended-length (`\\?\`) spelling that Git
+/// for Windows rejects as a `worktree add` destination. Keep the canonicalization
+/// for anti-aliasing, but hand Git the ordinary drive/UNC spelling.
 #[cfg(windows)]
 fn git_worktree_path(path: PathBuf) -> PathBuf {
     let raw = path.to_string_lossy();
@@ -67,12 +50,8 @@ fn keep_marker(worktree: &Path) -> PathBuf {
     PathBuf::from(marker)
 }
 
-/// Whether this checkout holds work that exists nowhere else.
-///
-/// On disk rather than in memory, because the process that decided to keep it
-/// is usually gone by the time anything sweeps: the in-memory lease dies with
-/// it, and the next launch would read a live rescue as an abandoned directory
-/// and force it away — losing exactly what the rescue was for.
+/// Whether this checkout holds work that exists nowhere else. On disk, so it
+/// outlives the process and the next sweep does not force it away.
 fn keeps_work(worktree: &Path) -> bool {
     keep_marker(worktree).exists()
 }
@@ -187,14 +166,10 @@ fn windows_owner_alive(record: OwnerRecord) -> bool {
 
 /// Whether the process that claimed `worktree` is still running.
 ///
-/// A worktree is only abandoned if its owner is gone. Without this check a
-/// second Medha in the same repository reads another's live checkout as stale
-/// — it holds no lease for it — and removes it while a child is editing.
+/// A worktree is abandoned only when its owner is gone.
 fn owner_alive(worktree: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(owner_marker(worktree)) else {
-        // No marker: either a pre-existing checkout from before this mechanism,
-        // or a crash between `worktree add` and the write. Treated as abandoned,
-        // which is the same behaviour as before and safe for both.
+        // The structure lock prevents observing a live checkout before its marker.
         return false;
     };
     let Some(record) = parse_owner_record(&text) else {
@@ -218,10 +193,8 @@ fn owner_alive(worktree: &Path) -> bool {
     }
 }
 
-/// Cap on the diff handed back to the parent, in bytes. A patch past this is
-/// still returned whole to the caller — which owns the artifact store — but
-/// [`Patch::is_large`] flags it so the summary path can spill instead of
-/// flooding a context window.
+/// Cap on the diff handed to the parent, in bytes. Larger patches are still
+/// returned whole but flagged by [`Patch::is_large`] so the caller can spill.
 pub const LARGE_PATCH_BYTES: usize = 64 * 1024;
 /// Default hard ceiling for an extracted patch. A diff is duplicated into the
 /// result and durable event, so allowing it to grow with the checkout makes a
@@ -663,10 +636,9 @@ async fn repository_structure_lock_path(repo: &Path) -> Result<PathBuf, Worktree
     Ok(common.join("medha-worktrees.lock"))
 }
 
-/// Serialize Git's worktree registry and the matching owner markers across
-/// every Medha process using this repository, even when two instances use
-/// different `MEDHA_HOME` state roots. The lock lives in Git's common metadata
-/// directory, is crash-released by the OS, and is polled asynchronously.
+/// Serialize Git's worktree registry and owner markers across every Medha process
+/// on this repository, including ones with different `MEDHA_HOME` roots. Lives in
+/// Git's common metadata dir and is crash-released by the OS.
 async fn with_structure_lock<T, F, Fut>(lock_path: &Path, operation: F) -> Result<T, WorktreeError>
 where
     F: FnOnce() -> Fut,
@@ -702,18 +674,13 @@ where
     result
 }
 
-/// What a writer child hands back instead of a prose summary of its edits.
-///
-/// A summary of a change cannot be reviewed, verified or applied; a diff can.
-/// The verification evidence travels with it because a patch that has not been
-/// built is not a finished patch — §6.4 requires both, and the merge gate reads
-/// `verified` rather than trusting the child's account of itself.
+/// What a writer child hands back instead of prose: a diff plus the verification
+/// evidence the merge gate reads rather than trusting the child's account.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Patch {
     /// Unified diff against `base`, empty when the child changed nothing.
     pub diff: String,
-    /// The commit the worktree was cut from. A patch is only meaningful
-    /// relative to its base, and three-way merge needs it by name.
+    /// The commit the worktree was cut from; three-way merge needs it by name.
     pub base: String,
     /// Paths touched, for the merge preview and for conflict reporting.
     pub files: Vec<String>,
@@ -836,8 +803,8 @@ async fn cleanup_worktree(
 }
 
 impl Worktree {
-    /// Where the child works. Both its cwd and its sandbox root must be this —
-    /// if either still points at the parent, the isolation is decorative.
+    /// Both the child's cwd and its sandbox root must be this, or the isolation
+    /// is decorative.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -851,12 +818,8 @@ impl Worktree {
         &self.branch
     }
 
-    /// Everything the child changed, as a patch against its base.
-    ///
-    /// Untracked files are staged with `--intent-to-add` first: without it a
-    /// newly created file is invisible to `git diff`, and a child whose whole
-    /// job was to add a module would return an empty patch and look like it had
-    /// done nothing.
+    /// Everything the child changed, as a patch against its base. Untracked files
+    /// are staged with `--intent-to-add` first or `git diff` cannot see them.
     pub async fn patch(&self) -> Result<Patch, WorktreeError> {
         git(&self.path, &["add", "--all", "--intent-to-add", "."]).await?;
         let diff = git_bounded(
@@ -892,15 +855,8 @@ impl Worktree {
         })
     }
 
-    /// Remove the checkout and its branch. Idempotent, and safe to call before
-    /// the [`Drop`] guard runs — the pool lease is what makes the second call a
-    /// no-op rather than a spurious git failure.
     /// Lay a previous patch into this checkout, so a follow-up continues from
     /// where the agent left off.
-    ///
-    /// Without it a resumed writer starts from a clean HEAD and has to redo —
-    /// or silently discard — everything it had already done, which is the one
-    /// outcome a follow-up exists to avoid.
     pub async fn restore(&self, patch: &Patch) -> Result<(), WorktreeError> {
         if patch.is_empty() {
             return Ok(());
@@ -972,14 +928,10 @@ impl Worktree {
 }
 
 impl Drop for Worktree {
-    /// Last-resort cleanup for the paths `reap` never reaches — a panic, or a
-    /// run future dropped mid-cancellation. `Drop` cannot await, so it hands
-    /// removal to an owned Tokio task whose Git children retain the same
-    /// deadline/process-tree guarantees. Without a runtime it leaves the owner
-    /// marker intact for the next startup sweep instead of launching an
-    /// unbounded blocking subprocess.
+    /// Last-resort cleanup where `reap` never ran. Spawns a Tokio task since
+    /// `Drop` cannot await; with no runtime, leaves the marker for the next sweep.
     fn drop(&mut self) {
-        // Preserved: hold the lease as well as the directory. Releasing it would
+        // Hold the lease as well as the directory. Releasing it would
         // let this process's own sweep treat the checkout as abandoned and
         // force it away — the exact loss the flag exists to prevent.
         if self.preserved() || keeps_work(&self.path) {
@@ -1112,15 +1064,12 @@ impl WorktreePool {
 
             #[cfg(test)]
             if let Some(hook) = &self.checkout_hook {
-                // Deterministic coverage of the exact historical race: another
-                // pool starts sweeping after Git publishes the checkout but
-                // before this process publishes its owner marker.
                 hook.after_add.wait().await;
                 hook.release.wait().await;
             }
 
             // The cross-process lock spans Git registration through marker
-            // publication, so a sweep can never observe the old dangerous gap.
+            // publication, so a sweep cannot observe an unowned checkout.
             if let Err(error) = std::fs::write(owner_marker(&path), owner_record_text()) {
                 let _ = git(
                     &self.repo,
@@ -1267,11 +1216,9 @@ impl WorktreePool {
 pub enum MergeCheck {
     /// Applies cleanly.
     Clean,
-    /// Applies with three-way resolution — the base moved but the edits do not
-    /// overlap.
+    /// The base moved but the edits do not overlap.
     ThreeWay,
-    /// Overlapping edits. §6.4: this goes to reconciliation, never to
-    /// last-writer-wins.
+    /// Overlapping edits go to reconciliation, never last-writer-wins.
     Conflict,
     /// Nothing to apply.
     Empty,
@@ -1412,8 +1359,6 @@ mod tests {
         std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
     }
 
-    /// A real repository with one commit — worktrees are a git feature, so
-    /// faking git here would test nothing that matters.
     async fn repo() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -1464,17 +1409,12 @@ mod tests {
         assert_ne!(tree.path(), root);
         assert!(!tree.path().starts_with(&root));
         std::fs::write(tree.path().join("a.txt"), "one\nCHANGED\nthree\n").unwrap();
-        // The parent's tree is untouched — that is the whole point.
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "one\ntwo\nthree\n"
         );
     }
 
-    /// The `Drop` guard force-removes any checkout it still holds a lease for,
-    /// so merely declining to call `reap` was not enough to keep work whose
-    /// patch could not be captured — the directory went anyway, on a path with
-    /// no other copy of it.
     #[tokio::test]
     async fn a_preserved_checkout_survives_being_dropped() {
         let (_repo, root) = repo().await;
@@ -1485,22 +1425,16 @@ mod tests {
             tree.preserve();
             tree.path().to_path_buf()
         };
-        // The guard has run by now; give the detached remover a chance to as
-        // well, so this fails loudly if preservation is not honoured.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(path.exists(), "preserved checkout was removed anyway");
         assert_eq!(
             std::fs::read_to_string(path.join("a.txt")).unwrap(),
             "work nobody captured\n"
         );
-        // And the sweep must not take it either: the lease is deliberately held.
         pool.sweep().await;
         assert!(path.exists(), "sweep removed a preserved checkout");
     }
 
-    /// The rescue has to outlive the process that made it. A restart holds no
-    /// lease and reads a dead owner pid, so without an on-disk mark the next
-    /// launch sweeps away exactly the work the rescue existed to save.
     #[tokio::test]
     async fn a_preserved_checkout_survives_a_restart() {
         let (_repo, root) = repo().await;
@@ -1511,8 +1445,6 @@ mod tests {
             tree.preserve();
             tree.path().to_path_buf()
         };
-        // A second pool over the same directory is what the next launch has:
-        // no lease table, and an owner marker naming a process that is gone.
         std::fs::write(owner_marker(&path), dead_pid().to_string()).unwrap();
         let restarted = WorktreePool::new(&root, state.path().join("worktrees"));
         restarted.sweep().await;
@@ -1529,13 +1461,10 @@ mod tests {
         let (_state, pool) = pool(&root);
         let session = Ulid::new();
         let _first = pool.checkout(session).await.unwrap();
-        // Same session id is the only way to collide, and it is refused rather
-        // than handing a second writer the same directory.
         assert!(matches!(
             pool.checkout(session).await,
             Err(WorktreeError::AlreadyLeased(_))
         ));
-        // Distinct children always get distinct paths.
         let other = pool.checkout(Ulid::new()).await.unwrap();
         assert_ne!(other.path(), _first.path());
     }
@@ -1551,8 +1480,6 @@ mod tests {
         let patch = tree.patch().await.unwrap();
         assert!(!patch.is_empty());
         assert!(patch.diff.contains("EDITED"));
-        // Without intent-to-add a created file is invisible to `git diff`, and a
-        // child that only added a module would report having done nothing.
         assert!(patch.diff.contains("fn added"));
         assert!(patch.files.contains(&"a.txt".to_string()));
         assert!(patch.files.contains(&"new.rs".to_string()));
@@ -1590,8 +1517,6 @@ mod tests {
         std::fs::write(tree.path().join("a.txt"), "one\ntwo\nthree\nfrom-child\n").unwrap();
         let patch = tree.patch().await.unwrap();
 
-        // The parent kept working while the child ran — the usual case, not an
-        // edge one. A strict apply would reject this.
         std::fs::write(root.join("b.txt"), "parent moved on\n").unwrap();
         git(&root, &["add", "."]).await.unwrap();
         git(&root, &["commit", "-m", "parent"]).await.unwrap();
@@ -1616,14 +1541,11 @@ mod tests {
         std::fs::write(tree.path().join("a.txt"), "one\nCHILD\nthree\n").unwrap();
         let patch = tree.patch().await.unwrap();
 
-        // The parent rewrote the same line the child did.
         std::fs::write(root.join("a.txt"), "one\nPARENT\nthree\nplus\n").unwrap();
         git(&root, &["add", "."]).await.unwrap();
         git(&root, &["commit", "-m", "parent edit"]).await.unwrap();
 
         assert_eq!(check(&root, &patch).await, MergeCheck::Conflict);
-        // Never last-writer-wins: the merge is refused and the tree is left as
-        // the parent had it.
         assert!(merge(&root, &patch).await.is_err());
         assert!(
             std::fs::read_to_string(root.join("a.txt"))
@@ -1645,15 +1567,11 @@ mod tests {
         git(&root, &["commit", "-m", "parent edit"]).await.unwrap();
         let before = std::fs::read_to_string(root.join("a.txt")).unwrap();
 
-        // `git apply --3way --check` is not a dry run: it writes conflict
-        // markers into the working tree and *exits zero*. Checking twice would
-        // have left the file mangled and reported the patch as mergeable.
         for _ in 0..2 {
             assert_eq!(check(&root, &patch).await, MergeCheck::Conflict);
         }
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), before);
         assert!(!before.contains("<<<<<<<"));
-        // The index is untouched too — the check runs against a scratch copy.
         assert!(
             git(&root, &["status", "--porcelain"])
                 .await
@@ -1696,8 +1614,6 @@ mod tests {
         tree.reap().await;
 
         assert!(!path.exists());
-        // The lease is released with the directory, so the same id can be
-        // leased again — an orphaned lease would wedge it forever.
         assert!(pool.checkout(session).await.is_ok());
     }
 
@@ -1707,11 +1623,6 @@ mod tests {
         let (state, pool) = pool(&root);
         let leaked = pool.checkout(Ulid::new()).await.unwrap();
         let path = leaked.path().to_path_buf();
-        // Forget the guard: exactly what a crash does — the registration and the
-        // directory survive with nothing left to clean them up. The owner marker
-        // has to name a dead process too, since a real crash is followed by a
-        // *new* process with a different pid; leaving this one's pid there would
-        // be simulating a crash that somehow kept running.
         std::mem::forget(leaked);
         std::fs::write(owner_marker(&path), dead_pid().to_string()).unwrap();
         assert!(path.exists());
@@ -1719,7 +1630,6 @@ mod tests {
         let fresh = WorktreePool::new(&root, state.path().join("worktrees"));
         fresh.sweep().await;
         assert!(!path.exists());
-        // And the next run of the same agent is not blocked by the leftovers.
         assert!(
             git(&root, &["branch", "--list", &format!("{BRANCH_PREFIX}/*")])
                 .await
@@ -1728,8 +1638,6 @@ mod tests {
         );
     }
 
-    /// A pid that has certainly exited: spawn something trivial and reap it.
-    /// Inventing a large number would be a guess that some CI box falsifies.
     fn dead_pid() -> u32 {
         #[cfg(windows)]
         let mut child = std::process::Command::new("cmd.exe")
@@ -1817,10 +1725,6 @@ mod tests {
         );
     }
 
-    /// Two Medha processes in one repository is ordinary — two terminals. The
-    /// lease table is per-process, so without an on-disk owner the second one
-    /// reads the first's live checkout as abandoned and force-removes it, taking
-    /// the child's uncommitted work with it.
     #[tokio::test]
     async fn a_sweep_leaves_another_live_medhas_worktree_alone() {
         let (_repo, root) = repo().await;
@@ -1829,8 +1733,6 @@ mod tests {
         let path = theirs.path().to_path_buf();
         std::fs::write(path.join("work-in-progress.txt"), "half an edit").unwrap();
 
-        // A different process: no lease for this path, and it must still refuse
-        // to touch it because the owner is alive.
         let other = WorktreePool::new(&root, state.path().join("worktrees"));
         other.sweep().await;
 
@@ -1844,10 +1746,6 @@ mod tests {
         );
     }
 
-    /// A repository-wide OS lock must cover the exact interval between Git
-    /// publishing a worktree and Medha publishing its owner marker. This uses a
-    /// second test-harness process, not merely another pool in this process, so
-    /// it proves the cross-process contract that failed in AUD-028.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cross_process_sweep_cannot_enter_the_add_marker_gap() {
         const ROOT_ENV: &str = "MEDHA_TEST_SWEEP_ROOT";
@@ -1884,8 +1782,6 @@ mod tests {
             tokio::spawn(async move { pool.checkout(Ulid::new()).await })
         };
 
-        // Checkout now holds the cross-process lock immediately after
-        // `git worktree add`, before writing the owner marker.
         if tokio::time::timeout(Duration::from_secs(10), after_add.wait())
             .await
             .is_err()
@@ -1913,8 +1809,6 @@ mod tests {
                 "--nocapture",
             ])
             .env(ROOT_ENV, &root)
-            // A distinct state root proves the lock is repository-wide rather
-            // than accidentally coordinating only one MEDHA_HOME.
             .env(STATE_ENV, &other_state_dir)
             .env(STARTED_ENV, &started)
             .env(DONE_ENV, &done)
@@ -1937,7 +1831,6 @@ mod tests {
             "second process swept while checkout lacked its owner marker"
         );
 
-        // Marker publication completes while the same lock is still held.
         release.wait().await;
         let tree = tokio::time::timeout(Duration::from_secs(10), checkout)
             .await
@@ -2045,9 +1938,7 @@ mod tests {
         .expect("fake Git process did not start");
         run.abort();
         let _ = run.await;
-        // The production supervisor itself permits a full settle grace. Give
-        // this observation a scheduling margin instead of racing the exact
-        // same five-second boundary under a busy all-targets test run.
+        // Allow scheduling margin beyond the supervisor's settle grace.
         let observation_deadline = GIT_SETTLE_TIMEOUT + Duration::from_secs(5);
         let _permit = tokio::time::timeout(observation_deadline, completion.acquire())
             .await
@@ -2087,8 +1978,6 @@ mod tests {
     #[tokio::test]
     async fn a_non_repository_is_refused_rather_than_silently_unisolated() {
         let dir = tempfile::tempdir().unwrap();
-        // Degrading to "write in the parent's tree" here would be the one
-        // outcome writer isolation exists to prevent.
         assert!(matches!(
             WorktreePool::discover(dir.path(), dir.path().join("wt")).await,
             Err(WorktreeError::NotARepo(_))

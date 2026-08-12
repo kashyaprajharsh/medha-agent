@@ -1,21 +1,7 @@
-//! Execution backends behind one interface (§4.8). Shell / build / VCS commands
-//! run through an `ExecBackend` so isolation is a swappable *policy*, not a
-//! hardcoded call:
-//!
-//! - [`HostBackend`] runs the command directly on the host (the historical
-//!   behavior; the fallback for platforms without a native sandbox).
-//! - [`SeatbeltBackend`] (macOS) confines the command with the OS-native
-//!   sandbox (`/usr/bin/sandbox-exec`) — filesystem writes jailed to the
-//!   workspace + temp, network optionally denied — with **zero external
-//!   dependencies** (no Docker, no daemon) — the standard OS-native isolation
-//!   approach for local coding agents on macOS.
-//!
-//! Container / microVM / ssh backends slot in here later behind the same trait
-//! (the opt-in "heavy" isolation tier); a Linux Landlock backend is the next
-//! native addition.
+//! Swappable host, native, container, and SSH command-execution backends.
 
 use async_trait::async_trait;
-use permissions::ApprovedRoots;
+use permissions::{ApprovedRoots, NetworkGrant};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +18,13 @@ pub struct ExecRequest {
     /// `shell.exec` so injected secrets (API keys) never reach an arbitrary
     /// command. Fixed-program tools (git, diagnostics) inherit the env instead.
     pub clear_env: bool,
+    /// Read roots granted for this invocation only. These are deliberately
+    /// carried by the request rather than published through [`ApprovedRoots`],
+    /// so an "allow once" answer cannot leak into a concurrent command.
+    pub read_roots: Vec<PathBuf>,
+    /// Write roots granted for this invocation only. A write root also implies
+    /// read access in native backends, but disappears with this request.
+    pub write_roots: Vec<PathBuf>,
 }
 
 /// The result of running a command. Mirrors `std::process::Output` but with the
@@ -131,11 +124,8 @@ impl Default for SandboxConfig {
 
 #[async_trait]
 pub trait ExecBackend: Send + Sync {
-    /// Build the fully jail-configured command (program/args/env + any wrapping:
-    /// `sandbox-exec`, Landlock `pre_exec`, `docker run`, `ssh`) — but do NOT
-    /// spawn it. `run` and the background-task facility both spawn through
-    /// [`spawn_and_wait`] / [`spawn_background`], so isolation is applied in one
-    /// place and the same jailed command can run in the foreground or background.
+    /// Build the fully jail-configured command without spawning it, so isolation
+    /// is applied in one place for both foreground and background runs.
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError>;
 
     /// Run a command to completion (foreground). Default: build + supervise, so a
@@ -150,6 +140,58 @@ pub trait ExecBackend: Send + Sync {
     fn containment(&self) -> kernel::Containment {
         kernel::Containment::None
     }
+    /// Whether this backend was configured to deny network for `req`. Deliberately
+    /// not `containment()`, which Landlock under-reports by design: this answers
+    /// only "did we ask for deny", which the failure-driven retry needs and which
+    /// is knowable from config without probing enforcement. Defaults to false, so
+    /// unsandboxed backends never offer a grant they cannot honour.
+    fn denies_network(&self, _req: &ExecRequest) -> bool {
+        false
+    }
+}
+
+/// Curated resolver/socket failure markers. DNS libraries report the same text
+/// for a real lookup failure and for an OS policy rejection, so a match is only
+/// evidence, never proof — the caller gates it behind `denies_network` and bounds
+/// the retry to a single prompt.
+const NETWORK_DENIAL_MARKERS: &[&str] = &[
+    "enotfound",
+    "eai_again",
+    "enetunreach",
+    "ehostunreach",
+    // npm/node/curl/git DNS failures all surface a resolver call by name.
+    "getaddrinfo",
+    "could not resolve host",
+    "could not resolve proxy",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "network is unreachable",
+    "network is down",
+    "no route to host",
+    // Deliberately NOT "operation not permitted": that is the filesystem-denial
+    // signature, and matching it here would offer a network grant for an fs jail
+    // block. Nor bare "failed to connect", which a down local service produces
+    // just as readily as a denied socket. DNS and routing markers keep the two
+    // escalations disjoint and keep false cards off a healthy box.
+];
+
+/// True when output under a net-denying jail looks like a policy-blocked network
+/// attempt. `denies_network` is the backend's config intent (did we ask for
+/// deny), not proof of enforcement — the failure itself is the proof, so no
+/// kernel probe is needed.
+///
+/// The exit code is deliberately ignored: agents routinely mask it behind pipes
+/// (`| tail`), a trailing `echo`, or `|| true`, so a zero exit is no evidence the
+/// command succeeded. A resolver/socket-failure marker under a net-denying box is
+/// the signal on its own.
+pub fn network_denial_signature(stdout: &str, stderr: &str, denies_network: bool) -> bool {
+    if !denies_network {
+        return false;
+    }
+    let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    NETWORK_DENIAL_MARKERS
+        .iter()
+        .any(|marker| output.contains(marker))
 }
 
 /// Build a `tokio` command applying cwd and environment policy. Isolation into
@@ -164,12 +206,8 @@ fn base_command(program: &str, args: &[String], req: &ExecRequest) -> tokio::pro
     cmd
 }
 
-/// Fires a `SIGKILL` at a whole process group when dropped while still armed.
-///
-/// The owned supervisor keeps this guard until it has observed the leader exit
-/// without reaping it, quiesced the group, reaped the leader, and joined both
-/// output pumps. If the runtime aborts that supervisor, the guard is the final
-/// synchronous backstop.
+/// Fires a `SIGKILL` at a whole process group when dropped while still armed —
+/// the synchronous backstop if the runtime aborts the supervisor.
 struct GroupReaper {
     pid: Option<u32>,
     armed: bool,
@@ -194,11 +232,8 @@ impl Drop for GroupReaper {
     }
 }
 
-/// Kill the command and descendants that still belong to it.
-///
-/// Unix commands are launched as process-group leaders. Windows has no
-/// `killpg`; `taskkill /T` is the platform fallback and is invoked by absolute
-/// System32 path so a workspace cannot shadow it with a different executable.
+/// Kill the command and descendants that still belong to it. Windows has no
+/// `killpg`, so `taskkill /T` is invoked by absolute path to resist shadowing.
 #[allow(unused_variables)]
 fn kill_process_tree(pid: u32) {
     #[cfg(unix)]
@@ -221,10 +256,8 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
-/// Put a command in its own process group (unix) and pipe stdout/stderr, so a
-/// spawned child can be supervised and group-killed. `kill_on_drop` is a
-/// per-caller choice: foreground runs set it (backstop for the leader);
-/// background tasks clear it (they must survive the handle being dropped).
+/// Put a command in its own process group (unix) and pipe stdout/stderr so it
+/// can be supervised and group-killed. Background tasks clear `kill_on_drop`.
 fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool) {
     #[cfg(unix)]
     cmd.process_group(0);
@@ -259,11 +292,8 @@ impl ShellOutcome {
 }
 
 /// Run `command` under the platform shell in `dir`, bounded in time and output.
-///
-/// The process is its own group leader and the run future is group-reaped on
-/// drop, so a timeout takes the whole tree — a bare `Command::output()` timeout
-/// leaves `sh`'s grandchildren (compiler jobs, dev servers) holding locks and
-/// ports, and the next attempt then hangs for the same reason.
+/// Group-reaped on drop, so a timeout takes the whole tree rather than leaving
+/// grandchildren holding locks and ports.
 ///
 pub async fn run_shell_bounded(
     command: &str,
@@ -275,12 +305,8 @@ pub async fn run_shell_bounded(
     run_shell_bounded_with(&HostBackend, command, dir, limit, max_output, cancel).await
 }
 
-/// Run a shell command through a configured execution backend, retaining the
-/// same timeout/output/process-tree guarantees as [`run_shell_bounded`].
-///
-/// This is the verifier path: build scripts and tests are workspace-controlled
-/// code, so they must execute under the same jail the editing tools use rather
-/// than escaping to an unconfined host shell.
+/// Run a shell command through a configured backend with the same guarantees as
+/// [`run_shell_bounded`]. The verifier path: build scripts run under the same jail.
 pub async fn run_shell_bounded_with(
     backend: &dyn ExecBackend,
     command: &str,
@@ -296,6 +322,8 @@ pub async fn run_shell_bounded_with(
         cwd: dir.to_path_buf(),
         env: Vec::new(),
         clear_env: false,
+        read_roots: Vec::new(),
+        write_roots: Vec::new(),
     };
     let cmd = backend.build_command(&request)?;
     run_command_bounded(cmd, limit, max_output, cancel).await
@@ -315,11 +343,9 @@ pub enum WinShell {
 }
 
 impl WinShell {
-    /// `/D` skips AutoRun registry hooks and `-NoProfile` skips the user
-    /// profile, so neither can inject into a command that was already approved.
-    /// The command itself is passed through untouched: the policy scanner reads
-    /// that same string before this wrapping happens, and the two must never
-    /// disagree about what is going to run.
+    /// `/D` and `-NoProfile` stop AutoRun hooks and user profiles injecting into
+    /// an approved command. The command string itself is passed through untouched
+    /// so it matches exactly what the policy scanner read.
     pub fn argv(&self, command: &str) -> (String, Vec<String>) {
         let s = |p: &PathBuf| p.display().to_string();
         match self {
@@ -346,11 +372,8 @@ pub struct WindowsShellCandidates {
     pub powershell: Option<PathBuf>,
 }
 
-/// Pick the interpreter, honouring an explicit override before any detection.
-///
-/// No detection cascade fits every machine, so `MEDHA_SHELL` wins outright: it
-/// is the one thing a user with an unusual setup can reach for without waiting
-/// on a release.
+/// Pick the interpreter. `MEDHA_SHELL` wins outright, so an unusual setup has an
+/// escape hatch that does not wait on a release.
 pub fn choose_windows_shell(c: &WindowsShellCandidates) -> WinShell {
     if let Some(p) = &c.override_shell {
         return classify_windows_shell(p);
@@ -367,10 +390,8 @@ pub fn choose_windows_shell(c: &WindowsShellCandidates) -> WinShell {
 /// Which interpreter a path *is*, so an override is invoked with the flags that
 /// binary actually understands rather than assumed to be one kind.
 pub fn classify_windows_shell(path: &Path) -> WinShell {
-    // Split on both separators rather than using `file_stem`, which only knows
-    // the *host* platform's separator — a Windows path can be classified while
-    // running elsewhere, and there it would read as one long filename and match
-    // nothing.
+    // Split on both separators: `file_stem` only knows the host's, so a Windows
+    // path classified elsewhere would read as one filename and match nothing.
     let name = path.to_string_lossy().to_ascii_lowercase();
     let name = name.rsplit(['/', '\\']).next().unwrap_or_default();
     match name.strip_suffix(".exe").unwrap_or(name) {
@@ -383,10 +404,8 @@ pub fn classify_windows_shell(path: &Path) -> WinShell {
     }
 }
 
-/// Git for Windows ships `bash.exe` beside `git.exe` but puts only `cmd\` on
-/// PATH, so a plain PATH lookup for bash misses it on a default install.
-/// Deriving it from `git.exe` needs neither configuration nor a hardcoded
-/// install location: `…\Git\cmd\git.exe` → `…\Git\bin\bash.exe`.
+/// Git for Windows puts only `cmd\` on PATH, so bash is derived from `git.exe`:
+/// `…\Git\cmd\git.exe` → `…\Git\bin\bash.exe`.
 pub fn bash_beside_git(git_exe: &Path) -> Option<PathBuf> {
     let git_root = git_exe.parent()?.parent()?;
     ["bin", "usr/bin"]
@@ -395,13 +414,8 @@ pub fn bash_beside_git(git_exe: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Whether a path is a shell that can actually be spawned.
-///
-/// `is_file()` alone is not enough on Windows: the Microsoft Store publishes
-/// zero-byte *app execution aliases* under `WindowsApps\` which satisfy it but
-/// cannot be executed. Accepting one is worse than finding nothing, because the
-/// PATH tier then reports success and the working absolute path below it is
-/// never tried.
+/// Whether a path is a shell that can actually be spawned. `is_file()` alone
+/// accepts Windows Store zero-byte app execution aliases, which cannot be run.
 pub fn is_runnable_shell(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(m) => m.is_file() && m.len() > 0,
@@ -452,13 +466,7 @@ impl WindowsShellCandidates {
     }
 }
 
-/// The interpreter for a backend with this label. Windows has no `sh`, so
-/// hardcoding one made *every* `shell.exec` fail with "program not found" — the
-/// missing program was always the shell, never the user's command, which is why
-/// `git`, `python` and even `cmd` failed identically.
-///
-/// Container and SSH backends execute on Unix-like hosts even when medha itself
-/// runs on Windows, so only the local backends switch interpreter.
+/// Choose a local Windows shell or `sh` for Unix-like and remote backends.
 pub fn shell_argv(backend_label: &str, command: &str) -> (String, Vec<String>) {
     if cfg!(windows) && matches!(backend_label, "host" | "native") {
         #[cfg(windows)]
@@ -701,10 +709,9 @@ impl CapturePair {
 
 type SharedCapture = std::sync::Arc<std::sync::Mutex<CapturePair>>;
 
-/// An owned command task: stdout/stderr stream into rolling buffers while it
-/// runs, and it can be polled, awaited, or killed as a whole process group.
-/// `shell.exec` uses this ownership even for foreground runs so cancellation
-/// has a synchronous process-tree kill handle before its future is dropped.
+/// An owned command task: output streams into rolling buffers and the whole
+/// process group can be killed. Foreground runs use it too, so cancellation has
+/// a synchronous kill handle before the future is dropped.
 pub struct BgProc {
     pub pid: Option<u32>,
     capture: SharedCapture,
@@ -945,11 +952,8 @@ fn process_tree_members(root: u32) -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// Stop the leader first so it cannot launch another command, snapshot and
-/// signal every known descendant parent-first, then signal the original group
-/// as a whole. This ordering avoids waking a shell after only its `sleep`
-/// child was killed and also closes cancellation races before the supervisor
-/// can observe and reap the leader.
+/// Leader first, then descendants parent-first, then the group as a whole. The
+/// ordering stops a shell waking after only its child was killed.
 #[cfg(unix)]
 fn kill_group_parent_first(group: u32) {
     unsafe {
@@ -1014,10 +1018,8 @@ fn spawn_background_with_limits(
 ) -> Result<BgProc, ExecError> {
     use std::sync::{Arc, Mutex};
     configure_for_spawn(&mut cmd, false);
-    // Keep a std Child rather than a tokio Child. The leader must remain
-    // unreaped (and therefore keep its PID reserved) until we have killed any
-    // helpers left in its process group. Reaping first makes a later group kill
-    // race PID reuse and, on Windows, loses taskkill's parent-tree anchor.
+    // std Child, not tokio: the leader must stay unreaped (PID reserved) until
+    // its group helpers are killed, or a later group kill races PID reuse.
     let mut child = cmd
         .as_std_mut()
         .spawn()
@@ -1076,11 +1078,8 @@ fn spawn_background_with_limits(
             pump(err, capture, CapturedStream::Stderr, stop);
         })
     });
-    // Lifecycle observation must not compete with the async runtime that is
-    // executing the command's caller. Under high fan-out a runtime worker can
-    // be starved long enough for a freshly orphaned helper to perform work
-    // before an async poll notices the leader died. A small-stack native
-    // supervisor begins monitoring immediately and owns the unreaped child.
+    // A native supervisor thread, not an async poll: under high fan-out a
+    // starved runtime worker lets an orphaned helper work on after the leader dies.
     let child_slot = Arc::new(Mutex::new(Some(child)));
     let supervisor_child = child_slot.clone();
     let supervisor = std::thread::Builder::new()
@@ -1224,15 +1223,9 @@ struct IsolatedHome {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl IsolatedHome {
-    /// The one isolated HOME for this process, shared by every native backend.
-    ///
-    /// Shared deliberately, and never dropped while the process lives: a
-    /// backend can be dropped seconds after it spawns a long-lived child
-    /// (LSP/MCP servers), and a per-backend home died with its backend — the
-    /// still-running server's toolchain proxies then found `$HOME/.rustup`
-    /// missing, tried to recreate it under the system temp dir, and the jail
-    /// correctly denied that write, so every `cargo`/`rustc` invocation
-    /// failed and workspaces silently never loaded.
+    /// The one isolated HOME for this process, shared by every native backend and
+    /// never dropped while it lives — a per-backend home died under long-lived
+    /// LSP/MCP children and broke their toolchains.
     fn shared() -> std::sync::Arc<Self> {
         static SHARED: std::sync::OnceLock<std::sync::Arc<IsolatedHome>> =
             std::sync::OnceLock::new();
@@ -1357,12 +1350,8 @@ fn native_sensitive_paths() -> Vec<PathBuf> {
     .collect()
 }
 
-/// Resolve an absolute policy path through its deepest existing ancestor.
-///
-/// `canonicalize()` alone is insufficient for write roots that have not been
-/// created yet, while a lexical-only comparison misses aliases such as a
-/// symlink to `~/.ssh`. Combining both keeps future paths usable and makes
-/// security comparisons against their physical parent identity.
+/// Resolve an absolute policy path through its deepest existing ancestor, so
+/// not-yet-created write roots stay usable and symlink aliases still resolve.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn resolve_native_policy_path(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
@@ -1421,6 +1410,23 @@ fn safe_extra_writable(paths: &[PathBuf]) -> Vec<PathBuf> {
     safe_extra_writable_against(paths, &native_sensitive_paths())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn safe_request_readable(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let sensitive: Vec<PathBuf> = native_sensitive_paths()
+        .into_iter()
+        .filter_map(|path| resolve_native_policy_path(&path))
+        .collect();
+    paths
+        .iter()
+        .filter_map(|path| resolve_native_policy_path(path))
+        .filter(|path| {
+            !sensitive
+                .iter()
+                .any(|secret| secret.starts_with(path) || path.starts_with(secret))
+        })
+        .collect()
+}
+
 /// Absolute-path tokens in a line of tool output or an argv entry. Utilities
 /// report denials as `prog: /path: message`, so split on the separators that
 /// bound a path and keep what still looks absolute.
@@ -1431,17 +1437,64 @@ fn absolute_path_tokens(text: &str) -> impl Iterator<Item = PathBuf> + '_ {
         .map(PathBuf::from)
 }
 
-/// Out-of-workspace roots a failed sandboxed command was plausibly denied on —
-/// the input to the exec escalation prompt. Denial lines in stderr name the
-/// actual target, so they are preferred; argv is the fallback. Files widen to
-/// their parent directory (one approval covers the sibling files the same task
-/// touches next), credential paths are never offered, and already-approved
-/// roots are excluded because they cannot be the cause.
+/// Roots already present in every native read profile. Error messages often
+/// prefix a denied target with the reporting executable (`/bin/sh: ...`); that
+/// executable path is evidence context, not a blocked candidate to prompt for.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn native_intrinsic_read_roots() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let roots = [
+        "/System",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/opt/homebrew",
+        "/usr/local",
+        "/private/etc/ssl",
+        "/private/var/select",
+        "/private/var/db/xcode_select_link",
+        "/Library/Developer",
+        "/Applications/Xcode.app",
+    ];
+    #[cfg(target_os = "linux")]
+    let roots = [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/nix/store",
+        "/run/current-system/sw",
+        "/etc/ssl",
+        "/etc/ca-certificates",
+        "/proc",
+        "/sys",
+    ];
+    let mut paths: Vec<PathBuf> = roots
+        .into_iter()
+        .filter_map(|path| resolve_native_policy_path(Path::new(path)))
+        .collect();
+    paths.extend(
+        native_toolchain_read_roots()
+            .into_iter()
+            .filter_map(|path| resolve_native_policy_path(&path)),
+    );
+    paths
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn native_intrinsic_read_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Out-of-workspace roots a failed command was plausibly denied on — the input
+/// to the escalation prompt. Only paths named in stderr; files widen to their
+/// parent; credential paths and already-approved roots are never offered.
 pub(crate) fn escalation_candidates(
     output: &ExecOutput,
-    args: &[String],
     workspace: &Path,
     approved: &ApprovedRoots,
+    permission: permissions::PermissionType,
 ) -> Vec<PathBuf> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let denial_lines: Vec<&str> = stderr
@@ -1453,35 +1506,36 @@ pub(crate) fn escalation_candidates(
     if denial_lines.is_empty() {
         return Vec::new();
     }
-    let mut tokens: Vec<PathBuf> = denial_lines
+    let tokens: Vec<PathBuf> = denial_lines
         .iter()
         .flat_map(|line| absolute_path_tokens(line))
         .collect();
-    if tokens.is_empty() {
-        tokens = args
-            .iter()
-            .flat_map(|arg| absolute_path_tokens(arg))
-            .collect();
-    }
+    // If the denial itself did not identify a path, there is no evidence that
+    // approving an argv path could change the result. Falling back to argv made
+    // unrelated application-level "Permission denied" failures raise cards.
     let workspace = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
     let sensitive = native_sensitive_paths();
+    let intrinsic_read = native_intrinsic_read_roots();
     let mut candidates = Vec::new();
     for token in tokens {
-        let Ok(resolved) = token.canonicalize() else {
+        let Some(resolved) = resolve_native_policy_path(&token) else {
             continue;
         };
-        let root = if resolved.is_file() {
+        let root = if resolved.is_dir() {
+            resolved
+        } else {
             match resolved.parent() {
                 Some(parent) => parent.to_path_buf(),
                 None => continue,
             }
-        } else {
-            resolved
         };
         if root.starts_with(&workspace)
-            || approved.is_allowed(&root, permissions::PermissionType::Read)
+            || intrinsic_read
+                .iter()
+                .any(|allowed| root.starts_with(allowed))
+            || approved.is_allowed(&root, permission)
             || sensitive
                 .iter()
                 .any(|secret| secret.starts_with(&root) || root.starts_with(secret))
@@ -1535,6 +1589,25 @@ fn native_toolchain_read_roots() -> Vec<PathBuf> {
             ".gradle/caches",
             ".m2/repository",
             "go/pkg",
+            // Shim directories alone are not enough: pyenv/nvm/Volta exec payloads
+            // and load libraries from these version roots.
+            ".pyenv/versions",
+            ".nvm/versions",
+            ".local/bin",
+            ".local/lib",
+            ".volta/bin",
+            ".volta/tools",
+            ".bun/bin",
+            ".bun/install/cache",
+            ".deno/bin",
+            "miniconda3",
+            "anaconda3",
+            ".rye/py",
+            ".rye/self",
+            ".rye/shims",
+            ".sdkman/candidates",
+            ".asdf/installs",
+            ".local/share/mise/installs",
         ] {
             let path = home.join(relative);
             if path.exists() {
@@ -1560,17 +1633,15 @@ fn sbpl_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// macOS Seatbelt backend: confines the command with `sandbox-exec` and a
-/// generated SBPL profile.
-///
-/// Non-filesystem syscalls remain compatible, while file reads and writes are
-/// deny-by-default and reopened only for the workspace, an isolated HOME/TMP,
-/// system runtimes, and narrowly selected read-only toolchain payloads.
+/// macOS Seatbelt backend: `sandbox-exec` with a generated SBPL profile. Reads
+/// and writes are deny-by-default, reopened only for the workspace, an isolated
+/// HOME/TMP, system runtimes, and selected toolchain roots.
 #[cfg(target_os = "macos")]
 pub struct SeatbeltBackend {
     net: NetPolicy,
     extra_writable: Vec<PathBuf>,
     approved: ApprovedRoots,
+    net_grant: NetworkGrant,
     home: std::sync::Arc<IsolatedHome>,
 }
 
@@ -1581,12 +1652,28 @@ impl SeatbeltBackend {
             net,
             extra_writable: safe_extra_writable(&extra_writable),
             approved,
+            net_grant: NetworkGrant::default(),
             home: IsolatedHome::shared(),
         }
     }
 
-    fn readable_paths(&self, cwd: &Path) -> Vec<PathBuf> {
-        let ws = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    pub fn with_network_grant(mut self, net_grant: NetworkGrant) -> Self {
+        self.net_grant = net_grant;
+        self
+    }
+
+    /// Network policy for this run: a one-shot task-local grant or a live
+    /// session/persistent grant opens it; otherwise the configured default.
+    fn effective_net(&self, _req: &ExecRequest) -> NetPolicy {
+        if kernel::network_once_active() || self.net_grant.granted() {
+            NetPolicy::Allow
+        } else {
+            self.net
+        }
+    }
+
+    fn readable_paths(&self, req: &ExecRequest) -> Vec<PathBuf> {
+        let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
         let mut readable = vec![
             ws,
             self.home.path.clone(),
@@ -1612,17 +1699,20 @@ impl SeatbeltBackend {
         // would be impossible. Sensitive-path denies appended later still win.
         readable.extend(self.approved.read_roots());
         readable.extend(self.approved.write_roots());
+        readable.extend(safe_request_readable(&req.read_roots));
+        readable.extend(safe_extra_writable(&req.write_roots));
         readable.sort();
         readable.dedup();
         readable
     }
 
-    fn profile(&self, cwd: &std::path::Path) -> String {
+    fn profile(&self, req: &ExecRequest) -> String {
         // Canonicalize so the subpath match survives /var → /private/var etc.
-        let ws = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
         let mut writable: Vec<PathBuf> = vec![ws, self.home.path.clone()];
         writable.extend(self.extra_writable.iter().cloned());
         writable.extend(safe_extra_writable(&self.approved.write_roots()));
+        writable.extend(safe_extra_writable(&req.write_roots));
         writable.sort();
         writable.dedup();
 
@@ -1630,7 +1720,7 @@ impl SeatbeltBackend {
             "(version 1)\n(allow default)\n\
              (deny file-read*)\n(allow file-read*\n",
         );
-        for path in self.readable_paths(cwd) {
+        for path in self.readable_paths(req) {
             let filter = if path.is_file() { "literal" } else { "subpath" };
             p.push_str(&format!(
                 "    ({filter} \"{}\")\n",
@@ -1647,13 +1737,9 @@ impl SeatbeltBackend {
             p.push_str(&format!("    (literal \"{device}\")\n"));
         }
         p.push_str(")\n");
-        // Deny-by-default reads still require path *traversal*: the kernel
-        // stats every component during resolution, and a subpath rule does not
-        // cover the root inode or the ancestors of an allowed root. Grant the
-        // literal root plus directory/symlink metadata (stat/lstat and link
-        // resolution — /var, /tmp and /etc are symlinks on macOS — but not
-        // readdir or file contents) so resolution works while directory
-        // listings stay denied.
+        // Resolution stats every component, and a subpath rule covers neither the
+        // root inode nor an allowed root's ancestors. Grant the literal root plus
+        // directory/symlink metadata only — not readdir or contents.
         p.push_str(
             "(allow file-read* (literal \"/\"))\n\
              (allow file-read-metadata (vnode-type DIRECTORY) (vnode-type SYMLINK))\n",
@@ -1678,7 +1764,7 @@ impl SeatbeltBackend {
                  (deny file-write* (literal \"{secret}\") (subpath \"{secret}\"))\n"
             ));
         }
-        if self.net == NetPolicy::Deny {
+        if self.effective_net(req) == NetPolicy::Deny {
             p.push_str("(deny network*)\n");
         }
         p
@@ -1695,7 +1781,7 @@ impl ExecBackend for SeatbeltBackend {
                     .into(),
             ));
         }
-        let profile = self.profile(&req.cwd);
+        let profile = self.profile(req);
         // sandbox-exec -p <profile> <program> <args...>
         let mut wrapped = Vec::with_capacity(req.args.len() + 3);
         wrapped.push("-p".to_string());
@@ -1710,23 +1796,31 @@ impl ExecBackend for SeatbeltBackend {
         "native"
     }
     fn containment(&self) -> kernel::Containment {
+        // A session/persistent grant opens the network for all later commands, so
+        // trust-flow must see it. A one-shot task-local grant is deliberately not
+        // reflected here — it stays scoped to the single retried command.
+        if self.net_grant.granted() {
+            return kernel::Containment::OsFsJail;
+        }
         match self.net {
             NetPolicy::Deny => kernel::Containment::OsFsJailNoNet,
             NetPolicy::Allow => kernel::Containment::OsFsJail,
         }
     }
+    fn denies_network(&self, req: &ExecRequest) -> bool {
+        self.effective_net(req) == NetPolicy::Deny
+    }
 }
 
-/// Linux Landlock backend: confines the child with the Landlock LSM (kernel
-/// ≥5.13), applied in a `pre_exec` hook so it affects the spawned command, not
-/// the agent. Reads and writes are both allowlisted. The ruleset is built in
-/// the parent — only the (allocation-free) `restrict_self` syscall runs in the
-/// post-fork child, which is the safe pattern in a threaded runtime.
+/// Linux Landlock backend (kernel ≥5.13), applied in `pre_exec` so it confines
+/// the child rather than the agent. The ruleset is built in the parent; only the
+/// allocation-free `restrict_self` runs post-fork.
 #[cfg(target_os = "linux")]
 pub struct LandlockBackend {
     net: NetPolicy,
     extra_writable: Vec<PathBuf>,
     approved: ApprovedRoots,
+    net_grant: NetworkGrant,
     home: std::sync::Arc<IsolatedHome>,
 }
 
@@ -1737,15 +1831,30 @@ impl LandlockBackend {
             net,
             extra_writable: safe_extra_writable(&extra_writable),
             approved,
+            net_grant: NetworkGrant::default(),
             home: IsolatedHome::shared(),
         }
     }
 
-    fn writable_paths(&self, cwd: &std::path::Path) -> Vec<PathBuf> {
-        let ws = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    pub fn with_network_grant(mut self, net_grant: NetworkGrant) -> Self {
+        self.net_grant = net_grant;
+        self
+    }
+
+    fn effective_net(&self, _req: &ExecRequest) -> NetPolicy {
+        if kernel::network_once_active() || self.net_grant.granted() {
+            NetPolicy::Allow
+        } else {
+            self.net
+        }
+    }
+
+    fn writable_paths(&self, req: &ExecRequest) -> Vec<PathBuf> {
+        let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
         let mut v = vec![ws, self.home.path.clone()];
         v.extend(self.extra_writable.iter().cloned());
         v.extend(safe_extra_writable(&self.approved.write_roots()));
+        v.extend(safe_extra_writable(&req.write_roots));
         // Common shell redirections need a sink, but granting all of `/dev`
         // would expose unrelated devices. A file-scoped Landlock rule is
         // added for this exact node.
@@ -1757,8 +1866,8 @@ impl LandlockBackend {
         v
     }
 
-    fn readable_paths(&self, cwd: &Path) -> Vec<PathBuf> {
-        let ws = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    fn readable_paths(&self, req: &ExecRequest) -> Vec<PathBuf> {
+        let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
         let mut paths = vec![
             ws,
             self.home.path.clone(),
@@ -1771,20 +1880,12 @@ impl LandlockBackend {
             PathBuf::from("/run/current-system/sw"),
             PathBuf::from("/etc/ssl"),
             PathBuf::from("/etc/ca-certificates"),
-            // Toolchains locate themselves through procfs: rustc resolves its
-            // sysroot from /proc/self/exe, so without this `cargo metadata`
-            // fails, no workspace loads, and every Rust/Go/Python toolchain
-            // degrades silently. /sys carries the cgroup limits runtimes size
-            // their pools from.
+            // Toolchains locate themselves through procfs (rustc reads
+            // /proc/self/exe); /sys carries the cgroup limits runtimes size to.
             //
-            // CAVEAT: procfs is process-wide, so a sandboxed child can read
-            // /proc/<pid>/environ of other same-UID processes — including this
-            // agent's own API keys. Landlock is allowlist-only and hierarchical,
-            // so a narrower grant is not expressible. This is strictly tighter
-            // than the read-everything policy it replaced, and the credential
-            // *files* AUD-006 targets stay denied, but closing the environ path
-            // needs either PR_SET_DUMPABLE on the agent or a PID namespace with
-            // a private /proc (the bubblewrap direction noted in AUD-006).
+            // CAVEAT: procfs is process-wide, so a child can read other same-UID
+            // processes' environ, including this agent's keys. Landlock cannot
+            // express a narrower grant; closing it needs PR_SET_DUMPABLE or a PID ns.
             PathBuf::from("/proc"),
             PathBuf::from("/sys"),
         ];
@@ -1809,6 +1910,8 @@ impl LandlockBackend {
         paths.extend(self.extra_writable.iter().cloned());
         paths.extend(self.approved.read_roots());
         paths.extend(self.approved.write_roots());
+        paths.extend(safe_request_readable(&req.read_roots));
+        paths.extend(safe_extra_writable(&req.write_roots));
         paths.retain(|path| path.exists());
         paths.sort();
         paths.dedup();
@@ -1833,10 +1936,8 @@ fn build_landlock_ruleset(
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(abi))
         .map_err(|error| ExecError::Unavailable(error.to_string()))?;
-    // Deny network by *handling* net access and then adding no net rules — with
-    // Landlock, a handled access with no matching rule is denied. Best-effort:
-    // silently a no-op on kernels < 6.7 (Landlock ABI < v4), so it never breaks
-    // the run; enforcement is real only where the kernel supports it.
+    // Handle net access and add no rules: in Landlock that denies it. Best-effort,
+    // so a no-op below kernel 6.7 rather than a failure.
     if net == NetPolicy::Deny {
         ruleset = ruleset
             .handle_access(AccessNet::from_all(abi))
@@ -1905,9 +2006,9 @@ impl ExecBackend for LandlockBackend {
             ));
         }
         let ruleset = build_landlock_ruleset(
-            &self.readable_paths(&req.cwd),
-            &self.writable_paths(&req.cwd),
-            self.net,
+            &self.readable_paths(req),
+            &self.writable_paths(req),
+            self.effective_net(req),
         )?;
 
         let mut cmd = std::process::Command::new(&req.program);
@@ -1938,20 +2039,20 @@ impl ExecBackend for LandlockBackend {
         "native"
     }
     fn containment(&self) -> kernel::Containment {
-        // We *attempt* net-deny via Landlock (best-effort), but only report
-        // FS-jail-only to the trust-flow layer: Landlock network confinement
-        // needs kernel ≥6.7 and we don't verify enforcement per-kernel here, so
-        // we never claim network is confined. Result: trust-flow still gates
-        // web-tainted network actions on Linux — conservative and safe. (Once a
-        // reliable ABI-≥v4 probe lands, net-deny can report OsFsJailNoNet.)
+        // Net-deny is attempted but never claimed: it needs kernel ≥6.7 and is not
+        // probed here, so trust-flow keeps gating web-tainted actions on Linux.
         kernel::Containment::OsFsJail
+    }
+    fn denies_network(&self, req: &ExecRequest) -> bool {
+        // Config intent, not enforcement proof. On kernel <6.7 the rule no-ops,
+        // the command succeeds, and the failure-driven card never fires; on ≥6.7
+        // the failure itself proves enforcement. Neither needs a probe.
+        self.effective_net(req) == NetPolicy::Deny
     }
 }
 
-/// True if `program` exists in `dir`, including Windows `PATHEXT` resolution.
-///
-/// `Command::new("npm")` can resolve `npm.cmd` on Windows; probing only the
-/// extensionless path reports a runnable tool as missing and disables installs.
+/// True if `program` exists in `dir`, including Windows `PATHEXT` resolution —
+/// probing only the extensionless path reports `npm.cmd` as missing.
 pub fn program_in_dir(dir: &std::path::Path, program: &str) -> bool {
     let candidate = dir.join(program);
     if candidate.exists() {
@@ -2036,15 +2137,14 @@ fn detect_container_runtime(configured: &Option<String>) -> String {
     "docker".to_string()
 }
 
-/// Opt-in heavy tier: run each command in a throwaway container by shelling out
-/// to `docker`/`podman` (no SDK linked → ~zero binary weight). The workspace is
-/// bind-mounted at `/workspace`, capabilities dropped, and — crucially — the
-/// host environment is NOT forwarded, so injected API keys never enter the
-/// sandbox (the mistake of wrapping the whole agent process in a container).
+/// Opt-in heavy tier: each command runs in a throwaway `docker`/`podman`
+/// container, workspace bind-mounted at `/workspace`, capabilities dropped. The
+/// host environment is not forwarded, so injected API keys never enter it.
 pub struct ContainerBackend {
     runtime: String,
     image: String,
     net: NetPolicy,
+    net_grant: NetworkGrant,
     memory: Option<String>,
     pids: Option<u32>,
     /// Stronger posture for repository-authored verification: never pull,
@@ -2067,6 +2167,7 @@ impl ContainerBackend {
             runtime,
             image,
             net,
+            net_grant: NetworkGrant::default(),
             memory,
             pids,
             hermetic: false,
@@ -2088,10 +2189,30 @@ impl ContainerBackend {
             runtime,
             image,
             net: NetPolicy::Deny,
+            net_grant: NetworkGrant::default(),
             memory,
             pids,
             hermetic: true,
             container_name: Some(container_name),
+        }
+    }
+
+    pub fn with_network_grant(mut self, net_grant: NetworkGrant) -> Self {
+        self.net_grant = net_grant;
+        self
+    }
+
+    /// Network policy for this run. A hermetic verification container hard-denies
+    /// regardless of any grant — it runs untrusted repository code and must never
+    /// be opened by a session grant meant for the interactive sandbox.
+    fn effective_net(&self, _req: &ExecRequest) -> NetPolicy {
+        if self.hermetic {
+            return self.net;
+        }
+        if kernel::network_once_active() || self.net_grant.granted() {
+            NetPolicy::Allow
+        } else {
+            self.net
         }
     }
 
@@ -2108,7 +2229,7 @@ impl ContainerBackend {
             "--security-opt".into(),
             "no-new-privileges".into(),
         ];
-        if self.net == NetPolicy::Deny {
+        if self.effective_net(req) == NetPolicy::Deny {
             a.push("--network".into());
             a.push("none".into());
         }
@@ -2136,12 +2257,8 @@ impl ContainerBackend {
         a
     }
 
-    /// Build only the inert registration phase for a hermetic check.
-    ///
-    /// `create` applies every isolation option and records the unique name, but
-    /// it never starts the image entrypoint or repository code. Keeping this
-    /// separate from `start` lets Gate finish registration before deciding
-    /// whether cancellation permits the workload to begin.
+    /// Inert registration only: `create` applies isolation and records the name
+    /// but starts nothing, so Gate can register before deciding whether to run.
     fn build_create_argv(&self, req: &ExecRequest) -> Vec<String> {
         debug_assert!(self.hermetic);
         let mut a = vec!["create".into()];
@@ -2231,10 +2348,16 @@ impl ExecBackend for ContainerBackend {
         "container"
     }
     fn containment(&self) -> kernel::Containment {
+        if !self.hermetic && self.net_grant.granted() {
+            return kernel::Containment::OsFsJail;
+        }
         match self.net {
             NetPolicy::Deny => kernel::Containment::OsFsJailNoNet,
             NetPolicy::Allow => kernel::Containment::OsFsJail,
         }
+    }
+    fn denies_network(&self, req: &ExecRequest) -> bool {
+        self.effective_net(req) == NetPolicy::Deny
     }
 }
 
@@ -2243,10 +2366,8 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
-/// Opt-in SSH backend: run each command on a remote host via `ssh`. This is
-/// remote execution, not local isolation — it assumes the workspace already
-/// exists on the remote (automatic sync is a follow-up). Key-scoped by the
-/// user's ssh config; the local scanner/policy still gate before dispatch.
+/// Opt-in SSH backend: remote execution, not local isolation. Assumes the
+/// workspace already exists on the remote; local policy still gates dispatch.
 pub struct SshBackend {
     host: String,
     remote_dir: Option<String>,
@@ -2296,14 +2417,14 @@ impl ExecBackend for SshBackend {
     }
 }
 
-/// Pick an execution backend from config. On platforms without a native sandbox
-/// (Windows has no lightweight equivalent yet), `Native` degrades to `Host`;
-/// `Container`/`Ssh` degrade to `Host` if misconfigured — callers validate and
-/// warn (see the CLI) so isolation is never silently assumed.
+/// Pick an execution backend from config. `Native` degrades to `Host` where no
+/// native sandbox exists (Windows), as do misconfigured `Container`/`Ssh`.
+/// Callers validate and warn, so isolation is never silently assumed.
 pub fn select_backend(
     cfg: &SandboxConfig,
     _extra_writable: Vec<PathBuf>,
     _approved: ApprovedRoots,
+    net_grant: NetworkGrant,
 ) -> std::sync::Arc<dyn ExecBackend> {
     use std::sync::Arc;
     match cfg.backend {
@@ -2312,7 +2433,10 @@ pub fn select_backend(
             #[cfg(target_os = "macos")]
             {
                 if native_backend_available() {
-                    Arc::new(SeatbeltBackend::new(cfg.net, _extra_writable, _approved))
+                    Arc::new(
+                        SeatbeltBackend::new(cfg.net, _extra_writable, _approved)
+                            .with_network_grant(net_grant),
+                    )
                 } else {
                     Arc::new(HostBackend)
                 }
@@ -2320,24 +2444,31 @@ pub fn select_backend(
             #[cfg(target_os = "linux")]
             {
                 if native_backend_available() {
-                    Arc::new(LandlockBackend::new(cfg.net, _extra_writable, _approved))
+                    Arc::new(
+                        LandlockBackend::new(cfg.net, _extra_writable, _approved)
+                            .with_network_grant(net_grant),
+                    )
                 } else {
                     Arc::new(HostBackend)
                 }
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
+                let _ = net_grant;
                 Arc::new(HostBackend)
             }
         }
         BackendKind::Container => match cfg.image.as_deref() {
-            Some(image) if !image.is_empty() => Arc::new(ContainerBackend::new(
-                detect_container_runtime(&cfg.runtime),
-                image.to_string(),
-                cfg.net,
-                cfg.memory.clone(),
-                cfg.pids,
-            )),
+            Some(image) if !image.is_empty() => Arc::new(
+                ContainerBackend::new(
+                    detect_container_runtime(&cfg.runtime),
+                    image.to_string(),
+                    cfg.net,
+                    cfg.memory.clone(),
+                    cfg.pids,
+                )
+                .with_network_grant(net_grant),
+            ),
             _ => Arc::new(HostBackend), // no image → CLI warns and shouldn't reach here
         },
         BackendKind::Ssh => match cfg.host.as_deref() {
@@ -2349,10 +2480,8 @@ pub fn select_backend(
     }
 }
 
-/// True if this *machine* can apply an OS sandbox at all, probed with a
-/// maximally permissive profile. A `false` here is a genuine platform
-/// property (managed or nested environments that reject `sandbox_apply`),
-/// never a statement about our own policy.
+/// True if this machine can apply an OS sandbox at all, probed with a permissive
+/// profile. `false` is a platform property, not a policy decision.
 pub fn native_sandbox_supported() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -2377,11 +2506,7 @@ pub fn native_sandbox_supported() -> bool {
     }
 }
 
-/// True if the native backend's *real* generated profile applies and can run a
-/// command. Probing the production builder rather than a hand-copied replica
-/// keeps one source of policy: a profile defect fails here loudly instead of
-/// masquerading as a platform limitation. Given [`native_sandbox_supported`],
-/// a `false` here is a bug in our profile.
+/// True if the generated native profile applies and can run a command.
 pub fn native_backend_available() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -2394,8 +2519,17 @@ pub fn native_backend_available() -> bool {
             // `cd` exercises path traversal through the workspace's ancestors,
             // which a broken profile fails even when plain exec succeeds.
             let script = format!("cd {} && /usr/bin/true", shell_quote(&ws.to_string_lossy()));
+            let request = ExecRequest {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.clone()],
+                cwd: ws,
+                env: Vec::new(),
+                clear_env: false,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+            };
             std::process::Command::new("/usr/bin/sandbox-exec")
-                .args(["-p", &backend.profile(&ws), "/bin/sh", "-c", &script])
+                .args(["-p", &backend.profile(&request), "/bin/sh", "-c", &script])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -2433,29 +2567,22 @@ mod tests {
             cwd,
             env: std::env::vars().collect(),
             clear_env: false,
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
         }
     }
 
-    /// K1: a timed-out command must take its whole process *tree* down, not just
-    /// the direct child. We spawn `sh -c 'sh -c "sleep 30" ...'` where a
-    /// grandchild writes a sentinel file only if it survives, wrap the run in a
-    /// short timeout (dropping the future, as the tool layer does), then confirm
-    /// the grandchild was killed before it could write.
+    /// A timed-out command must stop its whole process tree.
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_the_whole_process_group() {
         let dir = std::env::temp_dir().join(format!("medha-killpg-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("survived.txt");
-        // Grandchild sleeps briefly then writes the marker; if the group is
-        // killed on timeout it never gets there.
         let script = format!("(sleep 1; touch {}) & wait", marker.display());
         let fut = HostBackend.run(req("/bin/sh", &["-c", &script], dir.clone()));
-        // Drop the run future well before the grandchild's 1s write — this is
-        // exactly what an outer `tokio::time::timeout` does on expiry.
         let r = tokio::time::timeout(std::time::Duration::from_millis(150), fut).await;
         assert!(r.is_err(), "outer timeout should elapse");
-        // Give the reaper + any stray write a moment, then confirm no marker.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert!(
             !marker.exists(),
@@ -2493,10 +2620,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let started = dir.join("started.txt");
         let marker = dir.join("survived.txt");
-        // The script announces that it is running, and its helper outlives the
-        // cancel by a wide margin. Cancelling on a fixed 100ms delay instead
-        // raced the script's own completion: under load the run finished first
-        // and `cancelled` came back false, which is why this flaked.
+        // Wait for startup before cancelling to avoid a scheduler race.
         let script = format!(
             "(sleep 3; touch {}) & touch {}; wait",
             marker.display(),
@@ -2506,8 +2630,6 @@ mod tests {
         let trigger = cancel.clone();
         let probe = started.clone();
         tokio::spawn(async move {
-            // Bounded, so a script that never starts fails the assertion below
-            // rather than hanging the test forever.
             for _ in 0..500 {
                 if probe.exists() {
                     break;
@@ -2516,7 +2638,6 @@ mod tests {
             }
             trigger.cancel();
         });
-        // Well above the helper's sleep, so `timed_out` cannot fire first.
         let output = run_shell_bounded(
             &script,
             &dir,
@@ -2812,7 +2933,7 @@ mod tests {
         let workspace =
             std::env::temp_dir().join(format!("medha-seatbelt-profile-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&workspace).unwrap();
-        let profile = backend.profile(&workspace);
+        let profile = backend.profile(&req("/bin/true", &[], workspace.clone()));
         assert!(profile.contains("(deny file-read*)"));
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(deny network*)"));
@@ -2894,6 +3015,70 @@ mod tests {
         assert_eq!(SandboxConfig::default().net, NetPolicy::Deny);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn native_sandbox_includes_installed_version_manager_payloads() {
+        let Some(home) = home_dir_from_env() else {
+            return;
+        };
+        let roots = native_toolchain_read_roots();
+        for relative in [
+            ".pyenv/versions",
+            ".nvm/versions",
+            ".volta/tools",
+            ".sdkman/candidates",
+        ] {
+            let expected = home.join(relative);
+            if expected.exists() {
+                assert!(
+                    roots.contains(&expected),
+                    "installed version-manager payload was absent: {}",
+                    expected.display()
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_can_execute_an_installed_pyenv_interpreter() {
+        if !native_sandbox_supported() {
+            return;
+        }
+        let Some(home) = home_dir_from_env() else {
+            return;
+        };
+        let Ok(versions) = std::fs::read_dir(home.join(".pyenv/versions")) else {
+            return;
+        };
+        let Some(python) = versions
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("bin/python3"))
+            .find(|path| path.exists())
+        else {
+            return;
+        };
+        let ws = std::env::temp_dir().join(format!("medha-pyenv-sandbox-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let backend = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default());
+        let output = backend
+            .run(req(
+                python.to_str().unwrap(),
+                &["-c", "print('pyenv-ok')"],
+                ws.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            output.status,
+            Some(0),
+            "pyenv interpreter was unreadable: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "pyenv-ok");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
     #[cfg(unix)]
     fn denied_output(stderr: &str) -> ExecOutput {
         ExecOutput {
@@ -2919,23 +3104,34 @@ mod tests {
         let stderr = format!("cat: {}: Operation not permitted", target.display());
         let candidates = escalation_candidates(
             &denied_output(&stderr),
-            &["-c".into(), format!("cat {}", target.display())],
             &ws,
             &ApprovedRoots::default(),
+            permissions::PermissionType::Read,
         );
         assert_eq!(
             candidates,
             vec![outside.canonicalize().unwrap()],
             "a denied file must widen to its parent directory"
         );
+        let reporter_prefixed = format!("/bin/sh: {}: Operation not permitted", target.display());
+        assert_eq!(
+            escalation_candidates(
+                &denied_output(&reporter_prefixed),
+                &ws,
+                &ApprovedRoots::default(),
+                permissions::PermissionType::Write,
+            ),
+            vec![outside.canonicalize().unwrap()],
+            "a reporter executable already readable by the native profile is not a candidate"
+        );
 
         // Success output or unrelated stderr must never produce candidates.
         assert!(
             escalation_candidates(
                 &denied_output("cat: /nonexistent-dir-zz/f: No such file or directory"),
-                &[],
                 &ws,
                 &ApprovedRoots::default(),
+                permissions::PermissionType::Read,
             )
             .is_empty()
         );
@@ -2945,15 +3141,28 @@ mod tests {
         std::fs::write(&inside, "x").unwrap();
         let stderr = format!("cat: {}: Operation not permitted", inside.display());
         assert!(
-            escalation_candidates(&denied_output(&stderr), &[], &ws, &ApprovedRoots::default())
-                .is_empty()
+            escalation_candidates(
+                &denied_output(&stderr),
+                &ws,
+                &ApprovedRoots::default(),
+                permissions::PermissionType::Read,
+            )
+            .is_empty()
         );
 
         // An already-approved root cannot be the cause; it is excluded.
         let approved = ApprovedRoots::default();
         approved.allow_read(outside.canonicalize().unwrap());
         let stderr = format!("cat: {}: Operation not permitted", target.display());
-        assert!(escalation_candidates(&denied_output(&stderr), &[], &ws, &approved).is_empty());
+        assert!(
+            escalation_candidates(
+                &denied_output(&stderr),
+                &ws,
+                &approved,
+                permissions::PermissionType::Read,
+            )
+            .is_empty()
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -2973,10 +3182,52 @@ mod tests {
             ssh.join("id_rsa").display()
         );
         assert!(
-            escalation_candidates(&denied_output(&stderr), &[], &ws, &ApprovedRoots::default())
-                .is_empty(),
+            escalation_candidates(
+                &denied_output(&stderr),
+                &ws,
+                &ApprovedRoots::default(),
+                permissions::PermissionType::Read,
+            )
+            .is_empty(),
             "credential paths must never reach an approval card"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escalation_requires_the_denial_to_name_the_unapproved_path() {
+        let ws = std::env::temp_dir();
+        assert!(
+            escalation_candidates(
+                &denied_output("application: Permission denied"),
+                &ws,
+                &ApprovedRoots::default(),
+                permissions::PermissionType::Write,
+            )
+            .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_write_targets_escalate_their_existing_parent() {
+        let base = std::env::temp_dir().join(format!("medha-write-escal-{}", ulid::Ulid::new()));
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("new.txt");
+        let stderr = format!("touch: {}: Operation not permitted", target.display());
+        assert_eq!(
+            escalation_candidates(
+                &denied_output(&stderr),
+                &ws,
+                &ApprovedRoots::default(),
+                permissions::PermissionType::Write,
+            ),
+            vec![outside.canonicalize().unwrap()]
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[cfg(unix)]
@@ -3009,13 +3260,28 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn request_scoped_reads_defensively_reject_sensitive_roots() {
+        let Some(home) = home_dir_from_env() else {
+            return;
+        };
+        assert!(safe_request_readable(&[home.join(".ssh")]).is_empty());
+        assert!(safe_request_readable(&[home.join(".aws")]).is_empty());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn native_selection_degrades_to_host_when_seatbelt_cannot_apply() {
         if native_backend_available() {
             return;
         }
-        let backend = select_backend(&SandboxConfig::default(), vec![], ApprovedRoots::default());
+        let backend = select_backend(
+            &SandboxConfig::default(),
+            vec![],
+            ApprovedRoots::default(),
+            NetworkGrant::default(),
+        );
         assert_eq!(backend.label(), "host");
     }
 
@@ -3042,8 +3308,7 @@ mod tests {
             "net=deny → --network none"
         );
         assert!(joined.contains("--memory 2g") && joined.contains("--pids-limit 256"));
-        // The key improvement over wrapping the whole process: host env (and thus
-        // API keys) is never forwarded into the container.
+        // Host secrets must not enter the container.
         assert!(!joined.contains("TAVILY_API_KEY") && !joined.contains("supersecret"));
         // The command follows the image, in order.
         let img = argv.iter().position(|a| a == "alpine").unwrap();
@@ -3051,6 +3316,101 @@ mod tests {
             &argv[img + 1..],
             &["sh".to_string(), "-c".to_string(), "echo hi".to_string()]
         );
+    }
+
+    #[test]
+    fn network_denial_signature_gates_on_config_intent_and_markers() {
+        // A resolver failure under a net-denying backend is a signal.
+        assert!(network_denial_signature(
+            "",
+            "getaddrinfo ENOTFOUND registry.example",
+            true,
+        ));
+        // Same failure when the backend is not denying network: never a signal.
+        assert!(!network_denial_signature(
+            "",
+            "getaddrinfo ENOTFOUND registry.example",
+            false,
+        ));
+        // A masked zero exit (`… | tail; echo`) still signals — the marker, not
+        // the exit code, is the evidence.
+        assert!(network_denial_signature(
+            "npm error code ENOTFOUND\nexit=0",
+            "",
+            true,
+        ));
+        // An unrelated failure is not a network denial.
+        assert!(!network_denial_signature("", "syntax error", true));
+    }
+
+    #[test]
+    fn container_network_grant_opens_the_box_but_hermetic_stays_denied() {
+        let grant = NetworkGrant::default();
+        let be = ContainerBackend::new("docker".into(), "alpine".into(), NetPolicy::Deny, None, None)
+            .with_network_grant(grant.clone());
+        let r = req("sh", &["-c", "true"], std::env::temp_dir());
+        assert!(
+            be.build_run_argv(&r).join(" ").contains("--network none"),
+            "net=deny with no grant denies the network"
+        );
+        grant.grant();
+        assert!(
+            !be.build_run_argv(&r).join(" ").contains("--network none"),
+            "a session grant opens the container network"
+        );
+        assert!(!be.denies_network(&r), "granted → no longer denies network");
+
+        // A hermetic verification container ignores the grant entirely.
+        let hermetic = ContainerBackend::new_hermetic(
+            "docker".into(),
+            "img".into(),
+            None,
+            None,
+            "check".into(),
+        )
+        .with_network_grant(grant.clone());
+        assert!(
+            hermetic.effective_net(&r) == NetPolicy::Deny,
+            "hermetic verification never opens on a shared grant"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_profile_drops_the_deny_rule_once_network_is_granted() {
+        let grant = NetworkGrant::default();
+        let be = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default())
+            .with_network_grant(grant.clone());
+        let r = req("sh", &["-c", "true"], std::env::temp_dir());
+        assert!(be.profile(&r).contains("(deny network*)"));
+        assert_eq!(be.containment(), kernel::Containment::OsFsJailNoNet);
+        grant.grant();
+        assert!(!be.profile(&r).contains("(deny network*)"));
+        assert_eq!(be.containment(), kernel::Containment::OsFsJail);
+    }
+
+    /// The one-shot grant reaches the profile only because `build_command` is
+    /// polled synchronously inside the task-local scope. Moving the spawn behind
+    /// `tokio::spawn`/`spawn_blocking` would silently downgrade "once" to denied,
+    /// so this asserts the whole path rather than the task-local alone.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn once_scope_opens_the_profile_and_does_not_outlive_the_future() {
+        let be = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default());
+        let r = req("sh", &["-c", "true"], std::env::temp_dir());
+        assert!(be.profile(&r).contains("(deny network*)"));
+
+        let opened = kernel::network_once_scope(async { be.profile(&r) }).await;
+        assert!(
+            !opened.contains("(deny network*)"),
+            "a once-scoped run must reach the network"
+        );
+
+        assert!(
+            be.profile(&r).contains("(deny network*)"),
+            "the grant must not outlive the scoped future"
+        );
+        assert_eq!(be.containment(), kernel::Containment::OsFsJailNoNet);
     }
 
     #[test]
@@ -3140,9 +3500,6 @@ mod tests {
 
     #[test]
     fn a_shell_command_runs_through_an_interpreter_the_platform_actually_has() {
-        // `shell.exec` hardcoded `sh`, which Windows does not have, so every
-        // command failed with "program not found" before it ran — the missing
-        // program was always the shell, never the user's command.
         for label in ["host", "native"] {
             let (program, args) = shell_argv(label, "git status");
             assert_eq!(args.last().unwrap(), "git status", "command must survive");
@@ -3276,11 +3633,7 @@ mod tests {
 
     #[test]
     fn every_windows_shell_receives_the_command_unmodified() {
-        // The policy scanner reads the model's raw command string and the
-        // wrapper is applied afterwards, so the two can never disagree about
-        // what will run. That holds only while wrapping leaves the command
-        // itself untouched — a scanner approving one string while a different
-        // one executes is the whole gate defeated.
+        // Wrapping must not change the string approved by the policy scanner.
         let cmd = r#"git commit -m "a message with spaces && ;""#;
         for shell in [
             WinShell::Bash(bash_path()),

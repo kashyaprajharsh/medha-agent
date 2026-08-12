@@ -1,23 +1,15 @@
-//! File access permission system with live ask-then-persist flow.
-//!
-//! 1. RESOLVE target path fully before any check
-//! 2. Allow immediately if inside workspace root
-//! 3. Check the machine-local trust file for trusted paths if outside workspace
-//! 4. Prompt user via HumanGate if not trusted
-//! 5. Persist "always allow" decisions to the machine-local trust file
-//! 6. Separate read/write permissions
-//! 7. Load all entries into memory on startup
-//! 8. Audit log every out-of-workspace access attempt
+//! Gated file access with machine-local persistent trust and audit logging.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fd_lock::RwLock as FileRwLock;
-use kernel::HumanGate;
+use kernel::{HumanGate, NetworkDecision};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -72,10 +64,8 @@ mod serde_ts {
     }
 }
 
-/// Canonicalize a prospective file path even when the leaf (or some parent
-/// directories) does not exist yet. This makes the workspace-boundary check in
-/// [`PermissionManager::new`] resistant to `..` components and existing
-/// symlinked ancestors.
+/// Canonicalize a prospective path even when the leaf or its parents do not exist
+/// yet, so the workspace-boundary check resists `..` and symlinked ancestors.
 fn resolve_path_allowing_missing_leaf(path: &Path) -> Result<PathBuf, PermissionError> {
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -112,11 +102,9 @@ fn resolve_path_allowing_missing_leaf(path: &Path) -> Result<PathBuf, Permission
     }
 }
 
-/// Live, process-wide view of the user-approved out-of-workspace roots.
-/// Cloned handles share one underlying set, so a grant recorded here by the
-/// permission manager is immediately visible to every consumer that snapshots
-/// it — above all the OS exec sandbox, which resolves its filesystem roots
-/// per spawned command. "Once" approvals never enter this set.
+/// Live, process-wide view of user-approved out-of-workspace roots. Cloned
+/// handles share one set, so a grant is immediately visible to the exec sandbox,
+/// which resolves roots per spawned command. "Once" approvals never enter it.
 #[derive(Clone, Default)]
 pub struct ApprovedRoots {
     inner: Arc<RwLock<ApprovedRootsInner>>,
@@ -130,30 +118,47 @@ struct ApprovedRootsInner {
 
 impl ApprovedRoots {
     pub fn allow_read(&self, path: PathBuf) {
-        self.inner.write().unwrap().read.insert(path);
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read
+            .insert(path);
     }
 
     pub fn allow_write(&self, path: PathBuf) {
-        self.inner.write().unwrap().write.insert(path);
-    }
-
-    /// Withdraw a read grant — the scoped counterpart of [`allow_read`](Self::allow_read),
-    /// used to honour "Once" approvals: granted for one retry, then removed.
-    pub fn remove_read(&self, path: &Path) {
-        self.inner.write().unwrap().read.remove(path);
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write
+            .insert(path);
     }
 
     pub fn read_roots(&self) -> Vec<PathBuf> {
-        self.inner.read().unwrap().read.iter().cloned().collect()
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn write_roots(&self) -> Vec<PathBuf> {
-        self.inner.read().unwrap().write.iter().cloned().collect()
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// True when `path` or any ancestor was approved for the permission.
     pub fn is_allowed(&self, path: &Path, perm: PermissionType) -> bool {
-        let inner = self.inner.read().unwrap();
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let roots = match perm {
             PermissionType::Read => &inner.read,
             PermissionType::Write => &inner.write,
@@ -169,13 +174,36 @@ impl ApprovedRoots {
     }
 
     fn extend(&self, persisted: PersistedPaths) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.read.extend(persisted.read);
         inner.write.extend(persisted.write);
     }
 }
 
-/// Manages file access permissions with live ask-then-persist flow
+/// Live, process-wide network grant. Cloned handles share one flag, so a
+/// session or persistent grant is immediately visible to the exec sandbox, which
+/// reads it per spawned command. "Once" grants never enter it — they ride a
+/// task-local scope in the kernel instead.
+#[derive(Clone, Default)]
+pub struct NetworkGrant {
+    granted: Arc<AtomicBool>,
+}
+
+impl NetworkGrant {
+    /// Open the network for the rest of this process run.
+    pub fn grant(&self) {
+        self.granted.store(true, Ordering::SeqCst);
+    }
+
+    /// True once a session or persistent grant has opened the network.
+    pub fn granted(&self) -> bool {
+        self.granted.load(Ordering::SeqCst)
+    }
+}
+
 pub struct PermissionManager {
     workspace_root: PathBuf,
     /// Explicit user approvals only. `None` is a hard jail with no persistent
@@ -185,9 +213,11 @@ pub struct PermissionManager {
     /// In-memory allowlist loaded from the machine-local trust file. A shared
     /// handle: the exec sandbox reads the same set this manager writes.
     trusted: ApprovedRoots,
-    /// Human gate for prompting user
+    /// Shared network grant; the exec sandbox reads the same flag this manager
+    /// flips on a session or persistent approval.
+    network: NetworkGrant,
     human_gate: Option<Arc<dyn HumanGate>>,
-    /// Mutex to serialize prompts (one at a time)
+    /// Keeps approval cards serialized.
     prompt_mutex: Mutex<()>,
 }
 
@@ -334,6 +364,25 @@ fn collect_persisted_paths(value: &toml::Value) -> Result<PersistedPaths, Permis
     Ok(persisted)
 }
 
+fn persisted_network_allowed(value: &toml::Value) -> Result<bool, PermissionError> {
+    let root = value
+        .as_table()
+        .ok_or_else(|| PermissionError::Io("trust file: top-level is not a TOML table".into()))?;
+    let Some(permissions) = root.get("permissions") else {
+        return Ok(false);
+    };
+    let permissions = permissions
+        .as_table()
+        .ok_or_else(|| PermissionError::Io("trust file: [permissions] is not a table".into()))?;
+    match permissions.get("network_allowed") {
+        None => Ok(false),
+        Some(toml::Value::Boolean(allowed)) => Ok(*allowed),
+        Some(_) => Err(PermissionError::Io(
+            "trust file: permissions.network_allowed is not a boolean".into(),
+        )),
+    }
+}
+
 fn atomic_write_trust(
     target: &Path,
     bytes: &[u8],
@@ -432,11 +481,31 @@ fn sync_parent(
 }
 
 impl PermissionManager {
+    /// Expand a user path and anchor relative paths to this manager's sandbox.
+    /// File tools define relative paths in workspace coordinates; consulting
+    /// the process CWD here lets a child sandbox accidentally address its
+    /// parent's checkout instead.
+    fn workspace_path(&self, path: &Path) -> Result<PathBuf, PermissionError> {
+        let expanded = if path.starts_with("~") {
+            let home = dirs::home_dir().ok_or_else(|| {
+                PermissionError::Resolution("Could not determine home directory".into())
+            })?;
+            path.strip_prefix("~")
+                .map(|tail| home.join(tail))
+                .unwrap_or_else(|_| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        };
+        Ok(if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_root.join(expanded)
+        })
+    }
+
     /// Create a permission manager backed by a machine-local trust file.
-    ///
-    /// `trust_path` must be outside the workspace. This is a security boundary,
-    /// not merely a storage convention: a repository-controlled file must never
-    /// become a source of prompt-free grants.
+    /// `trust_path` must be outside the workspace — a repository-controlled file
+    /// must never become a source of prompt-free grants.
     pub fn new(
         workspace_root: impl Into<PathBuf>,
         trust_path: impl Into<PathBuf>,
@@ -462,13 +531,10 @@ impl PermissionManager {
         Self::new_scoped(workspace_root, trust_path, audit_path, trusted, None)
     }
 
-    /// Like [`new_with_roots`](Self::new_with_roots), but `state_root` names the
-    /// machine-local state directory (`$MEDHA_HOME`). A trust file inside it is
-    /// accepted even when the workspace is an ancestor of it — e.g. running with
-    /// `$HOME` as the workspace — because that directory is medha-managed and no
-    /// checked-out repository can populate it. A trust file inside the workspace
-    /// but outside `state_root` is still rejected: that repository-trust boundary
-    /// does not move.
+    /// Like [`new_with_roots`](Self::new_with_roots), but a trust file under
+    /// `state_root` (`$MEDHA_HOME`) is accepted even when the workspace is its
+    /// ancestor — no checked-out repository can populate that directory. Inside
+    /// the workspace but outside `state_root` is still rejected.
     pub fn new_with_state_root(
         workspace_root: impl Into<PathBuf>,
         trust_path: impl Into<PathBuf>,
@@ -516,6 +582,7 @@ impl PermissionManager {
             trust_path: Some(trust_path),
             audit_path,
             trusted,
+            network: NetworkGrant::default(),
             human_gate: None,
             prompt_mutex: Mutex::new(()),
         };
@@ -539,19 +606,30 @@ impl PermissionManager {
             trust_path: None,
             audit_path: audit_path.into(),
             trusted: ApprovedRoots::default(),
+            network: NetworkGrant::default(),
             human_gate: None,
             prompt_mutex: Mutex::new(()),
         })
     }
 
-    /// Set the human gate for user prompts
     pub fn set_human_gate(&mut self, gate: Arc<dyn HumanGate>) {
         self.human_gate = Some(gate);
     }
 
-    /// The live approval set this manager publishes into.
     pub fn approved_roots(&self) -> ApprovedRoots {
         self.trusted.clone()
+    }
+
+    /// Adopt a caller-supplied shared network grant so the exec sandbox honours
+    /// the same flag this manager flips, and load any persistent grant from the
+    /// trust file into it.
+    pub fn set_network_grant(&mut self, network: NetworkGrant) -> Result<(), PermissionError> {
+        self.network = network;
+        self.load_network_grant()
+    }
+
+    pub fn network_grant(&self) -> NetworkGrant {
+        self.network.clone()
     }
 
     /// Load trusted paths from the machine-local trust file into memory.
@@ -567,22 +645,60 @@ impl PermissionManager {
         Ok(())
     }
 
-    /// Resolve a path for READ/LIST/EDIT operations where the target is expected to exist.
-    /// Canonicalizes the full path directly.
-    fn resolve_path_for_read(&self, path: &Path) -> Result<PathBuf, PermissionError> {
-        // Expand ~ to home directory
-        let path = if path.starts_with("~") {
-            let home = dirs::home_dir().ok_or_else(|| {
-                PermissionError::Resolution("Could not determine home directory".into())
-            })?;
-            path.strip_prefix("~")
-                .map(|p| home.join(p))
-                .unwrap_or(path.to_path_buf())
-        } else {
-            path.to_path_buf()
+    fn load_network_grant(&self) -> Result<(), PermissionError> {
+        let Some(trust_path) = self.trust_path.as_ref() else {
+            return Ok(());
         };
+        if persisted_network_allowed(&read_trust_value(trust_path)?)? {
+            self.network.grant();
+        }
+        Ok(())
+    }
 
-        // Canonicalize to resolve symlinks and collapse .. - target must exist for read
+    /// Ask whether to grant the sandbox network access and retry. A session grant
+    /// flips the shared handle; a persistent grant also records it durably. A
+    /// failed persist degrades to a session grant so the retry is never blocked
+    /// by a trust-file write error — the failure is recorded in the audit log.
+    pub async fn request_network(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
+        let _guard = self.prompt_mutex.lock().await;
+        let Some(human_gate) = self.human_gate.as_ref() else {
+            let _ = self.audit_network("denied (no human gate)");
+            return NetworkDecision::Deny;
+        };
+        match human_gate.confirm_network(detail, escalated).await {
+            NetworkDecision::Once => {
+                let _ = self.audit_network("allowed (user approved, once)");
+                NetworkDecision::Once
+            }
+            NetworkDecision::Session => {
+                self.network.grant();
+                let _ = self.audit_network("allowed (user approved, session)");
+                NetworkDecision::Session
+            }
+            NetworkDecision::Persistent => match self.persist_network_allowed(None) {
+                Ok(()) => {
+                    self.network.grant();
+                    let _ = self.audit_network("allowed (user approved, persisted)");
+                    NetworkDecision::Persistent
+                }
+                Err(error) => {
+                    self.network.grant();
+                    let _ = self.audit_network(&format!(
+                        "allowed (user approved, session; persist failed: {error})"
+                    ));
+                    NetworkDecision::Session
+                }
+            },
+            NetworkDecision::Deny => {
+                let _ = self.audit_network("denied");
+                NetworkDecision::Deny
+            }
+        }
+    }
+
+    fn resolve_path_for_read(&self, path: &Path) -> Result<PathBuf, PermissionError> {
+        let path = self.workspace_path(path)?;
+
         path.canonicalize().map_err(|e| {
             PermissionError::Resolution(format!(
                 "Failed to canonicalize path {}: {e}",
@@ -591,20 +707,8 @@ impl PermissionManager {
         })
     }
 
-    /// Resolve a path for WRITE/CREATE operations where the file may not exist yet.
-    /// Splits into (parent_dir, filename), canonicalizes parent (walking up if needed), then re-joins.
     fn resolve_path_for_write(&self, path: &Path) -> Result<PathBuf, PermissionError> {
-        // Expand ~ to home directory
-        let path = if path.starts_with("~") {
-            let home = dirs::home_dir().ok_or_else(|| {
-                PermissionError::Resolution("Could not determine home directory".into())
-            })?;
-            path.strip_prefix("~")
-                .map(|p| home.join(p))
-                .unwrap_or(path.to_path_buf())
-        } else {
-            path.to_path_buf()
-        };
+        let path = self.workspace_path(path)?;
 
         // An existing target must be resolved as a whole, not as
         // `canonical-parent + raw-leaf`. The latter leaves a final-component
@@ -623,93 +727,51 @@ impl PermissionManager {
             });
         }
 
-        // Split into parent directory and filename
-        let parent = path.parent().ok_or_else(|| {
-            PermissionError::Resolution(format!("Path has no parent directory: {}", path.display()))
-        })?;
-        let filename = path.file_name().ok_or_else(|| {
-            PermissionError::Resolution(format!(
-                "Path has no filename component: {}",
-                path.display()
-            ))
-        })?;
-
-        // Canonicalize the nearest existing ancestor, keeping the intermediate
-        // components that don't exist yet, then rebuild the full path.
-        let (canonical_ancestor, missing) = self.canonicalize_existing_ancestor(parent)?;
-
-        // Re-join: canonical existing ancestor + missing intermediate dirs + filename.
-        let mut resolved = canonical_ancestor;
-        for component in &missing {
-            resolved.push(component);
+        // Component-wise resolution preserves `..` after missing directories.
+        let mut resolved = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+                std::path::Component::RootDir => resolved.push(component.as_os_str()),
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !resolved.pop() {
+                        return Err(PermissionError::Resolution(format!(
+                            "Path escapes its filesystem root: {}",
+                            path.display()
+                        )));
+                    }
+                }
+                std::path::Component::Normal(part) => {
+                    let candidate = resolved.join(part);
+                    if candidate.exists() {
+                        resolved = candidate.canonicalize().map_err(|e| {
+                            PermissionError::Resolution(format!(
+                                "Failed to canonicalize path component {}: {e}",
+                                candidate.display()
+                            ))
+                        })?;
+                    } else {
+                        resolved.push(part);
+                    }
+                }
+            }
         }
-        resolved.push(filename);
         Ok(resolved)
     }
 
-    /// Find the nearest existing ancestor of a path and canonicalize it, also
-    /// returning the trailing components that do *not* exist yet (in
-    /// top-to-bottom order) so the caller can re-append them.
-    ///
-    /// Dropping those components silently retargets the write to a different
-    /// file (e.g. `dir/newsub/f.txt` collapsing onto `dir/f.txt`), so they must
-    /// be preserved — that was the bug this return value fixes.
-    fn canonicalize_existing_ancestor(
-        &self,
-        path: &Path,
-    ) -> Result<(PathBuf, Vec<std::ffi::OsString>), PermissionError> {
-        // Walk up until we find an existing directory or hit the filesystem root
-        let mut missing: Vec<std::ffi::OsString> = Vec::new();
-        let mut current = path;
-        loop {
-            if current.exists() && current.is_dir() {
-                // Found existing directory - canonicalize it
-                let canonical = current.canonicalize().map_err(|e| {
-                    PermissionError::Resolution(format!(
-                        "Failed to canonicalize parent directory {}: {e}",
-                        current.display()
-                    ))
-                })?;
-                missing.reverse(); // collected bottom-up → restore top-to-bottom
-                return Ok((canonical, missing));
-            }
-            if let Some(name) = current.file_name() {
-                missing.push(name.to_os_string());
-            }
-            match current.parent() {
-                Some(p) if p != current => current = p,
-                _ => break, // Hit filesystem root
-            }
-        }
-
-        // No existing ancestor found - this shouldn't happen for valid paths,
-        // but as fallback, try to canonicalize the original path
-        // (may fail if it doesn't exist, which is correct fail-closed behavior).
-        let canonical = path.canonicalize().map_err(|e| {
-            PermissionError::Resolution(format!(
-                "Failed to canonicalize parent directory {}: {e}",
-                path.display()
-            ))
-        })?;
-        Ok((canonical, Vec::new()))
-    }
-
-    /// Check if a resolved path is inside the workspace root
     fn is_inside_workspace(&self, resolved_path: &Path) -> bool {
         resolved_path.starts_with(&self.workspace_root)
     }
 
-    /// Grant prompt-free READ access to a harness-owned directory for this
-    /// process only (in-memory; never persisted to the trust file). Exists for
-    /// roots like the user skills dir: skills bundle reference files the model
-    /// must read on demand, and a permission dialog per file would break them.
-    /// Writes stay fully gated.
+    /// Prompt-free read access to a harness-owned directory, in-memory only and
+    /// never persisted. For roots like the skills dir, whose reference files are
+    /// read on demand. Writes stay fully gated.
     pub fn allow_read_dir(&self, dir: &Path) {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         self.trusted.allow_read(dir);
     }
 
-    /// Check if a path (or its parent) is trusted for the given permission
     fn is_trusted(&self, resolved_path: &Path, perm: PermissionType) -> bool {
         self.trusted.is_allowed(resolved_path, perm)
     }
@@ -848,7 +910,76 @@ impl PermissionManager {
         collect_persisted_paths(&value)
     }
 
-    /// Log an access attempt to audit log
+    /// Persist a workspace-global network grant to the machine-local trust file
+    /// under the same sibling lock and atomic replacement as trusted paths. The
+    /// key is a single boolean: OS network enforcement is all-or-nothing per
+    /// process, so a per-command scope would advertise granularity the sandbox
+    /// cannot deliver.
+    fn persist_network_allowed(
+        &self,
+        failure: Option<PersistFailure>,
+    ) -> Result<(), PermissionError> {
+        let trust_path = self
+            .trust_path
+            .as_ref()
+            .ok_or(PermissionError::PersistenceDisabled)?;
+        let parent = trust_path.parent().ok_or_else(|| {
+            PermissionError::Io(format!(
+                "trust file has no parent directory: {}",
+                trust_path.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            PermissionError::Io(format!(
+                "could not create trust directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+
+        let lock_path = sibling_name(trust_path, ".medha-write-lock")?;
+        let lock_file = open_private(&lock_path, false)?;
+        let mut lock = FileRwLock::new(lock_file);
+        let _guard = lock.write().map_err(|e| {
+            PermissionError::Io(format!(
+                "could not lock trust file {}: {e}",
+                trust_path.display()
+            ))
+        })?;
+
+        let mut value = read_trust_value(trust_path)?;
+        let permissions = value
+            .as_table_mut()
+            .ok_or_else(|| PermissionError::Io("trust file: top-level is not a TOML table".into()))?
+            .entry("permissions")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let permissions_table = permissions.as_table_mut().ok_or_else(|| {
+            PermissionError::Io("trust file: [permissions] is not a table".into())
+        })?;
+        permissions_table.insert("network_allowed".into(), toml::Value::Boolean(true));
+
+        let new_content =
+            toml::to_string_pretty(&value).map_err(|e| PermissionError::Io(e.to_string()))?;
+        atomic_write_trust(trust_path, new_content.as_bytes(), failure)
+    }
+
+    fn audit_network(&self, decision: &str) -> Result<(), PermissionError> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let log_entry = format!("{timestamp} | Network | decision={decision}\n");
+        if let Some(parent) = self.audit_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| PermissionError::Io(e.to_string()))?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.audit_path)
+            .map_err(|e| PermissionError::Io(e.to_string()))?
+            .write_all(log_entry.as_bytes())
+            .map_err(|e| PermissionError::Io(e.to_string()))
+    }
+
     fn audit_log(
         &self,
         requested_path: &Path,
@@ -882,14 +1013,8 @@ impl PermissionManager {
             .map_err(|e| PermissionError::Io(e.to_string()))
     }
 
-    /// Resolve a path only if it is *already* permitted — inside the workspace,
-    /// or previously trusted. Returns `None` where [`request_permission`] would
-    /// have asked the user.
-    ///
-    /// For callers that must not interrupt, above all previews: a preview runs
-    /// before the approval card is shown, so prompting there asks the user to
-    /// authorise a path before telling them what it is for, and then asks again
-    /// when the operation actually runs.
+    /// Resolve only workspace or pre-approved paths without prompting. Intended
+    /// for previews and other non-interrupting callers.
     pub fn resolve_if_permitted(&self, path: &Path, permission: PermissionType) -> Option<PathBuf> {
         let resolved = match permission {
             PermissionType::Read => self.resolve_path_for_read(path).ok()?,
@@ -899,7 +1024,6 @@ impl PermissionManager {
             .then_some(resolved)
     }
 
-    /// Request permission for a path (the main entry point)
     pub async fn request_permission(
         &self,
         path: &Path,
@@ -918,29 +1042,22 @@ impl PermissionManager {
         permission: PermissionType,
         detail: Option<&str>,
     ) -> Result<PathBuf, PermissionError> {
-        // Step 1: RESOLVE the target path fully
-        // Use different resolution strategy based on permission type:
-        // - READ: canonicalize full path (target must exist)
-        // - WRITE: canonicalize parent dir, then re-join (file may not exist)
         let resolved = match permission {
             PermissionType::Read => self.resolve_path_for_read(path)?,
             PermissionType::Write => self.resolve_path_for_write(path)?,
         };
 
-        // Step 2: IF resolved path is inside workspace root → allow immediately
         if self.is_inside_workspace(&resolved) {
             self.audit_log(path, &resolved, permission, "allowed (workspace)")?;
             return Ok(resolved);
         }
 
-        // Step 3: IF outside workspace → check trusted paths
         if self.is_trusted(&resolved, permission) {
             self.audit_log(path, &resolved, permission, "allowed (trusted)")?;
             return Ok(resolved);
         }
 
-        // Step 4: Not trusted → prompt user via HumanGate
-        let _guard = self.prompt_mutex.lock().await; // Serialize prompts
+        let _guard = self.prompt_mutex.lock().await;
 
         // Another concurrent request may have received "Always" while this
         // request waited for the prompt lane. Recheck under the lane before
@@ -960,14 +1077,11 @@ impl PermissionManager {
             .as_ref()
             .ok_or(PermissionError::NoHumanGate)?;
 
-        // The surface (TUI/terminal) renders the selectable options; keep the
-        // detail to just the explanation so it isn't duplicated.
         let prompt = match detail {
             Some(detail) => detail.to_string(),
             None => format!("This path is outside the workspace: {}", resolved.display()),
         };
 
-        // Use the human gate to get the user's decision (allow once / always / deny).
         let decision = human_gate
             .confirm(
                 &format!("{permission:?} access to {}", resolved.display()),
@@ -982,12 +1096,10 @@ impl PermissionManager {
                 Err(PermissionError::Denied { path: resolved })
             }
             kernel::Approval::Once => {
-                // Allow this operation only; do not persist to machine-local trust.
                 self.audit_log(path, &resolved, permission, "allowed (user approved, once)")?;
                 Ok(resolved)
             }
             kernel::Approval::Always => {
-                // Persist exactly this resolved path and permission type.
                 self.trust_path(resolved.clone(), permission)?;
                 self.audit_log(
                     path,
@@ -1000,12 +1112,10 @@ impl PermissionManager {
         }
     }
 
-    /// Convenience method for read permission
     pub async fn request_read(&self, path: &Path) -> Result<PathBuf, PermissionError> {
         self.request_permission(path, PermissionType::Read).await
     }
 
-    /// Convenience method for write permission
     pub async fn request_write(&self, path: &Path) -> Result<PathBuf, PermissionError> {
         self.request_permission(path, PermissionType::Write).await
     }
@@ -1018,7 +1128,18 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    /// Mock gate that always returns a fixed decision.
+    #[test]
+    fn approved_roots_recovers_after_lock_poisoning() {
+        let roots = ApprovedRoots::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = roots.inner.write().unwrap();
+            panic!("poison fixture");
+        }));
+        let path = PathBuf::from("/tmp/medha-poison-recovery");
+        roots.allow_write(path.clone());
+        assert!(roots.is_allowed(&path, PermissionType::Write));
+    }
+
     struct FixedGate(Approval);
     #[async_trait::async_trait]
     impl HumanGate for FixedGate {
@@ -1101,10 +1222,101 @@ mod tests {
         );
     }
 
-    /// An "Always" grant must be visible through a cloned [`ApprovedRoots`]
-    /// handle immediately — that handle is what the OS exec sandbox snapshots
-    /// per spawn. "Once" must never appear there; trust-file grants must land
-    /// in it at construction.
+    #[tokio::test]
+    async fn network_session_grant_flips_the_handle_without_persisting() {
+        let ws = unique_dir("ws_net_session");
+        let trust = machine_trust_file("net_session");
+        let audit = ws.join("audit.log");
+        let grant = NetworkGrant::default();
+        let mut mgr = PermissionManager::new(&ws, &trust, &audit).unwrap();
+        mgr.set_network_grant(grant.clone()).unwrap();
+        // A gate that opts out of the network card returns Once → no live grant.
+        mgr.set_human_gate(Arc::new(FixedGate(Approval::Once)));
+        assert_eq!(mgr.request_network(None, false).await, NetworkDecision::Once);
+        assert!(!grant.granted(), "a once grant never flips the shared handle");
+        assert!(
+            !trust.exists() || !std::fs::read_to_string(&trust).unwrap().contains("network_allowed"),
+            "once must not persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_persistent_grant_round_trips_through_the_trust_file() {
+        let ws = unique_dir("ws_net_persist");
+        let trust = machine_trust_file("net_persist");
+        let audit = ws.join("audit.log");
+        let grant = NetworkGrant::default();
+        let mut mgr = PermissionManager::new(&ws, &trust, &audit).unwrap();
+        mgr.set_network_grant(grant.clone()).unwrap();
+        // The default confirm_network maps Always → persistent.
+        mgr.set_human_gate(Arc::new(FixedGate(Approval::Always)));
+        assert_eq!(
+            mgr.request_network(None, false).await,
+            NetworkDecision::Persistent
+        );
+        assert!(grant.granted(), "persistent grant flips the live handle");
+        assert!(
+            std::fs::read_to_string(&trust).unwrap().contains("network_allowed"),
+            "persistent grant is recorded durably"
+        );
+
+        // A fresh manager on the same trust file loads the grant at construction.
+        let reloaded = NetworkGrant::default();
+        let mut mgr2 = PermissionManager::new(&ws, &trust, &audit).unwrap();
+        mgr2.set_network_grant(reloaded.clone()).unwrap();
+        assert!(reloaded.granted(), "durable grant is honoured on restart");
+    }
+
+    #[tokio::test]
+    async fn relative_paths_are_resolved_from_the_workspace_not_process_cwd() {
+        let ws = unique_dir("ws_relative_resolution");
+        let target = ws.join("nested").join("file.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "workspace file").unwrap();
+        let manager = PermissionManager::new(
+            &ws,
+            machine_trust_file("relative_resolution"),
+            ws.join("audit.log"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager
+                .request_read(Path::new("nested/file.txt"))
+                .await
+                .unwrap(),
+            target.canonicalize().unwrap()
+        );
+        assert_eq!(
+            manager
+                .request_write(Path::new("nested/new.txt"))
+                .await
+                .unwrap(),
+            ws.canonicalize().unwrap().join("nested/new.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_resolution_normalizes_parent_after_a_missing_directory() {
+        let ws = unique_dir("ws_missing_parent_dir");
+        std::fs::create_dir_all(ws.join("dist")).unwrap();
+        let manager = PermissionManager::new(
+            &ws,
+            machine_trust_file("missing_parent_dir"),
+            ws.join("audit.log"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager
+                .request_write(Path::new("dist/tmp/../bundle.js"))
+                .await
+                .unwrap(),
+            ws.canonicalize().unwrap().join("dist/bundle.js")
+        );
+    }
+
+    /// Shared roots publish Always but never Once approvals.
     #[tokio::test]
     async fn grants_publish_into_the_shared_approved_roots_handle() {
         let ws = unique_dir("ws_shared");
@@ -1132,7 +1344,6 @@ mod tests {
             "an Always approval must be live in the shared handle"
         );
 
-        // A fresh manager on the same trust file seeds a fresh handle from it.
         let reloaded = ApprovedRoots::default();
         let _mgr2 =
             PermissionManager::new_with_roots(&ws, &trust, &audit, reloaded.clone()).unwrap();
@@ -1142,7 +1353,6 @@ mod tests {
         );
     }
 
-    /// "Always allow" persists to machine-local trust and is trusted on reload.
     #[tokio::test]
     async fn always_allow_persists_and_reloads() {
         let ws = unique_dir("ws_always");
@@ -1161,7 +1371,6 @@ mod tests {
                 .contains("trusted_paths")
         );
 
-        // Fresh manager with NO gate: must trust the explicit local grant.
         let mgr2 = PermissionManager::new(&ws, &trust, &audit).unwrap();
         assert!(
             mgr2.request_read(&target).await.is_ok(),
@@ -1316,7 +1525,6 @@ mod tests {
             .expect("concurrent readers must never observe truncated TOML");
     }
 
-    /// Counts prompts, so "asked once" is measured rather than assumed.
     struct CountingGate(Arc<AtomicU32>, Approval);
     #[async_trait::async_trait]
     impl HumanGate for CountingGate {
@@ -1583,10 +1791,7 @@ mod tests {
         );
     }
 
-    /// The stored path and the queried path both come from `canonicalize`, so
-    /// they must compare equal. On Windows that means both carry the `\\?\`
-    /// verbatim prefix; if one side kept it and the other did not, every lookup
-    /// would miss and "always allow" would silently behave like "allow once".
+    /// Canonical directory grants cover descendants on every platform.
     #[tokio::test]
     async fn a_trusted_directory_covers_files_beneath_it() {
         let ws = unique_dir("ws_tree");

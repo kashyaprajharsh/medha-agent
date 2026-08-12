@@ -1,17 +1,4 @@
-//! K1 Identity sheath (§4.3): the agent persona and harness rules that become
-//! the system prompt. Assembling K1 is the context compiler's responsibility,
-//! not the entrypoint's — so it lives here as a single, overridable home that
-//! the full five-sheath pipeline grows into. A deployment may override the
-//! persona via config / `medha.lock`; harness-rule fragments are appended by
-//! the compiler as the sheath matures.
-
-/// Assemble the K1 system prompt. Precedence: an explicit config persona wins;
-/// otherwise the `system` prompt from the registry — an editable
-/// `crates/context/prompts/system.md` embedded at build time, overridable at
-/// runtime via the prompt registry's chain ([`crate::prompts`]). The brief is
-/// the single biggest lever on agent behavior: it tells the model to narrate as
-/// it works (the transcript is live — silence during long tool runs reads as a
-/// hang), work in small verified steps, and explore before it edits.
+/// Return the explicit persona override or the registered system prompt.
 pub fn system_prompt(persona_override: Option<&str>) -> String {
     match persona_override {
         Some(p) => p.to_string(),
@@ -23,21 +10,18 @@ pub fn system_prompt(persona_override: Option<&str>) -> String {
 mod tests {
     use super::*;
 
-    /// The brief drifted once already: LSP, MCP and sub-agents all shipped while
-    /// it still described a file-tools-and-shell agent, so capabilities were paid
-    /// for and never used. This fails when the next one lands unmentioned.
     #[test]
     fn the_brief_covers_what_medha_can_actually_do() {
         let brief = system_prompt(None);
         for capability in [
-            "lsp.definition", // semantic navigation, not grep guesses
-            "agent.spawn",    // delegation, on its own judgement
-            "read_artifact",  // paging, so nothing is "truncated"
-            "update_plan",    // the user's live progress view
-            "skill.load",     // project procedures come first
-            "memory.write",   // what should outlive the session
-            "clarify",        // ask rather than guess
-            "mcp__",          // external tool output is data, not instruction
+            "lsp.definition",
+            "agent.spawn",
+            "read_artifact",
+            "update_plan",
+            "skill.load",
+            "memory.write",
+            "clarify",
+            "mcp__",
         ] {
             assert!(
                 brief.contains(capability),

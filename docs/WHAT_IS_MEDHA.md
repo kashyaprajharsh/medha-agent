@@ -104,7 +104,7 @@ MEDHA consists of **15 Rust crates**, each responsible for a specific concern:
 | `providers` | OpenAI Chat and Gemini Interactions wire protocols, SSE, models.dev metadata |
 | `context` | Prompt assembly, two-phase compaction, identity, context files, prompt registry |
 | `memory` | Typed memory with projection, ranked recall, consolidation |
-| `tools` | 52 tools: filesystem, shell, web, git, diagnostics, LSP, MCP, sub-agents, skills |
+| `tools` | 53 tools: filesystem, shell, web, git, diagnostics, LSP, MCP, sub-agents, skills |
 | `orchestrator` | Sub-agent sessions, capability narrowing, worktree isolation for writers |
 | `lsp` | Supervised multi-language LSP client: diagnostics + navigation |
 | `mcp` | Supervised MCP host: stdio and Streamable HTTP servers, OAuth |
@@ -3088,7 +3088,7 @@ MEDHA transforms any AI model into a **reliable, auditable, safe agent** through
 | **Interrupts** | Graceful cancellation and message steering |
 | **Event Log** | Tamper-evident history with time travel |
 | **Memory** | Persistent facts with kernel-computed trust |
-| **Tools** | 23 capabilities, sandbox-confined |
+| **Tools** | 53 capabilities, sandbox-confined |
 | **Context** | Five-layer prompt assembly with compaction |
 | **Skills** | Reusable procedures loaded on demand |
 | **Verify** | Post-edit checks to catch broken builds |

@@ -1,8 +1,4 @@
-//! Turning stochastic runs into a verdict (Vol 5 §5).
-//!
-//! A single run's pass/fail is noise — agents are stochastic. Running a scenario
-//! `n` times gives a pass-rate; with `n > 1` we attach a Wilson score interval so
-//! the report shows *confidence*, not a coin flip dressed as a fact.
+//! Aggregate stochastic runs with pass rates and Wilson score intervals.
 
 use crate::checks::CheckOutcome;
 #[cfg(test)]
@@ -12,11 +8,8 @@ use std::path::PathBuf;
 /// The gate's decision for one scenario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// Pass-rate met the threshold — safe to promote.
     Promote,
-    /// Neither clearly good nor clearly broken — flaky or a run error.
     Hold,
-    /// Nothing passed — a real regression.
     Reject,
 }
 
@@ -36,21 +29,14 @@ impl Verdict {
 /// correct after a crash, but only an ordinary zero exit is eligible to pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
-    /// The process exited normally with status zero.
     Succeeded,
-    /// The process exited normally with a non-zero status.
     ExitCode(i32),
     /// The process was terminated by a signal or an equivalent platform event
     /// that does not expose a numeric exit code.
     Signaled,
-    /// Gate's hard wall-clock deadline expired and the whole process tree was
-    /// killed and reaped.
     TimedOut,
-    /// The run was explicitly cancelled and its process tree was stopped.
     Cancelled,
-    /// The configured Medha executable could not be launched or supervised.
     LaunchError(String),
-    /// Gate failed before an agent process could produce an artifact.
     HarnessError(String),
 }
 
@@ -141,8 +127,6 @@ pub fn aggregate(id: String, seeds: Vec<SeedResult>, threshold: f64) -> Scenario
     } else {
         None
     };
-    // promote when the bar is cleared; reject when nothing passed at all;
-    // otherwise hold (flaky, or a run that errored/timed out).
     let verdict = if pass_rate + 1e-9 >= threshold {
         Verdict::Promote
     } else if passed == 0 {

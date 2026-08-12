@@ -1,9 +1,5 @@
-//! Memory write tools (design D5/D6/D9). The model calls these to persist
-//! typed memories; `trust`/`provenance`/`_session`/`_user_stated` arrive as
-//! kernel-injected `_`-prefixed args — anything the model passed under those
-//! names was stripped at dispatch. Each tool echoes the exact `MemoryOp` it
-//! applied under `applied`, which the kernel appends as the durable
-//! `memory.write` event (I1).
+//! Memory mutation tools. Trust and provenance metadata is injected by the
+//! kernel, never accepted from model arguments.
 
 use crate::{Tool, ToolError};
 use async_trait::async_trait;
@@ -29,7 +25,7 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolError> {
         .ok_or_else(|| ToolError::Args(format!("expected non-empty string '{key}'")))
 }
 
-/// The kernel-injected trust fields (D6). Absence means the intent did not go
+/// Kernel-injected trust fields. Absence means the intent did not go
 /// through kernel dispatch — refuse rather than invent trust.
 struct Injected {
     trust: TrustLabel,
@@ -145,8 +141,6 @@ fn scope_hint(scope: Scope) -> &'static str {
 }
 
 fn saved_response(op: MemoryOp, note: &str) -> Value {
-    // Terminal on success: no entry listing — echoing the store invites
-    // re-issuing the same writes.
     let (name, scope, trust, confidence) = match &op {
         MemoryOp::Write { entry } | MemoryOp::Update { entry } => (
             entry.name.clone(),
@@ -354,7 +348,6 @@ impl Tool for MemoryWrite {
         response["usage"] = json!({
             "tokens": usage_tokens,
             "budget_tokens": self.budget_tokens,
-            // A zero budget reads as "full", not as a division by zero.
             "percent": usage_tokens.saturating_mul(100).checked_div(self.budget_tokens).unwrap_or(100),
         });
         Ok(response)
@@ -422,9 +415,7 @@ impl Tool for MemoryUpdate {
             .unwrap_or(&existing.description);
         guard_scan(name, &claim, description)?;
 
-        // Promotion (D6): user restating wins outright; otherwise corroboration
-        // from a session that contributed no prior evidence lifts Candidate →
-        // Confirmed. Same-session repetition proves nothing.
+        // Only user-stated evidence or independent-session corroboration promotes.
         let fresh_session = !existing.sessions.contains(&inj.session);
         let confidence = if inj.user_stated {
             ConfidenceRung::UserStated
@@ -447,7 +438,7 @@ impl Tool for MemoryUpdate {
             description: description.to_string(),
             kind: existing.kind,
             scope,
-            // Evidence union: trust is the floor across all contributing turns.
+            // Trust is the floor across all contributing evidence.
             trust: existing.trust.min(inj.trust),
             confidence,
             provenance,
@@ -818,7 +809,6 @@ mod tests {
         Arc::new(MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap())
     }
 
-    /// Args as the kernel's dispatch enrichment would deliver them.
     fn enriched(mut args: Value, trust: &str, session: Ulid, user_stated: bool) -> Value {
         let obj = args.as_object_mut().unwrap();
         obj.insert("_trust".into(), json!(trust));
@@ -886,7 +876,6 @@ mod tests {
     async fn write_stores_kernel_trust_not_model_trust() {
         let s = store();
         let t = MemoryWrite::new(s.clone(), 1_200);
-        // Model smuggled trust:"user"; kernel enrichment says web-tainted.
         let mut args = write_args("a");
         args["trust"] = json!("user");
         let out = t
@@ -952,7 +941,6 @@ mod tests {
             ConfidenceRung::Candidate
         );
 
-        // Same session re-confirms: NO promotion.
         u.execute(&enriched(json!({ "name": "a" }), "tool", s1, false))
             .await
             .unwrap();
@@ -960,7 +948,6 @@ mod tests {
         assert_eq!(e.confidence, ConfidenceRung::Candidate);
         assert_eq!(e.version, 2);
 
-        // Fresh session corroborates: promoted.
         let s2 = Ulid::new();
         u.execute(&enriched(json!({ "name": "a" }), "tool", s2, false))
             .await
@@ -1071,7 +1058,6 @@ mod tests {
         assert!(out["note"].as_str().unwrap().contains("do not repeat"));
         assert!(out.get("entries").is_none());
         assert!(out["usage"]["percent"].is_number());
-        // Round-trip: the echoed op must deserialize as a MemoryOp.
         let op: MemoryOp = serde_json::from_value(out["applied"].clone()).unwrap();
         assert!(matches!(op, MemoryOp::Write { .. }));
     }

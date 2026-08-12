@@ -1,11 +1,10 @@
-//! The one interface the kernel sees for any model (§4.4). Open-first: the
-//! OpenAI-compatible adapter is the baseline impl; Anthropic/Gemini are opt-in
-//! native upgrades. All translate to/from the canonical `Block`.
+//! Model-provider interface over canonical blocks.
 
 use crate::types::{Block, CompiledContext};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Stable wire contracts supported by Medha. A protocol is a real HTTP/event
@@ -85,9 +84,8 @@ pub struct ModelLimits {
 
 impl ModelLimits {
     /// Maximum input for this request. A combined window reserves only the
-    /// explicitly requested output allowance; it does not invent a percentage.
-    /// Without a requested output cap, a combined limit cannot safely be
-    /// converted into an input-only allowance and therefore remains unknown.
+    /// explicitly requested output allowance, never a guessed percentage, so
+    /// without a requested cap the input allowance stays unknown.
     pub fn input_allowance(self, requested_output: Option<u64>) -> Option<u64> {
         let combined = self
             .max_combined_tokens
@@ -194,14 +192,14 @@ fn request_fingerprint(protocol: Protocol, model: &str, body: &serde_json::Value
     format!("{:x}", hash.finalize())
 }
 
-/// How a provider produces schema-valid tool intents (§4.4). The kernel always
+/// How a provider produces schema-valid tool intents. The kernel always
 /// receives a valid `ToolIntent` or a structured parse failure, whichever rung.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCallStrategy {
     /// Server + model support native tool calls well.
     Native,
     /// Constrained/guided decoding (grammar / JSON-schema) forces valid intents
-    /// from models with weak native support — what makes P1 hold on open models.
+    /// from models with weak native support.
     Guided,
     /// Structured JSON-in-text + parser. Last resort for the weakest endpoints.
     PromptFallback,
@@ -213,7 +211,7 @@ pub struct ProviderCaps {
     pub caching: bool,
     /// Context-window size in tokens. `None` = **unknown** — not a guess. The
     /// context compiler must never trust a fabricated number (it sizes
-    /// compaction against this, §4.3). Resolved, in order: model-discovery
+    /// compaction against this). Resolved, in order: model-discovery
     /// response (OpenRouter `context_length`, vLLM `max_model_len`, Ollama
     /// `/api/show`) → config/`medha.lock` override → conservative fallback with
     /// a warning. `vision`/`caching` default `false` because that's a safe
@@ -230,6 +228,9 @@ pub enum ProviderError {
     Decode(String),
     #[error("provider returned status {0}: {1}")]
     Status(u16, String),
+    /// An error object delivered inside an otherwise-successful HTTP response.
+    #[error("provider response error: {0}")]
+    Response(String),
     #[error("provider stream error: {0}")]
     Stream(String),
 }
@@ -270,58 +271,93 @@ impl ProviderError {
         match self {
             ProviderError::Transport(_) | ProviderError::Stream(_) => ProviderFailure::Transient,
             ProviderError::Decode(_) => ProviderFailure::Fatal,
+            ProviderError::Response(message) => classify_rejection(None, message),
             ProviderError::Status(code, message) => {
                 if *code == 429 || (500..600).contains(code) {
                     return ProviderFailure::Transient;
                 }
-                let lower = message.to_ascii_lowercase();
-                let output_shaped = (lower.contains("max_tokens")
-                    || lower.contains("max output")
-                    || lower.contains("output token"))
-                    && (lower.contains("too large")
-                        || lower.contains("exceed")
-                        || lower.contains("maximum")
-                        || lower.contains("available"));
-                if output_shaped {
-                    return ProviderFailure::OutputLimit {
-                        available_output: number_after_any(
-                            &lower,
-                            &["available_tokens", "available tokens", "available output"],
-                        ),
-                    };
-                }
-
-                let input_shaped = lower.contains("context_length_exceeded")
-                    || lower.contains("maximum context")
-                    || (lower.contains("context")
-                        && (lower.contains("length") || lower.contains("window"))
-                        && (lower.contains("exceed")
-                            || lower.contains("too long")
-                            || lower.contains("maximum")))
-                    || lower.contains("too many tokens in the prompt")
-                    || lower.contains("input tokens exceed");
-                if (*code == 400 || *code == 413) && input_shaped {
-                    return ProviderFailure::InputContextOverflow {
-                        reported_limit: number_after_any(
-                            &lower,
-                            &[
-                                "maximum context length is",
-                                "maximum context length:",
-                                "max context length:",
-                                "context window is",
-                                "context window:",
-                                "context_length:",
-                            ],
-                        ),
-                    };
-                }
-                if *code == 413 {
-                    return ProviderFailure::PayloadTooLarge;
-                }
-                ProviderFailure::Fatal
+                classify_rejection(Some(*code), message)
             }
         }
     }
+}
+
+fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
+    let lower = message.to_ascii_lowercase();
+    let output_shaped = (lower.contains("max_tokens")
+        || lower.contains("max output")
+        || lower.contains("output token"))
+        && (lower.contains("too large")
+            || lower.contains("exceed")
+            || lower.contains("maximum")
+            || lower.contains("available"));
+    if output_shaped {
+        return ProviderFailure::OutputLimit {
+            available_output: number_after_any(
+                &lower,
+                &["available_tokens", "available tokens", "available output"],
+            ),
+        };
+    }
+
+    let input_shaped = lower.contains("context_length_exceeded")
+        || lower.contains("maximum context")
+        || (lower.contains("context")
+            && (lower.contains("length") || lower.contains("window"))
+            && (lower.contains("exceed")
+                || lower.contains("too long")
+                || lower.contains("maximum")))
+        || lower.contains("too many tokens in the prompt")
+        || lower.contains("input tokens exceed");
+    if code.is_none_or(|code| code == 400 || code == 413) && input_shaped {
+        return ProviderFailure::InputContextOverflow {
+            reported_limit: number_after_any(
+                &lower,
+                &[
+                    "maximum context length is",
+                    "maximum context length:",
+                    "max context length:",
+                    "context window is",
+                    "context window:",
+                    "context_length:",
+                ],
+            ),
+        };
+    }
+    // Retry HTTP-200 error objects only for explicit transient declarations.
+    let transient_shaped = structured_google_rpc_transient_status(message)
+        || lower.contains("rate_limit")
+        || lower.contains("rate limit")
+        || lower.contains("rate limited")
+        || lower.contains("resource_exhausted")
+        || lower.contains("overloaded")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("service unavailable")
+        || lower.contains("server_error")
+        || lower.contains("internal_error");
+    if code.is_none() && transient_shaped {
+        return ProviderFailure::Transient;
+    }
+    if code == Some(413) {
+        return ProviderFailure::PayloadTooLarge;
+    }
+    ProviderFailure::Fatal
+}
+
+/// Match exact `google.rpc.Status` tokens; broad text matching retries
+/// application errors that merely mention internal state.
+fn structured_google_rpc_transient_status(message: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(message) else {
+        return false;
+    };
+    let status = value
+        .get("status")
+        .or_else(|| value.pointer("/error/status"))
+        .and_then(Value::as_str);
+    matches!(
+        status,
+        Some("INTERNAL" | "UNAVAILABLE" | "DEADLINE_EXCEEDED" | "ABORTED" | "RESOURCE_EXHAUSTED")
+    )
 }
 
 fn number_after_any(text: &str, markers: &[&str]) -> Option<u64> {
@@ -375,6 +411,58 @@ mod error_class_tests {
         assert!(!generic.is_context_overflow());
         // A 429 is retryable but not an overflow.
         assert!(!ProviderError::Status(429, "slow down".into()).is_context_overflow());
+    }
+
+    #[test]
+    fn in_band_rejections_are_classified_from_their_payload() {
+        let overflow = ProviderError::Response(
+            "context_length_exceeded: maximum context length is 32,768 tokens".into(),
+        );
+        assert_eq!(
+            overflow.classify(),
+            ProviderFailure::InputContextOverflow {
+                reported_limit: Some(32_768)
+            }
+        );
+        assert!(
+            !overflow.is_retryable(),
+            "the same overlong input must compact"
+        );
+
+        let generic = ProviderError::Response("invalid request parameter".into());
+        assert_eq!(generic.classify(), ProviderFailure::Fatal);
+        assert!(
+            !generic.is_retryable(),
+            "a declared rejection is not a transport retry"
+        );
+
+        let limited = ProviderError::Response("rate limited (rate_limit_error)".into());
+        assert_eq!(limited.classify(), ProviderFailure::Transient);
+        assert!(limited.is_retryable());
+
+        for status in [
+            "INTERNAL",
+            "UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+            "ABORTED",
+            "RESOURCE_EXHAUSTED",
+        ] {
+            let error = ProviderError::Response(
+                serde_json::json!({ "code": 500, "status": status, "message": "request failed" })
+                    .to_string(),
+            );
+            assert_eq!(error.classify(), ProviderFailure::Transient, "{status}");
+            assert!(error.is_retryable(), "{status}");
+        }
+        let invalid = ProviderError::Response(
+            serde_json::json!({
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "invalid request parameter"
+            })
+            .to_string(),
+        );
+        assert_eq!(invalid.classify(), ProviderFailure::Fatal);
     }
 
     #[test]
@@ -442,7 +530,7 @@ impl ReasoningSupport {
     }
 }
 
-/// Reasoning/thinking control for subsequent calls (§4.4). `enabled: None` /
+/// Reasoning/thinking control for subsequent calls. `enabled: None` /
 /// `effort: None` mean "don't touch the server's own default" — this is a
 /// request-side control (distinct from parsing reasoning back out of the
 /// response, which is the `Block::Reasoning` / `<think>` path). Config-file
@@ -511,8 +599,7 @@ pub trait Provider: Send + Sync {
         ))
     }
 
-    /// Stream canonical blocks for one model call. Phase 0 impls may buffer the
-    /// response and yield owned blocks; SSE token streaming lands in Phase 1.
+    /// Stream canonical blocks for one model call.
     async fn stream(
         &self,
         ctx: &CompiledContext,

@@ -1,11 +1,5 @@
-//! Token counting. The compactor needs to estimate how full the window is.
-//!
-//! The `TokenCounter` trait is the swap point (P8). Production uses a real BPE
-//! tokenizer ([`BpeCounter`]); the heuristic remains as a zero-dependency
-//! fallback and for deterministic tests. Note the *authoritative* count for the
-//! running model still comes from the provider's reported `usage` — the counter
-//! governs the pre-flight estimate (before the first response) and the per-item
-//! compaction boundaries, where good relative accuracy matters most.
+//! Token estimates for preflight and compaction boundaries; provider usage
+//! remains authoritative after a request.
 
 pub trait TokenCounter: Send + Sync {
     fn count(&self, text: &str) -> u32;

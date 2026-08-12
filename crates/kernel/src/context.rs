@@ -1,9 +1,5 @@
-//! The context-engine interface (§4.3). Each turn the kernel compiles the
-//! outbound model context *fresh* from the full message history, delegating to
-//! a `ContextEngine` that compacts it to fit the model's window. The engine
-//! lives in its own crate (P8); the kernel knows only this trait. The full
-//! history is retained by the kernel/log — compaction shrinks the *view sent to
-//! the model*, never the truth (P3).
+//! Context compilation from full durable history. Compaction changes only the
+//! provider view, not the event log.
 
 use crate::provider::InputTokenCount;
 use crate::types::{Message, ToolSpec, TrustLabel};
@@ -99,10 +95,7 @@ pub struct CompileResult {
     pub summarized: bool,
     pub before_tokens: u32,
     pub after_tokens: u32,
-    /// True if, even after the engine's best compaction effort, the result is
-    /// still projected to exceed the hard safety ceiling (§4.3 emergency_ratio).
-    /// The kernel must not send this turn — send would risk a provider
-    /// context-length-exceeded error rather than a controlled, graceful stop.
+    /// True when the request still exceeds the hard ceiling after compaction.
     pub overflow: bool,
     /// Summary text produced by a Full compaction, retained for diagnostics and
     /// UI notices alongside the event's exact post-compaction snapshot. `None`
@@ -129,7 +122,7 @@ pub trait ContextEngine: Send + Sync {
     /// pass without fabricating or permanently lowering a model limit.
     fn force_next_compaction(&self) {}
 
-    /// Note the session's tool set so tool-def overhead is sized once (P1-9).
+    /// Note the session's tool set so tool-definition overhead is sized once.
     fn note_tools(&self, _tools: &[ToolSpec]) {}
 
     /// Compile outbound context from the working history. `max_input_tokens`

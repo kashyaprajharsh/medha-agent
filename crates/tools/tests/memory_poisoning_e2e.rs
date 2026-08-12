@@ -1,8 +1,3 @@
-//! M2 exit criterion (design D6): through the REAL kernel loop and the REAL
-//! memory tools, a turn window containing web-trust content can never produce
-//! better-than-web-trust memory — and trust keys smuggled in the model's tool
-//! args are provably stripped and replaced.
-
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use kernel::{
@@ -55,8 +50,6 @@ impl Provider for ScriptedProvider {
     }
 }
 
-/// A web-category tool: its observation gets stamped `TrustLabel::Web` by the
-/// kernel, tainting the memory-evidence window.
 struct FakeWebFetch;
 
 #[async_trait]
@@ -129,7 +122,6 @@ fn memory_write_args() -> Value {
         "claim": "The gateway supports /v2/turbo.",
         "description": "gateway endpoint note",
         "kind": "project",
-        // Smuggled trust fields — the kernel must strip every one of these.
         "trust": "user",
         "confidence": "confirmed",
         "provenance": ["01FAKEFAKEFAKEFAKEFAKEFAKE"],
@@ -182,7 +174,6 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
     .await
     .unwrap();
 
-    // The stored entry carries the kernel's taint, not the smuggled values.
     let e = store
         .get(Scope::Project, "gateway-turbo")
         .unwrap()
@@ -198,8 +189,6 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
         "smuggled 'confirmed' ignored"
     );
     assert_eq!(e.sessions, vec![session.id]);
-    // Provenance = the kernel's window (user message + web observation), not
-    // the model's fake id.
     assert!(
         e.provenance.len() >= 2,
         "user msg + web obs, got {:?}",
@@ -213,7 +202,6 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
 
     let events = log.events(session.id).await;
 
-    // The logged intent shows the strip+inject actually happened at dispatch.
     let logged = events
         .iter()
         .find(|e| e.kind == EventKind::ModelIntent && e.payload["tool"] == "memory.write")
@@ -225,8 +213,6 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
     assert_eq!(logged.payload["args"]["_trust"], "web");
     assert_eq!(logged.payload["args"]["_user_stated"], false);
 
-    // Exactly one durable memory.write event, and rebuilding from the log
-    // reproduces the same tainted entry (D1 round-trip through the real loop).
     let mem_events: Vec<_> = events
         .iter()
         .filter(|e| e.kind == EventKind::MemoryWrite)

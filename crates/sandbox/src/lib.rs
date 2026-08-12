@@ -1,10 +1,5 @@
-//! Execution backends behind one interface (§4.8). Phase 0 ships the
-//! `workspace` backend: path-jailed file ops with snapshot-before-write so
-//! every mutation is reversible (the basis for `medha undo`). Container/microVM
-//! backends are added later behind this same surface (P8).
-//!
-//! The new permission system allows legitimate access to files outside the
-//! workspace via a live ask-then-persist flow (see issues.txt).
+//! Workspace-jailed file operations with reversible writes and gated access to
+//! external paths.
 
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -20,10 +15,10 @@ pub mod exec;
 pub use exec::{
     BackendKind, ExecBackend, ExecError, ExecOutput, ExecRequest, HostBackend, NetPolicy,
     SandboxConfig, ShellOutcome, native_backend_available, native_sandbox_supported,
-    program_in_dir, program_on_path, run_command_bounded, run_shell_bounded,
-    run_shell_bounded_with, select_backend,
+    network_denial_signature, program_in_dir, program_on_path, run_command_bounded,
+    run_shell_bounded, run_shell_bounded_with, select_backend,
 };
-pub use permissions::ApprovedRoots;
+pub use permissions::{ApprovedRoots, NetworkGrant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
@@ -55,11 +50,8 @@ pub struct GuardedInspection {
     pub bytes: Option<Vec<u8>>,
 }
 
-/// Result of a bounded streaming line-range read.
-///
-/// `total_lines` is known only when the scan reached EOF. Returning `None`
-/// rather than scanning the remainder keeps a small range read independent of
-/// the size of a multi-gigabyte file.
+/// Result of a bounded streaming line-range read. `total_lines` is `None` unless
+/// the scan reached EOF, keeping a small read independent of file size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineRangeRead {
     pub content: String,
@@ -71,16 +63,9 @@ pub struct LineRangeRead {
     pub bytes_scanned: u64,
 }
 
-/// Capability-based write anchor: the authorized directory is held as an open
-/// handle and every later component is traversed with `openat`+`O_NOFOLLOW`,
-/// so a parent directory swapped for a symlink after authorization cannot
-/// redirect the write (AUD-024).
-///
-/// SCOPE: Unix only. The `#[cfg(not(unix))]` branches below operate by
-/// pathname after authorization, so on Windows the parent-symlink-swap race
-/// remains open — the same accepted platform gap as the Windows exec sandbox.
-/// A port needs `NtCreateFile` relative-open against a held directory handle
-/// (or `FILE_FLAG_OPEN_REPARSE_POINT` traversal checks) before writes.
+/// Capability-based write anchor: the authorized directory is held open and later
+/// components use `openat`+`O_NOFOLLOW`, so a symlink swapped in after
+/// authorization cannot redirect the write. Unix only.
 #[cfg(unix)]
 struct UnixWriteCapability {
     anchor: std::fs::File,
@@ -124,12 +109,9 @@ impl Drop for PathLock {
     }
 }
 
-/// An authorised write target with its canonical per-target lock held.
-///
-/// Callers performing a read-modify-write must retain this value from before
-/// the read through the final write. The resolved path is intentionally carried
-/// with the guard so execution does not fall back to the model's raw spelling
-/// after locking a different alias.
+/// An authorised write target with its per-target lock held. Retain it across a
+/// read-modify-write; the resolved path travels with the guard so execution
+/// cannot fall back to the model's raw spelling.
 pub struct WritePathGuard {
     resolved: PathBuf,
     #[cfg(unix)]
@@ -146,15 +128,9 @@ impl WritePathGuard {
     }
 }
 
-/// Turn an authorised, canonical path into its lock-table identity.
-///
-/// Existing targets have already been canonicalized as a whole, so relative,
-/// absolute, `.` and symlink spellings converge here. A prospective target is
-/// represented by its canonical existing ancestor plus its normalized missing
-/// tail. Windows and the usual macOS filesystems are case-insensitive; folding
-/// their spelling also makes two concurrent creates with case-only aliases
-/// contend. On case-sensitive volumes this is conservatively over-serializing,
-/// never under-serializing.
+/// Turn an authorised, canonical path into its lock-table identity: a canonical
+/// existing ancestor plus any normalized missing tail. Case is folded so
+/// case-only aliases contend, which over-serializes rather than under-.
 fn path_lock_key(path: &Path) -> String {
     let canonical = path.to_string_lossy();
     #[cfg(any(windows, target_os = "macos"))]
@@ -498,12 +474,9 @@ fn rename_file_at(parent: &std::fs::File, from: &OsStr, to: &OsStr) -> Result<()
     }
 }
 
-/// Publish a newly created file without ever replacing an intervening entry.
-///
-/// The state is checked immediately before this call, but only an exclusive
-/// rename closes the final syscall-sized create race. macOS and Linux expose
-/// descriptor-relative no-replace renames; other Unix platforms use an atomic
-/// hard-link publication followed by unlinking the private temporary name.
+/// Publish a newly created file without replacing an intervening entry — only an
+/// exclusive rename closes the final syscall-sized race. macOS and Linux use
+/// no-replace renames; other Unix uses hard-link publication then unlink.
 #[cfg(unix)]
 fn publish_new_file_at(
     parent: &std::fs::File,
@@ -1287,19 +1260,343 @@ pub struct WorkspaceSandbox {
     permission_manager: Arc<PermissionManager>,
     /// Backend that runs shell/build/VCS commands (host or OS-native jail).
     exec: Arc<dyn ExecBackend>,
-    /// Per-target write locks (P0-4): serialize concurrent read-modify-write on
-    /// the same physical file so two same-turn edits can't both read the
-    /// original and clobber each other (last-write-wins, silent loss, corrupted
-    /// snapshot chain). Keys are produced only after resolution/authorization.
+    /// Serializes read-modify-write operations by resolved physical target.
     write_locks: Arc<WriteLockTable>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecIntent {
+    /// The command has no filesystem mutation mode. A repeated denial must not
+    /// turn `rg`, `grep`, or another reader into a write-capable process.
+    ReadOnly,
+    /// The denied root is an explicit mutation target.
+    Write,
+    /// Start with least-privilege read access, but allow a second, separately
+    /// approved write prompt if that read-only retry proves insufficient.
+    Unknown,
+}
+
+/// Eight cards cover four unknown roots that each need Read then Write.
+const MAX_EXEC_ESCALATION_PROMPTS: usize = 8;
+
+fn command_name(program: &str) -> &str {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+}
+
+fn is_read_only_command(command: &str, args: &[String]) -> bool {
+    match command {
+        "cat" | "head" | "tail" | "less" | "more" | "wc" | "stat" | "file" | "readlink"
+        | "realpath" | "ls" | "rg" | "grep" | "egrep" | "fgrep" | "diff" | "cmp" | "comm"
+        | "read" | "pwd" | "which" | "whereis" | "type" | "echo" | "printf" | "true" | "false"
+        | "test" | "[" => true,
+        // `sed` is a filter unless an in-place flag is present.
+        "sed" => !args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")),
+        _ => false,
+    }
+}
+
+fn resolve_prospective(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        missing.push(ancestor.file_name()?.to_os_string());
+        ancestor = ancestor.parent()?;
+    }
+    let mut resolved = ancestor.canonicalize().ok()?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Some(resolved)
+}
+
+fn operand_root(raw: &str, cwd: &Path) -> Option<PathBuf> {
+    let raw = raw.trim_matches(['\'', '"']);
+    if raw.is_empty() || raw.contains(['$', '`']) {
+        return None;
+    }
+    let path = Path::new(raw);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let root = if path.is_dir() {
+        path
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    resolve_prospective(&root)
+}
+
+fn operand_names(args: &[String]) -> Vec<&str> {
+    let mut after_options = false;
+    args.iter()
+        .filter_map(|arg| {
+            if !after_options && arg == "--" {
+                after_options = true;
+                return None;
+            }
+            (after_options || !arg.starts_with('-')).then_some(arg.as_str())
+        })
+        .collect()
+}
+
+fn target_directory_arg(args: &[String]) -> Option<&str> {
+    args.windows(2)
+        .find_map(|pair| {
+            matches!(pair[0].as_str(), "-t" | "--target-directory").then_some(pair[1].as_str())
+        })
+        .or_else(|| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix("--target-directory="))
+        })
+}
+
+fn candidate_matches_operand(candidate: &Path, operand: &str, cwd: &Path) -> bool {
+    operand_root(operand, cwd).is_some_and(|root| candidate == root || candidate.starts_with(root))
+}
+
+/// Classify the denied root, not the executable: `cp` reads its source and writes
+/// its destination, so a program-name grant would turn a read into an overwrite.
+fn command_intent(command: &str, args: &[String], cwd: &Path, candidate: &Path) -> ExecIntent {
+    if is_read_only_command(command, args) {
+        return ExecIntent::ReadOnly;
+    }
+    let operands = operand_names(args);
+    let matches = |operand: &&str| candidate_matches_operand(candidate, operand, cwd);
+    match command {
+        // Rename mutates both parents: the source entry is removed and the
+        // destination entry is created/replaced.
+        "mv" => operands.iter().any(matches).then_some(ExecIntent::Write),
+        // Copy/install/link sources are read-only; only their destination is a
+        // write target. Target-directory flags take precedence over the final
+        // positional operand.
+        "cp" | "install" | "ln" => {
+            let destinations: Vec<&str> = if command == "install"
+                && args.iter().any(|arg| arg == "-d" || arg == "--directory")
+            {
+                operands.clone()
+            } else if let Some(target) = target_directory_arg(args) {
+                vec![target]
+            } else if operands.len() >= 2 {
+                operands.last().copied().into_iter().collect()
+            } else {
+                Vec::new()
+            };
+            if destinations.iter().any(matches) {
+                Some(ExecIntent::Write)
+            } else if operands.iter().any(matches) {
+                Some(ExecIntent::ReadOnly)
+            } else {
+                None
+            }
+        }
+        "dd" => {
+            let output = args.iter().find_map(|arg| arg.strip_prefix("of="));
+            let input = args.iter().find_map(|arg| arg.strip_prefix("if="));
+            if output.is_some_and(|path| candidate_matches_operand(candidate, path, cwd)) {
+                Some(ExecIntent::Write)
+            } else if input.is_some_and(|path| candidate_matches_operand(candidate, path, cwd)) {
+                Some(ExecIntent::ReadOnly)
+            } else {
+                None
+            }
+        }
+        "rm" | "touch" | "mkdir" | "rmdir" | "tee" | "truncate" | "chmod" | "chown" | "chgrp" => {
+            operands.iter().any(matches).then_some(ExecIntent::Write)
+        }
+        "sed" if args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")) => {
+            operands.iter().any(matches).then_some(ExecIntent::Write)
+        }
+        "find"
+            if args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-delete" | "-exec" | "-execdir")) =>
+        {
+            operands.iter().any(matches).then_some(ExecIntent::Write)
+        }
+        _ => None,
+    }
+    .unwrap_or(ExecIntent::Unknown)
+}
+
+fn shell_command(req: &ExecRequest) -> Option<&str> {
+    matches!(command_name(&req.program), "sh" | "bash" | "zsh" | "dash")
+        .then(|| {
+            req.args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "-c").then_some(pair[1].as_str()))
+        })
+        .flatten()
+}
+
+/// Extract command-position words from a shell line. This is intentionally a
+/// small classifier, not a shell parser: unrecognized compound syntax remains
+/// `Unknown` and therefore starts with Read rather than being over-privileged.
+fn shell_segments(command: &str) -> Vec<Vec<String>> {
+    command
+        .split([';', '|', '&', '\n'])
+        .filter_map(|segment| {
+            let words: Vec<String> = segment
+                .split_whitespace()
+                .map(|word| word.trim_matches(['(', ')']).to_string())
+                .collect();
+            (!words.is_empty()).then_some(words)
+        })
+        .collect()
+}
+
+/// Redirection targets are the one case where a read-only executable (`rg … >
+/// out`) needs write access. Returns their canonical parent roots so the grant
+/// applies only to the output root, not to inputs of the same command.
+fn shell_redirection_roots(command: &str, cwd: &Path) -> Vec<PathBuf> {
+    let bytes = command.as_bytes();
+    let mut roots = Vec::new();
+    let mut index = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            }
+            index += 1;
+            continue;
+        }
+        if byte != b'>' || quote.is_some() {
+            index += 1;
+            continue;
+        }
+
+        // Consume >, >>, or >|, then the following shell word. Descriptor
+        // duplication (`2>&1`) is not a filesystem target.
+        index += 1;
+        if index < bytes.len() && matches!(bytes[index], b'>' | b'|') {
+            index += 1;
+        }
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] == b'&' {
+            continue;
+        }
+        let start = index;
+        let mut target_quote = None;
+        while index < bytes.len() {
+            let current = bytes[index];
+            if matches!(current, b'\'' | b'"') {
+                if target_quote == Some(current) {
+                    target_quote = None;
+                } else if target_quote.is_none() {
+                    target_quote = Some(current);
+                }
+                index += 1;
+                continue;
+            }
+            if target_quote.is_none()
+                && (current.is_ascii_whitespace() || matches!(current, b';' | b'|' | b'&'))
+            {
+                break;
+            }
+            index += 1;
+        }
+        let target = command[start..index].trim_matches(['\'', '"']);
+        if target.is_empty() || target.contains(['$', '`']) {
+            continue;
+        }
+        let path = Path::new(target);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        let mut root = path;
+        if !root.is_dir() {
+            if let Some(parent) = root.parent() {
+                root = parent.to_path_buf();
+            }
+        }
+        if let Some(root) = resolve_prospective(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+fn exec_denial_intent(req: &ExecRequest, candidate: &Path) -> ExecIntent {
+    let Some(shell) = shell_command(req) else {
+        return command_intent(command_name(&req.program), &req.args, &req.cwd, candidate);
+    };
+
+    if shell_redirection_roots(shell, &req.cwd)
+        .iter()
+        .any(|root| root == candidate)
+    {
+        return ExecIntent::Write;
+    }
+    let segments = shell_segments(shell);
+    let intents: Vec<ExecIntent> = segments
+        .iter()
+        .map(|words| command_intent(command_name(&words[0]), &words[1..], &req.cwd, candidate))
+        .collect();
+    if intents.contains(&ExecIntent::Write) {
+        ExecIntent::Write
+    } else if !intents.is_empty() && intents.iter().all(|intent| *intent == ExecIntent::ReadOnly) {
+        ExecIntent::ReadOnly
+    } else {
+        ExecIntent::Unknown
+    }
+}
+
+/// Add one request-local grant while retaining every earlier Once approval
+/// needed by the same command. Broader roots subsume narrower roots, and Write
+/// also subsumes Read over the same subtree.
+fn add_request_grant(
+    req: &mut ExecRequest,
+    root: PathBuf,
+    permission: permissions::PermissionType,
+) {
+    let covered_by = |granted: &PathBuf| root.starts_with(granted);
+    match permission {
+        permissions::PermissionType::Read => {
+            if req.read_roots.iter().any(covered_by) || req.write_roots.iter().any(covered_by) {
+                return;
+            }
+            req.read_roots.retain(|granted| !granted.starts_with(&root));
+            req.read_roots.push(root);
+        }
+        permissions::PermissionType::Write => {
+            if req.write_roots.iter().any(covered_by) {
+                return;
+            }
+            req.write_roots
+                .retain(|granted| !granted.starts_with(&root));
+            req.read_roots.retain(|granted| !granted.starts_with(&root));
+            req.write_roots.push(root);
+        }
+    }
+}
+
 impl WorkspaceSandbox {
-    /// Create a new sandbox with permission management.
-    ///
-    /// `trust_path` must point to a machine-local file outside the workspace;
-    /// repository files such as `medha.lock` are deliberately rejected as
-    /// trust sources. `audit_path` receives the access audit log.
+    /// Create a new sandbox with permission management. `trust_path` must be a
+    /// machine-local file outside the workspace — repository files such as
+    /// `medha.lock` are rejected as trust sources.
     pub fn new(
         root: impl Into<PathBuf>,
         trust_path: impl Into<PathBuf>,
@@ -1315,10 +1612,9 @@ impl WorkspaceSandbox {
         )
     }
 
-    /// Like [`new`](Self::new), but the permission manager publishes grants
-    /// into `approved` — the same live handle the exec backend snapshots per
-    /// spawned command, so a user approval opens both enforcement paths at
-    /// once. Trust-file grants land in it at construction.
+    /// Like [`new`](Self::new), but grants publish into `approved` — the live
+    /// handle the exec backend snapshots per command, so one approval opens both
+    /// enforcement paths. Trust-file grants land there at construction.
     pub fn new_with_roots(
         root: impl Into<PathBuf>,
         trust_path: impl Into<PathBuf>,
@@ -1329,12 +1625,9 @@ impl WorkspaceSandbox {
         Self::build(root, trust_path, audit_path, human_gate, approved, None)
     }
 
-    /// Like [`new_with_roots`](Self::new_with_roots), but `state_root` names the
-    /// machine-local state directory (`$MEDHA_HOME`). A trust file under it is
-    /// accepted even when the workspace is an ancestor of it — e.g. running with
-    /// `$HOME` as the workspace — because no checked-out repository can populate
-    /// that directory. Trust inside the workspace but outside `state_root` is
-    /// still rejected.
+    /// Like [`new_with_roots`](Self::new_with_roots), but a trust file under
+    /// `state_root` (`$MEDHA_HOME`) is accepted even when the workspace is its
+    /// ancestor, since no checked-out repository can populate that directory.
     pub fn new_with_state_root(
         root: impl Into<PathBuf>,
         trust_path: impl Into<PathBuf>,
@@ -1384,8 +1677,7 @@ impl WorkspaceSandbox {
         })
     }
 
-    /// Create a new sandbox without permission management (backward compatible).
-    /// This maintains the old behavior - hard jail with no out-of-workspace access.
+    /// Create a hard jail with no out-of-workspace access.
     pub fn new_jailed(root: impl Into<PathBuf>) -> Result<Self, SandboxError> {
         let root = root.into();
         let root = root.canonicalize().unwrap_or(root);
@@ -1405,15 +1697,9 @@ impl WorkspaceSandbox {
         })
     }
 
-    /// Resolve and authorise `path`, then acquire the lock for that canonical
-    /// physical target. Hold the returned guard across a read-modify-write (as
-    /// `fs.edit` / `multi_edit` / `fs.write` do).
-    ///
-    /// Resolution must precede lock selection: `x`, `./x`, an absolute path and
-    /// a symlink can all name one file. For a target that does not exist yet,
-    /// [`resolve_for_write`](Self::resolve_for_write) supplies the secured
-    /// canonical ancestor plus normalized missing components, which stays the
-    /// same key after the first contender creates it.
+    /// Resolve and authorise `path`, then lock its canonical physical target.
+    /// Hold the guard across a read-modify-write. Resolution precedes lock
+    /// selection because `x`, `./x`, an absolute path and a symlink are one file.
     pub async fn path_guard(&self, path: &str) -> Result<WritePathGuard, SandboxError> {
         let resolved = self.resolve_for_write(path).await?;
         let lock = self.path_lock(&resolved);
@@ -1465,9 +1751,47 @@ impl WorkspaceSandbox {
         self
     }
 
-    /// Grant prompt-free READ access to harness-owned directories outside the
-    /// workspace — e.g. the user skills root, whose bundled reference files
-    /// the model reads on demand (a dialog per file would break skills).
+    /// Adopt the shared network grant so the permission manager flips and persists
+    /// the same flag the exec backend enforces. Install before the sandbox is
+    /// shared — the permission manager is still uniquely owned at that point.
+    pub fn with_network_grant(mut self, net_grant: NetworkGrant) -> Result<Self, SandboxError> {
+        Arc::get_mut(&mut self.permission_manager)
+            .ok_or_else(|| {
+                SandboxError::Io(
+                    "network grant must be installed before the sandbox is shared".into(),
+                )
+            })?
+            .set_network_grant(net_grant)?;
+        Ok(self)
+    }
+
+    /// Prompt to grant the sandbox network access and retry the command.
+    pub async fn request_network(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        self.permission_manager
+            .request_network(detail, escalated)
+            .await
+    }
+
+    /// Whether the active backend is configured to deny network — the gate for
+    /// reading a resolver/socket failure as a policy denial rather than an outage.
+    pub fn denies_network(&self) -> bool {
+        self.exec.denies_network(&ExecRequest {
+            program: String::new(),
+            args: Vec::new(),
+            cwd: self.root.clone(),
+            env: Vec::new(),
+            clear_env: false,
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+        })
+    }
+
+    /// Prompt-free read access to harness-owned directories outside the workspace,
+    /// such as the skills root whose reference files are read on demand.
     /// In-memory only; writes stay gated.
     pub fn with_readable_roots(self, roots: &[PathBuf]) -> Self {
         for root in roots {
@@ -1485,26 +1809,19 @@ impl WorkspaceSandbox {
         self
     }
 
-    /// The label of the active execution backend (`"host"` / `"native"`).
     pub fn exec_backend_label(&self) -> &str {
         self.exec.label()
     }
 
-    /// How strongly the active backend confines commands (§4.8) — read by the
-    /// kernel's trust-flow escalation.
+    /// Confinement strength used by trust-flow escalation.
     pub fn containment(&self) -> kernel::Containment {
         self.exec.containment()
     }
 
-    /// Run a command through the active execution backend, rooted at the
-    /// workspace. `clear_env` starts the child from an empty environment (used
-    /// by `shell.exec`); fixed-program tools pass `false` to inherit.
+    /// Runs a workspace-rooted command; `clear_env` removes the inherited environment.
     ///
-    /// A denial inside the OS jail on a path the user never ruled on escalates
-    /// to the same approval card the file tools show, then retries once — so a
-    /// "yes" actually unblocks the command instead of surfacing as a tool
-    /// error. "Always" stays live for the session and beyond; "Once" is
-    /// granted for the single retry and withdrawn.
+    /// Jail denials may retry with approval. One-time grants remain invocation-local;
+    /// persistent grants are shared by the permission manager.
     pub async fn exec(
         &self,
         program: &str,
@@ -1518,21 +1835,58 @@ impl WorkspaceSandbox {
             cwd: self.root.clone(),
             env,
             clear_env,
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
         };
-        let mut output = self.exec.run(req.clone()).await?;
+        let mut admitted = req.clone();
+        let mut output = self.exec.run(admitted.clone()).await?;
         if self.exec.label() != "native" {
             // Host/container/ssh denials are real permission errors, not jail
             // policy — an approval card could not change them.
             return Ok(output);
         }
         let approved = self.permission_manager.approved_roots();
-        let mut prompted: Vec<PathBuf> = Vec::new();
-        while output.status != Some(0) && prompted.len() < 3 {
-            let candidate = exec::escalation_candidates(&output, &req.args, &self.root, &approved)
-                .into_iter()
-                .find(|candidate| !prompted.contains(candidate));
-            let Some(candidate) = candidate else { break };
-            prompted.push(candidate.clone());
+        let mut prompted: Vec<(PathBuf, permissions::PermissionType)> = Vec::new();
+        while output.status != Some(0) && prompted.len() < MAX_EXEC_ESCALATION_PROMPTS {
+            // Discover candidates against both capabilities. A root already
+            // approved for Read must still be visible here if the read-only
+            // retry proves that this unknown command genuinely needs Write.
+            let mut candidates = exec::escalation_candidates(
+                &output,
+                &self.root,
+                &approved,
+                permissions::PermissionType::Read,
+            );
+            for candidate in exec::escalation_candidates(
+                &output,
+                &self.root,
+                &approved,
+                permissions::PermissionType::Write,
+            ) {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+            let next = candidates.into_iter().find_map(|candidate| {
+                let intent = exec_denial_intent(&req, &candidate);
+                let permissions: &[permissions::PermissionType] = match intent {
+                    ExecIntent::ReadOnly => &[permissions::PermissionType::Read],
+                    ExecIntent::Write => &[permissions::PermissionType::Write],
+                    ExecIntent::Unknown => &[
+                        permissions::PermissionType::Read,
+                        permissions::PermissionType::Write,
+                    ],
+                };
+                permissions.iter().copied().find_map(|permission| {
+                    let key = (candidate.clone(), permission);
+                    (!prompted.contains(&key) && !approved.is_allowed(&candidate, permission))
+                        .then_some(key)
+                })
+            });
+            let Some((candidate, permission)) = next else {
+                break;
+            };
+            prompted.push((candidate.clone(), permission));
             let shown = match req.args.as_slice() {
                 [flag, command] if flag == "-c" => command.clone(),
                 _ => format!("{} {}", req.program, req.args.join(" ")),
@@ -1542,24 +1896,16 @@ impl WorkspaceSandbox {
             );
             let Ok(resolved) = self
                 .permission_manager
-                .request_permission_with_detail(
-                    &candidate,
-                    permissions::PermissionType::Read,
-                    Some(&detail),
-                )
+                .request_permission_with_detail(&candidate, permission, Some(&detail))
                 .await
             else {
                 break;
             };
-            let once = !approved.is_allowed(&resolved, permissions::PermissionType::Read);
+            let once = !approved.is_allowed(&resolved, permission);
             if once {
-                approved.allow_read(resolved.clone());
+                add_request_grant(&mut admitted, resolved, permission);
             }
-            let retried = self.exec.run(req.clone()).await;
-            if once {
-                approved.remove_read(&resolved);
-            }
-            output = retried?;
+            output = self.exec.run(admitted.clone()).await?;
         }
         Ok(output)
     }
@@ -1581,6 +1927,8 @@ impl WorkspaceSandbox {
             cwd: self.root.clone(),
             env,
             clear_env,
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
         })?;
         crate::exec::spawn_background(cmd)
     }
@@ -1589,16 +1937,10 @@ impl WorkspaceSandbox {
         &self.root
     }
 
-    /// Label of the active execution backend, so callers can pick the shell that
-    /// backend actually provides — see [`crate::exec::shell_argv`].
     pub fn backend_label(&self) -> &str {
         self.exec.label()
     }
 
-    /// Spawn a shell *command line* as an owned task, choosing the interpreter
-    /// the active backend provides. Prefer this over passing `sh` to
-    /// [`exec_background`]: Windows has no `sh`, and hardcoding one made every
-    /// shell command fail before it ran.
     pub fn shell_background(
         &self,
         command: &str,
@@ -1609,7 +1951,6 @@ impl WorkspaceSandbox {
         self.exec_background(&program, &args, env, clear_env)
     }
 
-    /// Get the permission manager for advanced use cases
     pub fn permission_manager(&self) -> Arc<PermissionManager> {
         self.permission_manager.clone()
     }
@@ -1659,12 +2000,9 @@ impl WorkspaceSandbox {
         Err(SandboxError::Escape(requested.to_string()))
     }
 
-    /// Resolve a path - now supports absolute paths and paths outside workspace
-    /// via the permission system.
     pub async fn resolve(&self, path: &str) -> Result<PathBuf, SandboxError> {
         let path = Path::new(path);
 
-        // If it's a relative path without .. or absolute components, treat as workspace-relative
         let is_simple_relative = path.is_relative()
             && !path.components().any(|c| {
                 matches!(
@@ -1674,7 +2012,6 @@ impl WorkspaceSandbox {
             });
 
         if is_simple_relative {
-            // Traditional workspace-relative resolution
             let mut out = self.root.clone();
             for comp in path.components() {
                 match comp {
@@ -1692,7 +2029,6 @@ impl WorkspaceSandbox {
             // prefix check alone lets an in-workspace symlink escape the jail.
             self.canonicalize_within_root(&out, &path.display().to_string())
         } else {
-            // Absolute path or path with .. - use permission system
             Ok(self
                 .permission_manager
                 .request_read(path)
@@ -1701,7 +2037,6 @@ impl WorkspaceSandbox {
         }
     }
 
-    /// Resolve a path for writing (requires write permission)
     pub async fn resolve_for_write(&self, path: &str) -> Result<PathBuf, SandboxError> {
         let path = Path::new(path);
 
@@ -1714,7 +2049,6 @@ impl WorkspaceSandbox {
             });
 
         if is_simple_relative {
-            // Traditional workspace-relative resolution
             let mut out = self.root.clone();
             for comp in path.components() {
                 match comp {
@@ -1732,7 +2066,6 @@ impl WorkspaceSandbox {
             // `canonicalize_within_root`): handles new files under the jail too.
             self.canonicalize_within_root(&out, &path.display().to_string())
         } else {
-            // Absolute path or path with .. - use permission system for write access
             Ok(self
                 .permission_manager
                 .request_write(path)
@@ -1741,7 +2074,6 @@ impl WorkspaceSandbox {
         }
     }
 
-    /// Read a file - supports paths outside workspace via permission system
     pub async fn read(&self, path: &str) -> Result<String, SandboxError> {
         let resolved = self.resolve(path).await?;
         self.read_resolved(&resolved).await
@@ -1889,7 +2221,6 @@ impl WorkspaceSandbox {
         }
     }
 
-    /// Write a file - supports paths outside workspace via permission system
     pub async fn write(&self, path: &str, contents: &str) -> Result<Option<String>, SandboxError> {
         let guard = self.path_guard(path).await?;
         self.write_guarded(&guard, contents).await
@@ -1976,9 +2307,7 @@ impl WorkspaceSandbox {
                     }
                     return Err(error);
                 }
-                // Windows cannot move/replace an open source file. Unix
-                // permits renaming an open inode, which hid this lifetime bug
-                // from the other hosted runners.
+                // Windows cannot replace an open source file.
                 drop(temp_file);
 
                 // Revalidate immediately before the atomic OS publication.
@@ -2019,7 +2348,6 @@ impl WorkspaceSandbox {
         }
     }
 
-    /// List a directory - supports paths outside workspace via permission system
     pub async fn list(&self, path: &str) -> Result<Vec<String>, SandboxError> {
         Ok(self.list_bounded(path, usize::MAX).await?.entries)
     }
@@ -2065,13 +2393,8 @@ impl WorkspaceSandbox {
         Ok(Some(id))
     }
 
-    /// Restore a single file to a snapshot taken before an earlier write —
-    /// the primitive behind code rewind (§18.4). `snapshot = Some(id)` copies
-    /// that pre-write snapshot back over `path`; `snapshot = None` means the
-    /// write being undone had *created* the file, so rewinding removes it. The
-    /// target path goes through the same write-jail resolution as a normal write
-    /// (so a rewind can never escape the workspace), and the snapshot id is
-    /// validated as a bare ULID so it can't reach outside the snapshots dir.
+    /// Restores a snapshot, or removes a file created by the reverted write.
+    /// Target resolution stays jailed and snapshot IDs must be bare ULIDs.
     pub async fn restore(&self, path: &str, snapshot: Option<&str>) -> Result<(), SandboxError> {
         let guard = self.path_guard(path).await?;
         self.restore_guarded(&guard, snapshot).await
@@ -2198,6 +2521,619 @@ mod tests {
     use super::*;
     use kernel::AutoDeny;
 
+    struct SequenceGate {
+        decisions: Mutex<std::collections::VecDeque<kernel::Approval>>,
+        actions: Mutex<Vec<String>>,
+    }
+
+    impl SequenceGate {
+        fn new(decisions: impl IntoIterator<Item = kernel::Approval>) -> Arc<Self> {
+            Arc::new(Self {
+                decisions: Mutex::new(decisions.into_iter().collect()),
+                actions: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn actions(&self) -> Vec<String> {
+            self.actions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HumanGate for SequenceGate {
+        async fn confirm(
+            &self,
+            action: &str,
+            _detail: Option<&str>,
+            _escalated: bool,
+        ) -> kernel::Approval {
+            self.actions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(action.to_string());
+            self.decisions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or(kernel::Approval::Deny)
+        }
+    }
+
+    struct CapabilityBackend {
+        requirements: Vec<(PathBuf, permissions::PermissionType)>,
+        persistent: Option<ApprovedRoots>,
+        requests: Mutex<Vec<ExecRequest>>,
+    }
+
+    impl CapabilityBackend {
+        fn new(denied_path: PathBuf, required: permissions::PermissionType) -> Arc<Self> {
+            Arc::new(Self {
+                requirements: vec![(denied_path, required)],
+                persistent: None,
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn new_many(
+            denied_paths: Vec<PathBuf>,
+            required: permissions::PermissionType,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                requirements: denied_paths
+                    .into_iter()
+                    .map(|path| (path, required))
+                    .collect(),
+                persistent: None,
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn new_staged(requirements: Vec<(PathBuf, permissions::PermissionType)>) -> Arc<Self> {
+            Arc::new(Self {
+                requirements,
+                persistent: None,
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn new_staged_with_persistent(
+            requirements: Vec<(PathBuf, permissions::PermissionType)>,
+            persistent: ApprovedRoots,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                requirements,
+                persistent: Some(persistent),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<ExecRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecBackend for CapabilityBackend {
+        fn build_command(&self, _req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
+            Err(ExecError::Unavailable(
+                "scripted backend does not spawn".into(),
+            ))
+        }
+
+        async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(req.clone());
+            let denied = self.requirements.iter().find(|(path, required)| {
+                let root = path
+                    .parent()
+                    .expect("fixture path has a parent")
+                    .canonicalize()
+                    .expect("fixture root canonicalizes");
+                match required {
+                    permissions::PermissionType::Read => {
+                        !req.read_roots.contains(&root)
+                            && !req.write_roots.contains(&root)
+                            && !self.persistent.as_ref().is_some_and(|approved| {
+                                approved.is_allowed(&root, permissions::PermissionType::Read)
+                                    || approved
+                                        .is_allowed(&root, permissions::PermissionType::Write)
+                            })
+                    }
+                    permissions::PermissionType::Write => {
+                        !req.write_roots.contains(&root)
+                            && !self.persistent.as_ref().is_some_and(|approved| {
+                                approved.is_allowed(&root, permissions::PermissionType::Write)
+                            })
+                    }
+                }
+            });
+            Ok(match denied {
+                None => ExecOutput {
+                    status: Some(0),
+                    stdout: b"ok".to_vec(),
+                    stderr: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                Some((path, _)) => ExecOutput {
+                    status: Some(1),
+                    stdout: Vec::new(),
+                    stderr: format!("tool: {}: Operation not permitted", path.display())
+                        .into_bytes(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+            })
+        }
+
+        fn label(&self) -> &str {
+            "native"
+        }
+    }
+
+    fn scripted_escalation_sandbox(
+        tag: &str,
+        gate: Arc<dyn HumanGate>,
+        backend: Arc<dyn ExecBackend>,
+    ) -> (PathBuf, WorkspaceSandbox, ApprovedRoots) {
+        scripted_escalation_sandbox_with_roots(tag, gate, backend, ApprovedRoots::default())
+    }
+
+    fn scripted_escalation_sandbox_with_roots(
+        tag: &str,
+        gate: Arc<dyn HumanGate>,
+        backend: Arc<dyn ExecBackend>,
+        approved: ApprovedRoots,
+    ) -> (PathBuf, WorkspaceSandbox, ApprovedRoots) {
+        let base =
+            std::env::temp_dir().join(format!("medha-scripted-escal-{tag}-{}", ulid::Ulid::new()));
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sandbox = WorkspaceSandbox::new_with_roots(
+            &workspace,
+            base.join("state/trust.lock"),
+            base.join("state/audit.log"),
+            Some(gate),
+            approved.clone(),
+        )
+        .unwrap()
+        .with_exec_backend(backend);
+        (base, sandbox, approved)
+    }
+
+    #[tokio::test]
+    async fn unknown_exec_escalates_read_then_write_for_the_same_root() {
+        let outside = std::env::temp_dir().join(format!(
+            "medha-scripted-unknown-outside-{}",
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let denied = outside.join("artifact");
+        let backend = CapabilityBackend::new(denied, permissions::PermissionType::Write);
+        let gate = SequenceGate::new([kernel::Approval::Once, kernel::Approval::Once]);
+        let (base, sandbox, approved) =
+            scripted_escalation_sandbox("unknown", gate.clone(), backend.clone());
+
+        let output = sandbox
+            .exec("mystery", &[], Vec::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(0));
+        let actions = gate.actions();
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].starts_with("Read access"));
+        assert!(actions[1].starts_with("Write access"));
+        assert!(
+            backend
+                .requests()
+                .iter()
+                .any(|request| !request.write_roots.is_empty()),
+            "the successful retry carried its write root on the request"
+        );
+        assert!(approved.read_roots().is_empty());
+        assert!(approved.write_roots().is_empty());
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
+    #[tokio::test]
+    async fn once_grants_accumulate_across_distinct_roots_for_one_exec() {
+        let outside = std::env::temp_dir().join(format!(
+            "medha-scripted-multi-root-outside-{}",
+            ulid::Ulid::new()
+        ));
+        let first_root = outside.join("first");
+        let second_root = outside.join("second");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let first = first_root.join("one.txt");
+        let second = second_root.join("two.txt");
+        std::fs::write(&first, "one").unwrap();
+        std::fs::write(&second, "two").unwrap();
+        let backend = CapabilityBackend::new_many(
+            vec![first.clone(), second.clone()],
+            permissions::PermissionType::Read,
+        );
+        let gate = SequenceGate::new([kernel::Approval::Once, kernel::Approval::Once]);
+        let (base, sandbox, approved) =
+            scripted_escalation_sandbox("multi-root", gate.clone(), backend.clone());
+
+        let output = sandbox
+            .exec(
+                "cat",
+                &[first.display().to_string(), second.display().to_string()],
+                Vec::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(0));
+        assert_eq!(gate.actions().len(), 2);
+        let requests = backend.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "initial attempt plus two approved retries"
+        );
+        let final_request = requests.last().unwrap();
+        assert_eq!(final_request.read_roots.len(), 2);
+        assert!(
+            final_request
+                .read_roots
+                .contains(&first_root.canonicalize().unwrap())
+        );
+        assert!(
+            final_request
+                .read_roots
+                .contains(&second_root.canonicalize().unwrap())
+        );
+        assert!(approved.read_roots().is_empty());
+        assert!(approved.write_roots().is_empty());
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
+    #[tokio::test]
+    async fn once_grants_accumulate_from_copy_source_read_to_destination_write() {
+        let outside = std::env::temp_dir().join(format!(
+            "medha-scripted-copy-once-outside-{}",
+            ulid::Ulid::new()
+        ));
+        let source_root = outside.join("source");
+        let destination_root = outside.join("destination");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&destination_root).unwrap();
+        let source = source_root.join("input.txt");
+        let destination = destination_root.join("output.txt");
+        std::fs::write(&source, "input").unwrap();
+        let backend = CapabilityBackend::new_staged(vec![
+            (source.clone(), permissions::PermissionType::Read),
+            (destination.clone(), permissions::PermissionType::Write),
+        ]);
+        let gate = SequenceGate::new([kernel::Approval::Once, kernel::Approval::Once]);
+        let (base, sandbox, approved) =
+            scripted_escalation_sandbox("copy-once", gate.clone(), backend.clone());
+
+        let output = sandbox
+            .exec(
+                "cp",
+                &[
+                    source.display().to_string(),
+                    destination.display().to_string(),
+                ],
+                Vec::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(0));
+        let actions = gate.actions();
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].starts_with("Read access"));
+        assert!(actions[1].starts_with("Write access"));
+        let requests = backend.requests();
+        assert_eq!(requests.len(), 3);
+        let final_request = requests.last().unwrap();
+        assert_eq!(
+            final_request.read_roots,
+            vec![source_root.canonicalize().unwrap()]
+        );
+        assert_eq!(
+            final_request.write_roots,
+            vec![destination_root.canonicalize().unwrap()]
+        );
+        assert!(approved.read_roots().is_empty());
+        assert!(approved.write_roots().is_empty());
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
+    #[tokio::test]
+    async fn prompt_bound_allows_two_unknown_roots_to_escalate_read_then_write() {
+        let outside = std::env::temp_dir().join(format!(
+            "medha-scripted-two-unknown-outside-{}",
+            ulid::Ulid::new()
+        ));
+        let first_root = outside.join("first");
+        let second_root = outside.join("second");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let first = first_root.join("artifact");
+        let second = second_root.join("artifact");
+        let backend =
+            CapabilityBackend::new_many(vec![first, second], permissions::PermissionType::Write);
+        let gate = SequenceGate::new([
+            kernel::Approval::Once,
+            kernel::Approval::Once,
+            kernel::Approval::Once,
+            kernel::Approval::Once,
+        ]);
+        let (base, sandbox, _) =
+            scripted_escalation_sandbox("two-unknown", gate.clone(), backend.clone());
+
+        let output = sandbox
+            .exec("mystery", &[], Vec::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(0));
+        let actions = gate.actions();
+        assert_eq!(actions.len(), 4);
+        assert!(actions[0].starts_with("Read access"));
+        assert!(actions[1].starts_with("Write access"));
+        assert!(actions[2].starts_with("Read access"));
+        assert!(actions[3].starts_with("Write access"));
+        assert_eq!(backend.requests().len(), 5);
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
+    #[tokio::test]
+    async fn once_and_always_grants_compose_across_distinct_roots() {
+        let outside = std::env::temp_dir().join(format!(
+            "medha-scripted-mixed-grants-outside-{}",
+            ulid::Ulid::new()
+        ));
+        let once_root = outside.join("once");
+        let always_root = outside.join("always");
+        std::fs::create_dir_all(&once_root).unwrap();
+        std::fs::create_dir_all(&always_root).unwrap();
+        let once_file = once_root.join("one.txt");
+        let always_file = always_root.join("two.txt");
+        std::fs::write(&once_file, "one").unwrap();
+        std::fs::write(&always_file, "two").unwrap();
+        let approved = ApprovedRoots::default();
+        let backend = CapabilityBackend::new_staged_with_persistent(
+            vec![
+                (once_file.clone(), permissions::PermissionType::Read),
+                (always_file.clone(), permissions::PermissionType::Read),
+            ],
+            approved.clone(),
+        );
+        let gate = SequenceGate::new([kernel::Approval::Once, kernel::Approval::Always]);
+        let (base, sandbox, shared) = scripted_escalation_sandbox_with_roots(
+            "mixed-grants",
+            gate.clone(),
+            backend.clone(),
+            approved,
+        );
+
+        let output = sandbox
+            .exec(
+                "cat",
+                &[
+                    once_file.display().to_string(),
+                    always_file.display().to_string(),
+                ],
+                Vec::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(0));
+        assert_eq!(gate.actions().len(), 2);
+        let final_request = backend.requests().last().cloned().unwrap();
+        assert_eq!(
+            final_request.read_roots,
+            vec![once_root.canonicalize().unwrap()]
+        );
+        assert!(!shared.is_allowed(
+            &once_root.canonicalize().unwrap(),
+            permissions::PermissionType::Read
+        ));
+        assert!(shared.is_allowed(
+            &always_root.canonicalize().unwrap(),
+            permissions::PermissionType::Read
+        ));
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
+    #[test]
+    fn request_grants_dedupe_and_write_subsumes_read() {
+        let base = PathBuf::from("/tmp/medha-request-grants");
+        let child = base.join("child");
+        let mut request = ExecRequest {
+            program: "tool".into(),
+            args: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            env: Vec::new(),
+            clear_env: true,
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+        };
+        add_request_grant(
+            &mut request,
+            child.clone(),
+            permissions::PermissionType::Read,
+        );
+        add_request_grant(
+            &mut request,
+            base.clone(),
+            permissions::PermissionType::Read,
+        );
+        assert_eq!(request.read_roots, vec![base.clone()]);
+        add_request_grant(
+            &mut request,
+            child.clone(),
+            permissions::PermissionType::Write,
+        );
+        assert_eq!(request.read_roots, vec![base.clone()]);
+        assert_eq!(request.write_roots, vec![child]);
+        add_request_grant(
+            &mut request,
+            base.clone(),
+            permissions::PermissionType::Write,
+        );
+        assert!(request.read_roots.is_empty());
+        assert_eq!(request.write_roots, vec![base]);
+    }
+
+    #[tokio::test]
+    async fn read_only_exec_never_upgrades_a_repeated_denial_to_write() {
+        let outside = std::env::temp_dir().join(format!(
+            "medha-scripted-reader-outside-{}",
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let denied = outside.join("notes.txt");
+        std::fs::write(&denied, "needle").unwrap();
+        let backend = CapabilityBackend::new(denied, permissions::PermissionType::Write);
+        let gate = SequenceGate::new([kernel::Approval::Once, kernel::Approval::Once]);
+        let (base, sandbox, _) =
+            scripted_escalation_sandbox("reader", gate.clone(), backend.clone());
+
+        let output = sandbox
+            .exec(
+                "rg",
+                &["needle".into(), outside.display().to_string()],
+                Vec::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_ne!(output.status, Some(0));
+        assert_eq!(gate.actions().len(), 1);
+        assert!(gate.actions()[0].starts_with("Read access"));
+        assert!(
+            backend
+                .requests()
+                .iter()
+                .all(|request| request.write_roots.is_empty()),
+            "a read-only executable must never receive a write root"
+        );
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
+    #[tokio::test]
+    async fn copy_source_gets_read_only_while_copy_destination_gets_write() {
+        let outside =
+            std::env::temp_dir().join(format!("medha-scripted-copy-outside-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("source.txt");
+        std::fs::write(&source, "source").unwrap();
+
+        let source_backend =
+            CapabilityBackend::new(source.clone(), permissions::PermissionType::Read);
+        let source_gate = SequenceGate::new([kernel::Approval::Once, kernel::Approval::Once]);
+        let (source_base, source_sandbox, _) =
+            scripted_escalation_sandbox("copy-source", source_gate.clone(), source_backend.clone());
+        let output = source_sandbox
+            .exec(
+                "cp",
+                &[source.display().to_string(), "copy.txt".into()],
+                Vec::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(0));
+        assert_eq!(source_gate.actions().len(), 1);
+        assert!(source_gate.actions()[0].starts_with("Read access"));
+        assert!(
+            source_backend
+                .requests()
+                .iter()
+                .all(|request| request.write_roots.is_empty()),
+            "reading a cp source must not grant write access to its parent"
+        );
+        let invalid_single_operand = ExecRequest {
+            program: "cp".into(),
+            args: vec![source.display().to_string()],
+            cwd: source_sandbox.root().to_path_buf(),
+            env: Vec::new(),
+            clear_env: true,
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+        };
+        assert_eq!(
+            exec_denial_intent(&invalid_single_operand, &outside.canonicalize().unwrap()),
+            ExecIntent::ReadOnly,
+            "an invalid one-operand cp still names a source, never a destination"
+        );
+
+        let destination = outside.join("destination.txt");
+        let destination_backend =
+            CapabilityBackend::new(destination.clone(), permissions::PermissionType::Write);
+        let destination_gate = SequenceGate::new([kernel::Approval::Once]);
+        let (destination_base, destination_sandbox, _) = scripted_escalation_sandbox(
+            "copy-destination",
+            destination_gate.clone(),
+            destination_backend,
+        );
+        let output = destination_sandbox
+            .exec(
+                "cp",
+                &[
+                    "workspace-source.txt".into(),
+                    destination.display().to_string(),
+                ],
+                Vec::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(0));
+        assert_eq!(destination_gate.actions().len(), 1);
+        assert!(destination_gate.actions()[0].starts_with("Write access"));
+
+        std::fs::remove_dir_all(source_base).ok();
+        std::fs::remove_dir_all(destination_base).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_redirection_requests_write_on_its_output_root() {
+        let outside = std::env::temp_dir().join(format!(
+            "medha-scripted-redirect-outside-{}",
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let denied = outside.join("report.txt");
+        let backend = CapabilityBackend::new(denied.clone(), permissions::PermissionType::Write);
+        let gate = SequenceGate::new([kernel::Approval::Once]);
+        let (base, sandbox, _) = scripted_escalation_sandbox("redirect", gate.clone(), backend);
+        let command = format!("printf report > {}", denied.display());
+
+        let output = sandbox
+            .exec("/bin/sh", &["-c".into(), command], Vec::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(0));
+        assert_eq!(gate.actions().len(), 1);
+        assert!(gate.actions()[0].starts_with("Write access"));
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(outside).ok();
+    }
+
     /// Gate that answers every prompt with one fixed decision and counts asks.
     /// Only the macOS escalation tests construct it; a Linux CI build with
     /// `-D warnings` sees it as dead code without the matching gate.
@@ -2255,6 +3191,7 @@ mod tests {
             },
             vec![],
             approved.clone(),
+            NetworkGrant::default(),
         );
         WorkspaceSandbox::new_with_roots(
             ws,
@@ -2304,6 +3241,37 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn exec_escalates_out_of_workspace_writes_as_write_permissions() {
+        if !exec::native_sandbox_supported() {
+            return;
+        }
+        let (base, ws, outside, approved) = escalation_fixture("write-always");
+        let gate = CountingGate::new(kernel::Approval::Always);
+        let sbx = escalation_sandbox(&base, &ws, &approved, gate.clone());
+        let target = outside.join("created.txt");
+        let cmd = format!("printf written > {}", target.display());
+
+        let out = sbx
+            .exec("/bin/sh", &["-c".into(), cmd], vec![], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status,
+            Some(0),
+            "write approval must unblock the retry; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "written");
+        assert_eq!(gate.asked(), 1);
+        assert!(approved.is_allowed(
+            &outside.canonicalize().unwrap(),
+            permissions::PermissionType::Write
+        ));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// "Once" unblocks the single retry, then the grant is withdrawn: the
     /// next identical command must ask again.
     #[cfg(target_os = "macos")]
@@ -2346,6 +3314,67 @@ mod tests {
             2,
             "a Once approval must be re-asked next time"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A request-scoped Once grant must not become visible to a second command
+    /// while the approved retry is still running. Each command receives its
+    /// own approval card and its own native profile.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_escalation_once_is_isolated_from_concurrent_commands() {
+        if !exec::native_sandbox_supported() {
+            return;
+        }
+        let (base, ws, outside, approved) = escalation_fixture("once-concurrent");
+        let gate = CountingGate::new(kernel::Approval::Once);
+        let sbx = Arc::new(escalation_sandbox(&base, &ws, &approved, gate.clone()));
+        let marker = ws.join("retry-running");
+        let outside_file = outside.join("notes.md");
+        let command = format!(
+            "if cat {} >/dev/null 2>&1; then printf running > {}; sleep 1; fi; cat {}",
+            outside_file.display(),
+            marker.display(),
+            outside_file.display()
+        );
+        let first_sandbox = sbx.clone();
+        let first = tokio::spawn(async move {
+            first_sandbox
+                .exec("/bin/sh", &["-c".into(), command], Vec::new(), true)
+                .await
+        });
+
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            marker.exists(),
+            "the approved retry never entered its wait window"
+        );
+        assert!(approved.read_roots().is_empty());
+        assert!(approved.write_roots().is_empty());
+
+        let second = sbx
+            .exec(
+                "/bin/cat",
+                &[outside_file.display().to_string()],
+                Vec::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status, Some(0));
+        assert_eq!(
+            gate.asked(),
+            2,
+            "the concurrent command must not inherit the first Once grant"
+        );
+        assert_eq!(first.await.unwrap().unwrap().status, Some(0));
+        assert!(approved.read_roots().is_empty());
+        assert!(approved.write_roots().is_empty());
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -2562,10 +3591,7 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// A symlink *inside* the workspace pointing *out* of it must not let a
-    /// "simple relative" path (no `..`, not absolute) escape the jail. This is
-    /// the path that previously skipped canonicalization AND the permission
-    /// manager entirely.
+    /// An in-workspace symlink must not redirect a relative path outside.
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_symlink_escape_simple_relative() {
@@ -2686,10 +3712,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A target that does not exist (including its intermediate directory) must
-    /// keep one identity before and after creation. The second task uses an
-    /// absolute spelling and must wait, then read the first task's committed
-    /// bytes before appending its own.
+    /// Prospective aliases retain one lock identity after creation.
     #[tokio::test]
     async fn concurrent_new_file_read_modify_write_serializes_across_aliases() {
         let dir = std::env::temp_dir().join(format!("medha-sbx-lock-new-{}", ulid::Ulid::new()));
@@ -2796,9 +3819,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sbx = WorkspaceSandbox::new_jailed(&dir).unwrap();
 
-        // Deterministically model cancellation after a unique canonical lane
-        // was inserted but before an OwnedMutexGuard was returned. This was the
-        // remaining Weak-map leak: no WritePathGuard existed to perform cleanup.
+        // Model cancellation between lane insertion and guard construction.
         for n in 0..20_000 {
             drop(sbx.path_lock(&dir.join(format!("cancelled-{n}.txt"))));
         }
@@ -3089,8 +4110,7 @@ mod tests {
         temp_file.write_all(b"medha").unwrap();
         temp_file.sync_all().unwrap();
 
-        // Simulate another process creating the approved-missing destination
-        // in the last instant before publication.
+        // Simulate a concurrent create immediately before publication.
         std::fs::write(dir.join(target), "other process").unwrap();
         assert!(matches!(
             publish_new_file_at(&parent, temporary, target),

@@ -83,9 +83,7 @@ fn chrome_slots_clear_the_non_text_threshold() {
 
 #[test]
 fn the_spinner_stays_legible_across_its_whole_glow_ramp() {
-    // The spinner dims as it twinkles; the dimmest point still has to be read
-    // against the canvas, and each theme must glow toward its own gold rather
-    // than every theme washing out to the same white.
+    // The whole animation ramp must remain legible against the canvas.
     for build in Palette::ALL {
         let p = build();
         let bg = canvas(&p);
@@ -106,15 +104,12 @@ fn the_spinner_stays_legible_across_its_whole_glow_ramp() {
             p.glow(100),
             Color::Rgb(p.comet_head.0, p.comet_head.1, p.comet_head.2)
         );
-        // Clamped, not wrapped: a brightness above the ramp must not overflow.
         assert_eq!(p.glow(255), p.glow(100));
     }
 }
 
 #[test]
 fn the_grey_ramp_stays_ordered_and_separated() {
-    // `faint` and `lineno` were once literally the same colour in light, so the
-    // recessive tiers collapsed into one.
     for build in Palette::ALL {
         let p = build();
         let bg = canvas(&p);
@@ -166,7 +161,6 @@ fn every_palette_has_a_distinct_id_and_resolves_back_to_itself() {
         seen.push(p.id);
         assert_eq!(resolve(p.id).id, p.id);
     }
-    // `auto` is a selector, not a palette, so it must never appear as one.
     assert!(!seen.contains(&AUTO.0));
     assert!(modes().iter().any(|(id, _)| *id == AUTO.0));
     assert_eq!(modes().len(), Palette::ALL.len() + 1);
@@ -180,13 +174,10 @@ fn an_unknown_theme_id_falls_back_to_the_default_rather_than_panicking() {
 
 #[test]
 fn every_theme_can_be_reached_and_left_again() {
-    // Switching must be a closed loop: from any palette, naming any other id
-    // lands exactly there, so no theme can become a one-way door.
     for from in Palette::ALL {
         for to in Palette::ALL {
             assert_eq!(resolve(to().id).id, to().id, "{} -> {}", from().id, to().id);
         }
-        // …and the picker can always find the row for wherever you are.
         assert!(
             modes().iter().any(|(id, _)| *id == from().id),
             "{} is missing from the picker",
@@ -202,7 +193,6 @@ fn a_fresh_session_starts_on_the_default_palette() {
     assert_eq!(default_palette().id, "copper");
     assert_eq!(current().id, default_palette().id);
     assert!(default_palette().is_dark);
-    // Every id in the picker must still resolve to itself, default or not.
     assert_eq!(resolve("dark").id, "dark");
 }
 

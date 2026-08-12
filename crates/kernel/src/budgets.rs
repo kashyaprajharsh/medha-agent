@@ -1,9 +1,5 @@
-//! Budget governor (§4.1, §18.5). The kernel enforces hard per-task ceilings —
-//! turns, tokens, cost, wall-clock — as a contract, checked before each turn.
-//! Each dimension is optional (`None` = unbounded on that axis). Exhaustion
-//! ends the session gracefully and reports which limit was hit (never a
-//! mid-tool kill, P10). This is the principled replacement for a hardcoded
-//! turn cap: the *user* sets the ceiling; turn-count is just one dimension.
+//! Hard turn, token, cost, and wall-clock ceilings. Exhaustion stops between
+//! tool calls rather than killing one in flight.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,12 +9,9 @@ use crate::types::{Pricing, Usage};
 /// Generous anti-runaway backstop on turns when the user sets nothing.
 pub const DEFAULT_MAX_TURNS: u32 = 200;
 
-/// Spend pooled across every session in one agent tree.
-///
-/// Turns are per-session — a child needs its own working room — but tokens,
-/// cost and wall-clock are the user's, and a tree that hands each child a fresh
-/// copy of the ceiling has no ceiling at all: three children sequentially, or
-/// one nesting three deep, spends the budget three times over.
+/// Spend pooled across every session in one agent tree. Turns stay per-session,
+/// but tokens, cost and wall-clock are the user's — a per-child copy of the
+/// ceiling is no ceiling at all.
 pub type Allowance = Arc<Mutex<Pooled>>;
 
 /// Shared slot holding the budget a session was started with, so anything that
@@ -111,8 +104,7 @@ pub enum BudgetStop {
     Wall,
     /// Even the engine's best compaction couldn't fit under the hard safety
     /// ceiling for this turn — refusing to send rather than risk an API
-    /// context-length error (§4.3 emergency_ratio, the second
-    /// safety layer above the normal compaction trigger).
+    /// context-length error.
     ContextOverflow,
 }
 
@@ -143,11 +135,9 @@ struct LocalSpend {
     cost_usd: f64,
 }
 
-/// An atomic worst-case reservation for one provider request.
-///
-/// Dropping an unreconciled reservation charges its full amount. Once a
-/// request has been admitted, losing the connection or receiving no usage
-/// block is uncertain spend, never free spend.
+/// An atomic worst-case reservation for one provider request. Dropping it
+/// unreconciled charges the full amount — a lost connection is uncertain spend,
+/// never free spend.
 pub struct ModelReservation {
     allowance: Allowance,
     local: Arc<Mutex<LocalSpend>>,
@@ -174,10 +164,8 @@ impl Governor {
         }
     }
 
-    /// Returns `Some(reason)` if any ceiling is reached — stop before the turn.
-    ///
-    /// Turns are this session's own; everything else is measured against the
-    /// pool when there is one, so a tree cannot spend its ceiling once per agent.
+    /// `Some(reason)` if any ceiling is reached — stop before the turn. Turns are
+    /// this session's; everything else measures against the pool when there is one.
     pub fn check(&self) -> Option<BudgetStop> {
         if matches!(self.budget.max_turns, Some(m) if self.turns >= m) {
             return Some(BudgetStop::Turns);
@@ -335,14 +323,17 @@ impl Governor {
 }
 
 impl ModelReservation {
-    /// Reconcile with authoritative usage. `None` charges the reserved
-    /// worst-case amount (the provider call may have run even if metering was
-    /// absent or the transport failed).
+    /// Reconcile with authoritative usage. Missing or all-zero usage charges
+    /// the reserved worst-case amount (the provider call may have run even if
+    /// metering was absent, broken, or the transport failed).
     pub fn reconcile(
         mut self,
         usage: Option<Usage>,
         pricing: Option<Pricing>,
     ) -> Result<(), BudgetStop> {
+        let usage = usage.filter(|usage| {
+            usage.prompt_tokens != 0 || usage.completion_tokens != 0 || usage.total_tokens != 0
+        });
         let (tokens, cost_usd) = usage.map_or((self.tokens, self.cost_usd), |usage| {
             (
                 u64::from(
@@ -433,8 +424,6 @@ mod tests {
 
     #[test]
     fn cost_budget_trips_with_real_pricing() {
-        // P1-12: with pricing resolved, recorded cost accrues and the cost
-        // ceiling actually trips (it could never trip while cost was 0.0).
         let p = crate::types::Pricing {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
@@ -455,8 +444,6 @@ mod tests {
         assert_eq!(g.check(), Some(BudgetStop::Cost));
     }
 
-    /// Each child used to get a fresh copy of the ceiling, so a tree spent the
-    /// user's whole token budget once per agent.
     #[test]
     fn a_childs_spend_counts_against_the_parents_ceiling() {
         let parent = Budget {
@@ -525,6 +512,39 @@ mod tests {
             .expect("exactly the remaining allowance is admissible");
         reservation.reconcile(None, None).unwrap();
         assert_eq!(governor.tokens(), 500);
+        assert_eq!(governor.check(), Some(BudgetStop::Tokens));
+    }
+
+    #[test]
+    fn zeroed_usage_commits_the_worst_case_reservation() {
+        let pricing = Pricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 10.0,
+            indicative: false,
+        };
+        let mut governor = Governor::new(Budget {
+            max_turns: None,
+            max_tokens: Some(500),
+            max_cost_usd: Some(0.002),
+            max_wall_s: None,
+            pooled: None,
+        });
+        let reservation = governor
+            .reserve_model(Some(400), Some(100), Some(pricing))
+            .expect("the worst-case request fits exactly");
+        reservation
+            .reconcile(
+                Some(Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                }),
+                Some(pricing),
+            )
+            .unwrap();
+
+        assert_eq!(governor.tokens(), 500);
+        assert!((governor.cost_usd() - 0.001_8).abs() < f64::EPSILON);
         assert_eq!(governor.check(), Some(BudgetStop::Tokens));
     }
 

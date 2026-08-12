@@ -1,9 +1,4 @@
-//! Scenario definition — a task + fixture + deterministic checks (Vol 5 §2).
-//!
-//! A scenario is a self-contained, content-addressed unit of agent evaluation:
-//! a workspace fixture, the task to perform, a resource contract, and the checks
-//! that decide pass/fail. Scenarios are authored as YAML and live in the repo
-//! (part of the harness artifact), so they diff and travel like any other code.
+//! YAML scenarios containing a fixture, task, resource contract, and checks.
 
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -21,20 +16,15 @@ pub const MAX_GATE_WALL_SECS: u64 = 24 * 60 * 60;
 /// One evaluation scenario, loaded from `<dir>/scenario.yaml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Scenario {
-    /// Stable id (used in reports and, later, as a regression key).
     pub id: String,
-    /// The instruction handed to the agent, verbatim.
     pub task: String,
     /// Directory (relative to the scenario file) copied into a fresh workspace
     /// for each run. Defaults to `fixture/`.
     #[serde(default = "default_fixture")]
     pub fixture: String,
-    /// Hard resource ceilings for the run (mapped to the kernel budget).
     #[serde(default)]
     pub contract: Contract,
-    /// The checks, evaluated in order. All must pass for the run to pass.
     pub checks: Vec<Check>,
-    /// Free-form tags for slicing (`coding`, `golden`, `adversarial`, …).
     #[serde(default)]
     pub labels: Vec<String>,
     /// Directory the scenario file was loaded from — resolves `fixture` and
@@ -66,8 +56,7 @@ pub struct Contract {
 /// won't map a bare externally-tagged enum onto it, and a `!tag` form would be
 /// worse to author.
 ///
-/// Every kind is exact and free of any model call (Vol 5 §2: "deterministic
-/// checks first, judges last"). LLM-as-judge rubrics are a later addition.
+/// Every check is deterministic and model-free.
 #[derive(Debug, Clone)]
 pub enum Check {
     /// Run a shell command in the post-run workspace; assert its exit code
@@ -77,8 +66,7 @@ pub enum Check {
         expect_exit: i32,
         contains: Option<String>,
     },
-    /// Every file matching the glob is byte-identical to the pristine fixture
-    /// (the anti-cheating guard: "fixed the bug without editing the tests").
+    /// Every matching file is byte-identical to the pristine fixture.
     Unchanged {
         pattern: String,
         allow_zero_matches: bool,
@@ -88,14 +76,13 @@ pub enum Check {
         pattern: String,
         allow_zero_matches: bool,
     },
-    /// A path exists in the post-run workspace.
+    /// Requires the path to exist after the run.
     Exists(String),
-    /// A path does NOT exist in the post-run workspace.
+    /// Requires the path to remain absent after the run.
     Absent(String),
-    /// The agent invoked this tool at least once (scans `model.tool_intent`).
+    /// Requires at least one matching tool intent.
     ToolUsed(String),
-    /// The agent never invoked this tool (a trajectory guard, e.g. "no web.fetch
-    /// on a purely local bug").
+    /// Requires no matching tool intent.
     ToolNotUsed(String),
     /// No event of `kind` carries `contains` in its payload, e.g. no
     /// `policy.decision` mentioning `dangerous_pattern`.
@@ -104,7 +91,6 @@ pub enum Check {
     EventPresent { kind: String, contains: String },
 }
 
-// Payload shapes for the map-valued check kinds.
 #[derive(Deserialize)]
 struct CommandArgs {
     run: String,
@@ -246,7 +232,6 @@ impl Scenario {
         Ok(scn)
     }
 
-    /// Absolute path to the fixture directory.
     pub fn fixture_dir(&self) -> PathBuf {
         self.base_dir.join(&self.fixture)
     }
@@ -314,8 +299,7 @@ impl Scenario {
             return bad("`task` must not be empty".into());
         }
         if self.checks.is_empty() {
-            // A scenario with no checks can never fail — it would rubber-stamp
-            // any run. Vol 5 §2: "a check that can't fail is deleted."
+            // Checkless scenarios would accept every run.
             return bad("a scenario must declare at least one check".into());
         }
         if let Some(wall_s) = self.contract.max_wall_s {
@@ -587,7 +571,6 @@ labels: [coding]
 
     #[test]
     fn a_scenario_with_no_checks_is_rejected() {
-        // A check-less scenario would rubber-stamp any run (Vol 5 §2).
         let dir = std::env::temp_dir().join(format!("gate-scn-empty-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(dir.join("fixture")).unwrap();
         std::fs::write(dir.join("scenario.yaml"), "id: x\ntask: y\nchecks: []\n").unwrap();

@@ -1,14 +1,11 @@
 //! Colour themes, in one place.
 //!
-//! A theme is a whole visual identity, not just a set of text colours: the
-//! canvas, the semantic slots, the tool-category hues, the splash wordmark and
-//! the activity motif all come from the same [`Palette`]. Nothing theme-shaped
-//! lives in `view.rs` — a new theme is one `const fn` here and nothing else.
+//! Each [`Palette`] owns the canvas, semantic slots, tool-category hues,
+//! wordmark, and activity motif.
 //!
 //! Colours are read through the accessor fns (`theme::text()` …), which return
 //! slots from the *current* palette, so a `/theme` switch re-colours the whole
-//! UI without threading a palette through every render fn. Reads take an
-//! uncontended `RwLock` read (tens of ns) — negligible at a few hundred a frame.
+//! UI without threading a palette through every renderer.
 //!
 //! Every text slot clears 4.5:1 against the surface it is drawn on, and every
 //! chrome slot 3:1. The one deliberate exception is `light.border` at 2.73: a
@@ -188,9 +185,7 @@ impl Palette {
         }
     }
 
-    /// **nīla** — resist-dyed indigo with gold zari. Indigo is the dye India
-    /// gave its name to, and the identity `mod.rs` has always claimed ("amber
-    /// accent + indigo depth") without any palette ever having it.
+    /// **nīla**: resist-dyed indigo with gold zari.
     pub const fn indigo() -> Self {
         Self {
             id: "indigo",
@@ -235,9 +230,7 @@ impl Palette {
         }
     }
 
-    /// **tāmrapatra** — the engraved copper plate that carried royal grants for
-    /// a millennium: oxidised ground, bright copper cut, verdigris in the
-    /// recesses.
+    /// **tāmrapatra**: oxidised ground, bright copper cut, and verdigris.
     pub const fn copper() -> Self {
         Self {
             id: "copper",

@@ -1,17 +1,8 @@
-//! The two-phase compactor (§4.3). Phase 1 = deterministic prune (no LLM);
-//! Phase 2 = LLM summarization of the middle, preserving a protected head and
-//! tail. The defining properties:
+//! Two-phase compaction: deterministic pruning followed by optional LLM
+//! summarization of the middle, preserving a protected head and tail.
 //!
-//!   * **Lossless:** pruning never destroys data — the full output stays
-//!     addressable by `artifact` hash, so the model can re-fetch it. Compaction
-//!     shrinks the *live window*, not the truth (P3).
-//!   * **Lineage:** every summary carries the `source_events` it covers (§4.3),
-//!     so a summary line can be traced back to the exact events.
-//!   * **Iterative re-summary:** a previous summary is passed in and *updated*,
-//!     not restarted, so detail accretes coherently across repeated compactions.
-//!   * **Offline fallback:** an extractive, no-LLM summarizer keeps compaction
-//!     working when the routed compressor model is unavailable or unreliable —
-//!     important when running entirely on local open-weight models.
+//! Pruned payloads remain addressable by artifact hash, and summaries retain
+//! source-event lineage. Extractive summarization is the offline fallback.
 
 use crate::budget::ContextBudget;
 use crate::policy::{CompactionAction, CompactionPolicy};
@@ -33,12 +24,12 @@ pub struct HistoryItem {
     pub role: Role,
     pub content: String,
     pub kind: ItemKind,
-    /// ULIDs of the events this item derives from — lineage pointers (§4.3).
+    /// ULIDs of the events this item derives from.
     pub source_events: Vec<String>,
     /// Content-addressed hash of the full payload, if it spilled to the blob
     /// store. Lets pruning be lossless: the full output is re-fetchable.
     pub artifact: Option<String>,
-    /// Pinned spans are never pruned or summarized (§16).
+    /// Pinned spans are never pruned or summarized.
     pub pinned: bool,
     /// Set once this item's content has been replaced by a prune placeholder.
     pub pruned: bool,
@@ -86,8 +77,8 @@ pub enum SummarizeError {
     Unavailable(String),
 }
 
-/// Pluggable summarizer (P8). The LLM impl routes to the `compressor` model
-/// (§4.4); `ExtractiveSummarizer` is the deterministic offline fallback.
+/// Pluggable summarizer. The LLM implementation routes to the `compressor`
+/// model; `ExtractiveSummarizer` is the deterministic offline fallback.
 #[async_trait]
 pub trait Summarizer: Send + Sync {
     /// Summarize `items`, optionally *updating* a previous summary rather than
@@ -98,10 +89,6 @@ pub trait Summarizer: Send + Sync {
         items: &[HistoryItem],
     ) -> Result<String, SummarizeError>;
 }
-
-// The LLM summarizer's instruction template is no longer a code literal: it is
-// resolved from the prompt registry (`crate::prompts::compaction_summary()`),
-// so it can be overridden and eval-gated as a versioned artifact (§4.11).
 
 pub fn total_tokens(items: &[HistoryItem], counter: &dyn TokenCounter) -> u32 {
     items.iter().map(|i| counter.count(&i.content)).sum()
@@ -152,15 +139,12 @@ pub async fn compact(
     let head_end = policy.protect_first_n.min(n);
     let tail_start = tail_start_index(&items, head_end, budget, policy, counter);
 
-    // Split into protected head/tail and the compactable middle.
     let mut head: Vec<HistoryItem> = items[..head_end].to_vec();
     let tail: Vec<HistoryItem> = items[tail_start..].to_vec();
     let middle: Vec<HistoryItem> = items[head_end..tail_start].to_vec();
 
-    // Pinned middle items are never compacted; keep them verbatim.
     let (pinned_middle, compactable): (Vec<_>, Vec<_>) = middle.into_iter().partition(|i| i.pinned);
 
-    // Phase 1 — prune tool outputs (deterministic, lossless).
     let mut compactable = compactable;
     let mut pruned = 0;
     let tool_tokens: u32 = compactable
@@ -180,7 +164,6 @@ pub async fn compact(
         }
     }
 
-    // Phase 2 — summarize the compactable middle (only on Full).
     let (mut new_middle, summarized) =
         if action == CompactionAction::Full && !compactable.is_empty() {
             let summary_text = summarizer.summarize(previous_summary, &compactable).await?;
@@ -205,9 +188,6 @@ pub async fn compact(
             (compactable, 0)
         };
 
-    // Reassemble: head + [summary | pruned middle] + pinned middle + tail.
-    // (Pinned items follow the summary for Phase 1; chronological re-weave of
-    // pinned spans is a Phase 2 refinement.)
     let mut out =
         Vec::with_capacity(head.len() + new_middle.len() + pinned_middle.len() + tail.len());
     out.append(&mut head);

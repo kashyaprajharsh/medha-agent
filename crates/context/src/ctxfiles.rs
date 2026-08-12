@@ -1,4 +1,4 @@
-//! Guarded project context and global persona discovery (D7/D8).
+//! Guarded project context and global persona discovery.
 
 use async_trait::async_trait;
 use guard_policy::guard::{self, Severity};
@@ -643,10 +643,6 @@ mod tests {
         file.write_all(tail.as_bytes()).unwrap();
         drop(file);
 
-        // On a current-thread runtime, the old synchronous full-file read
-        // prevented this timeout from even being polled and attempted a 4 GiB
-        // allocation. The bounded reader runs off-thread and touches only its
-        // fixed head/tail windows.
         let files = tokio::time::timeout(
             Duration::from_secs(5),
             ContextFileLoader::new().discover_startup(&root, &root.join("home")),

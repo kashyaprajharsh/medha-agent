@@ -1,4 +1,4 @@
-//! Input budget derived from resolved model limits and count quality (§4.3).
+//! Input budget derived from resolved model limits and count quality.
 //!
 //! Output reservation is handled by `ModelLimits::input_allowance`; this type
 //! never invents a percentage of the total window. Only non-authoritative

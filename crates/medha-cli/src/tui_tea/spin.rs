@@ -1,13 +1,9 @@
 //! Activity animation, in one place.
 //!
-//! Three tiers, so concurrent indicators do not compete: [`primary_at`] for
-//! whatever the user is waiting on, [`secondary`] at a slower pace for work
-//! running alongside, and [`track`] — the wide ornament on the splash, the one
-//! place with room for a theme's own shape, so it alone follows [`Motif`].
+//! [`primary_at`] marks foreground work, [`secondary`] marks concurrent work at
+//! a slower pace, and the wider splash [`track`] follows the theme's [`Motif`].
 //!
-//! The two status-line tiers are shared across themes and differ by colour: a
-//! palette supplies the ramp they glow along, so the same gesture reads as gold
-//! on `dark` and as copper on `copper`.
+//! Status-line motion is shared across themes; the palette supplies its colour.
 
 use super::theme::Motif;
 
@@ -18,9 +14,7 @@ mod tests;
 /// One movement of the spinner suite.
 pub(super) struct Movement {
     pub frames: &'static [&'static str],
-    /// Ticks per frame. `anim_frame` advances every 16 ms, so an undivided
-    /// spinner cycles ~60 times a second — a smear, not an animation. These land
-    /// in the 64–128 ms per frame a spinner stays legible at.
+    /// Ticks per frame; `anim_frame` advances every 16 ms.
     pub divisor: u64,
 }
 
@@ -31,10 +25,7 @@ const FLOWER: [&str; 4] = ["✿", "❀", "✾", "❀"];
 const MOON: [&str; 8] = ["○", "◔", "◑", "◕", "●", "◕", "◑", "◔"];
 const RINGS: [&str; 6] = ["◌", "◍", "◎", "◉", "◎", "◍"];
 
-/// The spinner is a suite, not a loop: six movements in sequence, each held
-/// [`CYCLES`] times before the next takes over. A single four-frame loop is what
-/// makes most CLI spinners read as machinery — a progression stays alive over a
-/// long turn without ever getting louder.
+/// Six movements in sequence, each held [`CYCLES`] times.
 const SUITE: [Movement; 6] = [
     Movement {
         frames: &STAR_SMALL,
@@ -62,17 +53,14 @@ const SUITE: [Movement; 6] = [
     },
 ];
 
-/// Times each movement repeats before handing over. One reads as restless; four
-/// hides that the suite is progressing at all.
+/// Times each movement repeats before handing over.
 const CYCLES: u64 = 2;
 
 /// Dimmest the glyph goes mid-cycle, as a percentage of the lit colour. The
 /// swell is what makes it twinkle rather than merely swap glyphs.
 const MIN_LIT: u16 = 45;
 
-/// Work happening alongside: sub-agents, background tasks. One quiet set at a
-/// slow pace, deliberately outside the suite — the ambient tier is never the
-/// thing being waited on, and must not compete with it.
+/// A slow, quiet indicator for concurrent work.
 const AMBIENT: [&str; 4] = ["⋅", "·", "∘", "·"];
 const AMBIENT_DIVISOR: u64 = 12;
 
@@ -114,9 +102,7 @@ pub(super) fn secondary(frame: u64) -> &'static str {
     AMBIENT[((frame / AMBIENT_DIVISOR) as usize) % AMBIENT.len()]
 }
 
-/// A Saraswati veena — resonator gourd with soundhole, fretted neck, upper
-/// gourd. Playing it means tuning the intellect into harmony, so the gesture is
-/// a *pluck*: resonance runs the neck, then the string is left to settle.
+/// A Saraswati veena: resonator, fretted neck, and upper gourd.
 const VEENA: [&str; 19] = [
     "◖", "◉", "◗", "─", "┼", "─", "┼", "─", "┼", "─", "┼", "─", "┼", "─", "┼", "─", "┼", "─", "○",
 ];
@@ -133,9 +119,7 @@ const CHISEL: [&str; 15] = [
     "▫", "┄", "┴", "┄", "┴", "┄", "┴", "┄", "┴", "┄", "┴", "┄", "┴", "┄", "▪",
 ];
 
-/// A themed ornament with a moving head. The head does not merely brighten a
-/// glyph — it *replaces* it, so each motif reads as its own gesture rather than
-/// as a dot sliding along a bar.
+/// A themed ornament whose moving head replaces the underlying glyph.
 pub(super) struct Track {
     pub glyphs: &'static [&'static str],
     /// Drawn in place of `glyphs[head]` while the head is there.
@@ -174,8 +158,7 @@ impl Track {
 /// the curl rendered as a stray `⌐` hanging off the end.
 pub(super) fn track(motif: Motif) -> Track {
     match motif {
-        // A pluck, then a long settle before the next one. The gourds glow
-        // throughout — Saraswati's white, the colour of true knowledge.
+        // A pluck followed by a long settle; the gourds stay lit.
         Motif::Veena => Track {
             glyphs: &VEENA,
             head_glyph: "◈",
@@ -184,7 +167,6 @@ pub(super) fn track(motif: Motif) -> Track {
             gap: 8,
             divisor: 3,
         },
-        // The shuttle crosses and returns almost at once; weaving is continuous.
         Motif::Loom => Track {
             glyphs: &LOOM,
             head_glyph: "◆",
@@ -193,7 +175,6 @@ pub(super) fn track(motif: Motif) -> Track {
             gap: 2,
             divisor: 2,
         },
-        // One deliberate stroke at a time, with the hand lifted between.
         Motif::Chisel => Track {
             glyphs: &CHISEL,
             head_glyph: "▼",

@@ -1,7 +1,3 @@
-//! Remote (Streamable HTTP) transport coverage against a hermetic local MCP
-//! server: no-auth and bearer connects, header enforcement, plaintext refusal,
-//! and the needs-sign-in state an OAuth server without credentials lands in.
-
 use std::{sync::Arc, time::Duration};
 
 use mcp::{
@@ -13,14 +9,10 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-/// A minimal Streamable HTTP MCP endpoint: one JSON-RPC POST in, one JSON
-/// response out. Enough to exercise the transport, not to reimplement a server.
 async fn spawn_server(required_bearer: Option<&'static str>) -> String {
     spawn_with_challenge(required_bearer, None).await
 }
 
-/// `challenge` is the `WWW-Authenticate` value returned with a 401 when the
-/// request carries no credentials — the signal Medha probes for.
 async fn spawn_with_challenge(
     required_bearer: Option<&'static str>,
     challenge: Option<&'static str>,
@@ -77,10 +69,7 @@ async fn spawn_with_challenge(
     format!("http://127.0.0.1:{port}/mcp")
 }
 
-/// Read one complete HTTP request: headers plus any `Content-Length` body. A
-/// single `read` can return a partial request when TCP splits the segment under
-/// load, dropping the auth header or JSON body — the source of the intermittent
-/// handshake failures this mock otherwise produced.
+/// Reads through the declared body because TCP reads may be partial.
 async fn read_http_request(stream: &mut TcpStream) -> Option<String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 16 * 1024];

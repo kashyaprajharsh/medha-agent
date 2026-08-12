@@ -1,33 +1,4 @@
-//! Provider configuration. The CLI *resolves* config; it never defines it.
-//!
-//! Resolution order (highest wins):
-//!   CLI flag  >  MEDHA_* env  >  ~/.medha/config.toml  >  TUI first-run model setup
-//!
-//! Only the `MEDHA_*` env namespace is read — never generic `OPENAI_*` /
-//! `OPENAI_COMPATIBLE_*` names, and never a project `.env`. Those belong to the
-//! app that owns the working directory; reading them let a repo's environment
-//! silently hijack medha's model/credentials. `medha nadi` reports provenance.
-//!
-//! Nothing is hardcoded as a product default — a value first comes to exist
-//! when the user saves a model profile in the TUI (the single interactive
-//! setup surface; the old terminal wizard is gone). This file is the Phase-0
-//! precursor to the
-//! `medha.lock` `[routing]` table (§4.4). Secrets never live in `config.toml`
-//! (§9); they resolve through a layered store (see [`store_key`]):
-//!
-//!   env var  >  ~/.medha/credentials.toml (owner-only, 0600)  >  OS keychain
-//!
-//! The owner-only credentials file is the default store — the same convention
-//! as most CLI tooling (`gh`, `gcloud` and others keep an auth/credentials
-//! file under the user's home). The OS keychain is NOT the
-//! default because macOS binds keychain ACLs to the binary's code signature:
-//! every rebuilt (ad-hoc-signed) dev binary looks like a new app and throws a
-//! password dialog on each read — the exact prompt-fatigue this design
-//! removes. Keys stored in the keychain by older builds are migrated into the
-//! file on first read (one final OS prompt, then never again).
-//! `MEDHA_CRED_STORE=keychain` opts back into keychain-first for users who
-//! prefer it. Found keys are cached in-process, so the store is consulted at
-//! most once per endpoint per run.
+//! Provider configuration and credential storage.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -36,8 +7,6 @@ use std::path::PathBuf;
 
 const KEYRING_SERVICE: &str = "medha";
 
-/// Common OpenAI-compatible endpoints offered in the wizard. Suggestions only —
-/// never silent defaults; the user always confirms or types their own.
 const PRESETS: &[(&str, &str)] = &[
     ("Ollama (local)", "http://localhost:11434/v1"),
     ("LM Studio (local)", "http://localhost:1234/v1"),
@@ -49,47 +18,29 @@ const PRESETS: &[(&str, &str)] = &[
     ("OpenAI", "https://api.openai.com/v1"),
 ];
 
-/// Provider suggestions shared by first-run setup and the in-TUI model
-/// manager. They are suggestions only; Custom always remains available.
 pub(crate) fn provider_presets() -> &'static [(&'static str, &'static str)] {
     PRESETS
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// Legacy single-provider connection written by the removed terminal
-    /// wizard. Load-only: [`load`] folds it into `models` (one-time migration)
-    /// and it is never serialized again. Nothing else may read it.
+    /// Load-only legacy connection, migrated into `models`.
     #[serde(default, skip_serializing)]
     provider: Option<ProviderConfig>,
-    /// User-named model connections — the ONLY place connections live. A
-    /// connection is more than a model id: it includes the provider endpoint
-    /// and its discovered context window.
     #[serde(default)]
     pub models: BTreeMap<String, ProviderConfig>,
-    /// Which saved model starts new sessions. `None` (or a stale name) falls
-    /// back to the first saved model; no models at all → the TUI opens its
-    /// first-run model setup.
     #[serde(default)]
     pub default_model: Option<String>,
-    /// Agent-level settings (K1 identity, etc.). Optional so existing configs
-    /// without an `[agent]` section still parse.
     #[serde(default)]
     pub agent: AgentConfig,
-    /// Web-search provider selection (set via `/search`). Optional so existing
-    /// configs without a `[search]` section still parse.
     #[serde(default)]
     pub search: SearchConfig,
-    /// User-scoped MCP servers (machine-local, never committed). The API key is
-    /// NOT stored here — it lives in the credential store (`mcp://<id>`), and the
-    /// server environment references it as `${key}`, substituted at spawn.
+    /// User-scoped, secret-free MCP definitions.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServer>,
 }
 
 impl McpServer {
-    /// What the server points at — URL for a hosted server, command line for a
-    /// local one. Used wherever a definition is shown to the user.
     pub fn target(&self) -> String {
         if self.url.is_empty() {
             self.command.join(" ")
@@ -99,35 +50,27 @@ impl McpServer {
     }
 }
 
-/// A user-scoped MCP server definition. Secret-free: any API key is referenced
-/// as the literal `${key}` in an env value and resolved from the credential
-/// store. Command arguments may not contain it because argv is locally visible.
+/// Secret-free user MCP definition; `${key}` resolves only in explicit env.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpServer {
     /// Local stdio server. Mutually exclusive with `url`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
-    /// Hosted server reached over Streamable HTTP. Takes precedence over `command`.
+    /// Mutually exclusive with `command`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
-    /// Credential scheme for `url`: `""` (none), `bearer`, or `oauth`. A bearer
-    /// token lives under `mcp://<id>`; OAuth tokens under `mcp-oauth://<id>`.
+    /// Credential scheme for `url`: empty, `bearer`, or `oauth`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth: String,
-    /// Extra environment for the server. Values may reference `${key}` (resolved
-    /// from the credential store) — e.g. `GITHUB_TOKEN = "${key}"`.
+    /// Values may reference `${key}`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// `workspace` (default) requires approval to start; `trusted` auto-connects.
     #[serde(default)]
     pub trust: String,
-    /// Switched off: kept here with its credentials, but never connected. Lets a
-    /// server be parked without losing its definition.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
-    /// Tools exposed to the model. `allow` (when set) whitelists, then `deny`
-    /// subtracts; entries are exact names or a `prefix*` glob. A big server can
-    /// publish 100+ schemas — filtering keeps them out of every model request.
+    /// Exact or `prefix*` tool filters; deny applies after allow.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -135,14 +78,10 @@ pub struct McpServer {
     /// Per-server network override; unset falls back to the host `[mcp]` default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<bool>,
-    /// Opt in to concurrent calls. Off by default: most servers hold per-session
-    /// state, and a server's own "read only" annotation is a hint, not a promise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub parallel_calls: bool,
 }
 
-/// MCP add flags whose values are credentials. Shared with TUI history
-/// redaction so adding a parser spelling cannot silently create a logging leak.
 pub const MCP_SECRET_FLAGS: &[&str] = &["--key", "--bearer", "--token", "--password"];
 
 pub struct ParsedMcpAdd {
@@ -151,9 +90,6 @@ pub struct ParsedMcpAdd {
     pub key: Option<String>,
 }
 
-/// Parse the common `mcp add` grammar used by both the CLI and TUI. Keeping one
-/// parser prevents `--bearer=value` from being safe in one surface but persisted
-/// as an unknown command argument in the other.
 pub fn parse_mcp_add_args<I, S>(args: I) -> Result<ParsedMcpAdd>
 where
     I: IntoIterator<Item = S>,
@@ -281,33 +217,23 @@ where
     })
 }
 
-/// Persisted web-search choice. API keys are secrets and live in the credential
-/// store (keyed `search://<provider>`), never here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchConfig {
-    /// Chosen provider id: `tavily` | `brave` | `searxng` | `duckduckgo`.
-    /// `None` = never configured → auto-detect from env for back-compat.
+    /// Provider id; `None` retains legacy environment auto-detection.
     #[serde(default)]
     pub provider: Option<String>,
-    /// SearXNG instance base URL, used only when the provider is `searxng`.
     #[serde(default)]
     pub searxng_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// Persona override for the K1 identity sheath. `None` → built-in default.
     #[serde(default)]
     pub identity: Option<String>,
 }
 
-/// Compatibility name for the provider-owned deployment profile. Keeping one
-/// type prevents config, model switching, and the HTTP client from disagreeing
-/// about protocol, authentication, headers, or limits.
 pub type ProviderConfig = providers::ProviderProfile;
 
-/// A display-safe saved model. API keys remain in the OS keychain and are never
-/// included here or serialized into config.toml.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelProfile {
     pub name: String,
@@ -315,16 +241,10 @@ pub struct ModelProfile {
     pub is_default: bool,
 }
 
-/// Where a resolved configuration value came from. Tracked so `medha nadi` and
-/// the startup line can answer "why this model?" without guesswork — the exact
-/// class of question that the `.env` hijack made impossible to answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// A `--model` / `--base-url` CLI flag (one-session override).
     Flag,
-    /// A `MEDHA_*` environment variable.
     Env,
-    /// A saved profile in `~/.medha/config.toml`.
     Config,
 }
 
@@ -338,13 +258,9 @@ impl Source {
     }
 }
 
-/// Where the API key resolved from. Distinct from [`Source`] because credentials
-/// have their own layered store (env → credentials file → keychain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredSource {
-    /// `MEDHA_API_KEY` environment variable.
     Env,
-    /// `~/.medha/credentials.toml` (owner-only file store).
     CredentialsFile,
     /// The OS keychain (or nowhere — resolved lazily at connect time).
     KeychainOrNone,
@@ -360,24 +276,18 @@ impl CredSource {
     }
 }
 
-/// What the kernel actually runs with, after resolution + secret lookup.
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub name: String,
     pub provider: providers::ProviderProfile,
     /// Resolved from environment/credential storage; never serialized.
     pub credential: String,
-    /// Where the model id resolved from (provenance for diagnostics).
     pub model_source: Source,
-    /// Where the base URL resolved from.
     pub base_url_source: Source,
-    /// Where the credential resolved from.
     pub credential_source: CredSource,
 }
 
 impl Config {
-    /// All selectable models in stable display order. Every entry is an
-    /// ordinary, removable profile — there is no reserved name.
     pub fn model_profiles(&self) -> Vec<ModelProfile> {
         let active = self.startup_model();
         self.models
@@ -394,9 +304,6 @@ impl Config {
         self.models.get(name)
     }
 
-    /// Effective startup model name: the configured default when it still
-    /// exists, else the first saved model (a removed default must never make
-    /// Medha unstartable), else `None` (no models — first-run setup).
     fn startup_model(&self) -> Option<&str> {
         self.default_model
             .as_deref()
@@ -417,7 +324,6 @@ impl Config {
     ) -> Result<()> {
         self.validate_new_model_name(&name)?;
         provider.validate().map_err(anyhow::Error::msg)?;
-        // The first saved model is implicitly the startup default.
         if make_default || self.models.is_empty() {
             self.default_model = Some(name.clone());
         }
@@ -425,9 +331,6 @@ impl Config {
         Ok(())
     }
 
-    /// Validate a new profile name before any related secret is persisted.
-    /// Kept separate from [`Self::add_model`] so an interactive form can give
-    /// immediate feedback without writing an API key for an invalid profile.
     pub fn validate_new_model_name(&self, name: &str) -> Result<()> {
         validate_model_name(name)?;
         if self.models.contains_key(name) {
@@ -446,9 +349,6 @@ impl Config {
         Ok(())
     }
 
-    /// Remove a saved profile. Removing the startup default promotes the first
-    /// remaining model. Stored credentials are retained because multiple
-    /// profiles may share the same endpoint.
     pub fn remove_model(&mut self, name: &str) -> Result<ProviderConfig> {
         let removed = self
             .models
@@ -460,8 +360,6 @@ impl Config {
         Ok(removed)
     }
 
-    /// The currently-selected search provider for display/preselection. An
-    /// unset `[search]` shows as DuckDuckGo (the effective default).
     pub fn search_provider(&self) -> tools::SearchProvider {
         self.search
             .provider
@@ -470,12 +368,8 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Record the chosen search provider (and, for SearXNG, its instance URL).
-    /// The API key, when the provider needs one, is stored separately via
-    /// [`store_key`] — never in config.toml.
     pub fn set_search(&mut self, provider: tools::SearchProvider, searxng_url: Option<String>) {
         self.search.provider = Some(provider.as_str().to_string());
-        // Keep a stale URL from leaking into a non-SearXNG choice.
         self.search.searxng_url = match provider {
             tools::SearchProvider::Searxng => searxng_url,
             _ => None,
@@ -483,8 +377,6 @@ impl Config {
     }
 }
 
-/// Credential-store id holding a keyed search provider's API key. Providers that
-/// need no key (DuckDuckGo, SearXNG) return `None`.
 pub(crate) fn search_cred_id(provider: tools::SearchProvider) -> Option<&'static str> {
     match provider {
         tools::SearchProvider::Tavily => Some("search://tavily"),
@@ -493,9 +385,6 @@ pub(crate) fn search_cred_id(provider: tools::SearchProvider) -> Option<&'static
     }
 }
 
-/// Auto-detect a provider from the environment when `[search]` is unset, in the
-/// legacy priority order. This preserves behavior for setups that only ever
-/// exported `TAVILY_API_KEY`/`BRAVE_API_KEY`/`MEDHA_SEARXNG_URL`.
 fn auto_detect_search_provider() -> tools::SearchProvider {
     use tools::SearchProvider as P;
     let has = |k: &str| std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty());
@@ -510,10 +399,6 @@ fn auto_detect_search_provider() -> tools::SearchProvider {
     }
 }
 
-/// Build the live [`tools::SearchSettings`] from saved config + the credential
-/// store. Both keyed providers' keys are loaded regardless of the chosen search
-/// backend, because `web.fetch`/`web.crawl` use the Tavily key independently.
-/// Keys still absent here fall back to env vars tool-side.
 pub fn resolve_search(cfg: &Config) -> tools::SearchSettings {
     let provider = match cfg.search.provider.as_deref() {
         Some(p) => tools::SearchProvider::from_id(p),
@@ -527,11 +412,6 @@ pub fn resolve_search(cfg: &Config) -> tools::SearchSettings {
     }
 }
 
-/// One-time migration of a wizard-era `[provider]` block into `models`.
-/// Returns true when the config changed and should be re-saved. The migrated
-/// connection becomes a normal named (and removable) profile; the startup
-/// default is preserved — legacy configs without one start on the migrated
-/// connection, exactly as before.
 fn migrate_legacy_provider(cfg: &mut Config) -> bool {
     let Some(legacy) = cfg.provider.take() else {
         return false;
@@ -550,15 +430,10 @@ fn migrate_legacy_provider(cfg: &mut Config) -> bool {
     true
 }
 
-/// Profile name for a new connection, derived from its model id and unique
-/// among the saved profiles. The setup form deliberately never asks the user
-/// to invent a name — this is the single naming path.
 pub(crate) fn derive_profile_name(cfg: &Config, model_id: &str) -> String {
     unique_profile_name(&cfg.models, &profile_name_from_model(model_id))
 }
 
-/// Derive a valid kebab-case profile name from a model id, e.g.
-/// `Qwen/Qwen3.5-397B-A17B` → `qwen3-5-397b-a17b`.
 fn profile_name_from_model(model: &str) -> String {
     let last = model.rsplit('/').next().unwrap_or(model);
     let mut out = String::new();
@@ -605,9 +480,6 @@ fn validate_model_name(name: &str) -> Result<()> {
     }
 }
 
-/// The MEDHA home directory — `$MEDHA_HOME` if set, else `~/.medha`. Holds
-/// user-global config (`config.toml`), user skills, and all per-workspace
-/// runtime state under `projects/` (see [`state_dir`]).
 pub fn medha_home() -> Result<PathBuf> {
     if let Some(h) = std::env::var_os("MEDHA_HOME") {
         return Ok(PathBuf::from(h));
@@ -620,8 +492,6 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(medha_home()?.join("config.toml"))
 }
 
-/// User-scoped reusable procedures. Kept beneath [`medha_home`] so
-/// `MEDHA_HOME` relocates config, skills, and runtime state together.
 pub fn user_skills_dir() -> Result<PathBuf> {
     Ok(user_skills_dir_in(&medha_home()?))
 }
@@ -630,28 +500,14 @@ fn user_skills_dir_in(home: &std::path::Path) -> PathBuf {
     home.join("skills")
 }
 
-/// Registered skill sources ("taps"). Lives beside the user skills dir so
-/// sources relocate with `MEDHA_HOME` like everything else. Not a skill folder
-/// (no `SKILL.md`), so discovery ignores it.
 pub fn user_taps_path() -> Result<PathBuf> {
     Ok(user_skills_dir()?.join("taps.toml"))
 }
 
-/// The skills lockfile for reproducible team setups. Lives in the workspace
-/// (committed with the repo) — not the user home — so a team shares one file
-/// and `/skill sync` reproduces the same skill set.
 pub fn skills_lock_path() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join("medha-skills.lock"))
 }
 
-/// Per-workspace runtime state directory:
-/// `~/.medha/projects/<readable-cwd>--<path-hash>/`
-/// Runtime state — the event log, artifacts, snapshots,
-/// logs — lives HERE, out of the working tree, so it never clutters or gets
-/// committed to the user's repos. Only committed config (`.medha/skills`,
-/// `medha.lock`) stays in the workspace. Creates the dir. `workspace` must be
-/// an existing directory; it is canonicalized here so aliases of one workspace
-/// share an identity while distinct paths cannot collide through punctuation.
 pub fn state_dir(workspace: &std::path::Path) -> Result<PathBuf> {
     let workspace = workspace
         .canonicalize()
@@ -661,11 +517,7 @@ pub fn state_dir(workspace: &std::path::Path) -> Result<PathBuf> {
     std::fs::create_dir_all(&projects)
         .with_context(|| format!("creating {}", projects.display()))?;
 
-    // Older releases used only the readable, separator-replaced name. That
-    // mapping was ambiguous (`/w/a-b` and `/w/a/b` both became `-w-a-b`), so
-    // importing it could expose another workspace's event history or, more
-    // importantly, its prompt-free trust grants. Leave the old state untouched
-    // for manual recovery and start from the collision-resistant identity.
+    // Legacy slugs can collide, so never import their trust state automatically.
     let legacy = home
         .join("projects")
         .join(readable_workspace_slug(&workspace));
@@ -681,19 +533,12 @@ pub fn state_dir(workspace: &std::path::Path) -> Result<PathBuf> {
     select_state_dir(&home, &workspace)
 }
 
-/// Pure path computation behind [`state_dir`] (no I/O) — testable without env.
 fn state_dir_in(home: &std::path::Path, workspace: &std::path::Path) -> PathBuf {
     home.join("projects").join(encode_workspace(workspace))
 }
 
 const WORKSPACE_ID_MARKER: &str = ".medha-workspace-id-v2";
 
-/// Select and bind a directory to this exact canonical path.
-///
-/// The marker is essential even though the name contains a strong hash. An old
-/// separator-only name could itself end in text that looks like `--<hash>`.
-/// Adopting an existing unmarked directory would then reintroduce the legacy
-/// cross-workspace trust collision during the migration.
 fn select_state_dir(home: &std::path::Path, workspace: &std::path::Path) -> Result<PathBuf> {
     let projects = home.join("projects");
     std::fs::create_dir_all(&projects)
@@ -704,9 +549,6 @@ fn select_state_dir(home: &std::path::Path, workspace: &std::path::Path) -> Resu
         Ok(()) => {
             let marker = candidate.join(WORKSPACE_ID_MARKER);
             if let Err(error) = std::fs::write(&marker, &identity) {
-                // No caller can use this directory until this function returns.
-                // Best-effort removal avoids leaving an unbound directory after
-                // a disk/permission failure.
                 let _ = std::fs::remove_dir(&candidate);
                 return Err(error).with_context(|| format!("writing {}", marker.display()));
             }
@@ -714,10 +556,7 @@ fn select_state_dir(home: &std::path::Path, workspace: &std::path::Path) -> Resu
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let marker = candidate.join(WORKSPACE_ID_MARKER);
-            // Another first launch may have won `create_dir` and be between
-            // directory creation and its marker write. Briefly wait for that
-            // exact marker; never allocate a second state directory, which
-            // would make later launches abandon whichever history lost.
+            // A concurrent first launch may still be writing the marker.
             let attempts = if cfg!(test) { 2 } else { 50 };
             for attempt in 0..attempts {
                 match std::fs::read_to_string(&marker) {
@@ -745,13 +584,9 @@ fn select_state_dir(home: &std::path::Path, workspace: &std::path::Path) -> Resu
     }
 }
 
-/// Encode an absolute workspace path into a readable but collision-resistant
-/// directory name. The readable prefix is diagnostic only; authority and state
-/// separation come from a 128-bit SHA-256 prefix over the canonical OS path.
 fn encode_workspace(p: &std::path::Path) -> String {
     let readable = readable_workspace_slug(p);
-    // Keep one path component comfortably below common 255-byte limits. The
-    // digest preserves identity even when the human-readable prefix is cut.
+    // Leave room below common 255-byte component limits.
     let mut prefix = String::with_capacity(readable.len().min(96));
     for character in readable.chars() {
         if prefix.len() + character.len_utf8() > 96 {
@@ -762,16 +597,7 @@ fn encode_workspace(p: &std::path::Path) -> String {
     format!("{prefix}--{}", workspace_path_fingerprint(p))
 }
 
-/// Produce the non-authoritative readable part of a workspace state name:
-/// every path separator becomes `-`, so `/Users/x/proj` becomes
-/// `-Users-x-proj`. Existing hyphens are intentionally left as-is.
-///
-/// Windows `canonicalize` hands back a *verbatim* path — `\\?\C:\Users\x`, or
-/// `\\?\UNC\server\share` for a network drive — and its `?` is one of the
-/// characters Windows forbids in a filename. Encoded as-is that produced
-/// `--?-C--Users-x`, so creating the state dir failed with os error 123 and
-/// medha could not start at all. The prefix is stripped first; on Unix, where
-/// `canonicalize` returns a plain absolute path, there is nothing to strip.
+/// Windows verbatim prefixes are removed because `?` is invalid in filenames.
 fn readable_workspace_slug(p: &std::path::Path) -> String {
     let raw = p.to_string_lossy();
     let path = raw
@@ -834,9 +660,6 @@ pub fn load() -> Result<Option<Config>> {
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut cfg: Config = toml::from_str(&text).context("parsing config.toml")?;
-    // Wizard-era [provider] block → ordinary named profile, rewritten once so
-    // the legacy shape disappears from disk. Best-effort save: a read-only FS
-    // still gets a working in-memory config.
     if migrate_legacy_provider(&mut cfg) {
         let _ = save(&cfg);
     }
@@ -879,8 +702,7 @@ fn write_config_file(path: &std::path::Path, text: &str) -> Result<()> {
     write_result
 }
 
-/// Serialize complete-config writes across Medha processes. The lock is a
-/// stable sibling because atomic publication replaces the config-file inode.
+/// Serialize config writes using a stable lock beside the replaced data file.
 fn with_config_lock<T>(path: &std::path::Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
@@ -898,16 +720,7 @@ fn with_config_lock<T>(path: &std::path::Path, operation: impl FnOnce() -> Resul
     operation()
 }
 
-/// Resolve effective provider settings from (in order) CLI flags → env → config
-/// file. `cfg` may be `None` (no config saved yet); returns `None` if base URL
-/// or model can't be determined from any source — the TUI then opens its
-/// first-run model setup (headless callers get an actionable error instead).
-///
-/// Only the `MEDHA_*` env namespace is honored. Generic third-party spellings
-/// (`OPENAI_*`, `OPENAI_COMPATIBLE_*`) are deliberately NOT read: they belong to
-/// whatever app owns the working directory, and reading them let a project's
-/// `.env`/environment silently hijack medha's model and credentials. medha's
-/// config is a function of medha's own state only.
+/// Only `MEDHA_*` environment variables may override saved settings.
 pub fn resolve(
     cfg: Option<&Config>,
     flag_base_url: Option<String>,
@@ -922,15 +735,11 @@ fn resolve_inner(
     flag_model: Option<String>,
     allow_keychain: bool,
 ) -> Result<Option<Resolved>> {
-    // An explicit endpoint/model is a one-session override, even if only one
-    // half of the connection came from a saved profile. Do not label that as a
-    // persisted profile in the TUI — selecting it again must be unambiguous.
     let has_override = flag_base_url.is_some()
         || flag_model.is_some()
         || first_env(&["MEDHA_BASE_URL"]).is_some()
         || first_env(&["MEDHA_MODEL"]).is_some();
     let (profile, configured) = cfg.and_then(|c| c.selected_model()).unzip();
-    // flag > MEDHA_* env > saved profile — each layer also records its provenance.
     let (base_url, base_url_source) = pick_source(
         flag_base_url,
         "MEDHA_BASE_URL",
@@ -947,8 +756,7 @@ fn resolve_inner(
     let base_url_source = base_url_source.unwrap_or(Source::Config);
     let model_source = model_source.unwrap_or(Source::Config);
 
-    // Environment first, then the layered credential store. The short circuit
-    // avoids touching the macOS keychain when a `MEDHA_API_KEY` is present.
+    // Avoid a macOS keychain prompt when the environment already supplies a key.
     let env_key = first_env(&["MEDHA_API_KEY"]);
     let file_key = if env_key.is_none() {
         file_load_key(&base_url)
@@ -1048,9 +856,6 @@ fn resolve_inner(
     }))
 }
 
-/// flag → `MEDHA_*` env → configured value, returning the chosen value with its
-/// provenance. The configured tier reports no `Source` (the caller maps a bare
-/// configured value to [`Source::Config`]) so a missing value stays `None`.
 fn pick_source(
     flag: Option<String>,
     env_name: &str,
@@ -1065,9 +870,6 @@ fn pick_source(
     (configured, None)
 }
 
-/// Generic third-party env prefixes medha intentionally IGNORES. Surfaced by
-/// `/pulse` so a stray `OPENAI_MODEL` (e.g. from a project this shell was set up
-/// for) is visibly acknowledged-and-ignored rather than a silent mystery.
 const IGNORED_ENV_PREFIXES: &[&str] = &[
     "OPENAI_",
     "GOOGLE_",
@@ -1076,7 +878,6 @@ const IGNORED_ENV_PREFIXES: &[&str] = &[
     "AZURE_OPENAI_",
 ];
 
-/// Severity of a [`Check`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
     Ok,
@@ -1094,8 +895,6 @@ impl Health {
     }
 }
 
-/// One diagnosed condition. `auto_fixable` marks the ones `/pulse fix` /
-/// `medha pulse --fix` can repair without asking (all are non-destructive).
 pub struct Check {
     pub health: Health,
     pub title: String,
@@ -1103,10 +902,6 @@ pub struct Check {
     pub auto_fixable: bool,
 }
 
-/// A prompt-free snapshot of how medha resolves its configuration right now,
-/// with the provenance of every value and a list of health checks — the data
-/// behind `medha pulse` / `/pulse`. (Distinct from the agent's `diagnostics`
-/// tool, which reports compiler/linter errors about the user's code.)
 pub struct Pulse {
     pub medha_home: String,
     pub config_path: String,
@@ -1118,17 +913,12 @@ pub struct Pulse {
     pub medha_env: Vec<String>,
     /// Names of generic third-party LLM env vars present but ignored by medha.
     pub ignored_env: Vec<String>,
-    /// Path to a project `medha.lock` if one exists in the cwd.
     pub project_lock: Option<String>,
-    /// `[routing] executor` from that lock, if set.
     pub lock_executor: Option<String>,
-    /// Diagnosed conditions, most-severe first.
     pub checks: Vec<Check>,
 }
 
-/// Build the pulse snapshot. Prompt-free: credential provenance is derived from
-/// env + the credentials file only (the keychain is never probed here, so
-/// running `pulse` can't trigger an OS auth dialog or spend API budget).
+/// Build diagnostics without probing the keychain or external services.
 pub fn pulse(
     cfg: Option<&Config>,
     flag_base_url: Option<String>,
@@ -1177,7 +967,6 @@ pub fn pulse(
     }
 }
 
-/// Compute the health checks. Ordered most-severe-first for display.
 fn diagnose_checks(
     cfg: Option<&Config>,
     resolved: &std::result::Result<Option<Resolved>, String>,
@@ -1187,7 +976,6 @@ fn diagnose_checks(
 
     match resolved {
         Ok(Some(r)) => {
-            // Credential required by the profile but none resolvable.
             if r.provider.auth.requires_credential() && r.credential.is_empty() {
                 checks.push(Check {
                     health: Health::Error,
@@ -1217,9 +1005,6 @@ fn diagnose_checks(
                 });
             }
 
-            // Endpoint/protocol mismatch — the exact class that produced the 404 /
-            // API_KEY_INVALID confusion (a Gemini endpoint spoken over OpenAI, or
-            // vice-versa).
             let url = r.provider.base_url.to_ascii_lowercase();
             let proto = r.provider.protocol.as_str();
             let proto_is_gemini = proto.contains("gemini");
@@ -1246,7 +1031,6 @@ fn diagnose_checks(
                 });
             }
 
-            // Compaction needs a context window.
             if r.provider.max_ctx.is_none() {
                 checks.push(Check {
                     health: Health::Warn,
@@ -1275,7 +1059,6 @@ fn diagnose_checks(
         }),
     }
 
-    // Stale default_model — auto-fixable (promote the first saved profile).
     if let Some(cfg) = cfg {
         if let Some(def) = &cfg.default_model {
             if !cfg.models.contains_key(def) {
@@ -1297,7 +1080,6 @@ fn diagnose_checks(
         }
     }
 
-    // Reassurance: foreign LLM env is present but ignored (acknowledged, not silent).
     if !ignored_env.is_empty() {
         checks.push(Check {
             health: Health::Ok,
@@ -1310,7 +1092,6 @@ fn diagnose_checks(
         });
     }
 
-    // Most severe first: Error, then Warn, then Ok.
     let rank = |h: Health| match h {
         Health::Error => 0,
         Health::Warn => 1,
@@ -1320,13 +1101,9 @@ fn diagnose_checks(
     checks
 }
 
-/// Apply the non-destructive fixes `/pulse fix` / `medha pulse --fix` offers,
-/// mutating `cfg` in place. Returns a human-readable line per applied fix; an
-/// empty vec means nothing needed fixing. The caller persists with [`save`].
 pub fn apply_safe_fixes(cfg: &mut Config) -> Vec<String> {
     let mut fixed = Vec::new();
 
-    // Repair a default_model pointing at a removed/renamed profile.
     if let Some(def) = cfg.default_model.clone() {
         if !cfg.models.contains_key(&def) {
             match cfg.models.keys().next().cloned() {
@@ -1348,12 +1125,10 @@ pub fn apply_safe_fixes(cfg: &mut Config) -> Vec<String> {
 }
 
 impl Pulse {
-    /// True when at least one check is auto-fixable.
     pub fn has_fixes(&self) -> bool {
         self.checks.iter().any(|c| c.auto_fixable)
     }
 
-    /// Overall verdict icon+word for the summary line.
     fn verdict(&self) -> (&'static str, &'static str) {
         if self.checks.iter().any(|c| c.health == Health::Error) {
             ("✗", "needs attention")
@@ -1364,8 +1139,6 @@ impl Pulse {
         }
     }
 
-    /// Render a human-readable report for `medha pulse` (stdout) and the `/pulse`
-    /// TUI message. No secrets ever appear — only sources and non-secret ids.
     pub fn render(&self) -> String {
         use std::fmt::Write as _;
         let mut o = String::new();
@@ -1557,15 +1330,11 @@ fn parse_reasoning_support(value: &str) -> Result<kernel::ReasoningSupport> {
     }
 }
 
-/// Resolve one saved named model for an in-TUI switch. An environment key keeps
-/// its documented precedence and avoids an unnecessary keychain prompt.
 pub fn resolve_model(cfg: &Config, name: &str) -> Result<Resolved> {
     let provider = cfg
         .model_profile(name)
         .ok_or_else(|| anyhow::anyhow!("no saved model named '{name}'"))?;
-    // Environment first, then keychain. The short circuit matters on macOS:
-    // merely reading a keychain item can show an authorization dialog. Only the
-    // `MEDHA_API_KEY` namespace is read — never generic third-party key names.
+    // Prefer MEDHA_API_KEY to avoid an unnecessary macOS keychain prompt.
     let api_key = normalize_api_key(
         &first_env(&["MEDHA_API_KEY"])
             .or_else(|| load_key(&provider.base_url))
@@ -1574,9 +1343,6 @@ pub fn resolve_model(cfg: &Config, name: &str) -> Result<Resolved> {
     resolve_model_with_key(cfg, name, &api_key)
 }
 
-/// Resolve a saved model with a credential the user just supplied. This avoids
-/// immediately reading Keychain after a write (and therefore avoids a second
-/// macOS authorization prompt in the same flow).
 pub(crate) fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) -> Result<Resolved> {
     let provider = cfg
         .model_profile(name)
@@ -1588,8 +1354,6 @@ pub(crate) fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) ->
             "model profile '{name}' requires a credential; choose 'Add or update an API key' in /model"
         );
     }
-    // A named-profile switch: model and endpoint both come from config.toml. The
-    // credential source is reported prompt-free (env → file → keychain/none).
     let credential_source = if first_env(&["MEDHA_API_KEY"]).is_some() {
         CredSource::Env
     } else if file_load_key(&provider.base_url).is_some() {
@@ -1607,17 +1371,12 @@ pub(crate) fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) ->
     })
 }
 
-/// First non-empty value among the given env var names.
 fn first_env(names: &[&str]) -> Option<String> {
     names
         .iter()
         .find_map(|n| std::env::var(n).ok().filter(|v| !v.is_empty()))
 }
 
-/// True when keychain-first storage is selected: runtime `MEDHA_CRED_STORE`
-/// wins, else the compile-time `MEDHA_DEFAULT_CRED_STORE` (set by a release
-/// pipeline whose binaries are stably signed — keychain is prompt-free there),
-/// else the silent credentials file.
 fn prefer_keychain() -> bool {
     std::env::var("MEDHA_CRED_STORE")
         .ok()
@@ -1630,8 +1389,6 @@ fn prefer_keychain() -> bool {
         .eq_ignore_ascii_case("keychain")
 }
 
-/// The default secrets file. Owner-only (0600); holds `[keys]` mapping
-/// base URL → API key.
 fn credentials_path() -> Result<PathBuf> {
     Ok(medha_home()?.join("credentials.toml"))
 }
@@ -1649,8 +1406,6 @@ fn read_credentials_file(path: &std::path::Path) -> CredentialsFile {
         .unwrap_or_default()
 }
 
-/// Write the credentials file with owner-only permissions. Created 0600 and
-/// re-tightened on every write in case an earlier tool loosened it.
 fn write_credentials_file(path: &std::path::Path, creds: &CredentialsFile) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -1660,9 +1415,7 @@ fn write_credentials_file(path: &std::path::Path, creds: &CredentialsFile) -> Re
          # Set MEDHA_CRED_STORE=keychain to use the OS keychain instead.\n{}",
         toml::to_string_pretty(creds).context("serializing credentials")?
     );
-    // Written beside the target and renamed over it: truncating in place left a
-    // window where a crash produced an empty credentials file, taking every
-    // stored key with it. Rename is atomic on the same filesystem.
+    // A same-directory rename prevents crashes from publishing a partial file.
     let temporary = path.with_extension(format!("tmp{}", std::process::id()));
     #[cfg(unix)]
     {
@@ -1732,21 +1485,12 @@ fn atomic_replace_file(source: &std::path::Path, target: &std::path::Path) -> st
     }
 }
 
-/// Serializes the read-modify-write on the credentials file.
-///
-/// Two writers each read the file, add their own key and write the whole thing
-/// back; without this the second silently drops the first's key. Process-local,
-/// which covers the concurrency Medha creates itself — a second Medha racing
-/// this one is rarer and costs a re-entered key rather than a corrupt file.
 fn credentials_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-/// Run one credential-store operation under both the process mutex and an
-/// advisory cross-process lock. The stable sibling is intentional: locking
-/// `credentials.toml` itself would stop protecting anything after its atomic
-/// rename replaced the locked inode/handle.
+/// The lock uses a stable sibling because publication replaces the data inode.
 fn with_credentials_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
     let _process = credentials_lock()
         .lock()
@@ -1776,9 +1520,6 @@ fn with_credentials_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> 
     operation()
 }
 
-/// The credentials-file read-modify-write. Every caller holds
-/// [`credentials_lock`] — the lock covers the keychain too, so store, load and
-/// purge cannot interleave across the two stores.
 fn write_key_file_locked(base_url: &str, key: &str) -> Result<()> {
     let path = credentials_path()?;
     let mut creds = read_credentials_file(&path);
@@ -1795,8 +1536,6 @@ fn file_load_key(base_url: &str) -> Option<String> {
         .cloned()
 }
 
-/// Read a key from the OS keychain. A missing item resolves silently; an item
-/// written by a differently-signed binary may show one OS authorization prompt.
 fn keychain_load_key(base_url: &str) -> Option<String> {
     keyring::Entry::new(KEYRING_SERVICE, base_url)
         .ok()
@@ -1804,20 +1543,13 @@ fn keychain_load_key(base_url: &str) -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
-/// Store a profile secret. It is deliberately kept out of `config.toml`;
-/// callers only retain it long enough to hand it here. Default target is the
-/// owner-only credentials file (silent everywhere, incl. rebuilt dev binaries
-/// and headless hosts); keychain-first builds/sessions fall back to the file
-/// when the keychain errors rather than losing the key.
+/// Secrets are stored outside `config.toml`.
 pub(crate) fn store_key(base_url: &str, key: &str) -> Result<()> {
     let key = normalize_api_key(key);
     if key.is_empty() {
         anyhow::bail!("API key cannot be empty");
     }
-    // The keychain is a shared store like the file is, and a purge touches
-    // both. Serializing only the file left a store racing a delete: written to
-    // the keychain, deleted from it, then published to the cache — a credential
-    // the user removed, alive for the rest of the session.
+    // Store and purge share one lock across both persistence layers.
     with_credentials_lock(|| {
         if prefer_keychain() {
             keyring::Entry::new(KEYRING_SERVICE, base_url)
@@ -1837,28 +1569,18 @@ pub(crate) fn store_key(base_url: &str, key: &str) -> Result<()> {
     })
 }
 
-/// Credential-store id holding an MCP server's API key.
-///
-/// Bound to the target as well as the name. Keyed on the id alone, editing a
-/// server's url or command to point somewhere else — same entry, new
-/// destination — silently sent the stored secret to whatever it now names.
+/// Credential id bound to both an MCP server name and destination.
 fn mcp_key_id(id: &str, server: &McpServer) -> String {
     format!("mcp://{id}#{}", target_fingerprint(server))
 }
 
-/// Credential-store id holding a remote server's OAuth credentials.
 fn mcp_oauth_id(id: &str, url: &str) -> String {
     format!("mcp-oauth://{id}#{}", fingerprint(url.as_bytes()))
 }
 
-/// What a server points at, as a short stable digest. The full target is not
-/// used: credential ids reach the OS keychain, and a command line can carry
-/// paths the user would not expect to see listed there.
+/// Return a privacy-preserving digest of an MCP destination.
 fn target_fingerprint(server: &McpServer) -> String {
-    // Environment is part of a stdio server's destination: the same proxy
-    // command with API_BASE_URL changed points at a different recipient.
-    // Structured encoding prevents separators inside an argument from making
-    // two configurations alias.
+    // Structured encoding binds stdio credentials to arguments and environment.
     let identity = if server.url.is_empty() {
         serde_json::to_vec(&("stdio", &server.command, &server.env))
     } else {
@@ -1877,8 +1599,6 @@ fn fingerprint(value: &[u8]) -> String {
         .collect()
 }
 
-/// Keychain-backed persistence for remote OAuth credentials, so an authorized
-/// server reconnects at launch instead of demanding a browser every time.
 #[derive(Debug)]
 pub struct McpTokens;
 
@@ -1898,12 +1618,8 @@ impl mcp::TokenStore for McpTokens {
     }
 }
 
-/// Best-effort removal of one credential from every layer (cache, file, keychain).
 fn purge_credential(cred_id: &str) {
-    // Cache eviction inside the same lock a load takes. Evicting first and
-    // locking after let a concurrent load — which had already read the key off
-    // disk — publish it back into the cache behind this delete, resurrecting a
-    // credential the user asked to remove for the life of the process.
+    // Keep removal atomic with concurrent loads and stores across both layers.
     let result = with_credentials_lock(|| {
         if let Ok(path) = credentials_path() {
             let mut creds = read_credentials_file(&path);
@@ -1911,8 +1627,6 @@ fn purge_credential(cred_id: &str) {
                 write_credentials_file(&path, &creds)?;
             }
         }
-        // Inside the lock too: a concurrent store must not slip a key back into
-        // the keychain between the file delete and this one.
         if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, cred_id) {
             let _ = entry.delete_credential();
         }
@@ -1923,8 +1637,6 @@ fn purge_credential(cred_id: &str) {
     }
 }
 
-/// Store an MCP server's API key in the credential store — never in `config.toml`
-/// or `medha.lock`. Empty key is a no-op (server needs no secret).
 pub fn store_mcp_key(id: &str, server: &McpServer, key: &str) -> Result<()> {
     if key.trim().is_empty() {
         return Ok(());
@@ -1932,27 +1644,18 @@ pub fn store_mcp_key(id: &str, server: &McpServer, key: &str) -> Result<()> {
     store_key(&mcp_key_id(id, server), key)
 }
 
-/// True when a stored key exists for this server (display only — never returns
-/// the secret itself).
 pub fn mcp_key_present(id: &str, server: &McpServer) -> bool {
     load_key(&mcp_key_id(id, server)).is_some()
 }
 
-/// Best-effort purge of an MCP server's key from every layer (cache, credentials
-/// file, keychain) — so `mcp remove` leaves no orphaned secret behind.
 pub fn delete_mcp_key(id: &str, server: &McpServer) {
     purge_credential(&mcp_key_id(id, server));
-    // Remote servers also hold OAuth credentials; removing the server drops both.
     purge_credential(&mcp_oauth_id(id, &server.url));
 }
 
-/// Resolve a user-scoped server into a connectable definition. The MCP host
-/// substitutes `${key}` only in explicit environment values at spawn time.
 pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
     let key = load_key(&mcp_key_id(id, server));
-    // The placeholder is left in the transport and resolved by the host at
-    // spawn time. Substituting here put the live secret into approval previews;
-    // substituting in argv would also expose it to local process inspection.
+    // Resolve `${key}` at spawn time so previews and argv never contain the secret.
     let transport = if server.url.is_empty() {
         mcp::Transport::Stdio {
             command: server.command.clone(),
@@ -1967,12 +1670,8 @@ pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
             url: server.url.clone(),
             auth: match server.auth.as_str() {
                 "oauth" => mcp::RemoteAuth::OAuth,
-                // A bearer server without a stored token is a config mistake, not
-                // a secret-free server: keep it explicit rather than silently
-                // connecting unauthenticated.
                 "bearer" => mcp::RemoteAuth::Bearer(key.clone().unwrap_or_default()),
                 "none" => mcp::RemoteAuth::None,
-                // Unset: let the server say what it wants on first connect.
                 _ => mcp::RemoteAuth::Auto,
             },
         }
@@ -1992,8 +1691,7 @@ pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
     }
 }
 
-/// Users sometimes paste the entire Authorization value. Reqwest adds the
-/// scheme itself, so persist only the token and avoid `Bearer Bearer …`.
+/// Normalize pasted bearer authorization values to their token.
 fn normalize_api_key(value: &str) -> String {
     let value = value.trim();
     if value.eq_ignore_ascii_case("bearer") {
@@ -2005,17 +1703,9 @@ fn normalize_api_key(value: &str) -> String {
     }
 }
 
-/// Look a key up through the layered store: process cache → credentials file
-/// → keychain (order inverted under keychain-first builds/sessions). Callers
-/// handle env-var precedence before reaching here.
-///
-/// A file miss followed by a keychain hit is a key stored by an older
-/// keychain-first build: it is migrated into the credentials file, so the OS
-/// prompt that read may have cost is paid at most once, ever.
+/// Load a key from the configured credential layers, migrating legacy keychain data.
 fn load_key(base_url: &str) -> Option<String> {
-    // Do not retain a process-local secret cache: another Medha process can
-    // remove a key, and no advisory file lock can invalidate a value already
-    // copied into this process. Reads are serialized with store/purge instead.
+    // Avoid caching secrets that another Medha process may remove.
     with_credentials_lock(|| {
         Ok(if prefer_keychain() {
             keychain_load_key(base_url).or_else(|| file_load_key(base_url))
@@ -2142,25 +1832,16 @@ mod tests {
 
     #[test]
     fn encodes_a_windows_verbatim_path_without_illegal_characters() {
-        // What `canonicalize` actually returns on Windows. Encoded verbatim this
-        // produced `--?-C--Users-ASUS`, and `?` is forbidden in a Windows
-        // filename, so the state dir could not be created (os error 123) and
-        // medha failed to start on every Windows machine.
         let enc = readable_workspace_slug(Path::new(r"\\?\C:\Users\ASUS"));
         assert_eq!(enc, "C--Users-ASUS");
 
-        // A drive path that was never verbatim encodes the same way, so the two
-        // forms retain the same readable portion. Runtime callers canonicalize
-        // first, so the hashed identity receives one stable OS spelling.
         assert_eq!(readable_workspace_slug(Path::new(r"C:\Users\ASUS")), enc);
 
-        // Network drives come back as `\\?\UNC\server\share`.
         assert_eq!(
             readable_workspace_slug(Path::new(r"\\?\UNC\server\share\proj")),
             "server-share-proj"
         );
 
-        // Nothing Windows forbids in a filename may survive encoding.
         for p in [
             r"\\?\C:\Users\ASUS",
             r"\\?\UNC\server\share",
@@ -2179,8 +1860,6 @@ mod tests {
 
     #[test]
     fn unix_paths_are_untouched_by_the_verbatim_strip() {
-        // The strip is a no-op off Windows: a Linux or macOS path never carries a
-        // prefix, and one that happens to contain a backslash is not a prefix.
         assert_eq!(
             readable_workspace_slug(Path::new("/home/u/proj")),
             "-home-u-proj"
@@ -2332,11 +2011,8 @@ mod tests {
         assert_eq!(p.model, "Qwen/Qwen3.5-397B-A17B");
         assert_eq!(p.auth, providers::AuthKind::Bearer);
         assert_eq!(cfg.default_model.as_deref(), Some("qwen3-5-397b-a17b"));
-        // The migrated profile is ordinary: removable like any other.
         assert!(cfg.remove_model("qwen3-5-397b-a17b").is_ok());
-        // Serialization never writes [provider] again.
         assert!(!toml::to_string(&cfg).unwrap().contains("[provider]"));
-        // Second load is a no-op.
         assert!(!migrate_legacy_provider(&mut cfg));
     }
 
@@ -2359,7 +2035,6 @@ mod tests {
         assert_eq!(cfg.selected_model().unwrap().0, "nemotron");
         assert!(cfg.models.contains_key("qwen3-5-397b-a17b"));
 
-        // An identical connection already saved under a name → nothing added.
         let dup = r#"
             [provider]
             base_url = "http://same.example/v1"
@@ -2404,7 +2079,6 @@ mod tests {
             .insert("http://one.example/v1".into(), "sk-one".into());
         write_credentials_file(&path, &creds).unwrap();
 
-        // A second key must not clobber the first.
         let mut creds = read_credentials_file(&path);
         creds
             .keys
@@ -2421,7 +2095,6 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "credentials file must be owner-only");
 
-            // A loosened file is re-tightened on the next write.
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             write_credentials_file(&path, &read_credentials_file(&path)).unwrap();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -2480,10 +2153,8 @@ mod tests {
     #[test]
     fn set_search_records_provider_and_scopes_searxng_url() {
         let mut cfg = Config::default();
-        // Unset → the effective default is DuckDuckGo.
         assert_eq!(cfg.search_provider(), tools::SearchProvider::DuckDuckGo);
 
-        // A SearXNG choice keeps its URL.
         cfg.set_search(
             tools::SearchProvider::Searxng,
             Some("https://searx.example".into()),
@@ -2494,7 +2165,6 @@ mod tests {
             Some("https://searx.example")
         );
 
-        // Switching to a non-SearXNG provider must not leave a stale URL behind.
         cfg.set_search(
             tools::SearchProvider::Tavily,
             Some("https://leftover".into()),
@@ -2513,7 +2183,6 @@ mod tests {
         ] {
             assert_eq!(tools::SearchProvider::from_id(p.as_str()), p);
         }
-        // Unknown ids degrade to the safe default rather than erroring.
         assert_eq!(
             tools::SearchProvider::from_id("nonsense"),
             tools::SearchProvider::DuckDuckGo

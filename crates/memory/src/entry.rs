@@ -1,5 +1,4 @@
-//! Typed memory entry (design §3.1) — the payload of an `EventKind::MemoryWrite`
-//! event and the row shape the projection stores/queries.
+//! Typed memory entries persisted as `EventKind::MemoryWrite` events.
 
 use kernel::TrustLabel;
 use serde::{Deserialize, Serialize};
@@ -38,7 +37,7 @@ impl MemoryKind {
     }
 }
 
-/// Which store an entry lives in (D9): project entries travel with the
+/// Which store an entry lives in: project entries travel with the
 /// workspace, user entries follow the person across projects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,8 +63,7 @@ impl Scope {
     }
 }
 
-/// Coarse, auditable confidence ladder (D6) — not a float; a float invites
-/// fake precision no one can justify.
+/// Confidence tier for a memory claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfidenceRung {
@@ -93,9 +91,7 @@ impl ConfidenceRung {
     }
 }
 
-/// One typed memory (design §3.1). `trust`, `confidence`, and `provenance` are
-/// kernel-computed at dispatch (D6) — this struct carries them, it doesn't
-/// decide them; nothing here should be treated as a trusted tool argument.
+/// Typed memory whose trust metadata is computed by the kernel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub name: String,

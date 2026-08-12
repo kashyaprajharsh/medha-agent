@@ -1,8 +1,4 @@
-//! Human gate (§4.7, the verifier layer's interactive verifier). When policy
-//! returns `Decision::Human`, the kernel asks the human to approve the action
-//! before it commits (draft → approve → commit, P5). The kernel knows only this
-//! trait; the surface provides the UI (a terminal y/N prompt, later an approval
-//! card). Headless runs use `AutoDeny` — no human, no approval.
+//! Human approval for policy-gated actions; headless runs deny automatically.
 
 use async_trait::async_trait;
 
@@ -26,16 +22,52 @@ impl Approval {
     }
 }
 
+/// The human's answer to a network-grant prompt. Distinct from [`Approval`] so a
+/// third "session" tier does not have to be forced onto every other card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkDecision {
+    /// Open the network for this one retried command only.
+    Once,
+    /// Open the network for the rest of this process run (in memory only).
+    Session,
+    /// Open the network and remember it in the machine-local trust file.
+    Persistent,
+    /// Reject.
+    Deny,
+}
+
 #[async_trait]
 pub trait HumanGate: Send + Sync {
-    /// Ask the human to approve `action`; `detail` is a preview (command/diff).
-    /// `action` doubles as the auto-approve scope key, so it should identify the
-    /// *specific* action (e.g. "shell.exec: cargo build"), not just the tool —
-    /// otherwise "always allow" blanket-approves every call of that tool (K9).
-    /// `escalated` is true when this gate exists only because of a trust-flow
-    /// escalation (a web-tainted consequential action, §4.6); such prompts must
-    /// NEVER be remembered/auto-approved — each one is asked afresh.
+    /// Ask about a specific action. Trust-flow escalations must not be remembered.
     async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> Approval;
+
+    /// Ask whether to grant the sandbox network access and retry. Gates that do
+    /// not override this map their [`confirm`](Self::confirm) answer: a plain
+    /// `Once` stays once, `Always` becomes a durable grant, `Deny` denies.
+    async fn confirm_network(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
+        match self.confirm("grant network access and retry", detail, escalated).await {
+            Approval::Once => NetworkDecision::Once,
+            Approval::Always => NetworkDecision::Persistent,
+            Approval::Deny => NetworkDecision::Deny,
+        }
+    }
+}
+
+tokio::task_local! {
+    static NETWORK_ONCE: bool;
+}
+
+/// Run `fut` with a one-shot network grant in scope. The value is visible to any
+/// synchronous `build_command` polled inside `fut` — including across the tool
+/// boundary, which carries no intent id — and is isolated per future, so it never
+/// leaks to a concurrently dispatched intent.
+pub async fn network_once_scope<F: std::future::Future>(fut: F) -> F::Output {
+    NETWORK_ONCE.scope(true, fut).await
+}
+
+/// True when the current task is inside a [`network_once_scope`].
+pub fn network_once_active() -> bool {
+    NETWORK_ONCE.try_with(|granted| *granted).unwrap_or(false)
 }
 
 /// No human available (headless / non-interactive): reject anything that needs
@@ -46,5 +78,51 @@ pub struct AutoDeny;
 impl HumanGate for AutoDeny {
     async fn confirm(&self, _action: &str, _detail: Option<&str>, _escalated: bool) -> Approval {
         Approval::Deny
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixed(Approval);
+
+    #[async_trait]
+    impl HumanGate for Fixed {
+        async fn confirm(&self, _a: &str, _d: Option<&str>, _e: bool) -> Approval {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_network_default_maps_confirm_answer() {
+        assert_eq!(
+            Fixed(Approval::Once).confirm_network(None, false).await,
+            NetworkDecision::Once
+        );
+        // A gate that does not opt in treats "always" as a durable grant.
+        assert_eq!(
+            Fixed(Approval::Always).confirm_network(None, false).await,
+            NetworkDecision::Persistent
+        );
+        assert_eq!(
+            Fixed(Approval::Deny).confirm_network(None, false).await,
+            NetworkDecision::Deny
+        );
+        // Headless auto-deny denies the grant with no code of its own.
+        assert_eq!(
+            AutoDeny.confirm_network(None, true).await,
+            NetworkDecision::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn network_once_scope_is_isolated_and_defaults_off() {
+        assert!(!network_once_active());
+        network_once_scope(async {
+            assert!(network_once_active());
+        })
+        .await;
+        assert!(!network_once_active());
     }
 }

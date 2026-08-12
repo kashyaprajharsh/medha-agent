@@ -1,18 +1,5 @@
-//! Skills — Phase A: the *consumption* side of spec §4.11 plus user/agent
-//! authoring with a human approval gate. A skill is a folder with a `SKILL.md`
-//! in the ecosystem-standard shape: YAML frontmatter + a markdown procedure
-//! body. Skills written for other agent harnesses drop in unchanged — unknown
-//! frontmatter keys (`license`, …) are tolerated, and legacy TOML frontmatter
-//! still parses as a fallback.
-//! No auto-distillation, evals, canary, or win-rates yet (Phase D) — here skills
-//! are config the harness discovers and the model loads on demand.
-//!
-//! Progressive disclosure matches the existing `read_artifact` pattern: the
-//! system prompt carries one compact line per skill (the manifest, K2), and the
-//! model pulls a full procedure with `skill.load` only when it decides one is
-//! relevant. `skill.save` lets the user (or the agent, on offer) persist a new
-//! skill — always behind the approval card, since it rides the normal
-//! blast-radius/policy path like any other write.
+//! Skill discovery, loading, and authoring. Writes use the human approval gate.
+//! `SKILL.md` accepts YAML frontmatter and legacy TOML.
 
 use crate::{Tool, ToolError};
 use async_trait::async_trait;
@@ -53,8 +40,7 @@ impl SkillScope {
     }
 }
 
-/// Where an installed user skill came from. Stored beside the package so `/skill
-/// info` can explain provenance and future update support has a stable base.
+/// Recorded source and security receipt for an installed skill.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillProvenance {
     pub source: String,
@@ -94,11 +80,7 @@ pub struct InstallReport {
     pub scan_findings: Vec<String>,
 }
 
-/// The frontmatter of a `SKILL.md` (YAML; legacy TOML still reads). Only
-/// `name` and `description` are required — the rest are optional extensions,
-/// skipped on write when empty so saved skills stay portable to other
-/// harnesses. Unknown keys (`license`, `allowed-tools`, …) parse fine and are
-/// simply not carried.
+/// YAML frontmatter with a legacy TOML read path. Unknown keys are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Frontmatter {
     name: String,
@@ -173,10 +155,7 @@ impl Discovery {
     }
 }
 
-/// Discovers, parses, and validates skills across the project and user scopes.
-/// Pure filesystem access (reads the harness's own `.medha/skills` config dirs
-/// directly, not through the sandbox) so scanning never prompts for permission
-/// and the store is unit-testable with plain temp dirs.
+/// Reads skill configuration directly so discovery never raises sandbox prompts.
 pub struct SkillStore {
     project_dir: PathBuf,
     /// `None` when the platform has no home directory (user scope unavailable).
@@ -195,8 +174,7 @@ impl SkillStore {
         }
     }
 
-    /// Attach an LLM judge for the guard's ambiguous verdicts (regex + judge,
-    /// two-tier). Without one the store is regex-only.
+    /// Adds LLM review for ambiguous guard verdicts; otherwise review is regex-only.
     pub fn with_judge(mut self, judge: Arc<dyn crate::judge::SkillJudge>) -> Self {
         self.judge = Some(judge);
         self
@@ -384,11 +362,7 @@ impl SkillStore {
         }))
     }
 
-    /// Build the compact K2 manifest section injected into the system prompt.
-    /// Empty string when no skills exist (regression guard: zero skills → no
-    /// section, no behaviour change). When more than `TRIM_ABOVE` skills exist,
-    /// trims to those whose triggers/domains match `prompt` plus a count of the
-    /// rest — keeping the sheath cheap.
+    /// Large catalogs retain prompt matches and an omitted count.
     pub fn manifest(&self, known_tools: &HashSet<String>, prompt: Option<&str>) -> String {
         const TRIM_ABOVE: usize = 30;
         let disc = self.discover(known_tools);
@@ -474,12 +448,7 @@ impl SkillStore {
         json!({ "skills": skills, "errors": errors })
     }
 
-    /// Validate and write a skill. Saving over an existing name in the same
-    /// scope is an UPDATE: the version bumps and the approval card previews a
-    /// diff, so iterating on a skill is first-class rather than "go edit the
-    /// file". Writes directly: the approval card (skill.save is on the policy
-    /// approve list) already showed the change, so a second permission prompt
-    /// would be redundant. Returns the written path and the version written.
+    /// Writes the human-approved skill and increments an existing version.
     pub fn save(
         &self,
         spec: &SaveSpec,
@@ -625,13 +594,10 @@ impl SkillStore {
         Ok(target)
     }
 
-    /// Install a complete skill package into the user scope. Accepts a GitHub
-    /// `/tree/<ref>/<path>` folder URL, a raw `SKILL.md` URL, a local directory,
-    /// or a local `SKILL.md`. Folder sources retain scripts/references/assets.
-    ///
-    /// The skill is validated before anything is written; the name comes from
-    /// its frontmatter (kebab-validated, so it can't escape the skills dir).
-    /// Installing over an existing name replaces it (that's an upgrade).
+    /// Install a skill package from a GitHub folder URL, a raw `SKILL.md` URL, a
+    /// local directory, or a local `SKILL.md`. Validated before anything is
+    /// written; the kebab-validated frontmatter name cannot escape the skills
+    /// dir. Installing over an existing name is an upgrade.
     pub async fn install_from(&self, src: &str) -> Result<InstallReport, String> {
         let user_dir = self
             .user_dir
@@ -816,8 +782,6 @@ impl SkillStore {
     }
 }
 
-/// Version a save should write: one past whatever is on disk (1 for new or
-/// unparseable — overwriting a broken file restarts its history honestly).
 fn next_version(target: &Path) -> u32 {
     std::fs::read_to_string(target)
         .ok()
@@ -826,10 +790,6 @@ fn next_version(target: &Path) -> u32 {
         .unwrap_or(1)
 }
 
-/// Files shipped alongside `SKILL.md` (references, scripts, assets), as paths
-/// relative to the skill dir — sorted, hidden files skipped, capped so a huge
-/// folder can't flood the tool result. Contents are never read here: the
-/// model pulls specific files on demand (progressive disclosure).
 fn bundled_files(dir: &Path) -> Vec<String> {
     const CAP: usize = 100;
     let mut out = Vec::new();
@@ -862,11 +822,9 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// Screen every file in a staged package with the Skills Guard before it is
-/// committed. `collect_files` omits `SKILL.md` (it lists *bundled* extras), so
-/// it is added back explicitly — the procedure body is the first thing to scan.
-/// Opaque and executable files are structural review findings; no staged file
-/// may disappear from the scan because a read failed.
+/// Screen every staged file with the Skills Guard before committing. `SKILL.md`
+/// is added back explicitly since `collect_files` lists only bundled extras. A
+/// read failure must never drop a file from the scan.
 fn scan_staged(stage: &Path) -> Result<policy::guard::ScanReport, String> {
     let mut rels = Vec::new();
     collect_files(stage, stage, &mut rels);
@@ -933,12 +891,9 @@ fn quarantine_executable_modes(_stage: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Deterministic content hash of a package directory (`sha256:<hex>`). Every
-/// file — including `SKILL.md`, excluding the `.`-prefixed provenance sidecar
-/// (`collect_files` skips dotfiles) — contributes its relative path and bytes,
-/// length-prefixed and in sorted order, so the same package always hashes
-/// identically regardless of enumeration order. Powers update drift-detection
-/// and the skills lockfile.
+/// Deterministic content hash of a package directory (`sha256:<hex>`). Each file
+/// contributes its relative path and bytes, length-prefixed and sorted, so
+/// enumeration order cannot change the result. Dotfiles are excluded.
 fn hash_package(dir: &Path) -> String {
     use sha2::{Digest, Sha256};
     let mut rels = Vec::new();
@@ -1437,14 +1392,7 @@ fn scan_dir(dir: &Path) -> Vec<(PathBuf, Result<ParsedMd, String>)> {
     out
 }
 
-/// Split a `SKILL.md` into its frontmatter and markdown body. The file must
-/// open with a `---` fence, contain a closing `---` fence, and the frontmatter
-/// must carry a non-empty `name` and `description`. YAML is the standard
-/// format (skills authored for any other harness drop in unchanged); TOML is
-/// accepted as a read-only legacy fallback for skills saved by older builds.
-/// Minimal metadata `(name, description, version)` from a `SKILL.md` — lets the
-/// hub preview a remote skill (search results) without downloading or trusting
-/// its whole package. Applies the same frontmatter validation as install.
+/// Reads validated metadata without loading the procedure.
 pub(crate) fn skill_meta(text: &str) -> Result<(String, String, u32), String> {
     let (fm, _) = parse_skill_md(text)?;
     Ok((fm.name, fm.description, fm.version))
@@ -1510,8 +1458,6 @@ fn build_skill(fm_body: ParsedMd, scope: SkillScope, path: PathBuf) -> Skill {
         path,
     }
 }
-
-// ---- Tools ---------------------------------------------------------------
 
 /// `skill.load` — read radius. The model pulls a full procedure by name.
 pub struct SkillLoad {

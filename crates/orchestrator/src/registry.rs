@@ -1,5 +1,3 @@
-//! Who exists, where, and how many.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 use crate::path::AgentPath;
 use crate::{AgentStatus, Error};
 
-/// One child, live or settled.
 #[derive(Debug, Clone, Serialize)]
 pub struct Agent {
     pub path: AgentPath,
@@ -17,9 +14,6 @@ pub struct Agent {
     pub objective: String,
     pub started_ms: u64,
     pub state: State,
-    /// The capabilities this agent was admitted with, kept so a follow-up
-    /// resumes the same agent rather than a differently-privileged one wearing
-    /// its name. Not part of the listing the model reads.
     #[serde(skip)]
     pub write: bool,
     #[serde(skip)]
@@ -44,12 +38,9 @@ impl Agent {
     }
 }
 
-/// Handles for acting on a live child.
 pub(crate) struct Live {
     pub(crate) cancel: CancellationToken,
     pub(crate) steer: kernel::InterruptHandle,
-    /// What this agent was admitted with, so its own children inherit its
-    /// ceilings and its pool rather than the root's.
     pub(crate) budget: kernel::Budget,
 }
 
@@ -58,13 +49,9 @@ struct Tree {
     agents: HashMap<AgentPath, Agent>,
     live: HashMap<AgentPath, Live>,
     settled: Vec<AgentPath>,
-    /// Names taken but not yet started. Held apart from `agents` so a listing
-    /// never has to know about a half-built entry to skip it.
+    /// Names reserved atomically before startup and excluded from listings.
     reserved: HashSet<AgentPath>,
-    /// Path→session for agents whose full entry was evicted from `agents`
-    /// (AUD-066). Two strings per agent, so a nested parent can still resolve
-    /// its child's durable transcript id long after 32 newer agents settled,
-    /// without keeping live-agent state around. FIFO-capped.
+    /// Evicted path-to-session mappings retained for transcript resolution.
     archived: Vec<(AgentPath, String)>,
 }
 
@@ -74,20 +61,14 @@ impl Tree {
     }
 }
 
-/// The agent tree for one session, shared by every descendant.
 #[derive(Default)]
 pub struct AgentRegistry {
     tree: Mutex<Tree>,
     max_settled: usize,
 }
 
-/// Settled agents kept addressable by path in the live roster. Their stable
-/// session ids continue to address durable transcripts after this cache evicts
-/// the full entry and after a process restart.
 const MAX_SETTLED: usize = 32;
 
-/// Evicted path→session pairs retained for transcript resolution. Far larger
-/// than `MAX_SETTLED` because an entry is two strings, not an agent.
 const MAX_ARCHIVED: usize = 4_096;
 
 impl AgentRegistry {
@@ -98,13 +79,7 @@ impl AgentRegistry {
         }
     }
 
-    /// Claim a free name under `parent`, preferring `wanted`, before any work
-    /// starts.
-    ///
-    /// Finding the name and taking it happen under one lock. Split across two,
-    /// two concurrent spawns settle on the same free name and the loser is
-    /// refused for a collision it never chose — auto-generated names make that
-    /// the common case, not the rare one.
+    /// Select and reserve a free child name under one lock.
     pub(crate) fn claim(
         self: &Arc<Self>,
         parent: &AgentPath,
@@ -135,8 +110,6 @@ impl AgentRegistry {
         ))
     }
 
-    /// Re-take a settled agent's own name, so a follow-up continues that agent
-    /// rather than creating a near-namesake beside it.
     pub(crate) fn revive(self: &Arc<Self>, path: &AgentPath) -> Result<Reservation, Error> {
         let mut tree = self.lock();
         match tree.agents.get(path) {
@@ -144,10 +117,7 @@ impl AgentRegistry {
             Some(_) => return Err(Error::NameTaken(path.to_string())),
             None => return Err(Error::UnknownAgent(path.to_string())),
         }
-        // Held for the reservation's lifetime: a follow-up that then fails
-        // admission — at capacity, no isolation for a writer — would otherwise
-        // have deleted the agent it was asked to continue, leaving nothing to
-        // retry against and no record that it ever existed.
+        // Restore the settled entry if follow-up admission fails.
         let previous = tree.agents.remove(path);
         tree.settled.retain(|settled| settled != path);
         tree.reserved.insert(path.clone());
@@ -185,10 +155,7 @@ impl AgentRegistry {
         }
     }
 
-    /// Durable session id of an evicted agent, resolved with the same
-    /// containment as [`Coordinator::reach`]: `reference` resolves from
-    /// `from`, and only descendants strictly under `from` answer — an evicted
-    /// sibling's transcript stays as unreachable as a live one's.
+    /// Resolve an evicted descendant without widening live-agent reachability.
     pub fn archived_session(&self, from: &AgentPath, reference: &str) -> Option<String> {
         let tree = self.lock();
         if let Ok(path) = from.resolve(reference)
@@ -253,18 +220,14 @@ impl AgentRegistry {
         }
     }
 
-    /// The live cancellation token of a running agent, so a child can be
-    /// derived from its own parent rather than from the root of the tree.
     pub(crate) fn token(&self, path: &AgentPath) -> Option<CancellationToken> {
         self.lock().live.get(path).map(|live| live.cancel.clone())
     }
 
-    /// A running agent's own budget, for sizing the children it spawns.
     pub(crate) fn budget(&self, path: &AgentPath) -> Option<kernel::Budget> {
         self.lock().live.get(path).map(|live| live.budget.clone())
     }
 
-    /// Watch what is being queued against `path`'s own session.
     pub(crate) fn activity(&self, path: &AgentPath) -> Option<kernel::Activity> {
         self.lock().live.get(path).map(|live| live.steer.activity())
     }
@@ -304,9 +267,6 @@ impl AgentRegistry {
         }
     }
 
-    /// Undo an admission whose durable dispatch could not be written. No child
-    /// has started yet, so removing its live entry is lossless; a failed
-    /// follow-up restores the settled agent it displaced.
     pub(crate) fn rollback_start(&self, path: &AgentPath, restore: Option<Agent>) {
         let mut tree = self.lock();
         tree.live.remove(path);
@@ -330,8 +290,6 @@ impl AgentRegistry {
 pub(crate) struct Reservation {
     registry: Arc<AgentRegistry>,
     path: Option<AgentPath>,
-    /// The settled agent a revive took off the roster, put back if the
-    /// reservation is dropped without being committed.
     restore: Option<Agent>,
 }
 
@@ -350,8 +308,6 @@ impl Drop for Reservation {
         };
         let mut tree = self.registry.lock();
         tree.reserved.remove(&path);
-        // Uncommitted: whatever this reservation displaced goes back, or a
-        // failed follow-up silently destroys the agent it meant to resume.
         if let Some(agent) = self.restore.take() {
             tree.settled.retain(|settled| settled != &path);
             tree.settled.push(path.clone());

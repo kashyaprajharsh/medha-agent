@@ -49,8 +49,6 @@ fn the_ambient_tier_shares_no_glyph_with_the_suite() {
 
 #[test]
 fn the_suite_plays_every_movement_before_repeating() {
-    // A suite that never reaches its later movements is just a loop with dead
-    // code behind it.
     let total = suite_total();
     for m in &SUITE {
         let first = m.frames[0];
@@ -63,8 +61,7 @@ fn the_suite_plays_every_movement_before_repeating() {
 
 #[test]
 fn every_movement_is_paced_for_legibility() {
-    // anim_frame advances every 16ms. Undivided, a spinner cycles ~60 times a
-    // second and smears; the arc set medha shipped ran 6x its designed speed.
+    // `anim_frame` advances every 16 ms.
     for m in &SUITE {
         let ms = m.divisor * 16;
         assert!(
@@ -86,7 +83,6 @@ fn brightness_swells_and_never_leaves_the_ramp() {
         assert!(lit <= 100, "lit {lit} is off the ramp");
         assert!(lit >= MIN_LIT, "lit {lit} is below the floor");
     }
-    // Flat brightness would be a glyph swap, not a twinkle.
     let levels: std::collections::BTreeSet<u16> =
         (0..suite_total()).map(|f| primary_at(f).1).collect();
     assert!(levels.len() > 1, "the spinner never changes brightness");
@@ -108,8 +104,6 @@ fn every_motif_is_single_width_so_the_layout_never_shifts() {
 
 #[test]
 fn the_head_replaces_a_glyph_rather_than_only_recolouring_it() {
-    // A head that merely brightens the glyph under it reads as a dot sliding
-    // along a bar — the same vague gesture for every theme.
     for motif in MOTIFS {
         let t = track(motif);
         let frame = (0..1000).find(|f| t.head(*f).is_some()).unwrap();

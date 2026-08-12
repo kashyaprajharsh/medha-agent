@@ -14,8 +14,7 @@ on:
 permissions:
   contents: read
 
-# Superseded runs on the same ref are wasteful: a newer push already re-verifies
-# the whole matrix. Cancel in-flight runs so the latest commit gets fast feedback.
+# Keep only the newest run for each ref.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -23,26 +22,22 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Real language-server tests are opt-in below on the one runner that also
-  # provisions the servers. An ambient binary on another image must not decide
-  # whether a test runs.
+  # Only the runner that installs language servers enables their end-to-end tests.
   MEDHA_LSP_E2E: "0"
 
 jobs:
-  # Formatting and lints are platform-independent, so they run once on the
-  # cheapest runner rather than three times.
+  # Formatting and linting are platform-independent.
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      # actions/checkout v5.1.0, pinned to an immutable upstream commit.
+      # actions/checkout, pinned to an immutable upstream commit.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
           persist-credentials: false
 
-      # rust-toolchain.toml is the single source of truth, but the action needs
-      # the version as an input — so read it out rather than duplicating it.
+      # Keep rust-toolchain.toml as the single version source.
       - name: Read pinned toolchain
         id: toolchain
         run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
@@ -54,8 +49,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
 
-      # keyring's Linux backend (sync-secret-service) links against D-Bus, so
-      # libdbus-sys needs the headers and pkg-config to find them.
+      # The Linux keyring backend links against D-Bus.
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -70,17 +64,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # Every host OS we publish for is built and tested here on every push. The
-  # release workflow separately builds each target architecture; this matrix
-  # catches host-specific Rust, shell, PowerShell, and installer defects before
-  # a tag exists.
+  # Test each published host OS before release packaging.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
-      # One platform failing must not hide the state of the others: the whole
-      # point of the matrix is learning about every platform in one run.
+      # Report every platform even if one fails.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -95,9 +85,7 @@ jobs:
         shell: bash
         run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
-      # No rust-analyzer component here: installing it on every platform puts a
-      # server on PATH everywhere, and the LSP end-to-end tests used to start
-      # themselves wherever they found one. Linux adds it below.
+      # Linux installs language servers separately below.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
@@ -109,24 +97,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config
 
-      # Real language servers so the LSP end-to-end tests exercise the protocol
-      # path for real. This is the only platform that provisions them, and it is
-      # therefore the only platform that asks for the tests — MEDHA_LSP_E2E is
-      # set here so requesting them and supplying what they need is one decision.
-      # Once set, a missing server fails the run instead of skipping it.
+      # Enabling MEDHA_LSP_E2E makes missing provisioned servers fail the run.
       - name: Install language servers
         if: runner.os == 'Linux'
         run: |
           mkdir -p "$HOME/.local/bin"
-          # `clangd`, not `clang-tools`: the latter installs only versioned
-          # binaries (clangd-14, …) and no unversioned symlink, so a bare
-          # `clangd` is not on PATH. Fall back to symlinking whichever
-          # versioned one apt provides if the meta-package is unavailable.
+          # Some images expose only a versioned clangd binary.
           sudo apt-get install -y clangd \
             || sudo apt-get install -y clang-tools
           command -v clangd >/dev/null \
             || ln -sf "$(ls -1 /usr/bin/clangd-* | sort -V | tail -1)" "$HOME/.local/bin/clangd"
-          # rust-analyzer ships as a rustup component; expose it on PATH.
           rustup component add rust-analyzer
           ln -sf "$(rustup which rust-analyzer)" "$HOME/.local/bin/rust-analyzer"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -142,7 +122,5 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      # The installer end-to-end tests are `#![cfg(windows)]` / `#![cfg(unix)]`,
-      # so each platform runs its own here and neither waits for a release.
       - name: Test
         run: cargo test --workspace --all-targets

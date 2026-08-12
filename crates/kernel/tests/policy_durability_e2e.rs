@@ -1,5 +1,3 @@
-//! Fail-closed policy logging and mutation outbox regressions (AUD-011).
-
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use kernel::{

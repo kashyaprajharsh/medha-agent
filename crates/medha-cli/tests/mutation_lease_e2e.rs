@@ -1,9 +1,6 @@
-//! Cross-connection regression for AUD-003.
-//!
-//! These kernels are independently constructed, as two MEDHA processes would
-//! be: they do not share the kernel's in-memory mutation mutex and each owns a
-//! separate `SqliteLog` connection. Only the durable SQLite mutation lease can
-//! prevent the forced read/modify/write race below.
+//! Cross-connection mutation-lease coverage. Independent kernels and SQLite
+//! connections share no in-memory scheduler, so only the durable lease can
+//! serialize their read/modify/write operations.
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -126,9 +123,7 @@ impl Executor for RacyMemoryExecutor {
     }
 
     async fn execute(&self, intent: &ToolIntent) -> Observation {
-        // Deliberately split read from write. Without the durable lease, the
-        // second kernel reads version 0 while the first sleeps, writes v1, and
-        // then the first overwrites it with another v1.
+        // Split read from write to expose lost updates without the durable lease.
         let observed = self.state.lock().unwrap().version;
         if intent.id == "first" {
             self.first_started.notify_one();
@@ -179,7 +174,6 @@ async fn independent_kernels_and_sqlite_connections_cannot_lose_an_update() {
         first_started: first_started.clone(),
     });
 
-    // Separate log handles and separate kernels: no shared in-memory scheduler.
     let first_log = Arc::new(store::SqliteLog::open(&db).unwrap());
     let second_log = Arc::new(store::SqliteLog::open(&db).unwrap());
     let first_kernel = kernel(

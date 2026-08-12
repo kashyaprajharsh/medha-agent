@@ -165,17 +165,8 @@ pub fn scan_text(path: &str, text: &str, out: &mut Vec<Finding>) {
 fn scan_text_with_mode(path: &str, text: &str, executable: bool, out: &mut Vec<Finding>) {
     scan_hidden_unicode(path, text, out);
     scan_injection(path, text, out);
-    // Command-danger scanning applies only where a command could actually be —
-    // scripts (line by line) and markdown (its extracted code). Data/config
-    // files (.xsd, .xml, .json, …) are NOT command-scanned: their contents
-    // aren't shell, and doing so raised false "shell escaping" flags on things
-    // like regex backslashes in an XML schema. Injection + hidden-Unicode
-    // checks (above) still run on every text file. A skill's script only
-    // *executes* through the runtime scanner + sandbox anyway.
-    // Markdown is documentation — full of *example* commands (subshells, scp,
-    // …). Flag only outright-destructive shapes there; the ambiguous
-    // `needs_review` patterns are for real scripts, not doc examples (else every
-    // skill's reference.md drowns in false cautions). Scripts get both.
+    // Command scanning only on scripts and markdown code; markdown gets the
+    // destructive shapes only, since doc examples trip the ambiguous ones.
     let (commands, docs_only) = if is_markdown(path) {
         (extract_markdown_code(text), true)
     } else if is_script(path, text, executable) {
@@ -377,16 +368,9 @@ struct Pattern {
     reason: &'static str,
 }
 
-/// The content-attack pattern families a skill package is screened against.
-/// Structured by category rather than a literal phrase list so coverage is
-/// broad and maintainable: each family generalizes over wording (verbs,
-/// determiners, targets) instead of pinning one sentence. Compiled once.
-///
-/// Severity follows the same fail-closed rule as the runtime scanner:
-/// unambiguous attacks (fake conversation roles, safety-bypass directives,
-/// instruction/system-prompt overrides, secret exfiltration) are `Dangerous`;
-/// dual-use signals a human should see (reading secret material, a role
-/// reassignment, an opaque encoded blob) are `Caution`.
+/// Content-attack pattern families a skill package is screened against, grouped
+/// by category so each generalizes over wording rather than pinning a phrase.
+/// Unambiguous attacks are `Dangerous`; dual-use signals are `Caution`.
 fn content_patterns() -> &'static [Pattern] {
     static PATTERNS: OnceLock<Vec<Pattern>> = OnceLock::new();
     PATTERNS.get_or_init(|| {
@@ -396,48 +380,38 @@ fn content_patterns() -> &'static [Pattern] {
             reason,
         };
         vec![
-            // ── Instruction / context override ──────────────────────────────
-            // Prose-injection signals are Caution, not Dangerous: real attacks
-            // and legitimate mentions (a doc explaining injection, PDF "security"
-            // wording) are hard to tell apart in prose, and a false *block* makes
-            // a legit skill uninstallable. The human reviews the caution.
+            // Prose injection is ambiguous enough to review rather than deny.
             p(
                 r"(?i)\b(ignore|disregard|forget|discard|override)\b[^.\n]{0,40}\b(all |any |these |those |the )?(previous|prior|earlier|above|preceding|foregoing|initial|original|system)\b[^.\n]{0,40}\b(instruction|instructions|prompt|prompts|rule|rules|guideline|guidelines|directive|directives|context|message|messages)\b",
                 Severity::Caution,
                 "possible prompt injection: overrides previous/system instructions",
             ),
-            // ── System-prompt / instruction exfiltration ───────────────────
             p(
                 r"(?i)\b(reveal|show|print|display|repeat|output|echo|leak|expose|dump|tell me|give me)\b[^.\n]{0,40}\b(your |the |my |initial |original )?(system[ -]?(prompt|message|instructions?)|(initial|original|hidden|secret) (prompt|instructions?)|prompt above)\b",
                 Severity::Caution,
                 "possible prompt injection: attempts to reveal the system prompt",
             ),
-            // ── Fake conversation-role / delimiter injection ────────────────
-            // These structural tokens never occur in honest prose → still block.
+            // Structural conversation tokens are unambiguous injection.
             p(
                 r"(?i)(<\|(im_start|im_end|system|user|assistant|endoftext)\|>|\[/?INST\]|<</?SYS>>|\bBEGIN SYSTEM PROMPT\b|\[system\]\(#.*\))",
                 Severity::Dangerous,
                 "prompt injection: injects a fake conversation role/delimiter",
             ),
-            // ── Jailbreak / mode-switch personas ────────────────────────────
             p(
                 r"(?i)\b(developer mode|jailbreak|jailbroken|do anything now|\bDAN\b mode|unrestricted mode|no[- ]restrictions mode|god mode)\b",
                 Severity::Caution,
                 "possible jailbreak / mode-switch persona",
             ),
-            // ── Safety / guardrail / sandbox disablement ────────────────────
             p(
                 r"(?i)\b(disable|turn off|bypass|circumvent|evade|ignore|skip|override|remove)\b[^.\n]{0,30}\b(safety|guardrail|guardrails|security|sandbox|policy|policies|restriction|restrictions|protection|filter|filters)\b",
                 Severity::Caution,
                 "possible safety/guardrail bypass",
             ),
-            // ── Approval-gate evasion ───────────────────────────────────────
             p(
                 r"(?i)\b(do ?n[o']?t|never|no need to|without)\b[^.\n]{0,30}\b(ask|asking|confirm|confirming|prompt|prompting|notify|telling|inform)\b[^.\n]{0,25}\b(the )?(user|human|permission|approval|confirmation)\b",
                 Severity::Caution,
                 "instructs acting without user confirmation",
             ),
-            // ── Secret exfiltration (verb + secret in proximity) ────────────
             // The secret noun tolerates surrounding `[a-z0-9_]` so env-var
             // shapes like `AWS_SECRET_ACCESS_KEY` match as one token (a bare
             // `\bsecret\b` would miss them).
@@ -446,7 +420,6 @@ fn content_patterns() -> &'static [Pattern] {
                 Severity::Caution,
                 "possible secret exfiltration",
             ),
-            // ── Reading secret material (dual-use → caution) ────────────────
             p(
                 r"(?i)(~/\.ssh|/\.ssh/|id_rsa|id_ed25519|id_dsa|\.env\b|\.aws/credentials|\.netrc\b|/etc/shadow|/etc/passwd|\.git-credentials|\.npmrc\b|kubeconfig|credentials\.toml)",
                 Severity::Caution,
@@ -457,13 +430,11 @@ fn content_patterns() -> &'static [Pattern] {
                 Severity::Caution,
                 "references a secret environment variable / token",
             ),
-            // ── Role reassignment (noisy → caution) ─────────────────────────
             p(
                 r"(?i)\byou are now\b[^.\n]{0,30}\b(a |an |no longer|unrestricted|free|DAN|able to)\b",
                 Severity::Caution,
                 "attempts to reassign the agent's role",
             ),
-            // ── Opaque encoded blob (obfuscation → caution) ─────────────────
             p(
                 r"[A-Za-z0-9+/]{512,}={0,2}",
                 Severity::Caution,
@@ -579,9 +550,7 @@ mod tests {
 
     #[test]
     fn legit_reference_doc_does_not_block_install() {
-        // Regression for the anthropics pdf skill: a reference.md with domain
-        // wording ("remove PDF security") and example commands (scp, $()) must
-        // NOT be refused — at most a caution.
+        // Domain prose and example commands may warn but must not be refused.
         let md = "# PDF reference\n\nTo remove PDF security/restrictions:\n\n\
                   ```sh\nqpdf --decrypt in.pdf out.pdf\nscp out.pdf host:/tmp\necho $(date)\n```\n";
         assert_ne!(scan("reference.md", md).verdict, ScanVerdict::Dangerous);
@@ -636,8 +605,7 @@ mod tests {
 
     #[test]
     fn data_files_are_not_command_scanned() {
-        // Regression: an XML schema's regex backslashes must NOT read as "shell
-        // escaping" (this was flagging pptx's bundled .xsd files on install).
+        // Regex backslashes in data files are not shell escaping.
         let xsd = "<xs:pattern value=\"\\d{3}\\.\\d+\"/>\n";
         assert_eq!(
             scan("scripts/office/schemas/wml.xsd", xsd).verdict,
@@ -647,7 +615,7 @@ mod tests {
             scan("data/config.json", "{\"re\": \"\\\\d+\"}").verdict,
             ScanVerdict::Safe
         );
-        // …but the same backslash in an actual shell script IS still scanned.
+        // Shell scripts still receive command scanning.
         assert_eq!(
             scan("scripts/run.sh", "grep \\d file").verdict,
             ScanVerdict::Caution

@@ -1,17 +1,6 @@
-//! `medha acp` — the editor bridge (Vol 4 §5). Exposes one session over
-//! line-delimited JSON-RPC 2.0 on stdio so an editor extension (VS Code, Zed,
-//! JetBrains) can embed MEDHA: the kernel streams `event` notifications out and
-//! the editor drives it with `message.send` / `approval.respond` / `cancel`.
-//!
-//! It's the same kernel the TUI runs — only the surface differs (P9). The gate
-//! and sink here are thin adapters that (de)serialize to the wire; the kernel
-//! never learns an editor exists.
-//!
-//! Wire format: one JSON object per line, both directions.
-//!   → (in)  {"jsonrpc":"2.0","id":1,"method":"message.send","params":{"content":"…"}}
-//!   ← (out) {"jsonrpc":"2.0","method":"event","params":{"kind":"model.text","delta":"…"}}
-//!   ← (out) {"jsonrpc":"2.0","method":"approval","params":{"gate_id":3,"action":"fs.edit","detail":"…"}}
-//!   → (in)  {"jsonrpc":"2.0","method":"approval.respond","params":{"gate_id":3,"approve":true}}
+//! Editor bridge for one kernel session over line-delimited JSON-RPC 2.0 on
+//! stdio. It accepts messages, approvals, and cancellation while streaming
+//! event and approval notifications.
 
 use kernel::{Budget, EventLog, Kernel, Message, Provider, Session, StopReason};
 use serde_json::{Value, json};
@@ -37,12 +26,8 @@ enum Outbound {
     Close(oneshot::Sender<io::Result<()>>),
 }
 
-/// Nonblocking producer side of ACP output.
-///
-/// Kernel stream callbacks are synchronous, so they cannot await stdout. They
-/// enqueue into a byte-bounded channel instead. Saturation means the editor is
-/// no longer consuming the protocol; fail the connection closed rather than
-/// pinning a Tokio worker or retaining unbounded deltas.
+/// Byte-bounded output queue for synchronous kernel callbacks; saturation
+/// closes the connection.
 pub struct Writer {
     tx: mpsc::Sender<Outbound>,
     queued_bytes: Arc<AtomicUsize>,
@@ -86,7 +71,6 @@ impl Writer {
         self.write_value(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
     }
 
-    /// Emit a domain event under the `event` method (the server→client stream).
     fn event(&self, kind: &str, mut params: Value) -> bool {
         if let Value::Object(ref mut m) = params {
             m.insert("kind".into(), json!(kind));
@@ -94,7 +78,6 @@ impl Writer {
         self.notify("event", params)
     }
 
-    /// Reply to a request that carried an `id`.
     fn respond(&self, id: Value, result: Value) -> bool {
         self.write_value(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
     }
@@ -205,7 +188,6 @@ impl Drop for WriterTask {
     }
 }
 
-/// Approval requests awaiting an `approval.respond`, keyed by gate id.
 pub(crate) type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>;
 
 fn lock_pending(
@@ -222,8 +204,6 @@ pub(crate) struct Bridge {
     writer_task: WriterTask,
 }
 
-/// Build the shared writer + pending-approval map. Created before the kernel so
-/// the gate (wired into the kernel at construction) shares them with the loop.
 pub(crate) fn bridge() -> Bridge {
     bridge_with_output(tokio::io::stdout(), OUTBOUND_FRAMES)
 }
@@ -255,9 +235,7 @@ where
     }
 }
 
-/// Human gate over the wire: emit an `approval` request carrying a fresh
-/// gate id, then park on a oneshot the stdin reader fulfills when the editor
-/// answers with `approval.respond`.
+/// Human approval gate over JSON-RPC.
 pub struct AcpGate {
     writer: Arc<Writer>,
     pending: Pending,
@@ -274,10 +252,7 @@ impl AcpGate {
     }
 }
 
-/// Removes an approval registration whenever its awaiting future is cancelled.
-///
-/// A surface disconnect can drop `confirm` at any await point. Without this
-/// guard the sender remained in the map forever, retaining the abandoned gate.
+/// Removes a pending approval if its await is cancelled.
 struct PendingGuard {
     pending: Pending,
     gate_id: u64,
@@ -310,9 +285,8 @@ impl kernel::HumanGate for AcpGate {
         ) {
             return kernel::Approval::Deny;
         }
-        // Editor disconnected or never answered → treat as a rejection (P5:
-        // never commit an unapproved action). An editor approval is "allow once":
-        // it never silently persists a path to medha.lock.
+        // Disconnect or no response denies the action. Editor approval is
+        // allow-once and never persists a path to medha.lock.
         let approved = tokio::select! {
             result = rx => result.unwrap_or(false),
             _ = self.writer.cancelled() => false,
@@ -337,9 +311,7 @@ fn deny_pending(pending: &Pending) -> usize {
     count
 }
 
-/// Streams kernel updates out as `event` notifications. Tool observations carry
-/// the raw payload so the editor can open a native diff when `old`/`new`/`path`
-/// are present (the "changes opened in your editor" experience).
+/// Streams kernel updates as JSON-RPC `event` notifications.
 struct AcpSink {
     writer: Arc<Writer>,
 }
@@ -391,35 +363,29 @@ impl kernel::StreamSink for AcpSink {
     }
 }
 
-/// Result of a spawned turn, delivered back to the main loop.
 enum TurnDone {
     Ok(Vec<Message>, StopReason),
     Err(String),
 }
 
-/// Upper bound for one JSON-RPC frame — far beyond any legitimate message,
-/// small enough that a runaway peer can't balloon the process.
+/// Bounds memory retained for one peer frame.
 const MAX_FRAME: u64 = 16 * 1024 * 1024;
 
-/// Read one newline-terminated frame with the size cap enforced. Cancel-safe:
-/// `read_until` accumulates into `buf` across `select!` cancellations, and the
-/// buffer is only drained once a full line has arrived. Returns `Ok(None)` on
-/// EOF; an oversized frame is an error (protocol violation — disconnect).
+/// Retains partial input across cancellation; oversized frames disconnect.
 async fn read_frame(
     stdin: &mut tokio::io::Take<BufReader<tokio::io::Stdin>>,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<Option<String>> {
     let n = stdin.read_until(b'\n', buf).await?;
     if n == 0 && buf.is_empty() {
-        return Ok(None); // clean EOF
+        return Ok(None);
     }
     if buf.last() == Some(&b'\n') || n == 0 {
         let line = String::from_utf8_lossy(buf).into_owned();
         buf.clear();
-        stdin.set_limit(MAX_FRAME); // fresh cap for the next frame
+        stdin.set_limit(MAX_FRAME);
         return Ok(Some(line));
     }
-    // No newline and the reader stopped: the cap was exhausted mid-frame.
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         "frame exceeds the 16 MiB limit",
@@ -445,10 +411,7 @@ fn rpc_error(writer: &Writer, id: &Option<Value>, code: i32, message: impl Into<
     }
 }
 
-/// Validate and dispatch one decoded JSON-RPC frame.
-///
-/// Every valid request (an object containing `id`) takes exactly one result or
-/// error arm. Valid notifications execute the same action but emit no response.
+/// Requests receive one response; notifications receive none.
 fn dispatch_rpc(
     message: Value,
     model: &str,
@@ -612,10 +575,8 @@ async fn settle_turn(
     }
 }
 
-/// Run the bridge until stdin closes. Single session, one turn at a time — a
-/// `message.send` arriving mid-turn becomes a STEER (injected at the next
-/// turn boundary); `cancel`/`interrupt` stops gracefully via the kernel's
-/// interrupt handle (in-flight tools settle; never a mid-tool kill).
+/// Mid-turn messages steer at the next boundary; cancellation lets in-flight
+/// tools settle through the kernel interrupt handle.
 #[allow(clippy::too_many_arguments)]
 pub async fn run<P, L>(
     kernel: Arc<Kernel<P, L>>,
@@ -636,8 +597,6 @@ where
         pending,
         writer_task,
     } = bridge;
-    // Announce readiness + capabilities (Vol 4 §6 handshake, editor-initiated
-    // handshakes also answered below).
     writer.notify(
         "ready",
         json!({ "proto": "1.0", "model": model, "caps": { "cards": ["approval", "diff"] } }),
@@ -671,9 +630,8 @@ where
                         let kernel = kernel.clone();
                         let session = session.clone();
                         let messages = transcript.clone();
-                        // One editor message starts one task. Publish its fresh
-                        // pool before the turn so descendants share this task,
-                        // not the spend accumulated by an earlier message.
+                        // Each editor message gets a fresh task budget shared
+                        // with descendants spawned during that turn.
                         let budget = crate::task_budget(&base_budget, &agent_budget);
                         let writer = writer.clone();
                         turns.spawn(async move {
@@ -1096,8 +1054,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn backpressure_never_blocks_runtime_and_cancels_only_that_connection() {
-        // One byte of socket capacity ensures the first JSON frame parks the
-        // writer task while the client deliberately never reads.
         let (blocked_output, _non_reading_client) = tokio::io::duplex(1);
         let Bridge {
             writer: blocked_writer,
@@ -1129,7 +1085,6 @@ mod tests {
             "runtime alive"
         );
 
-        // A separate ACP output remains independently usable.
         let (healthy_output, mut healthy_client) = tokio::io::duplex(1024);
         let Bridge {
             writer: healthy_writer,

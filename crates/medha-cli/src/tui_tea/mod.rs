@@ -1,8 +1,4 @@
-//! TEA-based TUI using ratatui::run — The Elm Architecture implementation
-//!
-//! Model (app state) → Update(model, message) → model → View(model) → frame
-//! View is a pure function of model — same state always renders identically.
-//! Message-passing, not shared mutable state.
+//! TEA-based ratatui interface with message-driven state updates and pure views.
 
 use crate::config;
 use crossterm::event::{
@@ -21,6 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 mod markdown;
 mod spin;
@@ -33,18 +30,25 @@ use view::*;
 mod termbg;
 pub(crate) mod theme;
 
-/// Maximum lines to keep in scrollback buffer
+/// Maximum lines retained in scrollback.
 const MAX_SCROLLBACK_LINES: usize = 5000;
-/// Maximum diff lines to display inline
+/// Maximum diff lines rendered inline.
 const MAX_DIFF_LINES: usize = 60;
-/// Maximum lines of raw tool I/O rendered inline per tool call (PART 4)
+/// Maximum raw tool I/O lines rendered per call.
 const MAX_TOOL_OUTPUT_LINES: usize = 500;
-/// Pastes longer than this are collapsed to a placeholder in the input box (PART 2)
+/// Pastes longer than this collapse to an input placeholder.
 const PASTE_COLLAPSE_THRESHOLD: usize = 1000;
-/// Redraw interval (16-33ms for 60-30fps)
+/// Redraw interval for 60 fps.
 const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 const TURN_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const TURN_ABORT_GRACE: Duration = Duration::from_secs(2);
+const FORCE_ABORT_SLOW_NOTICE: Duration = Duration::from_secs(2);
+
+// Task-local ownership prevents serialized prompts from inheriting a later
+// foreground turn's cancellation token.
+tokio::task_local! {
+    static FOREGROUND_TURN_CANCEL: CancellationToken;
+}
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
@@ -114,9 +118,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/exit", "quit (also Ctrl-D)"),
 ];
 
-/// Providers used by the interactive TUI must be able to atomically apply a
-/// saved profile between turns. The kernel remains provider-neutral; this small
-/// surface exists only because the TUI owns the explicit user action.
+/// Applies an explicitly selected profile atomically between turns.
 pub(crate) trait ProfileProvider: Provider {
     fn switch_profile(&self, profile: &config::Resolved) -> Result<(), String>;
 }
@@ -128,17 +130,10 @@ impl ProfileProvider for providers::OpenAiCompat {
     }
 }
 
-/// Recognized when typed, but intentionally omitted from autocomplete and
-/// `/help` so the palette stays lean: the `/reasoning` surface replaces the
-/// overlapping `/think`/`/thinking`/`/effort` names, and `/skills` folded into
-/// the `/skill` hub's "List all skills" action (typed `/skills` still works).
+/// Compatibility commands intentionally omitted from autocomplete and help.
 const HIDDEN_COMMANDS: &[&str] = &["/think", "/thinking", "/effort", "/skills"];
 
-/// The action rows at the top of the `/skill` hub picker, before the installed
-/// skills. `(row label, action id)`; the id drives Enter dispatch. This one menu
-/// replaces what were separate `/skill install|search|update|sources|lock|sync`
-/// palette entries — discoverable in a menu instead of cluttering autocomplete.
-/// The typed forms still work for power users.
+/// `(label, action id)` rows shown before installed skills in the skill hub.
 pub(super) const SKILL_HUB_ACTIONS: &[(&str, &str)] = &[
     (
         "➕ Add a skill…      search the catalog, or paste a GitHub link",
@@ -150,9 +145,7 @@ pub(super) const SKILL_HUB_ACTIONS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The Manage sub-menu, reached from the hub's "Manage skills…" row. Keeps the
-/// power operations one layer deep — present and usable, but off the everyday
-/// path. `(row label, action id)`; `back` returns to the hub.
+/// `(label, action id)` rows in the skill-management submenu.
 pub(super) const SKILL_MANAGE_ACTIONS: &[(&str, &str)] = &[
     ("▸ Check for updates", "update"),
     ("▸ Sources — add or remove repositories", "sources"),
@@ -169,9 +162,7 @@ fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// A line is a slash command only when its FIRST TOKEN is a known command.
-/// Anything else starting with `/` — a pasted absolute path, "/Users/… open
-/// this" — is chat for the model, not an "unknown command" error.
+/// Recognizes only known first-token commands, leaving absolute paths as chat.
 fn is_slash_command(line: &str) -> bool {
     match line.split_whitespace().next() {
         Some(tok) => COMMANDS.iter().any(|(c, _)| *c == tok) || HIDDEN_COMMANDS.contains(&tok),
@@ -179,7 +170,7 @@ fn is_slash_command(line: &str) -> bool {
     }
 }
 
-/// Channel shared by sink (agent → UI events) and human gate (agent → UI approval requests)
+/// Channel shared by agent events and approval requests.
 pub(crate) fn channel() -> (
     mpsc::UnboundedSender<TuiEvent>,
     mpsc::UnboundedReceiver<TuiEvent>,
@@ -187,7 +178,7 @@ pub(crate) fn channel() -> (
     mpsc::unbounded_channel()
 }
 
-/// Human gate for TUI: approval request sent as TuiEvent with oneshot responder
+/// Human gate backed by a TUI event and one-shot response.
 pub(crate) struct TuiGate {
     pub(crate) tx: mpsc::UnboundedSender<TuiEvent>,
 }
@@ -200,23 +191,65 @@ impl kernel::HumanGate for TuiGate {
         detail: Option<&str>,
         escalated: bool,
     ) -> kernel::Approval {
+        let cancel = FOREGROUND_TURN_CANCEL
+            .try_with(CancellationToken::clone)
+            .ok();
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return kernel::Approval::Deny;
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         let req = TuiEvent::Approval(
             action.to_string(),
             detail.map(str::to_string),
             escalated,
+            cancel.clone(),
             resp_tx,
         );
         if self.tx.send(req).is_err() {
             return kernel::Approval::Deny;
         }
-        resp_rx.await.unwrap_or(kernel::Approval::Deny)
+        match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => kernel::Approval::Deny,
+                    response = resp_rx => response.unwrap_or(kernel::Approval::Deny),
+                }
+            }
+            None => resp_rx.await.unwrap_or(kernel::Approval::Deny),
+        }
+    }
+
+    async fn confirm_network(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        let cancel = FOREGROUND_TURN_CANCEL
+            .try_with(CancellationToken::clone)
+            .ok();
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return kernel::NetworkDecision::Deny;
+        }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let req = TuiEvent::NetworkApproval(detail.map(str::to_string), escalated, cancel.clone(), resp_tx);
+        if self.tx.send(req).is_err() {
+            return kernel::NetworkDecision::Deny;
+        }
+        match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => kernel::NetworkDecision::Deny,
+                    response = resp_rx => response.unwrap_or(kernel::NetworkDecision::Deny),
+                }
+            }
+            None => resp_rx.await.unwrap_or(kernel::NetworkDecision::Deny),
+        }
     }
 }
 
-/// Question-asker for the TUI: the `clarify` tool's questions are sent as a
-/// `TuiEvent` with a oneshot responder, mirroring `TuiGate`. `None` back = the
-/// user dismissed the form or the channel closed.
+/// Sends structured questions to the TUI; `None` means dismissal or closure.
 pub(crate) struct TuiAsker {
     pub(crate) tx: mpsc::UnboundedSender<TuiEvent>,
 }
@@ -224,15 +257,34 @@ pub(crate) struct TuiAsker {
 #[async_trait::async_trait]
 impl kernel::Asker for TuiAsker {
     async fn ask(&self, questions: Vec<kernel::Question>) -> Option<Vec<kernel::Answer>> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        if self.tx.send(TuiEvent::Clarify(questions, resp_tx)).is_err() {
+        let cancel = FOREGROUND_TURN_CANCEL
+            .try_with(CancellationToken::clone)
+            .ok();
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
-        resp_rx.await.ok().flatten()
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(TuiEvent::Clarify(questions, cancel.clone(), resp_tx))
+            .is_err()
+        {
+            return None;
+        }
+        match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    response = resp_rx => response.ok().flatten(),
+                }
+            }
+            None => resp_rx.await.ok().flatten(),
+        }
     }
 }
 
-/// Events from agent to UI
+/// Events from the agent to the UI.
 #[derive(Debug)]
 pub(crate) enum TuiEvent {
     Text(String),
@@ -251,16 +303,34 @@ pub(crate) enum TuiEvent {
         String,
         Option<String>,
         bool,
+        Option<CancellationToken>,
         oneshot::Sender<kernel::Approval>,
+    ),
+    /// Network-grant prompt after a command was denied network; four-way answer
+    /// (once / session / persistent / deny).
+    NetworkApproval(
+        Option<String>,
+        bool,
+        Option<CancellationToken>,
+        oneshot::Sender<kernel::NetworkDecision>,
     ),
     /// `clarify` tool: ask the user structured questions, reply with their
     /// answers (or `None` if dismissed).
     Clarify(
         Vec<kernel::Question>,
+        Option<CancellationToken>,
         oneshot::Sender<Option<Vec<kernel::Answer>>>,
     ),
     Done(Vec<Message>, StopReason),
     Error(String),
+    /// The task which owned a force-aborted foreground turn has been dropped.
+    /// Events it queued before cancellation are ignored until this marker; the
+    /// marker is sent only after joining that task, so the next turn cannot
+    /// overlap its process-group teardown or mutation-lease cleanup.
+    ForegroundAbortSettled,
+    /// Force-abort cancellation has not finished promptly. This is advisory:
+    /// foreground ownership remains held until `ForegroundAbortSettled`.
+    ForegroundAbortSlow,
     /// `/lsp` completed querying the registered LSP status tool.
     LspStatus(Result<serde_json::Value, String>),
     /// A background agent's report is durably recorded and collectable.
@@ -339,14 +409,8 @@ pub(crate) enum TuiEvent {
     },
 }
 
-/// One rewind point offered by `/rewind` — a past user prompt. Rewinding *to* a
-/// message goes back to the state right BEFORE that message ran: the message and
-/// everything after it leave the conversation, the code reverts to before that
-/// turn's edits, and the message text is put back in the input box to edit and
-/// re-send (an edit-and-resubmit affordance). `label` is the prompt (truncated) for the
-/// picker; `at_event` is that user-message event (the cut is before it); `files`
-/// is how many files a code rollback from here would revert, so the scope menu
-/// can show the count and hide the code options when it's zero.
+/// A user-message boundary offered by `/rewind`; the cut occurs before `at_event`.
+/// `files` controls whether code rollback choices are available.
 #[derive(Clone, Debug)]
 pub(crate) struct RewindPoint {
     pub at_event: ulid::Ulid,
@@ -354,10 +418,7 @@ pub(crate) struct RewindPoint {
     pub files: usize,
 }
 
-/// What a `/rewind` restores once the user picks a scope — three independent
-/// restore actions. Conversation-touching scopes fork the session (the original
-/// is preserved) and prefill the chosen prompt; `Code` alone is a pure file
-/// revert that leaves the conversation as it is.
+/// Rewind scope. Conversation scopes fork and prefill; code-only preserves chat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RewindScope {
     /// Rewind the conversation only; leave the working files as they are now.
@@ -383,13 +444,9 @@ impl RewindScope {
 }
 
 impl RewindPoint {
-    /// The scope menu shown after this point is chosen (step 2 of `/rewind`),
-    /// ordered most-destructive first: code+conversation, conversation, code.
-    /// The two code options are omitted when no files were edited from here on
-    /// (nothing to roll back). `None` action = cancel.
+    /// Builds scope choices, omitting code rollback when no files are tracked.
     fn scope_options(&self) -> Vec<(String, Option<RewindScope>)> {
-        // "tracked" (K18): rollback reverts only snapshot-carrying writes —
-        // shell-side mutations (`sed -i`, `git checkout`) are not undone.
+        // Only snapshot-tracked writes can be rolled back.
         let plural = if self.files == 1 {
             "tracked file"
         } else {
@@ -423,7 +480,7 @@ impl RewindPoint {
     }
 }
 
-/// One rendered line-group in the transcript
+/// One rendered transcript item.
 #[derive(Debug)]
 enum Item {
     User(String),
@@ -451,11 +508,7 @@ enum Item {
     Thinking(String),
 }
 
-/// A transcript item plus its memoized render. `render_item` (which computes
-/// diffs, parses markdown, wraps lines) runs ONCE per item and is reused every
-/// frame; only the item that actually changes is re-rendered. This is what keeps
-/// scrolling and post-tool streaming smooth — previously a 2000-line diff was
-/// recomputed on every 16ms frame.
+/// A transcript item with a memoized physical-row render.
 struct Entry {
     item: Item,
     lines: Option<Vec<Line<'static>>>,
@@ -496,16 +549,9 @@ impl Entry {
     fn invalidate(&mut self) {
         self.lines = None;
     }
-    /// Render this item to PHYSICAL rows (each already wrapped to `width`, so one
-    /// stored line = one screen row). Runs once; reused until invalidated. `height`
-    /// is the exact row count — no separate wrap measurement, so scroll math and
-    /// the rendered slice can never drift.
-    ///
-    /// Assistant markdown is rendered whole (not per-line): tables and code fences
-    /// span multiple lines, so an earlier line's rendering depends on later
-    /// content — prefix caching would corrupt them. The render only runs on change
-    /// (when `lines` is invalidated by a stream delta) and is throttled to the
-    /// redraw interval, so a growing message re-renders at most once per frame.
+    /// Renders and caches physical rows so height and scroll agree. Markdown is
+    /// rendered whole, since tables and fences make earlier lines depend on later
+    /// content, and throttled so a growing message re-renders once per frame.
     fn ensure(&mut self, cx: &RenderCtx<'_>, width: u16) {
         if self.lines.is_some() {
             return;
@@ -519,15 +565,11 @@ impl Entry {
     }
 }
 
-/// Word-wrap one logical line into physical rows of at most `width` columns,
-/// preserving each span's style. Long words hard-break. This is the single source
-/// of truth for layout — the renderer draws these rows directly (no ratatui wrap),
-/// so measured height always equals rendered rows (essential for virtualization).
+/// Wraps styled text by terminal cells; long words hard-break.
 fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
-    // Flatten to (char, style); measure in terminal CELLS, not chars — CJK and
-    // emoji occupy 2 columns (K14), so char counting clips and mis-cursors.
+    // Terminal-cell widths keep CJK and emoji layout aligned.
     let cell_w = |c: char| c.width().unwrap_or(0);
     let mut chars: Vec<(char, Style)> = Vec::new();
     for span in &line.spans {
@@ -536,19 +578,16 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
             chars.push((c, st));
         }
     }
-    // Fast-path lines that already fit.
     if chars.iter().map(|&(c, _)| cell_w(c)).sum::<usize>() <= width {
         return vec![line.clone()];
     }
 
-    // Greedy word wrap: fill up to `width` cells, breaking at the last space
-    // when possible.
+    // Prefer the last fitting space before hard-breaking.
     let n = chars.len();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < n {
-        // Extend while the row's cell width fits (always take ≥1 char so a
-        // double-width char on a width-1 row can't loop forever).
+        // Always consume one glyph so a wide glyph cannot stall a narrow row.
         let mut used = 0usize;
         let mut hard_end = i;
         while hard_end < n {
@@ -572,7 +611,7 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
         i = hard_end;
     }
 
-    // Rebuild each row, coalescing consecutive same-style chars back into spans.
+    // Coalesce adjacent glyphs with the same style.
     ranges
         .into_iter()
         .map(|(a, b)| {
@@ -700,14 +739,88 @@ fn word_cell_range(text: &str, target: usize) -> Option<(usize, usize)> {
     Some((chars[first].1, chars[last - 1].2))
 }
 
-/// Pending approval for inline rendering
+/// The decision channel behind an approval card. A standard prompt returns a
+/// three-way [`kernel::Approval`]; a network-grant prompt returns a four-way
+/// [`kernel::NetworkDecision`]. Keeping both on one card path means the queue,
+/// cancellation, and ready-signal logic is written once.
+enum ApprovalResponder {
+    Standard(oneshot::Sender<kernel::Approval>),
+    Network(oneshot::Sender<kernel::NetworkDecision>),
+}
+
+impl ApprovalResponder {
+    /// Option labels shown on the card, in selection-index order.
+    fn options(&self) -> &'static [&'static str] {
+        match self {
+            Self::Standard(_) => &["Yes, allow once", "Yes, always allow", "No, deny"],
+            Self::Network(_) => &[
+                "Allow once and retry",
+                "Allow for this session",
+                "Always allow for this project",
+                "No, deny",
+            ],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.options().len()
+    }
+
+    /// Send the decision for the selected option index (last option is deny).
+    fn answer(self, sel: usize) {
+        match self {
+            Self::Standard(tx) => {
+                let _ = tx.send(match sel {
+                    0 => kernel::Approval::Once,
+                    1 => kernel::Approval::Always,
+                    _ => kernel::Approval::Deny,
+                });
+            }
+            Self::Network(tx) => {
+                let _ = tx.send(match sel {
+                    0 => kernel::NetworkDecision::Once,
+                    1 => kernel::NetworkDecision::Session,
+                    2 => kernel::NetworkDecision::Persistent,
+                    _ => kernel::NetworkDecision::Deny,
+                });
+            }
+        }
+    }
+
+    fn deny(self) {
+        let last = self.len() - 1;
+        self.answer(last);
+    }
+
+    /// Past-tense notice shown after the user picks option `sel`.
+    fn verb(&self, sel: usize) -> &'static str {
+        match self {
+            Self::Standard(_) => match sel {
+                0 => "approved",
+                1 => "approved (allowing all this session)",
+                _ => "rejected",
+            },
+            Self::Network(_) => match sel {
+                0 => "network allowed (once)",
+                1 => "network allowed (this session)",
+                2 => "network allowed (persisted)",
+                _ => "network denied",
+            },
+        }
+    }
+}
+
+/// Pending inline approval.
 struct PendingApproval {
     action: String,
     detail: Option<String>,
-    /// True for a trust-flow-escalated (web-tainted) action — never auto-approved
-    /// and never remembered via "always" (K9).
+    /// Trust-escalated actions cannot be remembered or auto-approved.
     escalated: bool,
-    responder: oneshot::Sender<kernel::Approval>,
+    /// Foreground turns carry their task-local cancellation token. `None`
+    /// belongs to work outside that foreground owner (for example a background
+    /// agent) and must survive the foreground turn ending.
+    cancel: Option<CancellationToken>,
+    responder: ApprovalResponder,
 }
 
 /// The user's in-progress answer to one clarify question.
@@ -719,8 +832,7 @@ struct ClarifyDraft {
     other: Option<String>,
 }
 
-/// An in-flight `clarify` form: the questions, per-question drafts, and the
-/// responder the `clarify` tool is awaiting. Owns all keyboard input while up.
+/// In-flight `clarify` form that owns keyboard input while visible.
 struct ClarifyState {
     questions: Vec<kernel::Question>,
     /// Which question is on screen.
@@ -743,9 +855,7 @@ struct ClarifyState {
 }
 
 impl ClarifyState {
-    /// Row count for the current question: options + the "Other" row. Navigation
-    /// between questions is ←→; Enter submits ALL answers, so there is no
-    /// per-question "continue" row.
+    /// Current options plus the free-text row.
     fn row_count(&self) -> usize {
         self.questions[self.idx].options.len() + 1
     }
@@ -925,13 +1035,7 @@ enum PickerKind {
     },
 }
 
-/// One row of the `/agents` panel.
-///
-/// Running children and finished writers share a list because they are one
-/// question — "what did Medha delegate, and what is outstanding?" A patch that
-/// nobody applied is unfinished delegated work just as much as a child still
-/// thinking, and splitting them into two panels would hide the one that costs
-/// something to forget.
+/// One running, settled, or patch-ready row in the `/agents` panel.
 #[derive(Debug, Clone)]
 pub(super) enum AgentRow {
     /// A child, running or settled — its `state` says which.
@@ -974,15 +1078,7 @@ pub(super) struct McpRow {
     pub disabled: bool,
 }
 
-/// The autonomy levels offered by the `/mode` picker, with self-explanatory
-/// descriptions (the picker shows these verbatim). Order = increasing autonomy.
-/// The model protocols offered at setup: `(label, available, protocol)`.
-///
-/// One table, so the rendered list and the selection handler cannot drift. They
-/// were previously a literal `vec!` of labels matched against hardcoded indices
-/// in `update.rs` — reordering the labels silently selected the wrong protocol.
-/// Available ones come first because that is the useful ordering; the "coming
-/// soon" entries stay listed so the roadmap is visible.
+/// Setup protocols as `(label, available, protocol)`, ordered by availability.
 pub(crate) const MODEL_PROTOCOLS: &[(&str, bool, kernel::Protocol)] = &[
     ("OpenAI-compatible Chat", true, kernel::Protocol::OpenAiChat),
     (
@@ -1433,11 +1529,7 @@ struct Picker {
     selected: usize,
 }
 
-/// Stages in the guided `/model add` flow. A form rather than a shell command
-/// keeps secrets out of terminal history and makes all required connection
-/// details discoverable for first-time users. There is deliberately no
-/// "profile name" question — the name is derived from the chosen model id
-/// (users kept pasting the model id into it).
+/// Guided model setup keeps credentials out of history and the transcript.
 #[derive(Clone, Copy)]
 enum ModelSetupStep {
     BaseUrl,
@@ -1525,8 +1617,7 @@ impl ModelSetup {
     }
 }
 
-/// Stages in the guided `/search` flow. Like `/model add`, a form (not a shell
-/// command) keeps the API key out of terminal history and the transcript.
+/// Guided search setup keeps API keys out of history and the transcript.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SearchSetupStep {
     /// The provider picker is open (owned by the generic picker handler).
@@ -1585,28 +1676,22 @@ impl Picker {
     }
 }
 
-/// TEA Model — all application state
+/// Complete TUI state.
 struct Model {
-    /// Transcript items (capped, with overflow to session log)
+    /// Capped transcript items; durable history remains in the event log.
     items: VecDeque<Entry>,
     /// Tool name → its declared presentation (glyph + category), from the
     /// executor's specs. The surface renders each tool's own glyph — no
     /// name→glyph table here.
     tool_viz: HashMap<String, ToolViz>,
-    /// Input buffer
     input: String,
-    /// Cursor position in input as a BYTE offset (always on a UTF-8 char boundary)
+    /// UTF-8 byte offset, always on a character boundary.
     cursor: usize,
-    /// Command history
     history: Vec<String>,
     history_idx: Option<usize>,
-    /// Scroll offset (0 = top)
     scroll_offset: usize,
-    /// Whether auto-scrolling to bottom
     auto_scroll: bool,
-    /// Viewport height (rows)
     viewport_height: usize,
-    /// Content height (rows)
     content_height: usize,
     /// Item heights/total need recomputing (content changed). Rendering is
     /// virtualized either way — only the visible window is built each frame.
@@ -1633,16 +1718,13 @@ struct Model {
     /// The pending approval card has been rendered at least once, so its options
     /// are on screen and selection input is safe to accept (blocks blind-Enter).
     approval_ready: bool,
-    /// Context percentage
     ctx_pct: Option<u32>,
     /// Session cost so far (USD, `true` = indicative "est." figure), when known.
     cost_usd: Option<(f64, bool)>,
-    /// Model name
     model: String,
     /// Active wire contract. Kept distinct from the provider/model label so a
     /// saved profile never hides which API shape is actually in use.
     protocol: kernel::Protocol,
-    /// Max context
     max_ctx: Option<u32>,
     /// The saved profile currently active for this session. This is distinct
     /// from `model`, which is the provider's model id and may be duplicated
@@ -1662,13 +1744,9 @@ struct Model {
     /// Autonomy dial (`/mode`): how much runs without asking. Applied to the
     /// session at the start of each turn; the safety floor is level-independent.
     autonomy: kernel::AutonomyLevel,
-    /// Whether agent turn is running
     running: bool,
-    /// A background report is collectable but a turn is already in flight.
-    ///
-    /// Injecting mid-turn is not an option — the model is part-way through a
-    /// response and the transcript is behoing mutated by the running task — so
-    /// the signal is held and the turn is started the moment this one settles.
+    /// A background report is collectable but a turn is already in flight. It
+    /// cannot be injected mid-response, so the signal is held until this settles.
     agent_report_deferred: bool,
     /// Tool whose call is currently streaming: (name, optional target file/command).
     /// Drives the "writing medha.html…" activity label instead of a vague "thinking".
@@ -1685,21 +1763,21 @@ struct Model {
     /// An Esc was sent and the kernel is settling in-flight tools — used to
     /// show one "stopping…" notice instead of one per Esc press.
     cancelling: bool,
-    /// Pending inline approval queue (PART 3). The kernel may emit several
-    /// tool calls concurrently (buffered up to `max_parallel_tools`), and each
-    /// out-of-workspace path or Human-gated tool spawns a separate `confirm()`
-    /// request. A single slot would clobber the prior request and drop its
-    /// `oneshot::Sender` — which the kernel's `TuiGate::confirm` turns into a
-    /// silent `Approval::Deny` (the "rejected by human" after a real approval).
-    /// Queue them instead and advance as each is answered.
+    /// A second Esc aborted the foreground task and its cancellation is being
+    /// joined. Visible turn state is already clear, but admitting another turn
+    /// before this barrier settles could overlap owned tool/process cleanup.
+    force_aborting: bool,
+    /// Concurrent prompts retain each responder until answered in order.
     pending_approvals: VecDeque<PendingApproval>,
     /// In-flight `clarify` question form (owns input while `Some`).
     clarify: Option<ClarifyState>,
-    /// Selected approval option (0=Yes, 1=Yes-all, 2=No)
+    /// Owner tag for `clarify`, kept beside the state so renderer test fixtures
+    /// can construct the presentation-only form without cancellation plumbing.
+    clarify_cancel: Option<CancellationToken>,
+    /// Selected approval option: once, always, or deny.
     approval_sel: usize,
-    /// Auto-approved tool classes for session
+    /// Session-scoped remembered approvals.
     auto_approve: std::collections::HashSet<String>,
-    /// Current reasoning config
     reasoning: kernel::ReasoningConfig,
     /// Model/profile-level control support; unknown stays visibly unverified.
     reasoning_support: kernel::ReasoningSupport,
@@ -1710,26 +1788,17 @@ struct Model {
     /// Delivery result for the most recently completed turn. `None` means this
     /// TUI has not completed a turn yet (resumed history does not retain it).
     last_turn_reasoning_received: Option<bool>,
-    /// Active picker
     picker: Option<Picker>,
-    /// Autocomplete selection
     ac_sel: usize,
-    /// Show welcome splash
     welcome: bool,
-    /// Show thinking/reasoning
     show_thinking: bool,
-    /// Full transparency (expanded tool I/O)
+    /// Whether tool I/O is expanded.
     full_transparency: bool,
-    /// Animation frame
     anim_frame: u64,
-    /// Intro frame for veena animation
     intro_frame: Option<u64>,
-    /// Quit flag
     should_quit: bool,
-    /// Last redraw time for throttling
     last_redraw: Instant,
-    /// Full content of large pastes, kept out of the rendered input box (PART 2).
-    /// The input holds a compact placeholder token that indexes into this vec.
+    /// Full large-paste content indexed by compact input placeholders.
     pastes: Vec<String>,
     /// Workspace sandbox handle, used only to roll files back on `/rewind`
     /// (code time-travel). File ops still go through the executor for turns;
@@ -1813,8 +1882,10 @@ impl Model {
             interrupt: None,
             foreground_turn: None,
             cancelling: false,
+            force_aborting: false,
             pending_approvals: VecDeque::new(),
             clarify: None,
+            clarify_cancel: None,
             approval_sel: 0,
             auto_approve: std::collections::HashSet::new(),
             reasoning,
@@ -1902,11 +1973,7 @@ impl Model {
         self
     }
 
-    /// Refresh the skills manifest inside the system message (transcript[0]) so a
-    /// skill saved or edited mid-session shows up in the model's list on the very
-    /// next turn — the manifest is otherwise built once at startup. Strips the
-    /// old "## Skills available" section (stable marker) and re-appends a fresh
-    /// one; no-op when skills aren't wired or transcript[0] isn't the system msg.
+    /// Replaces the system message's skill manifest while preserving memory.
     fn refresh_skill_manifest(&self, transcript: &mut [Message]) {
         let Some(store) = &self.skills else { return };
         let Some(sys) = transcript.first_mut() else {
@@ -1983,21 +2050,17 @@ impl Model {
         self.bg_tasks.iter().filter(|t| t.running).count()
     }
 
-    /// The front of the approval queue (the one currently rendered/answerable),
-    /// or `None` if no approval is pending. Callers that used to read a single
-    /// `pending_approval` field go through here so the queue is transparent.
+    /// The approval currently rendered and answerable.
     fn pending_approval(&self) -> Option<&PendingApproval> {
         self.pending_approvals.front()
     }
 
-    /// Deny and clear every queued approval — called whenever a turn ends
-    /// (Done/Error/Interrupted). An Esc-cancel drops the gate's receiver but the
-    /// card stayed on screen, and because it intercepts all keys, every keystroke
-    /// then routed to a prompt whose responder is dead — the UI froze. Denying is
-    /// safe: the turn is already over, so the decisions no longer matter.
+    /// Deny every queued prompt when the whole interactive surface is closing.
+    /// Ordinary turn completion uses the owner-aware helper below so a
+    /// background agent's prompt is not coupled to the foreground lifecycle.
     fn deny_pending_approvals(&mut self) {
         while let Some(p) = self.pending_approvals.pop_front() {
-            let _ = p.responder.send(kernel::Approval::Deny);
+            p.responder.deny();
         }
         self.approval_sel = 0;
         self.approval_ready = false;
@@ -2005,6 +2068,36 @@ impl Model {
         // settles) so a stale question can't linger on screen owning input.
         if let Some(state) = self.clarify.take() {
             let _ = state.responder.send(None);
+        }
+        self.clarify_cancel = None;
+    }
+
+    /// Deny only prompts owned by the foreground turn. The TUI gate and asker
+    /// are also shared by background agents, whose requests intentionally have
+    /// no foreground task-local token; ending one turn must not reject them.
+    fn deny_foreground_prompts(&mut self) {
+        let mut kept = VecDeque::with_capacity(self.pending_approvals.len());
+        let mut removed = false;
+        while let Some(pending) = self.pending_approvals.pop_front() {
+            if pending.cancel.is_some() {
+                pending.responder.deny();
+                removed = true;
+            } else {
+                kept.push_back(pending);
+            }
+        }
+        self.pending_approvals = kept;
+        if removed {
+            // Reset presentation after removing any non-front owner.
+            self.approval_sel = 0;
+            self.approval_ready = false;
+            self.dirty = true;
+        }
+        if self.clarify_cancel.is_some() {
+            if let Some(state) = self.clarify.take() {
+                let _ = state.responder.send(None);
+            }
+            self.clarify_cancel = None;
         }
     }
 
@@ -2017,8 +2110,7 @@ impl Model {
             .unwrap_or(ToolCategory::Other)
     }
 
-    /// Expand paste placeholder tokens back into their full content before a line
-    /// is submitted to the agent (PART 2). The compact token stays in history/input.
+    /// Expands paste placeholders before submission.
     fn resolve_pastes(&self, s: &str) -> String {
         expand_paste_tokens(&self.pastes, s)
     }
@@ -2148,22 +2240,13 @@ impl Model {
         self.pending_clipboard = self.selected_text();
     }
 
-    /// Whether the identity splash is what the user is currently looking at.
-    /// Mirrors the guard in `view::draw_transcript`: the first pushed item, of
-    /// any kind, replaces the splash for the rest of the session.
+    /// Whether the identity splash is currently visible.
     fn on_welcome_splash(&self) -> bool {
         self.welcome && self.items.is_empty()
     }
 
     fn push_notice(&mut self, s: impl Into<String>) {
-        // Mid-stream the trailing item is a reply still being appended to, and
-        // `push_text_delta` only continues an item that is *at the back*. A
-        // notice pushed behind it therefore makes the next delta open a new
-        // item, splitting one reply into two fragments with an unrelated line
-        // wedged between them — mid-sentence, since deltas arrive mid-word.
-        //
-        // Slotting it in front of the live reply keeps the message whole. The
-        // notice reads slightly early rather than the reply reading broken.
+        // Insert notices before a live reply so later deltas keep one item.
         if matches!(self.items.back().map(|e| &e.item), Some(Item::Assistant(_))) {
             let live = self.items.pop_back();
             self.push_item(Item::Notice(s.into()));
@@ -2212,7 +2295,6 @@ impl Model {
 
     fn push_item(&mut self, item: Item) {
         self.items.push_back(Entry::new(item));
-        // Cap scrollback
         let mut dropped = false;
         while self.items.len() > MAX_SCROLLBACK_LINES {
             self.items.pop_front();
@@ -2292,8 +2374,7 @@ impl Model {
         self.dirty = true;
     }
 
-    // ---- Input editing (byte-safe: `cursor` is a byte offset always on a UTF-8
-    // char boundary, so multi-byte input like "café" or emoji never panics). ----
+    // Editing maintains `cursor` on a UTF-8 character boundary.
 
     fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
@@ -2325,18 +2406,15 @@ impl Model {
     }
 }
 
-/// TEA Messages — all events that can update the model
+/// Events that update the model.
 #[derive(Debug)]
 enum Msg {
-    // Input events
     KeyPress(KeyEvent),
     MouseScroll(i32),
     Mouse(MouseEvent),
     Paste(String),
     Resize(u16),
-    // Agent events
     AgentEvent(TuiEvent),
-    // Internal
     Tick,
 }
 
@@ -2356,10 +2434,10 @@ async fn shutdown_foreground_turn(
     model.deny_pending_approvals();
     while let Ok(event) = rx.try_recv() {
         match event {
-            TuiEvent::Approval(_, _, _, responder) => {
+            TuiEvent::Approval(_, _, _, _, responder) => {
                 let _ = responder.send(kernel::Approval::Deny);
             }
-            TuiEvent::Clarify(_, responder) => {
+            TuiEvent::Clarify(_, _, responder) => {
                 let _ = responder.send(None);
             }
             _ => {}
@@ -2377,17 +2455,14 @@ async fn shutdown_foreground_turn(
     }
     model.running = false;
     model.current_tool = None;
+    model.compacting = false;
     model.turn_started = None;
     model.cancelling = false;
+    model.force_aborting = false;
     graceful
 }
 
-/// Update function — pure state transition
-/// Main entry point (PART 0). Uses `ratatui::init`/`restore` (which install a
-/// panic hook that restores the terminal) rather than `ratatui::run` + `block_on`:
-/// we are already inside the `#[tokio::main]` runtime, so the async event loop is
-/// driven with `.await` directly. Calling `block_on` here would panic ("cannot
-/// start a runtime from within a runtime").
+/// Runs the async TUI on the existing Tokio runtime with panic-safe restoration.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tea<P, L>(
     kernel: Arc<Kernel<P, L>>,
@@ -2419,10 +2494,7 @@ where
     P: ProfileProvider + 'static,
     L: EventLog + 'static,
 {
-    // A finished background agent wakes the UI itself. Installed here because
-    // the channel does not exist until now; the control plane holds only the
-    // slot. Sending on an unbounded channel cannot block, so the orchestrator
-    // task that fires this is never held up by the UI.
+    // The unbounded notifier wakes the UI without blocking the orchestrator.
     if let Some(control) = &agents
         && let Ok(mut slot) = control.notifier_handle().lock()
     {
@@ -2432,19 +2504,13 @@ where
         }));
     }
 
-    // Adapt colours to the terminal background BEFORE `tty::init`, which
-    // redirects fd 1/2 to the stray-stdout log — the OSC 11 query has to reach
-    // the real terminal, and its reply has to come back off the real stdin.
-    // `/theme` overrides whatever this picks.
+    // Detect before `tty::init` redirects output; OSC 11 needs the real terminal.
     theme::set(theme::detect());
 
-    // Terminal setup with panic-safe restore hook (PART 0/2). Draws on a private
-    // tty handle; a dependency's stray stdout is redirected to `stray_log` so it
-    // can't corrupt the alternate screen. See tty.rs.
+    // A private TTY and redirected stray output protect the alternate screen.
     let (mut terminal, mut redirect) = tty::init(&stray_log)?;
 
-    // Presentation flows from the tools' declared metadata (glyph + category) —
-    // the single source of truth — so adding a tool needs no TUI edit.
+    // Tool metadata is the presentation source of truth.
     let tool_viz: HashMap<String, ToolViz> = kernel
         .executor
         .specs()
@@ -2480,9 +2546,7 @@ where
     .with_search(search_handle);
     model.mcp = mcp;
     model.agents = agents;
-    // Reflect the session's starting autonomy (from lock/MEDHA_MODE) in the TUI.
     model.autonomy = session.autonomy;
-    // Mirror the provider's streaming state (lock default) into the status bar.
     model.streaming = kernel.provider.streaming();
     // First run (nothing configured) or explicit `medha --setup`: open the
     // model-setup form immediately — the same surface `/model add` uses. The
@@ -2495,10 +2559,8 @@ where
     let mut ticker = tokio::time::interval(REDRAW_INTERVAL);
     let mut redraw_needed = true;
 
-    // Initial draw
     terminal.draw(|f| view(f, &mut model)).ok();
 
-    // Async event loop driven directly on the current runtime (PART 0.4).
     loop {
         if model.should_quit {
             break;
@@ -2511,7 +2573,6 @@ where
         let mut immediate = false;
 
         tokio::select! {
-            // Terminal events (input, resize, paste)
             maybe_ev = events.next() => {
                 match maybe_ev {
                     Some(Ok(CtEvent::Key(key))) => { update(&mut model, Msg::KeyPress(key), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
@@ -2532,9 +2593,7 @@ where
                     _ => {}
                 }
             }
-            // Agent events — process this one, then DRAIN the rest of the channel this
-            // wake so a burst of streaming tokens can't pile up and dump "3 at once".
-            // Consecutive text deltas coalesce naturally (appended to one buffer).
+            // Drain each burst so streaming deltas coalesce before the next frame.
             Some(ev) = rx.recv() => {
                 update(&mut model, Msg::AgentEvent(ev), &kernel, &mut session, &mut transcript, &budget, &tx);
                 let mut drained = 0u32;
@@ -2546,13 +2605,9 @@ where
                 if drained > 0 { tracing::trace!(drained, "coalesced agent events"); }
                 redraw_needed = true;
             }
-            // Tick for animations — only forces a redraw when something is actually
-            // moving (spinner/intro) or content changed; idle ticks cost nothing.
             _ = ticker.tick() => {
                 update(&mut model, Msg::Tick, &kernel, &mut session, &mut transcript, &budget, &tx);
-                // The welcome splash breathes/resonates continuously; a live turn
-                // has a spinner; a running background task animates its indicator;
-                // otherwise idle ticks cost nothing.
+                // Avoid redraws when no visible state is moving.
                 let running = model.bg_running();
                 if model.running || model.welcome || model.intro_frame.is_some() || model.dirty
                     || running > 0
@@ -2595,20 +2650,14 @@ where
 
     shutdown_foreground_turn(&mut model, &mut rx, TURN_SHUTDOWN_GRACE).await;
 
-    // Restore terminal on exit (PART 2): leave the alternate screen on the
-    // private handle, then undo the fd 1/2 redirection.
+    // Leave the alternate screen before undoing output redirection.
     tty::restore(&mut terminal, &mut redirect);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    /// Slash commands are dispatched before the mid-turn steer path, so they
-    /// work while a turn is running — which is the only time `/steer` is any
-    /// use, since a foreground batch blocks the parent for as long as its
-    /// children run. A command missing from `COMMANDS` silently stops being a
-    /// command and becomes chat: it would be swallowed into the parent's steer
-    /// queue with a "queued for this task" notice, looking like it worked.
+    /// Slash commands must bypass the mid-turn steering path.
     #[test]
     fn agent_commands_are_recognised_so_they_survive_a_running_turn() {
         assert!(super::is_slash_command("/steer tokio-research narrow it"));
@@ -2636,6 +2685,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tui_gate_prompt_returns_deny_when_its_turn_is_cancelled() {
+        let (tx, mut rx) = channel();
+        let gate = TuiGate { tx };
+        let cancel = CancellationToken::new();
+
+        let confirm = FOREGROUND_TURN_CANCEL.scope(
+            cancel.clone(),
+            kernel::HumanGate::confirm(&gate, "shell.exec: cargo test", None, false),
+        );
+        let observe_then_cancel = async {
+            let event = rx.recv().await.expect("approval request should be emitted");
+            let TuiEvent::Approval(_, _, _, Some(tag), _) = &event else {
+                panic!("approval should carry its foreground turn token");
+            };
+            assert!(!tag.is_cancelled());
+            cancel.cancel();
+            event
+        };
+
+        let (decision, event) = tokio::join!(confirm, observe_then_cancel);
+        assert_eq!(decision, kernel::Approval::Deny);
+        let TuiEvent::Approval(_, _, _, Some(tag), _) = event else {
+            unreachable!()
+        };
+        assert!(tag.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn tui_asker_returns_none_when_its_turn_is_cancelled() {
+        let (tx, mut rx) = channel();
+        let asker = TuiAsker { tx };
+        let cancel = CancellationToken::new();
+        let questions = vec![kernel::Question {
+            prompt: "Continue?".into(),
+            header: "Choice".into(),
+            options: vec![
+                kernel::QOption {
+                    label: "Yes".into(),
+                    description: String::new(),
+                    recommended: true,
+                },
+                kernel::QOption {
+                    label: "No".into(),
+                    description: String::new(),
+                    recommended: false,
+                },
+            ],
+            multi_select: false,
+        }];
+
+        let ask =
+            FOREGROUND_TURN_CANCEL.scope(cancel.clone(), kernel::Asker::ask(&asker, questions));
+        let observe_then_cancel = async {
+            let event = rx.recv().await.expect("question request should be emitted");
+            let TuiEvent::Clarify(_, Some(tag), _) = &event else {
+                panic!("question should carry its foreground turn token");
+            };
+            assert!(!tag.is_cancelled());
+            cancel.cancel();
+            event
+        };
+
+        let (answer, event) = tokio::join!(ask, observe_then_cancel);
+        assert!(answer.is_none());
+        let TuiEvent::Clarify(_, Some(tag), _) = event else {
+            unreachable!()
+        };
+        assert!(tag.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelled_gate_waiter_does_not_emit_a_second_approval_card() {
+        let (tx, mut rx) = channel();
+        let gate = Arc::new(TuiGate { tx });
+        let serial = Arc::new(futures::lock::Mutex::new(()));
+        let cancel = CancellationToken::new();
+
+        let calls = FOREGROUND_TURN_CANCEL.scope(cancel.clone(), async {
+            let first = {
+                let gate = Arc::clone(&gate);
+                let serial = Arc::clone(&serial);
+                async move {
+                    let _guard = serial.lock().await;
+                    kernel::HumanGate::confirm(gate.as_ref(), "first", None, false).await
+                }
+            };
+            let second = {
+                let gate = Arc::clone(&gate);
+                let serial = Arc::clone(&serial);
+                async move {
+                    let _guard = serial.lock().await;
+                    kernel::HumanGate::confirm(gate.as_ref(), "second", None, false).await
+                }
+            };
+            tokio::join!(first, second)
+        });
+        let cancel_after_first = async {
+            let first = rx.recv().await.expect("the first card should be emitted");
+            cancel.cancel();
+            drop(first);
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+        };
+
+        let ((first, second), extra) = tokio::join!(calls, cancel_after_first);
+        assert_eq!(first, kernel::Approval::Deny);
+        assert_eq!(second, kernel::Approval::Deny);
+        assert!(
+            extra.is_err(),
+            "a waiter queued at Esc emitted a stale card"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_permission_waiter_does_not_emit_a_second_approval_card() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let first_path = outside.join("first.txt");
+        let second_path = outside.join("second.txt");
+        std::fs::write(&first_path, "first").unwrap();
+        std::fs::write(&second_path, "second").unwrap();
+
+        let (tx, mut rx) = channel();
+        let gate = Arc::new(TuiGate { tx });
+        let sandbox = Arc::new(
+            WorkspaceSandbox::new(
+                &workspace,
+                temp.path().join("trust.lock"),
+                temp.path().join("audit.log"),
+                Some(gate),
+            )
+            .unwrap(),
+        );
+        let cancel = CancellationToken::new();
+
+        let requests = FOREGROUND_TURN_CANCEL.scope(cancel.clone(), async {
+            tokio::join!(
+                sandbox.resolve(first_path.to_str().unwrap()),
+                sandbox.resolve(second_path.to_str().unwrap())
+            )
+        });
+        let cancel_after_first = async {
+            let first = rx
+                .recv()
+                .await
+                .expect("the first path card should be emitted");
+            cancel.cancel();
+            drop(first);
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+        };
+
+        let ((first, second), extra) = tokio::join!(requests, cancel_after_first);
+        assert!(first.is_err());
+        assert!(second.is_err());
+        assert!(
+            extra.is_err(),
+            "a permission request queued at Esc emitted a stale card"
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_cancels_and_joins_active_turn_and_denies_all_approvals() {
         let mut model = Model::new(
             "m".into(),
@@ -2656,7 +2868,8 @@ mod tests {
             action: "fs.write".into(),
             detail: None,
             escalated: false,
-            responder: visible_tx,
+            cancel: None,
+            responder: ApprovalResponder::Standard(visible_tx),
         });
         let (queued_tx, queued_rx) = oneshot::channel();
         surface_tx
@@ -2664,6 +2877,7 @@ mod tests {
                 "shell.exec".into(),
                 None,
                 false,
+                None,
                 queued_tx,
             ))
             .unwrap();
@@ -2724,7 +2938,6 @@ mod tests {
         );
     }
 
-    // ---- mid-session skill manifest refresh ----
 
     #[test]
     fn refresh_skill_manifest_injects_saved_skill_same_session() {
@@ -2768,7 +2981,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- /rewind scope menu (step 2) ----
 
     #[test]
     fn rewind_scope_menu_hides_code_options_when_nothing_to_undo() {
@@ -2800,7 +3012,7 @@ mod tests {
         let opts = p.scope_options();
         assert_eq!(opts.len(), 4);
         assert_eq!(opts[0].1, Some(RewindScope::ConversationAndCode));
-        // "tracked" is deliberate (K18): only snapshot-tracked writes revert.
+        // Shell-side mutations without snapshots cannot be rolled back.
         assert!(
             opts[0].0.contains("3 tracked files"),
             "count shown: {}",
@@ -2816,11 +3028,14 @@ mod tests {
         assert_eq!(opts[3].1, None, "last row is cancel");
     }
 
-    // ---- PART 3: inline approval card ----
-
     #[test]
     fn approval_renders_heading_and_three_plain_options() {
-        let lines = render_approval("fs_write", Some("+ added line\n- removed line"), 0);
+        let lines = render_approval(
+            "fs_write",
+            Some("+ added line\n- removed line"),
+            0,
+            &["Yes, allow once", "Yes, always allow", "No, deny"],
+        );
         let out = block(&lines);
         assert!(out.contains("Allow"), "missing heading: {out}");
         // Exactly the three arrow-selectable options, as plain numbered text.
@@ -2839,14 +3054,14 @@ mod tests {
 
     #[test]
     fn approval_selection_marker_tracks_index() {
-        let sel0 = block(&render_approval("fs_write", None, 0));
-        let sel2 = block(&render_approval("fs_write", None, 2));
+        let opts = &["Yes, allow once", "Yes, always allow", "No, deny"];
+        let sel0 = block(&render_approval("fs_write", None, 0, opts));
+        let sel2 = block(&render_approval("fs_write", None, 2, opts));
         // The accent marker sits on the selected option's line.
         assert!(sel0.contains("▌ 1. Yes, allow once"));
         assert!(sel2.contains("▌ 3. No, deny"));
     }
 
-    // ---- input editing is byte-safe on multi-byte UTF-8 (no panic) ----
 
     #[test]
     fn typing_and_editing_multibyte_does_not_panic() {
@@ -2878,16 +3093,12 @@ mod tests {
         assert!(m.input.contains('😀'));
     }
 
-    // ---- PART 5: hunk-based diff ----
-
     #[test]
     fn diff_collapses_unchanged_runs_into_gaps() {
-        // 40 identical lines with a single change in the middle.
         let old: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
         let mut new = old.clone();
         new[20] = "line 20 CHANGED".to_string();
         let rows = hunk_rows(&old.join("\n"), &new.join("\n"));
-        // Far-away unchanged lines must be collapsed, not emitted one-by-one.
         assert!(
             rows.iter().any(|r| matches!(r, DiffRow::Gap(n) if *n > 0)),
             "expected a gap marker"
@@ -2896,7 +3107,6 @@ mod tests {
             rows.iter()
                 .any(|r| matches!(r, DiffRow::Ins(_, t) if t.contains("CHANGED")))
         );
-        // Only context (3) around the change on each side survives, never all 40 lines.
         let ctx = rows
             .iter()
             .filter(|r| matches!(r, DiffRow::Ctx(..)))
@@ -3043,9 +3253,7 @@ mod tests {
 
     #[test]
     fn text_and_reasoning_stream_into_separate_transcript_items() {
-        // The display side of the "answer hidden behind thinking" bug: text
-        // deltas must build ONE visible Assistant item; only Reasoning deltas
-        // may create a (collapsible) Thinking item.
+        // Text and reasoning must remain distinct transcript channels.
         let ui = lockfile::UiConfig::default();
         let mut m = Model::new(
             "m".into(),
@@ -3058,7 +3266,6 @@ mod tests {
         let mut session = kernel::Session::new();
         let mut transcript: Vec<Message> = Vec::new();
 
-        // A pure-text answer that mentions think tags — streamed in deltas.
         for d in [
             "Shape 2: `<think>",
             "` tags) and the rest ",
@@ -3082,7 +3289,6 @@ mod tests {
             "the full answer is one visible Assistant item"
         );
 
-        // Genuine reasoning deltas DO make a Thinking item, answer separate.
         update::handle_agent_event(
             &mut m,
             TuiEvent::Reasoning("planning".into()),
@@ -3107,8 +3313,6 @@ mod tests {
         );
     }
 
-    // Resume regression: tool RESULTS must replay into the transcript, not
-    // just the calls — outputs silently vanished from resumed sessions once.
     #[test]
     fn resumed_history_replays_tool_results_with_their_tool_names() {
         let ui = lockfile::UiConfig::default();
@@ -3181,8 +3385,7 @@ mod tests {
 
     #[test]
     fn streaming_incremental_render_matches_full_render() {
-        // K15: the prefix-cache path must produce byte-identical rows to a
-        // from-scratch render at every step of a simulated stream.
+        // Cached streaming rows must match a full render at every step.
         let cats = HashMap::new();
         let cx = RenderCtx {
             width: 12,
@@ -3207,7 +3410,7 @@ mod tests {
             assert_eq!(flat(&streamed), flat(&fresh), "diverged after {acc:?}");
             assert_eq!(streamed.height, fresh.height);
         }
-        // A width change invalidates the cached prefix (no stale-width rows).
+        // Width changes invalidate cached layout.
         streamed.invalidate();
         streamed.ensure(&cx, 7);
         let mut fresh = Entry::new(Item::Assistant(acc.clone()));
@@ -3221,8 +3424,7 @@ mod tests {
     #[test]
     fn wrap_line_measures_terminal_cells_not_chars() {
         use unicode_width::UnicodeWidthStr;
-        // K14: 4 CJK chars = 8 cells. At width 4 that's 2 rows of 2 chars each —
-        // char-counting would cram all 4 into one row and clip the terminal.
+        // Four CJK glyphs occupy eight terminal cells.
         let rows = wrap_line(&Line::from("你好世界"), 4);
         let texts: Vec<String> = rows.iter().map(text).collect();
         assert_eq!(texts, vec!["你好", "世界"]);
@@ -3340,11 +3542,9 @@ mod tests {
         assert!(out.contains("l15!"));
     }
 
-    // ---- PART 2: paste helpers ----
-
     #[test]
     fn strip_markers_removes_guards_but_keeps_content() {
-        // Content deliberately contains the digits/brackets the old trim logic would eat.
+        // Digits resembling guard markers remain content.
         let raw = "\u{1b}[200~code[200] = 0~ok\u{1b}[201~";
         assert_eq!(strip_paste_markers(raw), "code[200] = 0~ok");
     }
@@ -3365,15 +3565,6 @@ mod tests {
         );
     }
 
-    // ---- approval queue: concurrent approvals must not clobber each other ----
-    //
-    // Regression for the "rejected by human after I clicked yes" bug: the kernel
-    // dispatches tool calls concurrently (buffered), so several `confirm()`
-    // requests can arrive in one turn. The old single-slot `pending_approval`
-    // overwrote the prior request, dropping its `oneshot::Sender`. The kernel's
-    // `TuiGate::confirm` reads a dropped sender as `Approval::Deny` → the spurious
-    // "rejected by human". The queue must hold all of them.
-
     fn push_approval(model: &mut Model, action: &str) -> oneshot::Receiver<kernel::Approval> {
         push_approval_ex(model, action, false)
     }
@@ -3384,10 +3575,10 @@ mod tests {
         escalated: bool,
     ) -> oneshot::Receiver<kernel::Approval> {
         let (tx, rx) = oneshot::channel();
-        let ev = TuiEvent::Approval(action.to_string(), None, escalated, tx);
+        let ev = TuiEvent::Approval(action.to_string(), None, escalated, None, tx);
         // Drive the same path handle_agent_event uses, minus the generic plumbing.
         match ev {
-            TuiEvent::Approval(action, detail, escalated, responder) => {
+            TuiEvent::Approval(action, detail, escalated, cancel, responder) => {
                 if !escalated && model.auto_approve.contains(&action) {
                     let _ = responder.send(kernel::Approval::Once);
                 } else {
@@ -3396,7 +3587,8 @@ mod tests {
                         action,
                         detail,
                         escalated,
-                        responder,
+                        cancel,
+                        responder: ApprovalResponder::Standard(responder),
                     });
                     if was_empty {
                         model.approval_sel = 0;
@@ -3421,11 +3613,9 @@ mod tests {
             HashMap::new(),
             test_sbx(),
         );
-        // The user previously chose "always" for this exact action.
         m.auto_approve
             .insert("shell.exec: curl example.com".to_string());
 
-        // A normal request for it auto-approves (no card queued).
         let mut rx = push_approval_ex(&mut m, "shell.exec: curl example.com", false);
         assert!(
             m.pending_approvals.is_empty(),
@@ -3433,8 +3623,7 @@ mod tests {
         );
         assert_eq!(rx.try_recv(), Ok(kernel::Approval::Once));
 
-        // The SAME action, but trust-flow ESCALATED (web-tainted), must NOT be
-        // auto-approved — it queues a fresh card for review (K9).
+        // Trust escalation requires fresh review despite a remembered action.
         let _rx2 = push_approval_ex(&mut m, "shell.exec: curl example.com", true);
         assert_eq!(
             m.pending_approvals.len(),
@@ -3455,18 +3644,15 @@ mod tests {
             test_sbx(),
         );
 
-        // Two approvals arrive back-to-back (the concurrent-dispatch case).
         let mut rx1 = push_approval(&mut m, "Read access to /outside/a");
         let mut rx2 = push_approval(&mut m, "Read access to /outside/b");
 
-        // Both are queued; the first is the one rendered/answerable.
         assert_eq!(m.pending_approvals.len(), 2);
         assert_eq!(
             m.pending_approval().map(|p| p.action.as_str()),
             Some("Read access to /outside/a")
         );
 
-        // Answer the visible one (Yes, allow once). Its responder must fire.
         m.approval_ready = true;
         handle_approval_key(
             &mut m,
@@ -3474,14 +3660,12 @@ mod tests {
         );
         assert_eq!(rx1.try_recv(), Ok(kernel::Approval::Once));
 
-        // The second approval is now front-and-center — NOT dropped.
         assert_eq!(m.pending_approvals.len(), 1);
         assert_eq!(
             m.pending_approval().map(|p| p.action.as_str()),
             Some("Read access to /outside/b")
         );
 
-        // Answer it too; its responder fires as well (this was the dropped one).
         m.approval_ready = true;
         handle_approval_key(
             &mut m,
@@ -3493,19 +3677,19 @@ mod tests {
 
     #[test]
     fn esc_is_not_wired_to_deny_an_approval() {
-        // Esc must cancel a running turn, not answer "No" on a pending approval.
-        // Verify the deny arm no longer matches Esc: with a pending approval and
-        // approval_ready set, Esc must leave the queue untouched (the top-level
-        // handler intercepts it before handle_approval_key ever runs).
-        let lines = render_approval("fs_write", None, 0);
+        // Esc belongs to turn cancellation, not approval denial.
+        let lines = render_approval(
+            "fs_write",
+            None,
+            0,
+            &["Yes, allow once", "Yes, always allow", "No, deny"],
+        );
         let help = block(&lines);
         assert!(
             !help.contains("esc to reject"),
             "help text still ties Esc to deny: {help}"
         );
 
-        // And at the queue level: routing Esc through handle_approval_key must not
-        // pop or answer anything (Esc is handled by the caller, not here).
         let ui = lockfile::UiConfig::default();
         let mut m = Model::new(
             "m".into(),

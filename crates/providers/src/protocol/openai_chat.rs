@@ -372,8 +372,6 @@ pub(crate) fn vllm_tokenize_body(request: &PreparedModelRequest) -> serde_json::
     body
 }
 
-// ── response decoding ───────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
 struct StreamChunk {
     #[serde(default)]
@@ -528,7 +526,7 @@ pub(crate) fn parse_completion(
     let parsed: ChatCompletion = serde_json::from_str(body)
         .map_err(|error| ProviderError::Stream(format!("non-streaming response parse: {error}")))?;
     if let Some(error) = parsed.error {
-        return Err(ProviderError::Stream(error_message(error)));
+        return Err(ProviderError::Response(error_message(error)));
     }
 
     let mut blocks = Vec::new();
@@ -605,7 +603,7 @@ pub(crate) fn process_sse_event(
         return Ok(blocks);
     };
     if let Some(error) = chunk.error {
-        return Err(ProviderError::Stream(error_message(error)));
+        return Err(ProviderError::Response(error_message(error)));
     }
     if let Some(usage) = chunk.usage {
         blocks.push(usage_block(usage));

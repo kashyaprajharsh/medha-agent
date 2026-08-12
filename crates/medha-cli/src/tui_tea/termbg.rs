@@ -1,10 +1,8 @@
 //! Is the terminal's own background light or dark?
 //!
-//! Two tiers. **OSC 11** is what modern terminals actually answer; `COLORFGBG`
-//! is an xterm/rxvt convention macOS Terminal.app never sets, so a
-//! `COLORFGBG`-only probe fell through to dark and painted the dark palette onto
-//! a white canvas. Either tier may decline, and `None` means "would not say" —
-//! never a guess.
+//! Probe **OSC 11** first, then the xterm/rxvt `COLORFGBG` convention, which is
+//! absent in terminals such as macOS Terminal. Either tier may decline; `None`
+//! means the terminal did not report a value.
 
 #[cfg(test)]
 #[path = "termbg_tests.rs"]
@@ -53,11 +51,8 @@ fn query_luma() -> Option<f32> {
     out.write_all(b"\x1b]11;?\x1b\\").ok()?;
     out.flush().ok()?;
 
-    // Read straight from fd 0, not through `std::io::stdin()`. `Stdin` is
-    // BufReader-backed: its first read pulls the WHOLE reply into a userspace
-    // buffer and hands back one byte, after which poll(2) sees an empty kernel
-    // queue and reports "nothing ready" — so the loop gave up holding just the
-    // leading ESC. Unbuffered reads keep poll(2) and the data in the same place.
+    // Unbuffered fd reads keep `poll(2)` and the remaining reply in the same
+    // queue; `Stdin` buffering could consume bytes that `poll(2)` cannot see.
     let mut buf = Vec::with_capacity(64);
     let deadline = std::time::Instant::now() + QUERY_TIMEOUT;
     while std::time::Instant::now() < deadline && buf.len() < 64 {

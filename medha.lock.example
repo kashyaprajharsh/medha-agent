@@ -1,26 +1,20 @@
-# medha.lock — the harness artifact (§6). Copy to `medha.lock` in your project
-# root to version and share these settings. Absent file = every value below
-# stays at its built-in default (nothing changes for a bare checkout).
-# Env vars (MEDHA_MAX_TURNS, MEDHA_APPROVE, MEDHA_VERIFY, ...) still work as
-# quick session-level overrides on top of whatever this file specifies.
+# Copy to `medha.lock` in the project root to share portable settings.
+# Environment variables remain session-level overrides.
 
 [routing]
-# Seat for the provider router (§4.4) once a second model is wired for
-# cross-vendor adversarial verification. Not yet consulted by the kernel.
 # executor = "openai-compat://localhost:8000/qwen3-coder"
 # verifier = "openai-compat://together/llama-3.3-70b"
 
 [budget]
-# Per-task ceilings (§4.1/§18.5). Omit any field to leave it unbounded/default.
+# Per-task ceilings; omitted fields use built-in defaults.
 max_turns = 200
 # max_tokens = 5000000
 # max_cost_usd = 5.0
 # max_wall_s = 7200
-# max_parallel_tools = 10000   # concurrent tool calls per turn (§12)
+# max_parallel_tools = 10000   # concurrent tool calls per turn
 
 [context]
-# Compaction tuning (§4.3). These are the built-in defaults — override only if
-# you know what you're changing; get eval-gated once the Gate exists (§4.11).
+# Compaction thresholds and protected transcript regions.
 trigger_ratio = 0.99
 microcompact_ratio = 0.60
 tail_ratio = 0.20
@@ -31,9 +25,7 @@ emergency_ratio = 0.98
 
 [memory]
 enabled = true
-# Token budget for the memory index kept *in the prompt* every turn (recall is
-# injection, not a model-run search). Generous so the working set stays fully
-# in-context; raise it if you keep many memories, lower it to save prompt space.
+# Token budget for the memory index injected into each prompt.
 k3_budget_tokens = 3000
 write_approval = "user-scope" # "none" | "user-scope" | "all"
 stale_after_days = 30
@@ -44,9 +36,7 @@ max_chars = 20000
 progressive_discovery = true
 
 [lsp]
-# Automatic stateful diagnostics/navigation for Rust, TypeScript/JavaScript,
-# Python, Go, and C/C++ when their known language-server binary is installed.
-# Missing binaries are reported and cached; no package is silently downloaded.
+# Language servers start only from installed binaries; none are downloaded.
 enabled = true
 startup_timeout_ms = 10000
 request_timeout_ms = 8000
@@ -59,8 +49,7 @@ max_results = 200
 max_text_chars = 16000
 allow_network = false # local servers are network-denied unless explicitly enabled
 
-# Optional project-defined adapter. Medha previews this command and requires
-# one-time human approval through `lsp.start` before it can execute.
+# Project-defined adapters require approval before execution.
 # [[lsp.servers]]
 # id = "zls"
 # languages = ["zig"]
@@ -69,25 +58,20 @@ allow_network = false # local servers are network-denied unless explicitly enabl
 # trust = "workspace"
 
 [policy]
-# Tool classes requiring human approval before execution (§4.7). File writes
-# need a nod by default; shell is instead gated by the deterministic
-# dangerous-pattern scanner (blocks rm -rf/, sudo, credential reads, etc.) so
-# ordinary commands like `open` or `ls` don't need approval. Add "shell.exec"
-# here too if you want every shell command to ask first. [] = fully autonomous.
-approve = ["fs.write", "fs.edit", "skill.save"]
+# Otherwise-allowed tool classes that still require human approval.
+# Add "shell.exec" to require approval for every shell command.
+approve = ["fs.write", "fs.edit", "multi_edit", "skill.save"]
 
 [sandbox]
-# Execution isolation for shell/build/VCS commands (§4.8). Makes the containment
-# posture part of the portable harness artifact. Zero external dependencies —
-# uses the OS-native sandbox (macOS Seatbelt; Linux Landlock later), not Docker.
+# Execution isolation for shell, build, and VCS commands.
 #   backend = "native"  (default) → OS jail: writes confined to the workspace,
 #             temp, and dev caches; anything else (e.g. ~/.ssh) is blocked.
 #           = "host"              → no OS isolation (scanner + approval only).
 #           = "container"         → run each command in a throwaway docker/podman
 #             container (opt-in heavy tier; shells out, no daemon linked in).
 #             Requires `image`. Host env is NOT forwarded, so API keys stay put.
-#           = "ssh"               → run each command on a remote `host` (remote
-#             exec, not local isolation; assumes the workspace exists there).
+#           = "ssh"               → run on `host`; this is remote execution,
+#             not local isolation, and assumes the workspace exists there.
 # Override per-session with `--no-sandbox` or MEDHA_SANDBOX=host|native.
 # Misconfigured container/ssh falls back to the native jail with a warning.
 backend = "native"
@@ -99,24 +83,24 @@ backend = "native"
 # SSH tier (only used when backend = "ssh"):
 # host = "user@devbox"
 # remote_dir = "/home/user/project"
-# network: "allow" (default — cargo/npm/etc. can fetch) or "deny" (block all
-# network from confined commands — stronger containment for untrusted work).
-network = "allow"
+# network: "deny" (default — block all network from confined commands) or
+# "allow" (opt in when cargo/npm/etc. need to fetch).
+network = "deny"
 # Extra absolute paths the jail may write to, beyond workspace + temp + the
 # built-in dev caches (~/.cargo, ~/.rustup, ~/.npm, ~/.cache, ...).
 # extra_writable = ["/path/to/shared/build/dir"]
 
 [ui]
-# TUI presentation defaults (configure reasoning live with /reasoning).
+# Initial TUI presentation defaults.
 show_thinking = false
 full_transparency = false
 
 [verify]
-# Deterministic check run after file-modifying turns (§4.7). Empty = none.
+# Optional deterministic check after file-modifying turns.
 # command = "cargo check"
 
 [gate]
-# Eval scenario defaults (§4.11–4.12). `seeds` must be 1–100; counts above 10
+# Gate scenario defaults. `seeds` must be 1–100; counts above 10
 # require an explicit `medha gate ... --yes` acknowledgement because every seed
 # may spend the scenario's full model budget.
 scenarios_dir = "scenarios"
@@ -125,9 +109,7 @@ seeds = 1
 regression_epsilon = 0.0
 
 [reasoning]
-# Request-side thinking control for reasoning-capable models (§4.4) — sent as
-# chat_template_kwargs (vLLM/SGLang-style servers). Both fields optional; a
-# server/model without a matching knob just ignores what it doesn't support.
+# Optional request-side reasoning controls; unsupported knobs are ignored.
 # Live override: /reasoning in a TUI session.
 # enabled = true
 # effort = "medium"   # "low" | "medium" | "high" — not every server has all three

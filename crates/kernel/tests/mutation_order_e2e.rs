@@ -1,4 +1,3 @@
-//! Regression coverage for mutation commit ordering (AUD-003).
 //!
 //! The event log is the replay authority. If two same-turn mutations execute
 //! concurrently, the slower first call can commit last while observations are

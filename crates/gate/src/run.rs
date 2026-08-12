@@ -1,11 +1,4 @@
-//! Hermetic scenario runner (Vol 5 §5 isolation).
-//!
-//! Each run gets a throwaway workspace (the fixture, copied in), a throwaway
-//! `MEDHA_HOME` (so its event log is isolated and never touches the operator's
-//! real `~/.medha`), and the scenario's contract as budget env. We spawn the
-//! *real* `medha` binary — black-box, end-to-end, exactly as a user runs it —
-//! then read back the run's event log for scoring. This deliberately does not
-//! re-assemble the kernel in-process: the gate tests the shipped artifact.
+//! Hermetic black-box scenario runner using isolated workspace and state roots.
 
 use kernel::{Event, EventLog};
 use sandbox::run_command_bounded;
@@ -147,9 +140,7 @@ async fn run_once_owned(
     let home = root.join("home");
     let result: Result<(Vec<Event>, RunStatus, u128), GateError> = async {
         let fixture = scn.validated_fixture_dir().map_err(GateError::Scenario)?;
-        // Snapshot the repository-authored fixture exactly once, then derive the
-        // mutable workspace from that validated snapshot. A concurrent source
-        // change can no longer make the "before" and "after" baselines disagree.
+        // Derive both baselines from one validated snapshot.
         copy_dir(&fixture, &pristine)?;
         copy_dir(&pristine, &workspace)?;
         std::fs::create_dir_all(&home).map_err(|e| GateError::Run(format!("mkdir home: {e}")))?;
@@ -164,8 +155,7 @@ async fn run_once_owned(
         for (k, v) in &cfg.provider_env {
             cmd.env(k, v);
         }
-        // Eval runs are unattended — there is no human to answer an approval
-        // prompt, so the agent must run autonomously.
+        // Eval runs are unattended.
         cmd.env("MEDHA_APPROVE", "none");
         if let Some(t) = scn.contract.max_turns {
             cmd.env("MEDHA_MAX_TURNS", t.to_string());
@@ -180,8 +170,7 @@ async fn run_once_owned(
             cmd.env("MEDHA_MAX_WALL", w.to_string());
         }
 
-        // The child enforces MEDHA_MAX_WALL; this validated duration is the
-        // hard process-tree backstop with a fixed grace period.
+        // Backstop the child-enforced wall limit with process-tree teardown.
         let start = Instant::now();
         let status = supervise_agent_command_owned(cmd, hard_wall, &cancellation).await;
         let wall_ms = start.elapsed().as_millis();
@@ -896,10 +885,7 @@ mod tests {
             "nested helper did not acquire its file lock before the timeout"
         );
 
-        // If the tree survived, this releases its barrier and makes it leave a
-        // deterministic marker. The cross-process lock must already be reusable
-        // when scoring resumes, proving teardown was settled rather than merely
-        // signalled.
+        // Release the barrier only after teardown and lock release.
         assert!(
             fixture_lock_available(&lock_file),
             "nested helper still holds its file lock"

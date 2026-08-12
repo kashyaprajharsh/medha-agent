@@ -1,5 +1,3 @@
-//! Deterministic working-set pressure checks (D3/D10).
-
 use crate::recall::{
     DEFAULT_STALE_AFTER_DAYS, entry_index_tokens, full_index_tokens, index_eligible, one_line,
 };
@@ -78,7 +76,7 @@ fn assess_with_counter(
     })
 }
 
-/// Assess whether a new index-eligible write fits the complete K3 working set.
+/// Assess whether a new index-eligible write fits the complete working set.
 pub fn assess_write(
     store: &MemoryProjection,
     incoming: &MemoryEntry,

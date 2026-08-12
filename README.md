@@ -49,12 +49,20 @@ One binary. No Python, no Node, no Docker daemon — SQLite is compiled in and T
 <summary>Pin a version, change the location, or build from source</summary>
 
 ```bash
-MEDHA_VERSION=v0.1.7     curl -fsSL .../install.sh | sh   # pin a release
-MEDHA_INSTALL_DIR=~/bin  curl -fsSL .../install.sh | sh   # choose the destination
+version=v0.1.7
+curl -fsSL "https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/$version/install.sh" \
+  | MEDHA_VERSION="$version" sh                            # pin installer + binary
+
+curl -fsSL https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/main/install.sh \
+  | MEDHA_INSTALL_DIR="$HOME/bin" sh                       # choose the destination
 
 git clone https://github.com/kashyaprajharsh/medha-agent   # build it yourself (Rust 1.85+)
 cd medha-agent && cargo build --release
 ```
+
+Releases produced from this revision onward publish the archives and versioned
+installer scripts with keyless, signed build-provenance attestations. Verify a downloaded asset with
+`gh attestation verify <file> --repo kashyaprajharsh/medha-agent`.
 
 </details>
 
@@ -199,7 +207,7 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
   └──┬────────┬──────────┬──────────┬──────────┬───────────────┘
      │        │          │          │          │
  providers  context   policy    executor   event log
- OpenAI ·   compact   deny-     52 tools   SQLite WAL +
+ OpenAI ·   compact   deny-     53 tools   SQLite WAL +
  Gemini     + spill   first     sandboxed  SHA-256 chain
 ```
 
@@ -209,7 +217,7 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
 
 Pre-1.0 (`0.1.7`) — interfaces may still change.
 
-**Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 52 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation, graceful interrupts, the ACP bridge, and the Eval Gate.
+**Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 53 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation, graceful interrupts, the ACP bridge, and the Eval Gate.
 
 **Next:** native Anthropic Messages and OpenAI Responses protocols, cross-vendor adversarial verification, span-level trust taint, and trace→skill distillation.
 

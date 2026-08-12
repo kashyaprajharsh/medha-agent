@@ -1,4 +1,4 @@
-//! Append-only event log — the single source of truth (P3, Vol 3 §3).
+//! Append-only event log and source of truth.
 //! State is a projection of the log; the kernel is the only writer.
 
 use crate::errors::KernelError;
@@ -9,6 +9,7 @@ use crate::types::{
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use ulid::Ulid;
 
@@ -28,43 +29,30 @@ pub enum EventKind {
     ModelMessage,
     ToolObs,
     PolicyDecision,
-    /// Durable write-ahead marker emitted after authorization and immediately
-    /// before a state-changing executor call. If the process/log fails before
-    /// the final observation, replay still shows that the effect may have
-    /// committed and includes the complete admitted intent.
+    /// Write-ahead marker emitted between authorization and a state-changing call,
+    /// so a crash still leaves replay knowing the effect may have committed.
     ToolEffectPrepared,
     Compaction,
     Session,
-    /// Full reasoning/thinking content for a turn — logged for complete
-    /// transparency/audit (P3/P7), even though it's excluded from the
-    /// conversation history sent back to the model.
+    /// Reasoning retained for audit but excluded from model history.
     ModelReasoning,
-    /// A processed interrupt (steer applied / turn cancelled) — audit trail
-    /// (Vol 3's Interrupt kind). Steer text ALSO logs as `user.message`, so
-    /// projection ignores this kind entirely.
+    /// A processed interrupt; steer text also logs as `user.message`.
     Interrupt,
-    /// A memory write/update/forget/pin (D1). Payload = the `memory` crate's
+    /// A memory write/update/forget/pin. Payload = the `memory` crate's
     /// `MemoryOp`, kept as opaque JSON here — the kernel doesn't parse it.
     MemoryWrite,
     ContextFileLoaded,
     ContextFileBlocked,
-    /// A sub-agent's lifecycle (§6.2). The child's own transcript lives under
-    /// its own session id; these record the delegation itself, on the parent's
-    /// chain, so a run is auditable without reading the child.
+    /// A sub-agent lifecycle event on the parent's chain.
     AgentSpawned,
     AgentCompleted,
     AgentFailed,
     AgentCancelled,
-    /// A background agent's report handed to the session that dispatched it.
-    /// Delivery has to be recorded, or replaying the log re-injects the report.
+    /// A delivered background-agent report.
     AgentDelivered,
-    /// A writing agent's patch (§6.4), on the dispatching session's chain. The
-    /// child's worktree is reaped as soon as the diff is taken, so this event is
-    /// the only place the work still exists — without it a patch dies with the
-    /// process that produced it.
+    /// A writing agent's durable patch.
     AgentPatch,
-    /// A patch merged into the working tree. Closes the record, so a restart
-    /// does not offer already-applied work as still outstanding.
+    /// A patch merged into the working tree.
     AgentApplied,
 }
 
@@ -129,8 +117,7 @@ pub struct Provenance {
     pub source: String,
 }
 
-/// One typed, hash-chained record. `prev_hash` makes the log tamper-evident
-/// (Vol 3 §3) — the SHA-256 link is computed by [`chain_hash`].
+/// One typed, hash-chained record. `prev_hash` makes the log tamper-evident.
 #[derive(Clone)]
 pub struct Event {
     pub id: Ulid,
@@ -198,21 +185,14 @@ impl Event {
         Self::user_input(s, text, TrustLabel::User)
     }
 
-    /// A message entering the conversation on the user's channel, labelled with
-    /// where the content actually came from.
-    ///
-    /// A sub-agent's report arrives this way. Recording it as `User` made replay
-    /// hand it back as if the operator had typed it, so taint the child picked
-    /// up survived the turn but not a resume.
+    /// A message on the user's channel, labelled with where the content actually
+    /// came from. Recording a sub-agent's report as `User` lost its taint on resume.
     pub fn user_input(s: &Session, text: &str, trust: TrustLabel) -> Self {
         Self::new(s, EventKind::UserMessage, json!({ "text": text }), trust)
     }
 
-    /// An explicit retry of one already-admitted user-channel event.
-    ///
-    /// Replay may coalesce this record only when `retry_of` resolves to a prior
-    /// event with identical text, trust, and provenance. Ordinary repeated
-    /// text is never guessed to be a retry.
+    /// An explicit retry of an already-admitted user-channel event. Coalesced on
+    /// replay only when `retry_of` matches; repeated text is never guessed.
     pub fn user_input_retry(s: &Session, text: &str, trust: TrustLabel, retry_of: Ulid) -> Self {
         Self::new(
             s,
@@ -222,10 +202,8 @@ impl Event {
         )
     }
 
-    /// A sub-agent starting, recorded on the child's own chain so its session is
-    /// self-describing: the objective it was given is the first thing in it. The
-    /// parent's chain already carries the `agent.spawn` intent and its result, so
-    /// the two link both ways without threading a parent id through the runtime.
+    /// A sub-agent starting, on the child's own chain so its session is
+    /// self-describing. The parent's `agent.spawn` intent links the other way.
     pub fn agent_spawned(s: &Session, name: &str, objective: &str, tools: &[String]) -> Self {
         Self::new(
             s,
@@ -236,17 +214,11 @@ impl Event {
         )
     }
 
-    /// A background agent dispatched, recorded on the *dispatching* session's
-    /// chain. This is the outbox row: its presence without a terminal event is
-    /// what makes an orphaned child visible after a crash.
-    ///
-    /// `dispatch` identifies this handout, `child` the session that serves it. A
-    /// follow-up reuses the child session, so folding on `child` would read the
-    /// first report's delivery as closing every later one.
-    ///
-    /// `instance` identifies the owning process and names its OS-backed lease.
-    /// The durable identity avoids pid-reuse ambiguity; recovery must prove the
-    /// corresponding process lock is no longer held before closing the row.
+    /// A background agent dispatched, on the dispatching session's chain. The
+    /// outbox row: present without a terminal event means an orphaned child.
+    /// `dispatch` is the handout, `child` the session serving it — a follow-up
+    /// reuses the session, so folding on `child` would over-close. `instance`
+    /// names the owning process lease, which recovery must prove released.
     pub fn agent_dispatched(
         s: &Session,
         dispatch: Ulid,
@@ -297,12 +269,9 @@ impl Event {
         )
     }
 
-    /// A writing agent's patch, on the dispatching session's chain (§6.4).
-    ///
-    /// The child's worktree is reaped the moment the diff is taken, so this
-    /// record *is* the work. It carries the parent's own label rather than the
-    /// child's: the diff is generated by git from the child's edits, not
-    /// authored content, and the child's trust already rides its report.
+    /// A writing agent's patch on the dispatching session's chain. The worktree is
+    /// reaped once the diff is taken, so this record is the work. Labelled with the
+    /// parent's trust — git generated it, and the child's trust rides its report.
     pub fn agent_patch(s: &Session, dispatch: Ulid, name: &str, child: Ulid, patch: Value) -> Self {
         Self::new(
             s,
@@ -374,13 +343,13 @@ impl Event {
 
     /// A tool observation, tagged with the provenance of its content. Local
     /// tools pass `TrustLabel::Tool`; web-facing tools pass `TrustLabel::Web`
-    /// so downstream layers can treat fetched content as untrusted (P7).
+    /// so downstream layers can treat fetched content as untrusted.
     pub fn tool_obs(s: &Session, o: &Observation, trust: TrustLabel) -> Self {
         let payload = serde_json::to_value(o).unwrap_or(Value::Null);
         Self::new(s, EventKind::ToolObs, payload, trust)
     }
 
-    /// A memory mutation (D1). `op` is the memory crate's `MemoryOp` JSON —
+    /// A memory mutation. `op` is the memory crate's `MemoryOp` JSON —
     /// opaque here; the projection rebuilds from it.
     pub fn memory_write(s: &Session, op: Value) -> Self {
         Self::new(s, EventKind::MemoryWrite, op, TrustLabel::Memory)
@@ -449,8 +418,6 @@ impl Event {
         after_tokens: u32,
         summary: Option<&str>,
     ) -> Self {
-        // Compatibility constructor for old callers and old summary-only
-        // records. New kernel compactions use `compaction_snapshot` below.
         Self::new(
             s,
             EventKind::Compaction,
@@ -459,13 +426,9 @@ impl Event {
         )
     }
 
-    /// Persist the exact post-compaction request views.
-    ///
-    /// `messages` is the legacy/control representation consumed by the context
-    /// engine. `ordered` is the canonical provider representation, including
-    /// opaque replay state. Keeping both avoids deriving either lossy view on
-    /// resume and makes a compaction event a true projection checkpoint rather
-    /// than merely a copy of its middle summary.
+    /// Persist both post-compaction request views — `messages` for the context
+    /// engine, `ordered` for the provider including opaque state. Keeping both
+    /// makes the event a real checkpoint rather than a lossy derivation.
     pub fn compaction_snapshot(
         s: &Session,
         before_tokens: u32,
@@ -504,13 +467,9 @@ pub struct SessionMeta {
     pub events: u64,
 }
 
-/// An owned, RAII mutation lease.
-///
-/// The kernel deliberately knows nothing about how a durable backend
-/// coordinates writers. In-memory logs return an empty lease; persistent logs
-/// can keep an OS/file/database lock alive inside this value. Dropping the
-/// value releases the lease, which makes it possible to hold coordination
-/// across the tool side effect and every event that records that effect.
+/// An owned, RAII mutation lease. The kernel knows nothing about how a backend
+/// coordinates writers — in-memory logs return an empty lease, persistent ones
+/// keep a lock alive here across the side effect and the events recording it.
 #[must_use = "dropping a mutation lease allows another state change to begin"]
 pub struct MutationLease {
     _guard: Option<Box<dyn MutationLeaseGuard>>,
@@ -540,13 +499,9 @@ pub trait EventLog: Send + Sync {
     async fn append(&self, e: Event) -> Result<Event, KernelError>;
     async fn events(&self, session: Ulid) -> Vec<Event>;
 
-    /// Acquire the durable writer lane for one state identity.
-    ///
-    /// The lease must remain alive from immediately before the tool side
-    /// effect through its `ToolObs` and any derived projection event. Backends
-    /// that cannot be shared between processes may use this no-op default;
-    /// [`crate::Kernel`] also holds its in-memory mutation mutex over the same
-    /// region.
+    /// Acquire the durable writer lane for one state identity. The lease must
+    /// stay alive from before the side effect through its `ToolObs` and any
+    /// derived event. Single-process backends can use this no-op default.
     async fn acquire_mutation_lease(
         &self,
         _mutation_key: &str,
@@ -560,28 +515,18 @@ pub trait EventLog: Send + Sync {
         Vec::new()
     }
 
-    /// Fork a session into a new branch that shares its history *before*
-    /// `at_event` (§18.4 time-travel). The prefix events are re-appended under a
-    /// fresh session id — a new, independently hash-valid chain — so the original
-    /// session is never mutated (append-only holds) and the fork can be continued
-    /// on its own. Returns the new session id. This is what makes rewind
-    /// non-destructive: you branch off a past point instead of erasing the future.
-    ///
-    /// `at_event` is a *cut before*: the new session contains every event that
-    /// preceded it, and none from `at_event` onward. The default impl reconstructs
-    /// the prefix via [`Self::events`] + [`Self::append`], so any backend gets a
-    /// correct fork for free; a store may override for efficiency.
+    /// Fork a session, re-appending everything before `at_event` under a fresh id
+    /// as an independently hash-valid chain, so the original is never mutated.
+    /// This is what makes rewind non-destructive. `at_event` is a cut *before* it.
+    /// The default impl rebuilds via [`Self::events`] + [`Self::append`].
     async fn fork(&self, session: Ulid, at_event: Ulid) -> Result<Ulid, KernelError> {
         let events = self.events(session).await;
         let idx = cut_index(&events, at_event).ok_or_else(|| {
             KernelError::Log(format!("event {at_event} not in session {session}"))
         })?;
         let new_id = Ulid::new();
-        // Stamp clones with fork time, not the original timestamps (K17):
-        // the /resume picker sorts sessions by newest event, and a branch
-        // carrying old timestamps sinks to the bottom the moment it's made.
-        // A tiny monotonic increment preserves intra-fork order for any
-        // consumer that sorts by ts (storage order itself is by rowid).
+        // Fresh timestamps keep the branch visible in newest-first session
+        // lists; the increment preserves intra-fork order.
         let forked_at = now_ts();
         for (i, e) in events[..idx].iter().enumerate() {
             let mut clone = e.clone();
@@ -598,10 +543,8 @@ pub trait EventLog: Send + Sync {
     }
 }
 
-/// Position of `at_event` within an ordered event slice — the cut point for
-/// rewind/fork. Everything at index `< cut_index` is the retained prefix;
-/// everything from the returned index onward is the discarded (or rolled-back)
-/// future. `None` if the event isn't in the slice.
+/// Cut point for rewind/fork: everything below the returned index is retained,
+/// everything from it onward is discarded. `None` if the event isn't present.
 pub fn cut_index(events: &[Event], at_event: Ulid) -> Option<usize> {
     events.iter().position(|e| e.id == at_event)
 }
@@ -615,24 +558,58 @@ pub struct FileRollback {
     pub snapshot: Option<String>,
 }
 
-/// Compute the file-level rollback that returns the workspace to its state at
-/// the cut point — i.e. undo every file write logged from `at_event` onward
-/// (§18.4). Walks the write-family tool observations (those carrying a `path`
-/// plus a `snapshot` field) that occur at/after the cut and, for each path,
-/// keeps the EARLIEST one: its `snapshot` is that file's content *before* the
-/// first post-cut write, which is exactly its state at the cut. `None` snapshot
-/// ⇒ the file didn't exist yet, so rewinding deletes it. One entry per path, so
-/// the result is order-independent to apply.
-///
-/// The event log holds the full tool result (P3), including the snapshot id the
-/// sandbox returns on every write — so this reads purely from the log, no
-/// separate write journal. If `at_event` isn't found, returns an empty plan
-/// (nothing to undo) rather than erroring.
+/// Normalize recorded write paths so aliases share one rollback entry.
+fn rollback_path_identity(path: &str, workspace_root: &Path) -> String {
+    let path = Path::new(path);
+    let rooted = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+    let identity = rooted.canonicalize().unwrap_or_else(|_| {
+        let mut normalized = PathBuf::new();
+        for component in rooted.components() {
+            match component {
+                Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+                Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    let can_pop = matches!(
+                        normalized.components().next_back(),
+                        Some(Component::Normal(_))
+                    );
+                    if can_pop {
+                        normalized.pop();
+                    } else if !normalized.has_root() {
+                        normalized.push("..");
+                    }
+                }
+                Component::Normal(part) => normalized.push(part),
+            }
+        }
+        normalized
+    });
+    identity.to_string_lossy().into_owned()
+}
+
+/// Return one rollback entry per written path at or after `at_event`.
+/// The earliest post-cut snapshot restores the path's state at the cut;
+/// `None` means the path must be deleted.
 pub fn rollback_plan(events: &[Event], at_event: Ulid) -> Vec<FileRollback> {
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    rollback_plan_in(events, at_event, &workspace_root)
+}
+
+/// Compute a rollback plan relative to the execution workspace.
+pub fn rollback_plan_in(
+    events: &[Event],
+    at_event: Ulid,
+    workspace_root: &Path,
+) -> Vec<FileRollback> {
     let Some(idx) = cut_index(events, at_event) else {
         return Vec::new();
     };
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut plan = Vec::new();
     for e in &events[idx..] {
         if e.kind != EventKind::ToolObs {
@@ -650,7 +627,7 @@ pub fn rollback_plan(events: &[Event], at_event: Ulid) -> Vec<FileRollback> {
         let Some(path) = result.get("path").and_then(Value::as_str) else {
             continue;
         };
-        if !seen.insert(path) {
+        if !seen.insert(rollback_path_identity(path, workspace_root)) {
             continue; // keep the earliest write per path — that's the cut state
         }
         let snapshot = result
@@ -665,8 +642,7 @@ pub fn rollback_plan(events: &[Event], at_event: Ulid) -> Vec<FileRollback> {
     plan
 }
 
-/// In-memory log for Phase 0. The SQLite WAL + FTS5 backend (Vol 3 §3) is a
-/// drop-in replacement behind this same trait.
+/// In-memory event log.
 pub struct InMemoryLog {
     inner: Mutex<Vec<Event>>,
     last_hash: Mutex<[u8; 32]>,
@@ -726,13 +702,9 @@ fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// The canonical tamper-evident link. Persistence backends call this exact
-/// function so in-memory and on-disk logs produce identical hashes.
-///
-/// Version 2 uses a domain-separated, length-framed encoding and authenticates
-/// every stored event field: chain version, prior hash, event/session/parent
-/// ids, kind, payload, trust, provenance, and timestamp. Store migration code
-/// upgrades valid version-1 rows transactionally before exposing the log.
+/// The canonical tamper-evident link — every backend calls this so in-memory and
+/// on-disk logs hash identically. Version 2 is domain-separated and length-framed
+/// and authenticates every stored field; v1 rows are migrated at open.
 pub fn chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
     match e.hash_version {
         1 => legacy_chain_hash(prev, e),
@@ -952,12 +924,6 @@ fn compacted_ordered_snapshot(payload: &Value) -> Option<Vec<ModelMessage>> {
     Some(compaction_snapshot(payload)?.ordered)
 }
 
-/// Reconstruct the conversation as `Vec<Message>` from a session's events — the
-/// projection P3 promises ("state is a projection of the log"). A model turn's
-/// text + tool intents collapse into one assistant message, followed by its
-/// tool-result messages. The system prompt is omitted (regenerated fresh each
-/// run); reasoning / policy / compaction events are skipped (scratch/governance,
-/// not conversation). This is what a resumed session is rebuilt from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UserAdmission {
     session_id: Ulid,
@@ -966,12 +932,9 @@ struct UserAdmission {
     provenance: String,
 }
 
-/// Return whether this event represents a new admitted input.
-///
-/// Text equality is intentionally irrelevant unless the durable event
-/// explicitly points at the identity it retries. The complete admission tuple
-/// must also match, so a forged/malformed retry marker cannot erase a weaker
-/// trust label or different provenance.
+/// Whether this event is a new admitted input. Text equality is irrelevant unless
+/// the event names what it retries, and the full admission tuple must match, so a
+/// forged retry marker cannot erase a weaker trust label.
 fn is_new_user_admission(
     event: &Event,
     admissions: &mut std::collections::HashMap<Ulid, UserAdmission>,
@@ -1157,10 +1120,6 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                 if e.payload.get("snapshot").is_some() {
                     continue;
                 }
-                // Backward compatibility for summary-only compaction events.
-                // Their protected boundaries cannot be recovered, but the
-                // summary itself still belongs on the assistant channel, just
-                // as it did in the live compacted request.
                 if let Some(summary) = e.payload.get("summary").and_then(Value::as_str) {
                     if !summary.trim().is_empty() {
                         canonical_call_ids.clear();
@@ -1402,15 +1361,8 @@ fn close_dangling_ordered_tool_calls(messages: Vec<ModelMessage>) -> Vec<ModelMe
     out
 }
 
-/// Close any tool call left unanswered — the case where a session was
-/// interrupted (Esc/crash) *between* logging a `model.tool_intent` and its
-/// `tool.observation`. The projected assistant message then carries a
-/// `tool_calls` entry with no matching tool result, and every subsequent turn of
-/// the resumed session is rejected by the provider (400: an assistant tool_call
-/// must be followed by a tool result) — resume is permanently bricked. We
-/// synthesize a `[interrupted]` tool result for each dangling call so the
-/// history is a valid request again. Placed right after the assistant's real
-/// results, before the next message.
+/// Close unanswered calls after interruption by synthesizing `[interrupted]`
+/// results. This preserves provider tool-call grammar on resume.
 fn close_dangling_tool_calls(msgs: Vec<Message>) -> Vec<Message> {
     use crate::types::Role;
     let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
@@ -1452,12 +1404,9 @@ pub struct ChainError {
     pub event_id: Ulid,
 }
 
-/// Recompute the hash chain over `events` (in append order) and confirm each
-/// event's stored `prev_hash` equals the running hash of everything before it.
-/// This actually *enforces* the tamper-evidence the log claims (Vol 3 §3): any
-/// altered payload/kind/timestamp/order in event *i* breaks event *i+1*'s link.
-/// The chain is global (across sessions), so pass the full log in append order,
-/// not a single session's slice.
+/// Recompute the chain over `events` and confirm each `prev_hash` matches the
+/// running hash, so any altered field or order breaks the next link. The chain is
+/// global — pass the full log in append order, not one session's slice.
 pub fn verify_chain(events: &[Event]) -> Result<(), ChainError> {
     let mut prev = [0u8; 32];
     for (index, e) in events.iter().enumerate() {
@@ -1548,12 +1497,10 @@ mod tests {
             Event::user_message(&s, "first task"),
             Event::model_text(&s, "did the first thing"),
             Event::user_message(&s, "second task"),
-            // A Full compaction fired here, summarizing everything above.
             Event::compaction(&s, 1000, 200, Some("HANDOFF: goal + progress")),
             Event::user_message(&s, "third task"),
         ];
         let msgs = project_messages(&events);
-        // Pre-compaction history collapses into the summary; post-compaction stays.
         assert!(
             msgs[0].content.contains("HANDOFF: goal + progress"),
             "summary is the head: {msgs:?}"
@@ -2056,8 +2003,6 @@ mod tests {
 
     #[test]
     fn hash_is_full_width_sha256() {
-        // Regression against the old DefaultHasher placeholder, which only
-        // filled the first 8 of 32 bytes (the rest stayed zero).
         let h = chain_hash(&[0u8; 32], &ev());
         assert!(
             h[8..].iter().any(|&b| b != 0),
@@ -2150,6 +2095,30 @@ mod tests {
     }
 
     #[test]
+    fn rollback_plan_deduplicates_raw_aliases_of_one_physical_path() {
+        let s = Session::new();
+        let write = |intent: &str, path: &str, snap: &str| {
+            let payload = json!({ "path": path, "written": true, "snapshot": snap });
+            Event::tool_obs(&s, &Observation::ok(intent, payload), TrustLabel::Tool)
+        };
+        let cut = Event::user_message(&s, "rewind here");
+        let cut_id = cut.id;
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let absolute = format!("{}/src/events.rs", env!("CARGO_MANIFEST_DIR"));
+        let relative_alias = "src/./events.rs";
+        let events = vec![
+            cut,
+            write("first", relative_alias, "BEFORE_FIRST_WRITE"),
+            write("second", &absolute, "AFTER_FIRST_WRITE"),
+        ];
+
+        let plan = rollback_plan_in(&events, cut_id, workspace);
+        assert_eq!(plan.len(), 1, "one physical target must be restored once");
+        assert_eq!(plan[0].path, relative_alias);
+        assert_eq!(plan[0].snapshot.as_deref(), Some("BEFORE_FIRST_WRITE"));
+    }
+
+    #[test]
     fn fork_branches_a_prefix_into_a_new_independent_session() {
         use futures::executor::block_on;
         let log = InMemoryLog::new();
@@ -2173,16 +2142,12 @@ mod tests {
             "events re-homed onto the branch"
         );
 
-        // The original session is untouched (append-only preserved).
         assert_eq!(block_on(log.events(s.id)).len(), 3);
 
-        // Projecting the branch yields the single retained user turn.
         let msgs = project_messages(&branch);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "one");
 
-        // K17: fork clones are stamped with fork time, not the originals' —
-        // so the fresh branch sorts to the TOP of a newest-first session list.
         let original = block_on(log.events(s.id));
         assert!(
             branch[0].ts >= original[0].ts,

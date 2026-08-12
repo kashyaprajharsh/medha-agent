@@ -1,8 +1,5 @@
-//! The kernel loop. Deliberately boring; all intelligence lives in modules.
-//! The model proposes blocks; the kernel disposes via validate→police→
-//! verify→execute (Vol 1 §4.1, Vol 3 §4). Phase 0 wires the spine and the
-//! multi-turn tool loop; Policy and Verifier are stubbed (the executor's tools
-//! are sandbox-jailed) until their crates land.
+//! The multi-turn kernel loop: models propose blocks and the kernel validates,
+//! authorizes, verifies, and executes them.
 
 use crate::context::ContextEngine;
 use crate::errors::KernelError;
@@ -17,13 +14,11 @@ use crate::types::{
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 
-/// Default cap on tool calls executed concurrently within one turn (§12).
+/// Default cap on tool calls executed concurrently within one turn.
 /// Overridable via `[budget] max_parallel_tools` in `medha.lock` or
 /// `MEDHA_MAX_PARALLEL_TOOLS`, or per session via [`Kernel::with_max_parallel_tools`].
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 16;
 
-/// A short, human-readable preview of what an intent will do — shown at the
-/// approval gate. (A rendered diff via tool dry-run is a later refinement.)
 fn approval_detail(intent: &ToolIntent) -> String {
     let s = |k: &str| intent.args.get(k).and_then(|v| v.as_str()).unwrap_or("");
     match intent.tool.as_str() {
@@ -41,7 +36,7 @@ fn approval_detail(intent: &ToolIntent) -> String {
     }
 }
 
-/// The auto-approve scope key for the human gate (K9): the tool plus its most
+/// The auto-approve scope key for the human gate: the tool plus its most
 /// salient argument, so "always allow" is scoped to *this* action — approving
 /// `rm -rf build/` doesn't then auto-approve every future `shell.exec`. Falls
 /// back to the bare tool name for tools with no obvious identifying arg.
@@ -152,12 +147,9 @@ fn legacy_views(message: &ModelMessage) -> Vec<Message> {
     }
 }
 
-/// Reuse exact canonical messages retained by a compaction result.
-///
-/// Message values are deliberately not searched: two turns can have identical
-/// legacy text while carrying different signed/opaque provider state. The
-/// context engine supplies the exact input occurrence for retained messages;
-/// generated or rewritten messages are bridged from their legacy form.
+/// Reuse exact canonical messages retained by a compaction result. Matched by
+/// occurrence, not value — identical legacy text can carry different opaque
+/// provider state.
 fn reconcile_ordered(
     compiled: &[Message],
     ordered: &[ModelMessage],
@@ -304,21 +296,19 @@ pub struct Kernel<P: Provider, L: EventLog> {
     pub verifier: Arc<dyn crate::verify::Verifier>,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     max_parallel_tools: usize,
-    /// Resolved model pricing (P1-12); `None` = cost unknown, meter stays off.
     pricing: Option<crate::types::Pricing>,
     /// Serializes human-gate prompts: parallel tool dispatch must not pop
-    /// several approval cards at once (P2 gate race).
+    /// several approval cards at once.
     gate_serial: futures::lock::Mutex<()>,
     /// Orders state-changing turns across concurrent root/child sessions. The
     /// guard spans execution through durable observation logging, so another
     /// mutation cannot commit in the gap before replay learns about this one.
     mutation_serial: Arc<tokio::sync::Mutex<()>>,
-    /// Post-cancel settle window for in-flight tools (tunable in tests).
     settle_grace: std::time::Duration,
 }
 
 /// Tool-result payloads larger than this spill to the artifact store and are
-/// replaced in-context by a head + a `read_artifact` reference (§4.5).
+/// replaced in-context by a head and a `read_artifact` reference.
 const SPILL_THRESHOLD: usize = 16_000;
 
 /// Absolute per-turn ingestion limits. These are deliberately independent of
@@ -329,7 +319,7 @@ const MAX_PROVIDER_STREAM_BLOCKS: usize = 16_384;
 const MAX_PROVIDER_STREAM_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many times a turn's model stream is retried on a transient provider
-/// failure (429 / 5xx / network drop) before giving up (K3).
+/// failure (429 / 5xx / network drop) before giving up.
 const MAX_TURN_RETRIES: u32 = 3;
 /// Bound measure → compact → remeasure so a pathological compressor cannot
 /// rewrite the same turn indefinitely.
@@ -377,12 +367,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     }
 
     /// A kernel for a sub-session: same provider, log, artifacts, policy and
-    /// verifier, but its own executor, context engine and gate.
-    ///
-    /// Everything that shapes how a run behaves — pricing, tool parallelism,
-    /// progressive context, the settle window — is inherited. Rebuilding a
-    /// child with `Kernel::new` silently dropped all of it: a child metered no
-    /// cost at all, so a shared cost ceiling could never trip on its spend.
+    /// verifier, but its own executor, context engine and gate. Pricing,
+    /// parallelism and the settle window are inherited, not rebuilt.
     pub fn derive(
         &self,
         executor: Arc<dyn Executor>,
@@ -407,18 +393,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
     }
 
-    /// Set resolved model pricing so the governor meters real dollars (P1-12).
+    /// Set resolved model pricing so the governor meters real dollars.
     pub fn with_pricing(mut self, pricing: Option<crate::types::Pricing>) -> Self {
         self.pricing = pricing;
         self
     }
 
-    /// Replace the deterministic verifier for a derived execution context.
-    ///
-    /// Writer sub-agents use this to disable the parent's fixed-directory
-    /// verifier: their checkout is verified authoritatively by the orchestrator
-    /// after patch extraction, while running the parent's verifier here would
-    /// check the wrong tree.
+    /// Replace the deterministic verifier for a derived context. Writer
+    /// sub-agents disable the parent's, which would check the wrong tree.
     pub fn with_verifier(mut self, verifier: Arc<dyn crate::verify::Verifier>) -> Self {
         self.verifier = verifier;
         self
@@ -460,8 +442,6 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     /// stop / cancel) — a steer that raced the final turn must reach the
     /// surface, never evaporate.
     fn return_unapplied_steers(q: &mut crate::interrupts::InterruptQueue, sink: &dyn StreamSink) {
-        // The surface gets the text back to put in its input box; the label
-        // matters only to the loop that would have applied it.
         let leftover: Vec<String> = q.drain_steers().into_iter().map(|(text, _)| text).collect();
         if !leftover.is_empty() {
             sink.steers_returned(&leftover);
@@ -470,7 +450,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
     /// Spill an oversized tool-result payload to the artifact store, returning a
     /// truncated head + a `read_artifact` pointer. The full payload is still in
-    /// the event log (P3), so nothing is lost — only the *live context* shrinks.
+    /// the event log, so nothing is lost; only the *live context* shrinks.
     async fn maybe_spill(&self, content: String) -> String {
         if content.len() <= SPILL_THRESHOLD {
             return content;
@@ -495,13 +475,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
     }
 
-    /// Apply the live-context spill policy to both request representations.
-    ///
-    /// Durable replay/checkpoints hydrate canonical `ModelMessage` values
-    /// directly. Rewriting only the legacy compatibility view therefore left
-    /// the provider-facing ordered request carrying the original unbounded
-    /// payload. Keep tool-call identity and opaque provider state intact while
-    /// replacing only the result body with its content-addressed reference.
+    /// Apply the live-context spill policy to both request representations —
+    /// rewriting only the legacy view left the provider-facing request unbounded.
+    /// Tool-call identity and opaque state are preserved; only the body is spilled.
     async fn spill_hydrated_tool_results(
         &self,
         messages: &mut [Message],
@@ -531,7 +507,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
     }
 
-    /// Override the per-turn concurrency cap (§12).
+    /// Override the per-turn concurrency cap.
     pub fn with_max_parallel_tools(mut self, n: usize) -> Self {
         self.max_parallel_tools = n.clamp(1, MAX_TOOL_INTENTS_PER_TURN);
         self
@@ -617,12 +593,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         (intent.id, intent.tool, obs, discovered)
     }
 
-    /// Make one settled execution durable and feed its observation back into the
-    /// active request. A mutation guard, when needed, is held by the caller
-    /// across both [`Self::execute_admitted`] and this method. Keeping persistence
-    /// here lets the scheduler release that guard before it runs unrelated
-    /// read/wait tools, while still ensuring another mutation cannot commit in
-    /// the side-effect → event-log gap.
+    /// Make one settled execution durable and feed its observation back. The
+    /// caller holds any mutation guard across this and [`Self::execute_admitted`],
+    /// closing the side-effect → event-log gap.
     #[allow(clippy::too_many_arguments)]
     async fn persist_admitted(
         &self,
@@ -638,7 +611,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         messages: &mut Vec<Message>,
         sink: &dyn StreamSink,
     ) -> Result<(), KernelError> {
-        // Label web-tool output as untrusted content (P7): a fetched page must
+        // Label web-tool output as untrusted content: a fetched page must
         // not be treated like a local file read. A tool relaying content it did
         // not produce declares that content's label, and the weaker wins.
         let trust = match self.executor.category(&tool) {
@@ -663,12 +636,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             *window_taint = window_taint.min(discovered.trust);
             attach_discovered_context(&mut obs, &discovered);
         }
-        // A settled memory mutation becomes a MemoryWrite event — the durable
-        // record the projection rebuilds from (I1). Commit it before the
-        // conversation observation, so a later observation append failure
-        // cannot leave an applied memory missing from replay. The earlier
-        // ToolEffectPrepared record still marks the attempt if this append
-        // itself fails after the projection-side effect.
+        // Persist applied memory before its observation so replay cannot miss it.
         let applied =
             if matches!(obs.status, crate::types::ObsStatus::Ok) && tool.starts_with("memory.") {
                 obs.payload
@@ -687,7 +655,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         window_events.push(event.id);
         *window_taint = window_taint.min(trust);
         // Once untrusted web content lands, taint the following provider turn
-        // so consequential actions derived from it get escalated (§4.6).
+        // so consequential actions derived from it get escalated.
         if matches!(trust, TrustLabel::Web) {
             *web_tainted = true;
         }
@@ -765,12 +733,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
     }
 
-    /// Run a session to completion: stream the model, execute any tool calls,
-    /// feed results back, and repeat until the model finishes with text only or
-    /// `max_turns` is hit. Returns the full message transcript.
-    ///
-    /// Context is recompiled from `messages` each turn (fresh per turn, §4.3);
-    /// step (c) replaces this with a compile-from-event-log + compaction pass.
+    /// Run a session to completion: stream, execute tool calls, feed results back
+    /// until the model finishes or `max_turns` is hit. Context is recompiled each turn.
     pub async fn run_session(
         &self,
         session: &Session,
@@ -782,26 +746,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // `None` (headless) → a token that never trips; every cancel path is dead.
         let cancel = interrupts.as_ref().map(|q| q.token()).unwrap_or_default();
         let specs = self.executor.specs();
-        // Size the tool-def overhead once so token estimates match the real
-        // request (tool defs are sent every turn) (P1-9).
+        // Tool definitions are sent every turn and count toward the request.
         self.context.note_tools(&specs);
         let mut gov = crate::budgets::Governor::new(budget);
-        // Record this turn's new user messages so the session is fully
-        // reconstructable from the log (resume/replay). Every *trailing* user
-        // message is new, not just the last: a surface can append a typed prompt
-        // and then a background agent's report in one turn, and logging only the
-        // tail dropped the prompt from the log — and with it from the rehydrated
-        // context below, so the model never saw what was typed.
-        // Memory taint window (D6): the evidence a memory write may cite — event
-        // ids since the last real user message, and the lowest trust label seen
-        // among them. Kernel-owned; the model can never assert these.
+        // Every trailing user message is new, not just the last: a surface can
+        // append a typed prompt and then an agent report in one turn.
+        // Memory taint window: event ids since the last real user message and the
+        // lowest trust among them. Kernel-owned; the model can never assert it.
         let mut window_events: Vec<ulid::Ulid> = Vec::new();
         let mut window_taint = TrustLabel::User;
-        // Skip what the log already ends with. A turn that failed after this
-        // point leaves its trailing run logged; retrying with the same messages
-        // would append the run a second time, and the projection only collapses
-        // *adjacent* identical user turns, so `[prompt, report]` twice survives
-        // as four messages.
+        // Skip what the log already ends with: a retry would append the run
+        // twice, and the projection only collapses adjacent identical turns.
         let prior_events = self.log.events(session.id).await;
         let already = logged_tail(&prior_events);
         // Retried input is already durable but still belongs to this evidence
@@ -844,11 +799,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 && crate::events::has_valid_compaction_snapshot(&event.payload)
         });
         if has_checkpoint {
-            // A compaction event is a full request checkpoint. Replace both
-            // views—including the freshly generated system sheath—with that
-            // exact state plus the durable events appended after it. Keeping
-            // the surface's system message as well would duplicate system
-            // instructions and would not be byte-equivalent replay.
+            // A compaction event is a full request checkpoint: replace both views
+            // wholesale, or the system sheath duplicates and replay is not exact.
             messages = crate::events::project_request_messages(&logged_events);
             ordered_messages = crate::events::project_request_ordered_messages(&logged_events);
         } else if logged_events
@@ -858,19 +810,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             let projected = crate::events::project_ordered_messages(&logged_events);
             ordered_messages = hydrate_ordered_log(&messages, projected);
         }
-        // Spill oversized tool results after hydration (K11). Checkpoint replay
-        // can replace the surface transcript with full durable observations, so
-        // spilling before that replacement would be silently undone. Apply the
-        // rewrite independently to both views: ordered replay is authoritative
-        // for provider requests and may carry opaque state which a legacy
-        // round-trip would discard.
+        // Spill after hydration — checkpoint replay would silently undo an earlier
+        // spill. Both views are rewritten independently.
         self.spill_hydrated_tool_results(&mut messages, &mut ordered_messages)
             .await;
-        // Trust-flow taint (§4.6): flips true once a web-labeled observation
-        // enters this request, so a later consequential action derived from it
-        // can be escalated. Scoped to the request (one run_session). Seeded from
-        // injected content, so a sub-agent that read the web taints the parent
-        // that acts on its report.
+        // Flips true once a web-labeled observation enters this request, so a
+        // later consequential action derived from it escalates. Request-scoped.
         let mut web_tainted = messages
             .iter()
             .any(|message| message.trust == Some(TrustLabel::Web));
@@ -1105,9 +1050,6 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     Err(e) => return Err(e),
                 }
             };
-            // Feed real token usage back: the context engine uses it for accurate
-            // compaction decisions, and the governor meters spend — real dollars
-            // when pricing resolved, 0.0 (meter off) otherwise (P1-12).
             if let Some(u) = usage {
                 self.context.update_usage(u.prompt_tokens, u.total_tokens);
             }
@@ -1125,11 +1067,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .append(Event::model_text(session, &assistant.content))
                         .await?;
                 }
-                self.log
-                    .append(Event::model_message(session, &canonical))
-                    .await?;
-                ordered_messages.push(canonical);
-                messages.push(Message::assistant_calls(assistant.content, Vec::new()));
+                // An empty cancelled turn can create invalid adjacent roles on replay.
+                if !canonical.parts.is_empty() {
+                    self.log
+                        .append(Event::model_message(session, &canonical))
+                        .await?;
+                    ordered_messages.push(canonical);
+                    // Keep compatibility and canonical histories aligned.
+                    messages.push(Message::assistant_calls(assistant.content, Vec::new()));
+                } else if !assistant.content.is_empty() {
+                    // Preserve compatibility text omitted from the canonical view.
+                    messages.push(Message::assistant_calls(assistant.content, Vec::new()));
+                }
                 if matches!(gov.check(), Some(crate::budgets::BudgetStop::Wall)) {
                     if let Some(q) = interrupts.as_mut() {
                         Self::return_unapplied_steers(q, sink);
@@ -1163,11 +1112,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 return Ok((messages, StopReason::Finished)); // text-only finish
             }
 
-            // Memory intents get their trust fields HERE, kernel-side (D6): any
-            // model-supplied trust/confidence/provenance is stripped and replaced
-            // with the taint-window values. The window covers events up to this
-            // turn's dispatch — same-turn sibling observations aren't evidence
-            // the model has seen yet.
+            // Model-supplied trust/confidence/provenance is stripped and replaced
+            // with taint-window values, which stop at this turn's dispatch.
             let mut intents = intents;
             for it in &mut intents {
                 if it.tool.starts_with("memory.") {
@@ -1186,9 +1132,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             for it in &intents {
                 sink.tool_call(&it.tool, &it.args);
             }
-            // Any locally-mutating tool triggers post-edit verification — derived
-            // from the declared blast radius, not a hardcoded name list, so edits
-            // via multi_edit / shell.exec (e.g. `sed -i`) are covered too (§4.7).
+            // Blast radius, not tool name, determines whether verification runs.
             let modified_files = intents.iter().any(|i| {
                 matches!(
                     self.executor.blast_radius(&i.tool),
@@ -1196,19 +1140,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 )
             });
 
-            // Execute side-effect-free runs concurrently, but put a hard
-            // barrier around every state mutation. The event log is the replay
-            // authority: if two writes commit B→A while observations are logged
-            // A→B, live state, resume, and rewind disagree. A mutation key is
-            // still collected by the executor (not inferred from tool names),
-            // including low-risk memory writes whose policy radius is `Read`.
+            // Reads run concurrently; every mutation gets a hard barrier. If two
+            // writes commit B→A while the log records A→B, replay disagrees with
+            // live state. Mutation keys come from the executor, not tool names.
             //
-            // This first correctness-first scheduler serializes all mutations;
-            // later it may parallelize distinct keys only after proving they
-            // commute. The lock is scoped to ONE mutation's execution and durable
-            // observation. Holding it across a later `agent.wait` would deadlock:
-            // the parent would await a child whose own write needed this lock.
-            // Read batches retain bounded parallelism between mutation barriers.
+            // Scoped to one mutation's execution and durable observation. Holding
+            // it across a later `agent.wait` would deadlock on a child's own write.
             let dispatch_cancel = cancel.clone();
             let dispatch_wall_deadline = gov.deadline();
             let dispatch_settle_deadline = Arc::new(std::sync::OnceLock::new());
@@ -1285,12 +1222,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .await?;
                         continue;
                     };
-                    // A second process has a different in-memory mutex. The log
-                    // backend supplies the durable writer lane, kept alive over
-                    // both the external side effect and the events that make it
-                    // replayable. Lease failure is a settled tool error rather
-                    // than an early return: every admitted intent still gets its
-                    // observation.
+                    // A second process has its own in-memory mutex, so the durable
+                    // writer lane comes from the log backend. Lease failure is a
+                    // settled tool error — every admitted intent gets an observation.
                     let lease = tokio::select! {
                         biased;
                         _ = wait_for_deadline(dispatch_wall_deadline) => None,
@@ -1411,8 +1345,6 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 return Ok((messages, StopReason::Interrupted));
             }
 
-            // Deterministic verification after edits (§4.7): run the configured
-            // check and feed the result back so a broken build self-corrects.
             if modified_files {
                 let verification = tokio::select! {
                     biased;
@@ -1461,15 +1393,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
     }
 
-    /// One turn: stream the model (retrying transient failures) and collect a
-    /// legacy control view plus the exact canonical assistant message.
-    ///
-    /// Retry policy (K3): a transient provider failure — network drop, 429, 5xx,
-    /// mid-stream cutoff — is retried with capped exponential backoff, but ONLY
-    /// while nothing has been streamed to the surface yet (re-running after
-    /// partial output would duplicate it). A context-length rejection is surfaced
-    /// as [`KernelError::ContextOverflow`] so `run_session` can compact and retry
-    /// (P0-6); other errors are fatal for the turn.
+    /// One turn: stream the model and collect a legacy control view plus the exact
+    /// canonical assistant message. Transient failures retry with capped backoff,
+    /// but only before anything has streamed; context overflow is surfaced to the
+    /// caller to compact and retry. Other errors are fatal for the turn.
     #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
@@ -1605,9 +1532,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             }
         };
-        // Keep the existing transparent reasoning audit event. The canonical
-        // message is appended by `run_session` only after it decides whether
-        // streamed tool calls reached dispatch admission.
+        // `run_session` appends the canonical message only after dispatch admission.
         if !reasoning.is_empty() {
             self.log
                 .append(Event::model_reasoning(session, &reasoning))
@@ -1642,10 +1567,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         ),
         (crate::provider::ProviderError, bool),
     > {
-        // Establishing the stream must ALSO race the cancel token: on large
-        // models the server can spend minutes in prompt processing before the
-        // first byte arrives, and an Esc during that window previously did
-        // nothing (the select below only covered an already-open stream).
+        // Connection and prompt processing must remain cancellable before the
+        // first stream byte arrives.
         let mut stream = tokio::select! {
             s = self.provider.stream_prepared(prepared) => s.map_err(|e| (e, false))?,
             _ = cancel.cancelled() => {
@@ -1859,10 +1782,6 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         Ok((text, reasoning, intents, canonical, usage, false))
     }
 
-    /// validate (P1) → police (§4.6) → gate (P5) → execute (§4.8).
-    /// The policy authorizes deny-first; `Human` routes through the approval
-    /// gate with a real preview. A pre-execution verifier chain (§4.7) will
-    /// slot in here when it exists.
     async fn execute_with_effect_outbox(
         &self,
         session: &Session,
@@ -1893,8 +1812,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     ) -> Observation {
         let radius = self.executor.blast_radius(&intent.tool);
         let raw = self.policy.authorize(session.autonomy, intent, radius);
-        // Did trust-flow turn a permissive verdict into a gate? Such an escalated
-        // gate must never be auto-approved (K9) — capture it before `raw` moves.
+        // Trust-flow escalations must never be auto-approved.
         let raw_permissive = matches!(raw, crate::types::Decision::Allow);
         let decision =
             escalate_for_trust_flow(raw, radius, web_tainted, self.executor.containment());
@@ -1915,21 +1833,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         match decision {
             crate::types::Decision::Deny { reason } => Observation::denial(&intent.id, reason),
             crate::types::Decision::Human => {
-                // One approval card at a time (P2 gate race): the lock spans
-                // preview → answer so parallel dispatch can't pop several
-                // prompts at once, but is dropped BEFORE execution so an
+                // Hold the lock through the answer, then drop it before execution so an
                 // approved slow tool doesn't block the next card.
                 let approved = {
                     let _one_gate = self.gate_serial.lock().await;
-                    // Draft → approve → commit (P5): show a real preview (rendered
-                    // diff via dry-run when available) and ask before executing.
                     let detail = self
                         .executor
                         .preview(intent)
                         .await
                         .unwrap_or_else(|| approval_detail(intent));
-                    // Scope the approval to this specific action (tool + salient arg),
-                    // so "always allow" doesn't blanket every call of the tool (K9).
                     let action = approval_key(intent);
                     self.gate
                         .confirm(&action, Some(&detail), escalated)
@@ -1937,19 +1849,89 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .approved()
                 };
                 if approved {
-                    self.execute_with_effect_outbox(session, intent).await
+                    self.execute_with_net_retry(session, intent, web_tainted, radius)
+                        .await
                 } else {
                     Observation::denial(&intent.id, "rejected by human".to_string())
                 }
             }
-            crate::types::Decision::Allow => self.execute_with_effect_outbox(session, intent).await,
+            crate::types::Decision::Allow => {
+                self.execute_with_net_retry(session, intent, web_tainted, radius)
+                    .await
+            }
+        }
+    }
+
+    /// Run the intent; if it failed because the sandbox denied network, offer a
+    /// grant and retry. The first run under net-deny could not exfiltrate, so the
+    /// grant admits a *second* action: trust-flow is re-evaluated as if the box's
+    /// network were already open (a literal [`Containment::OsFsJail`]), and a
+    /// web-tainted consequential action is gated exactly as it would be without
+    /// confinement. The retry calls [`Self::execute_with_effect_outbox`] directly
+    /// rather than recursing, so a real DNS outage matching the same signature
+    /// cannot re-prompt.
+    async fn execute_with_net_retry(
+        &self,
+        session: &Session,
+        intent: &ToolIntent,
+        web_tainted: bool,
+        radius: Option<BlastRadius>,
+    ) -> Observation {
+        let obs = self.execute_with_effect_outbox(session, intent).await;
+        if !obs.net_denied {
+            return obs;
+        }
+        // Trust-flow escalation only, not the policy engine: argv is unchanged, so
+        // policy would repeat the verdict that already admitted this intent. Given
+        // `Allow` the result can only widen to `Human`, never narrow to `Deny`.
+        let escalated = matches!(
+            escalate_for_trust_flow(
+                crate::types::Decision::Allow,
+                radius,
+                web_tainted,
+                crate::types::Containment::OsFsJail,
+            ),
+            crate::types::Decision::Human
+        );
+        let decision = {
+            let _one_gate = self.gate_serial.lock().await;
+            let detail = net_grant_detail(intent, web_tainted);
+            self.executor.grant_network(Some(&detail), escalated).await
+        };
+        match decision {
+            crate::NetworkDecision::Deny => obs,
+            crate::NetworkDecision::Once => {
+                crate::network_once_scope(self.execute_with_effect_outbox(session, intent)).await
+            }
+            crate::NetworkDecision::Session
+            | crate::NetworkDecision::Persistent => {
+                // The grant already flipped the shared network flag; the retry
+                // and every later command now reach the network.
+                self.execute_with_effect_outbox(session, intent).await
+            }
         }
     }
 }
 
-/// Kernel-computed trust for memory writes (D6): strip every trust-adjacent key
-/// the model may have passed, then inject the taint-window values under `_`-
-/// prefixed keys the memory tools read. Pure so it's unit-testable.
+/// Card detail for a network-grant prompt. Names the sandbox policy so the user
+/// is not left debugging a bare DNS error, and flags exfiltration risk when the
+/// command touched web content and does something consequential.
+fn net_grant_detail(intent: &ToolIntent, web_tainted: bool) -> String {
+    let action = approval_key(intent);
+    let mut detail = format!(
+        "The sandbox denied network access, so this command could not reach the network:\n  {action}\n\
+         Grant network access and retry?"
+    );
+    if web_tainted {
+        detail.push_str(
+            "\n\nThis command handled web-fetched content. Opening the network means it could \
+             send that content out — approve only if you trust it to.",
+        );
+    }
+    detail
+}
+
+/// Replace model-supplied trust metadata with kernel-computed values.
 fn enrich_memory_intent(
     args: &mut serde_json::Value,
     taint: TrustLabel,
@@ -1978,17 +1960,13 @@ fn enrich_memory_intent(
         serde_json::json!(window.iter().map(|u| u.to_string()).collect::<Vec<_>>()),
     );
     obj.insert("_session".into(), serde_json::json!(session_id.to_string()));
-    // User-stated only when nothing below user trust entered the window.
     obj.insert(
         "_user_stated".into(),
         serde_json::json!(taint == TrustLabel::User),
     );
 }
 
-/// Trust-flow escalation (§4.6): gate a consequential, web-tainted action unless
-/// the sandbox's containment blocks network exfiltration. Only ever *tightens*
-/// an `Allow` to `Human` — it never relaxes a denial or an existing gate. Pure
-/// and total so the policy is unit-testable in isolation.
+/// Tighten web-tainted consequential actions unless network is confined.
 fn escalate_for_trust_flow(
     decision: crate::types::Decision,
     radius: Option<BlastRadius>,
@@ -2047,12 +2025,8 @@ fn logged_tail(events: &[Event]) -> Vec<LoggedInput> {
     tail
 }
 
-/// Index of the first user message this turn has not logged yet.
-///
-/// Callers append what is new and then call `run_session`, so the trailing run
-/// of user messages is this turn's; everything before it was logged by an
-/// earlier call. It is a *run*, not one message: a surface can append a typed
-/// prompt and a background agent's report together.
+/// Index of the first user message this turn has not logged yet. A run, not one
+/// message: a surface can append a typed prompt and an agent report together.
 fn unlogged_tail(messages: &[Message]) -> usize {
     messages
         .iter()
@@ -2261,6 +2235,7 @@ mod progressive_context_tests {
                 status,
                 payload: json!({ "path": "/tmp/untrusted/file" }),
                 relayed_trust: None,
+                net_denied: false,
             };
             assert!(
                 successful_observed_path(&observation).is_none(),
@@ -2290,13 +2265,10 @@ mod approval_key_tests {
 
     #[test]
     fn approval_key_scopes_to_the_salient_arg_not_just_the_tool() {
-        // Two different shell commands must produce DIFFERENT keys, so approving
-        // one with "always" doesn't blanket-approve the other (K9).
         let a = approval_key(&intent("shell.exec", json!({ "command": "cargo build" })));
         let b = approval_key(&intent("shell.exec", json!({ "command": "rm -rf build" })));
         assert_eq!(a, "shell.exec: cargo build");
         assert_ne!(a, b, "distinct commands must not share an auto-approve key");
-        // Path-based tools key on the path; arg-less tools fall back to the tool.
         assert_eq!(
             approval_key(&intent("fs.write", json!({ "path": "x.rs" }))),
             "fs.write: x.rs"

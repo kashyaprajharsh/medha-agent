@@ -329,13 +329,10 @@ pub(crate) async fn authorize(
         .port();
     let redirect = format!("http://127.0.0.1:{port}/callback");
 
-    // Discovery and dynamic client registration both talk to endpoints named by
-    // the server's own metadata, and both happen inside these two calls — so
-    // the transport policy has to hold for the whole exchange, not just for the
-    // browser URL at the end. `rmcp` drives them over `http_client`, which is
-    // https-only by construction for a non-loopback host because `url` already
-    // passed `require_secure` above; what is checked here is the one endpoint
-    // that leaves the client entirely: where the user's browser is sent.
+    // Discovery and registration hit endpoints named by the server's own metadata,
+    // so transport policy must hold for the whole exchange. Those go over
+    // `http_client` (https-only via `require_secure`); checked here is the one
+    // endpoint that leaves the client — where the browser is sent.
     let policy = EndpointPolicy::new(url)?;
     let oauth_http = Arc::new(HardenedOAuthClient::new(url, http)?);
     let mut state = OAuthState::new_with_oauth_http_client(url, oauth_http)
@@ -447,11 +444,8 @@ fn query_pairs(target: &str) -> Vec<(String, String)> {
 }
 
 /// Best effort — the URL is announced first, so a headless box still works.
-///
-/// Windows goes through `rundll32` rather than `cmd /C start`: `cmd` re-parses
-/// its argument, and `&` separates commands there. Every authorization URL has
-/// one between query parameters, so `start` both truncated the URL and ran
-/// whatever followed as a command.
+/// Windows uses `rundll32`, not `cmd /C start`: `cmd` treats `&` as a command
+/// separator, which truncated authorization URLs and ran the remainder.
 fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let (program, args) = ("open", vec![url]);

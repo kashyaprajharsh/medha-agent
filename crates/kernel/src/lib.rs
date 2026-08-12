@@ -1,5 +1,4 @@
-//! MEDHA kernel — the only code that calls providers, writes the event log, and
-//! enforces budgets (Vol 3 §1). Everything else is a module behind a trait (P8).
+//! MEDHA kernel: provider calls, event logging, budgets, and execution policy.
 
 pub mod artifacts;
 pub mod budgets;
@@ -29,10 +28,12 @@ pub use context::{
 pub use errors::KernelError;
 pub use events::{
     Event, EventKind, EventLog, FileRollback, InMemoryLog, MutationLease, Provenance, SessionMeta,
-    cut_index, project_messages, project_ordered_messages, rollback_plan,
+    cut_index, project_messages, project_ordered_messages, rollback_plan, rollback_plan_in,
 };
 pub use executor::{BackgroundTask, Executor};
-pub use gate::{Approval, AutoDeny, HumanGate};
+pub use gate::{
+    Approval, AutoDeny, HumanGate, NetworkDecision, network_once_active, network_once_scope,
+};
 pub use interrupts::{Activity, Interrupt, InterruptHandle, InterruptQueue};
 pub use kernel_loop::{DEFAULT_MAX_PARALLEL_TOOLS, Kernel, StopReason};
 pub use policy::{AllowAll, Policy};

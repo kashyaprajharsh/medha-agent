@@ -1,8 +1,6 @@
 name: Release
 
-# Cuts a release from a tag. Publishing the archives is what makes the
-# curl|sh installers work — `install.sh` and `install.ps1` resolve the
-# latest tag from this repo's releases and download the matching asset.
+# Build release archives and publish them only from a validated tag.
 on:
   push:
     tags: ["v*"]
@@ -27,18 +25,19 @@ env:
   RELEASE_PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
 
 jobs:
-  # Resolve one immutable release identity before any compilation. A manual
-  # dispatch may dry-run any ref/SHA, but publishing additionally requires an
-  # existing version-matching tag that resolves to the exact checked-out SHA.
+  # Bind each build to one commit; publishing also requires a matching tag.
   validate:
     name: validate release identity
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       sha: ${{ steps.release_ref.outputs.sha }}
       tag: ${{ steps.release_ref.outputs.tag }}
     steps:
-      # actions/checkout v5.1.0, pinned to an immutable upstream commit.
+      # actions/checkout, pinned to an immutable upstream commit.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ env.RELEASE_REF }}
@@ -48,12 +47,19 @@ jobs:
       - name: Match tag, commit, and package version
         id: release_ref
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           version="$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           sha="$(git rev-parse HEAD)"
           tag="v$version"
 
           if [ "$RELEASE_PUBLISH" = "true" ]; then
+            # OIDC provenance describes the invoking ref, not a later checkout.
+            if [ "$GITHUB_SHA" != "$sha" ]; then
+              echo "publish ref $sha differs from workflow ref $GITHUB_SHA; dispatch the workflow from the release tag" >&2
+              exit 1
+            fi
             requested="$RELEASE_REF"
             case "$requested" in
               refs/tags/*) tag="${requested#refs/tags/}" ;;
@@ -61,6 +67,10 @@ jobs:
             esac
             if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
               echo "publishing requires an existing semantic-version tag, got: $tag" >&2
+              exit 1
+            fi
+            if [ "$GITHUB_REF" != "refs/tags/$tag" ]; then
+              echo "publishing $tag requires dispatching the workflow from refs/tags/$tag, not $GITHUB_REF" >&2
               exit 1
             fi
             if [ "$tag" != "v$version" ]; then
@@ -73,31 +83,31 @@ jobs:
               echo "$tag points at $tag_sha, not checked-out SHA $sha" >&2
               exit 1
             fi
+
+            # Publish only a commit whose exact SHA passed CI.
+            ci_ok="$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha" \
+              --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
+            if [ "${ci_ok:-0}" -lt 1 ]; then
+              echo "no successful CI run for $sha; refusing to publish untested bytes" >&2
+              exit 1
+            fi
           fi
 
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-  # Run the same lint and Linux/macOS/Windows test matrix as ordinary CI, but
-  # against the exact validated tag commit. Build cannot start unless every
-  # called-workflow job succeeds.
-  verify:
-    needs: validate
-    uses: ./.github/workflows/ci.yml
-    with:
-      checkout_ref: ${{ needs.validate.outputs.sha }}
-
+  # Validation requires CI for publishing; dry runs exercise packaging only.
   build:
     name: ${{ matrix.target }}
-    needs: [validate, verify]
+    needs: validate
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Built on the oldest supported glibc so the binary keeps working on
-          # distros older than the runner.
+          # Build against the oldest supported glibc.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
@@ -115,14 +125,12 @@ jobs:
           ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
 
-      # Version comes from rust-toolchain.toml, so a published binary is built
-      # by the same compiler CI linted with — not whatever stable happens to be.
+      # Use the same pinned compiler as CI.
       - id: toolchain
         shell: bash
         run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
-      # Third-party actions are commit-pinned because this workflow produces
-      # release binaries and its final job has repository write permission.
+      # Release actions are commit-pinned.
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
@@ -142,8 +150,6 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p medha-cli
 
-      # The reusable verify job has already tested this exact SHA on Linux,
-      # macOS and Windows, including both installer suites.
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -177,11 +183,33 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           merge-multiple: true
           path: dist
+
+      # Ship installers from the same immutable tag as their binaries.
+      - name: Stage installers
+        run: cp install.sh install.ps1 dist/
+
+      # Commit-pinned action; OIDC uses a short-lived Sigstore certificate.
+      - name: Attest release provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/install.sh
+            dist/install.ps1
 
       - name: Publish
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65

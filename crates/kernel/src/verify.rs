@@ -1,10 +1,3 @@
-//! Deterministic verifier (§4.7). After a turn modifies files, the kernel runs
-//! a configured check (tests / lint / typecheck) and feeds the result back to
-//! the model, so a broken build is caught and self-corrected within the loop —
-//! "verify before commit" applied post-hoc to reversible-local edits (P5/P2).
-//! Deterministic checks come first (cheap, exact); the adversarial model-review
-//! verifier layers on top later.
-
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 

@@ -19,14 +19,9 @@ pub struct NarrowedExecutor {
 }
 
 impl NarrowedExecutor {
-    /// Intersect `requested` with what `inner` actually exposes. `None` requests
-    /// everything the parent has — which is still only the parent's set, never
-    /// more. Unknown names are dropped rather than erroring: a child asking for
-    /// a tool that does not exist gets a smaller set, not a wider one.
-    ///
-    /// The set is snapshotted here. Tools can appear later (an MCP server
-    /// connecting mid-session), and the child will not see them — the stale
-    /// direction is the closed one, which is the direction to be stale in.
+    /// Intersect `requested` with what `inner` exposes; `None` means the parent's
+    /// whole set, never more. Unknown names are dropped, so a child gets a smaller
+    /// set rather than an error. Snapshotted here, so later tools stay invisible.
     pub fn new(inner: Arc<dyn Executor>, requested: Option<&[String]>) -> Self {
         let available: BTreeSet<String> = inner.specs().into_iter().map(|spec| spec.name).collect();
         let allowed = match requested {
@@ -41,21 +36,16 @@ impl NarrowedExecutor {
     }
 
     /// Drop everything that can mutate anything. Read-only children may share a
-    /// workspace safely; writers may not, and writer isolation is not built yet
-    /// (§6.4), so this is what keeps that impossible rather than merely
-    /// discouraged.
+    /// workspace safely; writers require an isolated workspace.
     pub fn read_only(mut self) -> Self {
         self.allowed
             .retain(|name| matches!(self.inner.blast_radius(name), Some(BlastRadius::Read)));
         self
     }
 
-    /// Drop `clarify`. Not permission gating — a child still routes
-    /// consequential actions through the human gate. What goes is the
-    /// open-ended question: a child cannot see the conversation, so its
-    /// question is unanswerable, and a background one can block forever on
-    /// someone who has moved on. `read_only` misses it because asking mutates
-    /// nothing.
+    /// Drop `clarify`: a child cannot see the conversation, so its question is
+    /// unanswerable and a background one blocks forever. Not permission gating —
+    /// consequential actions still route through the human gate.
     pub fn no_clarifying_questions(mut self) -> Self {
         self.allowed.retain(|name| name != "clarify");
         self

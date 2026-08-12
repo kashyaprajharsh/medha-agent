@@ -1,23 +1,13 @@
-//! Prompt registry (§4.11, §6). Prompts are content, not logic — versioned,
-//! diffable, evolvable, eval-gatable artifacts, never code literals.
-//!
-//! **Embed-with-override.** Each prompt is authored as a `.md` file under
-//! `prompts/` and embedded at compile time (`include_str!`) so the single
-//! static binary always has a working default. At runtime a deployment may
-//! override any prompt by id without recompiling; resolution order:
-//!
+//! Embedded prompt registry with deployment overrides, resolved in order:
 //!   1. `$MEDHA_PROMPTS_DIR/<id>.md`         (explicit override dir)
 //!   2. `./.medha/prompts/<id>.md`           (project scope)
 //!   3. embedded default                      (shipped in the binary)
-//!
-//! A future step keys overrides by content hash via `medha.lock` so a promoted
-//! prompt version is reproducible and rollback-able like any other artifact.
 
 use std::path::PathBuf;
 
 /// Stable prompt ids. Use these constants, not string literals at call sites.
 pub const COMPACTION_SUMMARY: &str = "compaction_summary";
-/// The K1 identity / operating brief that becomes the system prompt.
+/// Identity and operating brief used as the system prompt.
 pub const SYSTEM_IDENTITY: &str = "system";
 
 const EMBEDDED_COMPACTION_SUMMARY: &str = include_str!("../prompts/compaction_summary.md");

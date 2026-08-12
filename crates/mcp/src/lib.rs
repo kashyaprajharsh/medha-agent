@@ -223,12 +223,9 @@ pub enum RemoteAuth {
     OAuth,
 }
 
-/// Where remote OAuth credentials persist between sessions. Medha wires this to
-/// the OS keychain; without one an OAuth server re-authorizes every launch.
-///
-/// `url` is part of the identity, not just context: a server definition can be
-/// re-pointed at a different host under the same id, and credentials keyed on
-/// the id alone would then be replayed to whatever it now names.
+/// Where remote OAuth credentials persist between sessions, wired to the OS
+/// keychain. `url` is part of the identity: a server re-pointed at another host
+/// under the same id must not replay the old credentials.
 pub trait TokenStore: Send + Sync + fmt::Debug {
     fn load(&self, server: &str, url: &str) -> Option<String>;
     fn save(&self, server: &str, url: &str, blob: &str);
@@ -478,14 +475,9 @@ struct Slot {
     failures: u32,
     proven: bool,
     retry_at: Option<Instant>,
-    /// Which incarnation of this server id the slot holds. A connect that
-    /// started under an older generation has been superseded: installing its
-    /// client would overwrite the newer one, and its catalogue would resurrect
-    /// tools for a server that is no longer configured that way.
-    ///
-    /// Drawn from a process-wide counter rather than reset per slot: a replaced
-    /// slot starting again at zero collides with the generation an in-flight
-    /// connect captured from the slot it replaced.
+    /// Which incarnation of this server id the slot holds, so a connect started
+    /// under an older generation cannot overwrite the newer client. Drawn from a
+    /// process-wide counter — a per-slot reset would collide after replacement.
     generation: u64,
 }
 
@@ -532,7 +524,7 @@ impl Slot {
 }
 
 /// Client-side protocol handler. The only server→client traffic Medha acts on is
-/// `tools/list_changed`; sampling and elicitation stay refused (Stage 2-D).
+/// `tools/list_changed`; sampling and elicitation stay refused.
 struct Handler {
     server: String,
     changed: mpsc::UnboundedSender<String>,
@@ -683,8 +675,8 @@ impl McpManager {
             let replaced = servers
                 .insert(server.id.clone(), slot)
                 .map(|mut old| old.detach());
-            // The old catalogue describes the old target and old filter. Remove
-            // it under the same slot lock that publishes the replacement.
+            // Remove the stale catalogue under the lock that publishes its
+            // replacement.
             self.tools_mut().remove(&server.id);
             (replaced, generation)
         };
@@ -713,13 +705,10 @@ impl McpManager {
         Ok(())
     }
 
-    /// Approve and connect an approval-gated server. Also the manual refresh
-    /// path: it clears the failure budget so a parked server retries at once.
-    ///
-    /// `announce` opts the caller into the interactive sign-in for a remote
-    /// OAuth server that has no usable credentials — it receives the
-    /// authorization URL while a browser opens. Passing `None` keeps the call
-    /// non-interactive, which is what a model-invoked tool must do.
+    /// Approve and connect an approval-gated server, also clearing the failure
+    /// budget so a parked server retries at once. `announce` opts into
+    /// interactive OAuth sign-in; `None` keeps it non-interactive, as a
+    /// model-invoked tool must.
     pub async fn approve_and_connect(
         &self,
         server_id: &str,
@@ -754,9 +743,8 @@ impl McpManager {
         server_id: &str,
         announce: &UrlSink,
     ) -> Result<ServerStatus, Error> {
-        // Snapshot config and generation atomically. Reading them in separate
-        // lock acquisitions allowed an old config to be paired with a
-        // replacement's generation (and `None == None` after removal).
+        // Snapshot config and generation together so they cannot come from
+        // different server incarnations.
         let (server, generation) = {
             let mut servers = self.inner.servers.lock().await;
             let slot = servers
@@ -813,7 +801,7 @@ impl McpManager {
         {
             // Keep the generation check and persistence in the same manager
             // critical section. A manager-side remove/re-point cannot slip
-            // between them and have the old flow save into its incarnation.
+            // between them and let a superseded flow save credentials.
             let servers = self.inner.servers.lock().await;
             let Some(slot) = servers.get(server_id) else {
                 return Err(Error::Superseded(server_id.to_string()));
@@ -978,7 +966,7 @@ impl McpManager {
             detail: None,
         })?;
         // A queued call must not run after disable/re-point. An operation already
-        // on the wire may finish, but waiting on the old semaphore grants no
+        // on the wire may finish, but waiting on a stale semaphore grants no
         // authority over the replacement.
         //
         // The read lease is taken *before* the final check and held across the
@@ -1071,9 +1059,17 @@ impl McpManager {
                     ServerState::Ready => {
                         if slot.client.as_ref().is_none_or(|c| c.is_transport_closed()) {
                             retirees.push(slot.detach());
-                            slot.state = ServerState::Degraded;
                             slot.detail = Some("connection lost".into());
-                            slot.retry_at = Some(now);
+                            // Count post-handshake death against the reconnect
+                            // budget so short-lived Ready replacements cannot loop.
+                            slot.failures = slot.failures.saturating_add(1);
+                            if slot.failures >= self.inner.config.max_reconnects {
+                                slot.state = ServerState::Parked;
+                                slot.retry_at = Some(now + self.inner.config.park_probe);
+                            } else {
+                                slot.state = ServerState::Degraded;
+                                slot.retry_at = Some(now + backoff(slot.failures));
+                            }
                         } else if !slot.proven {
                             probe.push((slot.config.id.clone(), slot.generation));
                         }
@@ -1088,7 +1084,7 @@ impl McpManager {
                 }
             }
         }
-        // Reap the old process tree before spawning any replacement.
+        // Reap the retired process tree before spawning a replacement.
         for retiree in retirees.into_iter().filter(|r| !r.is_empty()) {
             retiree.retire().await;
         }
@@ -1142,13 +1138,9 @@ impl McpManager {
         }
     }
 
-    /// Reconnect (or first-connect) a server: reap any predecessor, spawn, and
-    /// install or record the failure with a backoff.
-    /// One connect attempt, scoped to the incarnation of the slot it starts
-    /// from. Every later mutation — installing the client, publishing the
-    /// catalogue, recording a failure — is refused once that generation has
-    /// been superseded, so a slow attempt cannot overwrite the server that
-    /// replaced it or resurrect its tools.
+    /// Reconnect (or first-connect) a server: reap any predecessor, spawn, then
+    /// install or record the failure with a backoff. Scoped to the slot's
+    /// incarnation, so a slow attempt cannot overwrite the server that replaced it.
     async fn connect_one(&self, server_id: &str, expected: u64) -> Result<(), Error> {
         // Drains the outgoing incarnation before this attempt supersedes it.
         // Held only across the slot mutation — never across `spawn_client`,
@@ -1302,13 +1294,9 @@ impl McpManager {
         }
     }
 
-    /// Take an incarnation out of service, waiting for calls already admitted
-    /// against it to finish first.
-    ///
-    /// The write lease is awaited *without* the server-map lock held, so
-    /// blocking on one server's in-flight call never stalls every other server.
-    /// `mutations` serializes the acquire-then-mutate pair so two
-    /// reconfigurations of the same slot cannot interleave in that window.
+    /// Take an incarnation out of service, letting admitted calls finish. The
+    /// write lease is awaited without the server-map lock, so one server's
+    /// in-flight call never stalls the rest; `mutations` serializes the pair.
     async fn exclusive(&self, server_id: &str) -> Option<AdmissionLease> {
         let admission = {
             let servers = self.inner.servers.lock().await;
@@ -1519,6 +1507,7 @@ impl McpManager {
             &sandbox_config,
             cache.clone().into_iter().collect(),
             sandbox::ApprovedRoots::default(),
+            sandbox::NetworkGrant::default(),
         );
         if !allow_network && backend.label() == "host" {
             return Err(Error::Sandbox(format!(
@@ -1550,6 +1539,8 @@ impl McpManager {
             cwd: self.inner.workspace.clone(),
             env: environment,
             clear_env: true,
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
         };
         let mut command = backend
             .build_command(&request)
@@ -1771,7 +1762,7 @@ fn kill_process_group(pid: Option<u32>) {
     {
         // Do not resolve a process-kill primitive through the inherited PATH:
         // an MCP server/project can control that PATH.  Also wait for the
-        // helper to finish so reconnect/retire cannot overlap the old tree.
+        // helper to finish so reconnect/retire cannot overlap the retired tree.
         let taskkill = std::env::var_os("SystemRoot")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))

@@ -1,8 +1,3 @@
-//! End-to-end tests for kernel interrupts (design: MEDHA_INTERRUPTS_DESIGN.md):
-//! graceful cancel (every admitted intent gets an observation), steer at turn
-//! boundaries, partial-stream preservation, steers returned on cancel, and the
-//! intent → decision → observation log-adjacency invariant.
-
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use kernel::{
@@ -15,8 +10,6 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-// ── fixtures ─────────────────────────────────────────────────────────────────
 
 enum Turn {
     /// Emit these blocks, then end the stream.
@@ -85,6 +78,7 @@ impl Executor for SleepyExecutor {
             status: ObsStatus::Ok,
             payload: json!({ "ok": true, "tool": intent.tool }),
             relayed_trust: None,
+            net_denied: false,
         }
     }
 }
@@ -173,11 +167,6 @@ fn ids_of(events: &[Event], kind: EventKind) -> Vec<Value> {
         .collect()
 }
 
-// ── tests ────────────────────────────────────────────────────────────────────
-
-/// Esc while the model is still "thinking" — i.e. the HTTP stream is open but
-/// no first byte has arrived (big models spend minutes in prompt processing).
-/// The cancel must abort the connect wait itself, not just an open stream.
 #[tokio::test]
 async fn cancel_aborts_a_stream_still_connecting() {
     let (kernel, log) = kernel_with(
@@ -205,7 +194,7 @@ async fn cancel_aborts_a_stream_still_connecting() {
     tokio::time::sleep(Duration::from_millis(200)).await; // connecting…
     let started = std::time::Instant::now();
     handle.cancel_turn();
-    let (_messages, reason) = task.await.unwrap().unwrap();
+    let (messages, reason) = task.await.unwrap().unwrap();
 
     assert_eq!(reason, StopReason::Interrupted);
     assert!(
@@ -213,8 +202,11 @@ async fn cancel_aborts_a_stream_still_connecting() {
         "Esc during connect must stop promptly, took {:?}",
         started.elapsed()
     );
-    // Nothing streamed → no dangling intents or observations in the log.
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, Role::User);
     let events = log.events(session.id).await;
+    assert_eq!(ids_of(&events, EventKind::ModelMessage).len(), 0);
+    assert_eq!(ids_of(&events, EventKind::ModelText).len(), 0);
     assert_eq!(ids_of(&events, EventKind::ModelIntent).len(), 0);
     assert_eq!(ids_of(&events, EventKind::ToolObs).len(), 0);
 }

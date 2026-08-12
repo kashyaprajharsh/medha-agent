@@ -1,8 +1,3 @@
-//! End-to-end and adversarial coverage against a hermetic stdio MCP server (a
-//! small dependency-free Python script whose behaviour is selected by argv).
-//! Exercises the real spawn + sandbox + rmcp transport + manager path. Skips
-//! when python3 is unavailable.
-
 use std::{path::Path, time::Duration};
 
 use mcp::{Config, Error, McpManager, ServerConfig, ServerState, ToolFilter, Transport};
@@ -10,7 +5,8 @@ use serde_json::json;
 
 /// Modes: `normal`, `hostile` (malformed tool names), `churn` (announces
 /// tools/list_changed), `stale <marker>` (blocks a refresh after marking it),
-/// `flaky <marker>` (exits once, then behaves).
+/// `flaky <marker>` (exits once, then behaves), `flap` (finishes each initial
+/// catalogue response and immediately exits).
 const FAKE_SERVER: &str = r#"
 import sys, json, os, time, subprocess
 
@@ -56,6 +52,8 @@ for line in sys.stdin:
             if marker: open(marker, "w").close()
             time.sleep(2)
         send({"jsonrpc":"2.0","id":mid,"result":{"tools":catalog()}})
+        if mode == "flap":
+            os._exit(1)
     elif method == "tools/call":
         params = msg.get("params",{}); name = params.get("name"); args = params.get("arguments",{})
         if name == "slow":
@@ -138,7 +136,6 @@ fn server(id: &str, command: Vec<String>) -> ServerConfig {
     }
 }
 
-/// Poll `check` until it holds or the budget runs out.
 async fn wait_for(label: &str, mut check: impl AsyncFnMut() -> bool) {
     for _ in 0..150 {
         if check().await {
@@ -348,6 +345,27 @@ async fn repeated_failures_park_instead_of_hot_looping() {
     })
     .await;
     // Parked servers stay callable-as-errors, reporting why.
+    let error = manager
+        .call("mcp__fake__echo", &json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.server_state(), Some(ServerState::Parked));
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_handshake_deaths_advance_backoff_and_park() {
+    let Some(fake) = Fake::new() else { return };
+    let mut cfg = config(server("fake", fake.command("flap", None)));
+    cfg.max_reconnects = 2;
+    cfg.park_probe = Duration::from_secs(60);
+    let manager = McpManager::new(fake.path().to_path_buf(), cfg);
+    manager.connect_startup().await;
+
+    wait_for("post-handshake flapping server to park", async || {
+        manager.status().await[0].state == ServerState::Parked
+    })
+    .await;
     let error = manager
         .call("mcp__fake__echo", &json!({}))
         .await
@@ -581,9 +599,6 @@ async fn switching_a_server_off_parks_it_without_forgetting_it() {
     assert_eq!(manager.status().await[0].state, ServerState::Disabled);
     assert!(manager.tool_specs().is_empty());
 
-    // …but the server is still known, so the UI can act on it again. This is
-    // the regression: a parked server used to be dropped from the manager and
-    // then reported as "no MCP server named 'fake'".
     manager.set_disabled("fake", false).await.unwrap();
     assert_eq!(manager.status().await[0].state, ServerState::Ready);
     assert_eq!(manager.tool_specs().len(), 5);

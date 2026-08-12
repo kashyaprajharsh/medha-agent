@@ -1,10 +1,5 @@
-//! `PipelineEngine` — the default `ContextEngine` (§4.3). Operates at the
-//! kernel `Message` level (not the standalone `HistoryItem`) because it must
-//! preserve OpenAI tool-call pairing: an assistant message that requested tool
-//! calls and the tool results answering it must never be split across the
-//! summarize boundary, or the provider rejects the request. It reuses the
-//! budget / policy / token / summarizer primitives; the `compactor` module
-//! remains the standalone-tested engine over `HistoryItem`.
+//! `PipelineEngine`, the default `ContextEngine`, preserves assistant/tool-result
+//! groups across compaction boundaries.
 
 use crate::budget::ContextBudget;
 use crate::compactor::{ExtractiveSummarizer, HistoryItem, ItemKind, Summarizer};
@@ -41,26 +36,13 @@ pub struct PipelineEngine {
     /// Consecutive compactions that barely helped; backs off to avoid the
     /// "compact every turn" thrash.
     ineffective: AtomicU32,
-    /// Context size when the anti-thrash backoff latched. Growth past this
-    /// releases the latch: new material means compaction can find new cuts —
-    /// without this, a latched session sat at >100% of usable with compaction
-    /// refusing to run until the 95%-of-true-window emergency line.
+    /// Context size when anti-thrash latched; sufficient growth releases it.
     latched_at: AtomicU32,
-    /// Summarizer for Full compaction. Defaults to the deterministic extractive
-    /// fallback; the CLI injects an `LlmSummarizer` for real summaries.
     summarizer: Arc<dyn Summarizer>,
-    /// Last summary produced, fed back as `previous` so re-compaction UPDATES it
-    /// (iterative re-summary) instead of summarizing a gist-of-a-gist.
     last_summary: std::sync::Mutex<Option<String>>,
-    /// Artifact store for lossless prune: pruned tool output is spilled here and
-    /// referenced by hash, so the model can `read_artifact` it back (P1-3). When
-    /// absent (tests), prune falls back to an honest non-recoverable placeholder.
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
-    /// Fixed per-request tool-definition token overhead, sized once by
-    /// `note_tools` and added to every estimate (P1-9).
     tool_overhead: AtomicU32,
-    /// Full compaction already breaks the prompt prefix, so frozen startup
-    /// sheaths may refresh at that boundary and nowhere else.
+    /// Frozen startup sheaths refresh only at full compaction.
     full_compaction_refresh: Option<Arc<SystemRefresh>>,
 }
 
@@ -99,8 +81,7 @@ impl PipelineEngine {
         self
     }
 
-    /// Inject the artifact store so pruned tool output is spilled + re-fetchable
-    /// (lossless prune, P1-3).
+    /// Inject the artifact store used for lossless pruning.
     pub fn with_artifacts(mut self, artifacts: Arc<dyn kernel::ArtifactStore>) -> Self {
         self.artifacts = Some(artifacts);
         self
@@ -128,9 +109,7 @@ impl Default for PipelineEngine {
     }
 }
 
-/// One message's estimate for the budget walks: the full tool-call envelope
-/// (name + args + id), not just text content — otherwise tool-heavy turns are
-/// badly undercounted (P1-9).
+/// Count the full tool-call envelope, including arguments and ids.
 fn count_msg(m: &Message, counter: &dyn TokenCounter) -> u32 {
     let mut t = counter.count(&m.content);
     for tc in &m.tool_calls {
@@ -304,11 +283,8 @@ impl PipelineEngine {
         let budget = ContextBudget::from_input_limit(mc, quality);
         let usable = budget.usable().max(1) as f32;
 
-        // Decision basis: the max of the last reported/counted figure and the
-        // local count of the CURRENT messages. On hosts with no count route the
-        // stored figure is last turn's usage, which excludes this turn's tool
-        // results — trusting it alone triggered compaction one turn late (P2).
-        // max() biases toward compacting earlier, the safe direction.
+        // Last-turn usage excludes new messages; the larger local count avoids
+        // compacting one turn late when no provider preflight count exists.
         let actual = self.last_prompt_tokens.load(Ordering::Relaxed);
         let basis = if preflight > 0 {
             preflight as f32
@@ -344,21 +320,7 @@ impl PipelineEngine {
 
         let n = messages.len();
         let mut head_end = self.policy.protect_first_n.min(n);
-        // Head-boundary pairing guard (mirror of the tail guard below): the head
-        // must not *end* on an assistant message that carries tool_calls — its
-        // tool results live in the middle, and Full compaction would summarize
-        // them away, leaving a dangling tool_calls message the provider rejects
-        // with a 400. Extend the head forward to swallow the whole tool-result
-        // group so the call and its results stay together.
-        if head_end > 0
-            && head_end < n
-            && messages[head_end - 1].role == Role::Assistant
-            && !messages[head_end - 1].tool_calls.is_empty()
-        {
-            while head_end < n && messages[head_end].role == Role::Tool {
-                head_end += 1;
-            }
-        }
+        head_end = complete_head_tool_group(messages, head_end);
         let mut tail_start = tail_start_index(messages, head_end, &budget, &self.policy, counter);
 
         // Tool-call pairing guard: the tail must not *begin* on a tool result,
@@ -385,8 +347,6 @@ impl PipelineEngine {
                 source_index: Some(source_index),
             },
         ));
-        // Stage 1 (budget reduction): a re-read/re-run tool result identical to
-        // an earlier one in this window costs nothing to elide.
         let raw_middle = messages[head_end..tail_start]
             .iter()
             .cloned()
@@ -401,8 +361,6 @@ impl PipelineEngine {
             self.policy.prune_floor(budget.usable()),
             counter,
         );
-        // Stage 3 (microcompact): a step `update_plan` marked completed is a
-        // verified checkpoint — the turns that did it collapse to one line.
         let microcompacted = microcompact_tracked(&group_tracked_into_turns(&deduped));
         let raw_middle_tokens: u32 = raw_middle
             .iter()
@@ -417,11 +375,7 @@ impl PipelineEngine {
 
         match action {
             CompactionAction::Prune => {
-                // Cheap, lossless: shrink tool-result bodies, keep structure
-                // (and tool_call_id) so pairing is untouched. Oldest-first,
-                // honoring the prune floor, and STOP once pressure is back
-                // under the prune trigger — wiping the whole middle at 60%
-                // threw away recent context the model was still using (P2).
+                // Preserve tool-call structure and ids while pruning bodies.
                 let floor = self.policy.prune_floor(budget.usable()).max(1);
                 let target = usable * self.policy.microcompact_ratio;
                 let mut est = basis - pre_pass_saved as f32;
@@ -434,9 +388,6 @@ impl PipelineEngine {
                     };
                     if m.role == Role::Tool && toks >= floor && est >= target {
                         let mut pm = m.clone();
-                        // Lossless prune: spill the full output and reference it so
-                        // the model can re-read it (P1-3). No store → honest
-                        // non-recoverable placeholder.
                         pm.content = match self
                             .artifacts
                             .as_ref()
@@ -462,20 +413,12 @@ impl PipelineEngine {
                 }
             }
             CompactionAction::Full => {
-                // Replace the whole middle with one summary message. The full
-                // history is retained by the kernel/log (P3). It is an ASSISTANT
-                // message, not system: a mid-array system message is invalid for
-                // strict providers (vLLM: "system must be at the beginning"), and
-                // the summary belongs in its chronological place, not hoisted to
-                // the top. It compresses the model's own working context.
+                // A mid-array system message is invalid for strict providers;
+                // the chronological summary is an assistant message.
                 let items: Vec<HistoryItem> = middle
                     .iter()
                     .map(|tracked| msg_to_item(&tracked.message))
                     .collect();
-                // Injected summarizer (LLM), then extractive fallback — never the
-                // useless "[summary unavailable]" placeholder that produced
-                // hallucination-inducing empty context.
-                // Feed the last summary back so the model UPDATES it (iterative).
                 let previous = self.last_summary.lock().ok().and_then(|g| g.clone());
                 let primary = control
                     .run(self.summarizer.summarize(previous.as_deref(), &items))
@@ -568,6 +511,45 @@ impl PipelineEngine {
             summary: summary_text,
         })
     }
+}
+
+fn complete_head_tool_group(messages: &[Message], head_end: usize) -> usize {
+    if head_end == 0 || head_end >= messages.len() || messages[head_end].role != Role::Tool {
+        return head_end;
+    }
+
+    let mut first_result = head_end;
+    while first_result > 0 && messages[first_result - 1].role == Role::Tool {
+        first_result -= 1;
+    }
+    let Some(owner_index) = first_result.checked_sub(1) else {
+        return head_end;
+    };
+    let owner = &messages[owner_index];
+    if owner.role != Role::Assistant || owner.tool_calls.is_empty() {
+        return head_end;
+    }
+    let belongs_to_owner = |message: &Message| {
+        message
+            .tool_call_id
+            .as_deref()
+            .is_some_and(|id| owner.tool_calls.iter().any(|tool_call| tool_call.id == id))
+    };
+    if !messages[first_result..=head_end]
+        .iter()
+        .all(belongs_to_owner)
+    {
+        return head_end;
+    }
+
+    let mut end = head_end;
+    while end < messages.len()
+        && messages[end].role == Role::Tool
+        && belongs_to_owner(&messages[end])
+    {
+        end += 1;
+    }
+    end
 }
 
 /// Last-resort summary if even the extractive fallback errors (it doesn't today,
@@ -671,9 +653,6 @@ fn plan_snapshot(turn: &[Message]) -> Option<Vec<(String, String)>> {
     )
 }
 
-/// Stage 3 (microcompact, §4.3): a step that `update_plan` marks completed is
-/// a verified sub-task boundary — the turns between the plan snapshot that
-/// last had it unfinished and the one that completed it collapse to one line.
 #[cfg(test)]
 fn microcompact(turns: &[Vec<Message>]) -> Vec<Message> {
     let tracked = turns
@@ -707,9 +686,6 @@ fn microcompact_tracked(turns: &[Vec<TrackedMessage>]) -> Vec<TrackedMessage> {
         })
         .collect();
 
-    // One span per plan-snapshot pair, carrying EVERY step that completed in
-    // that window — two steps finishing in the same window used to shadow each
-    // other (identical bounds, second span dropped by the overlap filter).
     let mut spans: Vec<(usize, usize, Vec<String>)> = Vec::new();
     for pair in plans.windows(2) {
         let (i0, before) = &pair[0];
@@ -828,12 +804,8 @@ fn msg_to_item(m: &Message) -> HistoryItem {
     }
 }
 
-/// Walk back from the end, keeping messages until the tail token budget is met,
-/// never fewer than `protect_last_n`, never crossing into the head. The walk
-/// itself is [`crate::compactor::tail_start_index_by`]; only the cost differs:
-/// the full envelope incl. tool-call args (P1-9) — an assistant message whose
-/// args carry a whole file must count as such, or the "protected tail" walks
-/// far deeper than the budget it claims to respect.
+/// Find the protected-tail boundary using the full message envelope, including
+/// tool-call arguments.
 fn tail_start_index(
     messages: &[Message],
     head_end: usize,
@@ -914,10 +886,6 @@ mod tests {
 
     #[test]
     fn tail_walk_counts_tool_call_args_not_just_text() {
-        // P1-9 (tail half): an assistant message whose tool-call args carry a
-        // big payload must weigh its full size in the tail-budget walk. With
-        // args counted, the tail budget is filled by the last message alone;
-        // uncounted (content is empty), the walk would run past it.
         let counter = HeuristicCounter;
         let budget = ContextBudget::from_max_ctx(10_000);
         let policy = CompactionPolicy {
@@ -1246,9 +1214,6 @@ mod tests {
 
     #[tokio::test]
     async fn prune_is_oldest_first_respects_floor_and_stops_at_target() {
-        // P2: the prune tier must (a) skip outputs under the floor, (b) prune
-        // oldest-first, (c) STOP once pressure is back under the prune trigger
-        // — not wipe every middle tool result at 60%.
         let eng = engine(CompactionPolicy {
             protect_first_n: 1,
             protect_last_n: 2,
@@ -1256,9 +1221,6 @@ mod tests {
             prune_min_tool_tokens: Some(100),
             ..Default::default()
         });
-        // Usable input is 5200; band [3120, 4420). Three 1100-token outputs + one
-        // 50-token one ≈ 3360 → Prune. Pruning the OLDEST (-~1075) lands under
-        // target 3120, so the rest must survive.
         let msgs = vec![
             Message::system("S"),
             user("ask 0"),
@@ -1349,10 +1311,6 @@ mod tests {
 
     #[tokio::test]
     async fn single_uncompactable_turn_reports_overflow_not_silent_passthrough() {
-        // Regression test for the exact bug found earlier: one giant turn
-        // (a single tool-call group right after the head) that cannot be
-        // safely compacted (pairing guard blocks it) and pushes past the true
-        // hard ceiling. Must report overflow=true, not silently pass through.
         let eng = engine(CompactionPolicy::default());
         let call = ToolIntent {
             id: "c1".into(),
@@ -1399,7 +1357,6 @@ mod tests {
             ..Default::default()
         });
 
-        // Build a long history with assistant->tool pairs in the middle.
         let mut msgs = vec![Message::system("SYSTEM")];
         for i in 0..12 {
             msgs.push(user(&format!("ask {i} {}", "y".repeat(400))));
@@ -1417,7 +1374,6 @@ mod tests {
         assert!(r.compacted);
         assert!(r.after_tokens < r.before_tokens);
 
-        // Head + tail survive; a summary exists.
         assert_eq!(r.messages.first().unwrap().content, "SYSTEM");
         assert_eq!(r.messages.last().unwrap().content, "FINAL QUESTION");
 
@@ -1438,11 +1394,6 @@ mod tests {
 
     #[tokio::test]
     async fn full_compaction_does_not_leave_a_dangling_tool_call_at_the_head() {
-        // Regression for P0-2: with protect_first_n=3, the last kept head
-        // message (index 2) is an assistant WITH tool_calls whose result sits in
-        // the middle. Full compaction must not summarize that result away and
-        // leave a dangling tool_calls message (provider 400) — the head guard
-        // should extend the head to keep the call and its result together.
         let eng = engine(CompactionPolicy {
             protect_first_n: 3,
             protect_last_n: 2,
@@ -1450,7 +1401,6 @@ mod tests {
             ..Default::default()
         });
         let mut msgs = vec![Message::system("SYSTEM"), user("first ask")];
-        // Index 2: assistant with a tool call whose result is the next message.
         let head_call = ToolIntent {
             id: "head".into(),
             tool: "fs.read".into(),
@@ -1458,7 +1408,6 @@ mod tests {
         };
         msgs.push(Message::assistant_calls("", vec![head_call]));
         msgs.push(Message::tool_result("head", "z".repeat(400)));
-        // Enough middle turns to force a Full compaction under a tiny window.
         for i in 0..12 {
             msgs.push(user(&format!("ask {i} {}", "y".repeat(400))));
             let call = ToolIntent {
@@ -1474,9 +1423,6 @@ mod tests {
         let r = eng.compile(&msgs, Some(2_000)).await;
         assert!(r.compacted && r.summarized, "expected a Full compaction");
 
-        // Forward pairing invariant (the one P0-2 breaks): every tool_call id in
-        // any assistant message must have a matching tool_result later in the
-        // request — no dangling call.
         for (i, m) in r.messages.iter().enumerate() {
             for call in &m.tool_calls {
                 let paired = r.messages[i + 1..].iter().any(|later| {
@@ -1488,6 +1434,58 @@ mod tests {
                     call.id
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_compaction_keeps_a_parallel_tool_group_atomic_at_the_head() {
+        let eng = engine(CompactionPolicy {
+            protect_first_n: 4,
+            protect_last_n: 2,
+            tail_ratio: 0.1,
+            ..Default::default()
+        });
+        let calls = vec![
+            ToolIntent {
+                id: "parallel-a".into(),
+                tool: "fs.read".into(),
+                args: serde_json::json!({}),
+            },
+            ToolIntent {
+                id: "parallel-b".into(),
+                tool: "grep".into(),
+                args: serde_json::json!({}),
+            },
+        ];
+        let mut msgs = vec![
+            Message::system("SYSTEM"),
+            user("parallel ask"),
+            Message::assistant_calls("", calls),
+            Message::tool_result("parallel-a", "first result"),
+            Message::tool_result("parallel-b", "second result"),
+        ];
+        for i in 0..12 {
+            msgs.push(user(&format!("ask {i} {}", "y".repeat(400))));
+            let call = ToolIntent {
+                id: format!("middle-{i}"),
+                tool: "fs.read".into(),
+                args: serde_json::json!({}),
+            };
+            msgs.push(Message::assistant_calls("", vec![call]));
+            msgs.push(Message::tool_result(format!("middle-{i}"), "z".repeat(400)));
+        }
+        msgs.push(user("FINAL"));
+
+        let compiled = eng.compile(&msgs, Some(2_000)).await;
+        assert!(compiled.compacted && compiled.summarized);
+        for id in ["parallel-a", "parallel-b"] {
+            assert!(
+                compiled
+                    .messages
+                    .iter()
+                    .any(|message| message.tool_call_id.as_deref() == Some(id)),
+                "parallel result {id} was split from its retained assistant"
+            );
         }
     }
 
@@ -1695,15 +1693,9 @@ mod tests {
             !r.messages.iter().any(|m| m.content.len() > 1_000),
             "the big output must be gone, not just pruned"
         );
-        // Regression: the checkpoint marker must NOT be a mid-array system
-        // message (strict providers reject `system` that isn't first — the 400
-        // "System message must be at the beginning").
         assert_no_mid_array_system(&r.messages);
     }
 
-    /// A `system` message anywhere but index 0 is rejected by strict providers
-    /// (vLLM). Compaction must never emit one — summaries and checkpoints are
-    /// non-system so they stay in their chronological place.
     fn assert_no_mid_array_system(messages: &[Message]) {
         for (i, m) in messages.iter().enumerate() {
             assert!(

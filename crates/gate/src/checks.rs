@@ -1,4 +1,4 @@
-//! Deterministic check evaluation over a finished run (Vol 5 §2).
+//! Deterministic check evaluation over a finished run.
 //!
 //! Checks make no model call and introduce no randomness. Filesystem/event
 //! checks are pure projections of the artifact; command checks execute the
@@ -338,10 +338,7 @@ fn validate_container_image(image: &str) -> Result<(), String> {
     }
 }
 
-/// Resolve only a real docker/podman client selected by the operator's PATH.
-/// `runtime` lives in repository-owned `medha.lock`, so accepting an arbitrary
-/// program/path here would merely move the original host-code-execution bug
-/// from `sh` to a fake "docker" executable in the checkout.
+/// Resolve only docker/podman from the operator's trusted PATH.
 fn trusted_container_runtime(config: &SandboxConfig, workspace: &Path) -> Result<PathBuf, String> {
     let requested = config.runtime.as_deref().map(str::trim);
     let names: &[&str] = match requested {
@@ -849,6 +846,8 @@ fn check_request(
         cwd: workspace.to_path_buf(),
         env,
         clear_env: true,
+        read_roots: Vec::new(),
+        write_roots: Vec::new(),
     }
 }
 
@@ -1145,17 +1144,11 @@ mod tests {
         }
     }
 
-    // Each check must PASS on a good state and FAIL on a bad one — a check that
-    // can't fail is worthless (Vol 5 §2).
-
     #[tokio::test]
     async fn command_check_reads_exit_code() {
         let ws = temp_workspace("gate-command");
         let runner = test_runner(Duration::from_secs(5), 8 * 1024);
-        // `exit N` is the one spelling every interpreter this runs under
-        // agrees on — sh, bash, PowerShell and cmd alike. The previous
-        // Windows arm assumed cmd (`exit /B`), but `shell_argv` prefers bash
-        // wherever it exists, which is every Windows image that ships git.
+        // `exit N` works in every selected interpreter.
         let (success, failure) = ("exit 0", "exit 1");
         let (ok, _) = run_command(&runner, &ws, success, 0, None).await;
         assert!(ok);
@@ -1593,12 +1586,7 @@ esac
 
         let runner = CommandRunner::for_container_test(runtime, Duration::from_secs(10), 8 * 1024);
         let mut execution = Box::pin(execute_command(&runner, &workspace, "printf checked"));
-        // These deadlines wait for a spawned `/bin/sh` to reach a state; they are
-        // liveness bounds, not the assertion. A shared CI runner executing the
-        // rest of the suite in parallel takes far longer than a quiet machine to
-        // get a process scheduled, and a deadline tuned to the quiet case fails
-        // for load rather than for a defect. Budget for the slow machine — the
-        // marker assertions below are what catch a real regression.
+        // Generous liveness bounds avoid scheduler-load flakes; markers assert behavior.
         let observe_start = async {
             tokio::time::timeout(Duration::from_secs(30), async {
                 while !running.exists() {
@@ -1774,9 +1762,7 @@ esac
         );
         let out = execute_command(&runner, &ws, &command).await.unwrap();
         assert!(out.timed_out);
-        // The descendant cannot mutate before this point, even if the test
-        // runtime was CPU-starved past the nominal 100 ms deadline. If teardown
-        // missed it, releasing the barrier now makes that survivor observable.
+        // Releasing the barrier exposes any descendant missed by teardown.
         std::fs::write(&release, b"go").unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!marker.exists(), "a timed-out descendant survived");

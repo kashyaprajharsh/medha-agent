@@ -17,9 +17,6 @@ fn configured_medha(workspace: &std::path::Path, home: &std::path::Path) -> Comm
     command
 }
 
-/// A provider failure after the kernel session has started must reach the
-/// process exit status. Printing an error and returning `Ok(())` made CI accept
-/// failed agent runs as successful.
 #[test]
 fn a_headless_provider_failure_exits_nonzero() {
     let root = tempfile::tempdir().unwrap();

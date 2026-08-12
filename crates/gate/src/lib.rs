@@ -1,17 +1,4 @@
-//! The Eval Gate — "CI for cognition" (spec §4.11–4.12, Vol 5).
-//!
-//! `medha gate <scenario>` runs the real agent against a fixture task in
-//! isolation, then scores the run with **deterministic checks over the event
-//! log and the filesystem** — no LLM-as-judge (that is a later, calibrated
-//! addition; Vol 5 §4). It emits a **promote / hold / reject** verdict with
-//! evidence, and its exit code gates CI.
-//!
-//! Layering, so scoring stays testable without a model:
-//! - [`scenario`] — the YAML schema + validation.
-//! - [`run`] — spawns the binary hermetically → [`checks::RunArtifact`].
-//! - [`checks`] — *pure* evaluation of an artifact → outcomes (unit-tested).
-//! - [`verdict`] — seed aggregation + Wilson interval.
-//! - [`report`] — human table + JSON.
+//! Deterministic scenario evaluation over filesystem and event-log evidence.
 
 pub mod checks;
 pub mod report;
@@ -43,17 +30,12 @@ pub const MAX_SEEDS: u32 = 100;
 /// Above this count an operator must acknowledge the paid work explicitly.
 pub const COSTLY_SEEDS: u32 = 10;
 
-/// Options for a gate invocation.
 pub struct GateOptions {
-    /// A scenario file, a scenario directory, or a directory of scenarios.
     pub path: PathBuf,
-    /// Repeats per scenario (`[gate] seeds`, overridable by `--seeds`).
     pub seeds: u32,
-    /// Promote threshold (`[gate] pass_threshold`).
     pub threshold: f64,
     /// Explicit acknowledgement for a seed count above [`COSTLY_SEEDS`].
     pub confirm_costly: bool,
-    /// How to launch runs (binary + provider env + backstop wall).
     pub run: RunConfig,
 }
 
@@ -86,7 +68,6 @@ pub fn validate_run_inputs(
 
 /// Run the gate over one or more scenarios and return their aggregated results.
 pub async fn run_gate(opts: GateOptions) -> Result<Vec<ScenarioResult>, GateError> {
-    // Validate before discovery, vector allocation, or any provider-backed run.
     validate_run_inputs(opts.seeds, opts.threshold, opts.confirm_costly)?;
     let paths = discover(&opts.path)?;
     let mut results = Vec::with_capacity(paths.len());
@@ -97,11 +78,8 @@ pub async fn run_gate(opts: GateOptions) -> Result<Vec<ScenarioResult>, GateErro
     Ok(results)
 }
 
-/// Run one scenario `seeds` times and aggregate. A run that errors becomes a
-/// non-completing seed rather than aborting the whole gate (P10).
+/// Run one scenario `seeds` times and aggregate errors as incomplete seeds.
 async fn run_scenario(scn: &Scenario, opts: &GateOptions) -> ScenarioResult {
-    // Do not size an allocation from a caller-controlled count. The validated
-    // ceiling above bounds both memory and paid provider work.
     let mut seeds = Vec::new();
     let command_runner = checks::CommandRunner::from_sandbox(&opts.run.check_sandbox);
     for _ in 0..opts.seeds {

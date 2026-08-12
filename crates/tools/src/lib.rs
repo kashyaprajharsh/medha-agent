@@ -1,7 +1,7 @@
-//! Tool families and the registry (§4.5). A `Tool` is a schema-bearing,
+//! Tool families and the registry. A `Tool` is a schema-bearing,
 //! blast-radius-tagged capability; the `ToolRegistry` implements the kernel's
-//! `Executor`, exposing specs (K2) and dispatching validated intents to the
-//! right tool. Phase 0 ships fs + shell over the workspace sandbox.
+//! `Executor`, exposing specs and dispatching validated intents to the
+//! right tool.
 
 use async_trait::async_trait;
 use ignore::WalkBuilder;
@@ -68,12 +68,9 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn blast_radius(&self) -> BlastRadius;
 
-    /// Stable identity of state changed by this invocation, or `None` when the
-    /// tool is side-effect free. This is independent of blast radius: memory
-    /// writes are low-risk for policy purposes but still mutate durable state.
-    ///
-    /// Non-read tools default to one conservative global lane. A tool declared
-    /// `Read` that nevertheless updates replayable state must override this.
+    /// Stable identity of state this call changes, or `None` if side-effect free.
+    /// Independent of blast radius, so a `Read` tool that mutates replayable
+    /// state must override this rather than share the global mutation lane.
     fn mutation_key(&self, _args: &Value) -> Option<String> {
         match self.blast_radius() {
             BlastRadius::Read => None,
@@ -85,7 +82,7 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> Value;
     async fn execute(&self, args: &Value) -> Result<Value, ToolError>;
 
-    /// Presentation category surfaces map to a glyph/verb (§4.13). Defaults from
+    /// Presentation category surfaces map to a glyph/verb. Defaults from
     /// the blast radius; tools override for a finer class (Search/Web/Vcs/…).
     /// Declared here so surfaces read it, never re-deriving from the tool name.
     fn category(&self) -> ToolCategory {
@@ -119,12 +116,9 @@ pub trait Tool: Send + Sync {
         None
     }
 
-    /// Hard wall-clock ceiling for one call. Default `Some(60s)` protects against
-    /// a stuck tool. Tools that legitimately run long or self-manage their own
-    /// bound return a larger value or `None` (no outer cap): `shell.exec` owns
-    /// a stricter foreground deadline and process-tree teardown, while
-    /// `diagnostics`/`web.crawl` can exceed 60s on a big workspace/site. A `None`
-    /// here means the tool is trusted to bound itself.
+    /// Hard wall-clock ceiling for one call, default 60s. `None` means the tool
+    /// bounds itself — `shell.exec` owns a stricter deadline with process-tree
+    /// teardown; `diagnostics`/`web.crawl` legitimately run longer.
     fn timeout(&self) -> Option<std::time::Duration> {
         Some(TOOL_TIMEOUT)
     }
@@ -142,14 +136,9 @@ fn cap_preview(s: &str) -> String {
     out.join("\n")
 }
 
-/// Helper: required string argument.
 /// Run one tool under its own timeout and shape the result into an observation.
-///
-/// The ceiling is the tool's own (default 60s); tools that self-manage a longer
-/// run (`shell.exec` has an internal kill-and-settle deadline; `diagnostics`,
-/// `web.crawl`, `agent.*`) return a larger value or `None` for no outer cap. On timeout the run
-/// future is dropped — and for exec-backed tools that drop tears down the whole
-/// process group (see `GroupReaper`), so nothing is orphaned.
+/// On timeout the run future is dropped, which for exec-backed tools tears down
+/// the whole process group, so nothing is orphaned.
 pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observation {
     let run = tool.execute(&intent.args);
     let result = match tool.timeout() {
@@ -171,18 +160,27 @@ pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observatio
     match result {
         Ok(mut payload) => {
             let relayed = take_relayed_trust(&mut payload);
-            let obs = Observation::ok(&intent.id, payload);
-            match relayed {
-                Some(trust) => obs.relaying(trust),
-                None => obs,
+            let net_denied = take_net_denied(&mut payload);
+            let mut obs = Observation::ok(&intent.id, payload);
+            if let Some(trust) = relayed {
+                obs = obs.relaying(trust);
             }
+            if net_denied {
+                obs = obs.net_denied();
+            }
+            obs
         }
-        Err(ToolError::Structured(payload)) => Observation {
-            intent_id: intent.id.clone(),
-            status: kernel::ObsStatus::Error,
-            payload,
-            relayed_trust: None,
-        },
+        Err(ToolError::Structured(mut payload)) => {
+            let net_denied = take_net_denied(&mut payload);
+            let obs = Observation {
+                intent_id: intent.id.clone(),
+                status: kernel::ObsStatus::Error,
+                payload,
+                relayed_trust: None,
+                net_denied: false,
+            };
+            if net_denied { obs.net_denied() } else { obs }
+        }
         Err(error) => Observation::error(&intent.id, error.to_string()),
     }
 }
@@ -194,6 +192,18 @@ pub(crate) const RELAYED_TRUST: &str = "_relayed_trust";
 fn take_relayed_trust(payload: &mut Value) -> Option<kernel::TrustLabel> {
     let taken = payload.as_object_mut()?.remove(RELAYED_TRUST)?;
     serde_json::from_value(taken).ok()
+}
+
+/// Key a tool sets when a command failed because the sandbox denied network.
+/// Stripped here: it is a signal for the kernel's retry, not for the model.
+pub(crate) const NET_DENIED: &str = "_net_denied";
+
+fn take_net_denied(payload: &mut Value) -> bool {
+    payload
+        .as_object_mut()
+        .and_then(|obj| obj.remove(NET_DENIED))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
@@ -941,13 +951,11 @@ impl Tool for McpStart {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// The workspace sandbox, kept so the executor can report its containment
-    /// level (§4.8) to the kernel's trust-flow escalation. `None` for a bare
+    /// level to the kernel's trust-flow escalation. `None` for a bare
     /// registry built via [`ToolRegistry::new`].
     sandbox: Option<Arc<WorkspaceSandbox>>,
-    /// Shared owned-process table. Foreground `shell.exec` calls live here while
-    /// running, giving cancellation and concurrent surfaces a stable process-
-    /// tree kill handle; a bounded TTL/LRU cache retains recent settled output.
-    /// `None` for a bare registry.
+    /// Shared owned-process table giving cancellation a stable process-tree kill
+    /// handle, plus a bounded TTL/LRU cache of recent settled output.
     tasks: Option<Arc<TaskTable>>,
     /// Live web-search configuration shared with the `web.*` tools. The TUI's
     /// `/search` writes it; the tools read it per call, so a provider change
@@ -1143,8 +1151,7 @@ impl ToolRegistry {
         self
     }
 
-    /// Persistent typed memory (D5): write/update/forget over the projection.
-    /// Trust fields arrive kernel-injected at dispatch — see `memory_tools`.
+    /// Trust fields arrive kernel-injected at dispatch.
     pub fn register_memory(&mut self, store: Arc<memory::MemoryProjection>) -> &mut Self {
         self.register_memory_configured(
             store,
@@ -1174,7 +1181,6 @@ impl ToolRegistry {
         self
     }
 
-    /// Verbatim episodic recall over the persistent event log (D4).
     pub fn register_session_search(
         &mut self,
         log: Arc<store::SqliteLog>,
@@ -1279,20 +1285,7 @@ impl ToolRegistry {
         r
     }
 
-    /// The same capabilities, rooted at a different workspace (§6.4).
-    ///
-    /// This is what makes writer isolation real rather than nominal. Every
-    /// file and shell tool binds its `WorkspaceSandbox` at registration, so a
-    /// child handed a worktree but the parent's registry would still resolve
-    /// every path against the parent's root — isolated in name, editing the
-    /// parent's files in fact, and nothing would say so until something was
-    /// overwritten.
-    ///
-    /// Sandbox-bound tools are rebuilt against `sandbox`; everything else —
-    /// MCP, skills, memory, session search, the agent tools — is carried over
-    /// as-is, because those are session services rather than workspace ones.
-    /// The result can only ever be a subset of this registry's tool names, so
-    /// rebasing cannot widen a child's capabilities.
+    /// Rebind workspace tools without widening the registry's capabilities.
     pub fn rebase(&self, sandbox: Arc<WorkspaceSandbox>) -> Option<Self> {
         // A registry with no workspace has nothing to rebase, and inventing an
         // artifact store here would give the child a place to write that the
@@ -1315,9 +1308,7 @@ impl ToolRegistry {
         fresh.agent_parent = Arc::clone(&self.agent_parent);
         fresh.agent_session = Arc::clone(&self.agent_session);
         for (name, tool) in &self.tools {
-            // Never overwrite: anything the fresh registry already built is
-            // bound to the new root, and the parent's version of that same
-            // name is bound to the old one.
+            // Preserve tools already rebound to the new root.
             if !fresh.tools.contains_key(name) {
                 fresh.tools.insert(name.clone(), Arc::clone(tool));
             }
@@ -1399,6 +1390,17 @@ impl Executor for ToolRegistry {
         self.tasks.as_ref().map(|t| t.info()).unwrap_or_default()
     }
 
+    async fn grant_network(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        match self.sandbox.as_ref() {
+            Some(sbx) => sbx.request_network(detail, escalated).await,
+            None => kernel::NetworkDecision::Deny,
+        }
+    }
+
     async fn execute(&self, intent: &ToolIntent) -> Observation {
         if mcp::McpManager::is_mcp_tool(&intent.tool) {
             let Some(mcp) = &self.mcp else {
@@ -1425,6 +1427,7 @@ impl Executor for ToolRegistry {
                             status: kernel::ObsStatus::Error,
                             payload,
                             relayed_trust: None,
+                            net_denied: false,
                         }
                     } else {
                         Observation::ok(&intent.id, payload)
@@ -1446,8 +1449,6 @@ impl Executor for ToolRegistry {
         }
     }
 }
-
-// ── fs family ──────────────────────────────────────────────────────────────
 
 struct FsRead {
     sbx: Arc<WorkspaceSandbox>,
@@ -1517,8 +1518,7 @@ impl Tool for FsRead {
                  or `glob`/`grep` to find files inside it"
             )));
         }
-        // Size guard (P2): refuse a whole-file read of a huge file BEFORE
-        // loading it — otherwise it lands in memory and the event log intact.
+        // Reject oversized whole-file reads before allocation.
         if offset.is_none()
             && limit.is_none()
             && let Ok(md) = std::fs::metadata(&resolved)
@@ -1659,10 +1659,8 @@ impl Tool for FsWrite {
         Ok(out)
     }
 
-    /// The gate preview for a write is a diff against the file's current state
-    /// (all additions for a brand-new file, or a real change diff when it
-    /// already exists), so the approval card shows exactly what will land —
-    /// capped so a large file doesn't flood the prompt.
+    /// A diff against the file's current state so the approval card shows exactly
+    /// what will land, capped so a large file cannot flood the prompt.
     async fn preview(&self, args: &Value) -> Option<String> {
         let path = args.get("path")?.as_str()?;
         let content = args.get("content")?.as_str()?;
@@ -1698,11 +1696,9 @@ impl Tool for FsWrite {
     }
 }
 
-/// Read a file's contents for diffing; distinguish "doesn't exist" (empty, false)
-/// from "exists but unreadable" (empty, true) so previews can't call a
-/// destructive overwrite a new file.
-/// `may_prompt` is false for previews, which must not raise a permission dialog
-/// before the approval card explains what the operation is.
+/// Read a file for diffing. Distinguishes "missing" (empty, false) from "exists
+/// but unreadable" (empty, true) so a preview cannot call an overwrite a new file.
+/// `may_prompt` is false for previews, which must not raise a permission dialog.
 #[cfg(test)]
 async fn read_or_flag_unreadable(
     sbx: &WorkspaceSandbox,
@@ -1864,7 +1860,6 @@ impl Tool for FsEdit {
                 .ok_or_else(|| ToolError::Failed(format!("{path} does not exist")))?,
         )
         .map_err(|_| ToolError::Failed(format!("{path} is not valid UTF-8")))?;
-        // Refuse if the file changed since the approved preview (P1-1).
         self.pins.check(args, &path, &inspection.state)?;
         // CRLF-tolerant byte-exact match (see `resolve_edit`).
         let (old_s, new_s) = resolve_edit(&content, &old_s, &new_s)
@@ -1928,34 +1923,27 @@ impl Tool for FsEdit {
         // authorise the path here would question the user before telling them
         // what it is for — and again when the edit actually runs.
         let inspection = self.sbx.inspect_if_permitted(path).await.ok()??;
-        // Pin what the approval card will show (P1-1).
         self.pins.pin(args, &inspection.state);
         let content = String::from_utf8(inspection.bytes.unwrap_or_default()).ok()?;
-        let count = content.matches(old_s).count();
-        if count == 0 {
+        let Some((old_s, new_s)) = resolve_edit(&content, old_s, new_s) else {
             return Some(format!(
                 "(old_string not found in {path} — this edit would fail)"
             ));
-        }
+        };
+        let count = content.matches(&old_s).count();
         if count > 1 && !replace_all {
             return Some(format!(
                 "(old_string appears {count}× in {path}; needs replace_all or a more specific match)"
             ));
         }
         let updated = if replace_all {
-            content.replace(old_s, new_s)
+            content.replace(&old_s, &new_s)
         } else {
-            content.replacen(old_s, new_s, 1)
+            content.replacen(&old_s, &new_s, 1)
         };
         Some(cap_preview(&make_diff(path, &content, &updated)))
     }
 }
-
-// ── word_count ───────────────────────────────────────────────────────────────
-//
-// A simple read-only tool that counts words, lines, and characters in a workspace
-// file. Useful for the model to get a quick sense of file size without reading
-// the full content.
 
 struct WordCount {
     sbx: Arc<WorkspaceSandbox>,
@@ -2090,8 +2078,6 @@ fn stream_text_counts(path: &std::path::Path) -> Result<TextCounts, String> {
     }
     Ok(counts)
 }
-
-// ── search family ────────────────────────────────────────────────────────────
 
 struct Grep {
     sbx: Arc<WorkspaceSandbox>,
@@ -2304,8 +2290,6 @@ impl Tool for Glob {
         .map_err(|e| ToolError::Failed(e.to_string()))?
     }
 }
-
-// ── code intelligence ─────────────────────────────────────────────────────────
 
 struct CodeOutline {
     sbx: Arc<WorkspaceSandbox>,
@@ -2797,8 +2781,6 @@ impl Tool for Tree {
     }
 }
 
-// ── artifact recovery ────────────────────────────────────────────────────────
-
 struct ReadArtifact {
     store: Arc<dyn kernel::ArtifactStore>,
 }
@@ -2869,11 +2851,6 @@ impl Tool for ReadArtifact {
             .get_async(hash.clone(), offset, Some(length))
             .await
             .map_err(ToolError::Failed)?;
-        // Snap page edges to char boundaries (P2): a byte offset can land
-        // mid-UTF-8-sequence; lossy decoding put U+FFFD at the edges and made
-        // stitched pages corrupt exact strings. Skip leading continuation
-        // bytes, drop an incomplete trailing char, and report `next_offset`
-        // so the dropped tail bytes re-appear at the start of the next page.
         let lead = if offset > 0 {
             bytes.iter().take_while(|b| (**b & 0xC0) == 0x80).count()
         } else {
@@ -2883,11 +2860,9 @@ impl Tool for ReadArtifact {
         let (content, consumed) = match std::str::from_utf8(slice) {
             Ok(s) => (s.to_string(), slice.len()),
             Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => {
-                // Clean text cut mid-char at the page end — keep the valid prefix.
                 let v = e.valid_up_to();
                 (String::from_utf8_lossy(&slice[..v]).into_owned(), v)
             }
-            // Genuinely non-UTF-8 (binary artifact) — lossy as before.
             Err(_) => (String::from_utf8_lossy(slice).into_owned(), slice.len()),
         };
         let next_offset = offset + lead + consumed;
@@ -2904,12 +2879,6 @@ impl Tool for ReadArtifact {
         Ok(out)
     }
 }
-
-// ── web family (free: DuckDuckGo search, no key) ─────────────────────────────
-//
-// NOTE: web output is *untrusted* content (P7, `TrustLabel::Web`). The full
-// trust-flow escalation (taint: a tool whose params derive from web content is
-// escalated) lands with the governance layer; for now these are read-only.
 
 /// A realistic desktop-browser User-Agent. Search engines (DuckDuckGo especially)
 /// and many sites return empty/blocked responses to non-browser agents, so a
@@ -3071,8 +3040,7 @@ fn resolve_public_url(url: &reqwest::Url) -> Result<PublicTarget, String> {
 /// Read a response body into memory, but abort as soon as it exceeds `max`
 /// bytes — streaming rather than buffering the whole (possibly unbounded,
 /// chunked) body first. A declared oversized `Content-Length` is rejected up
-/// front. This is the cap the PDF/HTML size limits used to apply only *after*
-/// the entire body was already in memory.
+/// front, so the cap also bounds peak memory use.
 async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>, ToolError> {
     use futures::StreamExt;
     if let Some(len) = resp.content_length() {
@@ -3641,9 +3609,6 @@ fn parse_ddg_lite(html: &str, max: usize) -> Vec<Value> {
     let row_sel = Selector::parse("tr").unwrap();
     let link_sel = Selector::parse("a.result-link").unwrap();
     let snip_sel = Selector::parse("td.result-snippet, .result-snippet").unwrap();
-    // Pair structurally, not by index (P2): a snippet belongs to the link row
-    // immediately before it. Index-zipping the two node lists meant one ad or
-    // snippet-less row shifted EVERY later snippet onto the wrong result.
     let mut out: Vec<Value> = Vec::new();
     let mut pending: Option<(String, String)> = None;
     let flush = |pending: &mut Option<(String, String)>, snippet: String, out: &mut Vec<Value>| {
@@ -3960,8 +3925,6 @@ impl Tool for WebCrawl {
     }
 }
 
-// ── clarify (human-in-the-loop questions) ────────────────────────────────────
-
 struct Clarify {
     asker: ClarifyHandle,
 }
@@ -4227,8 +4190,6 @@ fn extract_pdf_text(bytes: &[u8]) -> String {
     }
 }
 
-// ── shell family ─────────────────────────────────────────────────────────────
-
 /// The environment handed to `shell.exec` children: the current process env
 /// filtered down to a non-secret allowlist. Everything else (provider/API keys
 /// like TAVILY_API_KEY/BRAVE_API_KEY and any other injected secrets) is dropped,
@@ -4303,6 +4264,24 @@ const MAX_RECENT_SHELL_TASKS: usize = 64;
 const MAX_RECENT_SHELL_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const RECENT_SHELL_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const MAX_TASK_COMMAND_BYTES: usize = 4096;
+const NETWORK_DISABLED_HINT: &str = "The active sandbox denied network access. Medha offers to grant \
+     network and retry when this happens; if that grant was declined, the command cannot reach the \
+     network. This is an advisory; the original error may also have another cause.";
+
+/// Add configuration context to otherwise opaque resolver/socket failures.
+///
+/// DNS libraries report the same errors for a real lookup failure and for an OS
+/// policy rejection, so this deliberately does not attribute causality — it only
+/// states the independently known sandbox posture. `denies_network` is the
+/// backend's config intent, not proof of enforcement.
+fn network_disabled_hint(
+    denies_network: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Option<&'static str> {
+    sandbox::network_denial_signature(stdout, stderr, denies_network)
+        .then_some(NETWORK_DISABLED_HINT)
+}
 
 #[derive(Debug, Clone, Copy)]
 struct TaskLimits {
@@ -4798,8 +4777,6 @@ impl Tool for ShellExec {
          for everything else, including multi-step shell pipelines."
     }
     fn blast_radius(&self) -> BlastRadius {
-        // Phase 0 runs locally in the workspace; the container backend and the
-        // pre-execution scanner (§4.6) harden this in Phase 1.
         BlastRadius::IrreversibleLocal
     }
     fn timeout(&self) -> Option<std::time::Duration> {
@@ -4868,7 +4845,15 @@ impl Tool for ShellExec {
                 .take()
                 .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
             let completed = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
-            let result = json!({
+            let denies_network = self.sbx.denies_network();
+            let net_denied = sandbox::network_denial_signature(
+                &completed.stdout,
+                &completed.stderr,
+                denies_network,
+            );
+            let sandbox_hint =
+                network_disabled_hint(denies_network, &completed.stdout, &completed.stderr);
+            let mut result = json!({
                 "command": command,
                 "exit_code": completed.exit_code,
                 "stdout": completed.stdout,
@@ -4876,6 +4861,12 @@ impl Tool for ShellExec {
                 "stdout_truncated": completed.stdout_truncated,
                 "stderr_truncated": completed.stderr_truncated,
             });
+            if let Some(hint) = sandbox_hint {
+                result["sandbox_hint"] = Value::String(hint.to_string());
+            }
+            if net_denied {
+                result[NET_DENIED] = Value::Bool(true);
+            }
             self.tasks.remember(task_id, completed);
             return Ok(result);
         }
@@ -4889,7 +4880,15 @@ impl Tool for ShellExec {
         entry.proc.kill();
         entry.proc.wait().await;
         let completed = CompletedTask::capture(entry, TerminalTaskStatus::TimedOut);
-        let error = ToolError::Structured(json!({
+        // A command that retried a denied resolver until the deadline is still a
+        // network denial; without this the escalation is silently unreachable for
+        // anything slow enough to time out.
+        let net_denied = sandbox::network_denial_signature(
+            &completed.stdout,
+            &completed.stderr,
+            self.sbx.denies_network(),
+        );
+        let mut payload = json!({
             "error": format!("shell command timed out after {timeout_s}s; process tree was stopped"),
             "command": command,
             "timed_out": true,
@@ -4898,9 +4897,12 @@ impl Tool for ShellExec {
             "stderr": completed.stderr,
             "stdout_truncated": completed.stdout_truncated,
             "stderr_truncated": completed.stderr_truncated,
-        }));
+        });
+        if net_denied {
+            payload[NET_DENIED] = Value::Bool(true);
+        }
         self.tasks.remember(task_id, completed);
-        Err(error)
+        Err(ToolError::Structured(payload))
     }
 
     async fn preview(&self, args: &Value) -> Option<String> {
@@ -4909,8 +4911,6 @@ impl Tool for ShellExec {
             .map(|c| format!("$ {c}"))
     }
 }
-
-// ── live owned tasks: task.output / task.kill / task.list ────────────────────
 
 /// Kill every still-running task when the table (and thus the session's tool
 /// registry) is dropped.
@@ -5068,8 +5068,6 @@ impl Tool for TaskList {
         Ok(json!({ "tasks": self.tasks.list() }))
     }
 }
-
-// ── multi_edit ─────────────────────────────────────────────────────────────
 
 struct MultiEdit {
     sbx: Arc<WorkspaceSandbox>,
@@ -5230,7 +5228,6 @@ impl Tool for MultiEdit {
                 .ok_or_else(|| ToolError::Failed(format!("{path} does not exist")))?,
         )
         .map_err(|_| ToolError::Failed(format!("{path} is not valid UTF-8")))?;
-        // Refuse if the file changed since the approved preview (P1-1).
         self.pins.check(args, &path, &inspection.state)?;
         let updated = apply_edits(&content, edits)?;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
@@ -5268,7 +5265,6 @@ impl Tool for MultiEdit {
         let edits = args.get("edits")?.as_array()?;
         // Never prompts — see `fs.edit`'s preview.
         let inspection = self.sbx.inspect_if_permitted(path).await.ok()??;
-        // Pin what the approval card will show (P1-1).
         self.pins.pin(args, &inspection.state);
         let content = String::from_utf8(inspection.bytes.unwrap_or_default()).ok()?;
         match apply_edits(&content, edits) {
@@ -5277,8 +5273,6 @@ impl Tool for MultiEdit {
         }
     }
 }
-
-// ── git (read-only) ──────────────────────────────────────────────────────────
 
 struct Git {
     sbx: Arc<WorkspaceSandbox>,
@@ -5408,15 +5402,20 @@ impl Tool for Git {
                 "\n[truncated: showing first 400 of {total_lines} lines — scope with `path` or use shell.exec git for full output]"
             ));
         }
-        Ok(json!({
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut result = json!({
             "subcommand": sub,
             "exit_code": output.status,
             "stdout": capped,
             "truncated": output.stdout_truncated || total_lines > 400,
             "stdout_truncated": output.stdout_truncated,
-            "stderr": String::from_utf8_lossy(&output.stderr),
+            "stderr": stderr,
             "stderr_truncated": output.stderr_truncated,
-        }))
+        });
+        if sandbox::network_denial_signature(&stdout, &stderr, self.sbx.denies_network()) {
+            result[NET_DENIED] = Value::Bool(true);
+        }
+        Ok(result)
     }
 
     async fn preview(&self, args: &Value) -> Option<String> {
@@ -5439,8 +5438,6 @@ impl Tool for Git {
         }
     }
 }
-
-// ── diagnostics ──────────────────────────────────────────────────────────────
 
 struct Diagnostics {
     sbx: Arc<WorkspaceSandbox>,
@@ -5929,6 +5926,8 @@ impl Tool for Diagnostics {
         let mut ran: Vec<&str> = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
+        let denies_network = self.sbx.denies_network();
+        let mut net_denied = false;
 
         for c in plan_checkers(lang) {
             // Under a sandbox wrapper a missing checker surfaces as a wrapper
@@ -5948,6 +5947,7 @@ impl Tool for Diagnostics {
             };
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
+            net_denied |= sandbox::network_denial_signature(&stdout, &stderr, denies_network);
             if output.stdout_truncated || output.stderr_truncated {
                 notes.push(format!(
                     "{} output exceeded the capture limit (stdout truncated: {}, stderr truncated: {}); diagnostics are a bounded tail",
@@ -6009,17 +6009,13 @@ impl Tool for Diagnostics {
         if !notes.is_empty() {
             result["notes"] = json!(notes);
         }
+        if net_denied {
+            result[NET_DENIED] = Value::Bool(true);
+        }
         Ok(result)
     }
 }
 
-// ── planning ─────────────────────────────────────────────────────────────────
-
-/// A cognitive tool (no side effects): the model maintains a live checklist for
-/// a multi-step task. It passes the *full* list each call, so the latest call
-/// is the current plan; the surface renders it and the event log captures the
-/// agent's intent + progress over time (P3). This is what lets the agent lay
-/// out a plan for complex work and tick it off as it goes.
 struct UpdatePlan;
 
 #[async_trait]
@@ -6416,6 +6412,7 @@ mod tests {
             },
             vec![],
             sandbox::ApprovedRoots::default(),
+            sandbox::NetworkGrant::default(),
         );
         let sbx = Arc::new(
             WorkspaceSandbox::new_jailed(&dir)
@@ -6555,8 +6552,6 @@ mod tests {
 
     #[test]
     fn ddg_lite_snippets_pair_structurally_not_by_index() {
-        // Result 1 has NO snippet row — its absence must not shift result 2's
-        // snippet onto it (the old index-zip did exactly that).
         let html = r#"<table>
             <tr><td><a class="result-link" href="https://one.example/">One</a></td></tr>
             <tr><td><a class="result-link" href="https://two.example/">Two</a></td></tr>
@@ -7223,8 +7218,6 @@ mod tests {
         .await
     }
 
-    // ── P0-1: ranged reads keep raw bytes (CRLF + trailing newline) so an edit
-    //         built from a ranged read matches byte-for-byte ───────────────────
     #[tokio::test]
     async fn ranged_read_preserves_crlf_then_edit_roundtrips() {
         let dir = std::env::temp_dir().join(format!("medha-crlf-{}", ulid_like()));
@@ -7236,7 +7229,6 @@ mod tests {
         )
         .await;
 
-        // A ranged read returns the slice with its CRLF terminator intact.
         let r = run(
             &reg,
             "fs.read",
@@ -7249,7 +7241,6 @@ mod tests {
             "CRLF preserved (was LF-normalized)"
         );
 
-        // The model copies that exact slice into an edit — it must match.
         let e = run(
             &reg,
             "fs.edit",
@@ -7275,9 +7266,6 @@ mod tests {
 
     #[tokio::test]
     async fn edit_keeps_crlf_when_new_string_is_lf_only() {
-        // Exact-match path: old_string matches the CRLF file verbatim, but the
-        // model supplied an LF-only new_string. The write must not leave mixed
-        // endings — new is normalized to the file's CRLF.
         let dir = std::env::temp_dir().join(format!("medha-crlf3-{}", ulid_like()));
         let reg = reg_in(&dir);
         run(
@@ -7319,7 +7307,6 @@ mod tests {
             json!({ "path": "f.txt", "content": "one\r\ntwo\r\n" }),
         )
         .await;
-        // Needle uses LF though the file is CRLF — resolve_edit should still match.
         let e = run(
             &reg,
             "fs.edit",
@@ -7343,7 +7330,41 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── P2: a huge limit must not overflow into an empty slice ────────────────
+    #[tokio::test]
+    async fn edit_preview_matches_crlf_tolerant_execution() {
+        let dir = std::env::temp_dir().join(format!("medha-crlf-preview-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        run(
+            &reg,
+            "fs.write",
+            json!({ "path": "f.txt", "content": "one\r\ntwo\r\n" }),
+        )
+        .await;
+        let intent = ToolIntent {
+            id: "crlf-preview".into(),
+            tool: "fs.edit".into(),
+            args: json!({
+                "path": "f.txt", "old_string": "one\ntwo", "new_string": "1\n2"
+            }),
+        };
+
+        let preview = reg.preview(&intent).await.expect("edit preview");
+        assert!(!preview.contains("would fail"), "{preview}");
+        assert!(
+            preview.contains("+1") && preview.contains("+2"),
+            "{preview}"
+        );
+        let observation = reg.execute(&intent).await;
+        assert_eq!(observation.status, kernel::ObsStatus::Ok, "{observation:?}");
+        assert_eq!(
+            run(&reg, "fs.read", json!({ "path": "f.txt" }))
+                .await
+                .payload["content"],
+            "1\r\n2\r\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn ranged_read_huge_limit_does_not_overflow() {
         let dir = std::env::temp_dir().join(format!("medha-ovf-{}", ulid_like()));
@@ -7364,7 +7385,6 @@ mod tests {
             r.payload["content"], "b\nc\n",
             "saturating end, not wrapped-empty"
         );
-        // Offset past EOF is flagged, not silently empty.
         let past = run(
             &reg,
             "fs.read",
@@ -7381,7 +7401,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── P0-5: empty / no-op old_string must fail, not corrupt the file ────────
     #[tokio::test]
     async fn edit_rejects_empty_and_noop_old_string() {
         let dir = std::env::temp_dir().join(format!("medha-empty-{}", ulid_like()));
@@ -7406,7 +7425,6 @@ mod tests {
             kernel::ObsStatus::Error,
             "empty old_string must be rejected"
         );
-        // File untouched.
         assert_eq!(
             run(&reg, "fs.read", json!({ "path": "f.txt" }))
                 .await
@@ -7428,7 +7446,6 @@ mod tests {
             "old==new must be rejected"
         );
 
-        // multi_edit guards the same way.
         let me = run(
             &reg,
             "multi_edit",
@@ -7441,7 +7458,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── P0-3 / §2: background-task facility ───────────────────────────────────
     #[tokio::test]
     async fn shell_fast_command_completes_inline() {
         let dir = std::env::temp_dir().join(format!("medha-sh-fast-{}", ulid_like()));
@@ -7455,6 +7471,50 @@ mod tests {
             "fast command should not promote"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn network_failure_hint_is_actionable_without_claiming_causality() {
+        let hint = network_disabled_hint(true, "", "getaddrinfo ENOTFOUND registry.example")
+            .expect("a resolver-shaped failure in a no-network sandbox needs context");
+        assert!(hint.contains("network access"));
+        assert!(hint.contains("grant network"));
+        assert!(hint.contains("may also have another cause"));
+
+        assert_eq!(
+            network_disabled_hint(false, "", "getaddrinfo ENOTFOUND registry.example"),
+            None,
+            "never show the hint when the backend is not denying network"
+        );
+        assert_eq!(
+            network_disabled_hint(true, "", "compiler: syntax error"),
+            None,
+            "unrelated failures must stay uncluttered"
+        );
+        // A masked zero exit does not suppress the signal — the marker carries it.
+        assert!(
+            network_disabled_hint(true, "npm error code ENOTFOUND\nexit=0", "").is_some(),
+            "a resolver marker signals even when the exit code was masked to 0"
+        );
+    }
+
+    #[test]
+    fn take_net_denied_strips_the_marker_and_tolerates_non_objects() {
+        let mut obj = json!({ "exit_code": 1, "_net_denied": true });
+        assert!(take_net_denied(&mut obj));
+        assert!(
+            obj.get(NET_DENIED).is_none(),
+            "the marker must be stripped so the model never sees it"
+        );
+
+        let mut without = json!({ "exit_code": 0 });
+        assert!(!take_net_denied(&mut without));
+
+        // A non-object payload has no marker and must not panic.
+        let mut array = json!(["stdout only"]);
+        assert!(!take_net_denied(&mut array));
+        let mut string = json!("plain");
+        assert!(!take_net_denied(&mut string));
     }
 
     #[tokio::test]
@@ -7734,11 +7794,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── K7 / P1-10: long-running tools get a wider ceiling than the 60s default ──
     #[test]
     fn per_tool_timeouts_exceed_the_default_for_long_runners() {
         let default = TOOL_TIMEOUT;
-        // A quick local tool keeps the default 60s.
         assert_eq!(WordCount { sbx: mk_sbx() }.timeout(), Some(default));
         // shell.exec self-manages a bounded kill-and-settle deadline → no outer cap.
         assert_eq!(
@@ -7749,7 +7807,6 @@ mod tests {
             .timeout(),
             None
         );
-        // A long-running fixed tool widens its ceiling past the default.
         assert!(
             Diagnostics { sbx: mk_sbx() }.timeout().unwrap() > default,
             "diagnostics must exceed 60s"
@@ -7767,7 +7824,6 @@ mod tests {
         Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap())
     }
 
-    // ── P0-4: concurrent same-file edits must not clobber each other ──────────
     #[tokio::test]
     async fn concurrent_edits_to_one_file_both_apply() {
         let dir = std::env::temp_dir().join(format!("medha-p04-{}", ulid_like()));
@@ -7779,9 +7835,6 @@ mod tests {
         )
         .await;
 
-        // Fire two edits to the SAME file at once. Without per-path serialization
-        // both read "alpha beta" and last-write-wins drops one; the lock forces
-        // the second to see the first's result, so both land.
         let (a, b) = (reg.clone(), reg.clone());
         let e1 = tokio::spawn(async move {
             run(
@@ -7804,7 +7857,6 @@ mod tests {
         assert_eq!(r1.status, kernel::ObsStatus::Ok);
         assert_eq!(r2.status, kernel::ObsStatus::Ok);
 
-        // Final file reflects BOTH edits (order-independent).
         let out = run(&reg, "fs.read", json!({ "path": "f.txt" }))
             .await
             .payload["content"]
@@ -7815,7 +7867,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── P1-7: `*` must not cross `/` ──────────────────────────────────────────
     #[tokio::test]
     async fn glob_star_does_not_cross_slash() {
         let dir = std::env::temp_dir().join(format!("medha-glob-{}", ulid_like()));
@@ -7876,10 +7927,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── clarify tool ─────────────────────────────────────────────────────────
     #[test]
     fn clarify_parse_validates_bounds() {
-        // Good input parses (2 questions, options within 2–5, recommended flag).
         let ok = json!({ "questions": [
             { "question": "Which DB?", "header": "DB", "options": [
                 { "label": "Postgres", "recommended": true }, { "label": "SQLite" } ] },
@@ -7891,18 +7940,15 @@ mod tests {
         assert!(qs[0].options[0].recommended, "recommended flag parsed");
         assert!(!qs[0].multi_select, "default single-select");
         assert!(qs[1].multi_select, "multi_select parsed");
-        // Too many questions → rejected.
         let many = json!({ "questions": (0..5).map(|i| json!({
             "question": format!("q{i}"), "options": [{"label":"a"},{"label":"b"}] })).collect::<Vec<_>>() });
         assert!(Clarify::parse_questions(&many).is_err());
-        // A question with <2 options → rejected (a non-choice).
         let thin = json!({ "questions": [ { "question": "x", "options": [ {"label":"only"} ] } ] });
         assert!(Clarify::parse_questions(&thin).is_err());
     }
 
     #[test]
     fn clarify_truncates_more_than_five_options() {
-        // A model overshooting to 6 options must not fail the call — keep 5.
         let args = json!({ "questions": [ { "question": "Which?", "options": [
             {"label":"a"},{"label":"b"},{"label":"c"},{"label":"d"},{"label":"e"},{"label":"f"} ] } ]});
         let qs = Clarify::parse_questions(&args).expect("6 options truncates, not errors");
@@ -7911,7 +7957,6 @@ mod tests {
 
     #[test]
     fn clarify_accepts_double_encoded_questions() {
-        // Some models send `questions` as a JSON *string* of the array. Accept it.
         let inner =
             r#"[{"question":"Which DB?","options":[{"label":"Postgres"},{"label":"SQLite"}]}]"#;
         let args = json!({ "questions": inner });
@@ -7922,8 +7967,6 @@ mod tests {
 
     #[test]
     fn clarify_never_times_out() {
-        // Regression: a human question must have NO deadline — with the default
-        // 60s tool timeout it fired and the agent proceeded without an answer.
         let tool = Clarify {
             asker: Arc::new(Mutex::new(None)),
         };
@@ -7935,8 +7978,6 @@ mod tests {
 
     #[tokio::test]
     async fn clarify_without_an_asker_reports_skipped_never_blocks() {
-        // Headless/no-surface: the tool must return promptly with skipped=true,
-        // never hang waiting for an answer that can't come.
         let tool = Clarify {
             asker: Arc::new(Mutex::new(None)),
         };
@@ -8074,11 +8115,6 @@ mod tests {
         observation.payload
     }
 
-    /// `agent.wait` told the caller "their reports arrive with the rest of this
-    /// turn's results". They do not: collection runs at the head of a turn and
-    /// this call is mid-turn. The caller was left holding a promise nothing kept
-    /// and went digging through the transcript — the one thing it is told not to
-    /// do, and the one that costs the most context.
     #[tokio::test]
     async fn waiting_hands_back_the_reports_it_waited_for() {
         let (registry, _outbox, _owner) = registry_with_outbox();
@@ -8256,9 +8292,6 @@ mod tests {
 
     #[tokio::test]
     async fn reading_a_missing_file_reports_it_rather_than_returning_empty() {
-        // Resolution failure used to fall through to the read for its error;
-        // it now returns early, so the message has to stay just as clear —
-        // silently succeeding with empty content would be far worse.
         let dir = std::env::temp_dir().join(format!("medha-missing-{}", ulid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
@@ -8356,9 +8389,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    /// A preview renders the approval card, so it runs *before* the user has
-    /// been told what the operation is. Prompting there asks them to authorise
-    /// a path with no context, and asks again when the write actually runs.
     #[tokio::test]
     async fn a_preview_never_raises_a_permission_prompt() {
         let ws = std::env::temp_dir().join(format!("medha-pv-ws-{}", ulid_like()));

@@ -1,9 +1,4 @@
-//! The delegation tools: `agent.spawn`, the control verbs, and `agent.apply`.
-//!
-//! Every one of them is bound to the [`Caller`] that holds it. A tool shared
-//! with the whole tree would resolve `parser` from the root no matter who
-//! called it, which is how a depth limit comes to read the root's depth and a
-//! child comes to cancel its own siblings.
+//! Delegation tools bound to the calling agent's address and limits.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,12 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{Tool, ToolError, arg_str};
 
-/// Builds the delegation tools for one address.
-///
-/// Held by the control plane so it can furnish a child with its own set at
-/// admission. The handle back to the control plane is weak: the control plane
-/// owns this, and a strong handle would close the cycle and leak the tree for
-/// the life of the process.
+/// Builds delegation tools through a weak control-plane handle.
 pub struct Delegate {
     control: std::sync::Weak<orchestrator::AgentControl>,
     executor: ParentHandle,
@@ -73,8 +63,6 @@ impl Delegate {
                 max_turns: self.max_turns,
             }));
         }
-        // Only where writers are possible. Offering a merge tool in a session
-        // that can never produce a patch is a tool that can only ever fail.
         if control.can_write() {
             tools.push(Arc::new(AgentApply { control }));
         }
@@ -108,11 +96,7 @@ impl orchestrator::Delegation for Delegate {
     }
 }
 
-/// An executor whose delegation tools answer for a child rather than the root.
-///
-/// Every other name falls through untouched. The overlay is built from the
-/// inner executor's own spec list, so it can only ever replace a tool, never
-/// introduce one.
+/// Rebinds existing delegation tools without adding capabilities.
 struct Rebound {
     inner: Arc<dyn kernel::Executor>,
     tools: std::collections::HashMap<String, Arc<dyn Tool>>,
@@ -469,11 +453,7 @@ impl Tool for AgentSpawn {
 /// Shared slot for the session a background report belongs to.
 pub type SessionHandle = Arc<Mutex<Option<ulid::Ulid>>>;
 
-/// The ceilings to hand a child: the operator's per-child turn cap, and the
-/// *caller's* token/cost/wall limits against the caller's own pool.
-///
-/// The caller's, not the root's: a grandchild reading the root's budget rejoins
-/// the root's pool and ignores any ceiling its own parent was narrowed to.
+/// Intersects the operator cap with the caller's inherited budget.
 fn child_budget(
     control: &orchestrator::AgentControl,
     caller: &Caller,
@@ -485,22 +465,14 @@ fn child_budget(
     budget
 }
 
-/// Shared slot for the executor a child inherits from.
-///
-/// Weak, and it has to be: that executor is the registry which owns the tool
-/// holding this slot. A strong handle closes the loop, and nothing in the cycle
-/// is ever dropped — the registry, every tool in it, the control plane and each
-/// child's worktree lease all outlive the session that made them, for the life
-/// of the process.
+/// Weak executor slot that breaks the registry/tool ownership cycle.
 pub type ParentHandle = Arc<Mutex<Option<std::sync::Weak<dyn kernel::Executor>>>>;
 
-/// The executor a child narrows from, if the session that owns it is still up.
 fn parent_executor(slot: &ParentHandle) -> Option<Arc<dyn kernel::Executor>> {
     slot.lock().ok()?.as_ref()?.upgrade()
 }
 
-/// How much conversation a child inherits. Absent means `all`, matching the
-/// reading that a child asked to help with *this* work should know about it.
+/// An omitted fork mode inherits the full conversation.
 fn parse_fork(args: &Value) -> Result<orchestrator::Fork, ToolError> {
     match args.get("fork").and_then(Value::as_str) {
         None => Ok(orchestrator::Fork::default()),
@@ -508,11 +480,7 @@ fn parse_fork(args: &Value) -> Result<orchestrator::Fork, ToolError> {
     }
 }
 
-/// The address a delegation tool acts from.
-///
-/// The root's session id does not exist when its tools are built, so it arrives
-/// through a slot; a child's is known at the moment it is admitted, and fixing
-/// it there is what stops a nested report being posted to the root's chain.
+/// Keeps nested reports addressed to the session that spawned them.
 #[derive(Clone)]
 enum CallerSlot {
     Root(SessionHandle),
@@ -542,8 +510,6 @@ impl CallerSlot {
     }
 }
 
-/// Inspect and stop running agents. Read-only listing plus a targeted stop, so
-/// the model can abandon work it no longer needs rather than paying for it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AgentAction {
     List,
@@ -786,12 +752,8 @@ impl Tool for AgentControlTool {
                 // reads an error and abandons work that is still running fine.
                 match self.control.wait(&from, timeout).await {
                     Waited::Settled(settled) => {
-                        // The reports themselves, not a promise of them. Saying
-                        // "they arrive with this turn's results" was false —
-                        // collection happens at a turn boundary and this call is
-                        // mid-turn, so the caller was left holding a promise
-                        // nothing kept and went digging through the transcript
-                        // instead, which is the one thing it is told not to do.
+                        // Collection normally happens at a turn boundary, so a
+                        // mid-turn wait must return the reports directly.
                         let owner = self.caller.resolve()?.session;
                         let collected = self.control.collect(owner).await;
                         // Do not acknowledge here. Tool execution precedes the
@@ -891,12 +853,7 @@ impl Tool for AgentControlTool {
     }
 }
 
-/// Merge a writing child's patch into the user's working tree (§6.4).
-///
-/// Separate from `agent.spawn` on purpose. A child finishing is not consent to
-/// change the user's files, so the patch waits until someone asks for it — and
-/// because this is a consequential action, the ask goes through the human gate
-/// with the diff on screen.
+/// Applies a child patch only through a separate human-gated action.
 struct AgentApply {
     control: Arc<orchestrator::AgentControl>,
 }
@@ -1027,9 +984,6 @@ impl Tool for AgentApply {
                     "forced": force,
                 }))
             }
-            // A patch that does not build does not merge (§6.4). The failure
-            // output travels with the refusal, so the next step is reading it
-            // rather than guessing or reaching for `force`.
             Err(orchestrator::Error::Unverified(command)) => Err(ToolError::Failed(format!(
                 "{} — nothing was applied.\n\n{}",
                 orchestrator::Error::Unverified(command),
@@ -1039,9 +993,6 @@ impl Tool for AgentApply {
                     .map(|evidence| evidence.output.clone())
                     .unwrap_or_default()
             ))),
-            // §6.4: conflicting patches go to reconciliation, never
-            // last-writer-wins. Nothing was applied, and saying so precisely is
-            // what stops the model from "fixing" it by force.
             Err(error) => Err(ToolError::Failed(format!(
                 "{error} — nothing was applied. The files {} changed since this agent started; \
                  read the patch and make the edits yourself, or re-run the agent from the \

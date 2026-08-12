@@ -1,32 +1,22 @@
-//! Skill sources ("taps") — remembered GitHub repositories to search and
-//! install skills from, so a source is registered once instead of pasted as a
-//! full URL every time. Persisted as TOML in the user's medha home. The hub
-//! reuses the guard-gated installer in [`crate::skills`] for anything it fetches.
+//! Persistent skill-source catalogs. Installs reuse the guarded skill installer.
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-/// SKILL.md fetches per tap to run concurrently. Bounds outbound requests so a
-/// large catalog can't open hundreds of sockets at once.
+/// Bounds concurrent catalog requests.
 const SEARCH_CONCURRENCY: usize = 8;
-/// Cap on skill folders inspected per tap, so one huge repo can't dominate a
-/// search (and to keep the request count bounded against rate limits).
+/// Bounds requests made for one catalog.
 const MAX_SKILLS_PER_TAP: usize = 200;
 
-/// The default subdirectory a tap's skill folders live under, matching the
-/// prevailing `repo/skills/<name>/SKILL.md` convention across the ecosystem.
 pub const DEFAULT_TAP_PATH: &str = "skills";
 
 fn default_tap_path() -> String {
     DEFAULT_TAP_PATH.to_string()
 }
 
-/// Sources shipped enabled out of the box, so browse/search works with zero
-/// setup — a user never has to register a source to find common skills (mirrors
-/// how mature agents ship an official catalog on). Merged with the user's own
-/// taps for browse/search; a user can still add more or shadow these.
+/// Sources available without user configuration.
 pub fn default_taps() -> Vec<Tap> {
     vec![Tap {
         repo: "anthropics/skills".into(),
@@ -101,16 +91,13 @@ fn is_github_segment(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// On-disk `taps.toml` shape.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TapsFile {
     #[serde(default, rename = "tap")]
     taps: Vec<Tap>,
 }
 
-/// The persisted set of registered sources. Backed by a single TOML file;
-/// reads tolerate its absence (no sources yet) and a corrupt file surfaces as
-/// an error rather than silently dropping a user's sources.
+/// Persistent source set; absence is empty and malformed data is an error.
 pub struct TapStore {
     path: PathBuf,
 }
@@ -178,8 +165,7 @@ impl TapStore {
     }
 }
 
-/// Write-through a temp file + rename so a crash never leaves a half-written
-/// sources file (a corrupt one would lose every registered source).
+/// Publishes atomically so a crash cannot leave partial configuration.
 fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let parent = target.parent().ok_or("taps file has no parent")?;
@@ -257,11 +243,7 @@ fn atomic_replace(source: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
-// ── search ────────────────────────────────────────────────────────────────
-
-/// One skill found in a source during search — metadata only (progressive
-/// disclosure at the registry level). The full package is pulled, scanned, and
-/// approved only on install via `install_url`.
+/// Search metadata; package download, scanning, and approval happen on install.
 #[derive(Debug, Clone)]
 pub struct SkillHit {
     pub name: String,
@@ -283,10 +265,7 @@ pub struct SearchResults {
     pub errors: Vec<String>,
 }
 
-/// Search every registered source for skills whose name or description matches
-/// `query` (empty query lists everything). Metadata only — nothing is
-/// downloaded beyond each candidate's `SKILL.md`. One failing source does not
-/// abort the others.
+/// Searches metadata across sources without letting one failure abort the rest.
 pub async fn search(taps: &[Tap], query: &str) -> Result<SearchResults, String> {
     let client = crate::skills::install_client()?;
     let q = query.trim().to_lowercase();
@@ -303,7 +282,6 @@ pub async fn search(taps: &[Tap], query: &str) -> Result<SearchResults, String> 
 }
 
 async fn search_tap(client: &reqwest::Client, tap: &Tap, q: &str) -> Result<Vec<SkillHit>, String> {
-    // 1) List the tap's skills directory — one API call.
     let ref_qs = tap
         .git_ref
         .as_deref()
@@ -341,8 +319,6 @@ async fn search_tap(client: &reqwest::Client, tap: &Tap, q: &str) -> Result<Vec<
     Ok(hits)
 }
 
-/// Fetch and parse one folder's `SKILL.md`. `None` (skipped, not an error) when
-/// a subdirectory has no valid SKILL.md — a repo folder need not be a skill.
 async fn fetch_hit(
     client: &reqwest::Client,
     repo: &str,
@@ -362,7 +338,6 @@ async fn fetch_hit(
         .ok()?;
     let (name, description, version) =
         crate::skills::skill_meta(std::str::from_utf8(&bytes).ok()?).ok()?;
-    // Browser-style tree URL (unencoded segments); the installer re-resolves it.
     let install_url = format!("https://github.com/{repo}/tree/{r}/{path}/{dir}");
     Some(SkillHit {
         name,
@@ -374,8 +349,6 @@ async fn fetch_hit(
     })
 }
 
-/// Attach a match score, or drop the hit when the (non-empty) query matches
-/// neither name nor description. Exact name > name substring > description.
 fn score(mut hit: SkillHit, q: &str) -> Option<SkillHit> {
     hit.score = match_score(&hit.name, &hit.description, q)?;
     Some(hit)
@@ -397,8 +370,7 @@ fn match_score(name: &str, description: &str, q: &str) -> Option<u8> {
     }
 }
 
-/// URL-encode each `/`-separated path segment (empty segments dropped) so a
-/// subpath is safe in a GitHub URL without escaping its slashes.
+/// Encodes path segments without escaping separators.
 fn encode_path(path: &str) -> String {
     path.split('/')
         .filter(|s| !s.is_empty())
@@ -406,8 +378,6 @@ fn encode_path(path: &str) -> String {
         .collect::<Vec<_>>()
         .join("/")
 }
-
-// ── update / drift ──────────────────────────────────────────────────────────
 
 /// Update status of one installed skill relative to its recorded source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,10 +393,7 @@ pub enum UpdateStatus {
     Unmanaged(&'static str),
 }
 
-/// Decide whether an installed user skill can/should be updated. Drift is
-/// checked first and wins: a locally edited skill is protected, never clobbered.
-/// Otherwise a re-fetchable GitHub source's current revision is compared with
-/// the one recorded at install.
+/// Protects local drift before checking the recorded upstream revision.
 pub async fn check_update(store: &crate::skills::SkillStore, name: &str) -> UpdateStatus {
     let Some(prov) = store.provenance(name) else {
         return UpdateStatus::Unmanaged("no recorded source");
@@ -449,8 +416,6 @@ pub async fn check_update(store: &crate::skills::SkillStore, name: &str) -> Upda
         None => UpdateStatus::Unmanaged("source is not a resolvable GitHub folder"),
     }
 }
-
-// ── lockfile ────────────────────────────────────────────────────────────────
 
 /// One locked skill: enough to reproduce an exact install. Committed with the
 /// repo so a team shares the same skill set.

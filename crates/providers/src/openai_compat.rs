@@ -1,7 +1,4 @@
-//! The baseline, open-first adapter: the OpenAI-compatible Chat Completions
-//! API. Point `base_url` at any compatible server (local or hosted) and it
-//! works with zero new code. Translates to/from the canonical `Block` so the
-//! kernel stays vendor-neutral (§4.4).
+//! OpenAI-compatible Chat Completions adapter over canonical kernel blocks.
 
 use crate::protocol::{gemini_interactions, openai_chat};
 use crate::transport::http;
@@ -30,13 +27,7 @@ pub struct ProviderClient {
     connection: Mutex<Connection>,
     http: reqwest::Client,
     caps: ProviderCaps,
-    /// Runtime-mutable (config at startup, `/think` slash command live) —
-    /// interior mutability since `Provider` methods take `&self` (shared
-    /// behind `Arc`, §4.4).
     reasoning: Mutex<ReasoningConfig>,
-    /// SSE streaming on/off (`/stream` slash command). Off → one blocking
-    /// request, whole response yielded at once. Same interior-mutability reason
-    /// as `reasoning`.
     streaming: std::sync::atomic::AtomicBool,
 }
 
@@ -64,9 +55,7 @@ fn validate_reasoning(
     }
     match profile.protocol {
         Protocol::OpenAiChat => {
-            // Disable is portable here: compatible servers (vLLM/SGLang) accept
-            // `reasoning_effort: "none"` (LLM_REFACTOR translation matrix).
-            // Enabling still needs a concrete level, which normalize supplies.
+            // Compatible servers use `reasoning_effort: "none"` to disable.
             if config.enabled == Some(true) && config.effort.is_none() {
                 return Err(ProviderError::Decode(
                     "open-ai-chat cannot enable reasoning without an explicit effort".into(),
@@ -155,15 +144,11 @@ impl ProviderClient {
             caps: ProviderCaps {
                 vision: false,
                 caching: false,
-                // Unknown until discovered/configured — never a fabricated
-                // constant (it would mislead the context compiler, §4.3).
+                // Unknown until discovered/configured; a fabricated value would
+                // mislead the context compiler.
                 max_ctx,
-                // Initial selection only, not an asserted capability. The
-                // tool-calling ladder (§4.4) owns the runtime contract: it
-                // attempts the selected strategy and downgrades on failure so a
-                // schema-valid intent (or a structured parse failure) always
-                // reaches the kernel (P1/P10). Discovery or config may pin a
-                // lower rung up front for endpoints known to lack native calls.
+                // Initial selection only, not an asserted capability. Runtime
+                // fallback handles endpoints that lack native calls.
                 tool_calls: ToolCallStrategy::Native,
             },
             reasoning: Mutex::new(ReasoningConfig::default()),
@@ -507,7 +492,7 @@ use openai_chat::{
 
 /// A model advertised by an endpoint, with whatever capability metadata the
 /// server chose to expose. `context_length` is `None` when the endpoint doesn't
-/// report it — never guessed (§4.3/§4.4).
+/// report it; it is never guessed.
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub id: String,
@@ -535,12 +520,9 @@ fn openai_endpoint_url(base_url: &str, endpoint: &str) -> Result<String, Provide
     Ok(url.to_string())
 }
 
-/// Discover the models an OpenAI-compatible endpoint serves via `GET /v1/models`
-/// (§4.4). Lets the setup wizard show a *picker* instead of asking the user to
-/// type a model id blind, and captures the context window when the server
-/// reports it. Servers spell that field differently, so we accept the common
-/// spellings; absence stays `None`. Errors if the endpoint doesn't implement
-/// `/models` so callers can fall back to manual entry.
+/// Discover the models an OpenAI-compatible endpoint serves via `GET /v1/models`.
+/// Accepts common spellings of the optional context-window field. Errors if the
+/// endpoint does not implement `/models` so callers can fall back to manual entry.
 pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>, ProviderError> {
     let auth = if api_key.trim().is_empty() {
         AuthKind::None
@@ -787,10 +769,7 @@ impl Provider for ProviderClient {
     }
 
     fn model_limits(&self) -> ModelLimits {
-        // Read both mutable limits under one guard. Calling `context_window()`
-        // from this struct literal used to lock `connection` a second time
-        // while the temporary guard for `max_output_tokens` was still alive,
-        // deadlocking bare `medha` before the TUI could open.
+        // Avoid recursively locking `connection`.
         let connection = self.connection.lock().unwrap();
         ModelLimits {
             max_input_tokens: None,
@@ -1149,17 +1128,14 @@ mod sniff_tests {
 
     #[test]
     fn escaped_quotes_do_not_cut_the_value_short() {
-        // K19: an escaped quote inside the value is content, not the closer.
         assert_eq!(
             sniff_target(r#"{"command":"echo \"hello world\" > f.txt"}"#),
             Some(r#"echo "hello world" > f.txt"#.to_string())
         );
-        // Escaped backslash before the real closing quote still closes correctly.
         assert_eq!(
             sniff_target(r#"{"path":"dir\\file.rs"}"#),
             Some(r"dir\file.rs".to_string())
         );
-        // Still-open value ending mid-escape is incomplete, not a hit.
         assert_eq!(sniff_target(r#"{"command":"echo \"unfinished"#), None);
     }
 }
@@ -1218,11 +1194,6 @@ mod sse_tests {
 
     #[test]
     fn answer_mentioning_think_tags_streams_fully_visible() {
-        // End-to-end regression for the reported bug: the model streams an
-        // answer that DOCUMENTS think tags ("Shape 2: `<think>` tags"), with
-        // the tag split across SSE deltas exactly as a real stream does. The
-        // whole reply must arrive as visible text; nothing may be rerouted
-        // into hidden reasoning.
         let full = "Reasoning support (Shape 1: `reasoning_content` field; Shape 2: `<think>` tags)\n- Tool call strategies: `Native`, `Guided` (planned)\n- `models.dev` integration for pricing";
         let deltas = [
             "Reasoning support (Shape 1: `reasoning_content` field; Shape 2: `<th",
@@ -1239,8 +1210,6 @@ mod sse_tests {
 
     #[test]
     fn genuine_leading_thinking_still_separates_from_answer() {
-        // The same path with REAL inline thinking: block stripped into the
-        // reasoning lane, answer intact.
         let deltas = ["<think>weigh the", " options</think>", "The answer is 42."];
         let (text, reasoning) = join(&drive_many(&deltas));
         assert_eq!(reasoning, "weigh the options");
@@ -1249,8 +1218,6 @@ mod sse_tests {
 
     #[test]
     fn crlf_record_is_parsed_not_dropped() {
-        // A CRLF-delimited content frame must yield its text (previously the
-        // whole response was silently dropped on CRLF servers).
         let blocks = drive("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\r\n");
         let text: String = blocks
             .iter()
@@ -1265,11 +1232,9 @@ mod sse_tests {
         );
     }
 
-    // ── K13: a tool call the server never gave an id gets a synthesized one ─────
     #[test]
     fn missing_tool_call_id_is_synthesized() {
         let mut accum = BTreeMap::new();
-        // index 0, a name, no id (empty) — as a lax gateway streams it.
         accum.insert(
             0u32,
             (
@@ -1348,9 +1313,6 @@ mod think_tag_tests {
 
     #[test]
     fn literal_think_mid_answer_is_content_not_a_tag() {
-        // The reported bug: the model writes documentation ABOUT `<think>`
-        // tags mid-answer — everything after got hidden as collapsed
-        // reasoning and the user saw their reply "cut off".
         let mut f = ThinkTagFilter::default();
         let mut all = Vec::new();
         all.extend(f.feed("Reasoning support (Shape 2: `<think>"));
@@ -1652,13 +1614,10 @@ mod count_tokens_tests {
 
     #[test]
     fn build_chat_hoists_and_merges_system_to_the_front() {
-        // Regression: vLLM rejects a `system` message that isn't first, and
-        // compaction can insert a summary as a mid-array system message. All
-        // system content must merge into one leading message, rest kept in order.
         let msgs = vec![
             Message::system("SYS PROMPT"),
             Message::user("do X"),
-            Message::system("earlier conversation summary"), // mid-array (compaction)
+            Message::system("earlier conversation summary"),
             Message::new(Role::Assistant, "ok"),
             Message::tool_result("c1", "out"),
         ];
@@ -1790,8 +1749,11 @@ mod wire_tool_name_tests {
 
     #[test]
     fn parse_completion_surfaces_an_error_body() {
-        let body = r#"{"error":{"message":"rate limited","type":"rate_limit"}}"#;
-        assert!(parse_completion(body, &std::collections::HashMap::new()).is_err());
+        let body = r#"{"error":{"message":"maximum context length is 8192 tokens","type":"context_length_exceeded"}}"#;
+        let error = parse_completion(body, &std::collections::HashMap::new()).unwrap_err();
+        assert!(matches!(error, ProviderError::Response(_)));
+        assert!(error.is_context_overflow());
+        assert!(!error.is_retryable());
     }
 
     #[test]

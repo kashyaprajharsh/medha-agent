@@ -35,8 +35,6 @@ impl Executor for Tools {
     }
 }
 
-/// Records what the runtime handed it, so the tests can assert on the
-/// narrowing and budget decisions rather than on model output.
 struct Recorder {
     seen: std::sync::Mutex<Vec<(Vec<String>, u32)>>,
 }
@@ -67,13 +65,10 @@ fn control() -> (Arc<Recorder>, AgentControl) {
     (recorder, control)
 }
 
-/// A control with somewhere to deliver to. Every spawn is asynchronous now, so
-/// a control without an outbox refuses every one of them.
 fn deliverable(runner: Arc<dyn ChildRunner>, cancel: CancellationToken) -> AgentControl {
     AgentControl::new(runner, cancel).with_outbox(Arc::new(MemoryOutbox::default()))
 }
 
-/// Wait for `ready`, failing the test rather than hanging if it never comes.
 async fn until(what: &str, mut ready: impl FnMut() -> bool) {
     for _ in 0..20_000 {
         if ready() {
@@ -84,14 +79,11 @@ async fn until(what: &str, mut ready: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}")
 }
 
-/// Start a child and wait for its report — what production does across two
-/// turns, collapsed into one call so a test can assert on the outcome.
 async fn run(control: &AgentControl, spec: AgentSpec, turns: u32) -> Result<AgentResult, Error> {
     let owner = control.owner().unwrap_or_default();
     run_as(control, &Caller::root(owner), spec, turns).await
 }
 
-/// The same, from an agent's own address rather than the root's.
 async fn run_as(
     control: &AgentControl,
     caller: &Caller,
@@ -141,7 +133,6 @@ async fn a_child_runs_read_only_within_the_parents_budget() {
     assert_eq!(result.agent, "summarise-the-crate");
 
     let seen = recorder.seen.lock().unwrap();
-    // fs.write is gone: O1 children cannot mutate a shared workspace.
     assert_eq!(seen[0].0, vec!["fs.read"]);
     assert_eq!(seen[0].1, 5);
 }
@@ -159,7 +150,6 @@ async fn a_child_budget_is_clamped_to_what_the_parent_has_left() {
 async fn capacity_is_refused_rather_than_queued() {
     let (_, control) = control();
     let control = control.with_limits(1, 1);
-    // Hold the only permit, then prove a second spawn is refused outright.
     let held = control.reserve().unwrap();
     assert!(matches!(
         run(&control, spec("second"), 5).await,
@@ -206,8 +196,6 @@ async fn an_empty_objective_is_rejected() {
     ));
 }
 
-/// Settles itself when its queue's token trips, as the real runner does now,
-/// and records that it got to return rather than being dropped mid-run.
 struct Cooperative {
     settled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -229,10 +217,6 @@ impl ChildRunner for Cooperative {
     }
 }
 
-/// A cancelled child must be allowed to finish writing and answer its own
-/// in-flight tool calls. Racing its future against the token dropped it
-/// mid-tool, which is how a half-written file and an unanswered call happen on
-/// the one path where the work still has to survive.
 #[tokio::test]
 async fn a_cancelled_child_settles_itself_rather_than_being_dropped() {
     let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -270,8 +254,6 @@ async fn a_cancelled_child_settles_itself_rather_than_being_dropped() {
     );
 }
 
-/// Blocks until cancelled, so the roster/cancellation behaviour is testable
-/// without depending on a runner that cooperates.
 struct Hangs;
 
 #[async_trait]
@@ -290,7 +272,6 @@ async fn a_cancelled_agent_leaves_no_phantom_in_the_roster() {
     cancel.cancel();
     let result = run(&control, spec("will be cancelled"), 5).await.unwrap();
     assert_eq!(result.status, AgentStatus::Cancelled);
-    // The run future was dropped mid-flight; the roster must still be clean.
     assert!(control.active().is_empty());
 }
 
@@ -300,8 +281,6 @@ async fn capacity_is_one_budget_for_the_whole_tree() {
     let control = control.with_limits(2, 2);
     let held = control.reserve().unwrap();
     let _also_held = control.reserve().unwrap();
-    // A nested agent draws on the same permits, so depth cannot be used to buy
-    // more concurrency than the operator allowed.
     assert!(matches!(
         run_as(&control, &at("/parent"), spec("nested"), 5).await,
         Err(Error::AtCapacity(2))
@@ -318,8 +297,6 @@ async fn capacity_is_one_budget_for_the_whole_tree() {
 async fn nesting_is_allowed_when_the_limit_permits_it() {
     let (_, control) = control();
     let control = control.with_limits(4, 2);
-    // Recursion is a capability, not an accident: at depth 2 of 2 a grandchild
-    // is admitted, and the tools to do it are no longer stripped.
     assert!(
         run_as(&control, &at("/parent"), spec("nested"), 5)
             .await
@@ -474,8 +451,6 @@ async fn a_nested_childs_report_reaches_its_own_parent() {
     assert_eq!(*trust, TrustLabel::Tool, "report arrived unlabelled");
 }
 
-/// Hands back whatever conversation it was given, so a test can assert on what
-/// a child actually inherited.
 struct Echoes {
     inherited: std::sync::Mutex<Vec<Vec<String>>>,
 }
@@ -527,8 +502,6 @@ async fn a_forked_child_starts_with_the_callers_conversation() {
     let mut asked = spec("check the lexer");
     asked.fork = Fork::All;
     run(&control, asked, 5).await.unwrap();
-    // Starting cold is what made a delegated writer redo the reasoning its
-    // caller had already paid for.
     assert_eq!(
         runner.inherited.lock().unwrap()[0],
         ["what does the parser do?", "it builds an AST"]
@@ -562,8 +535,6 @@ async fn a_message_reaches_sideways_where_control_does_not() {
     ));
 }
 
-/// Register a live agent by hand, keeping its queue so a test can read what was
-/// delivered to it. Production has a running session on the other end.
 fn listening(control: &AgentControl, path: &str) -> (AgentPath, kernel::InterruptQueue) {
     let path = AgentPath::parse(path).unwrap();
     let reservation = control
@@ -757,7 +728,6 @@ async fn waiting_returns_only_for_the_callers_own_children() {
     );
 }
 
-/// Reports a summary far past the context cap.
 struct Verbose;
 
 #[async_trait]
@@ -782,14 +752,10 @@ async fn a_long_report_reaches_the_caller_whole() {
     assert_eq!(result.summary.len(), MAX_SUMMARY_CHARS * 2);
 }
 
-/// In-memory stand-in for the event-log outbox, with the same state machine.
 #[derive(Default)]
 struct MemoryOutbox {
     rows: std::sync::Mutex<Vec<(Dispatch, Option<AgentResult>, bool)>>,
-    /// The durable patch record, with the same `recorded → applied` fold
-    /// the log implements.
     patches: std::sync::Mutex<Vec<Recorded>>,
-    /// Stand-in for "newest event on the child's chain".
     activity: std::sync::Mutex<std::collections::HashMap<Ulid, f64>>,
 }
 
@@ -956,11 +922,6 @@ async fn a_background_result_reaches_the_session_that_asked_for_it() {
     assert_eq!(mine[0].status, AgentStatus::Completed);
 }
 
-/// The signal must arrive only once the report can actually be read.
-///
-/// A child leaves the roster inside its own execution, *before* its report
-/// is persisted, so anything keyed on the roster emptying races the record
-/// it is trying to read — and the loser is a turn spent on nothing.
 #[tokio::test]
 async fn the_ready_signal_never_arrives_before_the_report_is_collectable() {
     let (_outbox, control) = background_control();
@@ -1061,18 +1022,11 @@ async fn a_cancelled_background_agent_still_reports() {
         .unwrap();
     control.shutdown().await;
 
-    // Partial-result preservation (§6.5): killing a child must not lose the
-    // fact that it ran, or the parent is left waiting on nothing.
     let reported = control.collect(parent).await;
     assert_eq!(reported.len(), 1);
     assert_eq!(reported[0].status, AgentStatus::Cancelled);
 }
 
-/// Drains its steer queue and reports what it was told, so steering is
-/// asserted on what the *session loop* received — not on the roster having
-/// a handle. A queue the runner drops would pass the second check and fail
-/// this one, and that is exactly the bug worth catching: text accepted and
-/// silently lost is worse than text refused.
 struct Listens;
 
 #[async_trait]
@@ -1247,9 +1201,6 @@ async fn cancelling_one_agent_leaves_its_siblings_running() {
     control.shutdown().await;
 }
 
-// ── writer isolation (O3) ────────────────────────────────────────────────
-
-/// A repository with one commit, plus a pool cutting worktrees outside it.
 async fn writable() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path().canonicalize().unwrap();
@@ -1280,10 +1231,6 @@ fn read_text(path: impl AsRef<std::path::Path>) -> String {
     std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
 }
 
-/// Isolation over a real repository. The executor is deliberately *not*
-/// rebased here — this crate cannot build one — so the tests assert on
-/// worktree lifecycle, patch return and the refusal path, and the rebasing
-/// itself is covered where it lives, in the tool registry.
 struct Isolation {
     pool: WorktreePool,
     repo: std::path::PathBuf,
@@ -1354,8 +1301,6 @@ fn writer(objective: &str) -> AgentSpec {
     }
 }
 
-/// Edits a file inside whatever workspace it was given, so the tests can
-/// assert on where a writer's changes actually land.
 struct Edits;
 
 #[async_trait]
@@ -1378,9 +1323,6 @@ impl ChildRunner for Edits {
 #[tokio::test]
 async fn a_writer_without_isolation_is_refused_not_downgraded() {
     let (_, control) = control();
-    // Running it read-only would fail the objective; running it un-isolated
-    // would corrupt the parent's tree. Neither is a safe default, so the
-    // spawn is refused and the model is told to make the edits itself.
     assert!(matches!(
         run(&control, writer("fix the bug"), 5).await,
         Err(Error::NoIsolation(_))
@@ -1396,7 +1338,6 @@ async fn a_writer_edits_its_own_checkout_and_never_the_parents() {
 
     let result = run(&control, writer("rewrite a.txt"), 5).await.unwrap();
     assert_eq!(result.status, AgentStatus::Completed);
-    // The parent's working tree is exactly as it was.
     assert_eq!(read_text(root.join("a.txt")), "original\n");
     assert!(!root.join("added.txt").exists());
 }
@@ -1549,7 +1490,6 @@ async fn a_writers_checkout_does_not_outlive_it() {
     assert!(left.is_empty(), "a checkout was left behind");
 }
 
-/// Isolation whose verifier reports whatever the test needs it to.
 fn judged(
     root: &Path,
     state: &tempfile::TempDir,
@@ -1581,9 +1521,6 @@ async fn a_patch_that_does_not_build_does_not_merge() {
     let result = run(&control, writer("rewrite a.txt"), 5).await.unwrap();
     let patch = result.patch.unwrap();
 
-    // §6.4. The child said it succeeded and the diff applies cleanly — the
-    // only thing standing between a broken change and the user's tree is
-    // this refusal.
     assert_eq!(control.check(&patch).await, Some(MergeCheck::Clean));
     assert!(matches!(
         control.merge(&patch, false).await,
@@ -1629,8 +1566,6 @@ async fn a_project_with_no_verifier_is_not_blocked_by_the_gate() {
     control.merge(&patch, false).await.unwrap();
 }
 
-/// A control sharing one outbox and owner with another — what a restart
-/// looks like from the patch registry's point of view.
 fn restarted(
     outbox: Arc<MemoryOutbox>,
     owner: OwnerHandle,
@@ -1659,8 +1594,6 @@ async fn a_patch_outlives_the_process_that_produced_it() {
         .unwrap()
         .session;
 
-    // A fresh control plane: same log, no in-memory registry. The worktree
-    // is long gone, so if the patch is not in the record it is not anywhere.
     let after = restarted(
         outbox.clone(),
         Arc::clone(&owner),
@@ -1672,10 +1605,7 @@ async fn a_patch_outlives_the_process_that_produced_it() {
     assert_eq!(after.outstanding().await.len(), 1);
 
     after.merge(&recovered.patch, false).await.unwrap();
-    // Closed by handout: the session may hold several once followed up.
     after.forget(&recovered.dispatch).await;
-    // And once applied it stays applied — a later run must not offer it
-    // again, or the same patch lands twice.
     let later = restarted(outbox, owner, judged(&root, &state, None));
     assert!(later.outstanding().await.is_empty());
 }
@@ -1687,8 +1617,6 @@ async fn finished_children_stay_visible_after_they_leave_the_roster() {
         .with_workspaces(judged(&root, &state, None));
     run(&control, writer("rewrite a.txt"), 5).await.unwrap();
 
-    // "What is running" and "what happened" are different questions; a settled
-    // child leaves the first and stays answerable to the second.
     assert!(control.active().is_empty());
     let agents = control.agents();
     assert_eq!(agents.len(), 1);

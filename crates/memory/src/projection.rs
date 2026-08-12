@@ -1,7 +1,4 @@
-//! SQLite projection over `EventKind::MemoryWrite` events (D1). The event log
-//! is the source of truth; this table + its FTS5 index are a queryable cache
-//! that `rebuild` can always reconstruct from scratch — so replay, resume, and
-//! fork/rewind all apply to memory for free.
+//! Rebuildable SQLite projection over `EventKind::MemoryWrite` events.
 
 use crate::entry::{MemoryEntry, Scope};
 use kernel::{Event, EventKind};
@@ -313,8 +310,7 @@ fn memory_ops(events: impl Iterator<Item = Event>) -> Result<Vec<MemoryOp>, Memo
         .collect()
 }
 
-/// Two SQLite targets (D9): project entries live in the workspace projection,
-/// user entries in the user-global store. Recall merges both, project-first.
+/// Project and user-global memory projections.
 #[derive(Clone)]
 pub struct MemoryProjection {
     project: Arc<Mutex<Connection>>,
@@ -506,7 +502,7 @@ impl MemoryProjection {
             .map_err(|e| MemoryError::Db(e.to_string()))
     }
 
-    /// Merged read across both scopes — project wins on name collision (D9).
+    /// Merged read across both scopes; project wins on name collision.
     pub fn list(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
         let mut out = self.list_scope(Scope::Project)?;
         let seen: std::collections::HashSet<String> = out.iter().map(|e| e.name.clone()).collect();
@@ -1037,8 +1033,6 @@ mod tests {
         )))
         .unwrap();
 
-        // Fork *before* "after-fork" was written — the branch should only ever
-        // have learned "before-fork" (§18.4 time-travel applies to memory too).
         let cut = block_on(log.events(s.id))
             .into_iter()
             .find(|e| e.id != before.id)

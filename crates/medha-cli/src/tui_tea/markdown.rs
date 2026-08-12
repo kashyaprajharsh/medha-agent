@@ -1,12 +1,7 @@
 //! Markdown → ratatui rendering.
 //!
-//! `pulldown-cmark` (the rustdoc/mdBook parser) does the parsing; we own the
-//! presentation so every block styles from the active [`super::theme`] palette
-//! and adapts to light/dark. No off-the-shelf renderer fit our constraints:
-//! `tui-markdown` drops tables and hardcodes colours, `termimad` owns its own
-//! draw loop (fights our virtualized scroll buffer), and `ratatui-markdown`
-//! ships a non-standard licence. Layering a battle-tested parser under a thin
-//! renderer we control is the same pattern bat/delta/mdcat/glow use.
+//! `pulldown-cmark` parses the document; this module renders it with the active
+//! [`super::theme`] palette and the TUI's virtualized scroll model.
 //!
 //! Output contract: logical [`Line`]s. Paragraph/heading/list/quote lines are
 //! emitted *unwrapped* — the caller's `wrap_line` folds them to the pane width.
@@ -29,9 +24,7 @@ pub(super) fn render(src: &str, width: u16) -> Vec<Line<'static>> {
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
-    // Recognize `$…$` / `$$…$$` so LaTeX math becomes InlineMath/DisplayMath
-    // events we can transliterate, instead of the raw `$$\text{…}$$` leaking
-    // through as literal text (a terminal can't typeset real math).
+    // Terminals cannot typeset math, so transliterate parsed math events.
     opts.insert(Options::ENABLE_MATH);
     let parser = Parser::new_ext(src, opts);
     let mut r = Renderer::new(width);
@@ -60,21 +53,17 @@ struct ListFrame {
 struct Renderer {
     width: u16,
     out: Vec<Line<'static>>,
-    /// Spans accumulated for the line currently being built.
     cur: Vec<Span<'static>>,
     inline: Inline,
     lists: Vec<ListFrame>,
     quote_depth: usize,
     /// Pending task-list checkbox marker for the next list item's first text.
-    /// Code-fence capture: language + collected source, set between Start/End.
+    /// Code-fence capture: language and collected source.
     code: Option<(String, String)>,
-    /// Table capture.
     table: Option<TableBuilder>,
-    /// True while inside a heading (so text is styled as a heading).
     heading: Option<HeadingLevel>,
     /// Deferred link destination, rendered dimmed after the link text.
     link_dest: Option<String>,
-    /// Whether the current list item has emitted its bullet/number yet.
     need_marker: bool,
 }
 
@@ -225,9 +214,9 @@ impl Renderer {
             Event::Code(t) => self.write_inline(&t, true),
             Event::SoftBreak | Event::HardBreak => {
                 if self.code.is_some() {
-                    // handled in code accumulation
+                    // Code accumulation preserves the break.
                 } else if self.table.is_some() {
-                    // ignore inside cells
+                    // Cell text is flattened before layout.
                 } else {
                     self.break_line();
                 }
@@ -266,19 +255,14 @@ impl Renderer {
                 self.write_inline(&format!("[^{name}]"), false);
             }
             Event::InlineMath(t) | Event::DisplayMath(t) => {
-                // Terminals can't typeset math; transliterate LaTeX to readable
-                // Unicode so a flow like `$$\text{A}\longrightarrow\text{B}$$`
-                // reads as `A ⟶ B` instead of raw markup.
+                // Render readable Unicode rather than raw LaTeX markup.
                 self.write_inline(&math_to_unicode(&t), false);
             }
         }
     }
 
-    /// The single sink for every inline text event. Routing lives HERE and
-    /// nowhere else, so inline code / html / math inside a table cell or code
-    /// fence is captured into that buffer instead of leaking onto the main
-    /// transcript line (the bug where `` `file.rs` `` in a cell printed itself
-    /// below the table). Precedence: code fence → table cell → current line.
+    /// Route inline text to the code fence, table cell, or current line, in that
+    /// precedence order.
     fn write_inline(&mut self, text: &str, code: bool) {
         if let Some((_, buf)) = self.code.as_mut() {
             buf.push_str(text);
@@ -349,9 +333,7 @@ impl Renderer {
                 self.link_dest = Some(dest_url.to_string());
             }
             Tag::Image { dest_url, .. } => {
-                // No inline images in a TUI — show a labelled placeholder.
-                // Routed through write_inline so it lands in the active sink
-                // (e.g. a table cell) instead of leaking onto the main line.
+                // Show a labelled placeholder; terminals cannot display inline images.
                 self.write_inline("🖼 ", false);
                 self.link_dest = Some(dest_url.to_string());
                 self.inline.link = true;
@@ -415,9 +397,7 @@ impl Renderer {
             TagEnd::Strong => self.inline.bold = false,
             TagEnd::Strikethrough => self.inline.strike = false,
             TagEnd::Link | TagEnd::Image => {
-                // Append the destination so the target is visible. In a table
-                // cell it goes into the cell as text (no leak); elsewhere it's a
-                // dimmed span after the link text.
+                // Keep the target visible in either the cell or the transcript.
                 if let Some(dest) = self.link_dest.take() {
                     if !dest.is_empty() && !dest.starts_with('#') {
                         if let Some(tb) = self.table.as_mut() {
@@ -464,7 +444,6 @@ impl Renderer {
 
     fn emit_code_block(&mut self, lang: &str, src: &str) {
         let border = Style::default().fg(theme::border());
-        // Language tag header line.
         let label = if lang.is_empty() { "code" } else { lang };
         self.out.push(Line::from(vec![
             Span::styled("╭─ ", border),
@@ -508,7 +487,6 @@ impl Renderer {
         }
         let get = |row: &[String], c: usize| row.get(c).cloned().unwrap_or_default();
 
-        // Natural column widths = widest cell (header + body), display cells.
         let mut widths = vec![0usize; ncols];
         for (c, w) in widths.iter_mut().enumerate() {
             *w = (*w).max(display_width(&get(&tb.header, c)));
@@ -528,16 +506,13 @@ impl Renderer {
             let mut remaining = budget;
             let n = ncols;
             for w in widths.iter_mut() {
-                // Weight each column by its measured width. With nothing
-                // measured (total 0), fall back to an even split — and to the
-                // whole budget if there are somehow no columns.
+                // Preserve relative widths; fall back to an even split.
                 let share = (*w * budget)
                     .checked_div(total)
                     .unwrap_or_else(|| budget.checked_div(n).unwrap_or(budget));
                 *w = share.max(3);
                 remaining = remaining.saturating_sub(*w);
             }
-            // Hand any rounding leftover to the first column.
             if remaining > 0 {
                 widths[0] += remaining;
             }
@@ -698,8 +673,6 @@ fn pad_cell(s: &str, width: usize, align: Alignment) -> String {
     }
 }
 
-// ---- syntect code-fence highlighting -------------------------------------
-
 struct Highlighter {
     syntaxes: syntect::parsing::SyntaxSet,
     themes: syntect::highlighting::ThemeSet,
@@ -772,8 +745,6 @@ fn highlight(lang: &str, src: &str) -> Option<Vec<Vec<Span<'static>>>> {
     }
     Some(out)
 }
-
-// ── math transliteration ─────────────────────────────────────────────────────
 
 /// LaTeX-ish math → readable Unicode for a terminal (which has no math
 /// typesetting). Not a real renderer: it strips formatting wrappers (`\text{}`,
@@ -1130,7 +1101,6 @@ mod tests {
     #[test]
     fn bold_span_is_bold_not_literal_stars() {
         let out = render("a **b** c", 80);
-        // No literal ** survives.
         assert!(!plain(&out).contains("**"));
         let bolded = out
             .iter()
@@ -1148,14 +1118,12 @@ mod tests {
 
     #[test]
     fn math_transliterates_to_unicode() {
-        // The screenshot case: a flow diagram in display math.
         assert_eq!(
             math_to_unicode(
                 r"\text{Task Trajectory} \longrightarrow \text{Reflection/Diagnosis} \longrightarrow \text{Eval Gate}"
             ),
             "Task Trajectory ⟶ Reflection/Diagnosis ⟶ Eval Gate"
         );
-        // Wrappers stripped, symbols mapped, super/subscripts, fractions.
         assert_eq!(
             math_to_unicode(r"\alpha \times \beta \leq \gamma"),
             "α × β ≤ γ"
@@ -1163,15 +1131,12 @@ mod tests {
         assert_eq!(math_to_unicode(r"x^2 + y_1"), "x² + y₁");
         assert_eq!(math_to_unicode(r"\frac{a}{b}"), "(a)/(b)");
         assert_eq!(math_to_unicode(r"\sqrt{x+1}"), "√(x+1)");
-        // Unknown command degrades to its bare name — never a raw backslash.
         assert_eq!(math_to_unicode(r"\weirdcmd x"), "weirdcmd x");
         assert!(!math_to_unicode(r"\foo^{bar}").contains('\\'));
     }
 
     #[test]
     fn math_renders_through_the_markdown_pipeline_no_dollars() {
-        // `$$...$$` must be parsed as math (ENABLE_MATH) and transliterated, not
-        // leaked as literal `$$` / raw LaTeX.
         let out = render(r"$$\text{A} \longrightarrow \text{B}$$", 80);
         let text = plain(&out);
         assert!(text.contains("A ⟶ B"), "got: {text:?}");
@@ -1195,7 +1160,6 @@ mod tests {
         assert!(text.contains('│'));
         assert!(text.contains("A") && text.contains("B"));
         assert!(text.contains("1") && text.contains("2"));
-        // The markdown separator row (---) must not leak as content.
         assert!(!text.contains("---"));
     }
 
@@ -1219,14 +1183,11 @@ mod tests {
 
     #[test]
     fn inline_code_inside_table_cell_stays_in_the_cell() {
-        // Regression: inline code in a cell used to leak onto the transcript
-        // below the table (filenames printed outside the grid).
+        // Inline code must remain inside the table grid.
         let md = "| Crate | Key Files |\n|---|---|\n| kernel | `loop_.rs`, `events.rs` |\n";
         let out = render(md, 70);
         let text = plain(&out);
         assert!(text.contains("loop_.rs") && text.contains("events.rs"));
-        // The last non-blank rendered line must be the table's bottom border —
-        // nothing leaked after it.
         let last = out
             .iter()
             .rev()

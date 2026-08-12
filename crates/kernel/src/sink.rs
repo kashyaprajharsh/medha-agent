@@ -1,7 +1,4 @@
-//! Live-output sink. The kernel pushes streamable updates — model text deltas,
-//! tool-call notices, compaction notices — to a sink as they happen, so a
-//! surface can render token-by-token without the kernel knowing about surfaces
-//! (P9). All methods default to no-ops, so headless callers pass `NullSink`.
+//! Live-output sink with no-op defaults for headless callers.
 
 use serde_json::Value;
 
@@ -22,7 +19,7 @@ pub trait StreamSink: Send + Sync {
     fn tool_result(&self, _tool: &str, _ok: bool, _payload: &Value) {}
     /// Real token usage for the turn, reported by the provider (authoritative).
     fn usage(&self, _prompt_tokens: u32, _total_tokens: u32) {}
-    /// Session cost so far, when pricing is known (P1-12). `indicative` = the
+    /// Session cost so far, when pricing is known. `indicative` means the
     /// figure comes from a list price (models.dev) rather than the operator's
     /// own configured rate — surfaces show it as "~$0.42 est.".
     fn cost(&self, _total_usd: f64, _indicative: bool) {}

@@ -1,7 +1,4 @@
-//! MEDHA memory layer (Phase 3 design doc, D1). Entries are events; the
-//! projection here is a rebuildable cache over them. `MemoryStore` is the
-//! public seam so the substrate stays swappable (P8) — recall/tools/CLI code
-//! against the trait, not `MemoryProjection` directly.
+//! Event-sourced memory with a rebuildable projection.
 
 pub mod consolidate;
 pub mod entry;

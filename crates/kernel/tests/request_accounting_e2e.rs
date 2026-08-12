@@ -949,10 +949,9 @@ async fn output_cap_error_retries_with_a_lower_cap_without_compacting_history() 
 }
 
 #[tokio::test]
-async fn input_overflow_forces_compaction_without_halving_the_known_window() {
+async fn in_band_input_overflow_forces_compaction_without_halving_the_known_window() {
     let provider = Arc::new(RecordingProvider::new(vec![
-        Err(ProviderError::Status(
-            400,
+        Err(ProviderError::Response(
             "input exceeds the context window".into(),
         )),
         Ok(vec![Block::Text("finished".into())]),

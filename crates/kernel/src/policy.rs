@@ -1,17 +1,10 @@
-//! The policy interface (§4.6). Deny-first authorization: every validated tool
-//! intent passes through `authorize` before execution. The kernel knows only
-//! this trait; the declarative rules + command scanner live in the policy crate
-//! (P8). Returns a `Decision` (allow / deny / verify / human).
+//! Deny-first authorization interface for validated tool intents.
 
 use crate::types::{AutonomyLevel, BlastRadius, Decision, ToolIntent};
 
 pub trait Policy: Send + Sync {
-    /// Authorize an intent. `blast_radius` is the tool's declared radius (§4.7),
-    /// looked up by the kernel from the executor — `None` means the tool isn't
-    /// registered (deny-first). `autonomy` is the session's dial: it may relax
-    /// escalation of *otherwise-allowed* reversible/shell actions, but never
-    /// loosens the base `Human`/`Deny` floor. The policy decides from the radius
-    /// plus any tool-specific rules (e.g. a shell scanner).
+    /// Authorize an intent. `None` radius is unregistered; autonomy never
+    /// weakens a base `Human` or `Deny` decision.
     fn authorize(
         &self,
         autonomy: AutonomyLevel,

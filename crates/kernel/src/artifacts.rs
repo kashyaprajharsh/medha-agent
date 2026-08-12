@@ -1,7 +1,4 @@
-//! Content-addressed artifact store (§4.2/§4.5). Large tool outputs spill here
-//! by hash so they never blow the context window, while staying fully
-//! recoverable via the `read_artifact` tool (range reads). The kernel knows
-//! only this trait; the file-backed implementation lives in the store crate (P8).
+//! Content-addressed storage for recoverable, range-readable tool output.
 
 #[async_trait::async_trait]
 pub trait ArtifactStore: Send + Sync + 'static {

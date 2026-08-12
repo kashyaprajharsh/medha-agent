@@ -472,7 +472,7 @@ pub(crate) fn parse_interaction(
     let value: Value = serde_json::from_str(body)
         .map_err(|error| ProviderError::Decode(format!("Gemini response parse: {error}")))?;
     if value.get("status").and_then(Value::as_str) == Some("failed") {
-        return Err(ProviderError::Stream(
+        return Err(ProviderError::Response(
             value
                 .get("error")
                 .map(Value::to_string)
@@ -564,7 +564,7 @@ impl ResponseDecoder {
             "step.delta" => self.delta_step(&value),
             "step.stop" => self.stop_step(&value),
             "interaction.completed" | "interaction.requires_action" => self.complete(&value),
-            "error" | "interaction.failed" => Err(ProviderError::Stream(
+            "error" | "interaction.failed" => Err(ProviderError::Response(
                 value
                     .get("error")
                     .map(Value::to_string)
@@ -1079,6 +1079,43 @@ mod tests {
     }
 
     #[test]
+    fn google_rpc_status_controls_in_band_retry_classification() {
+        for status in [
+            "INTERNAL",
+            "UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+            "ABORTED",
+            "RESOURCE_EXHAUSTED",
+        ] {
+            let body = json!({
+                "status": "failed",
+                "error": {
+                    "code": 500,
+                    "status": status,
+                    "message": "request failed"
+                }
+            })
+            .to_string();
+            let error = parse_interaction(&body, &HashMap::new()).unwrap_err();
+            assert!(matches!(error, ProviderError::Response(_)), "{status}");
+            assert!(error.is_retryable(), "{status}");
+        }
+
+        let invalid = json!({
+            "status": "failed",
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "invalid request parameter"
+            }
+        })
+        .to_string();
+        let error = parse_interaction(&invalid, &HashMap::new()).unwrap_err();
+        assert!(matches!(error, ProviderError::Response(_)));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
     fn streaming_reassembles_arguments_and_signature_before_completion() {
         let mut decoder =
             ResponseDecoder::new(HashMap::from([("fs_read".into(), "fs.read".into())]));
@@ -1214,7 +1251,7 @@ mod tests {
         };
         assert!(matches!(
             decoder.push(&error),
-            Err(ProviderError::Stream(_))
+            Err(ProviderError::Response(_))
         ));
     }
 

@@ -1,13 +1,10 @@
-//! The execution bridge (§4.5/§4.8). After the kernel validates and polices an
-//! intent, it hands off here. Implementations own tool lookup and sandboxed
-//! execution, and must always return a structured `Observation` (P10) — a tool
-//! crash, denial, or timeout is data the model reasons about, never a panic.
+//! Execution bridge for validated, authorized tool intents.
 
+use crate::gate::NetworkDecision;
 use crate::types::{BlastRadius, Containment, Observation, ToolCategory, ToolIntent, ToolSpec};
 use async_trait::async_trait;
 
-/// An owned command the executor is currently tracking, for surfaces to display
-/// while it runs — so the *user* can see what's active, not just the model.
+/// A tracked background command.
 #[derive(Debug, Clone)]
 pub struct BackgroundTask {
     pub id: String,
@@ -17,36 +14,23 @@ pub struct BackgroundTask {
 
 #[async_trait]
 pub trait Executor: Send + Sync {
-    /// Tool specs to expose into the K2 capability sheath for this session
-    /// (registration ≠ exposure — only exposed specs can be called).
+    /// Tool specs exposed for this session.
     fn specs(&self) -> Vec<ToolSpec>;
 
-    /// The blast radius of a registered tool, or `None` if it isn't registered.
-    /// Lets the policy authorize by radius (§4.7) instead of a hardcoded name
-    /// list — the tool declares its radius once and the policy reads it.
+    /// The registered tool's blast radius, or `None` if unknown.
     fn blast_radius(&self, _tool: &str) -> Option<BlastRadius> {
         None
     }
 
-    /// The presentation category of a registered tool, or `None` if unknown.
-    /// Lets the kernel label observations by provenance (e.g. `Web` results are
-    /// stamped `TrustLabel::Web`) without a hardcoded tool-name list.
+    /// The registered tool's presentation category, or `None` if unknown.
     fn category(&self, _tool: &str) -> Option<ToolCategory> {
         None
     }
 
-    /// Stable identity of state this intent mutates, or `None` for a
-    /// side-effect-free call.
-    ///
-    /// Mutation identity is deliberately separate from [`BlastRadius`].
-    /// Blast radius is an authorization/verification classification, while
-    /// this method drives execution ordering. Some durable operations (notably
-    /// project-scoped memory writes) are intentionally low-risk enough to carry
-    /// a `Read` radius but still mutate a replayable projection.
-    ///
-    /// The default is conservative: every non-read tool shares one global
-    /// mutation lane. Executors with low-risk mutations declared as `Read`
-    /// must override this method.
+    /// Stable identity of state this intent mutates, or `None` if side-effect
+    /// free. Separate from [`BlastRadius`], which authorizes rather than orders —
+    /// a `Read` radius can still mutate a replayable projection. Defaults to one
+    /// global mutation lane, so such executors must override this.
     fn mutation_key(&self, intent: &ToolIntent) -> Option<String> {
         match self.blast_radius(&intent.tool) {
             Some(BlastRadius::Read) | None => None,
@@ -54,7 +38,7 @@ pub trait Executor: Send + Sync {
         }
     }
 
-    /// How strongly this executor confines command execution (§4.8). Drives the
+    /// How strongly this executor confines command execution. Drives the
     /// kernel's trust-flow escalation — a web-tainted action is gated unless the
     /// containment blocks exfiltration. Defaults to no containment.
     fn containment(&self) -> Containment {
@@ -63,6 +47,15 @@ pub trait Executor: Send + Sync {
 
     /// Execute one validated intent and return its observation.
     async fn execute(&self, intent: &ToolIntent) -> Observation;
+
+    /// Prompt to grant the sandbox network access and retry after a command
+    /// failed under a net-denying jail. A session or persistent grant flips the
+    /// shared network flag (and, for persistent, records it durably) so the retry
+    /// and later commands reach the network. Defaults to deny — an executor with
+    /// no sandbox cannot open a network it does not confine.
+    async fn grant_network(&self, _detail: Option<&str>, _escalated: bool) -> NetworkDecision {
+        NetworkDecision::Deny
+    }
 
     /// Side-effect-free preview of an intent (e.g. a rendered diff), for the
     /// human gate. Async because building a real diff means reading the file's

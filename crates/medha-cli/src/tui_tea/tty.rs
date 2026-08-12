@@ -1,16 +1,8 @@
-//! Private-tty terminal init (PART 0.1).
+//! Private-tty terminal initialization.
 //!
-//! Some dependencies print to stdout unconditionally — e.g. a PDF text
-//! extractor emits a "Unicode mismatch" line on ligatures, which any `web.fetch`
-//! of an academic PDF triggers. On the alternate screen that spray corrupts the
-//! display (the long-standing "input box jumps / gibberish" bug).
-//!
-//! The fix is structural and covers the whole class, not one crate: build the
-//! ratatui terminal on a *duplicated* tty handle, then redirect the real fd 1/2
-//! to `.medha/logs/stray-stdout.log`. The terminal keeps drawing to the private
-//! handle (immune to the redirection), while any stray `println!`/`eprintln!`
-//! from anywhere lands in the log instead of on screen. Restored on exit and via
-//! a panic hook.
+//! The terminal renders through a duplicated tty handle while fd 1/2 redirect to
+//! `.medha/logs/stray-stdout.log`. This prevents dependency output from
+//! corrupting the alternate screen. Redirection is restored on exit and panic.
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -47,8 +39,7 @@ pub fn init(stray_log: &Path) -> anyhow::Result<(TuiTerminal, StrayRedirect)> {
     #[cfg(unix)]
     {
         use std::os::fd::FromRawFd;
-        // Private dup of the real stdout (the tty): the terminal draws here, so
-        // its output survives the fd 1/2 redirection installed just below.
+        // Rendering through this private fd survives the fd 1/2 redirection.
         let tty_fd = unsafe { libc::dup(1) };
         if tty_fd < 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -60,14 +51,9 @@ pub fn init(stray_log: &Path) -> anyhow::Result<(TuiTerminal, StrayRedirect)> {
         install_panic_hook(redirect.saved_out, redirect.saved_err);
 
         enable_raw_mode()?;
-        // Mouse capture is required for wheel scrolling to reach us uniformly: the
-        // event loop drives scroll from `Mouse` events, which crossterm only emits
-        // when tracking is on. Without it, scroll works only in emulators that
-        // translate the wheel to arrow keys themselves (VS Code / xterm.js alternate
-        // scroll mode) — macOS Terminal.app doesn't, so the wheel there scrolls the
-        // terminal's own scrollback instead of the app. Click-drag selection is
-        // handled by the TUI and copied through OSC 52; terminal-native selection
-        // remains available through the emulator's usual override modifier.
+        // Mouse capture makes wheel scrolling consistent across terminal
+        // emulators. The TUI handles selection through OSC 52; terminal-native
+        // selection remains available via the emulator's override modifier.
         execute!(
             tty,
             EnterAlternateScreen,
@@ -213,11 +199,8 @@ fn set_panic_hook_plain() {
 mod tests {
     use super::*;
 
-    /// A stray write to fd 1 must land in the log while redirected, then reach
-    /// the real tty again after restore. Uses a raw `write(2)` (not `println!`)
-    /// so it bypasses the test harness's thread-local stdout capture and truly
-    /// exercises fd-level redirection — the exact path a dependency's stray
-    /// `println!` takes at runtime. Does not install the global panic hook.
+    /// Uses `write(2)` to bypass the test harness's stdout capture and exercise
+    /// fd-level redirection without installing the global panic hook.
     #[test]
     fn stray_stdout_is_redirected_then_restored() {
         let dir = std::env::temp_dir().join(format!("medha-tty-test-{}", ulid::Ulid::new()));
@@ -235,7 +218,6 @@ mod tests {
             "stray write should be captured in the log, got: {contents:?}"
         );
 
-        // restore() is idempotent — a second call must not panic or re-close.
         redirect.restore();
 
         std::fs::remove_dir_all(&dir).ok();

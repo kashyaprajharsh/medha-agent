@@ -1,9 +1,4 @@
-//! Compaction policy — the thresholds that decide *when* and *how hard* to
-//! compact. Compaction is *graduated*: a cheap prune-only pass relieves
-//! moderate pressure before the expensive summarize pass is needed near the
-//! limit. Defaults are conservative starting points, kept here so they can be
-//! tuned and, later, eval-gated as part of `medha.lock` (§4.3, P4) — compaction
-//! settings are themselves an evolvable artifact, not magic constants.
+//! Thresholds for prune-only and full compaction passes.
 
 #[derive(Debug, Clone)]
 pub struct CompactionPolicy {
@@ -23,14 +18,9 @@ pub struct CompactionPolicy {
     /// an absolute constant can't fit both an 8k local model and a 200k
     /// hosted one (every other threshold here is a ratio for the same reason).
     pub prune_min_tool_tokens: Option<u32>,
-    /// Hard safety ceiling, as a fraction of the *true* model window (not the
-    /// reduced usable budget). A second, independent layer above the normal
-    /// trigger — the pattern real harnesses use two thresholds for: a soft
-    /// trigger that compacts early and gracefully, and a hard ceiling that is
-    /// the last line of defense if the soft pass couldn't find enough to cut
-    /// (e.g. one huge single turn). Crossing this forces compaction even
-    /// through the anti-thrash backoff, and if still over afterward, the
-    /// kernel refuses to send rather than risk an API context-length error.
+    /// Hard ceiling as a fraction of the true model window, above the soft
+    /// trigger. Crossing it forces compaction through the anti-thrash backoff;
+    /// still over afterwards, the kernel refuses to send.
     pub emergency_ratio: f32,
 }
 

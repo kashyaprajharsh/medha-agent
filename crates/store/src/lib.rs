@@ -1,7 +1,4 @@
-//! Persistent event log (§4.2). A SQLite (WAL) implementation of the kernel's
-//! `EventLog` trait, with a real SHA-256 hash chain making the log
-//! tamper-evident (P3). Drop-in replacement for the in-memory log (P8); state
-//! is still a projection of these events.
+//! SQLite event log with a tamper-evident SHA-256 chain.
 
 use async_trait::async_trait;
 use kernel::events::{EVENT_HASH_VERSION, chain_hash};
@@ -256,7 +253,7 @@ fn read_chain_anchor(conn: &Connection) -> Result<Option<(u64, [u8; 32])>, Store
     }
 }
 
-/// Content-addressed blob store on disk (§4.2/§4.5). Blobs live under a dir,
+/// Content-addressed blob store on disk. Blobs live under a directory,
 /// named by their SHA-256 hash, so identical content is stored once.
 pub struct FileArtifactStore {
     dir: PathBuf,
@@ -291,11 +288,8 @@ fn open_verified_artifact(path: &Path, expected_hash: &str) -> Result<File, Stri
     Ok(file)
 }
 
-/// Open an already-published artifact with write access before flushing it.
-///
-/// On Windows `File::sync_all` maps to `FlushFileBuffers`, which rejects a
-/// read-only handle with `ERROR_ACCESS_DENIED`. Reads should stay read-only,
-/// but the post-publication durability barrier needs this separate handle.
+/// Open a published artifact writable before flushing: on Windows `sync_all`
+/// maps to `FlushFileBuffers`, which rejects a read-only handle.
 fn open_verified_artifact_for_sync(path: &Path, expected_hash: &str) -> Result<File, String> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -470,11 +464,9 @@ impl SqliteLog {
     }
 
     /// Open an event log whose user-global mutations coordinate through
-    /// `global_mutation_lock`. File, shell, and MCP mutations still use a lock
-    /// beside this workspace's event database, so a long build in one
-    /// repository does not stall an unrelated repository. Memory mutations are
-    /// short and all use the global lane so CLI wildcard operations cannot race
-    /// kernel-dispatched project memory.
+    /// `global_mutation_lock`. File/shell/MCP mutations stay per-workspace so a
+    /// long build cannot stall another repository; memory writes use the global
+    /// lane so CLI wildcards cannot race kernel-dispatched project memory.
     pub fn open_with_mutation_lock(
         path: impl AsRef<Path>,
         global_mutation_lock: impl AsRef<Path>,
@@ -533,9 +525,6 @@ impl SqliteLog {
         migrate_event_chain_v2(&mut conn)?;
         backfill_event_fts(&mut conn)?;
 
-        // The chain head is read from the DB inside each append's transaction
-        // (see `append`), not cached — so a second MEDHA process on the same
-        // workspace can't append against a stale head and corrupt the chain (K10).
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             runtime_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -594,11 +583,9 @@ impl SqliteLog {
         .map_err(|error| KernelError::Log(format!("SQLite worker failed: {error}")))?
     }
 
-    /// Verify the tamper-evident hash chain over the ENTIRE log (all sessions,
-    /// in append/rowid order — the chain is global). For each event we confirm
-    /// both that its `prev_hash` links to the running hash AND that recomputing
-    /// its hash reproduces the stored `hash` column, so a direct edit to any row
-    /// — including the last — is detected. Call this on open / session resume.
+    /// Verify the tamper-evident hash chain over the entire log in rowid order.
+    /// Each event must link to the running hash and recompute to its stored hash,
+    /// so an edit to any row is detected. Call on open and on session resume.
     pub fn verify(&self) -> Result<(), StoreError> {
         let conn = self
             .conn
@@ -927,11 +914,7 @@ impl SqliteLog {
             .conn
             .lock()
             .map_err(|_| KernelError::Log("poisoned".into()))?;
-        // Read the chain head and insert inside ONE `IMMEDIATE` transaction, so
-        // the read-then-append is atomic against any other writer — including a
-        // second MEDHA process on the same DB. Trusting an in-memory cached head
-        // (the old design) let two processes both link off the same hash and
-        // fail `verify()` as "tampering" (K10). SQLite's write lock serializes.
+        // The head read and insert must share one cross-process write lock.
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|err| KernelError::Log(err.to_string()))?;
@@ -1875,11 +1858,6 @@ mod tests {
 
     #[tokio::test]
     async fn two_instances_on_one_db_keep_the_chain_intact() {
-        // Simulates two MEDHA processes sharing a workspace: each opens its own
-        // SqliteLog (own connection, no shared cache) and appends interleaved.
-        // The head is read inside each append's IMMEDIATE txn (K10), so the chain
-        // stays linked and verify() passes — the old cached-head design corrupted
-        // it here.
         let dir = std::env::temp_dir().join(format!("medha-k10-{}", Ulid::new()));
         let db = dir.join("events.db");
         let a = SqliteLog::open(&db).unwrap();

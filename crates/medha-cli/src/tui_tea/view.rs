@@ -1,5 +1,4 @@
-//! View layer: all rendering (transcript, input, status, welcome, diffs,
-//! pickers, autocomplete). Pure functions of Model. Split out of tui_tea.rs.
+//! Pure rendering for the transcript, composer, status, and overlays.
 #![allow(clippy::too_many_arguments)]
 use super::*;
 use unicode_width::UnicodeWidthStr;
@@ -11,9 +10,7 @@ pub(super) fn spinner_span(frame: u64) -> Span<'static> {
     Span::styled(glyph, Style::default().fg(theme::current().glow(lit)))
 }
 
-/// Human-readable verb for a tool name (used both for the live activity label and
-/// the in-progress tool-call line).
-/// Live-activity verb for a tool's *category*.
+/// Live-activity verb for a tool category.
 pub(super) fn cat_verb(cat: ToolCategory) -> &'static str {
     match cat {
         ToolCategory::Read => "reading",
@@ -64,9 +61,7 @@ pub(super) fn activity_label(model: &Model) -> String {
             None => verb.to_string(),
         };
     }
-    // Between actions the model is producing its next output; we only *know* it's
-    // "thinking" when reasoning is actually enabled/streaming. With reasoning off,
-    // saying "thinking" is a lie — it's generating a reply or a tool call → "working".
+    // Claim "thinking" only when reasoning is actually enabled or streaming.
     let between = if model.reasoning.enabled == Some(false) {
         "working"
     } else {
@@ -81,21 +76,14 @@ pub(super) fn activity_label(model: &Model) -> String {
     }
 }
 
-/// The active theme's ornament, with its head travelling along it.
-///
-/// For `dark`/`light` this is a Saraswati veena — the instrument Medha holds:
-/// resonator gourd (kudam), fretted neck (dandi), upper gourd (tumba). Playing
-/// it means tuning the intellect into harmony, so the gesture is a *pluck*.
-/// Other themes bring their own shape and pace; see [`super::spin::track`].
-/// Driven by the always-advancing `anim_frame`, not the one-shot intro clock.
+/// Draws the active theme's ornament from the continuous animation clock.
 pub(super) fn motif_line(frame: u64) -> Line<'static> {
     let p = theme::current();
     let t = spin::track(p.motif);
     let n = t.glyphs.len();
     let head = t.head(frame);
 
-    // Cells the tail fades across. Three hard steps banded visibly; a smooth
-    // ramp over six reads as one moving light instead of three lit cells.
+    // A six-cell ramp reads as one moving light instead of separate bands.
     const TAIL: usize = 6;
 
     let white = Style::default()
@@ -129,10 +117,7 @@ pub(super) fn motif_line(frame: u64) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Solid blocks only. The previous form mixed full blocks with box-drawing
-/// outlines (`╗ ║ ═`), which come from a different glyph family — most terminal
-/// fonts render the two at different weights and baselines, so the outline
-/// floated off the fill and the letterforms read as broken.
+/// Solid blocks avoid mixed font weights and baselines in terminal renderers.
 pub(super) const LOGO: &str = r#"██   ██ ██████ █████  ██   ██  █████
 ███ ███ ██     ██  ██ ██   ██ ██   ██
 ██ █ ██ █████  ██  ██ ███████ ███████
@@ -146,9 +131,7 @@ pub(super) fn shade(rgb: (u8, u8, u8), num: u16, den: u16) -> Color {
     Color::Rgb(m(rgb.0), m(rgb.1), m(rgb.2))
 }
 
-/// Build one logo row: the solid `█` fill in the row's gold, the box-drawing
-/// outline (╔╗╚╝║═ …) a few shades darker so each letter looks raised/engraved
-/// rather than flat — a lightweight bevel using only per-glyph color.
+/// Builds a logo row with darker outline glyphs for a terminal-safe bevel.
 pub(super) fn logo_row(line: &str, rgb: (u8, u8, u8)) -> Vec<Span<'static>> {
     let fill = Style::default()
         .fg(Color::Rgb(rgb.0, rgb.1, rgb.2))
@@ -156,8 +139,7 @@ pub(super) fn logo_row(line: &str, rgb: (u8, u8, u8)) -> Vec<Span<'static>> {
     let edge = Style::default()
         .fg(shade(rgb, 52, 100))
         .add_modifier(Modifier::BOLD);
-    // A glyph is either solid fill (█, or a space — no visible ink) or an
-    // outline edge; coalesce consecutive same-class glyphs into one span.
+    // Coalesce consecutive fill and outline glyphs into spans.
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut buf = String::new();
     let mut buf_fill = true;
@@ -198,8 +180,7 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
     let p = theme::current();
     let t = (model.anim_frame % 60) as i32;
     let level = if t < 30 { t } else { 60 - t };
-    // The wordmark breathes between the theme's own two ends, so the pulse stays
-    // visible on parchment instead of fading into it.
+    // Theme endpoints keep the pulse visible on both light and dark canvases.
     let word = lerp_color(p.word_lo, p.word_hi, level, 30);
     body.push(center_line(
         vec![Span::styled(
@@ -211,9 +192,7 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
         )],
         w,
     ));
-    // The block logo is the tallest element and the first to go. A short
-    // terminal used to render the splash from row 0 and clip it mid-letter;
-    // dropping the art keeps a composed screen at any height.
+    // Drop the tallest element first when vertical space is constrained.
     let logo_rows = LOGO.lines().count();
     // wordmark + blank + tagline + blank + veena + blank + hint, plus the art.
     let room_for_logo = (area.height as usize) >= logo_rows + 9;
@@ -254,9 +233,7 @@ pub(super) fn draw_welcome(f: &mut Frame, model: &Model, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// A tool's presentation, resolved once from its declared spec: its own glyph
-/// plus the category that drives colour/verb. The surface holds no name→glyph
-/// table — the glyph is the tool's, so each stays distinct.
+/// Presentation derived from the tool's declared glyph and category.
 #[derive(Clone)]
 pub(super) struct ToolViz {
     pub(super) icon: String,
@@ -279,10 +256,7 @@ pub(super) fn cat_color(cat: ToolCategory) -> Color {
     }
 }
 
-/// Prettify a tool name for display without a per-tool table: take the last
-/// dotted segment, turn `_` into spaces, capitalize. `fs.read`→"Read",
-/// `code_outline`→"Code outline", `web.search`→"Search". Always reasonable for
-/// any future tool, zero maintenance.
+/// Humanizes the final dotted tool-name segment without a lookup table.
 pub(super) fn tool_label(tool: &str) -> String {
     let seg = tool.rsplit('.').next().unwrap_or(tool).replace('_', " ");
     let mut chars = seg.chars();
@@ -552,13 +526,12 @@ fn render_reconciliation(card: &serde_json::Value) -> Vec<Line<'static>> {
     ]
 }
 
-/// Inline approval rendering (PART 3: appended to the transcript stream, not a modal).
-/// Rendered as a plain block in the same scrollable region — heading, diff hunk, then
-/// options as plain numbered lines. Never a floating overlay, so it can never be clipped.
+/// Renders an approval inline in the scrollable transcript.
 pub(super) fn render_approval(
     action: &str,
     detail: Option<&str>,
     sel: usize,
+    opts: &[&str],
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(""),
@@ -594,7 +567,6 @@ pub(super) fn render_approval(
         }
     }
     lines.push(Line::from(""));
-    let opts = ["Yes, allow once", "Yes, always allow", "No, deny"];
     for (i, label) in opts.iter().enumerate() {
         if i == sel {
             lines.push(Line::from(vec![
@@ -838,9 +810,7 @@ pub(super) fn checklist_line(line: &str) -> Option<Line<'static>> {
     Some(Line::from(spans))
 }
 
-/// Tool input/output panel: a framed, syntax-highlighted JSON block matching the
-/// markdown code-fence styling (│ gutter, dim language label). Kept capped so a
-/// huge payload never builds thousands of spans (PART 4).
+/// Renders capped tool JSON using the code-fence visual style.
 pub(super) fn json_block(v: &serde_json::Value, label: &str) -> Vec<Line<'static>> {
     let text = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
     let border = Style::default().fg(theme::border());
@@ -874,7 +844,7 @@ pub(super) fn json_block(v: &serde_json::Value, label: &str) -> Vec<Line<'static
 
 pub(super) const MIN_SIDE_BY_SIDE: u16 = 96;
 
-/// Lines of unchanged context kept above/below each change (PART 5: hunk-based).
+/// Unchanged context lines retained around each change.
 pub(super) const DIFF_CONTEXT: usize = 3;
 
 /// One display row of a hunk-filtered diff.
@@ -889,9 +859,7 @@ pub(super) enum DiffRow {
     Gap(usize),
 }
 
-/// Reduce a full unified diff to hunks: keep changed lines plus `DIFF_CONTEXT` lines
-/// of surrounding context, collapsing longer unchanged runs into `Gap` markers.
-/// This is what stops a 1000-line file with 3 edits from rendering 1000 lines (PART 5).
+/// Collapses unchanged diff runs outside the configured hunk context.
 pub(super) fn hunk_rows(old: &str, new: &str) -> Vec<DiffRow> {
     use similar::{ChangeTag, TextDiff};
     let diff = TextDiff::from_lines(old, new);
@@ -979,9 +947,7 @@ pub(super) fn render_diff(old: &str, new: &str, path: &str, width: u16) -> Vec<L
             format!("{t:<w$}")
         }
     };
-    // Side-by-side only helps when there are BOTH deletions and insertions to compare.
-    // For a one-sided change (new file / pure addition or pure deletion) it wastes a
-    // whole column and wraps badly — use the single-column unified layout instead.
+    // Side-by-side layout is useful only when both sides contain changes.
     let has_del = rows.iter().any(|r| matches!(r, DiffRow::Del(..)));
     let has_ins = rows.iter().any(|r| matches!(r, DiffRow::Ins(..)));
     let unified = width < MIN_SIDE_BY_SIDE || !(has_del && has_ins);
@@ -1144,9 +1110,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         ),
     };
     left.push(Span::styled(format!("  [{mode_txt}]"), mode_style));
-    // While a form/approval is up the turn is PAUSED on the user, not working —
-    // say so, or the running spinner makes it look like the agent ran off on its
-    // own (it hasn't; it's blocked awaiting your answer).
+    // User-owned forms pause the activity indicator.
     let awaiting_user = model.clarify.is_some() || model.pending_approval().is_some();
     if awaiting_user {
         let what = if model.clarify.is_some() {
@@ -1179,9 +1143,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // Live background-task indicator: an animated glyph + count, so the user sees
-    // what's still running in an owned `shell.exec` even when no turn is active.
-    // `/tasks` lists them; `task.kill` can stop a concurrent session's command.
+    // Surface owned background tasks even when no foreground turn is active.
     let running_bg = model.bg_running();
     if running_bg > 0 {
         let g = super::spin::secondary(model.anim_frame);
@@ -1193,9 +1155,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // Delegated agents. A child's work never reaches the transcript, so without
-    // this the user has no way to know Medha handed part of the task away, or to
-    // what. Esc cancels the turn, which settles the child with it.
+    // Delegated work is otherwise absent from the parent transcript.
     if !model.agent_runs.is_empty() {
         let g = super::spin::secondary(model.anim_frame);
         let names = model
@@ -1211,12 +1171,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // Patches a writing child produced and nobody has applied. Unlike a running
-    // agent this waits indefinitely and costs nothing to ignore, which is
-    // exactly why it needs saying — the work is done and sitting there.
-    // The cached count, not the durable one: this runs every frame, and a log
-    // read per frame would be absurd. A patch from a previous process shows up
-    // in `/agents`, which is where acting on one happens anyway.
+    // Use the cached patch count because status rendering runs every frame.
     let unmerged = model
         .agents
         .as_ref()
@@ -1242,8 +1197,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         Some(pct) => format!("ctx {pct}%"),
         None => "ctx —".to_string(),
     };
-    // Cost so far, when pricing resolved (P1-12); "~…est." marks an indicative
-    // list price (self-hosted routes aren't billed it). No pricing → no line.
+    // Mark indicative list prices; self-hosted routes may not incur them.
     let cost = match model.cost_usd {
         Some((usd, true)) => format!(" · ~${usd:.2} est."),
         Some((usd, false)) => format!(" · ${usd:.2}"),
@@ -1274,16 +1228,12 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     } else {
         "/reasoning · /detail · /help"
     };
-    // Pad in terminal cells (K14) so the right block stays right-aligned even
-    // with wide glyphs in the left block.
+    // Pad by terminal cells so wide glyphs preserve right alignment.
     let left_w: usize = left
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    // Fullest first. A status line that does not fit used to overflow the row
-    // and get clipped by the renderer, which cuts mid-word ("…/rea"); dropping
-    // detail in priority order degrades legibly instead. Two cells of gap keep
-    // the blocks from touching.
+    // Drop status details by priority rather than clipping mid-word.
     let available = (area.width as usize).saturating_sub(left_w + 2);
     let right = [
         format!("{ctx}{cost} · {reasoning}{stream}   {hints}"),
@@ -1303,9 +1253,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Lay the input box out in terminal CELLS (K14): rows wrap on display width
-/// (CJK/emoji = 2 columns) and the returned cursor column is a cell offset, so
-/// the terminal cursor lands on the right glyph, not two cells short.
+/// Wraps input and positions its cursor using terminal-cell widths.
 pub(super) fn layout_input(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
     use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
@@ -1505,10 +1453,7 @@ pub(super) fn draw_autocomplete(f: &mut Frame, model: &Model, input_area: Rect) 
     }
     let n = matches.len();
     let sel = model.ac_sel.min(n - 1);
-    // Never let the menu grow taller than the space above the input box (it
-    // would push the prompt off-screen). Reserve one row for the hint line and
-    // one top margin, then window around the selection — same discipline as the
-    // picker overlay.
+    // Window the menu so it cannot displace the composer.
     let capacity = (input_area.y as usize).saturating_sub(2).max(1);
     let visible = n.min(capacity).max(1);
     let start = if n <= visible {
@@ -1562,10 +1507,7 @@ pub(super) fn draw_autocomplete(f: &mut Frame, model: &Model, input_area: Rect) 
 pub(super) fn draw_picker(f: &mut Frame, picker: &Picker, input_area: Rect) {
     let labels = picker.kind.labels();
     let n = labels.len();
-    // Fit the picker into the space actually available above the input box —
-    // no magic row count. `input_area.y` is how many rows sit above the input;
-    // reserve one for the title, keep one as a top margin. A long session list
-    // then windows around the selection instead of overflowing the screen.
+    // Derive picker height from the rows actually available above the composer.
     let capacity = (input_area.y as usize).saturating_sub(2).max(1);
     let visible = n.min(capacity).max(1);
     let start = if n <= visible {
@@ -1612,12 +1554,7 @@ pub(super) fn draw_picker(f: &mut Frame, picker: &Picker, input_area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Render the `clarify` question form as a bordered card above the input box:
-/// the question up top, options as radio (single) / checkbox (multi) rows with
-/// the recommended one starred, then an "Other" row that becomes an inline
-/// editor when selected. Long content is pre-wrapped into physical terminal rows
-/// and the card scrolls just enough to keep the focused row visible on short
-/// terminals.
+/// Renders a wrapped, focus-scrolling structured-question card above the composer.
 pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect) {
     use ratatui::widgets::{Block, BorderType, Borders};
 
@@ -1628,8 +1565,7 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Tab row — shows EVERY question so the user sees there are several and can
-    // switch. Current = accent ▸; answered = ✓; still-open = dim ○.
+    // Tabs expose current, answered, and open questions.
     if multi_q {
         let mut tabs: Vec<Span> = Vec::new();
         for (i, qq) in state.questions.iter().enumerate() {
@@ -1661,8 +1597,7 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
         lines.push(Line::from(""));
     }
 
-    // Question prompt — prominent, at the top of the question section. (Header is
-    // in the tab row when there are several; inline it for a lone question.)
+    // Inline a lone header; multiple headers already appear as tabs.
     let head = if multi_q || q.header.trim().is_empty() {
         String::new()
     } else {
@@ -1676,8 +1611,7 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
     )));
     lines.push(Line::from("")); // breathing room
 
-    // Options — rich per-component styling. While editing "Other", dim them so
-    // focus is on the text field.
+    // Dim options while the free-text field owns focus.
     let options_start = lines.len();
     for (i, opt) in q.options.iter().enumerate() {
         let on = draft.selected.contains(&i);
@@ -1730,8 +1664,7 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
         lines.push(Line::from(spans));
     }
 
-    // The "Other" row: an inline editor when active (shows the live buffer + a
-    // block cursor), otherwise a normal selectable row echoing any saved text.
+    // The free-text row becomes an inline editor while active.
     let other_line = lines.len();
     if editing {
         let cursor = state.other_cursor.min(state.other_input.len());
@@ -1830,8 +1763,7 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
         ))
         .padding(ratatui::widgets::Padding::horizontal(1));
 
-    // Pre-wrap with the exact inner width (border + horizontal padding consume
-    // four cells). The resulting row count is both rendering and layout truth.
+    // Use one wrapped-row count for rendering and layout.
     let inner_width = input_area.width.saturating_sub(4).max(1) as usize;
     let focus_logical = if editing {
         other_line
@@ -1847,8 +1779,7 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
         physical.extend(wrap_line(&line, inner_width));
     }
 
-    // Never cover the composer/status on a short terminal. If the full card does
-    // not fit above it, scroll the content so the active row remains reachable.
+    // Scroll within available space so the active row remains reachable.
     let available_height = input_area.y;
     if available_height < 3 {
         return;
@@ -1869,30 +1800,22 @@ pub(super) fn draw_clarify(f: &mut Frame, state: &ClarifyState, input_area: Rect
     );
 }
 
-/// View function — pure rendering from model
+/// Renders the current model.
 pub(super) fn view(f: &mut Frame, model: &mut Model) {
     let area = f.area();
     model.viewport_height = area.height as usize;
 
-    // Paint the themed canvas first. Dark's bg is `Reset` (a no-op that keeps
-    // the terminal's own background), light paints parchment — so light mode is
-    // readable even on a dark terminal. Text drawn afterwards uses fg-only
-    // styles (bg: None), which inherit this fill.
+    // Paint the canvas first so foreground-only styles inherit the theme.
     f.render_widget(
         Block::default().style(Style::default().bg(theme::bg())),
         area,
     );
 
-    // Horizontal gutter — insets the transcript, input box and status from the
-    // terminal edge so nothing is glued to column 0. Scales gently with width
-    // (a wide terminal gets a touch more breathing room), clamped for narrow ones.
+    // Clamp a width-scaled gutter for narrow terminals.
     let margin = (area.width / 30).clamp(3, 6);
     let content_w = area.width.saturating_sub(margin * 2);
 
-    // Input box interior width = content minus the rounded border (1 each side)
-    // and its horizontal padding (1 each side) = 4. Height is the text plus the
-    // border only: a blank line above and below cost two rows of transcript for
-    // no legibility, and made an empty composer five rows tall.
+    // Border and horizontal padding consume four cells of composer width.
     let text_rows = input_rows(model, content_w.saturating_sub(4)) as u16;
     let box_h = text_rows.clamp(1, 8) + 2;
     let chunks = Layout::default()
@@ -1918,9 +1841,7 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     draw_input(f, model, pad_h(chunks[2]));
     draw_status(f, model, pad_h(chunks[3]));
 
-    // While an approval card is pending it owns the keyboard — drawing the
-    // autocomplete/picker under it would show interactive-looking menus that
-    // don't respond ("stuck menu"). They come back once the card is answered.
+    // Hide inactive menus while an approval owns input.
     let gate_open = model.pending_approval().is_some() || model.clarify.is_some();
     if !gate_open
         && model.model_setup.is_none()
@@ -1980,14 +1901,10 @@ fn highlight_cell_range(line: &Line<'static>, start: usize, end: usize) -> Line<
 }
 
 pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
-    // Scroll math must use the TRANSCRIPT pane height, not the full frame height
-    // (set in view()), or the last lines — e.g. the approval options — get clipped
-    // off the bottom even when auto-scrolled.
+    // Scroll math uses transcript height, excluding composer and status rows.
     model.viewport_height = area.height as usize;
     model.transcript_area = area;
-    // Show the welcome splash only while the transcript is truly empty, so any
-    // pushed content (e.g. a `/skills` notice run as the first action) always
-    // wins — the splash can never hide it.
+    // Any transcript content takes precedence over the splash.
     if model.on_welcome_splash() {
         model.content_height = area.height as usize;
         draw_welcome(f, model, area);
@@ -1999,9 +1916,7 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
         model.invalidate_all_renders();
         model.cached_width = area.width;
     }
-    // Recompute per-item physical rows + total height only when content changed.
-    // Each item is wrapped ONCE and memoized; a big diff is never re-laid-out per
-    // frame. (This block is the only O(items) work, and only on change.)
+    // Recompute memoized physical rows only after content or width changes.
     if model.dirty {
         let cx = RenderCtx {
             width: area.width,
@@ -2015,12 +1930,13 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
             e.ensure(&cx, vw);
             total += e.height;
         }
-        // Approval card: pre-wrap into physical rows too (PART 3, inline in stream).
+        // Approval rows participate in the same physical-row scroll model.
         model.approval_rows = if let Some(pending) = model.pending_approval() {
             let mut rows = render_approval(
                 &pending.action,
                 pending.detail.as_deref(),
                 model.approval_sel,
+                pending.responder.options(),
             );
             // If more approvals are queued behind the current one, say so — so the
             // user knows to expect another prompt right after this one.
@@ -2061,9 +1977,7 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
         model.scroll_offset = model.max_scroll();
     }
 
-    // VIRTUALIZE: build only the physical rows inside the visible window
-    // [top, bot). Per-frame cost is O(screen height), independent of transcript
-    // size — this is what makes it scale to a large repo / long session.
+    // Build only the visible physical-row window.
     let top = model.scroll_offset;
     let bot = top + model.viewport_height;
     let mut visible: Vec<Line<'static>> = Vec::with_capacity(model.viewport_height);
@@ -2110,9 +2024,7 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
     let p = Paragraph::new(visible).style(Style::default().fg(theme::text()));
     f.render_widget(p, area);
 
-    // A slim scrollbar in the right-hand padding gutter (never overlaps text) —
-    // shows position + how much is off-screen, so scrolling a long session reads
-    // like a normal pane. Only drawn when content actually overflows the viewport.
+    // Draw overflow position in the padding gutter, never over transcript text.
     if model.content_height > model.viewport_height && area.right() < f.area().right() {
         use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
         let gutter = Rect {
@@ -2320,8 +2232,7 @@ mod clarify_view_tests {
     #[test]
     fn the_placeholder_never_gets_clipped_mid_hint() {
         use unicode_width::UnicodeWidthStr;
-        // Every width must yield something that fits, including absurdly narrow
-        // ones — the composer used to print a half-finished shortcut.
+        // Every width yields a complete fitting variant.
         for width in [10usize, 40, 60, 80, 100, 140, 200] {
             let text = super::placeholder(width);
             assert!(
@@ -2331,7 +2242,6 @@ mod clarify_view_tests {
                 UnicodeWidthStr::width(text)
             );
         }
-        // The invitation survives at every width; only the hints give way.
         assert!(super::placeholder(200).contains("ctrl-click"));
         assert!(!super::placeholder(60).contains("ctrl-click"));
         assert!(super::placeholder(60).starts_with("Ask medha"));
@@ -2339,15 +2249,11 @@ mod clarify_view_tests {
 
     #[test]
     fn the_splash_stays_visible_on_every_canvas() {
-        // Asserted on the ramps directly rather than by swapping the global
-        // palette: the theme is process-wide, and mutating it here would race
-        // every other test that renders.
+        // Avoid mutating the process-wide palette in parallel tests.
         let luma = |(r, g, b): (u8, u8, u8)| 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
         for build in theme::Palette::ALL {
             let p = build();
             for row in p.logo {
-                // A dark ramp crowning at near-white is invisible on parchment —
-                // the whole splash used to wash out under the light theme.
                 if p.is_dark {
                     assert!(luma(row) > 90.0, "{}: {row:?} is too dark", p.id);
                 } else {
@@ -2364,10 +2270,7 @@ mod clarify_view_tests {
 
     #[test]
     fn every_motif_uses_only_glyphs_that_render() {
-        // Heavy and mixed-weight box drawing falls back to unrelated shapes in
-        // common terminal fonts; the pegbox curl rendered as a stray `⌐`.
-        // Checked per motif rather than through the active palette, so changing
-        // the default theme cannot quietly stop covering the other two.
+        // Check each motif independently of the active palette.
         for motif in [
             theme::Motif::Veena,
             theme::Motif::Loom,
@@ -2380,8 +2283,6 @@ mod clarify_view_tests {
                 }
             }
         }
-        // Whatever the active palette names, the ornament renders and is drawn
-        // entirely from that motif's own glyph set.
         let t = super::super::spin::track(theme::current().motif);
         let drawn: String = super::motif_line(0)
             .spans

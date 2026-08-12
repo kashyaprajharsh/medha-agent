@@ -3,18 +3,18 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/main/install.sh | sh
 #
-# Downloads the release build for this platform and puts `medha` on your PATH.
-# Override the destination with MEDHA_INSTALL_DIR, or pin a build with
-# MEDHA_VERSION=v0.1.0.
+# Installs the release build. Set MEDHA_INSTALL_DIR to override the destination.
+# To pin both installer and binary, fetch the same immutable release tag:
+#   version=v0.1.0
+#   curl -fsSL "https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/$version/install.sh" \
+#     | MEDHA_VERSION="$version" sh
 set -eu
 
 REPO="${MEDHA_REPO:-kashyaprajharsh/medha-agent}"
 VERSION="${MEDHA_VERSION:-latest}"
 INSTALL_DIR="${MEDHA_INSTALL_DIR:-}"
 
-# ── presentation ─────────────────────────────────────────────────────────────
-# Colour and glyphs only when stdout is a real terminal, never when piped into a
-# log or when NO_COLOR is set, so the output stays clean and readable anywhere.
+# Use color only on an interactive terminal unless NO_COLOR is set.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
   c_reset=$(printf '\033[0m'); c_dim=$(printf '\033[2m'); c_bold=$(printf '\033[1m')
   c_accent=$(printf '\033[36m'); c_ok=$(printf '\033[32m'); c_err=$(printf '\033[31m')
@@ -38,17 +38,12 @@ printf '  %s──────────────────────�
 need uname
 need tar
 
-# GitHub serves release assets from several anycast addresses, and one that is
-# unreachable from the caller's network must not stall the install: bound each
-# connect attempt so the next address is tried promptly, then retry transient
-# failures. The asset download also reports progress, because a slow network
-# must not be indistinguishable from a hung one.
+# Bound connection attempts and retry transient release-download failures.
 if command -v curl >/dev/null 2>&1; then
   NET_OPTS="--connect-timeout 5 --retry 3 --proto =https --proto-redir =https"
   fetch() { curl -fsSL $NET_OPTS "$1"; }
   fetch_to() { curl -fSL $NET_OPTS --progress-bar "$1" -o "$2"; }
-  # Return 0 = downloaded, 2 = precise HTTP 404, 1 = transport/other HTTP
-  # failure. Only a real 404 means "this release did not publish a checksum."
+  # Return 0 for success, 2 for HTTP 404, and 1 for other failures.
   fetch_optional_to() {
     status="$(curl -sSL $NET_OPTS -o "$2" -w '%{http_code}' "$1")" || return 1
     case "$status" in
@@ -78,7 +73,6 @@ else
   die "either curl or wget is required"
 fi
 
-# ---- target detection -------------------------------------------------------
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -100,7 +94,6 @@ esac
 
 TARGET="${arch_part}-${os_part}"
 
-# ---- resolve the version ----------------------------------------------------
 
 if [ "$VERSION" = "latest" ]; then
   step "resolving latest release"
@@ -115,10 +108,9 @@ fi
 ASSET="medha-${TARGET}.tar.gz"
 URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
 
-# ---- choose an install directory --------------------------------------------
 
 if [ -z "$INSTALL_DIR" ]; then
-  # Prefer a location already on PATH that we can write to without sudo.
+  # Prefer a writable directory already on PATH.
   if [ -w "/usr/local/bin" ] 2>/dev/null; then
     INSTALL_DIR="/usr/local/bin"
   else
@@ -127,7 +119,6 @@ if [ -z "$INSTALL_DIR" ]; then
 fi
 mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
 
-# ---- download and install ---------------------------------------------------
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -136,8 +127,7 @@ step "downloading medha $VERSION  ($TARGET)"
 fetch_to "$URL" "$tmp/$ASSET" || die "download failed: $URL
 This platform may not have a published build for $VERSION."
 
-# A precise 404 means an older release omitted a checksum and may continue.
-# Every other fetch failure is uncertain and therefore fails closed.
+# Older releases may omit checksums; all failures except a precise 404 fail closed.
 checksum_status=0
 fetch_optional_to "$URL.sha256" "$tmp/$ASSET.sha256" || checksum_status=$?
 case "$checksum_status" in
@@ -168,9 +158,7 @@ case "$checksum_status" in
   *) die "checksum download failed: $URL.sha256 -- refusing an unverifiable install" ;;
 esac
 
-# Require one regular root entry with the release's exact layout. Validating
-# before extraction rejects traversal, absolute paths, duplicates, links,
-# devices, FIFOs, and "first executable named medha wins" ambiguity.
+# Validate one regular root entry before extraction to reject archive attacks.
 entries="$(tar tzf "$tmp/$ASSET")" \
   || die "could not inspect the downloaded archive"
 [ "$entries" = "medha" ] \

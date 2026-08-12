@@ -1,15 +1,8 @@
-//! Model metadata lookup via models.dev (§4.4) — a real, externally
-//! maintained metadata database, not a
-//! hardcoded table baked into the binary. Fetched once, cached to disk, and
-//! matched by model id. If a model genuinely isn't in it, we say so and leave
-//! the value unknown (P2: never fabricate a number) — the caller then either
-//! asks the user to set one explicitly or disables the dependent feature —
-//! the safe behaviour when metadata can't be resolved for a local/custom
-//! model. Carries both context windows and per-MTok list prices
-//! (the latter feed the cost meter, P1-12 — indicative for self-hosted routes).
+//! Cached models.dev metadata. Missing values remain unknown; prices are
+//! indicative for self-hosted routes.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,13 +26,13 @@ pub struct ModelMeta {
 struct Cache {
     fetched_at_unix: u64,
     /// lowercased model id → metadata
-    entries: HashMap<String, ModelMeta>,
+    entries: BTreeMap<String, ModelMeta>,
 }
 
 #[derive(Deserialize)]
 struct Provider {
     #[serde(default)]
-    models: HashMap<String, ModelEntry>,
+    models: BTreeMap<String, ModelEntry>,
 }
 
 #[derive(Deserialize)]
@@ -94,7 +87,9 @@ fn save_disk_cache(cache: &Cache) {
     }
 }
 
-async fn fetch_and_flatten(client: &reqwest::Client) -> Result<HashMap<String, ModelMeta>, String> {
+async fn fetch_and_flatten(
+    client: &reqwest::Client,
+) -> Result<BTreeMap<String, ModelMeta>, String> {
     let resp = client
         .get(API_URL)
         .send()
@@ -103,8 +98,8 @@ async fn fetch_and_flatten(client: &reqwest::Client) -> Result<HashMap<String, M
     if !resp.status().is_success() {
         return Err(format!("models.dev returned {}", resp.status()));
     }
-    let providers: HashMap<String, Provider> = resp.json().await.map_err(|e| e.to_string())?;
-    let mut flat = HashMap::new();
+    let providers: BTreeMap<String, Provider> = resp.json().await.map_err(|e| e.to_string())?;
+    let mut flat = BTreeMap::new();
     for provider in providers.into_values() {
         for (id, model) in provider.models {
             let meta = ModelMeta {
@@ -121,7 +116,7 @@ async fn fetch_and_flatten(client: &reqwest::Client) -> Result<HashMap<String, M
 }
 
 /// Load the metadata table: fresh disk cache if present, else fetch + re-cache.
-async fn entries() -> Option<HashMap<String, ModelMeta>> {
+async fn entries() -> Option<BTreeMap<String, ModelMeta>> {
     if let Some(cache) = load_disk_cache() {
         return Some(cache.entries);
     }
@@ -151,7 +146,7 @@ pub async fn pricing(model_id: &str) -> Option<(f64, f64)> {
     Some((meta.input_per_mtok?, meta.output_per_mtok?))
 }
 
-fn lookup(model_id: &str, entries: &HashMap<String, ModelMeta>) -> Option<ModelMeta> {
+fn lookup(model_id: &str, entries: &BTreeMap<String, ModelMeta>) -> Option<ModelMeta> {
     let needle = model_id.to_lowercase();
     // Exact match on the full id (as given, and stripped of a provider prefix).
     if let Some(&meta) = entries.get(&needle) {
@@ -161,12 +156,14 @@ fn lookup(model_id: &str, entries: &HashMap<String, ModelMeta>) -> Option<ModelM
     if let Some(&meta) = entries.get(tail) {
         return Some(meta);
     }
-    // Fuzzy: the known id is a substring of ours, or ours is a substring of it
-    // (handles version/quantization suffixes like "-bf16", "-instruct").
     entries
         .iter()
-        .find(|(k, _)| needle.contains(k.as_str()) || tail.contains(k.as_str()) || k.contains(tail))
-        .map(|(_, v)| *v)
+        .filter(|(key, _)| {
+            needle.contains(key.as_str()) || tail.contains(key.as_str()) || key.contains(tail)
+        })
+        // `BTreeMap` order makes equal-length fuzzy matches deterministic.
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, value)| *value)
 }
 
 #[cfg(test)]
@@ -175,7 +172,7 @@ mod tests {
 
     #[test]
     fn exact_and_fuzzy_match() {
-        let mut m = HashMap::new();
+        let mut m = BTreeMap::new();
         m.insert(
             "qwen3-32b".to_string(),
             ModelMeta {
@@ -206,5 +203,30 @@ mod tests {
         let opus = lookup("claude-opus-4", &m).unwrap();
         assert_eq!(opus.input_per_mtok, Some(15.0));
         assert_eq!(opus.output_per_mtok, Some(75.0));
+    }
+
+    #[test]
+    fn ambiguous_fuzzy_match_is_deterministic_and_prefers_the_most_specific_id() {
+        let generic = ModelMeta {
+            context: Some(8_192),
+            input_per_mtok: Some(1.0),
+            output_per_mtok: Some(2.0),
+        };
+        let specific = ModelMeta {
+            context: Some(131_072),
+            input_per_mtok: Some(3.0),
+            output_per_mtok: Some(4.0),
+        };
+        let entries = BTreeMap::from([
+            ("qwen3".to_string(), generic),
+            ("qwen3-32b".to_string(), specific),
+        ]);
+
+        for _ in 0..32 {
+            let matched = lookup("vendor/qwen3-32b-instruct", &entries).unwrap();
+            assert_eq!(matched.context, specific.context);
+            assert_eq!(matched.input_per_mtok, specific.input_per_mtok);
+            assert_eq!(matched.output_per_mtok, specific.output_per_mtok);
+        }
     }
 }

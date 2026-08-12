@@ -1,13 +1,5 @@
-//! LLM-backed [`SkillJudge`]: MEDHA's own model reviews the guard's ambiguous
-//! (Caution) findings in a single **tool-less** call — the escalation tier of
-//! the two-tier skill review (regex first, judge for the gray zone). See
-//! [`tools::judge`] for the trait, prompt, and parsing.
-//!
-//! Tool-less and single-shot on purpose: the judge reads untrusted skill
-//! content, so with no tools there is nothing a prompt-injected package could
-//! make it *do* — it can only emit a verdict. A timeout or any error surfaces as
-//! `Err`, which the installer treats as fail-safe (keep the regex verdict, never
-//! block a legitimate skill on a model hiccup).
+//! Tool-less, single-shot review for ambiguous skill-guard findings. Errors and
+//! timeouts leave the regex verdict unchanged.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +9,6 @@ use futures::StreamExt;
 use kernel::{Block, CompiledContext, Message, Provider};
 use tools::judge::{self, JudgeOutcome, JudgeRequest, SkillJudge};
 
-/// A security review must never hang an install; give up after this and fall
-/// back to the regex verdict.
 const JUDGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Reviews flagged skills with the session's configured model.
@@ -75,8 +65,6 @@ impl context::ctxfiles::ContextJudge for LlmJudge {
     }
 }
 
-/// Drive one model call to completion, concatenating its text (ignoring
-/// reasoning/usage/tool blocks — the judge has no tools and returns only JSON).
 async fn collect_text(provider: &dyn Provider, ctx: &CompiledContext) -> Result<String, String> {
     let mut stream = provider.stream(ctx).await.map_err(|e| e.to_string())?;
     let mut out = String::new();

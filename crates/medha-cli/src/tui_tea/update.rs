@@ -1,5 +1,4 @@
-//! Update/input/async logic: the TEA update fn, key handling, and the
-//! StreamSink→TuiEvent bridge. Split out of the old monolithic tui_tea.rs.
+//! TEA state updates, input handling, and asynchronous UI events.
 #![allow(clippy::too_many_arguments)]
 use super::*;
 use sandbox::WorkspaceSandbox;
@@ -29,35 +28,27 @@ pub(super) fn update<P, L>(
         Msg::AgentEvent(ev) => handle_agent_event(model, ev, session, transcript),
         Msg::Tick => {
             model.anim_frame = model.anim_frame.wrapping_add(1);
-            // A background agent's report is durably recorded and no turn is in
-            // flight — so run one. The answer to a question the user already
-            // asked should not wait on them sending an unrelated message.
-            //
-            // The flag is cleared *before* the turn starts: `spawn_turn` sets
-            // `running`, and leaving it set would arm a second turn the instant
-            // this one settles, on a report that has already been delivered.
-            if model.agent_report_deferred && !model.running && model.picker.is_none() {
+            // Clear before spawning so one durable report triggers one turn.
+            if model.agent_report_deferred
+                && !model.running
+                && !model.force_aborting
+                && model.picker.is_none()
+            {
                 model.agent_report_deferred = false;
                 spawn_turn(model, kernel, session, transcript, budget, tx, None);
             }
             if let Some(f) = model.intro_frame {
                 model.intro_frame = if f >= 40 { None } else { Some(f + 1) };
             }
-            // Refresh the live owned-shell-task list a few times a second (cheap
-            // mutex read) so the status-line indicator tracks reality.
+            // Poll inexpensive live state a few times per second.
             if model.anim_frame % 16 == 0 {
                 model.bg_tasks = kernel.executor.background_tasks();
-                // Delegation is invisible otherwise: the child's work never
-                // enters the transcript, so without this the user cannot tell
-                // Medha handed part of the task to an agent.
                 let running = model
                     .agents
                     .as_ref()
                     .map(|control| control.active())
                     .unwrap_or_default();
-                // A child leaves the running set exactly when it settles, so the
-                // difference is the finish notification — no extra channel, and
-                // the user is not left watching a spinner for work that landed.
+                // A child leaving the running set is its finish notification.
                 let finished: Vec<(String, String)> = model
                     .agent_runs
                     .iter()
@@ -66,11 +57,7 @@ pub(super) fn update<P, L>(
                     .collect();
                 model.agent_runs = running;
                 for (agent, session) in finished {
-                    // A writer that produced a patch is not just "finished" —
-                    // there is something waiting on the user, and saying only
-                    // that a report is coming would bury it. The cached lookup
-                    // is deliberate: this runs on the UI thread, and the patch
-                    // was written by this process moments ago.
+                    // Use the cache here because this polling runs on the UI thread.
                     let patch = model
                         .agents
                         .as_ref()
@@ -297,15 +284,12 @@ fn os_open(target: &str) {
     }
 }
 
-/// Remove any leaked bracketed-paste guard sequences (PART 2). Terminals send these
-/// around a paste; if they leak into the payload they must be stripped exactly, not
-/// via per-character trimming (which would eat legitimate content).
+/// Removes exact bracketed-paste guards without trimming legitimate content.
 pub(super) fn strip_paste_markers(s: &str) -> String {
     s.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "")
 }
 
-/// Replace `[paste #N: M chars]` placeholder tokens with the full content stored in
-/// `pastes[N]` (PART 2). Non-token text is passed through untouched.
+/// Expands stored paste placeholders, preserving non-token text.
 pub(super) fn expand_paste_tokens(pastes: &[String], s: &str) -> String {
     const MARK: &str = "[paste #";
     if pastes.is_empty() || !s.contains(MARK) {
@@ -335,7 +319,7 @@ pub(super) fn expand_paste_tokens(pastes: &[String], s: &str) -> String {
     out
 }
 
-/// Handle paste event (PART 2: bracketed paste, atomic insert, large-paste collapse)
+/// Inserts a paste atomically, collapsing large content to a placeholder.
 pub(super) fn handle_paste(model: &mut Model, data: String) {
     let clean = strip_paste_markers(&data);
     let count = clean.chars().count();
@@ -351,9 +335,7 @@ pub(super) fn handle_paste(model: &mut Model, data: String) {
     model.ac_sel = 0;
 }
 
-/// Give a visible picker first refusal on Esc while an agent turn is running.
-/// Returning `true` tells the caller not to forward that same keypress to the
-/// turn-cancellation path.
+/// Lets a visible picker consume Esc before turn cancellation.
 fn dismiss_running_picker_on_esc(model: &mut Model, key: &KeyEvent) -> bool {
     // Approval cards suppress picker rendering. A hidden picker must not steal
     // Esc from the visible approval/running-turn cancellation path.
@@ -386,9 +368,7 @@ fn handle_global_key(model: &mut Model, key: &KeyEvent) -> bool {
     false
 }
 
-/// Capture one `/model add` form field. This has its own input path so an API
-/// key never reaches command history, completion, a transcript entry, or the
-/// session event log.
+/// Captures model-setup input without exposing API keys to history or logs.
 fn handle_model_setup_key<P: ProfileProvider>(
     model: &mut Model,
     key: KeyEvent,
@@ -435,10 +415,7 @@ pub(super) fn begin_model_setup(model: &mut Model) {
     model.push_notice("Add a model — choose a provider. Esc cancels.");
 }
 
-/// Capture one `/search` form field. Like `handle_model_setup_key`, this owns
-/// the keyboard while a draft is alive so an API key never reaches command
-/// history, completion, the transcript, or the session log. Returns false while
-/// the provider picker is up, letting the generic picker handler drive it.
+/// Captures search setup without exposing keys; the provider picker returns false.
 fn handle_search_setup_key(model: &mut Model, key: KeyEvent) -> bool {
     if model.search_setup.is_none() {
         return false;
@@ -557,9 +534,7 @@ fn advance_search_setup(model: &mut Model) {
     }
 }
 
-/// Persist the chosen provider, save config, and update the live search handle
-/// the running `web.*` tools read — so the change applies on the next search
-/// without a restart.
+/// Persists search settings and updates the live tool handle.
 fn commit_search(model: &mut Model, provider: tools::SearchProvider, searxng_url: Option<String>) {
     model.search_setup = None;
     let saved = match model.model_config.lock() {
@@ -697,8 +672,7 @@ fn advance_model_setup<P: ProfileProvider>(
             }
             setup.api_key = value;
             setup.step = ModelSetupStep::Discovering;
-            // Ask the endpoint what it serves — picking from a live list beats
-            // typing a model id blind (and typos in ids are the #1 setup bug).
+            // Prefer server-reported model IDs while retaining manual fallback.
             let base_url = setup.base_url.clone();
             let api_key = setup.api_key.clone();
             let protocol = setup.protocol;
@@ -748,9 +722,7 @@ fn advance_model_setup<P: ProfileProvider>(
     }
 }
 
-/// Discovery result for an in-flight add-model draft: a non-empty list opens
-/// the model picker; anything else falls back to manual id entry, honestly
-/// labelled with the reason.
+/// Opens discovered models or falls back to manual ID entry with a reason.
 pub(super) fn on_models_discovered(
     model: &mut Model,
     base_url: String,
@@ -781,9 +753,7 @@ pub(super) fn on_models_discovered(
     }
 }
 
-/// Complete an add-model draft: derive the profile name from the model id
-/// (never asked; users pasted model ids into the old name field), persist the
-/// key + config, and switch to the new connection.
+/// Persists an add-model draft and switches to the resulting profile.
 fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
     let Some(completed) = model.model_setup.take() else {
         return;
@@ -848,7 +818,7 @@ fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
     }
 }
 
-/// Handle keyboard input
+/// Handles keyboard input.
 pub(super) fn handle_key<P, L>(
     model: &mut Model,
     key: KeyEvent,
@@ -871,46 +841,46 @@ pub(super) fn handle_key<P, L>(
         return;
     }
 
-    // A visible picker owns the first Esc, even while a turn is running. This
-    // lets `/reasoning` behave like a normal dismissible panel; a second Esc,
-    // now that no picker is open, interrupts the turn. Without this ordering the
-    // global running-turn handler swallowed Esc and left the panel stuck open.
+    // A second Esc must win over UI that raced with graceful cancellation.
+    if key.code == KeyCode::Esc && model.running && model.cancelling {
+        force_abort_foreground_turn(model, tx);
+        return;
+    }
+
+    // A visible picker owns the first Esc; a later Esc can stop the turn.
     if dismiss_running_picker_on_esc(model, &key) {
         return;
     }
 
-    // A `clarify` question form owns all input while it's up. It appears mid-turn
-    // (the tool awaits an answer), so intercept BEFORE the Esc→cancel path: here
-    // Esc dismisses the form (agent proceeds on best judgment), it never kills
-    // the turn.
+    // Clarify owns Esc while its tool is awaiting an answer.
     if model.clarify.is_some() {
         handle_clarify_key(model, key);
         return;
     }
 
-    // With no picker open, Esc is reserved for stopping a running turn, not for
-    // answering an approval. Intercept it before the approval branch so it
-    // interrupts instead of silently denying whichever prompt is on screen.
-    // The cancel is GRACEFUL: the kernel lets in-flight tools settle (bounded)
-    // and returns Done with StopReason::Interrupted.
+    // With no modal owner, Esc gracefully cancels the turn rather than a prompt.
     if key.code == KeyCode::Esc && model.running {
         if let Some(h) = &model.interrupt {
             h.cancel_turn();
-            if !model.cancelling {
-                model.cancelling = true;
-                model.push_notice("⏹ stopping — letting in-flight tools settle…");
-            }
+            model.cancelling = true;
+            model.push_notice("⏹ stopping — letting in-flight tools settle…");
         }
-        // Answering the pending approvals unblocks any gate the kernel is
-        // waiting on, so the cancel settles immediately (K8, by design).
-        model.deny_pending_approvals();
+        // Denying owned prompts unblocks gates during cancellation.
+        model.deny_foreground_prompts();
         // A picker may have been suppressed while the approval card was shown;
         // do not let it unexpectedly reappear after cancellation.
         model.picker = None;
         return;
     }
 
-    // Inline approval handling (PART 3) — input captured when last item is approval
+    // Keep the editor usable while the aborted task's Drop cleanup joins, but
+    // do not dispatch a command or consume a prompt until ownership is clear.
+    if key.code == KeyCode::Enter && model.force_aborting {
+        model.push_notice("(force stop is still quiescing owned work…)");
+        return;
+    }
+
+    // A visible approval owns ordinary input.
     if model.pending_approval().is_some() {
         handle_approval_key(model, key);
         return;
@@ -981,8 +951,6 @@ pub(super) fn handle_key<P, L>(
                 }
                 return;
             }
-            // `d` stops the selected sub-agent. Only a running one — a finished
-            // writer's patch is not something you can cancel.
             KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Agents(_)) => {
                 let session = match &picker.kind {
                     PickerKind::Agents(rows) => match rows.get(picker.selected) {
@@ -999,9 +967,7 @@ pub(super) fn handle_key<P, L>(
                 }
                 return;
             }
-            // `a` applies the selected patch; `A` applies one whose build
-            // failed. Two keys rather than a prompt, so the override is a
-            // deliberate act and never a reflex Enter on a confirmation.
+            // Uppercase `A` deliberately overrides only verification failure.
             KeyCode::Char(key @ ('a' | 'A')) if matches!(&picker.kind, PickerKind::Agents(_)) => {
                 let dispatch = match &picker.kind {
                     PickerKind::Agents(rows) => match rows.get(picker.selected) {
@@ -1012,17 +978,13 @@ pub(super) fn handle_key<P, L>(
                 };
                 match dispatch {
                     Some(dispatch) => agents_apply_patch(model, &dispatch, key == 'A', tx),
-                    // Say what this row *can* do rather than only what it
-                    // cannot — a running agent has a transcript to watch, which
-                    // is usually what someone reaching for a key here wants.
                     None => model.push_notice(
                         "nothing to apply on this row — press Enter to watch what it is doing",
                     ),
                 }
                 return;
             }
-            // Enter on a patch row shows the diff, so applying is never a blind
-            // choice between two words on a row.
+            // Viewing the diff stays distinct from applying it.
             KeyCode::Enter | KeyCode::Right if matches!(&picker.kind, PickerKind::Agents(_)) => {
                 let dispatch = match &picker.kind {
                     PickerKind::Agents(rows) => match rows.get(picker.selected) {
@@ -1033,10 +995,6 @@ pub(super) fn handle_key<P, L>(
                 };
                 match dispatch {
                     Some(dispatch) => agents_view_patch(model, &dispatch, tx),
-                    // No diff on this row — but a running or finished child has
-                    // a live transcript, and "what is it actually doing" is the
-                    // question the panel gets asked most. Stop-or-nothing was
-                    // the wrong answer to it.
                     None => {
                         let watching = match &picker.kind {
                             PickerKind::Agents(rows) => match rows.get(picker.selected) {
@@ -1053,7 +1011,6 @@ pub(super) fn handle_key<P, L>(
                 }
                 return;
             }
-            // `d` removes the selected server in the /mcp picker (row 0 is Add).
             KeyCode::Char('d') if matches!(&picker.kind, PickerKind::Mcp(_)) => {
                 let id = if let PickerKind::Mcp(rows) = &picker.kind {
                     (picker.selected > 0)
@@ -1071,8 +1028,7 @@ pub(super) fn handle_key<P, L>(
             // a nested menu: right descends, left backs out one level.
             KeyCode::Enter | KeyCode::Right => {
                 if matches!(picker.kind, PickerKind::ModelProtocol) {
-                    // Resolved through MODEL_PROTOCOLS rather than by index, so
-                    // reordering the list cannot select the wrong protocol.
+                    // Resolve through the same table that produced the rows.
                     let Some(&(label, available, protocol)) = MODEL_PROTOCOLS.get(picker.selected)
                     else {
                         return;
@@ -1122,7 +1078,6 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // `/mode`: a level was chosen — set it live and close.
                 if matches!(picker.kind, PickerKind::AutonomyMode) {
                     let selected = picker.selected;
                     model.picker = None;
@@ -1131,7 +1086,6 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // `/theme`: a theme was chosen — apply it live and close.
                 if matches!(picker.kind, PickerKind::Theme) {
                     let selected = picker.selected;
                     model.picker = None;
@@ -1164,9 +1118,7 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // Discovery step 2: a live model was chosen (or manual entry).
-                // With a server-reported context window the profile completes
-                // right here — name derived, saved, switched.
+                // Server-reported context can complete setup without another field.
                 if let PickerKind::ModelDiscovery(models) = &picker.kind {
                     let choice = models.get(picker.selected).cloned();
                     model.picker = None;
@@ -1191,7 +1143,6 @@ pub(super) fn handle_key<P, L>(
                                 );
                             }
                         }
-                        // Trailing "Type a model id manually…" row.
                         None => {
                             if let Some(setup) = model.model_setup.as_mut() {
                                 setup.step = ModelSetupStep::ModelId;
@@ -1200,8 +1151,6 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // Session picker: fetch the selected session's events and replay
-                // them into the transcript.
                 if let PickerKind::Session(sessions) = &picker.kind {
                     if let Some(meta) = sessions.get(picker.selected) {
                         let id = meta.id;
@@ -1217,17 +1166,12 @@ pub(super) fn handle_key<P, L>(
                         return;
                     }
                 }
-                // Rewind step 1: a cut point was chosen → open the scope menu
-                // (conversation only · + code · cancel). No async work yet.
                 if let PickerKind::Rewind(points) = &picker.kind {
                     if let Some(point) = points.get(picker.selected).cloned() {
                         model.picker = Some(Picker::new(PickerKind::RewindMode(point)));
                         return;
                     }
                 }
-                // Rewind step 2: a scope was chosen → branch the session and,
-                // for the "+ code" scope, roll the workspace back. `None` = cancel
-                // (return to no picker; the user can re-open with /rewind).
                 if let PickerKind::RewindMode(point) = &picker.kind {
                     let scope = point
                         .scope_options()
@@ -1254,7 +1198,6 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // Tool browser: the last row goes back, every other row toggles.
                 if let PickerKind::McpTools { id, tools } = &picker.kind {
                     let (id, sel) = (id.clone(), picker.selected);
                     match tools.get(sel).cloned() {
@@ -1263,14 +1206,12 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // Credential choice for a server the probe could not classify.
                 if let PickerKind::McpAuth { id, url } = &picker.kind {
                     let (id, url, sel) = (id.clone(), url.clone(), picker.selected);
                     model.picker = None;
                     mcp_choose_auth(model, &id, &url, sel, tx);
                     return;
                 }
-                // `/mcp` picker: row 0 adds a server; any other row connects it.
                 if let PickerKind::Mcp(rows) = &picker.kind {
                     let sel = picker.selected;
                     if sel == 0 {
@@ -1290,9 +1231,7 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // Skill hub: the top rows are actions, the rest are installed
-                // skills. An action runs (or prefills a command needing input); a
-                // skill row force-loads its procedure (same as `/skill <name>`).
+                // Action rows precede installed skills; keep indexing in one place.
                 if let PickerKind::Skill(skills) = &picker.kind {
                     let sel = picker.selected;
                     let n_actions = SKILL_HUB_ACTIONS.len();
@@ -1302,12 +1241,7 @@ pub(super) fn handle_key<P, L>(
                         .map(|(n, _)| n.clone());
                     model.picker = None;
                     match action {
-                        // "Add a skill" immediately opens the scrollable catalog
-                        // (browse all from your sources) — arrow-keys → Enter to
-                        // install. To filter or install a link directly, type
-                        // `/skill add <word|link>`.
                         Some("add") => search_skills(model, "", tx),
-                        // Power operations live one layer deep, not on the main path.
                         Some("manage") => {
                             model.picker = Some(Picker::new(PickerKind::SkillManage));
                         }
@@ -1319,7 +1253,6 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // Manage sub-menu: run the chosen power operation, or go back.
                 if matches!(&picker.kind, PickerKind::SkillManage) {
                     let id = SKILL_MANAGE_ACTIONS.get(picker.selected).map(|(_, id)| *id);
                     model.picker = None;
@@ -1332,7 +1265,6 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                // Sources sub-picker: Add / Remove <source> / Back.
                 if let PickerKind::SkillSources(sources) = &picker.kind {
                     let sel = picker.selected;
                     let n = sources.len();
@@ -1577,7 +1509,7 @@ pub(super) fn handle_key<P, L>(
                 h.cancel_turn();
             }
         }
-        // Shift/Alt+Enter or Ctrl+J for newline (PART 2)
+        // Modified Enter and Ctrl-J insert a newline.
         KeyCode::Enter
             if key
                 .modifiers
@@ -1619,7 +1551,7 @@ pub(super) fn handle_key<P, L>(
             model.history.push(raw.clone());
             model.history_idx = None;
             model.welcome = false;
-            // Expand any collapsed pastes before the agent sees the line (PART 2).
+            // Expand compact paste placeholders only at submission.
             let line = model.resolve_pastes(&raw);
 
             if model.running {
@@ -1679,7 +1611,7 @@ pub(super) fn handle_key<P, L>(
     }
 }
 
-/// Handle approval keyboard input (inline, PART 3)
+/// Handles inline approval input.
 pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
     // Reject selection input until the card's options are actually on screen —
     // stops a blind Enter (queued behind stream backlog) from confirming an
@@ -1687,21 +1619,32 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
     if !model.approval_ready {
         return;
     }
+    // Card option count varies: three for a standard prompt, four for a network
+    // grant (once / session / persistent / deny). Selection maths key off it.
+    let count = model
+        .pending_approvals
+        .front()
+        .map(|p| p.responder.len())
+        .unwrap_or(3);
+    let last = count - 1;
     let sel: Option<usize> = match key.code {
         KeyCode::Char('1') | KeyCode::Char('y') | KeyCode::Char('Y') => Some(0),
-        KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => Some(1),
+        KeyCode::Char('2') => Some(1),
+        KeyCode::Char('3') => Some(2.min(last)),
+        KeyCode::Char('4') if count >= 4 => Some(3),
+        KeyCode::Char('a') | KeyCode::Char('A') => Some(1),
         // Esc is intentionally NOT a deny: it is intercepted at the top of the
         // key handler to cancel a running turn. Denial requires an explicit 'n'
-        // or '3' — no accidental rejections from a reflexive Esc.
-        KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') => Some(2),
+        // or the last digit — no accidental rejections from a reflexive Esc.
+        KeyCode::Char('n') | KeyCode::Char('N') => Some(last),
         KeyCode::Enter => Some(model.approval_sel),
         KeyCode::Up => {
-            model.approval_sel = model.approval_sel.checked_sub(1).unwrap_or(2);
+            model.approval_sel = model.approval_sel.checked_sub(1).unwrap_or(last);
             model.dirty = true;
             return;
         }
         KeyCode::Down => {
-            model.approval_sel = (model.approval_sel + 1) % 3;
+            model.approval_sel = (model.approval_sel + 1) % count;
             model.dirty = true;
             return;
         }
@@ -1713,33 +1656,22 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
             // will render on the next frame and re-arm `approval_ready` then.
             model.approval_ready = false;
             model.approval_sel = 0;
-            let decision = match choice {
-                0 => kernel::Approval::Once,
-                1 => kernel::Approval::Always,
-                _ => kernel::Approval::Deny,
-            };
-            // "Always" for a tool means don't re-ask this session; for a path the
-            // permission layer persists it to medha.lock (PART 1). A trust-flow
-            // escalated action is NEVER remembered — each web-tainted action is
-            // reviewed afresh (K9), so treat its "always" as a one-time approve.
-            if choice == 1 && !pending.escalated {
+            // "Always allow" on a standard prompt remembers the action. Network
+            // grants persist through the shared grant handle, never here.
+            if choice == 1
+                && !pending.escalated
+                && matches!(pending.responder, super::ApprovalResponder::Standard(_))
+            {
                 model.auto_approve.insert(pending.action.clone());
             }
-            let _ = pending.responder.send(decision);
-            let verb = match choice {
-                0 => "approved",
-                1 => "approved (allowing all this session)",
-                _ => "rejected",
-            };
+            let verb = pending.responder.verb(choice);
             model.push_notice(format!("{verb} {}", pending.action));
+            pending.responder.answer(choice);
         }
     }
 }
 
-/// Keyboard input for the `clarify` question form. Owns all keys while a form is
-/// up. Rows per question = options, then "✎ Other…". Space toggles (multi) or
-/// selects (single); Enter on a radio option selects it before submitting, Enter
-/// on Other opens free text, and Esc dismisses the whole form (agent proceeds).
+/// Handles keys owned by the active structured-question form.
 pub(super) fn handle_clarify_key(model: &mut Model, key: KeyEvent) {
     // Snapshot the layout from a short immutable borrow (mutating helpers below
     // re-borrow `model`, so we can't hold the state borrow across them).
@@ -1853,10 +1785,7 @@ pub(super) fn handle_clarify_key(model: &mut Model, key: KeyEvent) {
     }
 }
 
-/// Toggle (multi) or set (single) an option in the current question's draft.
-/// For a radio (single-select) question, options and "Other" are mutually
-/// exclusive — picking an option clears any typed Other, so the answer is never
-/// self-contradictory.
+/// Updates an option, keeping single-select choices exclusive with free text.
 fn toggle_option(s: &mut ClarifyState, i: usize, multi: bool) {
     let d = &mut s.drafts[s.idx];
     if multi {
@@ -1960,7 +1889,7 @@ fn submit_clarify(model: &mut Model) {
     }
 
     if let Some(state) = model.clarify.take() {
-        // Human-readable summary, per question: "Header: pick, pick (“other”)".
+        model.clarify_cancel = None;
         let mut parts = Vec::new();
         for (q, d) in state.questions.iter().zip(state.drafts.iter()) {
             let label = if q.header.trim().is_empty() {
@@ -1995,6 +1924,7 @@ fn submit_clarify(model: &mut Model) {
 /// Dismiss the whole form; the tool receives `None` → the agent proceeds.
 pub(super) fn cancel_clarify(model: &mut Model) {
     if let Some(state) = model.clarify.take() {
+        model.clarify_cancel = None;
         let _ = state.responder.send(None);
         model.push_notice("clarify dismissed — proceeding on best judgment");
         model.dirty = true;
@@ -2008,10 +1938,48 @@ pub(super) fn handle_agent_event(
     session: &mut Session,
     transcript: &mut Vec<Message>,
 ) {
+    // Suppress an aborted owner's queued tail until its join marker arrives.
+    // Prompt responders still need explicit refusal to release their callers.
+    let ev = if model.force_aborting {
+        match ev {
+            TuiEvent::ForegroundAbortSettled => {
+                model.foreground_turn.take();
+                model.force_aborting = false;
+                model.push_notice("⏹ force-stopped — prompt ready");
+                return;
+            }
+            TuiEvent::ForegroundAbortSlow => {
+                model.push_notice(
+                    "⚠ force-stop cleanup is still running — the prompt stays locked to \
+                     prevent overlapping process or file mutation cleanup; Ctrl-D exits",
+                );
+                return;
+            }
+            TuiEvent::Approval(_, _, _, Some(_), responder) => {
+                let _ = responder.send(kernel::Approval::Deny);
+                return;
+            }
+            TuiEvent::Clarify(_, Some(_), responder) => {
+                let _ = responder.send(None);
+                return;
+            }
+            TuiEvent::Text(_)
+            | TuiEvent::Reasoning(_)
+            | TuiEvent::ToolStarted(_, _)
+            | TuiEvent::ToolCall(_, _)
+            | TuiEvent::ToolResult(_, _, _)
+            | TuiEvent::Compaction(_, _, _, _)
+            | TuiEvent::Compacting(_)
+            | TuiEvent::Usage(_, _)
+            | TuiEvent::Cost(_, _)
+            | TuiEvent::Verify(_, _) => return,
+            other => other,
+        }
+    } else {
+        ev
+    };
     match ev {
-        // Record only. Starting the turn needs the kernel, which this handler
-        // does not have; the tick drives it. Both run on the UI thread, so the
-        // flag cannot be read between being set and being acted on.
+        // The next UI tick owns starting the deferred turn.
         TuiEvent::AgentReportReady => model.agent_report_deferred = true,
         TuiEvent::ToolStarted(tool, target) => model.current_tool = Some((tool, target)),
         TuiEvent::Text(delta) => {
@@ -2045,26 +2013,25 @@ pub(super) fn handle_agent_event(
         }
         TuiEvent::Cost(usd, indicative) => model.cost_usd = Some((usd, indicative)),
         TuiEvent::Verify(ok, summary) => model.push_item(Item::Verify { ok, summary }),
-        TuiEvent::Approval(action, detail, escalated, responder) => {
-            // Auto-approve only a previously "always"-ed action, and NEVER a
-            // trust-flow-escalated one (a web-tainted action is always reviewed
-            // afresh — approving one shell command must not wave through a later
-            // web-derived one, K9).
+        TuiEvent::Approval(action, detail, escalated, cancel, responder) => {
+            // A request cancelled in transit must never become an actionable card.
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                let _ = responder.send(kernel::Approval::Deny);
+                return;
+            }
+            // Trust-escalated actions always receive fresh review.
             if !escalated && model.auto_approve.contains(&action) {
                 let _ = responder.send(kernel::Approval::Once);
             } else {
                 tracing::debug!(action = %action, escalated, "approval created");
-                // Queue, don't clobber: the kernel runs tool calls concurrently
-                // (buffered up to `max_parallel_tools`), so several `confirm()`
-                // requests can arrive in the same turn. Replacing a pending one
-                // would drop its `oneshot::Sender` and the kernel would read that
-                // as `Approval::Deny` (the spurious "rejected by human").
+                // Concurrent requests retain every one-shot responder.
                 let was_empty = model.pending_approvals.is_empty();
                 model.pending_approvals.push_back(PendingApproval {
                     action,
                     detail,
                     escalated,
-                    responder,
+                    cancel,
+                    responder: ApprovalResponder::Standard(responder),
                 });
                 if was_empty {
                     model.approval_sel = 0;
@@ -2074,7 +2041,31 @@ pub(super) fn handle_agent_event(
                 }
             }
         }
-        TuiEvent::Clarify(questions, responder) => {
+        TuiEvent::NetworkApproval(detail, escalated, cancel, responder) => {
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                let _ = responder.send(kernel::NetworkDecision::Deny);
+                return;
+            }
+            let was_empty = model.pending_approvals.is_empty();
+            model.pending_approvals.push_back(PendingApproval {
+                action: "network access".to_string(),
+                detail,
+                escalated,
+                cancel,
+                responder: ApprovalResponder::Network(responder),
+            });
+            if was_empty {
+                model.approval_sel = 0;
+                model.approval_ready = false;
+                model.dirty = true;
+                model.scroll_to_bottom();
+            }
+        }
+        TuiEvent::Clarify(questions, cancel, responder) => {
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                let _ = responder.send(None);
+                return;
+            }
             // One form at a time. If somehow another is up, decline the new one.
             if model.clarify.is_some() || questions.is_empty() {
                 let _ = responder.send(None);
@@ -2099,6 +2090,7 @@ pub(super) fn handle_agent_event(
                     .and_then(|d: &ClarifyDraft| d.selected.first())
                     .copied()
                     .unwrap_or(0);
+                model.clarify_cancel = cancel;
                 model.clarify = Some(ClarifyState {
                     questions,
                     idx: 0,
@@ -2122,7 +2114,7 @@ pub(super) fn handle_agent_event(
             model.turn_started = None;
             model.interrupt = None;
             model.cancelling = false;
-            model.deny_pending_approvals();
+            model.deny_foreground_prompts();
             match reason {
                 StopReason::Budget(stop) => {
                     model.push_notice(format!("(stopped: {} reached)", stop.label()));
@@ -2143,8 +2135,11 @@ pub(super) fn handle_agent_event(
             model.turn_started = None;
             model.interrupt = None;
             model.cancelling = false;
-            model.deny_pending_approvals();
+            model.deny_foreground_prompts();
         }
+        // Handled by the force-abort barrier above. A stale/duplicate marker is
+        // harmless and must not disturb a later foreground turn.
+        TuiEvent::ForegroundAbortSettled | TuiEvent::ForegroundAbortSlow => {}
         TuiEvent::LspStatus(result) => {
             let text = match result {
                 Err(error) => format!("LSP: disabled or unavailable\n  {error}"),
@@ -2276,6 +2271,10 @@ pub(super) fn handle_agent_event(
         // A queued steer reached its turn boundary: promote the "queued"
         // notice to a real user line (that's what the model now sees).
         TuiEvent::Steered(text) => {
+            // Done normally replaces this with the kernel's canonical history.
+            // Recording it eagerly is what preserves typed text if Error or a
+            // force-abort prevents that terminal reconciliation.
+            transcript.push(Message::user(text.clone()));
             model.remove_last_notice("↳ queued for this task:");
             model.push_item(Item::User(text));
         }
@@ -2465,8 +2464,7 @@ pub(super) fn handle_agent_event(
             scope,
             prefill,
         } => {
-            // "tracked" is honest (K18): only snapshot-carrying writes revert —
-            // files mutated via shell (`sed -i`, `git checkout`) are not rolled back.
+            // Shell mutations without snapshots cannot be rolled back.
             let files = |n: usize| {
                 if n == 1 {
                     "1 tracked file".to_string()
@@ -2510,12 +2508,7 @@ pub(super) fn handle_agent_event(
     }
 }
 
-/// Rebuild the visible transcript items from a projected message list.
-/// Used when resuming a past session: the replayed conversation replaces the
-/// on-screen items. User text → `Item::User`; assistant text → `Item::Assistant`,
-/// each tool call → `Item::ToolCall`, and each tool result → `Item::ToolResult`
-/// — a resumed session shows what the agent did AND what came back, exactly
-/// like the live view (results were silently dropped here once).
+/// Rebuilds the visible transcript, including tool calls and their results.
 pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
     model.items.clear();
     // Tool results reference their call by id; remember each call's tool name
@@ -2560,12 +2553,8 @@ pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
     model.scroll_to_bottom();
 }
 
-/// Open the resume picker — but refuse while a turn is mid-flight: resuming then
-/// would let the finishing turn's `Done` event overwrite the freshly-loaded
-/// transcript. The user must finish or Esc the current turn first.
-/// What a slash command routes to. Pure — no kernel, no side effects — so the
-/// routing itself is unit-testable (a `/skill` regression once slipped through
-/// because only the *handler* was tested, not that the command reached it).
+/// Opens resume only while idle so a finishing turn cannot overwrite it.
+/// Pure slash-command routing target.
 #[derive(Debug, PartialEq, Eq)]
 enum SlashAction {
     Resume,
@@ -2720,9 +2709,7 @@ fn classify_slash(cmd: &str) -> SlashAction {
     }
 }
 
-/// Route a slash command to its handler. The ONE dispatch point — both Enter
-/// paths (autocomplete-accept and plain typed) call this, so they can never
-/// diverge (a bug we hit when the two were duplicated).
+/// Routes both typed and autocomplete-accepted slash commands.
 fn dispatch_slash<P, L>(
     model: &mut Model,
     cmd: &str,
@@ -2854,13 +2841,7 @@ fn open_mcp_picker(model: &mut Model) {
     model.picker = Some(Picker::new(PickerKind::Mcp(rows)));
 }
 
-/// Redact the credential flags exported by the shared CLI/TUI MCP parser. A
-/// single list prevents parser and history behavior from drifting apart.
-/// `line` with every credential value replaced.
-///
-/// Command history is recalled with ↑ and rendered in the scrollback, so a
-/// pasted token would otherwise stay on screen for the rest of the session.
-/// Both spellings are covered: `--bearer TOKEN` and `--bearer=TOKEN`.
+/// Redacts both separated and joined credential flags before storing history.
 fn redact_secrets(line: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut redact_next = false;
@@ -2938,17 +2919,7 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
     open_mcp_picker(model);
 }
 
-/// `/agents` — what Medha has delegated and is still waiting on. A child's work
-/// never enters the transcript, so without this the only sign one exists is a
-/// name in the status bar.
-/// Open the panel on what this process knows, then refresh from the durable
-/// record.
-///
-/// Two steps because the panel must appear on the keystroke: outstanding
-/// patches live in the event log so they outlive the process that made them,
-/// and reading the log is not something a key handler may block on. The
-/// cached view is correct for everything produced in this session, which is the
-/// common case; the refresh adds what survived a restart.
+/// Opens cached delegated work immediately, then refreshes durable patches.
 fn open_agents_picker(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let Some(control) = model.agents.clone() else {
         model.picker = Some(Picker::new(PickerKind::Agents(Vec::new())));
@@ -3018,12 +2989,7 @@ fn agent_rows(
     rows
 }
 
-/// Order agents so a child sits under its parent, with the branch each row
-/// needs to draw.
-///
-/// Sorting by path is the whole tree walk: `/survey` < `/survey/parse` <
-/// `/writer` orders depth-first, parents before their own children, with no
-/// recursion and no parent lookup.
+/// Sorts by path for depth-first parent-before-child display and branch drawing.
 fn branched(
     mut agents: Vec<orchestrator::Agent>,
     idle: &std::collections::HashMap<String, Option<u64>>,
@@ -3060,10 +3026,7 @@ fn branched(
         .collect()
 }
 
-/// Show a writer's patch in the transcript.
-///
-/// Applying without reading is the failure this panel exists to prevent, so
-/// viewing is one keystroke and never requires asking the model to fetch it.
+/// Shows a writer's patch before any explicit apply action.
 fn agents_view_patch(model: &mut Model, patch_id: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let Some(control) = model.agents.clone() else {
         return;
@@ -3110,11 +3073,7 @@ fn agents_view_patch(model: &mut Model, patch_id: &str, tx: &mpsc::UnboundedSend
     });
 }
 
-/// `/tree` — the whole agent tree, settled ones included.
-///
-/// The panel shows what is outstanding; this shows what *happened*. A finished
-/// agent's address is what `/followup` and `agent.apply` need, and until now
-/// there was nowhere to read one once it left the panel.
+/// Shows the complete agent tree, including settled addresses used by follow-up.
 fn show_agent_tree(model: &mut Model) {
     let Some(control) = model.agents.clone() else {
         model.push_notice("sub-agents are not enabled in this session");
@@ -3153,11 +3112,7 @@ fn show_agent_tree(model: &mut Model) {
     ));
 }
 
-/// `/followup <agent> <text>` — more work for an agent, finished or not.
-///
-/// A finished agent still holds everything it learned. Re-spawning to build on
-/// its work pays for all of that a second time, and a writer whose patch needs
-/// one more fix is the case where that is most expensive.
+/// Gives additional work to an existing agent context.
 fn agents_followup<P, L>(
     model: &mut Model,
     rest: &str,
@@ -3200,9 +3155,7 @@ fn agents_followup<P, L>(
     });
 }
 
-/// Turn ceiling for a hand-typed follow-up. The operator is asking for one more
-/// pass, not a fresh investigation, so this is deliberately below `[agents]
-/// max_turns` — a follow-up that ran as long as the original would be a re-run.
+/// Follow-ups get a lower turn ceiling than fresh investigations.
 const DEFAULT_FOLLOWUP_TURNS: u32 = 30;
 
 /// A follow-up gets its own turns but the tree's remaining spend.
@@ -3214,17 +3167,7 @@ fn followup_budget(control: &orchestrator::AgentControl) -> kernel::Budget {
     budget
 }
 
-/// `/steer <agent> <text>` — correct a running agent without killing it.
-///
-/// With one agent running the id may be omitted, because that is the case where
-/// having to look one up is pure friction. With several it is required: sending
-/// a correction to the wrong agent is worse than being asked which.
-/// Who `/steer <rest>` addresses and what it says, given the agents in reach as
-/// `(name, session)`.
-///
-/// Pure, because every interesting case here is a parse: the version that read
-/// the roster inline sent an agent its own name as a message and nothing could
-/// see it happen.
+/// Resolves a steer target; omission is allowed only when exactly one is running.
 fn steer_target(rest: &str, running: &[(String, String)]) -> Result<(String, String), String> {
     let missing = || "nothing to send — /steer <agent> <message>".to_string();
     let addressed = |word: &str| running.iter().any(|(name, id)| name == word || id == word);
@@ -3285,12 +3228,7 @@ fn agents_steer(model: &mut Model, rest: &str) {
     }
 }
 
-/// Show what a child has actually been doing.
-///
-/// A child's chain is appended as it works, so this answers for a *running*
-/// agent as well as a finished one. Without it the panel offers stop-or-nothing
-/// on a running child, and the only way to see inside is to ask the model to
-/// fetch it — which spends a turn to read something already on disk.
+/// Shows a running or settled child's recorded transcript.
 fn agents_view_transcript(model: &mut Model, session: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let Some(control) = model.agents.clone() else {
         return;
@@ -3328,12 +3266,8 @@ fn agents_view_transcript(model: &mut Model, session: &str, tx: &mpsc::Unbounded
     });
 }
 
-/// Apply a writer's patch by hand. The user pressing `a` *is* the human gate —
-/// this is not the model deciding to change the user's files.
-///
-/// `force` comes from `A` (shift), and only bypasses the verification refusal.
-/// A conflict is never forceable from here: §6.4 sends conflicting patches to
-/// reconciliation, and no keystroke should be able to override that.
+/// Applies a patch after an explicit human keypress. Force bypasses only
+/// verification failure; conflicts remain non-overridable.
 fn agents_apply_patch(
     model: &mut Model,
     patch_id: &str,
@@ -3411,9 +3345,7 @@ fn agents_stop(model: &mut Model, session: &str, tx: &mpsc::UnboundedSender<TuiE
     open_agents_picker(model, tx);
 }
 
-/// Which language servers this machine can actually run, and what to do about
-/// the ones it cannot. Servers start lazily, so the running list alone never
-/// explains why an answer came back as a text match.
+/// Reports runnable and unavailable language servers, including remediation.
 fn lsp_inventory_line(payload: &serde_json::Value) -> String {
     let Some(available) = payload
         .get("available")
@@ -3573,9 +3505,7 @@ fn authorize_mcp_server(
     });
 }
 
-/// Switch a server on or off. Disabling drops it from the live host so its
-/// tools leave the model's context at once, but keeps its definition and
-/// credentials so enabling costs nothing but a reconnect.
+/// Toggles a server live while preserving its definition and credentials.
 fn mcp_set_disabled(
     model: &mut Model,
     id: &str,
@@ -3612,9 +3542,7 @@ fn mcp_set_disabled(
     open_mcp_picker(model);
 }
 
-/// Open one server's catalogue so individual tools can be switched off. A large
-/// server injects every schema into every request, so this is real context cost.
-/// Connects on demand — browsing tools should not require connecting first.
+/// Opens a server catalogue, connecting on demand, to control schema context cost.
 fn open_mcp_tools(model: &mut Model, id: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let Some(manager) = model.mcp.clone() else {
         return model.push_notice("MCP host unavailable");
@@ -3782,9 +3710,7 @@ fn open_memory<L: EventLog + 'static>(
     model.push_notice(format!("(opening memory '{name}' provenance …)"));
 }
 
-/// Memory picker actions (p = pin/unpin, f = forget). Returns true if the key
-/// was handled. Mutations go through the log first (an event) then the
-/// projection, exactly like the CLI — so trust/provenance and fork-safety hold.
+/// Handles memory mutations through the durable log before projection updates.
 fn handle_memory_picker_key<P, L>(
     model: &mut Model,
     key: &KeyEvent,
@@ -3939,10 +3865,7 @@ fn start_resume<L: EventLog + 'static>(
     spawn_sessions_fetch(kernel, tx);
 }
 
-/// Open the rewind (time-travel) picker for the CURRENT session. Like resume, it
-/// refuses mid-turn. Reads the session's events off the main loop and derives one
-/// cut point per past user turn — branching before turn *k* keeps turns 1..k-1 and
-/// rolls the workspace back to that moment. Sends `RewindPointsLoaded` back.
+/// Loads idle-session rewind boundaries without blocking the UI loop.
 fn start_rewind<L: EventLog + 'static>(
     model: &mut Model,
     kernel: &Arc<Kernel<impl Provider + 'static, L>>,
@@ -3954,6 +3877,7 @@ fn start_rewind<L: EventLog + 'static>(
         return;
     }
     let log = kernel.log.clone();
+    let restore_root = model.restore.root().to_path_buf();
     let session_id = session.id;
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -3982,7 +3906,7 @@ fn start_rewind<L: EventLog + 'static>(
                 };
                 // Files a code rollback from this prompt onward would revert —
                 // shown in the picker; hides the code options when zero.
-                let files = kernel::rollback_plan(&events, e.id).len();
+                let files = kernel::rollback_plan_in(&events, e.id, &restore_root).len();
                 RewindPoint {
                     at_event: e.id,
                     label,
@@ -3994,13 +3918,7 @@ fn start_rewind<L: EventLog + 'static>(
     });
 }
 
-/// Perform a rewind back to just before `at_event` (a past user prompt).
-/// Reads the session history once. When `scope` touches code, it rolls files
-/// back to before that turn's edits. When `scope` touches the conversation, it
-/// forks the session before the prompt (a new branch — the original is
-/// preserved), projects the conversation up to the cut, and lifts the prompt
-/// text out to prefill the input box. Code-only leaves the conversation as-is
-/// (no fork, `new_id = None`). Sends `Rewound` back with whatever it changed.
+/// Rewinds code and/or forks conversation state immediately before `at_event`.
 fn spawn_rewind<L: EventLog + 'static>(
     kernel: &Arc<Kernel<impl Provider + 'static, L>>,
     restore: Arc<WorkspaceSandbox>,
@@ -4033,7 +3951,7 @@ fn spawn_rewind<L: EventLog + 'static>(
         // returning the workspace to its state before the turn ran.
         let mut rolled = 0usize;
         if scope.touches_code() {
-            for fr in kernel::rollback_plan(&events, at_event) {
+            for fr in kernel::rollback_plan_in(&events, at_event, restore.root()) {
                 if restore
                     .restore(&fr.path, fr.snapshot.as_deref())
                     .await
@@ -4091,13 +4009,7 @@ fn spawn_sessions_fetch<L: EventLog + 'static>(
     });
 }
 
-/// Spawn agent turn as background task.
-///
-/// `line` is `None` for a turn nobody typed: a background agent finished, and
-/// its report is picked up at the head of this turn like any other. Without
-/// that path a finished agent's work sits in the outbox until the user happens
-/// to send something, so the answer to a question they already asked waits on
-/// an unrelated message.
+/// Spawns a turn; `None` starts collection of a completed background report.
 pub(super) fn spawn_turn<P, L>(
     model: &mut Model,
     kernel: &Arc<Kernel<P, L>>,
@@ -4141,6 +4053,7 @@ pub(super) fn spawn_turn<P, L>(
     // handle; run_session ALWAYS returns (settled history + StopReason), so
     // there is no select! race dropping the session future mid-tool anymore.
     let (handle, queue) = kernel::InterruptQueue::pair();
+    let approval_cancel = queue.token();
     // The control plane watches this so an `agent.wait` ends the moment you
     // type, rather than holding the turn against instructions you have already
     // superseded. A fresh handle per turn, so this replaces the last one.
@@ -4231,10 +4144,13 @@ pub(super) fn spawn_turn<P, L>(
             return;
         }
         let sink = TuiSink { tx: tx.clone() };
-        match kernel
-            .run_session(&session, messages, budget, &sink, Some(queue))
-            .await
-        {
+        let outcome = FOREGROUND_TURN_CANCEL
+            .scope(
+                approval_cancel,
+                kernel.run_session(&session, messages, budget, &sink, Some(queue)),
+            )
+            .await;
+        match outcome {
             Ok((updated, reason)) => {
                 // Acknowledged only now. `run_session` logs the reports as part
                 // of the turn, so this is the first point at which they survive
@@ -4254,7 +4170,50 @@ pub(super) fn spawn_turn<P, L>(
     }));
 }
 
-/// Monotonic sequence for tracing events across the agent→UI channel (PART 7).
+/// Aborts the foreground future but retains ownership until its cleanup joins.
+/// Tool drop guards may still be terminating process groups or releasing leases.
+fn force_abort_foreground_turn(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    model.interrupt = None;
+    model.running = false;
+    model.cancelling = false;
+    model.current_tool = None;
+    model.compacting = false;
+    model.turn_started = None;
+    model.picker = None;
+    model.deny_foreground_prompts();
+
+    let Some(task) = model.foreground_turn.take() else {
+        model.force_aborting = false;
+        model.push_notice("⏹ force-stopped — prompt ready");
+        return;
+    };
+
+    task.abort();
+    model.force_aborting = true;
+    model.push_notice("⏹ force-stopping — aborting owned work…");
+    model.foreground_turn = Some(spawn_foreground_abort_joiner(
+        task,
+        tx.clone(),
+        FORCE_ABORT_SLOW_NOTICE,
+    ));
+}
+
+/// Joins an aborted owner without detaching process or mutation cleanup.
+fn spawn_foreground_abort_joiner(
+    mut task: tokio::task::JoinHandle<()>,
+    tx: mpsc::UnboundedSender<TuiEvent>,
+    slow_after: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if tokio::time::timeout(slow_after, &mut task).await.is_err() {
+            let _ = tx.send(TuiEvent::ForegroundAbortSlow);
+            let _ = task.await;
+        }
+        let _ = tx.send(TuiEvent::ForegroundAbortSettled);
+    })
+}
+
+/// Monotonic sequence for tracing agent-to-UI events.
 static EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Sink for sending events from kernel to TUI
@@ -4321,10 +4280,7 @@ impl kernel::StreamSink for TuiSink {
     }
 }
 
-/// Run slash command
-/// True when a stripped command prefix ends at a word boundary — i.e. the rest
-/// is empty or starts with whitespace (an argument). Distinguishes `/think` and
-/// `/think high` from `/thinking`.
+/// Checks that a command prefix ends before whitespace or end-of-input.
 fn is_cmd_boundary(rest: &str) -> bool {
     rest.is_empty() || rest.starts_with(char::is_whitespace)
 }
@@ -4431,21 +4387,14 @@ fn handle_reasoning_picker_key<P: kernel::Provider>(
     true
 }
 
-/// Re-point the agent tree at the session the surface now holds. The handle is
-/// shared with the tool registry, so a child spawned after this addresses its
-/// report and its patch to the session that will actually collect them.
+/// Re-points shared agent control to the session now owned by the surface.
 fn adopt_session(model: &Model, session: ulid::Ulid) {
     if let Some(control) = &model.agents {
         control.adopt(session);
     }
 }
 
-/// `/clear`: reset the conversation for real. Clearing only the rendered items
-/// (as `run_slash` used to) left the full prior history in `transcript`, so the
-/// very next turn re-shipped everything to the model. Truncate the transcript to
-/// the system prompt AND start a fresh session id so new events don't append to
-/// the old thread. Refused mid-turn (the running turn would rewrite transcript
-/// on `Done`).
+/// Clears projected conversation and starts a fresh event-log session while idle.
 fn do_clear(model: &mut Model, session: &mut Session, transcript: &mut Vec<Message>) {
     if model.running {
         model.push_notice("finish or Esc the current turn before clearing");
@@ -4637,9 +4586,7 @@ fn set_default_model(model: &mut Model, name: &str) {
     }
 }
 
-/// A distinctive lead shared by every transient skill-hub hint so that clicking
-/// hub actions refreshes ONE line via `upsert_notice` instead of stacking
-/// identical notices (the notice-wall bug).
+/// Stable prefix used to replace transient skill-hub notices in place.
 const HUB_LEAD: &str = "◈ ";
 
 /// Standard, actionable "no sources yet" line — shared by search and the sources
@@ -4703,9 +4650,7 @@ fn remove_source(model: &mut Model, key: &str) {
     }
 }
 
-/// `/skill add <word-or-link>` — the one friendly way to get a skill. A URL or
-/// path installs it; anything else searches the catalog. Auto-detected, so a
-/// user never has to choose between "install" and "search".
+/// Installs URL/path inputs and searches catalog terms.
 fn add_skill(model: &mut Model, input: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let input = input.trim();
     if looks_like_source(input) {
@@ -4750,9 +4695,7 @@ fn install_skill(model: &mut Model, src: &str, tx: &mpsc::UnboundedSender<TuiEve
     model.push_notice("(installing skill …)");
 }
 
-/// `/skill sources` — list registered taps; `add`/`remove` to edit them. Config
-/// is loaded on demand (sources are session-independent). Backend + validation
-/// live in `tools::TapStore`/`Tap`; this only parses the subcommand and reports.
+/// Parses source-management commands; storage and validation remain in tools.
 fn skill_sources(model: &mut Model, args: &str) {
     let path = match config::user_taps_path() {
         Ok(p) => p,
@@ -4825,9 +4768,7 @@ fn skill_sources(model: &mut Model, args: &str) {
     }
 }
 
-/// `/skill search <query>` — search the sources (shipped defaults + the user's)
-/// and open a results picker. Metadata only; an empty query browses everything.
-/// Async (network).
+/// Searches configured and built-in sources; an empty query browses all metadata.
 fn search_skills(model: &mut Model, query: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let taps = browse_taps();
     if taps.is_empty() {
@@ -4848,10 +4789,7 @@ fn search_skills(model: &mut Model, query: &str, tx: &mpsc::UnboundedSender<TuiE
     hub_notice(model, format!("({label})"));
 }
 
-/// `/skill update [<name> | --all]` — check registered sources for newer
-/// revisions of installed user skills. No argument only reports; a name or
-/// `--all` applies available updates (guard-gated, atomic). Locally edited
-/// skills are always protected. Async (network).
+/// Checks or atomically updates installed user skills while protecting local edits.
 fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let Some(store) = model.skills.clone() else {
         return model.push_notice("skills unavailable in this session");
@@ -4927,9 +4865,7 @@ fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEve
     });
 }
 
-/// Put a command stub in the input box (cursor at end) and hint what to type
-/// next — used by hub actions that need a free-text argument (a search query,
-/// an install source) so the user completes one line instead of guessing syntax.
+/// Prefills a command that still needs a free-text argument.
 fn prefill_command(model: &mut Model, cmd: &str, hint: &str) {
     model.input = cmd.to_string();
     model.cursor = model.input.len();
@@ -5158,11 +5094,7 @@ fn human_bytes(bytes: usize) -> String {
     }
 }
 
-/// Force-load a skill's full procedure into the conversation, deterministically
-/// (no reliance on the model choosing to call `skill.load`). A model-independent
-/// `/skill-name` trigger: the procedure lands in the transcript, so the next
-/// turn the model *has* it. Empty name → open the picker instead. Reached from
-/// `/skill <name>` and the skill picker.
+/// Injects a named skill procedure deterministically; an empty name opens the picker.
 fn load_skill_by_name(model: &mut Model, name: &str, transcript: &mut Vec<Message>) {
     if name.is_empty() {
         open_skill_picker(model);
@@ -5504,9 +5436,7 @@ mod fix_tests {
             "the command stays recallable, only the value goes"
         );
         assert_eq!(redact_secrets("/mcp list"), "/mcp list");
-        // A flag with nothing after it must not redact into the next command.
         assert_eq!(redact_secrets("/mcp add gh --key"), "/mcp add gh --key");
-        // The joined spelling is the same secret.
         assert_eq!(
             redact_secrets("/mcp add gh --bearer=sk-live-abc"),
             "/mcp add gh --bearer=<redacted>"
@@ -5541,20 +5471,13 @@ mod fix_tests {
         ))
     }
 
-    // ── slash ROUTING (the bug that shipped: `/skill` reached only one of the
-    //    two Enter paths and fell through to "unknown command"). Both paths now
-    //    route through classify_slash; this pins that routing. ──────────────────
     #[test]
     fn classify_slash_routes_steer_with_its_whole_message() {
-        // The message is free text and must survive intact — splitting it or
-        // trimming inside it would silently alter what the agent is told.
         assert_eq!(
             classify_slash("steer only the parser, skip the lexer"),
             SlashAction::Steer("only the parser, skip the lexer".into())
         );
         assert_eq!(classify_slash("steer"), SlashAction::Steer(String::new()));
-        // `/steering` is not `/steer` — a prefix match without a boundary would
-        // hijack any future command starting with these letters.
         assert_ne!(
             classify_slash("steering"),
             SlashAction::Steer(String::new())
@@ -5568,7 +5491,6 @@ mod fix_tests {
             classify_slash("skill frontend-ui-design"),
             SlashAction::LoadSkill("frontend-ui-design".into())
         );
-        // `/skills` (list) must NOT be mistaken for `/skill` (load).
         assert_eq!(classify_slash("skills"), SlashAction::Other);
         assert_eq!(classify_slash("model"), SlashAction::ModelPicker);
         assert_eq!(classify_slash("model add"), SlashAction::AddModel);
@@ -5577,12 +5499,10 @@ mod fix_tests {
             classify_slash("memory quoted-fact"),
             SlashAction::Memory("quoted-fact".into())
         );
-        // `/model <name>` switches directly, matching other agent CLIs.
         assert_eq!(
             classify_slash("model fast-local"),
             SlashAction::SwitchModel("fast-local".into())
         );
-        // `/skill install <src>` routes to the installer, not skill loading.
         assert_eq!(
             classify_slash("skill install https://example.com/SKILL.md"),
             SlashAction::InstallSkill("https://example.com/SKILL.md".into())
@@ -5603,8 +5523,6 @@ mod fix_tests {
             classify_slash("skill load frontend-ui-design"),
             SlashAction::LoadSkill("frontend-ui-design".into())
         );
-        // Subcommand prefixes require a word boundary; valid skill names that
-        // merely begin with one must still route as names.
         assert_eq!(
             classify_slash("skill installer"),
             SlashAction::LoadSkill("installer".into())
@@ -5639,7 +5557,6 @@ mod fix_tests {
             classify_slash("skill add"),
             SlashAction::AddSkill(String::new())
         );
-        // a name that merely starts with "add" still loads as a skill name
         assert_eq!(
             classify_slash("skill adder"),
             SlashAction::LoadSkill("adder".into())
@@ -5685,7 +5602,6 @@ mod fix_tests {
 
     #[test]
     fn add_auto_detects_link_or_path_vs_search_term() {
-        // links / paths → install
         assert!(looks_like_source(
             "https://github.com/anthropics/skills/tree/main/skills/pdf"
         ));
@@ -5693,15 +5609,12 @@ mod fix_tests {
         assert!(looks_like_source("/tmp/my-skill"));
         assert!(looks_like_source("~/skills/foo"));
         assert!(looks_like_source("./local"));
-        // plain words → search
         assert!(!looks_like_source("pdf"));
         assert!(!looks_like_source("excel spreadsheet"));
     }
 
     #[test]
     fn skill_hub_lists_actions_then_installed_skills() {
-        // The Enter dispatch indexes skills as `selected - SKILL_HUB_ACTIONS.len()`,
-        // so the layout must be exactly: every action (in order), then the skills.
         let kind = PickerKind::Skill(vec![("deploy".into(), "[user] ship it".into())]);
         let labels = kind.labels();
         assert_eq!(labels.len(), SKILL_HUB_ACTIONS.len() + 1);
@@ -5709,7 +5622,6 @@ mod fix_tests {
             assert_eq!(&labels[i], label, "action row {i} out of order");
         }
         assert_eq!(labels[SKILL_HUB_ACTIONS.len()], "deploy — [user] ship it");
-        // …but a name that merely starts with "sources" still loads as a name.
         assert_eq!(
             classify_slash("skill sources-of-truth"),
             SlashAction::LoadSkill("sources-of-truth".into())
@@ -5726,7 +5638,6 @@ mod fix_tests {
         );
     }
 
-    // ── /search opens the provider picker with the current choice preselected ──
     #[test]
     fn begin_search_setup_opens_provider_picker() {
         let mut m = model();
@@ -5739,16 +5650,12 @@ mod fix_tests {
             ),
             "the provider picker must be open"
         );
-        // Unconfigured → DuckDuckGo row (index 0) preselected.
         assert_eq!(m.picker.as_ref().unwrap().selected, 0);
-        // Esc-equivalent cleanup leaves no dangling draft.
         m.search_setup = None;
     }
 
-    // ── a keyed provider advances to the masked Secret step, not a direct commit ─
     #[test]
     fn keyed_provider_needs_a_secret_step() {
-        // Tavily/Brave mask input; SearXNG (a URL) does not; DuckDuckGo is not secret.
         let mut s = SearchSetup::new();
         s.provider = tools::SearchProvider::Tavily;
         s.step = SearchSetupStep::Secret;
@@ -5757,7 +5664,6 @@ mod fix_tests {
         assert!(!s.is_secret(), "a SearXNG URL must stay visible");
     }
 
-    // ── /skill <name> force-loads the procedure into the transcript ───────────
     #[test]
     fn load_skill_injects_procedure_into_transcript() {
         let dir = std::env::temp_dir().join(format!("medha-loadskill-{}", ulid::Ulid::new()));
@@ -5780,7 +5686,6 @@ mod fix_tests {
         );
         assert!(injected.contains("Loaded skill: greet"));
 
-        // Unknown skill → no injection, a clear notice instead.
         let n = transcript.len();
         load_skill_by_name(&mut m, "nope", &mut transcript);
         assert_eq!(
@@ -5789,17 +5694,13 @@ mod fix_tests {
             "unknown skill must not inject anything"
         );
 
-        // Empty name → opens the picker (no injection), listing the one skill.
         load_skill_by_name(&mut m, "", &mut transcript);
         assert!(matches!(&m.picker, Some(p) if matches!(p.kind, PickerKind::Skill(_))));
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── K6: `/think` must not capture `/thinking` ─────────────────────────────
     #[test]
     fn cmd_boundary_distinguishes_think_from_thinking() {
-        // `strip_prefix("think")` on "thinking" leaves "ing" (no boundary) → not
-        // the think command; on "think"/"think high" it leaves ""/" high".
         assert!(is_cmd_boundary("")); // /think
         assert!(is_cmd_boundary(" high")); // /think high
         assert!(!is_cmd_boundary("ing")); // /thinking → must fall through
@@ -5885,6 +5786,374 @@ mod fix_tests {
             &tx,
         );
         assert!(queue.cancel_requested());
+        assert!(m.running, "the first turn-directed Esc stays graceful");
+        assert!(m.cancelling);
+    }
+
+    #[tokio::test]
+    async fn second_esc_aborts_and_joins_the_owned_turn_before_reusing_the_prompt() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropNotice(Arc<AtomicBool>);
+        impl Drop for DropNotice {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let kernel = input_kernel();
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (interrupt, queue) = kernel::InterruptQueue::pair();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+
+        m.running = true;
+        m.interrupt = Some(interrupt);
+        m.current_tool = Some(("shell.exec".into(), Some("sleep 600".into())));
+        m.compacting = true;
+        m.turn_started = Some(Instant::now());
+        m.foreground_turn = Some(tokio::spawn(async move {
+            let _notice = DropNotice(task_dropped);
+            std::future::pending::<()>().await;
+        }));
+        tokio::task::yield_now().await;
+
+        // Background prompts have no foreground owner and survive its teardown.
+        let (background_tx, mut background_rx) = oneshot::channel();
+        m.pending_approvals.push_back(PendingApproval {
+            action: "agent 'reviewer' · shell.exec".into(),
+            detail: None,
+            escalated: false,
+            cancel: None,
+            responder: crate::tui_tea::ApprovalResponder::Standard(background_tx),
+        });
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &event_tx,
+        );
+        assert!(queue.cancel_requested());
+        assert!(m.running);
+        assert!(m.cancelling);
+        assert!(!dropped.load(Ordering::Acquire));
+        assert_eq!(m.pending_approvals.len(), 1);
+        assert!(matches!(
+            background_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        // UI racing after graceful cancellation cannot consume the hard-stop Esc.
+        run_slash(&mut m, "reasoning", &transcript, kernel.provider.as_ref());
+        assert!(m.picker.is_some());
+        let (approval_tx, mut approval_rx) = oneshot::channel();
+        m.pending_approvals.push_back(PendingApproval {
+            action: "shell.exec".into(),
+            detail: None,
+            escalated: false,
+            cancel: Some(queue.token()),
+            responder: crate::tui_tea::ApprovalResponder::Standard(approval_tx),
+        });
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &event_tx,
+        );
+        assert!(!m.running);
+        assert!(!m.cancelling);
+        assert!(m.current_tool.is_none());
+        assert!(!m.compacting);
+        assert!(m.turn_started.is_none());
+        assert!(m.interrupt.is_none());
+        assert_eq!(m.pending_approvals.len(), 1);
+        assert_eq!(approval_rx.try_recv(), Ok(kernel::Approval::Deny));
+        assert!(m.force_aborting, "join barrier remains until Drop ran");
+
+        // Abort settlement preserves applied or returned steer text.
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Steered("applied steer".into()),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(
+            transcript.last().map(|message| message.content.as_str()),
+            Some("applied steer")
+        );
+        m.input = "draft".into();
+        m.cursor = m.input.len();
+        handle_agent_event(
+            &mut m,
+            TuiEvent::SteersReturned(vec!["unsent steer".into()]),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(m.input, "draft\nunsent steer");
+
+        // A canonical outcome queued before the abort marker remains authoritative.
+        let settled_transcript = vec![
+            Message::system("S"),
+            Message::user("applied steer"),
+            Message::new(kernel::Role::Assistant, "settled answer"),
+        ];
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Done(settled_transcript.clone(), StopReason::Interrupted),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(transcript.len(), settled_transcript.len());
+        assert_eq!(
+            transcript
+                .iter()
+                .map(|message| (message.role.clone(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            settled_transcript
+                .iter()
+                .map(|message| (message.role.clone(), message.content.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            m.pending_approval()
+                .map(|approval| approval.action.as_str()),
+            Some("agent 'reviewer' · shell.exec")
+        );
+        assert!(matches!(
+            background_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        // Background prompts arriving during abort remain independently owned.
+        let (late_background_tx, mut late_background_rx) = oneshot::channel();
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Approval(
+                "agent 'tester' · fs.read".into(),
+                None,
+                false,
+                None,
+                late_background_tx,
+            ),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(m.pending_approvals.len(), 2);
+        assert!(matches!(
+            late_background_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        m.input = "next prompt".into();
+        m.cursor = m.input.len();
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &event_tx,
+        );
+        assert_eq!(m.input, "next prompt", "quiescing never eats user input");
+
+        // Background questions follow the same owner-aware teardown rule.
+        let (background_question_tx, mut background_question_rx) = oneshot::channel();
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Clarify(
+                vec![kernel::Question {
+                    prompt: "Keep reviewing?".into(),
+                    header: "Review".into(),
+                    options: vec![
+                        kernel::QOption {
+                            label: "Yes".into(),
+                            description: String::new(),
+                            recommended: true,
+                        },
+                        kernel::QOption {
+                            label: "No".into(),
+                            description: String::new(),
+                            recommended: false,
+                        },
+                    ],
+                    multi_select: false,
+                }],
+                None,
+                background_question_tx,
+            ),
+            &mut session,
+            &mut transcript,
+        );
+        m.deny_foreground_prompts();
+        assert!(m.clarify.is_some());
+        assert!(matches!(
+            background_question_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        let settled = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("aborted owner should join promptly")
+            .expect("settlement marker should be delivered");
+        assert!(matches!(settled, TuiEvent::ForegroundAbortSettled));
+        assert!(dropped.load(Ordering::Acquire));
+        handle_agent_event(&mut m, settled, &mut session, &mut transcript);
+        assert!(!m.force_aborting);
+        assert!(m.foreground_turn.is_none());
+        assert!(m.clarify.is_some());
+        assert!(matches!(
+            background_question_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_force_abort_warns_but_keeps_ownership_until_drop_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SlowDrop(Arc<AtomicBool>);
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                // Model cleanup that still owns process or mutation resources.
+                std::thread::sleep(Duration::from_millis(150));
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let (started_tx, started_rx) = oneshot::channel();
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let task_cleanup_finished = Arc::clone(&cleanup_finished);
+        let task = tokio::spawn(async move {
+            let _drop = SlowDrop(task_cleanup_finished);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("owned task should start");
+        task.abort();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        m.force_aborting = true;
+        m.foreground_turn = Some(spawn_foreground_abort_joiner(
+            task,
+            tx,
+            Duration::from_millis(10),
+        ));
+
+        let slow = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("slow cleanup warning should be bounded")
+            .expect("warning channel should remain open");
+        assert!(matches!(slow, TuiEvent::ForegroundAbortSlow));
+        handle_agent_event(&mut m, slow, &mut session, &mut transcript);
+        assert!(m.force_aborting, "a warning must not release ownership");
+        assert!(m.foreground_turn.is_some());
+        assert!(m.items.iter().any(
+            |entry| matches!(&entry.item, Item::Notice(text) if text.contains("cleanup is still running"))
+        ));
+
+        let settled = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("cleanup should eventually settle")
+            .expect("settlement channel should remain open");
+        assert!(matches!(settled, TuiEvent::ForegroundAbortSettled));
+        assert!(cleanup_finished.load(Ordering::Acquire));
+        handle_agent_event(&mut m, settled, &mut session, &mut transcript);
+        assert!(!m.force_aborting);
+        assert!(m.foreground_turn.is_none());
+    }
+
+    #[test]
+    fn stale_cancelled_approval_event_is_denied_before_it_can_reach_a_later_turn() {
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let old_cancel = CancellationToken::new();
+        old_cancel.cancel();
+        let (old_tx, mut old_rx) = oneshot::channel();
+
+        // Cancellation wins over remembered approval for an in-transit request.
+        m.auto_approve.insert("shell.exec: cargo test".into());
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Approval(
+                "shell.exec: cargo test".into(),
+                None,
+                false,
+                Some(old_cancel),
+                old_tx,
+            ),
+            &mut session,
+            &mut transcript,
+        );
+        assert!(m.pending_approvals.is_empty());
+        assert_eq!(old_rx.try_recv(), Ok(kernel::Approval::Deny));
+
+        let (fresh_tx, _fresh_rx) = oneshot::channel();
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Approval(
+                "fs.write: fresh.txt".into(),
+                None,
+                false,
+                Some(CancellationToken::new()),
+                fresh_tx,
+            ),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(
+            m.pending_approval()
+                .map(|approval| approval.action.as_str()),
+            Some("fs.write: fresh.txt")
+        );
+
+        // Questions use the same ownership tag.
+        let cancelled_question = CancellationToken::new();
+        cancelled_question.cancel();
+        let (question_tx, mut question_rx) = oneshot::channel();
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Clarify(
+                vec![kernel::Question {
+                    prompt: "Stale?".into(),
+                    header: "Race".into(),
+                    options: vec![
+                        kernel::QOption {
+                            label: "Yes".into(),
+                            description: String::new(),
+                            recommended: false,
+                        },
+                        kernel::QOption {
+                            label: "No".into(),
+                            description: String::new(),
+                            recommended: true,
+                        },
+                    ],
+                    multi_select: false,
+                }],
+                Some(cancelled_question),
+                question_tx,
+            ),
+            &mut session,
+            &mut transcript,
+        );
+        assert!(m.clarify.is_none());
+        assert!(matches!(question_rx.try_recv(), Ok(None)));
     }
 
     #[test]
@@ -5933,7 +6202,8 @@ mod fix_tests {
             action: "test".into(),
             detail: None,
             escalated: false,
-            responder: approval_tx,
+            cancel: Some(queue.token()),
+            responder: crate::tui_tea::ApprovalResponder::Standard(approval_tx),
         });
 
         handle_key(
@@ -5987,7 +6257,6 @@ mod fix_tests {
         assert_eq!(m.reasoning_trace_label(), "received");
     }
 
-    // ── K5: `/clear` truncates the transcript and starts a fresh session ──────
     #[test]
     fn clear_truncates_transcript_and_starts_fresh_session() {
         let mut m = model();
@@ -6030,7 +6299,6 @@ mod fix_tests {
         assert_eq!(session.id, id);
     }
 
-    // ── K8: ending a turn denies queued approvals so the card can't freeze input ──
     #[tokio::test]
     async fn deny_pending_approvals_answers_and_clears_the_queue() {
         let mut m = model();
@@ -6039,7 +6307,8 @@ mod fix_tests {
             action: "shell.exec".into(),
             detail: None,
             escalated: false,
-            responder: tx,
+            cancel: None,
+            responder: crate::tui_tea::ApprovalResponder::Standard(tx),
         });
         m.deny_pending_approvals();
         assert!(m.pending_approvals.is_empty(), "queue drained");
@@ -6049,7 +6318,50 @@ mod fix_tests {
         );
     }
 
-    // ── clarify form ─────────────────────────────────────────────────────────
+    #[test]
+    fn network_card_maps_the_four_options_to_a_network_decision() {
+        for (key, expected) in [
+            (KeyCode::Char('1'), kernel::NetworkDecision::Once),
+            (KeyCode::Char('2'), kernel::NetworkDecision::Session),
+            (KeyCode::Char('3'), kernel::NetworkDecision::Persistent),
+            (KeyCode::Char('4'), kernel::NetworkDecision::Deny),
+            (KeyCode::Char('n'), kernel::NetworkDecision::Deny),
+        ] {
+            let mut m = model();
+            let (tx, mut rx) = oneshot::channel();
+            m.pending_approvals.push_back(PendingApproval {
+                action: "network access".into(),
+                detail: None,
+                escalated: false,
+                cancel: None,
+                responder: crate::tui_tea::ApprovalResponder::Network(tx),
+            });
+            m.approval_ready = true;
+            handle_approval_key(&mut m, KeyEvent::new(key, KeyModifiers::NONE));
+            assert_eq!(rx.try_recv(), Ok(expected), "key {key:?}");
+            assert!(m.pending_approvals.is_empty());
+        }
+    }
+
+    #[test]
+    fn network_card_arrow_wrap_covers_all_four_options() {
+        let mut m = model();
+        let (tx, _rx) = oneshot::channel();
+        m.pending_approvals.push_back(PendingApproval {
+            action: "network access".into(),
+            detail: None,
+            escalated: false,
+            cancel: None,
+            responder: crate::tui_tea::ApprovalResponder::Network(tx),
+        });
+        m.approval_ready = true;
+        // Up from the first option wraps to the fourth (deny), not the third.
+        handle_approval_key(&mut m, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(m.approval_sel, 3);
+        handle_approval_key(&mut m, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(m.approval_sel, 0);
+    }
+
     fn clarify_state(
         multi: bool,
         recommended: Option<usize>,
@@ -6112,7 +6424,6 @@ mod fix_tests {
         let mut m = model();
         let (tx, mut rx) = oneshot::channel();
         m.clarify = Some(clarify_state(true, None, tx));
-        // cursor on option 0 → space selects it; move down, space selects option 1.
         handle_clarify_key(&mut m, kc(KeyCode::Char(' ')));
         handle_clarify_key(&mut m, kc(KeyCode::Down));
         handle_clarify_key(&mut m, kc(KeyCode::Char(' ')));
@@ -6189,7 +6500,7 @@ mod fix_tests {
         assert_eq!(state.other_cursor, "é🙂".len(), "cursor is a byte offset");
         assert!(state.other_input.is_char_boundary(state.other_cursor));
 
-        // Moving across both multi-byte characters must preserve the invariant.
+        // Cursor movement remains on UTF-8 boundaries.
         handle_clarify_key(&mut m, kc(KeyCode::Left));
         handle_clarify_key(&mut m, kc(KeyCode::Left));
         handle_clarify_key(&mut m, kc(KeyCode::Right));
@@ -6205,7 +6516,7 @@ mod fix_tests {
         assert_eq!(token_at(line, 4).as_deref(), Some("src/lib.rs"));
         assert_eq!(token_at(line, 20).as_deref(), Some("https://x.dev/a"));
         assert_eq!(token_at(line, 3), None); // the space between tokens
-        // A wide glyph earlier in the line must not shift later hit tests.
+        // Hit testing counts cells occupied by earlier wide glyphs.
         assert_eq!(token_at("→ src/lib.rs", 2).as_deref(), Some("src/lib.rs"));
     }
 
@@ -6225,7 +6536,6 @@ mod fix_tests {
         assert_eq!(strip_locator("src/lib.rs:42"), "src/lib.rs");
         assert_eq!(strip_locator("src/lib.rs:42:7"), "src/lib.rs");
         assert_eq!(strip_locator("src/lib.rs"), "src/lib.rs");
-        // Not a locator: a Windows drive letter must survive intact.
         assert_eq!(strip_locator("C:\\src\\lib.rs"), "C:\\src\\lib.rs");
     }
 
@@ -6235,7 +6545,6 @@ mod fix_tests {
             target_at("visit https://medha.dev/docs now", 6),
             Some(OpenTarget::Url(url)) if url == "https://medha.dev/docs"
         ));
-        // A word that is not a path resolves to nothing, so no app is launched.
         assert!(target_at("just some prose here", 5).is_none());
         assert!(target_at("see does/not/exist.rs", 4).is_none());
     }
@@ -6272,8 +6581,7 @@ mod agent_tree_tests {
 
     #[test]
     fn a_child_is_drawn_under_the_agent_that_started_it() {
-        // Spawn order says nothing about ownership; the path does. Listing by
-        // start time would scatter a parent's children among strangers'.
+        // Paths, rather than spawn time, define ownership order.
         assert_eq!(
             drawn(&["/writer", "/survey/parse", "/survey", "/survey/lex"]),
             ["survey", "├ lex", "└ parse", "writer"]
@@ -6291,9 +6599,7 @@ mod agent_tree_tests {
 
     #[test]
     fn a_grandchild_is_not_mistaken_for_a_sibling() {
-        // `ast` sits below `parse` at a greater depth. Counting rows rather
-        // than comparing depths would read it as another child of `survey` and
-        // leave `parse` drawn as though something followed it.
+        // Branch drawing compares depth so descendants remain attached.
         assert_eq!(
             drawn(&[
                 "/survey",
@@ -6307,8 +6613,6 @@ mod agent_tree_tests {
 
     #[test]
     fn a_flat_tree_is_drawn_flat() {
-        // The common case at the default depth of 1: no indentation to read
-        // past when there is no nesting to show.
         assert_eq!(drawn(&["/one", "/two"]), ["one", "two"]);
     }
 }
@@ -6330,8 +6634,6 @@ mod steer_target_tests {
 
     #[test]
     fn a_bare_agent_name_is_a_half_typed_command_not_a_message() {
-        // Sent verbatim it costs the agent a turn to read its own name, and the
-        // sender is told the message landed.
         assert!(steer_target("tokio-audit", &one()).is_err());
         assert!(steer_target("01SESSION", &one()).is_err());
         assert!(steer_target("tokio-audit   ", &one()).is_err());
@@ -6353,8 +6655,6 @@ mod steer_target_tests {
 
     #[test]
     fn an_unnamed_message_with_several_running_asks_which() {
-        // Picking one would send it to whichever sorted first, which is a coin
-        // toss the sender cannot see.
         let refused = steer_target("skip the tests", &two()).unwrap_err();
         assert!(refused.contains("say which"), "{refused}");
         assert!(refused.contains("tokio-audit"), "names the candidates");

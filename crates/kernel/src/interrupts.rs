@@ -1,5 +1,5 @@
-//! Kernel-owned interrupts (§4.1, Vol 3 §7): graceful mid-tool cancellation
-//! and a steer queue. The contract with surfaces:
+//! Kernel-owned graceful cancellation and steering.
+//! The contract with surfaces:
 //!
 //! - **Steer**: text queued mid-turn is injected as a user message at the next
 //!   turn boundary; the session continues. Logged as a normal `user.message`,

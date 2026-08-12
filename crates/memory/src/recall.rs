@@ -1,11 +1,9 @@
-//! Frozen K3 recall index (D2/D10).
+//! Frozen recall index.
 
 use crate::{ConfidenceRung, MemoryEntry, MemoryError, MemoryProjection, Scope};
 use context::{BpeCounter, TokenCounter};
 
-/// Generous by default so the whole working set stays *in the prompt* (recall
-/// is injection, not a model-initiated search) — overflow to `memory.search`
-/// should be the exception, not the norm. Still tiny against a modern window.
+/// Default token budget for the frozen memory index.
 pub const DEFAULT_K3_BUDGET_TOKENS: u32 = 3_000;
 pub const DEFAULT_STALE_AFTER_DAYS: u32 = 30;
 pub const MEMORY_MARKER: &str = "## Memory";
@@ -226,7 +224,7 @@ fn compile_with_counter(
     ))
 }
 
-/// Compile the deterministic K3 snapshot. `now` is injected so replay and
+/// Compile the deterministic recall snapshot. `now` is injected so replay and
 /// tests never depend on wall-clock time.
 pub fn compile_k3(
     store: &MemoryProjection,
@@ -251,7 +249,7 @@ pub fn compile_k3_configured(
     )
 }
 
-/// Replace the trailing K3 section while preserving the stable system-prefix.
+/// Replace the trailing recall section while preserving the stable system-prefix.
 pub fn replace_k3(system: &str, block: &str) -> String {
     let head = system
         .find(MEMORY_MARKER)

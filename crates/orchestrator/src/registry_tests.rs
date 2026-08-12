@@ -7,9 +7,7 @@ fn registry() -> Arc<AgentRegistry> {
 }
 
 thread_local! {
-    /// The loop side of every queue these tests create, held for the duration.
-    /// `steer` reports whether anything is listening, so dropping the receiver
-    /// would make it fail for a reason none of these tests is about.
+    /// Retains receivers because `steer` fails after the receiver drops.
     static QUEUES: std::cell::RefCell<Vec<kernel::InterruptQueue>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -54,8 +52,6 @@ fn a_claim_finds_a_free_name_beside_a_taken_one() {
 fn an_outstanding_claim_is_not_handed_out_twice() {
     let registry = registry();
     let (first, _held) = registry.claim(&AgentPath::root(), "survey").unwrap();
-    // Finding a free name and taking it happen under one lock; two spawns that
-    // raced on the same name would otherwise both be told it was free.
     let (second, _also_held) = registry.claim(&AgentPath::root(), "survey").unwrap();
     assert_ne!(first, second);
 }
@@ -65,7 +61,6 @@ fn an_abandoned_claim_frees_the_name() {
     let registry = registry();
     let (path, reservation) = registry.claim(&AgentPath::root(), "survey").unwrap();
     drop(reservation);
-    // A spawn that fails after claiming must not burn the name.
     let (again, _held) = registry.claim(&AgentPath::root(), "survey").unwrap();
     assert_eq!(again, path);
 }
@@ -74,8 +69,6 @@ fn an_abandoned_claim_frees_the_name() {
 fn a_claimed_name_never_shows_up_as_an_agent() {
     let registry = registry();
     let (_path, _held) = registry.claim(&AgentPath::root(), "survey").unwrap();
-    // A half-built entry in the listing is one every reader has to know to
-    // skip; keeping claims apart makes that unrepresentable.
     assert!(registry.all().is_empty());
     assert!(registry.find(&AgentPath::root(), "survey").is_none());
 }
@@ -97,8 +90,6 @@ fn a_settled_agent_no_longer_accepts_control() {
     let path = start(&registry, "survey", 1);
     assert!(registry.steer(&path, "narrow it"));
     registry.settled(&path, AgentStatus::Completed);
-    // Reporting success for a message nobody receives would let a caller
-    // believe it had corrected a run.
     assert!(!registry.steer(&path, "too late"));
     assert!(!registry.cancel(&path));
 }
@@ -211,9 +202,6 @@ fn settled_history_is_bounded() {
     assert!(registry.find(&AgentPath::root(), "agent-3").is_some());
 }
 
-/// Roster eviction must not orphan a durable transcript: a nested parent
-/// still resolves its own child's session id through the archive — by name
-/// and by the documented stable id — while a sibling can do neither.
 #[test]
 fn evicted_agents_stay_resolvable_by_their_parent_through_the_archive() {
     let registry = Arc::new(AgentRegistry {
@@ -260,9 +248,6 @@ fn evicted_agents_stay_resolvable_by_their_parent_through_the_archive() {
     );
 }
 
-/// A follow-up revives a settled agent before admission can fail. Without a
-/// rollback the agent it was asked to continue is simply gone — no roster
-/// entry, nothing to retry against, and no record that it ever ran.
 #[test]
 fn a_revive_that_is_never_committed_puts_the_agent_back() {
     let registry = registry();
@@ -271,7 +256,6 @@ fn a_revive_that_is_never_committed_puts_the_agent_back() {
     registry.settled(&path, AgentStatus::Completed);
     assert_eq!(registry.all().len(), 1);
 
-    // Admission fails after the revive — at capacity, no isolation, anything.
     drop(registry.revive(&path).unwrap());
 
     let found = registry.all();

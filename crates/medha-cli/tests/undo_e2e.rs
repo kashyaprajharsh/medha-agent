@@ -1,5 +1,4 @@
-//! `medha undo`: log events → rollback_plan → sandbox.restore, same pipeline
-//! `rewind_e2e.rs` proves, targeted at a write event instead of a prompt.
+//! End-to-end undo from logged writes through `rollback_plan` and restore.
 
 use kernel::{Event, EventLog, Observation, Session, TrustLabel};
 use sandbox::WorkspaceSandbox;
@@ -33,9 +32,6 @@ async fn undo_reverts_only_the_single_most_recent_write() {
     let last = log_write(&log, &sbx, &s, "a.txt", "v2").await;
     assert_eq!(sbx.read("a.txt").await.unwrap(), "v2");
 
-    // `medha undo` (no --event): target = the single most recent write-family
-    // observation across the log — found here by scanning newest-first, the
-    // same walk `recent_writes` does in main.rs.
     let events = log.events(s.id).await;
     let plan = kernel::rollback_plan(&events, last.id);
     assert_eq!(plan.len(), 1, "only a.txt's second write is undone");
@@ -67,8 +63,6 @@ async fn undo_by_event_id_reverts_everything_from_that_point_forward() {
     assert_eq!(sbx.read("lib.rs").await.unwrap(), "v2");
     assert_eq!(sbx.read("main.rs").await.unwrap(), "fn main() {}");
 
-    // `medha undo --event <target>`: undoes lib.rs's second write AND the
-    // later main.rs creation — everything at/after the given event.
     let events = log.events(s.id).await;
     let plan = kernel::rollback_plan(&events, target.id);
     assert_eq!(plan.len(), 2, "both post-target writes are in the plan");

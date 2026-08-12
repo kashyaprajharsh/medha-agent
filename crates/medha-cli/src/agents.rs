@@ -1,9 +1,5 @@
-//! The concrete [`ChildRunner`]: runs a sub-agent as a real Medha session.
-//!
-//! A child is `run_session` on a fresh session id with a narrowed executor and a
-//! child cancellation token. Because the event log is keyed by session, the
-//! child's transcript is durable, resumable and independently addressable with
-//! no extra persistence — the parent only ever sees the bounded result.
+//! Runs child agents as durable kernel sessions with narrowed executors and
+//! task-local cancellation.
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -16,9 +12,6 @@ use kernel::{
 };
 use orchestrator::{AgentStatus, ChildOutcome, ChildRun, ChildRunner};
 
-/// Framing for a delegated task. The child cannot see the parent's conversation,
-/// so the objective has to stand alone — this says so explicitly rather than
-/// letting the model assume shared context.
 fn child_prompt(run: &ChildRun) -> String {
     let mut prompt = format!(
         "You are a focused sub-agent. You have been delegated one task and you \
@@ -30,10 +23,6 @@ fn child_prompt(run: &ChildRun) -> String {
         prompt.push_str(&format!("\nYour answer must be: {contract}\n"));
     }
     match &run.workspace {
-        // A writer is told plainly that its tree is private. Without this the
-        // model hedges — it avoids edits it was asked to make, or narrates a
-        // patch instead of applying one, because it assumes it is touching the
-        // user's live files.
         Some(_) => prompt.push_str(
             "\nYou can modify code. You are working in a private checkout of the \
              repository that nobody else can see: your edits affect nothing \
@@ -61,11 +50,6 @@ fn child_prompt(run: &ChildRun) -> String {
              doing it is the harmful one.\n",
         ),
     }
-    // Read from the child's own tool set rather than assumed. A writer keeps
-    // `agent.spawn`; a read-only child loses it to narrowing. Stating either as
-    // a constant is how the prompt came to claim a limit the child did not have
-    // — and a model told it cannot do something will not try, however plainly
-    // the tool sits in its list.
     let holds = |name: &str| run.executor.specs().iter().any(|spec| spec.name == name);
     prompt.push_str(match holds("agent.spawn") {
         true => {
@@ -84,9 +68,6 @@ fn child_prompt(run: &ChildRun) -> String {
              answer you.\n",
         );
     }
-    // Stated literally, because a model asked to reason about its own limits
-    // will otherwise invent them — asking a question nobody will read, or
-    // planning a handoff it cannot make.
     prompt.push_str(
         "\nYou cannot ask a question and wait for an answer. Where the task is \
          ambiguous, choose the most reasonable reading, say which you chose, and \
@@ -120,13 +101,7 @@ fn child_prompt(run: &ChildRun) -> String {
     prompt
 }
 
-/// Everything needed to rebuild the workspace sandbox at another root.
-///
-/// A writer's sandbox has to be *the parent's sandbox with a different root* —
-/// same permission store, same audit log, same execution backend, same
-/// snapshotting. Rebuilding it from a template rather than mutating the
-/// parent's is what keeps the two independent: a child must not be able to
-/// widen the permissions its parent is operating under.
+/// Rebuilds sandbox-bound services at a child root without widening permissions.
 #[derive(Clone)]
 pub struct SandboxTemplate {
     pub trust: PathBuf,
@@ -135,44 +110,31 @@ pub struct SandboxTemplate {
     pub exec: Arc<dyn sandbox::ExecBackend>,
     pub snapshots: PathBuf,
     pub readable: Vec<PathBuf>,
-    /// The session-wide live approval set; a sub-agent's grants must reach the
-    /// same exec sandbox the parent shares.
+    /// Session-wide approval roots shared with the parent sandbox.
     pub approved: sandbox::ApprovedRoots,
+    /// Session-wide network grant shared with the parent sandbox, so a grant in
+    /// one writer worktree is honoured everywhere.
+    pub net_grant: sandbox::NetworkGrant,
 }
 
-/// Shared slot for the registry a child's tools are rebased from.
-///
-/// Deferred because the registry hosts `agent.spawn`, so it cannot exist before
-/// the control plane that owns this. Weak because it would otherwise close the
-/// loop back to that registry: nothing in the cycle is ever dropped, so the
-/// registry, every tool in it and each child's worktree lease would outlive the
-/// session that made them for the life of the process.
+/// Deferred weak handle that avoids the agent-control ownership cycle.
 pub type RegistryHandle = Arc<Mutex<Option<std::sync::Weak<tools::ToolRegistry>>>>;
 
-/// Writer isolation over git worktrees (§6.4).
-/// How much verifier output rides along with a patch into the parent's context.
 const VERIFY_MAX_OUTPUT: usize = 8_192;
 
 pub struct WorktreeWorkspaces {
     pool: orchestrator::WorktreePool,
     repo: PathBuf,
-    /// Ceiling on one verification run. The command executes whatever build
-    /// scripts and tests the writer just edited, so it has to terminate.
+    /// Bounds verification commands that may run edited build scripts.
     verify_timeout: std::time::Duration,
     registry: RegistryHandle,
     template: SandboxTemplate,
-    /// The project's verification command, run inside the child's checkout so
-    /// its patch arrives with evidence rather than a claim.
     verify: Option<String>,
 }
 
 impl WorktreeWorkspaces {
-    /// Build isolation for `repo`, with checkouts under `dir`.
-    ///
-    /// Returns `None` when the workspace is not a git repository: writers are
-    /// then refused outright, which is the only safe answer. Degrading to
-    /// "write in the parent's tree" would be exactly the collision this exists
-    /// to prevent, and it would be silent.
+    /// Returns `None` outside Git, causing writers to be refused rather than
+    /// run without isolation.
     pub async fn discover(
         repo: &Path,
         dir: PathBuf,
@@ -186,10 +148,7 @@ impl WorktreeWorkspaces {
             .await
             .ok()?
             .with_max_patch_bytes(max_patch_bytes);
-        // Clear anything a crashed run left behind before the first checkout —
-        // `git worktree add` refuses a path that already exists, so a leftover
-        // would fail the *next* agent for a reason that has nothing to do with
-        // it.
+        // Clear abandoned paths that would block the next `git worktree add`.
         pool.sweep().await;
         Some(Self {
             pool,
@@ -229,6 +188,8 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
         )
         .map_err(|error| error.to_string())?
         .with_exec_backend(Arc::clone(&self.template.exec))
+        .with_network_grant(self.template.net_grant.clone())
+        .map_err(|error| error.to_string())?
         .with_readable_roots(&self.template.readable)
         .with_snapshots_dir(self.template.snapshots.clone());
 
@@ -247,13 +208,9 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<orchestrator::Verification> {
         let command = self.verify.clone()?;
-        // The writer has just edited this tree, and a verifier runs whatever
-        // build scripts and tests it now contains. Bounded so a hang or a
-        // runaway suite cannot wedge the merge gate; the environment is the
-        // user's because a build needs their toolchain.
-        // Group-reaped, so a timeout takes the compiler jobs the command
-        // spawned rather than orphaning them onto the locks the next run needs.
-        // The output bound is the tail: that is where a build says what failed.
+        // Verification is bounded and group-reaped because edited build scripts
+        // may hang or leave compiler jobs holding locks. Retain the output tail,
+        // where build failures are normally reported.
         match sandbox::run_shell_bounded_with(
             self.template.exec.as_ref(),
             &command,
@@ -454,19 +411,11 @@ impl ProcessLease {
     }
 }
 
-/// Durable delivery folded from the dispatching session's own event chain.
-///
-/// Medha's log is append-only, hash-chained and already per-session, so the
-/// outbox needs no storage of its own: `agent.spawned` is the dispatch row,
-/// a terminal event carries the report, and `agent.delivered` closes it. State
-/// is whatever the fold says, which means it survives a restart for free and
-/// cannot disagree with the audit trail.
+/// Durable child delivery projected from the append-only session log.
 pub struct LogOutbox<L: EventLog> {
     log: Arc<L>,
     lease_directory: PathBuf,
-    /// Identifies this process and owns its OS lock for the lifetime of every
-    /// dispatch. A foreign id is not assumed dead: recovery must prove this
-    /// lease is no longer held.
+    /// Recovery requires proving this process lease is no longer held.
     lease: ProcessLease,
 }
 
@@ -514,16 +463,14 @@ fn field(event: &Event, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The handout an outbox row belongs to. Logs written before dispatch ids
-/// existed fall back to the child session, which is what they folded on.
+/// The handout an outbox row belongs to. Rows without dispatch ids use the
+/// child session for compatibility.
 fn handout(event: &Event) -> String {
     field(event, "dispatch")
         .or_else(|| field(event, "child"))
         .unwrap_or_default()
 }
 
-/// Events are addressed by session id; the rest of `Session` is not read when
-/// one is appended, so this is enough to write onto another session's chain.
 fn chain(id: ulid::Ulid) -> Session {
     Session {
         id,
@@ -534,8 +481,6 @@ fn chain(id: ulid::Ulid) -> Session {
 
 #[async_trait::async_trait]
 impl<L: EventLog + 'static> orchestrator::Transcripts for LogOutbox<L> {
-    /// The same projection `--resume` uses, so a forked child sees exactly the
-    /// conversation a human resuming that session would.
     async fn history(&self, session: ulid::Ulid) -> Vec<Message> {
         kernel::project_messages(&self.log.events(session).await)
     }
@@ -592,13 +537,7 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
     }
 
     async fn transcript(&self, child: ulid::Ulid) -> Vec<String> {
-        // The child's own chain, rendered as readable lines. A report is a
-        // summary by design; when one looks thin the work behind it has to be
-        // reachable, or the only recourse is guessing.
-        // The child's chain opens with its objective; every later user message
-        // is a steer. Labelling both "objective" made a correction read as a
-        // second task — misleading to anyone reading back, and actively wrong
-        // for the model, which uses this to work out what an agent was told.
+        // The first user message is the objective; later ones are steers.
         let mut objective_seen = false;
         self.log
             .events(child)
@@ -694,8 +633,6 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                 _ => {}
             }
         }
-        // The fold is what makes a re-apply impossible, rather than a flag
-        // someone has to remember to clear.
         recorded
             .into_iter()
             .filter(|pending| !applied.contains(&pending.dispatch))
@@ -703,10 +640,6 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
     }
 
     async fn last_activity(&self, child: ulid::Ulid) -> Option<f64> {
-        // The chain is ordered, so the newest event is the last one. Reading
-        // the whole chain to take its tail is more work than the answer needs;
-        // it is bounded by one child's own transcript and only runs when the
-        // panel is opened, which is what keeps that acceptable.
         self.log.events(child).await.last().map(|event| event.ts)
     }
 
@@ -841,9 +774,7 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                     if let Ok(mut result) =
                         serde_json::from_value::<orchestrator::AgentResult>(event.payload.clone())
                     {
-                        // Older rows carry no dispatch of their own; the fold
-                        // keyed on the child session then, so keep addressing
-                        // them that way or they can never be marked delivered.
+                        // Rows without dispatch ids remain keyed by child session.
                         result.dispatch = dispatch.clone();
                         ready.push((dispatch, result));
                     }
@@ -867,8 +798,6 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                 _ => {}
             }
         }
-        // Oldest first, and never one already handed over — the fold is what
-        // makes redelivery impossible rather than a flag someone has to remember.
         ready.sort_by(|(a, _), (b, _)| a.cmp(b));
         ready
             .into_iter()
@@ -878,17 +807,7 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
     }
 }
 
-/// Attributes an approval request to the child that raised it (§6.3).
-///
-/// A child shares its parent's gate, so without this a writer's `shell.exec`
-/// produces a card indistinguishable from the main session asking — for work
-/// the user never directly requested, possibly long after they stopped thinking
-/// about it. "Approve this command?" is a different question depending on who
-/// is asking, and the user cannot answer it well without knowing.
-///
-/// The name is prepended to `action`, which is also the auto-approve scope key.
-/// That is deliberate: "always allow" granted to one agent should not silently
-/// widen to the whole session.
+/// Prefixes approval scope with child identity to prevent cross-agent grants.
 struct AttributedGate {
     inner: Arc<dyn kernel::HumanGate>,
     agent: String,
@@ -913,9 +832,7 @@ impl kernel::HumanGate for AttributedGate {
 }
 
 pub struct KernelRunner<P: Provider, L: EventLog> {
-    /// Weak on purpose: the kernel owns the executor that hosts `agent.spawn`,
-    /// which owns the control plane that owns this runner. A strong handle would
-    /// close that cycle and leak the kernel for the process lifetime.
+    /// Weak to break the kernel/executor/control-plane ownership cycle.
     kernel: std::sync::Weak<Kernel<P, L>>,
 }
 
@@ -965,10 +882,6 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             autonomy: kernel::AutonomyLevel::Careful,
         };
         let budget = run.budget.clone();
-        // Inherited conversation first, objective last: the child reads what was
-        // already said and then what it is being asked to do about it. The other
-        // order makes the objective the thing it has forgotten by the time it
-        // finishes reading.
         let mut messages = run.history.clone();
         messages.push(Message::new(Role::User, child_prompt(&run)));
 
@@ -985,14 +898,9 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             ))
             .await;
 
-        // No race against the cancel token: the queue is rooted at it, so
-        // `run_session` observes the cancellation itself and returns a settled
-        // transcript. Selecting on the token here dropped the session future
-        // mid-tool — a half-written file and an unanswered tool call — and made
-        // the orchestrator's grace period unreachable.
-        // The child's steer queue goes to the loop that runs it, so text queued
-        // against this agent is injected at its next turn boundary; dropping it
-        // would make `agent.steer` accept text and lose it.
+        // The queue owns cancellation, allowing `run_session` to settle in-flight
+        // tools and the transcript. Pass the steer queue through so accepted text
+        // reaches the child's next turn boundary.
         let outcome = child
             .run_session(&session, messages, budget, &NullSink, Some(run.interrupts))
             .await;
@@ -1013,12 +921,6 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             }
         };
 
-        // The child's last assistant message is its report — but only when it
-        // chose to stop. A child cut off by its budget was mid-sentence, so its
-        // last message is a narration fragment ("Let me compile the table…"),
-        // and handing that to the parent as an answer is worse than useless: it
-        // reads as a report and sends the parent hunting for content that was
-        // never written.
         let last = transcript
             .iter()
             .rev()
@@ -1027,8 +929,6 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         let summary = match (&stop, last) {
             (StopReason::Finished, Some(text)) => text,
             (StopReason::Finished, None) => "the agent finished without reporting anything".into(),
-            // Say what happened first, then offer the fragment as evidence of
-            // where it got to rather than as the answer.
             (_, Some(text)) => format!(
                 "[incomplete — the agent was stopped before it reported. \
                  Treat the following as where it had got to, not as an answer. \
@@ -1166,19 +1066,14 @@ mod tests {
         }
     }
 
-    /// A second `LogOutbox` over the same log is a restart: new process
-    /// instance, same durable record.
     #[tokio::test]
     async fn a_child_abandoned_by_a_dead_process_is_reported_not_forgotten() {
         let (log, dir) = log_at("orphan");
         let parent = Ulid::new();
 
-        // The process that dispatched this one never came back.
         let died = outbox(&log, &dir);
         let abandoned = dispatch(parent, "surveyor");
         died.dispatched(&abandoned).await;
-        // Nothing resolves it while only the dispatch exists — this is exactly
-        // the state in which the parent would wait forever.
         assert!(died.undelivered(parent).await.is_empty());
         drop(died);
 
@@ -1188,9 +1083,6 @@ mod tests {
         let reported = restarted.undelivered(parent).await;
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].session, abandoned.child.to_string());
-        // "Unknown", not "failed": the child may have finished its work and
-        // died before recording it. Asserting failure would be a guess the
-        // parent then acts on as though it were a finding.
         assert!(
             reported[0].summary.contains("outcome unknown"),
             "must not claim to know the child failed: {}",
@@ -1208,14 +1100,9 @@ mod tests {
         drop(died);
 
         let live = outbox(&log, &dir);
-        // This one belongs to the *current* instance: it is still running and
-        // will write its own terminal event. Reaping it would report a running
-        // agent as dead.
         live.dispatched(&dispatch(parent, "still-running")).await;
 
         assert_eq!(live.reap_abandoned(parent).await, 1);
-        // The terminal event the first pass wrote is what closes the record, so
-        // a second pass must find nothing to do.
         assert_eq!(live.reap_abandoned(parent).await, 0);
 
         let reported = live.undelivered(parent).await;
@@ -1312,8 +1199,6 @@ mod tests {
             .finished(&finished, &report(&finished, "the real answer"))
             .await;
 
-        // Across a restart a completed child keeps its real report: reaping
-        // must never overwrite an outcome that was genuinely recorded.
         let restarted = outbox(&log, &dir);
         assert_eq!(restarted.reap_abandoned(parent).await, 0);
         let reported = restarted.undelivered(parent).await;
@@ -1336,14 +1221,9 @@ mod tests {
             .parse()
             .unwrap();
         restarted.delivered(parent, handout).await;
-        // A recovered report joins the same delivery fold, so it cannot be
-        // re-injected on the next turn.
         assert!(restarted.undelivered(parent).await.is_empty());
     }
 
-    /// A follow-up reuses the child's session. Folding delivery on that id let
-    /// the first report's delivery close every later one, so an agent given more
-    /// work reported into silence.
     #[tokio::test]
     async fn a_follow_up_on_the_same_session_still_reports() {
         let (log, dir) = log_at("followup-delivery");
@@ -1358,7 +1238,6 @@ mod tests {
         outbox.delivered(parent, first.id).await;
         assert!(outbox.undelivered(parent).await.is_empty());
 
-        // Same child session, new handout — what `agent.followup` produces.
         let again = Dispatch {
             id: Ulid::new(),
             child: first.child,
@@ -1421,9 +1300,6 @@ mod child_prompt_tests {
 
     #[test]
     fn a_child_is_told_it_can_delegate_only_when_it_actually_can() {
-        // Read from the child's own tool set, never assumed. A model told it
-        // cannot do something will not try, however plainly the tool sits in
-        // its list — so a stale constant here silently disables a capability.
         let reader = prompt_for(vec!["fs.read"], None);
         assert!(reader.contains("You cannot delegate"));
 
@@ -1446,8 +1322,6 @@ mod child_prompt_tests {
 
     #[test]
     fn every_child_is_told_it_cannot_ask_but_may_be_stopped_for_approval() {
-        // Two different things, and conflating them is what made a child treat
-        // an approval prompt as a dead end and work around it.
         let prompt = prompt_for(vec!["fs.read"], None);
         assert!(prompt.contains("cannot ask a question"));
         assert!(prompt.contains("approval"));

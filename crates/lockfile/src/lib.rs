@@ -1,25 +1,13 @@
-//! `medha.lock` — the harness artifact (§6). The entire cognitive
-//! configuration — routing, budget, context/compaction tuning, policy
-//! approvals, verifier command — as one declarative, diffable, portable TOML
-//! file, instead of scattered struct defaults and ad-hoc env vars.
-//!
-//! Absence of a file is not an error: every section defaults to exactly the
-//! behavior MEDHA already had before this artifact existed, so introducing
-//! `medha.lock` never changes behavior for anyone who doesn't create one.
-//! Env vars remain valid as *session-level overrides* on top of the loaded
-//! lock (precedence: env > medha.lock > built-in default) — they're for quick
-//! one-off tweaks; the lock file is the durable, versioned source of truth.
+//! Portable TOML configuration for routing, budgets, policy, and verification.
+//! Precedence is environment, `medha.lock`, then built-in defaults.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use thiserror::Error;
 
-/// Legacy permission type accepted while parsing old `medha.lock` files.
-///
-/// Portable permission entries are never a source of runtime authority. The
-/// CLI only retains this shape so it can detect and warn about obsolete,
-/// repository-provided grants.
+/// Legacy permission type accepted when parsing old `medha.lock` files. Never a
+/// source of runtime authority — retained only to warn about obsolete grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PermissionType {
     Read,
@@ -183,39 +171,23 @@ impl Default for LspConfig {
     }
 }
 
-/// Sub-agent limits. These bound blast radius and spend, so they are an
-/// operator decision that belongs in the committed lockfile — unlike which MCP
-/// servers a machine happens to have.
+/// Portable sub-agent concurrency, depth, and spend limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsConfig {
     pub enabled: bool,
-    /// Children alive at once, across the whole session tree.
     pub max_active: usize,
-    /// Delegation depth. 1 keeps it flat: a child cannot spawn a child, which
-    /// bounds how far a single request can fan out.
     pub max_depth: u32,
-    /// Whether children may modify code (§6.4). A writing child works in its
-    /// own git worktree and returns a patch that only lands once a human
-    /// approves it — the parent's tree is never touched by the child itself.
-    /// Off means writers are refused, not downgraded to editing in place.
+    /// Whether isolated children may produce patches for human-reviewed application.
     pub write: bool,
-    /// Turn ceiling for one child. A child's turns are its own session's, but
-    /// the tokens are the same wallet, so this is the real spend bound. Set it
-    /// generously: a child cut off before it reports has spent everything and
-    /// returned nothing, which is the expensive failure.
     pub max_turns: u32,
     /// Bounds on one `agent.wait`, in seconds. The floor exists because a
     /// zero-length wait is a poll, and a model that can poll will.
     pub min_wait_secs: u64,
     pub default_wait_secs: u64,
     pub max_wait_secs: u64,
-    /// Steps `agent.transcript` returns when the caller does not say how many.
-    /// Enough to see what an agent was doing when it stopped; short of what
-    /// spills to an artifact and costs turns to page back in.
+    /// Default transcript tail when no explicit limit is supplied.
     pub transcript_tail: usize,
-    /// Ceiling on one patch verification. The command runs whatever build
-    /// scripts and tests the writer just edited, so it has to terminate.
     pub verify_timeout_secs: u64,
     /// How long a cancelled child may take to settle itself before its future
     /// is dropped. Long enough for a tool call in flight to finish writing,
@@ -230,17 +202,9 @@ impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            //  default, on the reasoning that each child burns tokens
-            // independently.
             max_active: 3,
             max_depth: 1,
-            // On: the isolation is what makes it safe, and it is structural
-            // rather than advisory. Nothing a writing child does reaches the
-            // user's files without the merge passing the human gate.
             write: true,
-            // A real survey burned all 24 on exploration and was cut off before
-            // writing anything; the whole run was wasted. The child is told its
-            // budget and to wrap up early, but the ceiling has to leave room to.
             max_turns: 100,
             min_wait_secs: 1,
             default_wait_secs: 120,
@@ -265,13 +229,9 @@ pub struct McpConfig {
     /// Default network policy; a server may override it with `network` in the
     /// user config.
     pub allow_network: bool,
-    /// Supervisor sweep period: liveness probe and reconnect scheduling.
     pub health_interval_ms: u64,
-    /// Consecutive connect failures tolerated before a server is parked.
     pub max_reconnects: u32,
-    /// How long a parked server waits before one slow self-probe.
     pub park_probe_ms: u64,
-    /// How long the interactive OAuth flow waits for the browser redirect.
     pub auth_timeout_ms: u64,
     /// Total deadline on one HTTP request to a remote server, discovery and
     /// token exchange included. A host that accepts the connection and then
@@ -333,10 +293,7 @@ impl Default for ContextFilesConfig {
     }
 }
 
-/// Eval-gate policy (§4.11–4.12, Vol 5 §5). Thresholds live here so the pass/fail
-/// bar is part of the portable, diffable harness artifact — a harness A/B can
-/// change the gate policy and that change is itself reviewable. `medha gate`
-/// reads these; `#[serde(default)]` keeps existing locks parsing unchanged.
+/// Eval-gate thresholds read by `medha gate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GateConfig {
@@ -345,10 +302,7 @@ pub struct GateConfig {
     /// Minimum pass-rate in (0.0, 1.0] for a `promote` verdict. Goldens default to
     /// 1.0 — a golden that regresses at all is a regression.
     pub pass_threshold: f64,
-    /// Repeats per scenario. Agents are stochastic; >1 turns a single noisy
-    /// verdict into a pass-rate with a confidence interval (Vol 5 §5). Gate
-    /// caps this at 100 and requires `--yes` above 10. Kept at 1 by default so
-    /// local runs stay cheap; CI raises it.
+    /// Repeats per scenario, capped at 100; values above 10 require `--yes`.
     pub seeds: u32,
     /// Max tolerated per-scenario pass-rate drop vs a baseline before a
     /// regression is called (reserved for the global non-inferiority check).
@@ -366,11 +320,7 @@ impl Default for GateConfig {
     }
 }
 
-/// Operator-declared per-token pricing for the executor model (P1-12), USD per
-/// million tokens. Set this on self-hosted/custom routes where a vendor list
-/// price doesn't apply (or to your negotiated rate). When unset, the models.dev
-/// list price is used as an *indicative* figure (shown "est."); if that's
-/// unknown too, the cost meter stays off — never a silent $0.00.
+/// Operator-declared executor pricing in USD per million tokens.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PricingConfig {
@@ -378,10 +328,7 @@ pub struct PricingConfig {
     pub output_per_mtok: Option<f64>,
 }
 
-/// Execution sandbox for shell/build/VCS commands (§4.8). This makes the
-/// containment posture part of the portable harness artifact: "this repo runs
-/// shell in an OS-native jail with network denied" travels, diffs, and is
-/// ablatable — security-as-artifact.
+/// Execution sandbox for shell, build, and VCS commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SandboxLockConfig {
@@ -426,6 +373,35 @@ impl Default for SandboxLockConfig {
 }
 
 impl SandboxLockConfig {
+    fn validate(&self) -> Result<(), String> {
+        let backend = self.backend.trim().to_lowercase();
+        if !matches!(
+            backend.as_str(),
+            "native"
+                | "host"
+                | "none"
+                | "off"
+                | "container"
+                | "docker"
+                | "podman"
+                | "ssh"
+                | "remote"
+        ) {
+            return Err(format!(
+                "sandbox.backend has unknown value {:?}; expected native, host, container, docker, podman, ssh, or remote",
+                self.backend
+            ));
+        }
+        let network = self.network.trim().to_lowercase();
+        if !matches!(network.as_str(), "allow" | "on" | "deny" | "off") {
+            return Err(format!(
+                "sandbox.network has unknown value {:?}; expected allow or deny",
+                self.network
+            ));
+        }
+        Ok(())
+    }
+
     pub fn to_config(&self) -> sandbox::SandboxConfig {
         let backend = match self.backend.trim().to_lowercase().as_str() {
             "host" | "none" | "off" | "" => sandbox::BackendKind::Host,
@@ -463,10 +439,7 @@ impl SandboxLockConfig {
     }
 }
 
-/// Model routing by role (§4.4). Only `executor` is consulted today (the CLI
-/// already resolves the provider from config/env — this documents intent and
-/// is the seat the provider router lands in once a second model is wired for
-/// adversarial cross-vendor verification).
+/// Optional model routes by execution role.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoutingConfig {
     #[serde(default)]
@@ -482,8 +455,7 @@ pub struct BudgetConfig {
     pub max_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
     pub max_wall_s: Option<u64>,
-    /// Concurrent tool-call cap within one turn (§12). `None` = the kernel's
-    /// built-in default (`kernel::DEFAULT_MAX_PARALLEL_TOOLS`).
+    /// Per-turn tool concurrency; `None` uses the kernel default.
     pub max_parallel_tools: Option<usize>,
 }
 
@@ -559,17 +531,9 @@ impl ContextConfig {
     }
 }
 
-/// Tool classes requiring human approval before execution (§4.7). File
-/// mutations ask first by default (reversible-local but worth a nod). Shell is
-/// deliberately *not* in this default set: per the spec's own policy model
-/// (§4.6), shell commands are gated by the deterministic dangerous-pattern
-/// scanner instead of a blanket ask-every-time gate — an ordinary `open
-/// file.html` or `ls` shouldn't need a human in the loop, but `rm -rf /`,
-/// `sudo`, credential reads, etc. are hard-blocked regardless of this list.
-/// Set to `[]` for full autonomy, or add "shell.exec" to also gate shell.
+/// Default human-gated tools. Shell commands use deterministic scanning unless
+/// `shell.exec` is explicitly added.
 fn default_approve() -> Vec<String> {
-    // skill.save always shows an approval card so the user sees the full SKILL.md
-    // being written before it lands (Phase A skills).
     vec![
         "fs.write".into(),
         "fs.edit".into(),
@@ -586,11 +550,9 @@ fn default_autonomy() -> String {
 pub struct PolicyConfig {
     #[serde(default = "default_approve")]
     pub approve: Vec<String>,
-    /// Starting autonomy dial: `careful` (edits+shell ask) · `normal` (edits
-    /// auto, shell asks) · `yolo` (everything in-workspace auto). The safety
-    /// floor (dangerous-command scanner, external actions, out-of-workspace
-    /// access) is gated at every level. Live-switchable via `/mode` in the TUI
-    /// or the `MEDHA_MODE` env override.
+    /// Starting autonomy dial: `careful` (edits+shell ask) · `normal` (edits auto)
+    /// · `yolo` (everything in-workspace auto). The safety floor is gated at every
+    /// level. Switchable via `/mode` or `MEDHA_MODE`.
     #[serde(default = "default_autonomy")]
     pub autonomy: String,
 }
@@ -604,16 +566,14 @@ impl Default for PolicyConfig {
     }
 }
 
-/// Deterministic post-edit check (§4.7), e.g. `"cargo check"`. Empty = none.
+/// Optional deterministic post-edit command.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VerifyConfig {
     #[serde(default)]
     pub command: Option<String>,
 }
 
-/// TUI presentation defaults (§4.13-adjacent surface config). A session can
-/// still toggle these live with a keyboard shortcut; this only sets what the
-/// TUI opens with.
+/// Initial TUI presentation settings; live toggles remain session-scoped.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -627,11 +587,7 @@ pub struct UiConfig {
     pub full_transparency: bool,
 }
 
-/// Reasoning/thinking request-side control (§4.4), config-file counterpart to
-/// the live `/reasoning` slash command. `enabled`/`effort` both `None` = don't
-/// touch the server's own default. Not every model/server has a "medium" tier
-/// (some only expose on/off) — an effort the adapter can't map is silently
-/// unused rather than faked; see `kernel::ReasoningConfig`.
+/// Request-side reasoning defaults; absent values preserve server defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReasoningLockConfig {
     #[serde(default)]
@@ -667,7 +623,9 @@ impl ReasoningLockConfig {
 impl MedhaLock {
     /// Parse a lock file's TOML text.
     pub fn parse(text: &str) -> Result<Self, String> {
-        toml::from_str(text).map_err(|e| e.to_string())
+        let lock: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        lock.sandbox.validate()?;
+        Ok(lock)
     }
 
     /// Load from an explicit path. Absence is optional; a present file that
@@ -746,8 +704,6 @@ mod tests {
     #[test]
     fn absent_file_yields_secure_defaults() {
         let lock = MedhaLock::default();
-        // Matches kernel::Budget::default() / context::CompactionPolicy::default()
-        // exactly, so introducing this artifact changes nothing by default.
         assert_eq!(
             lock.budget.to_budget().max_turns,
             kernel::Budget::default().max_turns
@@ -756,7 +712,6 @@ mod tests {
             lock.context.to_policy().trigger_ratio,
             context::CompactionPolicy::default().trigger_ratio
         );
-        // File-write default (§4.6): writes need approval; shell is scanner-gated.
         assert_eq!(
             lock.policy.approve,
             vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]
@@ -811,7 +766,6 @@ mod tests {
         "#;
         let lock = MedhaLock::parse(toml).unwrap();
         assert_eq!(lock.budget.max_turns, Some(50));
-        // Unspecified budget fields keep the built-in default (None = unbounded).
         assert_eq!(lock.budget.max_tokens, None);
         assert_eq!(lock.policy.approve, vec!["fs.write", "shell.exec"]);
         assert_eq!(lock.verify.command, Some("cargo check".to_string()));
@@ -820,7 +774,6 @@ mod tests {
         assert_eq!(lock.memory.stale_after_days, 30);
         assert!(!lock.context_files.progressive_discovery);
         assert_eq!(lock.context_files.max_chars, 20_000);
-        // context section wasn't in the TOML at all — full default applies.
         assert_eq!(
             lock.context.trigger_ratio,
             context::CompactionPolicy::default().trigger_ratio
@@ -848,7 +801,6 @@ mod tests {
         let default_used = MedhaLock::load("/nonexistent/path/medha.lock")
             .unwrap()
             .unwrap_or_default();
-        // Deny-first default applies even when no file exists at all.
         assert_eq!(
             default_used.policy.approve,
             vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]
@@ -865,6 +817,21 @@ mod tests {
         assert!(error.contains(&path.display().to_string()));
         assert!(error.contains("could not parse"));
         assert!(error.contains("line"));
+    }
+
+    #[test]
+    fn unknown_sandbox_values_are_rejected_instead_of_coerced() {
+        for text in [
+            "[sandbox]\nbackend = \"contaner\"\n",
+            "[sandbox]\nbackend = \"\"\n",
+            "[sandbox]\nnetwork = \"true\"\n",
+        ] {
+            let error = MedhaLock::parse(text).unwrap_err();
+            assert!(
+                error.contains("sandbox."),
+                "unexpected validation error for {text:?}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -903,12 +870,10 @@ mod tests {
             .to_config();
         assert_eq!(minimal.effort, Some(kernel::ReasoningEffort::Minimal));
 
-        // An unrecognized effort string degrades to None, not a panic/guess.
         let toml2 = "[reasoning]\neffort = \"extreme\"\n";
         let cfg2 = MedhaLock::parse(toml2).unwrap().reasoning.to_config();
         assert_eq!(cfg2.effort, None);
 
-        // Absent section entirely -> both None (server default untouched).
         assert_eq!(
             MedhaLock::default().reasoning.to_config(),
             kernel::ReasoningConfig::default()

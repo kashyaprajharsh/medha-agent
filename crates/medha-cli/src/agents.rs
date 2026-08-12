@@ -672,10 +672,6 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
             .collect()
     }
 
-    async fn last_activity(&self, child: ulid::Ulid) -> Option<f64> {
-        self.log.events(child).await.last().map(|event| event.ts)
-    }
-
     async fn reap_abandoned(&self, parent: ulid::Ulid) -> usize {
         // One pass over the owner's chain: every dispatch, every terminal event.
         // A foreign instance is only a candidate. Its OS lease must be

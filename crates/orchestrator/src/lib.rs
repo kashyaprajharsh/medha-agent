@@ -425,11 +425,6 @@ pub trait Outbox: Send + Sync {
     /// Patches owned by `parent` that have not been applied, oldest first.
     async fn unapplied(&self, parent: Ulid) -> Vec<Pending>;
 
-    /// When `child` last recorded anything, as epoch seconds. A child appends an
-    /// event per step, so the newest one is its heartbeat — no separate signal to
-    /// keep in sync with the work.
-    async fn last_activity(&self, child: Ulid) -> Option<f64>;
-
     /// Resolve children whose owning process died before reporting. Records an
     /// unknown-outcome terminal result and returns how many it closed. Idempotent.
     async fn reap_abandoned(&self, parent: Ulid) -> usize;
@@ -1062,28 +1057,6 @@ impl AgentControl {
                 _ => None,
             })
             .collect()
-    }
-
-    /// How long each running child has been silent, in milliseconds, keyed by
-    /// session id. Absent means it has recorded nothing yet.
-    pub async fn idle_times(&self) -> std::collections::HashMap<String, Option<u64>> {
-        let Some(outbox) = &self.outbox else {
-            return std::collections::HashMap::new();
-        };
-        let now = epoch_ms();
-        let mut idle = std::collections::HashMap::new();
-        for run in self.active() {
-            let Ok(id) = run.session.parse::<Ulid>() else {
-                continue;
-            };
-            let since = outbox.last_activity(id).await.map(|ts| {
-                // Saturating: clock adjustment must not read as a child that
-                // has been idle since before the epoch.
-                now.saturating_sub((ts * 1000.0) as u64)
-            });
-            idle.insert(run.session, since);
-        }
-        idle
     }
 
     /// Send further instruction to a running child, by name or session id.

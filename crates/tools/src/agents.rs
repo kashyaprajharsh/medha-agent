@@ -673,19 +673,33 @@ impl Tool for AgentControlTool {
         let from = self.caller.path();
         match self.action {
             AgentAction::List => {
-                // Elapsed-since-start cannot answer "is it moving?", which is
-                // the only question worth asking about a long-running agent.
-                let idle = self.control.idle_times().await;
+                // What each child is doing, not how long since it last wrote an
+                // event: elapsed silence cannot tell a model composing a reply
+                // from a connection that died, and "is it moving?" is the only
+                // question worth asking about a long-running agent.
+                let progress = self.control.progress();
                 let agents: Vec<Value> = self
                     .control
                     .active()
                     .into_iter()
                     .filter(|agent| agent.path.under(&from) && agent.path != from)
                     .map(|handle| {
-                        let quiet = idle.get(&handle.session).copied().flatten();
+                        let seen = progress.get(&handle.path);
                         let mut row = serde_json::to_value(&handle).unwrap_or_default();
                         if let Some(object) = row.as_object_mut() {
-                            object.insert("idle_ms".into(), json!(quiet));
+                            object.insert(
+                                "doing".into(),
+                                json!(seen.map(|p| p.phase.label()).unwrap_or_default()),
+                            );
+                            object.insert("tool_calls".into(), json!(seen.map(|p| p.tool_calls)));
+                            object.insert("tokens".into(), json!(seen.map(|p| p.tokens)));
+                            // Only for a phase where silence means something, so
+                            // an agent blocked on the operator never reads as
+                            // stuck and never invites the caller to cancel it.
+                            object.insert(
+                                "quiet_ms".into(),
+                                json!(seen.and_then(|p| p.stalled_for()).map(|d| d.as_millis())),
+                            );
                         }
                         row
                     })

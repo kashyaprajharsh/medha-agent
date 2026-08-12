@@ -40,6 +40,204 @@ pub(super) fn elapsed_str(model: &Model) -> String {
     }
 }
 
+/// Seconds as "8s" or "1m03s", matching the turn clock.
+fn secs_str(s: u64) -> String {
+    if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Token counts at a glance: exact while small, thousands once it stops mattering.
+fn tokens_str(tokens: u64) -> String {
+    match tokens {
+        0 => "—".to_string(),
+        t if t < 1_000 => t.to_string(),
+        t => format!("{:.1}k", t as f64 / 1_000.0),
+    }
+}
+
+/// One line naming what an agent is doing now. This is the whole point of the
+/// tree: "running" for eleven minutes and "fs.read app.py" for eleven minutes
+/// look identical to the operator, and only one of them is a mystery.
+fn phase_line(phase: &kernel::Phase) -> (String, Color) {
+    match phase {
+        kernel::Phase::Generating => ("thinking…".to_string(), theme::dim()),
+        kernel::Phase::InTool { tool, target } => (
+            match target {
+                Some(target) => format!("{tool}  {}", short_target(target)),
+                None => tool.clone(),
+            },
+            theme::dim(),
+        ),
+        // The one row that is about the operator, so it is the one that is loud.
+        kernel::Phase::AwaitingApproval { action } => {
+            (format!("⏸ waiting on you — {action}"), theme::warn())
+        }
+        kernel::Phase::Idle => ("idle".to_string(), theme::faint()),
+        kernel::Phase::Settled => ("finished".to_string(), theme::faint()),
+    }
+}
+
+/// How many rows [`draw_agent_tree`] needs: a header, then two per agent.
+pub(super) fn agent_tree_height(model: &Model) -> u16 {
+    match model.agent_runs.len() {
+        0 => 0,
+        n => 1 + (n as u16 * 2),
+    }
+}
+
+/// The live fleet, pinned above the composer while children run.
+///
+/// Pinned rather than appended: a tree that pushed a line per refresh would bury
+/// the conversation it is reporting on. The permanent record is one collapsed
+/// item written to the transcript when the fleet settles.
+pub(super) fn draw_agent_tree(f: &mut Frame, model: &Model, area: Rect) {
+    if model.agent_runs.is_empty() || area.height == 0 {
+        return;
+    }
+    let waiting = model
+        .agent_progress
+        .values()
+        .filter(|p| matches!(p.phase, kernel::Phase::AwaitingApproval { .. }))
+        .count();
+    let g = super::spin::secondary(model.anim_frame);
+    let mut header = vec![Span::styled(
+        format!("{g} {} agent(s) running", model.agent_runs.len()),
+        Style::default()
+            .fg(theme::accent())
+            .add_modifier(Modifier::BOLD),
+    )];
+    if waiting > 0 {
+        header.push(Span::styled(
+            format!("   ⏸ {waiting} waiting on you"),
+            Style::default()
+                .fg(theme::warn())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let mut lines = vec![Line::from(header)];
+
+    let last = model.agent_runs.len().saturating_sub(1);
+    for (index, run) in model.agent_runs.iter().enumerate() {
+        let progress = model.agent_progress.get(&run.path);
+        let (branch, cont) = if index == last {
+            ("└ ", "  ")
+        } else {
+            ("├ ", "│ ")
+        };
+        let elapsed = secs_str(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|now| now.as_secs().saturating_sub(run.started_ms / 1000))
+                .unwrap_or(0),
+        );
+        let counters = match progress {
+            Some(p) => format!(
+                " · {} tools · {} · {elapsed}",
+                p.tool_calls,
+                tokens_str(p.tokens)
+            ),
+            // Absent means the tick has not sampled it yet, which is not the
+            // same as an agent that has done nothing — so it says neither.
+            None => format!(" · {elapsed}"),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(branch, Style::default().fg(theme::faint())),
+            Span::styled(
+                run.path.name().to_string(),
+                Style::default()
+                    .fg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(counters, Style::default().fg(theme::faint())),
+        ]));
+        let (what, colour) = progress
+            .map(|p| phase_line(&p.phase))
+            .unwrap_or_else(|| ("starting…".to_string(), theme::faint()));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{cont}└ "), Style::default().fg(theme::faint())),
+            Span::styled(what, Style::default().fg(colour)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Glyph and colour for a settled agent, matching the roster's vocabulary.
+fn status_mark(status: orchestrator::AgentStatus) -> (&'static str, Color) {
+    match status {
+        orchestrator::AgentStatus::Completed => ("✓", theme::ok()),
+        orchestrator::AgentStatus::Exhausted => ("◐", theme::warn()),
+        orchestrator::AgentStatus::Cancelled => ("⊘", theme::dim()),
+        orchestrator::AgentStatus::Failed => ("✗", theme::err()),
+    }
+}
+
+/// The record of a finished fan-out: one line, or every child when expanded.
+fn render_agents_done(rows: &[AgentDoneRow], expanded: bool) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let tools: u32 = rows.iter().map(|row| row.tool_calls).sum();
+    let tokens: u64 = rows.iter().map(|row| row.tokens).sum();
+    let longest = rows.iter().map(|row| row.seconds).max().unwrap_or(0);
+    // The worst outcome leads: three completions and one failure is a failure
+    // you need to see, not a summary that averages it away.
+    let worst = rows
+        .iter()
+        .map(|row| row.status)
+        .max_by_key(|status| match status {
+            orchestrator::AgentStatus::Failed => 3,
+            orchestrator::AgentStatus::Exhausted => 2,
+            orchestrator::AgentStatus::Cancelled => 1,
+            orchestrator::AgentStatus::Completed => 0,
+        })
+        .unwrap_or(orchestrator::AgentStatus::Completed);
+    let (mark, colour) = status_mark(worst);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("  {mark} "), Style::default().fg(colour)),
+        Span::styled(
+            format!("{} agent(s) finished", rows.len()),
+            Style::default().fg(theme::text()),
+        ),
+        Span::styled(
+            format!(
+                " · {tools} tools · {} · {}",
+                tokens_str(tokens),
+                secs_str(longest)
+            ),
+            Style::default().fg(theme::faint()),
+        ),
+        Span::styled(
+            if expanded { "" } else { "   ^E to expand" },
+            Style::default().fg(theme::faint()),
+        ),
+    ])];
+    if expanded {
+        let last = rows.len().saturating_sub(1);
+        for (index, row) in rows.iter().enumerate() {
+            let (mark, colour) = status_mark(row.status);
+            let branch = if index == last { "    └ " } else { "    ├ " };
+            lines.push(Line::from(vec![
+                Span::styled(branch, Style::default().fg(theme::faint())),
+                Span::styled(format!("{mark} "), Style::default().fg(colour)),
+                Span::styled(row.name.clone(), Style::default().fg(theme::text())),
+                Span::styled(
+                    format!(
+                        " · {} tools · {} · {}",
+                        row.tool_calls,
+                        tokens_str(row.tokens),
+                        secs_str(row.seconds)
+                    ),
+                    Style::default().fg(theme::faint()),
+                ),
+            ]));
+        }
+    }
+    lines
+}
+
 /// Compact display of a tool target: a file's basename, or a clipped command.
 pub(super) fn short_target(t: &str) -> String {
     let base = t.rsplit(['/', '\\']).next().unwrap_or(t);
@@ -367,6 +565,7 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
             lines
         }
         Item::Assistant(s) => render_assistant(s, cx.width),
+        Item::AgentsDone(rows) => render_agents_done(rows, cx.show_summary),
         Item::ToolCall { tool, .. } if tool == "update_plan" => Vec::new(),
         Item::ToolCall { tool, args } => {
             let v = cx.viz.get(tool);
@@ -1155,19 +1354,20 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // Delegated work is otherwise absent from the parent transcript.
-    if !model.agent_runs.is_empty() {
-        let g = super::spin::secondary(model.anim_frame);
-        let names = model
-            .agent_runs
-            .iter()
-            .map(|run| run.path.name())
-            .collect::<Vec<_>>()
-            .join(", ");
+    // The tree above the composer carries the detail; the status line only needs
+    // to say a child is blocked on the operator, because nothing else will move
+    // it and it is invisible from the conversation.
+    let waiting = model
+        .agent_progress
+        .values()
+        .filter(|p| matches!(p.phase, kernel::Phase::AwaitingApproval { .. }))
+        .count();
+    if waiting > 0 {
+        let word = if waiting == 1 { "agent" } else { "agents" };
         left.push(Span::styled(
-            format!("  {g} agent: {names}"),
+            format!("  ⏸ {waiting} {word} waiting on you"),
             Style::default()
-                .fg(theme::accent())
+                .fg(theme::warn())
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1818,11 +2018,14 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     // Border and horizontal padding consume four cells of composer width.
     let text_rows = input_rows(model, content_w.saturating_sub(4)) as u16;
     let box_h = text_rows.clamp(1, 8) + 2;
+    // The fleet takes the gap above the composer, and gives it back the moment
+    // nothing is running, so it costs no screen when there are no children.
+    let tree_h = agent_tree_height(model);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
-            Constraint::Length(1),
+            Constraint::Length(1 + tree_h),
             Constraint::Length(box_h),
             Constraint::Length(1),
         ])
@@ -1838,6 +2041,18 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     };
 
     draw_transcript(f, model, pad_h(chunks[0]));
+    if tree_h > 0 {
+        let gap = chunks[1];
+        draw_agent_tree(
+            f,
+            model,
+            pad_h(Rect {
+                y: gap.y + 1,
+                height: tree_h,
+                ..gap
+            }),
+        );
+    }
     draw_input(f, model, pad_h(chunks[2]));
     draw_status(f, model, pad_h(chunks[3]));
 
@@ -2297,5 +2512,133 @@ mod clarify_view_tests {
                 "{s:?} is not part of this motif"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_view_tests {
+    use super::*;
+
+    fn row(name: &str, status: orchestrator::AgentStatus, tools: u32, tokens: u64) -> AgentDoneRow {
+        AgentDoneRow {
+            name: name.into(),
+            status,
+            tool_calls: tools,
+            tokens,
+            seconds: 75,
+        }
+    }
+
+    fn text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_phase_names_the_tool_and_its_target() {
+        let (label, _) = phase_line(&kernel::Phase::InTool {
+            tool: "fs.read".into(),
+            target: Some("/long/path/to/app.py".into()),
+        });
+        assert_eq!(label, "fs.read  app.py", "the basename, not the whole path");
+
+        let (label, _) = phase_line(&kernel::Phase::Generating);
+        assert_eq!(label, "thinking…");
+    }
+
+    #[test]
+    fn waiting_on_a_person_is_the_loud_row() {
+        let (label, colour) = phase_line(&kernel::Phase::AwaitingApproval {
+            action: "shell: npm ls".into(),
+        });
+        assert!(label.contains("waiting on you"), "{label}");
+        assert!(label.contains("npm ls"), "it must say what it is waiting for");
+        assert_eq!(
+            colour,
+            theme::warn(),
+            "a blocked agent is the one row that must catch the eye"
+        );
+    }
+
+    fn running(name: &str) -> orchestrator::Agent {
+        orchestrator::Agent {
+            path: orchestrator::AgentPath::root().child(name).unwrap(),
+            session: ulid::Ulid::new().to_string(),
+            objective: "work".into(),
+            started_ms: 0,
+            state: orchestrator::State::Running,
+            write: false,
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn the_tree_costs_no_rows_when_nothing_is_running() {
+        let dir = std::env::temp_dir().join(format!("medha-view-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut model = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            lockfile::UiConfig::default(),
+            HashMap::new(),
+            Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap()),
+        );
+        assert_eq!(
+            agent_tree_height(&model),
+            0,
+            "no children, no screen taken from the conversation"
+        );
+        model.agent_runs = vec![running("worker")];
+        assert_eq!(agent_tree_height(&model), 3, "header plus two rows per agent");
+    }
+
+    #[test]
+    fn a_finished_fanout_collapses_to_one_line_and_expands_on_request() {
+        let rows = vec![
+            row("overview", orchestrator::AgentStatus::Completed, 12, 18_400),
+            row("backend", orchestrator::AgentStatus::Completed, 24, 43_100),
+        ];
+        let collapsed = text(&render_agents_done(&rows, false));
+        assert_eq!(collapsed.lines().count(), 1, "{collapsed}");
+        assert!(collapsed.contains("2 agent(s) finished"), "{collapsed}");
+        assert!(collapsed.contains("36 tools"), "counters sum: {collapsed}");
+        assert!(collapsed.contains("61.5k"), "{collapsed}");
+        assert!(collapsed.contains("^E"), "the way to expand must be on the row");
+
+        let expanded = text(&render_agents_done(&rows, true));
+        assert_eq!(expanded.lines().count(), 3, "summary plus a row each");
+        assert!(expanded.contains("overview") && expanded.contains("backend"));
+        assert!(!expanded.contains("^E"), "already expanded");
+    }
+
+    #[test]
+    fn the_worst_outcome_leads_the_summary() {
+        let rows = vec![
+            row("a", orchestrator::AgentStatus::Completed, 1, 10),
+            row("b", orchestrator::AgentStatus::Failed, 1, 10),
+            row("c", orchestrator::AgentStatus::Completed, 1, 10),
+        ];
+        let collapsed = text(&render_agents_done(&rows, false));
+        // Averaging three successes and a failure into a tick would hide the one
+        // result the operator has to act on.
+        assert!(collapsed.contains('✗'), "{collapsed}");
+    }
+
+    #[test]
+    fn token_counts_stay_readable_across_magnitudes() {
+        assert_eq!(tokens_str(0), "—");
+        assert_eq!(tokens_str(940), "940");
+        assert_eq!(tokens_str(43_100), "43.1k");
+        assert_eq!(secs_str(9), "9s");
+        assert_eq!(secs_str(75), "1m15s");
     }
 }

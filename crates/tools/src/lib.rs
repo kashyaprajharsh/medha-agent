@@ -8048,9 +8048,6 @@ mod tests {
         async fn unapplied(&self, _parent: ulid::Ulid) -> Vec<orchestrator::Pending> {
             Vec::new()
         }
-        async fn last_activity(&self, _child: ulid::Ulid) -> Option<f64> {
-            None
-        }
         async fn reap_abandoned(&self, _parent: ulid::Ulid) -> usize {
             0
         }

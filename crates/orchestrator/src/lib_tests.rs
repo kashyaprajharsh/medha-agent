@@ -758,7 +758,6 @@ async fn a_long_report_reaches_the_caller_whole() {
 struct MemoryOutbox {
     rows: std::sync::Mutex<Vec<(Dispatch, Option<AgentResult>, bool)>>,
     patches: std::sync::Mutex<Vec<Recorded>>,
-    activity: std::sync::Mutex<std::collections::HashMap<Ulid, f64>>,
 }
 
 struct Recorded {
@@ -847,9 +846,6 @@ impl Outbox for MemoryOutbox {
                 patch: row.patch.clone(),
             })
             .collect()
-    }
-    async fn last_activity(&self, child: Ulid) -> Option<f64> {
-        self.activity.lock().unwrap().get(&child).copied()
     }
     async fn reap_abandoned(&self, parent: Ulid) -> usize {
         // A row dispatched but never finished is the in-memory shape of the
@@ -1080,47 +1076,23 @@ async fn steering_reaches_the_running_child() {
 
 #[tokio::test]
 async fn a_stalled_child_is_distinguishable_from_a_working_one() {
-    let outbox = Arc::new(MemoryOutbox::default());
-    let control = deliverable(Arc::new(Hangs), CancellationToken::new())
-        .with_outbox(outbox.clone())
-        .with_limits(4, 1);
-    let parent = Ulid::new();
-    let busy = control
-        .spawn_background(
-            spec("busy worker"),
-            &Caller::root(parent),
-            Arc::new(Tools),
-            kernel::Budget::turns(5),
-        )
-        .await
-        .unwrap();
-    let stalled = control
-        .spawn_background(
-            spec("stalled worker"),
-            &Caller::root(parent),
-            Arc::new(Tools),
-            kernel::Budget::turns(5),
-        )
-        .await
-        .unwrap();
+    let (control, stalled) = parked(kernel::Phase::Generating).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let quiet_for = control.progress()[&stalled]
+        .stalled_for()
+        .expect("generating is measurable");
 
-    let now = epoch_ms() as f64 / 1000.0;
-    {
-        let mut activity = outbox.activity.lock().unwrap();
-        activity.insert(busy.session.parse().unwrap(), now - 1.0);
-        activity.insert(stalled.session.parse().unwrap(), now - 300.0);
-    }
-
-    let idle = control.idle_times().await;
-    // Both started at the same moment, so elapsed-since-start says they are
-    // identical. Only last-activity separates them.
-    assert!(idle[&busy.session].unwrap() < 5_000);
-    assert!(idle[&stalled.session].unwrap() > 250_000);
+    // The distinction the event log could not make. Both children start at the
+    // same moment, so elapsed-since-start says they are identical; only the
+    // phase clock separates a stream that is arriving from one that stopped.
+    let busy = control.progress()[&stalled].clone();
+    assert!(quiet_for >= Duration::from_millis(50), "{quiet_for:?}");
+    assert_eq!(busy.phase, kernel::Phase::Generating);
     control.shutdown().await;
 }
 
 #[tokio::test]
-async fn a_child_that_has_recorded_nothing_reads_as_unknown_not_stalled() {
+async fn a_child_that_has_only_just_started_does_not_read_as_stalled() {
     let control = deliverable(Arc::new(Hangs), CancellationToken::new())
         .with_outbox(Arc::new(MemoryOutbox::default()));
     let parent = Ulid::new();
@@ -1133,10 +1105,13 @@ async fn a_child_that_has_recorded_nothing_reads_as_unknown_not_stalled() {
         )
         .await
         .unwrap();
-    // Starting up is not stalling. Reporting a huge idle time for a child
-    // that simply has not written its first event yet would flag every
-    // healthy agent as stuck in its opening moments.
-    assert_eq!(control.idle_times().await[&starting.session], None);
+    // Starting up is not stalling. The phase clock begins when the agent does,
+    // so a child that has not spoken yet reads as brand new rather than as one
+    // that has been silent since the epoch.
+    let quiet = control.progress()[&starting.path]
+        .stalled_for()
+        .expect("idle is measurable");
+    assert!(quiet < Duration::from_secs(5), "{quiet:?}");
     control.shutdown().await;
 }
 

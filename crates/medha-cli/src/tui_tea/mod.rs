@@ -509,6 +509,23 @@ enum Item {
     },
     Notice(String),
     Thinking(String),
+    /// What a fan-out did, written once when the last child settles.
+    ///
+    /// The live tree is pinned above the composer and vanishes with the agents,
+    /// so without this the delegation leaves no trace in the conversation it
+    /// served. Collapsed to one line by default and expanded with the same key
+    /// as any other collapsed card.
+    AgentsDone(Vec<AgentDoneRow>),
+}
+
+/// One finished child, as its record reads afterwards.
+#[derive(Debug, Clone)]
+struct AgentDoneRow {
+    name: String,
+    status: orchestrator::AgentStatus,
+    tool_calls: u32,
+    tokens: u64,
+    seconds: u64,
 }
 
 /// A transcript item with a memoized physical-row render.
@@ -1044,9 +1061,10 @@ pub(super) enum AgentRow {
     /// A child, running or settled — its `state` says which.
     Agent {
         agent: orchestrator::Agent,
-        /// Silence so far. `None` means nothing recorded yet — starting up, not
-        /// stalled.
-        idle_ms: Option<u64>,
+        /// What this child is doing, from the live plane. `None` only before the
+        /// first sample; it is never used to mean "quiet", because the phase says
+        /// that far better than a timestamp difference ever could.
+        progress: Option<kernel::Progress>,
         /// Drawn tree branch for this row's depth, empty at the top level.
         /// Precomputed because it depends on what *follows* the row, which a
         /// per-row render cannot see.
@@ -1442,21 +1460,24 @@ impl PickerKind {
                 .map(|row| match row {
                     AgentRow::Agent {
                         agent,
-                        idle_ms,
+                        progress,
                         branch,
                     } => {
                         let objective: String = agent.objective.chars().take(52).collect();
-                        // Nothing is recorded while a model composes, so an
-                        // agent mid-generation looks exactly like a wedged one.
-                        // Only multi-minute silence is worth remarking on, and
-                        // then as silence, not as a fault.
-                        let note = match agent.state {
-                            orchestrator::State::Running => match idle_ms {
-                                Some(ms) if *ms >= 180_000 => format!("  quiet {}m", ms / 60_000),
-                                Some(_) => String::new(),
-                                None => "  starting".to_string(),
-                            },
-                            orchestrator::State::Settled(_) => String::new(),
+                        // The phase, not a timestamp difference. "starting" used
+                        // to appear for every running agent on the first paint
+                        // and for anything the log had not heard from, which made
+                        // a wedged child and a thinking one identical.
+                        let note = match (&agent.state, progress) {
+                            (orchestrator::State::Running, Some(progress)) => {
+                                let counters = match progress.tool_calls {
+                                    0 => String::new(),
+                                    n => format!("{n} tools · "),
+                                };
+                                format!("  {counters}{}", progress.phase.label())
+                            }
+                            (orchestrator::State::Running, None) => String::new(),
+                            (orchestrator::State::Settled(_), _) => String::new(),
                         };
                         let mark = match agent.state {
                             orchestrator::State::Running => "⚇",
@@ -1839,6 +1860,14 @@ struct Model {
     agents: Option<Arc<orchestrator::AgentControl>>,
     /// Children running right now, refreshed on the animation tick.
     agent_runs: Vec<orchestrator::Agent>,
+    /// What each child is doing, from the live plane rather than the event log,
+    /// so the tree can name the tool a child is in instead of only that it runs.
+    /// Refreshed on the same tick as `agent_runs`.
+    agent_progress: HashMap<orchestrator::AgentPath, kernel::Progress>,
+    /// Children that have settled since the last record was written. Held until
+    /// the fleet empties so one fan-out leaves one record, not a line per child
+    /// finishing at its own pace.
+    agents_done: Vec<AgentDoneRow>,
 }
 
 impl Model {
@@ -1925,6 +1954,8 @@ impl Model {
             mcp: None,
             agents: None,
             agent_runs: Vec::new(),
+            agent_progress: HashMap::new(),
+            agents_done: Vec::new(),
             known_tools: Arc::new(std::collections::HashSet::new()),
         }
     }

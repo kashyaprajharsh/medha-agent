@@ -49,13 +49,60 @@ pub(super) fn update<P, L>(
                     .map(|control| control.active())
                     .unwrap_or_default();
                 // A child leaving the running set is its finish notification.
-                let finished: Vec<(String, String)> = model
+                let gone: Vec<orchestrator::Agent> = model
                     .agent_runs
                     .iter()
                     .filter(|previous| !running.iter().any(|run| run.session == previous.session))
+                    .cloned()
+                    .collect();
+                let finished: Vec<(String, String)> = gone
+                    .iter()
                     .map(|previous| (previous.path.name().to_string(), previous.session.clone()))
                     .collect();
+                let fleet_emptied = running.is_empty();
                 model.agent_runs = running;
+                // The live plane, read in the same pass: `active()` says an
+                // agent exists, this says what it is doing.
+                model.agent_progress = model
+                    .agents
+                    .as_ref()
+                    .map(|control| control.progress())
+                    .unwrap_or_default();
+                // Progress outlives settlement in the registry, so a child's
+                // final counters are still readable here.
+                let settled_states: Vec<orchestrator::Agent> = model
+                    .agents
+                    .as_ref()
+                    .map(|control| control.agents())
+                    .unwrap_or_default();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_millis() as u64)
+                    .unwrap_or(0);
+                for previous in &gone {
+                    let status = settled_states
+                        .iter()
+                        .find(|agent| agent.session == previous.session)
+                        .and_then(|agent| match agent.state {
+                            orchestrator::State::Settled(status) => Some(status),
+                            orchestrator::State::Running => None,
+                        })
+                        .unwrap_or(orchestrator::AgentStatus::Completed);
+                    let progress = model.agent_progress.get(&previous.path);
+                    model.agents_done.push(AgentDoneRow {
+                        name: previous.path.name().to_string(),
+                        status,
+                        tool_calls: progress.map(|p| p.tool_calls).unwrap_or(0),
+                        tokens: progress.map(|p| p.tokens).unwrap_or(0),
+                        seconds: now_ms.saturating_sub(previous.started_ms) / 1000,
+                    });
+                }
+                // One record per fan-out, written when the last child lands, so
+                // the delegation leaves a trace once the live tree disappears.
+                if fleet_emptied && !model.agents_done.is_empty() {
+                    let rows = std::mem::take(&mut model.agents_done);
+                    model.push_item(Item::AgentsDone(rows));
+                }
                 for (agent, session) in finished {
                     // Use the cache here because this polling runs on the UI thread.
                     let patch = model
@@ -2933,22 +2980,24 @@ fn open_agents_picker(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
         model.picker = Some(Picker::new(PickerKind::Agents(Vec::new())));
         return;
     };
-    // Opens on what this process already knows, then fills in from the log.
-    // Idle times need a read per child, which is not something a keystroke may
-    // block on — so the first paint carries none and the refresh supplies them.
+    // Opens on what this process already knows. Liveness comes from memory, so
+    // the first paint is already current — it used to pass an empty map, which
+    // rendered every running agent as "starting" until a background read
+    // returned, and forever if that read never did.
+    let progress = model.agent_progress.clone();
     model.picker = Some(Picker::new(PickerKind::Agents(agent_rows(
         &control,
         control.cached_unmerged_patches(),
-        &std::collections::HashMap::new(),
+        &progress,
     ))));
     let tx = tx.clone();
+    // Only the durable half needs a read: which patches are still owed.
     tokio::spawn(async move {
         let outstanding = control.outstanding().await;
-        let idle = control.idle_times().await;
         let _ = tx.send(TuiEvent::AgentRows(agent_rows(
             &control,
             outstanding,
-            &idle,
+            &control.progress(),
         )));
     });
 }
@@ -2958,7 +3007,7 @@ fn open_agents_picker(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
 fn agent_rows(
     control: &orchestrator::AgentControl,
     outstanding: Vec<orchestrator::Pending>,
-    idle: &std::collections::HashMap<String, Option<u64>>,
+    progress: &std::collections::HashMap<orchestrator::AgentPath, kernel::Progress>,
 ) -> Vec<AgentRow> {
     let waiting: Vec<String> = outstanding
         .iter()
@@ -2972,7 +3021,7 @@ fn agent_rows(
         .filter(|agent| agent.is_running() || !waiting.contains(&agent.session))
         .partition(orchestrator::Agent::is_running);
 
-    let mut rows: Vec<AgentRow> = branched(running, idle);
+    let mut rows: Vec<AgentRow> = branched(running, progress);
     for pending in outstanding {
         rows.push(AgentRow::Patch {
             agent: pending.agent,
@@ -2990,7 +3039,7 @@ fn agent_rows(
     let mut history = settled;
     history.reverse();
     rows.extend(history.into_iter().map(|agent| AgentRow::Agent {
-        idle_ms: idle.get(&agent.session).copied().flatten(),
+        progress: progress.get(&agent.path).cloned(),
         agent,
         branch: String::new(),
     }));
@@ -3000,7 +3049,7 @@ fn agent_rows(
 /// Sorts by path for depth-first parent-before-child display and branch drawing.
 fn branched(
     mut agents: Vec<orchestrator::Agent>,
-    idle: &std::collections::HashMap<String, Option<u64>>,
+    progress: &std::collections::HashMap<orchestrator::AgentPath, kernel::Progress>,
 ) -> Vec<AgentRow> {
     agents.sort_by(|a, b| a.path.cmp(&b.path));
     let depths: Vec<u32> = agents.iter().map(|agent| agent.path.depth()).collect();
@@ -3024,9 +3073,7 @@ fn branched(
                 ),
             };
             AgentRow::Agent {
-                // Absent from the map reads the same as nothing recorded yet —
-                // both mean no answer, and neither should be shown as a stall.
-                idle_ms: idle.get(&agent.session).copied().flatten(),
+                progress: progress.get(&agent.path).cloned(),
                 agent: agent.clone(),
                 branch,
             }
@@ -3327,11 +3374,10 @@ fn agents_apply_patch(
         };
         let _ = tx.send(TuiEvent::AgentPatchAction(outcome));
         // Refresh the panel from the record, so an applied patch leaves it.
-        let idle = control.idle_times().await;
         let _ = tx.send(TuiEvent::AgentRows(agent_rows(
             &control,
             control.outstanding().await,
-            &idle,
+            &control.progress(),
         )));
     });
 }

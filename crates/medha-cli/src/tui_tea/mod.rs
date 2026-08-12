@@ -298,6 +298,12 @@ pub(crate) enum TuiEvent {
     /// The turn is being retried after a transient provider failure and will
     /// stream its reply again from the start.
     Restarted,
+    /// One step of a child agent's own working-out, addressed by its path so it
+    /// lands in that agent's view rather than in the conversation that spawned it.
+    AgentStep {
+        path: orchestrator::AgentPath,
+        step: AgentStep,
+    },
     Usage(u32, u32),
     /// Session cost so far in USD; `true` = indicative list price (shown "est.").
     Cost(f64, bool),
@@ -516,6 +522,26 @@ enum Item {
     /// served. Collapsed to one line by default and expanded with the same key
     /// as any other collapsed card.
     AgentsDone(Vec<AgentDoneRow>),
+}
+
+/// A step in a child agent's own transcript.
+///
+/// The same shapes the parent renders, kept as a separate type because a child's
+/// stream is routed rather than appended: it belongs to that agent's view, and
+/// three children streaming into one conversation is unreadable.
+#[derive(Debug, Clone)]
+pub(crate) enum AgentStep {
+    Text(String),
+    Reasoning(String),
+    ToolCall {
+        tool: String,
+        args: serde_json::Value,
+    },
+    ToolResult {
+        tool: String,
+        ok: bool,
+        payload: serde_json::Value,
+    },
 }
 
 /// One finished child, as its record reads afterwards.
@@ -1868,7 +1894,20 @@ struct Model {
     /// the fleet empties so one fan-out leaves one record, not a line per child
     /// finishing at its own pace.
     agents_done: Vec<AgentDoneRow>,
+    /// Each live child's own transcript, so one can be opened and watched.
+    ///
+    /// A bounded ring: a chatty child must not be able to grow this without
+    /// limit, and the event log holds the complete record for anything that has
+    /// scrolled off or settled.
+    agent_panes: HashMap<orchestrator::AgentPath, VecDeque<Entry>>,
+    /// Which pane the transcript area shows. `None` is the conversation itself.
+    /// Kept apart from the switcher's cursor so moving through the list does not
+    /// yank the view out from under what is being read.
+    focus: Option<orchestrator::AgentPath>,
 }
+
+/// How much of one child's stream is kept for viewing.
+const MAX_AGENT_PANE_ITEMS: usize = 200;
 
 impl Model {
     fn new(
@@ -1956,6 +1995,8 @@ impl Model {
             agent_runs: Vec::new(),
             agent_progress: HashMap::new(),
             agents_done: Vec::new(),
+            agent_panes: HashMap::new(),
+            focus: None,
             known_tools: Arc::new(std::collections::HashSet::new()),
         }
     }
@@ -2364,6 +2405,55 @@ impl Model {
         } else {
             self.streamed_this_turn += 1;
             self.push_item(Item::Assistant(delta.to_string()));
+        }
+    }
+
+    /// File one step into that agent's own pane, coalescing streamed deltas onto
+    /// the item they extend so a reply is one block rather than a line per token.
+    fn push_agent_step(&mut self, path: orchestrator::AgentPath, step: AgentStep) {
+        let showing = self.focus.as_ref() == Some(&path);
+        let pane = self.agent_panes.entry(path).or_default();
+        let item = match step {
+            AgentStep::Text(delta) => {
+                match pane.back_mut().map(|entry| &mut entry.item) {
+                    Some(Item::Assistant(buffer)) => {
+                        buffer.push_str(&delta);
+                        if let Some(entry) = pane.back_mut() {
+                            entry.invalidate();
+                        }
+                        if showing {
+                            self.dirty = true;
+                        }
+                        return;
+                    }
+                    _ => Item::Assistant(delta),
+                }
+            }
+            AgentStep::Reasoning(delta) => match pane.back_mut().map(|entry| &mut entry.item) {
+                Some(Item::Thinking(buffer)) => {
+                    buffer.push_str(&delta);
+                    if let Some(entry) = pane.back_mut() {
+                        entry.invalidate();
+                    }
+                    if showing {
+                        self.dirty = true;
+                    }
+                    return;
+                }
+                _ => Item::Thinking(delta),
+            },
+            AgentStep::ToolCall { tool, args } => Item::ToolCall { tool, args },
+            AgentStep::ToolResult { tool, ok, payload } => Item::ToolResult { tool, ok, payload },
+        };
+        pane.push_back(Entry::new(item));
+        while pane.len() > MAX_AGENT_PANE_ITEMS {
+            pane.pop_front();
+        }
+        if showing {
+            self.dirty = true;
+            if self.auto_scroll {
+                self.scroll_to_bottom();
+            }
         }
     }
 

@@ -1395,7 +1395,10 @@ async fn main() -> Result<()> {
     if let Ok(mut slot) = agent_parent.lock() {
         *slot = Some(Arc::downgrade(&kernel.executor));
     }
-    agent_runner.install(Arc::new(agents::KernelRunner::new(&kernel)));
+    agent_runner.install(Arc::new(agents::KernelRunner::new(
+        &kernel,
+        tui_channel.as_ref().map(|(tx, _)| tx.clone()),
+    )));
 
     let configured_persona = model_profiles
         .lock()

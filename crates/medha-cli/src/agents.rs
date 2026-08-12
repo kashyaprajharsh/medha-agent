@@ -18,7 +18,23 @@ use orchestrator::{AgentStatus, ChildOutcome, ChildRun, ChildRunner};
 /// running child could only ever be described by scraping timestamps back out of
 /// the event log — and why a wedged one looked exactly like a busy one.
 struct AgentSink {
+    path: orchestrator::AgentPath,
     progress: kernel::ProgressHandle,
+    route: AgentRoute,
+}
+
+impl AgentSink {
+    /// Hand one step to whatever surface is watching. Dropped silently when
+    /// nothing is: a headless run has nowhere to show a child's working-out, and
+    /// that is not a failure.
+    fn show(&self, step: crate::tui_tea::AgentStep) {
+        if let Some(tx) = &self.route {
+            let _ = tx.send(crate::tui_tea::TuiEvent::AgentStep {
+                path: self.path.clone(),
+                step,
+            });
+        }
+    }
 }
 
 impl kernel::StreamSink for AgentSink {
@@ -30,8 +46,28 @@ impl kernel::StreamSink for AgentSink {
         self.progress.ticked();
     }
 
-    fn tool_call(&self, _tool: &str, _args: &serde_json::Value) {
+    fn text(&self, delta: &str) {
+        self.show(crate::tui_tea::AgentStep::Text(delta.to_string()));
+    }
+
+    fn reasoning(&self, delta: &str) {
+        self.show(crate::tui_tea::AgentStep::Reasoning(delta.to_string()));
+    }
+
+    fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) {
+        self.show(crate::tui_tea::AgentStep::ToolResult {
+            tool: tool.to_string(),
+            ok,
+            payload: payload.clone(),
+        });
+    }
+
+    fn tool_call(&self, tool: &str, args: &serde_json::Value) {
         self.progress.tool_dispatched();
+        self.show(crate::tui_tea::AgentStep::ToolCall {
+            tool: tool.to_string(),
+            args: args.clone(),
+        });
     }
 
     fn usage(&self, _prompt_tokens: u32, total_tokens: u32) {
@@ -860,15 +896,24 @@ impl kernel::HumanGate for AttributedGate {
     }
 }
 
+/// Where children's streams are delivered. `None` when nobody is watching —
+/// the headless case, which costs a child nothing.
+///
+/// Unbounded on purpose: a bounded channel would let a slow surface stall a
+/// child mid-tool, and the viewer keeps only a bounded ring anyway.
+pub type AgentRoute = Option<tokio::sync::mpsc::UnboundedSender<crate::tui_tea::TuiEvent>>;
+
 pub struct KernelRunner<P: Provider, L: EventLog> {
     /// Weak to break the kernel/executor/control-plane ownership cycle.
     kernel: std::sync::Weak<Kernel<P, L>>,
+    route: AgentRoute,
 }
 
 impl<P: Provider, L: EventLog> KernelRunner<P, L> {
-    pub fn new(kernel: &Arc<Kernel<P, L>>) -> Self {
+    pub fn new(kernel: &Arc<Kernel<P, L>>, route: AgentRoute) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
+            route,
         }
     }
 }
@@ -931,7 +976,9 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         // tools and the transcript. Pass the steer queue through so accepted text
         // reaches the child's next turn boundary.
         let sink = AgentSink {
+            path: run.path.clone(),
             progress: run.progress.clone(),
+            route: self.route.clone(),
         };
         let outcome = child
             .run_session(&session, messages, budget, &sink, Some(run.interrupts))
@@ -1317,6 +1364,7 @@ mod child_prompt_tests {
     fn prompt_for(tools: Vec<&'static str>, workspace: Option<PathBuf>) -> String {
         child_prompt(&ChildRun {
             session: ulid::Ulid::new(),
+            path: orchestrator::AgentPath::root().child("survey").unwrap(),
             spec: AgentSpec {
                 objective: "survey the crate".into(),
                 ..Default::default()

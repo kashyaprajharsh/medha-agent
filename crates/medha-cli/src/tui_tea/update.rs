@@ -2018,6 +2018,7 @@ pub(super) fn handle_agent_event(
             | TuiEvent::Compaction(_, _, _, _)
             | TuiEvent::Compacting(_)
             | TuiEvent::Restarted
+            | TuiEvent::AgentStep { .. }
             | TuiEvent::Usage(_, _)
             | TuiEvent::Cost(_, _)
             | TuiEvent::Verify(_, _) => return,
@@ -2059,6 +2060,7 @@ pub(super) fn handle_agent_event(
             model.drop_streamed_this_turn();
             model.push_notice("the model's connection dropped — retrying");
         }
+        TuiEvent::AgentStep { path, step } => model.push_agent_step(path, step),
         TuiEvent::Usage(prompt_tokens, _total) => {
             if let Some(mc) = model.max_ctx {
                 let usable = context::ContextBudget::from_max_ctx(mc).usable().max(1);

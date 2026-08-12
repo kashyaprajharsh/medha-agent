@@ -312,6 +312,10 @@ pub trait Transcripts: Send + Sync {
 /// Everything a runner needs to execute one child.
 pub struct ChildRun {
     pub session: Ulid,
+    /// This child's address in the tree. The runner tags everything it emits
+    /// with this, so a surface can route one child's stream to one view without
+    /// having to guess from a name that siblings may share.
+    pub path: AgentPath,
     pub spec: AgentSpec,
     /// The caller's conversation, already filtered to what a child may inherit.
     /// The runner puts this *before* the objective, so the child reads the
@@ -1504,6 +1508,7 @@ async fn execute(
     let started = Instant::now();
     let run = runner.run(ChildRun {
         session,
+        path: path.clone(),
         spec: spec.clone(),
         history,
         executor,

@@ -640,6 +640,55 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         (intent.id, intent.tool, obs, discovered)
     }
 
+    /// Run a batch of read-only calls to completion, then hand back every result.
+    ///
+    /// Draining before persisting anything is load-bearing, not tidiness. The
+    /// obvious shape — persist each result as the batch yields it — deadlocks:
+    /// `persist_admitted` awaits an append, the event log admits appends through
+    /// one fair queue, and the batch's remaining futures are already waiting in
+    /// that queue for their own policy decisions. The queue hands the next permit
+    /// to a batch future, but nothing will poll it: `Buffered` is polled only by
+    /// the loop that has just left it to await an append of its own. The turn
+    /// stops there, with a prefix of decisions written, no observations, and
+    /// nothing running — a live session sat like that for minutes.
+    ///
+    /// So the batch is polled to exhaustion first, and appends happen afterwards
+    /// when no other future is holding a place in the queue. Reads have no
+    /// mutation guard to span, so nothing is weakened by the delay; every
+    /// admitted intent still reaches its observation before the next request.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_reads(
+        &self,
+        session: &Session,
+        intents: Vec<ToolIntent>,
+        web_tainted: bool,
+        cancel: &tokio_util::sync::CancellationToken,
+        wall_deadline: Option<tokio::time::Instant>,
+        settle_deadline: &Arc<std::sync::OnceLock<tokio::time::Instant>>,
+        sink: &dyn StreamSink,
+    ) -> Vec<(
+        String,
+        String,
+        Observation,
+        Option<crate::context::DiscoveredContext>,
+    )> {
+        stream::iter(intents)
+            .map(|intent| {
+                self.execute_admitted(
+                    session,
+                    intent,
+                    web_tainted,
+                    cancel.clone(),
+                    wall_deadline,
+                    Arc::clone(settle_deadline),
+                    sink,
+                )
+            })
+            .buffered(self.max_parallel_tools)
+            .collect()
+            .await
+    }
+
     /// Make one settled execution durable and feed its observation back. The
     /// caller holds any mutation guard across this and [`Self::execute_admitted`],
     /// closing the side-effect → event-log gap.
@@ -1204,20 +1253,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             for intent in intents {
                 if let Some(mutation_key) = self.executor.mutation_key(&intent) {
                     if !read_batch.is_empty() {
-                        let mut batch = stream::iter(std::mem::take(&mut read_batch))
-                            .map(|intent| {
-                                self.execute_admitted(
-                                    session,
-                                    intent,
-                                    dispatch_web_tainted,
-                                    dispatch_cancel.clone(),
-                                    dispatch_wall_deadline,
-                                    Arc::clone(&dispatch_settle_deadline),
-                                    sink,
-                                )
-                            })
-                            .buffered(self.max_parallel_tools);
-                        while let Some((id, tool, obs, discovered)) = batch.next().await {
+                        let settled = self
+                            .settle_reads(
+                                session,
+                                std::mem::take(&mut read_batch),
+                                dispatch_web_tainted,
+                                &dispatch_cancel,
+                                dispatch_wall_deadline,
+                                &dispatch_settle_deadline,
+                                sink,
+                            )
+                            .await;
+                        for (id, tool, obs, discovered) in settled {
                             self.persist_admitted(
                                 session,
                                 id,
@@ -1344,20 +1391,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             }
             if !read_batch.is_empty() {
-                let mut batch = stream::iter(read_batch)
-                    .map(|intent| {
-                        self.execute_admitted(
-                            session,
-                            intent,
-                            dispatch_web_tainted,
-                            dispatch_cancel.clone(),
-                            dispatch_wall_deadline,
-                            Arc::clone(&dispatch_settle_deadline),
-                            sink,
-                        )
-                    })
-                    .buffered(self.max_parallel_tools);
-                while let Some((id, tool, obs, discovered)) = batch.next().await {
+                let settled = self
+                    .settle_reads(
+                        session,
+                        read_batch,
+                        dispatch_web_tainted,
+                        &dispatch_cancel,
+                        dispatch_wall_deadline,
+                        &dispatch_settle_deadline,
+                        sink,
+                    )
+                    .await;
+                for (id, tool, obs, discovered) in settled {
                     self.persist_admitted(
                         session,
                         id,

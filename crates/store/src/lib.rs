@@ -445,6 +445,10 @@ pub struct SqliteLog {
     /// This keeps contention on one SQLite connection from consuming an
     /// unbounded number of blocking workers; callers cancelled while queued
     /// never start database work.
+    ///
+    /// The queue is fair, so a caller must never await it while holding futures
+    /// that are ahead of it and can only be polled by that same caller — see the
+    /// note on the kernel's read-batch dispatch.
     runtime_gate: Arc<tokio::sync::Semaphore>,
     /// Serializes state changes made by independent processes in this
     /// workspace. It is deliberately a different SQLite database from the

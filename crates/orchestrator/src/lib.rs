@@ -78,6 +78,81 @@ impl WaitBounds {
     }
 }
 
+/// How long a child may be silent, per phase, before it is treated as wedged.
+///
+/// One flat number cannot serve: a model composing a long reply, a twenty-minute
+/// build and an agent parked on an approval card are all "silent", and only one
+/// of them is broken. A single bound either kills real work or catches nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct StallBounds {
+    /// Waiting on the provider. The transport already bounds each read and the
+    /// turn retries on failure, and every chunk and every retry counts as
+    /// progress — so silence past this means nothing is coming back at all.
+    pub generating: Duration,
+    /// Running a tool. Generous: builds and test suites are legitimately long,
+    /// and a tool declaring its own timeout bounds itself sooner.
+    pub in_tool: Duration,
+    /// Between turns with nothing in flight. Should never persist.
+    pub idle: Duration,
+}
+
+impl Default for StallBounds {
+    fn default() -> Self {
+        Self {
+            generating: Duration::from_secs(300),
+            in_tool: Duration::from_secs(900),
+            idle: Duration::from_secs(120),
+        }
+    }
+}
+
+impl StallBounds {
+    /// The budget for `phase`, or `None` when time spent there proves nothing.
+    ///
+    /// Waiting on a person is the case that matters: an operator who stepped
+    /// away has not wedged anything, and stopping their agent for it would make
+    /// the approval gate a liability.
+    pub fn for_phase(&self, phase: &kernel::Phase) -> Option<Duration> {
+        if !phase.is_stall_evidence() {
+            return None;
+        }
+        Some(match phase {
+            kernel::Phase::Generating => self.generating,
+            kernel::Phase::InTool { .. } => self.in_tool,
+            _ => self.idle,
+        })
+    }
+}
+
+/// Wait until `progress` has been silent for longer than its phase allows.
+///
+/// Never returns while the phase is one where silence proves nothing, and never
+/// returns once the publisher is gone — a finished run must not be reported as a
+/// stalled one.
+async fn stalled(mut progress: kernel::ProgressWatch, bounds: StallBounds) {
+    loop {
+        let (phase, elapsed) = {
+            let seen = progress.borrow_and_update();
+            (seen.phase.clone(), seen.in_phase())
+        };
+        let Some(budget) = bounds.for_phase(&phase) else {
+            if progress.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+            continue;
+        };
+        let Some(left) = budget.checked_sub(elapsed) else {
+            return;
+        };
+        match tokio::time::timeout(left, progress.changed()).await {
+            // Silent for the whole budget: nothing is going to move it.
+            Err(_) => return,
+            Ok(Err(_)) => return std::future::pending().await,
+            Ok(Ok(())) => continue,
+        }
+    }
+}
+
 /// Why a [`AgentControl::wait`] returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Waited {
@@ -256,6 +331,10 @@ pub struct ChildRun {
     /// — text queued against a child whose runner drops this is accepted and
     /// then silently lost, which is worse than refusing it.
     pub interrupts: kernel::InterruptQueue,
+    /// Where the runner publishes what this child is doing. A runner that drops
+    /// this leaves the child unobservable: the roster can then only report that
+    /// it exists, and no inactivity bound can tell working from wedged.
+    pub progress: kernel::ProgressHandle,
 }
 
 /// An isolated checkout plus the tools rooted at it. Both must come from one
@@ -396,6 +475,7 @@ pub struct AgentControl {
     max_depth: u32,
     cancel_grace: Duration,
     wait_bounds: WaitBounds,
+    stall_bounds: StallBounds,
     transcript_tail: usize,
     /// Builds a child's own delegation tools. Installed after construction, for
     /// the same cycle [`DeferredRunner`] breaks.
@@ -475,6 +555,7 @@ impl AgentControl {
             max_depth: DEFAULT_MAX_DEPTH,
             cancel_grace: DEFAULT_CANCEL_GRACE,
             wait_bounds: WaitBounds::default(),
+            stall_bounds: StallBounds::default(),
             transcript_tail: 40,
             delegation: std::sync::OnceLock::new(),
             registry: Arc::new(AgentRegistry::new()),
@@ -562,6 +643,7 @@ impl AgentControl {
             registry: Arc::clone(&self.registry),
             settled: Arc::clone(&self.settled),
             cancel_grace: self.cancel_grace,
+            stall_bounds: self.stall_bounds,
         }
     }
 
@@ -571,6 +653,17 @@ impl AgentControl {
     }
 
     /// How long a cancelled child gets to settle itself before it is dropped.
+    /// Replace the per-phase silence budgets. Lower them for short tasks; raise
+    /// `in_tool` for a workspace whose build is genuinely slow.
+    pub fn with_stall_bounds(mut self, bounds: StallBounds) -> Self {
+        self.stall_bounds = bounds;
+        self
+    }
+
+    pub fn stall_bounds(&self) -> StallBounds {
+        self.stall_bounds
+    }
+
     pub fn with_cancel_grace(mut self, grace: Duration) -> Self {
         self.cancel_grace = grace;
         self
@@ -950,6 +1043,27 @@ impl AgentControl {
         }
     }
 
+    /// What every agent in this tree is doing, keyed by path — the live plane.
+    /// Read from memory and current by construction, unlike anything recovered
+    /// from the event log, which cannot distinguish a model composing a reply
+    /// from a connection that has died.
+    pub fn progress(&self) -> std::collections::HashMap<AgentPath, kernel::Progress> {
+        self.registry.progress_all()
+    }
+
+    /// The agents blocked on a human decision. Nothing else will move them, so a
+    /// surface that does not surface these lets a whole tree sit on one card.
+    pub fn awaiting_approval(&self) -> Vec<(AgentPath, String)> {
+        self.registry
+            .progress_all()
+            .into_iter()
+            .filter_map(|(path, progress)| match progress.phase {
+                kernel::Phase::AwaitingApproval { action } => Some((path, action)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// How long each running child has been silent, in milliseconds, keyed by
     /// session id. Absent means it has recorded nothing yet.
     pub async fn idle_times(&self) -> std::collections::HashMap<String, Option<u64>> {
@@ -1174,6 +1288,7 @@ impl AgentControl {
         // Rooted at this child's token so a cancel reaches the session loop as a
         // cooperative interrupt; a separate token raced it and dropped mid-tool.
         let (steer, interrupts) = kernel::InterruptQueue::rooted(cancel.clone());
+        let (progress, progress_watch) = kernel::ProgressHandle::new();
         reservation.commit(
             registry::Agent {
                 path: path.clone(),
@@ -1189,6 +1304,7 @@ impl AgentControl {
                 steer,
                 budget: budget.clone(),
             },
+            progress_watch,
         );
         Ok(Admitted {
             session,
@@ -1201,6 +1317,7 @@ impl AgentControl {
             budget,
             permit,
             supersedes,
+            progress,
         })
     }
 
@@ -1358,6 +1475,9 @@ struct Admitted {
     /// A prior handout this run's patch will contain, closed once the new one
     /// is durable. Set when a follow-up restored an agent's own earlier work.
     supersedes: Option<String>,
+    /// Handed to the runner so the child's phase and counters are observable
+    /// while it runs, and settled by [`execute`] however the run ends.
+    progress: kernel::ProgressHandle,
 }
 
 /// The collaborators a run needs from its control plane. Bundled so foreground
@@ -1372,6 +1492,7 @@ struct Shared {
     registry: Arc<AgentRegistry>,
     settled: Arc<tokio::sync::Notify>,
     cancel_grace: Duration,
+    stall_bounds: StallBounds,
 }
 
 /// The one execution path, shared by foreground and background spawn so they
@@ -1392,6 +1513,7 @@ async fn execute(
         registry,
         settled,
         cancel_grace,
+        stall_bounds,
     } = shared;
     let Admitted {
         session,
@@ -1404,6 +1526,7 @@ async fn execute(
         path,
         history,
         supersedes,
+        progress,
     } = admitted;
     let started = Instant::now();
     let run = runner.run(ChildRun {
@@ -1415,8 +1538,23 @@ async fn execute(
         cancel: cancel.clone(),
         interrupts,
         workspace: workspace.as_ref().map(|tree| tree.path().to_path_buf()),
+        progress: progress.clone(),
     });
     tokio::pin!(run);
+    // A stall is turned into a cooperative cancel, never a dropped future: the
+    // child then settles its own in-flight tools and still reports what it had
+    // found, exactly as it would if the operator had stopped it.
+    let went_silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let cancel = cancel.clone();
+        let went_silent = Arc::clone(&went_silent);
+        let watch = progress.subscribe();
+        tokio::spawn(async move {
+            stalled(watch, stall_bounds).await;
+            went_silent.store(true, std::sync::atomic::Ordering::Release);
+            cancel.cancel();
+        })
+    };
     // Kernel-backed runners own cancellation cleanup and must be awaited;
     // other runners get a bounded grace period.
     let outcome = if runner.settles_cancellation() {
@@ -1430,6 +1568,11 @@ async fn execute(
             },
         }
     };
+    // The run is over, so nothing left to watch. Aborting a watchdog that has
+    // already fired is harmless; leaving it alive would hold a receiver and keep
+    // waking for a session that no longer exists.
+    watchdog.abort();
+    let went_silent = went_silent.load(std::sync::atomic::Ordering::Acquire);
     // Cancellation and failure may still leave real edits to preserve.
     let (patch, extracted) = match (&workspace, &workspaces) {
         (Some(tree), Some(workspaces)) => match tree.patch().await {
@@ -1474,6 +1617,18 @@ async fn execute(
             elapsed,
         ),
     };
+    // A stall reads as exhaustion, not as cancellation: nobody asked for it to
+    // stop, and a report labelled "cancelled" invites the reader to assume the
+    // operator did it. The partial findings still travel either way.
+    if went_silent {
+        result.status = AgentStatus::Exhausted;
+        result.summary = format!(
+            "[stopped after going silent — it recorded nothing for longer than its phase \
+             allows, so it was treated as wedged rather than left running. What it had \
+             found follows.]\n\n{}",
+            result.summary
+        );
+    }
     // Retained so the merge is asked for by agent id; round-tripping the diff
     // through the model would not preserve whitespace exactly.
     let mut durable = true;
@@ -1568,6 +1723,10 @@ async fn execute(
         // built from web content must escalate what that parent does next.
         registry.steer_labelled(&parent, &report(&path, &result), result.trust);
     }
+    // However the run ended — reported, cancelled, failed, or dropped mid-tool
+    // — the phase stops claiming work is in flight. A roster left showing
+    // `generating` for a finished agent is the same lie as showing nothing.
+    progress.settled();
     registry.settled(&path, result.status);
     // After the registry and the outbox, so anything woken here can read both.
     settled.notify_waiters();

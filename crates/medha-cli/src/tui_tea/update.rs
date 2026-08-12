@@ -1970,6 +1970,7 @@ pub(super) fn handle_agent_event(
             | TuiEvent::ToolResult(_, _, _)
             | TuiEvent::Compaction(_, _, _, _)
             | TuiEvent::Compacting(_)
+            | TuiEvent::Restarted
             | TuiEvent::Usage(_, _)
             | TuiEvent::Cost(_, _)
             | TuiEvent::Verify(_, _) => return,
@@ -2005,6 +2006,12 @@ pub(super) fn handle_agent_event(
             });
         }
         TuiEvent::Compacting(active) => model.compacting = active,
+        // Said out loud: a reply that visibly rewinds and starts again is
+        // alarming without a reason, and the retry is the reassuring part.
+        TuiEvent::Restarted => {
+            model.drop_streamed_this_turn();
+            model.push_notice("the model's connection dropped — retrying");
+        }
         TuiEvent::Usage(prompt_tokens, _total) => {
             if let Some(mc) = model.max_ctx {
                 let usable = context::ContextBudget::from_max_ctx(mc).usable().max(1);
@@ -2326,6 +2333,7 @@ pub(super) fn handle_agent_event(
             transcript.extend(msgs.clone());
             repaint_history(model, &msgs);
             model.reasoning_received_this_turn = false;
+            model.streamed_this_turn = 0;
             model.last_turn_reasoning_received = None;
             model.push_notice(format!("(resumed session {id})"));
         }
@@ -4041,6 +4049,7 @@ pub(super) fn spawn_turn<P, L>(
     model.auto_scroll = true;
     model.running = true;
     model.reasoning_received_this_turn = false;
+    model.streamed_this_turn = 0;
     model.turn_started = Some(Instant::now());
     // Pick up any skill saved/edited since startup so the model's manifest is
     // current this turn (not just next session).
@@ -4257,6 +4266,9 @@ impl kernel::StreamSink for TuiSink {
     fn compacting(&self, active: bool) {
         self.emit("compacting", TuiEvent::Compacting(active));
     }
+    fn restarted(&self) {
+        self.emit("restarted", TuiEvent::Restarted);
+    }
     fn compaction(&self, before: u32, after: u32, summarized: bool, summary: Option<&str>) {
         self.emit(
             "compaction",
@@ -4410,6 +4422,7 @@ fn do_clear(model: &mut Model, session: &mut Session, transcript: &mut Vec<Messa
     adopt_session(model, session.id);
     model.items.clear();
     model.reasoning_received_this_turn = false;
+    model.streamed_this_turn = 0;
     model.last_turn_reasoning_received = None;
     model.invalidate_all_renders();
     model.push_notice("(conversation cleared — fresh session)");
@@ -6664,5 +6677,110 @@ mod steer_target_tests {
     fn an_empty_message_reaches_nobody() {
         assert!(steer_target("", &one()).is_err());
         assert!(steer_target("tokio-audit    ", &two()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retry_render_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn model() -> Model {
+        let dir = std::env::temp_dir().join(format!("medha-retry-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            lockfile::UiConfig::default(),
+            HashMap::new(),
+            sbx,
+        )
+    }
+
+    /// Only the model's streamed output; notices are the surface talking, not
+    /// the reply, and a retry is expected to add one.
+    fn streamed(model: &Model) -> Vec<String> {
+        model
+            .items
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                Item::Assistant(text) => Some(format!("assistant:{text}")),
+                Item::Thinking(text) => Some(format!("thinking:{text}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_retry_drops_its_own_partial_reply_and_keeps_the_previous_answer() {
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+
+        // A turn that finished, leaving its answer in the transcript.
+        m.running = true;
+        m.streamed_this_turn = 0;
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Text("settled answer".into()),
+            &mut session,
+            &mut transcript,
+        );
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Done(transcript.clone(), StopReason::Finished),
+            &mut session,
+            &mut transcript,
+        );
+
+        // The next turn streams, then its connection drops.
+        m.running = true;
+        m.streamed_this_turn = 0;
+        for event in [
+            TuiEvent::Reasoning("half a thought".into()),
+            TuiEvent::Text("half an ans".into()),
+        ] {
+            handle_agent_event(&mut m, event, &mut session, &mut transcript);
+        }
+        assert_eq!(m.streamed_this_turn, 2, "one thinking, one assistant item");
+
+        handle_agent_event(&mut m, TuiEvent::Restarted, &mut session, &mut transcript);
+
+        let rendered = streamed(&m);
+        assert!(
+            rendered.iter().any(|line| line == "assistant:settled answer"),
+            "the finished turn's answer must survive a later retry: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("half an ans")),
+            "the abandoned attempt's reply must not be left to duplicate: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("half a thought")),
+            "nor its reasoning: {rendered:?}"
+        );
+        assert_eq!(m.streamed_this_turn, 0, "the retry starts counting again");
+    }
+
+    #[test]
+    fn a_retry_that_streamed_nothing_removes_nothing() {
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        m.running = true;
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Text("earlier answer".into()),
+            &mut session,
+            &mut transcript,
+        );
+        m.streamed_this_turn = 0;
+        let before = streamed(&m);
+
+        handle_agent_event(&mut m, TuiEvent::Restarted, &mut session, &mut transcript);
+
+        assert_eq!(streamed(&m), before);
     }
 }

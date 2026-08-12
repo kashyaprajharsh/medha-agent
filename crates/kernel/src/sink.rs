@@ -36,6 +36,20 @@ pub trait StreamSink: Send + Sync {
     /// The session was cancelled with steers still queued — they were NOT
     /// applied; the surface should give them back to the user (input box).
     fn steers_returned(&self, _texts: &[String]) {}
+    /// The turn is being retried after a transient failure, and whatever this
+    /// sink already rendered for it is about to be streamed again. Drop that
+    /// partial output: keeping it duplicates the reply. Without this a surface
+    /// could only choose between a doubled answer and never retrying a stream
+    /// that died mid-flight.
+    fn restarted(&self) {}
+    /// What this session is doing now. The one hook that carries liveness, so a
+    /// watcher can tell a model that is thinking from a connection that has
+    /// died — a distinction no amount of reading the event log recovers, because
+    /// a session composing a reply writes nothing.
+    fn phase(&self, _phase: crate::progress::Phase) {}
+    /// The stream produced something within its current phase. Separate from
+    /// [`Self::phase`] because a slow reply and a dead one are the same phase.
+    fn phase_ticked(&self) {}
 }
 
 /// Discards every update — the headless default.

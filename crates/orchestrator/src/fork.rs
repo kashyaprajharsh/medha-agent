@@ -3,11 +3,18 @@
 use kernel::{Message, Role};
 
 /// How much of the parent's conversation a child starts with.
+///
+/// Cold by default. A delegated task states what it needs, and the child is
+/// told it cannot see the conversation that produced it — inheriting that
+/// conversation anyway makes the briefing a lie, and a child reading its
+/// parent's goal re-derives the parent's role instead of doing the narrower job
+/// it was sent to do. It also multiplies the history's token cost by the number
+/// of children. Inheriting is available, but it is a choice the caller makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fork {
     /// Start cold. The objective is all the child gets.
-    None,
     #[default]
+    None,
     All,
     /// The last `n` user turns and everything after them.
     LastTurns(usize),

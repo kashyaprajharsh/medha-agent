@@ -426,6 +426,7 @@ async fn a_nested_childs_report_reaches_its_own_parent() {
             steer: handle,
             budget: kernel::Budget::turns(5),
         },
+        kernel::ProgressHandle::new().1,
     );
 
     let caller = Caller {
@@ -558,6 +559,7 @@ fn listening(control: &AgentControl, path: &str) -> (AgentPath, kernel::Interrup
             steer: handle,
             budget: kernel::Budget::turns(5),
         },
+        kernel::ProgressHandle::new().1,
     );
     (path, queue)
 }
@@ -1697,4 +1699,230 @@ fn the_weakest_trust_a_child_touched_is_what_it_reports() {
         TrustLabel::System
     );
     assert_eq!(least_trusted([]), TrustLabel::Tool);
+}
+
+/// A child that reports what it is doing and then parks, so the roster can be
+/// inspected mid-run rather than only after the fact.
+struct Reporting {
+    phase: kernel::Phase,
+    reached: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ChildRunner for Reporting {
+    async fn run(&self, run: ChildRun) -> Result<ChildOutcome, String> {
+        run.progress.enter(kernel::Phase::Generating);
+        run.progress.metered(1_500);
+        run.progress.tool_dispatched();
+        run.progress.enter(self.phase.clone());
+        self.reached.notify_waiters();
+        run.cancel.cancelled().await;
+        Ok(ChildOutcome {
+            status: AgentStatus::Completed,
+            summary: "done".into(),
+            turns: 1,
+            tool_calls: 1,
+            trust: TrustLabel::Tool,
+        })
+    }
+}
+
+async fn parked(phase: kernel::Phase) -> (AgentControl, AgentPath) {
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let runner = Arc::new(Reporting {
+        phase,
+        reached: Arc::clone(&reached),
+    });
+    let control = deliverable(runner, CancellationToken::new());
+    let owner = control.owner().unwrap_or_default();
+    let waiter = reached.notified();
+    let agent = control
+        .spawn_background(
+            spec("investigate"),
+            &Caller::root(owner),
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
+        .await
+        .expect("spawn");
+    waiter.await;
+    (control, agent.path)
+}
+
+#[tokio::test]
+async fn a_running_child_reports_what_it_is_doing_not_merely_that_it_exists() {
+    let (control, path) = parked(kernel::Phase::InTool {
+        tool: "fs.read".into(),
+        target: Some("app.py".into()),
+    })
+    .await;
+
+    let progress = control.progress();
+    let seen = progress.get(&path).expect("the child is on the live plane");
+    assert_eq!(
+        seen.phase,
+        kernel::Phase::InTool {
+            tool: "fs.read".into(),
+            target: Some("app.py".into())
+        },
+        "the roster must be able to name the tool, not just say 'running'"
+    );
+    assert_eq!(seen.tokens, 1_500, "counters are live, not only in the report");
+    assert_eq!(seen.tool_calls, 1);
+    assert!(seen.stalled_for().is_some(), "work is measurable as a stall");
+    control.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_child_blocked_on_a_person_is_visible_and_never_counted_as_stalled() {
+    let (control, path) = parked(kernel::Phase::AwaitingApproval {
+        action: "shell: npm ls".into(),
+    })
+    .await;
+
+    let waiting = control.awaiting_approval();
+    assert_eq!(
+        waiting,
+        vec![(path.clone(), "shell: npm ls".to_string())],
+        "a child blocked on a card must be reportable, or a tree sits on one prompt"
+    );
+    assert_eq!(
+        control.progress()[&path].stalled_for(),
+        None,
+        "an operator who stepped away has not wedged the agent"
+    );
+    control.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_settled_child_keeps_its_final_counters_for_the_roster() {
+    let (recorder, control) = control();
+    let _ = recorder;
+    let result = run(&control, spec("investigate"), 5).await.expect("report");
+    let path = AgentPath::root().child(&result.agent).expect("path");
+    let progress = control.progress();
+    let seen = progress.get(&path).expect("settled agents stay readable");
+    assert_eq!(seen.phase, kernel::Phase::Settled);
+    assert_eq!(
+        seen.stalled_for(),
+        None,
+        "a finished agent is not a stalled one"
+    );
+}
+
+/// A child that reports a phase and then never speaks again — the shape of the
+/// failure this bound exists to catch.
+struct GoesSilent {
+    phase: kernel::Phase,
+}
+
+#[async_trait]
+impl ChildRunner for GoesSilent {
+    async fn run(&self, run: ChildRun) -> Result<ChildOutcome, String> {
+        run.progress.enter(self.phase.clone());
+        run.cancel.cancelled().await;
+        Ok(ChildOutcome {
+            status: AgentStatus::Cancelled,
+            summary: "read two files before it went quiet".into(),
+            turns: 1,
+            tool_calls: 2,
+            trust: TrustLabel::Tool,
+        })
+    }
+}
+
+fn twitchy(phase: kernel::Phase) -> AgentControl {
+    let quick = Duration::from_millis(40);
+    deliverable(Arc::new(GoesSilent { phase }), CancellationToken::new()).with_stall_bounds(
+        StallBounds {
+            generating: quick,
+            in_tool: quick,
+            idle: quick,
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_child_that_goes_silent_is_stopped_and_still_reports_what_it_found() {
+    let control = twitchy(kernel::Phase::Generating);
+    let result = run(&control, spec("investigate"), 5)
+        .await
+        .expect("a stalled child still delivers a report");
+
+    assert_eq!(
+        result.status,
+        AgentStatus::Exhausted,
+        "nobody cancelled it; reporting `Cancelled` would blame the operator"
+    );
+    assert!(
+        result.summary.contains("going silent"),
+        "the report must say why it stopped: {}",
+        result.summary
+    );
+    assert!(
+        result.summary.contains("read two files"),
+        "partial findings must survive the stop: {}",
+        result.summary
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_tool_is_bounded_too_not_only_a_stalled_stream() {
+    let control = twitchy(kernel::Phase::InTool {
+        tool: "shell".into(),
+        target: Some("npm install".into()),
+    });
+    let result = run(&control, spec("install deps"), 5).await.expect("report");
+    assert_eq!(result.status, AgentStatus::Exhausted);
+}
+
+#[tokio::test]
+async fn a_child_waiting_on_a_person_is_never_stopped_for_being_slow() {
+    let control = twitchy(kernel::Phase::AwaitingApproval {
+        action: "shell: npm ls".into(),
+    });
+    let owner = control.owner().unwrap_or_default();
+    control
+        .spawn_background(
+            spec("needs a decision"),
+            &Caller::root(owner),
+            Arc::new(Tools),
+            kernel::Budget::turns(5),
+        )
+        .await
+        .expect("spawn");
+
+    // Several times the bound: an operator who stepped away has not wedged it.
+    // A real sleep, not a paused clock — the phase clock is a `std::Instant` and
+    // does not advance with tokio's virtual time.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        control.active().len(),
+        1,
+        "an agent blocked on a card must still be running"
+    );
+    assert_eq!(control.awaiting_approval().len(), 1);
+    control.shutdown().await;
+}
+
+#[test]
+fn silence_budgets_differ_by_phase_and_exempt_a_person() {
+    let bounds = StallBounds::default();
+    assert_eq!(
+        bounds.for_phase(&kernel::Phase::AwaitingApproval { action: "x".into() }),
+        None
+    );
+    assert_eq!(bounds.for_phase(&kernel::Phase::Settled), None);
+    assert!(
+        bounds.for_phase(&kernel::Phase::InTool {
+            tool: "shell".into(),
+            target: None
+        }) > bounds.for_phase(&kernel::Phase::Generating),
+        "a long build is not a stalled stream"
+    );
+    assert!(
+        bounds.for_phase(&kernel::Phase::Generating).unwrap()
+            > std::time::Duration::from_secs(120),
+        "must exceed the transport's own idle timeout plus its retries"
+    );
 }

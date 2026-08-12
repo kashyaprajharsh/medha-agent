@@ -480,3 +480,105 @@ async fn headless_without_a_queue_finishes_exactly_as_before() {
     assert_eq!(reason, StopReason::Finished);
     assert_eq!(msgs.last().unwrap().content, "done");
 }
+
+/// Everything needs a decision, so every dispatched intent reaches the gate.
+struct AlwaysHuman;
+impl kernel::Policy for AlwaysHuman {
+    fn authorize(
+        &self,
+        _autonomy: kernel::AutonomyLevel,
+        _intent: &ToolIntent,
+        _blast_radius: Option<kernel::BlastRadius>,
+    ) -> kernel::Decision {
+        kernel::Decision::Human
+    }
+}
+
+/// Records the highest number of cards that were ever open at once. One surface
+/// can only ask one question, so anything above 1 is a card racing another.
+#[derive(Default)]
+struct CountingGate {
+    open: Mutex<usize>,
+    most: Mutex<usize>,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl kernel::HumanGate for CountingGate {
+    async fn confirm(
+        &self,
+        _action: &str,
+        _detail: Option<&str>,
+        _escalated: bool,
+    ) -> kernel::Approval {
+        {
+            let mut open = self.open.lock().unwrap();
+            *open += 1;
+            *self.calls.lock().unwrap() += 1;
+            let mut most = self.most.lock().unwrap();
+            *most = (*most).max(*open);
+        }
+        // Long enough that a second card would have to overlap this one.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        *self.open.lock().unwrap() -= 1;
+        kernel::Approval::Once
+    }
+}
+
+#[tokio::test]
+async fn a_derived_kernel_queues_behind_the_parents_approval_card() {
+    let gate = Arc::new(CountingGate::default());
+    // `derive` shares the provider, so one script serves both sessions: a turn
+    // each, one card each. Queue two or the child's turn finds it exhausted and
+    // never reaches the gate at all.
+    let parent = Kernel::new(
+        Arc::new(ScriptedProvider::new(vec![
+            Turn::Blocks(vec![intent_block("a", "fs.read")]),
+            Turn::Blocks(vec![intent_block("b", "fs.read")]),
+        ])),
+        Arc::new(InMemoryLog::new()),
+        Arc::new(SleepyExecutor {
+            delay: Duration::ZERO,
+        }),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(AlwaysHuman),
+        gate.clone(),
+        Arc::new(NoVerify),
+    );
+    // A sub-agent's kernel: its own executor and gate wrapper, everything else
+    // inherited — exactly how a spawned child is built.
+    let child = parent.derive(
+        Arc::new(SleepyExecutor {
+            delay: Duration::ZERO,
+        }),
+        Arc::new(Passthrough),
+        gate.clone(),
+    );
+
+    let run_one = |k: Kernel<ScriptedProvider, InMemoryLog>| async move {
+        let session = Session::new();
+        let _ = k
+            .run_session(
+                &session,
+                vec![Message::user("go")],
+                Budget::turns(1),
+                &CaptureSink::default(),
+                Some(InterruptQueue::pair().1),
+            )
+            .await;
+    };
+    tokio::join!(run_one(parent), run_one(child));
+
+    assert_eq!(
+        *gate.calls.lock().unwrap(),
+        2,
+        "both sessions must actually reach the gate, or this proves nothing"
+    );
+    assert_eq!(
+        *gate.most.lock().unwrap(),
+        1,
+        "a parent and its child must share one approval lane: two cards at one \
+         surface means whichever the operator answers, the other is answered for them"
+    );
+}

@@ -22,6 +22,12 @@ fn live() -> Live {
     }
 }
 
+/// A receiver with no live publisher. `borrow` keeps working after the sender
+/// drops, so a roster still reads an agent's last known state.
+fn progress() -> kernel::ProgressWatch {
+    kernel::ProgressHandle::new().1
+}
+
 fn agent(path: &AgentPath, started_ms: u64) -> Agent {
     Agent {
         path: path.clone(),
@@ -36,7 +42,7 @@ fn agent(path: &AgentPath, started_ms: u64) -> Agent {
 
 fn start(registry: &Arc<AgentRegistry>, name: &str, started_ms: u64) -> AgentPath {
     let (path, reservation) = registry.claim(&AgentPath::root(), name).unwrap();
-    reservation.commit(agent(&path, started_ms), live());
+    reservation.commit(agent(&path, started_ms), live(), progress());
     path
 }
 
@@ -164,7 +170,7 @@ fn agents_are_found_by_path_or_session_never_by_bare_name() {
     let (nested, reservation) = registry
         .claim(&AgentPath::parse("/survey").unwrap(), "parse")
         .unwrap();
-    reservation.commit(agent(&nested, 2), live());
+    reservation.commit(agent(&nested, 2), live(), progress());
     assert!(registry.find(&root, "parse").is_none());
     assert!(
         registry
@@ -209,13 +215,13 @@ fn evicted_agents_stay_resolvable_by_their_parent_through_the_archive() {
         max_settled: 2,
     });
     let (parent, reservation) = registry.claim(&AgentPath::root(), "parent").unwrap();
-    reservation.commit(agent(&parent, 0), live());
+    reservation.commit(agent(&parent, 0), live(), progress());
     let (sibling, reservation) = registry.claim(&AgentPath::root(), "sibling").unwrap();
-    reservation.commit(agent(&sibling, 0), live());
+    reservation.commit(agent(&sibling, 0), live(), progress());
     let (child, reservation) = registry.claim(&parent, "child").unwrap();
     let child_agent = agent(&child, 1);
     let child_session = child_agent.session.clone();
-    reservation.commit(child_agent, live());
+    reservation.commit(child_agent, live(), progress());
 
     registry.settled(&child, AgentStatus::Completed);
     for n in 0..3 {
@@ -252,7 +258,7 @@ fn evicted_agents_stay_resolvable_by_their_parent_through_the_archive() {
 fn a_revive_that_is_never_committed_puts_the_agent_back() {
     let registry = registry();
     let (path, reservation) = registry.claim(&AgentPath::root(), "writer").unwrap();
-    reservation.commit(agent(&path, 0), live());
+    reservation.commit(agent(&path, 0), live(), progress());
     registry.settled(&path, AgentStatus::Completed);
     assert_eq!(registry.all().len(), 1);
 

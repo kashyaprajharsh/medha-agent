@@ -4,6 +4,8 @@
 //! mechanics which must behave consistently across those protocols: applying
 //! credentials, bounding provider error bodies, and redacting diagnostics.
 
+use std::time::Duration;
+
 use futures::StreamExt;
 use kernel::ProviderError;
 
@@ -11,6 +13,48 @@ use crate::{AuthKind, ProviderProfile};
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const REDACTED: &str = "<redacted>";
+
+/// Connection-establishment ceiling. An endpoint that never finishes a
+/// TCP/TLS handshake is unreachable, not slow.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Backstop on any single read, the wait for response headers included. Set
+/// generously: a queued request legitimately takes minutes to its first byte,
+/// and cutting that short turns a busy provider into a failure.
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Idle ceiling between body chunks once a stream is flowing. Tighter than
+/// [`READ_TIMEOUT`], because a gap here means the connection died rather than
+/// that the request is still queued. The clock restarts on every chunk, so a
+/// slow stream is never penalised for being long.
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Ceiling on an honoured `Retry-After`. A provider asking for an hour is
+/// telling us to stop, not to sleep — past this the caller's own backoff and
+/// retry budget decide, so the turn fails while the user is still watching.
+const MAX_RETRY_AFTER_MS: f64 = 60_000.0;
+
+/// The client every provider request shares. An unconfigured client waits
+/// forever on an endpoint that accepts the connection and then sends nothing,
+/// which is indistinguishable from a hang and cannot be retried because it
+/// never errors. Deliberately no total-request timeout: that would kill a long
+/// stream which is working correctly.
+pub(crate) fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+        .expect("provider HTTP client")
+}
+
+/// How a stalled stream settles. `Stream` classifies as transient, so the turn
+/// retries instead of surfacing a dead connection as a failed request.
+pub(crate) fn stalled_stream() -> ProviderError {
+    ProviderError::Stream(format!(
+        "stream stalled: no data for {}s",
+        STREAM_IDLE_TIMEOUT.as_secs()
+    ))
+}
 
 /// Add bearer authentication only when a non-empty credential is present.
 /// Accepting a pasted `Bearer …` value prevents a malformed double scheme at
@@ -71,10 +115,34 @@ pub(crate) async fn require_success(
     if status.is_success() {
         return Ok(response);
     }
-    Err(ProviderError::Status(
-        status.as_u16(),
-        read_error_body(response).await,
-    ))
+    let retry_after = retry_after(response.headers());
+    let status = status.as_u16();
+    let body = read_error_body(response).await;
+    match retry_after {
+        Some(retry_after) => Err(ProviderError::Throttled {
+            status,
+            retry_after,
+            body,
+        }),
+        None => Err(ProviderError::Status(status, body)),
+    }
+}
+
+/// The wait a response asked for, from `retry-after-ms` or `retry-after`
+/// delta-seconds. The HTTP-date form is not read: providers send it for
+/// scheduled maintenance rather than rate limits, and honouring a date would
+/// mean parking a turn for hours. Absent or unparsable leaves the caller on its
+/// own backoff curve.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok();
+    let millis = match value("retry-after-ms") {
+        Some(ms) => ms,
+        None => value("retry-after")? * 1000.0,
+    };
+    if !millis.is_finite() || millis <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_millis(millis.min(MAX_RETRY_AFTER_MS) as u64))
 }
 
 /// Capture an unsuccessful response body without exceeding the transport cap.
@@ -181,6 +249,79 @@ fn is_sensitive_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stalled_stream_retries_rather_than_failing_the_turn() {
+        let error = stalled_stream();
+        assert!(
+            error.is_retryable(),
+            "a dead connection is transient; failing the turn strands the work"
+        );
+        assert!(!error.is_context_overflow(), "compaction cannot fix a stall");
+        assert!(error.to_string().contains("90s"), "{error}");
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                reqwest::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn retry_after_reads_both_units_and_prefers_milliseconds() {
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "3")])),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            retry_after(&headers(&[("retry-after-ms", "1500")])),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            retry_after(&headers(&[("retry-after-ms", "250"), ("retry-after", "60")])),
+            Some(Duration::from_millis(250)),
+            "the finer unit wins when a provider sends both"
+        );
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "2.5")])),
+            Some(Duration::from_millis(2500))
+        );
+    }
+
+    #[test]
+    fn an_unusable_retry_after_leaves_the_caller_on_its_own_curve() {
+        assert_eq!(retry_after(&headers(&[])), None);
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")])),
+            None,
+            "the HTTP-date form is deliberately not honoured"
+        );
+        assert_eq!(retry_after(&headers(&[("retry-after", "0")])), None);
+        assert_eq!(retry_after(&headers(&[("retry-after", "-5")])), None);
+        assert_eq!(retry_after(&headers(&[("retry-after", "soon")])), None);
+    }
+
+    #[test]
+    fn an_outlandish_retry_after_is_capped_rather_than_parked_on() {
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "3600")])),
+            Some(Duration::from_millis(MAX_RETRY_AFTER_MS as u64))
+        );
+    }
+
+    #[test]
+    fn the_shared_client_builds_with_its_ceilings() {
+        // Construction is the assertion: `expect` in `client()` would panic on a
+        // rejected builder, silently reinstating an unbounded client otherwise.
+        let _ = client();
+        assert!(STREAM_IDLE_TIMEOUT < READ_TIMEOUT, "idle must bite first");
+        assert!(CONNECT_TIMEOUT < STREAM_IDLE_TIMEOUT);
+    }
 
     #[test]
     fn bearer_auth_omits_empty_values_and_normalizes_a_pasted_scheme() {

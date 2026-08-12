@@ -295,6 +295,9 @@ pub(crate) enum TuiEvent {
     Compaction(u32, u32, bool, Option<String>),
     /// Compaction is running (true) / finished (false) — drives the live indicator.
     Compacting(bool),
+    /// The turn is being retried after a transient provider failure and will
+    /// stream its reply again from the start.
+    Restarted,
     Usage(u32, u32),
     /// Session cost so far in USD; `true` = indicative list price (shown "est.").
     Cost(f64, bool),
@@ -1785,6 +1788,11 @@ struct Model {
     streaming: bool,
     /// Whether any reasoning delta arrived during the active turn.
     reasoning_received_this_turn: bool,
+    /// Assistant/thinking items this turn has streamed into the transcript.
+    /// A retried turn re-streams its reply, so this is how much of the tail
+    /// belongs to the attempt being abandoned — counted rather than searched
+    /// for, because an earlier turn's answer can also end in an assistant item.
+    streamed_this_turn: usize,
     /// Delivery result for the most recently completed turn. `None` means this
     /// TUI has not completed a turn yet (resumed history does not retain it).
     last_turn_reasoning_received: Option<bool>,
@@ -1892,6 +1900,7 @@ impl Model {
             reasoning_support: kernel::ReasoningSupport::Unknown,
             streaming: true,
             reasoning_received_this_turn: false,
+            streamed_this_turn: 0,
             last_turn_reasoning_received: None,
             picker: None,
             ac_sel: 0,
@@ -2322,7 +2331,24 @@ impl Model {
                 self.scroll_to_bottom();
             }
         } else {
+            self.streamed_this_turn += 1;
             self.push_item(Item::Assistant(delta.to_string()));
+        }
+    }
+
+    /// Forget what the abandoned attempt rendered, so a retried turn's reply
+    /// arrives once. Only this turn's streamed items are dropped; the answer
+    /// above them belongs to a turn that finished.
+    fn drop_streamed_this_turn(&mut self) {
+        for _ in 0..std::mem::take(&mut self.streamed_this_turn) {
+            self.items.pop_back();
+        }
+        self.reasoning_received_this_turn = false;
+        self.current_tool = None;
+        self.invalidate_all_renders();
+        self.dirty = true;
+        if self.auto_scroll {
+            self.scroll_to_bottom();
         }
     }
 
@@ -2340,6 +2366,7 @@ impl Model {
                 self.scroll_to_bottom();
             }
         } else {
+            self.streamed_this_turn += 1;
             self.push_item(Item::Thinking(delta.to_string()));
         }
     }

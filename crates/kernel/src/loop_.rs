@@ -41,13 +41,19 @@ fn approval_detail(intent: &ToolIntent) -> String {
 /// `rm -rf build/` doesn't then auto-approve every future `shell.exec`. Falls
 /// back to the bare tool name for tools with no obvious identifying arg.
 fn approval_key(intent: &ToolIntent) -> String {
-    let arg = ["command", "path", "url"]
-        .iter()
-        .find_map(|k| intent.args.get(*k).and_then(|v| v.as_str()));
-    match arg {
+    match salient_arg(intent) {
         Some(a) => format!("{}: {a}", intent.tool),
         None => intent.tool.clone(),
     }
+}
+
+/// The argument worth naming when identifying a call — the file, command or URL
+/// it acts on. One definition, so an approval key and a live status line never
+/// disagree about which call they are describing.
+fn salient_arg(intent: &ToolIntent) -> Option<&str> {
+    ["command", "path", "url"]
+        .iter()
+        .find_map(|key| intent.args.get(*key).and_then(|value| value.as_str()))
 }
 
 fn attach_discovered_context(
@@ -299,7 +305,12 @@ pub struct Kernel<P: Provider, L: EventLog> {
     pricing: Option<crate::types::Pricing>,
     /// Serializes human-gate prompts: parallel tool dispatch must not pop
     /// several approval cards at once.
-    gate_serial: futures::lock::Mutex<()>,
+    ///
+    /// Shared with every kernel derived from this one, because the operator is
+    /// shared too. A per-session lock only orders one session's own cards, so a
+    /// tree of agents would each hold their own lane and race the single surface
+    /// they all prompt through.
+    gate_serial: Arc<futures::lock::Mutex<()>>,
     /// Orders state-changing turns across concurrent root/child sessions. The
     /// guard spans execution through durable observation logging, so another
     /// mutation cannot commit in the gap before replay learns about this one.
@@ -319,8 +330,16 @@ const MAX_PROVIDER_STREAM_BLOCKS: usize = 16_384;
 const MAX_PROVIDER_STREAM_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many times a turn's model stream is retried on a transient provider
-/// failure (429 / 5xx / network drop) before giving up.
-const MAX_TURN_RETRIES: u32 = 3;
+/// failure (429 / 5xx / network drop / stalled stream) before giving up.
+const MAX_TURN_RETRIES: u32 = 5;
+
+/// First backoff nap between stream retries.
+const RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Ceiling on one backoff nap. A rate limit needs tens of seconds to clear, so
+/// a sub-second curve spends the entire retry budget inside the window that was
+/// refusing us and reports failure before the limit has lifted.
+const RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 /// Bound measure → compact → remeasure so a pathological compressor cannot
 /// rewrite the same turn indefinitely.
 const MAX_COMPACTION_PASSES: u32 = 3;
@@ -331,9 +350,33 @@ const MAX_COMPACTION_PASSES: u32 = 3;
 /// synthesized observation keeps the intent→observation invariant intact.
 const TOOL_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Capped exponential backoff between stream retries: 250ms, 500ms, 1s, …
+/// Capped exponential backoff with ±25% jitter: 500ms, 1s, 2s, 4s, 8s, …
+///
+/// The jitter decorrelates the sessions in one agent tree. Children spawned
+/// together hit their rate limit together, and an unjittered curve then has
+/// them retry in lockstep and be refused in lockstep until the budget is gone.
 fn retry_backoff(attempt: u32) -> std::time::Duration {
-    std::time::Duration::from_millis(250u64.saturating_mul(1 << attempt.saturating_sub(1).min(4)))
+    let base = RETRY_BASE
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(6))
+        .min(RETRY_MAX_BACKOFF);
+    let spread = (base.as_millis() / 4) as u64;
+    if spread == 0 {
+        return base;
+    }
+    // Centred on `base`, so the average interval stays on the curve.
+    let offset = jitter_nanos() % (spread * 2 + 1);
+    base.saturating_add(std::time::Duration::from_millis(offset))
+        .saturating_sub(std::time::Duration::from_millis(spread))
+        .min(RETRY_MAX_BACKOFF)
+}
+
+/// A cheap source of spread for [`retry_backoff`]. Jitter needs decorrelation,
+/// not unpredictability, so the clock serves and no dependency is needed.
+fn jitter_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| u64::from(since.subsec_nanos()))
+        .unwrap_or(0)
 }
 
 impl<P: Provider, L: EventLog> Kernel<P, L> {
@@ -360,7 +403,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             progressive_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             pricing: None,
-            gate_serial: futures::lock::Mutex::new(()),
+            gate_serial: Arc::new(futures::lock::Mutex::new(())),
             mutation_serial: Arc::new(tokio::sync::Mutex::new(())),
             settle_grace: TOOL_SETTLE_GRACE,
         }
@@ -387,7 +430,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             progressive_context: self.progressive_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
             pricing: self.pricing,
-            gate_serial: futures::lock::Mutex::new(()),
+            // Shared, not rebuilt: see the field's own note. A fresh lane here
+            // is what let three children pop three cards at one surface.
+            gate_serial: Arc::clone(&self.gate_serial),
             mutation_serial: Arc::clone(&self.mutation_serial),
             settle_grace: self.settle_grace,
         }
@@ -517,6 +562,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     /// cancellation invariant: a call either settles with its real result or
     /// gets one synthesized interrupted observation. Calls that have not
     /// started when cancellation arrives are never dispatched.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_admitted(
         &self,
         session: &Session,
@@ -525,6 +571,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         cancel: tokio_util::sync::CancellationToken,
         wall_deadline: Option<tokio::time::Instant>,
         settle_deadline: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+        sink: &dyn StreamSink,
     ) -> (
         String,
         String,
@@ -548,7 +595,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // tool gets TOOL_SETTLE_GRACE to finish and keep its real
             // observation. Only after the grace is it dropped and replaced by
             // a synthetic result, preserving intent → observation.
-            let fut = self.dispatch_one(session, &intent, web_tainted);
+            let fut = self.dispatch_one(session, &intent, web_tainted, sink);
             tokio::pin!(fut);
             tokio::select! {
                 biased;
@@ -1166,6 +1213,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                     dispatch_cancel.clone(),
                                     dispatch_wall_deadline,
                                     Arc::clone(&dispatch_settle_deadline),
+                                    sink,
                                 )
                             })
                             .buffered(self.max_parallel_tools);
@@ -1256,6 +1304,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                     dispatch_cancel.clone(),
                                     dispatch_wall_deadline,
                                     Arc::clone(&dispatch_settle_deadline),
+                                    sink,
                                 )
                                 .await;
                             (Some(lease), result)
@@ -1304,6 +1353,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             dispatch_cancel.clone(),
                             dispatch_wall_deadline,
                             Arc::clone(&dispatch_settle_deadline),
+                            sink,
                         )
                     })
                     .buffered(self.max_parallel_tools);
@@ -1425,6 +1475,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             let reservation = governor
                 .reserve_model(prepared_input_tokens, reserved_output_tokens, self.pricing)
                 .map_err(KernelError::Budget)?;
+            sink.phase(crate::progress::Phase::Generating);
             match self
                 .stream_turn(&request, sink, cancel, wall_deadline)
                 .await
@@ -1493,13 +1544,28 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         crate::provider::ProviderFailure::Transient
                         | crate::provider::ProviderFailure::Fatal => {}
                     }
-                    if e.is_retryable() && !emitted && attempt < MAX_TURN_RETRIES {
+                    if e.is_retryable() && attempt < MAX_TURN_RETRIES {
                         attempt += 1;
+                        // A stream that died after streaming part of a reply is
+                        // the common shape of a transient failure, so refusing
+                        // to retry once anything was emitted would strand
+                        // exactly the turns most worth saving. The sink drops
+                        // its partial render instead, and the reply arrives once.
+                        if emitted {
+                            sink.restarted();
+                        }
+                        // A retry is progress, not silence. Without this an
+                        // inactivity bound would kill the turns that are
+                        // recovering from exactly the stall it exists to catch.
+                        sink.phase_ticked();
+                        // The provider's own number when it gave one; retrying
+                        // sooner than asked just earns another refusal.
+                        let wait = e.retry_after().unwrap_or_else(|| retry_backoff(attempt));
                         // The backoff nap races the cancel token too — Esc
                         // during a retry wait must stop the turn, not queue
                         // another attempt.
                         tokio::select! {
-                            _ = tokio::time::sleep(retry_backoff(attempt)) => continue,
+                            _ = tokio::time::sleep(wait) => continue,
                             _ = cancel.cancelled() => {
                                 break (
                                     String::new(),
@@ -1623,6 +1689,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             };
             let Some(block) = block else { break };
+            // Every block is proof the connection is alive. Without this a slow
+            // reply and a dead one share one phase and one clock.
+            sink.phase_ticked();
             stream_blocks = stream_blocks.saturating_add(1);
             if stream_blocks > MAX_PROVIDER_STREAM_BLOCKS {
                 return Err((
@@ -1809,6 +1878,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         session: &Session,
         intent: &ToolIntent,
         web_tainted: bool,
+        sink: &dyn StreamSink,
     ) -> Observation {
         let radius = self.executor.blast_radius(&intent.tool);
         let raw = self.policy.authorize(session.autonomy, intent, radius);
@@ -1833,6 +1903,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         match decision {
             crate::types::Decision::Deny { reason } => Observation::denial(&intent.id, reason),
             crate::types::Decision::Human => {
+                // Published before the wait for the lane, not after: an agent
+                // queued behind another agent's card is still blocked on a
+                // person, and a watcher must be able to say so.
+                sink.phase(crate::progress::Phase::AwaitingApproval {
+                    action: approval_key(intent),
+                });
                 // Hold the lock through the answer, then drop it before execution so an
                 // approved slow tool doesn't block the next card.
                 let approved = {
@@ -1849,6 +1925,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .approved()
                 };
                 if approved {
+                    self.running_tool(intent, sink);
                     self.execute_with_net_retry(session, intent, web_tainted, radius)
                         .await
                 } else {
@@ -1856,10 +1933,20 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             }
             crate::types::Decision::Allow => {
+                self.running_tool(intent, sink);
                 self.execute_with_net_retry(session, intent, web_tainted, radius)
                     .await
             }
         }
+    }
+
+    /// Publish which tool is running, and on what. A watcher showing "in tool"
+    /// with no target cannot tell a wedged read from a long build.
+    fn running_tool(&self, intent: &ToolIntent, sink: &dyn StreamSink) {
+        sink.phase(crate::progress::Phase::InTool {
+            tool: intent.tool.clone(),
+            target: salient_arg(intent).map(str::to_string),
+        });
     }
 
     /// Run the intent; if it failed because the sandbox denied network, offer a
@@ -2363,5 +2450,66 @@ mod trust_flow_tests {
             Containment::None,
         );
         assert!(matches!(d, Decision::Deny { .. }));
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_and_stays_within_its_jitter_band() {
+        for attempt in 1..=5u32 {
+            let curve = RETRY_BASE * (1u32 << (attempt - 1));
+            let spread = curve / 4;
+            for _ in 0..64 {
+                let actual = retry_backoff(attempt);
+                assert!(
+                    actual >= curve - spread && actual <= curve + spread,
+                    "attempt {attempt}: {actual:?} outside {curve:?} ±{spread:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_is_capped_however_many_attempts() {
+        for attempt in 1..64u32 {
+            assert!(
+                retry_backoff(attempt) <= RETRY_MAX_BACKOFF,
+                "attempt {attempt} exceeded the ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ceiling_leaves_room_for_a_rate_limit_to_clear() {
+        // The failure this replaces: a 250ms curve over 3 attempts gave up
+        // 1.75s after the first refusal, well inside any real limit window.
+        let total: std::time::Duration = (1..=MAX_TURN_RETRIES).map(retry_backoff).sum();
+        assert!(total >= std::time::Duration::from_secs(10), "{total:?}");
+    }
+
+    #[test]
+    fn a_stated_retry_after_is_preferred_over_the_curve() {
+        let asked = std::time::Duration::from_secs(7);
+        let throttled = crate::provider::ProviderError::Throttled {
+            status: 429,
+            retry_after: asked,
+            body: "slow down".into(),
+        };
+        assert!(throttled.is_retryable());
+        assert_eq!(throttled.retry_after(), Some(asked));
+        assert_eq!(
+            throttled.retry_after().unwrap_or_else(|| retry_backoff(1)),
+            asked
+        );
+    }
+
+    #[test]
+    fn an_unthrottled_transient_falls_back_to_the_curve() {
+        let stalled = crate::provider::ProviderError::Stream("stream stalled".into());
+        assert!(stalled.is_retryable());
+        assert_eq!(stalled.retry_after(), None);
     }
 }

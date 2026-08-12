@@ -48,6 +48,11 @@ pub(crate) struct Live {
 struct Tree {
     agents: HashMap<AgentPath, Agent>,
     live: HashMap<AgentPath, Live>,
+    /// What each agent is doing, outliving [`Live`] deliberately: a settled
+    /// agent's final tool and token counts are what a roster shows for it, and
+    /// dropping the last receiver would discard them. Cleared on eviction, with
+    /// the row it describes.
+    progress: HashMap<AgentPath, kernel::ProgressWatch>,
     settled: Vec<AgentPath>,
     /// Names reserved atomically before startup and excluded from listings.
     reserved: HashSet<AgentPath>,
@@ -128,11 +133,29 @@ impl AgentRegistry {
         })
     }
 
-    fn started(&self, agent: Agent, live: Live) {
+    fn started(&self, agent: Agent, live: Live, progress: kernel::ProgressWatch) {
         let mut tree = self.lock();
         tree.reserved.remove(&agent.path);
         tree.live.insert(agent.path.clone(), live);
+        tree.progress.insert(agent.path.clone(), progress);
         tree.agents.insert(agent.path.clone(), agent);
+    }
+
+    /// What `path` is doing, for a running or a settled agent alike.
+    pub fn progress(&self, path: &AgentPath) -> Option<kernel::Progress> {
+        self.lock()
+            .progress
+            .get(path)
+            .map(|watch| watch.borrow().clone())
+    }
+
+    /// Every agent's live state, keyed by path — one lock for a whole repaint.
+    pub fn progress_all(&self) -> HashMap<AgentPath, kernel::Progress> {
+        self.lock()
+            .progress
+            .iter()
+            .map(|(path, watch)| (path.clone(), watch.borrow().clone()))
+            .collect()
     }
 
     pub(crate) fn settled(&self, path: &AgentPath, status: AgentStatus) {
@@ -145,6 +168,7 @@ impl AgentRegistry {
         tree.settled.push(path.clone());
         while tree.settled.len() > self.max_settled {
             let oldest = tree.settled.remove(0);
+            tree.progress.remove(&oldest);
             if let Some(evicted) = tree.agents.remove(&oldest) {
                 tree.archived.retain(|(path, _)| path != &oldest);
                 tree.archived.push((oldest, evicted.session));
@@ -270,6 +294,7 @@ impl AgentRegistry {
     pub(crate) fn rollback_start(&self, path: &AgentPath, restore: Option<Agent>) {
         let mut tree = self.lock();
         tree.live.remove(path);
+        tree.progress.remove(path);
         tree.agents.remove(path);
         tree.settled.retain(|settled| settled != path);
         if let Some(agent) = restore {
@@ -294,10 +319,10 @@ pub(crate) struct Reservation {
 }
 
 impl Reservation {
-    pub(crate) fn commit(mut self, agent: Agent, live: Live) {
+    pub(crate) fn commit(mut self, agent: Agent, live: Live, progress: kernel::ProgressWatch) {
         self.path = None;
         self.restore = None;
-        self.registry.started(agent, live);
+        self.registry.started(agent, live, progress);
     }
 }
 

@@ -140,7 +140,7 @@ impl ProviderClient {
         let max_ctx = connection.profile.max_ctx;
         Self {
             connection: Mutex::new(connection),
-            http: reqwest::Client::new(),
+            http: http::client(),
             caps: ProviderCaps {
                 vision: false,
                 caching: false,
@@ -399,7 +399,17 @@ impl ProviderClient {
             let mut decoder = gemini_interactions::ResponseDecoder::new(names);
 
             futures::pin_mut!(byte_stream);
-            while let Some(chunk) = byte_stream.next().await {
+            loop {
+                let next =
+                    tokio::time::timeout(http::STREAM_IDLE_TIMEOUT, byte_stream.next()).await;
+                let chunk = match next {
+                    Err(_) => {
+                        yield Err(http::stalled_stream());
+                        return;
+                    }
+                    Ok(None) => break,
+                    Ok(Some(chunk)) => chunk,
+                };
                 match chunk {
                     Err(error) => {
                         yield Err(ProviderError::Transport(error.to_string()));
@@ -981,7 +991,22 @@ impl Provider for ProviderClient {
             let mut decoder = openai_chat::ResponseDecoder::new(names);
 
             futures::pin_mut!(byte_stream);
-            while let Some(chunk) = byte_stream.next().await {
+            loop {
+                let next =
+                    tokio::time::timeout(http::STREAM_IDLE_TIMEOUT, byte_stream.next()).await;
+                let chunk = match next {
+                    // A stall is reported like any transport failure, so the
+                    // tail the filter is holding still reaches the caller.
+                    Err(_) => {
+                        if let Some(b) = decoder.flush_pending() {
+                            yield Ok(b);
+                        }
+                        yield Err(http::stalled_stream());
+                        return;
+                    }
+                    Ok(None) => break,
+                    Ok(Some(chunk)) => chunk,
+                };
                 match chunk {
                     Err(e) => {
                         // Surface what the filter is still holding before the

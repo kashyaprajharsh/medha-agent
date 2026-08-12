@@ -89,3 +89,18 @@ fn a_fork_setting_is_parsed_or_refused_never_guessed() {
     assert!(Fork::parse("0").is_err());
     assert!(Fork::parse("some").is_err());
 }
+
+#[test]
+fn an_unspecified_fork_starts_the_child_cold() {
+    // The child's briefing states it cannot see the conversation that produced
+    // its task, and `agent.spawn` describes the objective as everything the
+    // child sees. Defaulting to `All` contradicted both.
+    assert_eq!(Fork::default(), Fork::None);
+    assert!(Fork::default().apply(&conversation()).is_empty());
+}
+
+#[test]
+fn inheriting_stays_available_for_a_caller_that_asks() {
+    assert_eq!(Fork::parse("all").unwrap(), Fork::All);
+    assert!(!Fork::All.apply(&conversation()).is_empty());
+}

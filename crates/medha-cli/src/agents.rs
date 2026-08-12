@@ -7,10 +7,43 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use kernel::{
-    Event, EventKind, EventLog, Kernel, Message, NullSink, Provider, Role, Session, StopReason,
-    TrustLabel,
+    Event, EventKind, EventLog, Kernel, Message, Provider, Role, Session, StopReason, TrustLabel,
 };
 use orchestrator::{AgentStatus, ChildOutcome, ChildRun, ChildRunner};
+
+/// Publishes a child's liveness as it runs.
+///
+/// Children used to stream into [`kernel::NullSink`], which discarded every
+/// token, tool call and phase change the moment it was produced. That is why a
+/// running child could only ever be described by scraping timestamps back out of
+/// the event log — and why a wedged one looked exactly like a busy one.
+struct AgentSink {
+    progress: kernel::ProgressHandle,
+}
+
+impl kernel::StreamSink for AgentSink {
+    fn phase(&self, phase: kernel::Phase) {
+        self.progress.enter(phase);
+    }
+
+    fn phase_ticked(&self) {
+        self.progress.ticked();
+    }
+
+    fn tool_call(&self, _tool: &str, _args: &serde_json::Value) {
+        self.progress.tool_dispatched();
+    }
+
+    fn usage(&self, _prompt_tokens: u32, total_tokens: u32) {
+        self.progress.metered(u64::from(total_tokens));
+    }
+
+    fn cost(&self, total_usd: f64, _indicative: bool) {
+        // `cost` reports the running total, not a delta, so it is recorded as an
+        // absolute rather than added to what is already there.
+        self.progress.priced(total_usd);
+    }
+}
 
 fn child_prompt(run: &ChildRun) -> String {
     let mut prompt = format!(
@@ -901,8 +934,11 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         // The queue owns cancellation, allowing `run_session` to settle in-flight
         // tools and the transcript. Pass the steer queue through so accepted text
         // reaches the child's next turn boundary.
+        let sink = AgentSink {
+            progress: run.progress.clone(),
+        };
         let outcome = child
-            .run_session(&session, messages, budget, &NullSink, Some(run.interrupts))
+            .run_session(&session, messages, budget, &sink, Some(run.interrupts))
             .await;
         let (transcript, stop) = match outcome {
             Ok(result) => result,
@@ -1295,6 +1331,7 @@ mod child_prompt_tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             workspace,
             interrupts: kernel::InterruptQueue::pair().1,
+            progress: kernel::ProgressHandle::new().0,
         })
     }
 

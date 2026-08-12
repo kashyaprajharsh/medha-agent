@@ -287,7 +287,7 @@ impl Tool for AgentSpawn {
                 },
                 "fork": {
                     "type": "string",
-                    "description": "How much of this conversation the child inherits: 'all' (default), 'none' for a cold start, or a number of recent turns. Lower it when the task is self-contained and the history is long; 'none' when the objective says everything."
+                    "description": "How much of this conversation the child inherits: 'none' (default — it works from the objective alone), 'all', or a number of recent turns. Raise it only when the task genuinely depends on what was said earlier and you cannot restate it in the objective; the child pays for that history in its own context."
                 },
                 "tasks": {
                     "type": "array",
@@ -301,7 +301,7 @@ impl Tool for AgentSpawn {
                             "tools": { "type": "array", "items": { "type": "string" } },
                             "max_turns": { "type": "integer", "description": "Turn ceiling for this task, clamped to the caller and operator ceilings." },
                             "write": { "type": "boolean", "description": "REQUIRED if this task changes anything; without it the child is read-only and cannot edit." },
-                            "fork": { "type": "string", "description": "How much of this conversation this child inherits: 'all' (default), 'none', or a number of turns." }
+                            "fork": { "type": "string", "description": "How much of this conversation this child inherits: 'none' (default), 'all', or a number of turns." }
                         },
                         "required": ["objective"]
                     }
@@ -472,7 +472,8 @@ fn parent_executor(slot: &ParentHandle) -> Option<Arc<dyn kernel::Executor>> {
     slot.lock().ok()?.as_ref()?.upgrade()
 }
 
-/// An omitted fork mode inherits the full conversation.
+/// An omitted fork mode starts the child cold, which is what its objective and
+/// its briefing both already promise.
 fn parse_fork(args: &Value) -> Result<orchestrator::Fork, ToolError> {
     match args.get("fork").and_then(Value::as_str) {
         None => Ok(orchestrator::Fork::default()),

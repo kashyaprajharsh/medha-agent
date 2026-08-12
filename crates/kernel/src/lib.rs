@@ -10,6 +10,7 @@ pub mod executor;
 pub mod gate;
 pub mod interrupts;
 pub mod policy;
+pub mod progress;
 pub mod provider;
 pub mod sink;
 pub mod types;
@@ -35,6 +36,7 @@ pub use gate::{
     Approval, AutoDeny, HumanGate, NetworkDecision, network_once_active, network_once_scope,
 };
 pub use interrupts::{Activity, Interrupt, InterruptHandle, InterruptQueue};
+pub use progress::{Phase, Progress, ProgressHandle, ProgressWatch};
 pub use kernel_loop::{DEFAULT_MAX_PARALLEL_TOOLS, Kernel, StopReason};
 pub use policy::{AllowAll, Policy};
 pub use provider::{

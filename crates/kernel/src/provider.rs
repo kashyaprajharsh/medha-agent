@@ -228,6 +228,15 @@ pub enum ProviderError {
     Decode(String),
     #[error("provider returned status {0}: {1}")]
     Status(u16, String),
+    /// A rate limit or server error which stated when to come back. Held apart
+    /// from [`ProviderError::Status`] so the wait is the provider's number
+    /// rather than our guess — backing off less than asked earns another 429.
+    #[error("provider returned status {status}: {body}")]
+    Throttled {
+        status: u16,
+        retry_after: std::time::Duration,
+        body: String,
+    },
     /// An error object delivered inside an otherwise-successful HTTP response.
     #[error("provider response error: {0}")]
     Response(String),
@@ -267,9 +276,20 @@ impl ProviderError {
         )
     }
 
+    /// How long the provider asked us to wait, when it said so. The retry
+    /// schedule prefers this over its own backoff curve.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            ProviderError::Throttled { retry_after, .. } => Some(*retry_after),
+            _ => None,
+        }
+    }
+
     pub fn classify(&self) -> ProviderFailure {
         match self {
-            ProviderError::Transport(_) | ProviderError::Stream(_) => ProviderFailure::Transient,
+            ProviderError::Transport(_)
+            | ProviderError::Stream(_)
+            | ProviderError::Throttled { .. } => ProviderFailure::Transient,
             ProviderError::Decode(_) => ProviderFailure::Fatal,
             ProviderError::Response(message) => classify_rejection(None, message),
             ProviderError::Status(code, message) => {

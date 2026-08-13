@@ -4255,6 +4255,21 @@ struct ShellExec {
 /// is killed and awaited before the tool returns an error; it is never detached.
 const SHELL_TIMEOUT_SECS: u64 = 50;
 const SHELL_TIMEOUT_MAX_SECS: u64 = 600;
+/// How often a running command is checked for a resolver failure. Short enough
+/// that the grant card arrives while the user is still watching the command.
+const NET_DENIAL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+/// Silence after a resolver failure before the command is treated as stuck.
+/// Package managers back off for tens of seconds between retries; anything
+/// still doing useful work writes something long before this elapses.
+const NET_DENIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why a bounded foreground wait ended.
+enum ShellWait {
+    Finished,
+    /// Blocked on the network and no longer making progress.
+    NetStalled,
+    Deadline,
+}
 
 /// A process retains at most 1.5 MB across stdout/stderr in `sandbox::exec`.
 /// Admission control therefore bounds live shell capture to about 48 MB, and
@@ -4274,11 +4289,7 @@ const NETWORK_DISABLED_HINT: &str = "The active sandbox denied network access. M
 /// policy rejection, so this deliberately does not attribute causality — it only
 /// states the independently known sandbox posture. `denies_network` is the
 /// backend's config intent, not proof of enforcement.
-fn network_disabled_hint(
-    denies_network: bool,
-    stdout: &str,
-    stderr: &str,
-) -> Option<&'static str> {
+fn network_disabled_hint(denies_network: bool, stdout: &str, stderr: &str) -> Option<&'static str> {
     sandbox::network_denial_signature(stdout, stderr, denies_network)
         .then_some(NETWORK_DISABLED_HINT)
 }
@@ -4331,6 +4342,7 @@ struct TaskEntry {
 enum TerminalTaskStatus {
     Exited,
     TimedOut,
+    NetBlocked,
 }
 
 impl TerminalTaskStatus {
@@ -4338,6 +4350,7 @@ impl TerminalTaskStatus {
         match self {
             Self::Exited => "exited",
             Self::TimedOut => "timed_out",
+            Self::NetBlocked => "net_blocked",
         }
     }
 }
@@ -4625,6 +4638,65 @@ impl TaskTable {
         sandbox::exec::wait_done(rx, dur).await
     }
 
+    /// Live resolver-failure flag and captured-byte count, or `None` if the id is
+    /// no longer active. Both reads are synchronous, so the table lock is never
+    /// held across an await.
+    fn net_progress(&self, id: &str) -> Option<(bool, u64)> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = state.active.get(id)?;
+        Some((task.proc.network_denial_seen(), task.proc.bytes_seen()))
+    }
+
+    /// Await a task, but under a net-denying sandbox also watch it while it runs.
+    ///
+    /// A resolver failure alone is not enough to stop a command: a build that
+    /// logs one failed optional fetch and keeps working would be destroyed by a
+    /// grant prompt it never needed. So a marker only opens a grace window, and
+    /// the verdict is what happens next — output means progress and the command
+    /// is left alone, silence means it is sitting in a retry backoff that will
+    /// consume the whole deadline for nothing.
+    async fn watch_until(
+        &self,
+        id: &str,
+        dur: std::time::Duration,
+        watch_network: bool,
+    ) -> ShellWait {
+        if !watch_network {
+            return match self.wait_until(id, dur).await {
+                true => ShellWait::Finished,
+                false => ShellWait::Deadline,
+            };
+        }
+        let started = std::time::Instant::now();
+        let mut stalled: Option<(std::time::Instant, u64)> = None;
+        loop {
+            let remaining = dur.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return ShellWait::Deadline;
+            }
+            if self.wait_until(id, NET_DENIAL_POLL.min(remaining)).await {
+                return ShellWait::Finished;
+            }
+            let Some((seen, bytes)) = self.net_progress(id) else {
+                return ShellWait::Deadline;
+            };
+            if !seen {
+                continue;
+            }
+            match stalled {
+                Some((since, at)) if at == bytes => {
+                    if since.elapsed() >= NET_DENIAL_GRACE {
+                        return ShellWait::NetStalled;
+                    }
+                }
+                _ => stalled = Some((std::time::Instant::now(), bytes)),
+            }
+        }
+    }
+
     /// Transfer ownership out without holding the table lock across a wait.
     fn take(&self, id: &str) -> Option<TaskEntry> {
         self.inner
@@ -4840,12 +4912,16 @@ impl Tool for ShellExec {
         // Install the Drop guard before the first await. A dropped execute future
         // synchronously signals the registered process group before the kernel
         // can release its mutation lease.
-        if self.tasks.wait_until(registered.id(), deadline).await {
+        let denies_network = self.sbx.denies_network();
+        let waited = self
+            .tasks
+            .watch_until(registered.id(), deadline, denies_network)
+            .await;
+        if let ShellWait::Finished = waited {
             let (task_id, entry) = registered
                 .take()
                 .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
             let completed = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
-            let denies_network = self.sbx.denies_network();
             let net_denied = sandbox::network_denial_signature(
                 &completed.stdout,
                 &completed.stderr,
@@ -4871,34 +4947,49 @@ impl Tool for ShellExec {
             return Ok(result);
         }
 
-        // Deadline: transfer ownership, kill the whole tree, and wait for the
-        // child waiter to settle before returning. The durable mutation lease
-        // remains held throughout this path.
+        // Stopped early or at the deadline: transfer ownership, kill the whole
+        // tree, and wait for the child waiter to settle before returning. The
+        // durable mutation lease remains held throughout this path.
         let (task_id, entry) = registered
             .take()
             .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
         entry.proc.kill();
         entry.proc.wait().await;
-        let completed = CompletedTask::capture(entry, TerminalTaskStatus::TimedOut);
-        // A command that retried a denied resolver until the deadline is still a
-        // network denial; without this the escalation is silently unreachable for
-        // anything slow enough to time out.
-        let net_denied = sandbox::network_denial_signature(
-            &completed.stdout,
-            &completed.stderr,
-            self.sbx.denies_network(),
+        let stalled = matches!(waited, ShellWait::NetStalled);
+        let completed = CompletedTask::capture(
+            entry,
+            if stalled {
+                TerminalTaskStatus::NetBlocked
+            } else {
+                TerminalTaskStatus::TimedOut
+            },
         );
         let mut payload = json!({
-            "error": format!("shell command timed out after {timeout_s}s; process tree was stopped"),
             "command": command,
-            "timed_out": true,
             "exit_code": completed.exit_code,
             "stdout": completed.stdout,
             "stderr": completed.stderr,
             "stdout_truncated": completed.stdout_truncated,
             "stderr_truncated": completed.stderr_truncated,
         });
-        if net_denied {
+        if stalled {
+            payload["error"] = json!(
+                "stopped early: this command reported a name-resolution failure under a \
+                 network-denying sandbox and then made no further progress"
+            );
+            payload["net_blocked"] = Value::Bool(true);
+        } else {
+            payload["error"] = json!(format!(
+                "shell command timed out after {timeout_s}s; process tree was stopped"
+            ));
+            payload["timed_out"] = Value::Bool(true);
+        }
+        // A timeout under a net-denying box escalates even with no marker: when
+        // the failing stderr went into a pipe (`| tail`), the kill leaves that
+        // filter's buffer unflushed and no amount of output matching can recover
+        // it. The command has already failed here, so offering the grant costs a
+        // dismissal at worst — the wording stays honest about which case it is.
+        if stalled || denies_network {
             payload[NET_DENIED] = Value::Bool(true);
         }
         self.tasks.remember(task_id, completed);
@@ -7690,6 +7781,147 @@ mod tests {
         );
         let list = run(&reg, "task.list", json!({})).await;
         assert!(list.payload["tasks"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Runs commands unjailed but reports the net-denying posture, so the
+    /// escalation path can be exercised without a real jail (which the CI box
+    /// may not be able to build) and without touching the network.
+    struct NetDenyingBackend;
+
+    #[async_trait]
+    impl sandbox::exec::ExecBackend for NetDenyingBackend {
+        fn build_command(
+            &self,
+            req: &sandbox::exec::ExecRequest,
+        ) -> Result<tokio::process::Command, sandbox::exec::ExecError> {
+            sandbox::exec::HostBackend.build_command(req)
+        }
+        fn label(&self) -> &str {
+            "host"
+        }
+        fn denies_network(&self, _req: &sandbox::exec::ExecRequest) -> bool {
+            true
+        }
+    }
+
+    fn reg_net_denied(dir: &std::path::Path) -> ToolRegistry {
+        std::fs::create_dir_all(dir).unwrap();
+        let sbx = WorkspaceSandbox::new_jailed(dir)
+            .unwrap()
+            .with_exec_backend(Arc::new(NetDenyingBackend));
+        ToolRegistry::with_workspace(Arc::new(sbx), mem_artifacts())
+    }
+
+    /// The reported bug: a package manager reports one resolver failure, then
+    /// sleeps in a retry backoff far longer than the deadline. It must be cut
+    /// short and escalated, not sat on until the timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_stuck_on_a_denied_resolver_escalates_without_waiting_out_the_deadline() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-netstall-{}", ulid_like()));
+        let reg = reg_net_denied(&dir);
+        let started = std::time::Instant::now();
+        let obs = run(
+            &reg,
+            "shell.exec",
+            json!({
+                "command": "echo 'getaddrinfo ENOTFOUND registry.example' >&2; sleep 45",
+                "timeout_s": 45
+            }),
+        )
+        .await;
+        assert_eq!(obs.status, kernel::ObsStatus::Error);
+        assert!(obs.net_denied, "a grant must be offered: {:?}", obs.payload);
+        assert_eq!(obs.payload["net_blocked"], true, "{:?}", obs.payload);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "escalated only after {:?}; the point is not to wait out the deadline",
+            started.elapsed()
+        );
+        assert!(reg.background_tasks().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A command that logs a failed optional fetch and keeps working must not be
+    /// killed for a grant it never needed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_keeps_working_after_a_resolver_failure_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-network-{}", ulid_like()));
+        let reg = reg_net_denied(&dir);
+        let obs = run(
+            &reg,
+            "shell.exec",
+            json!({
+                "command": "echo 'getaddrinfo ENOTFOUND optional.example' >&2; \
+                            for i in 1 2 3 4 5 6 7 8; do echo step $i; sleep 1; done; echo done",
+                "timeout_s": 30
+            }),
+        )
+        .await;
+        assert_eq!(obs.status, kernel::ObsStatus::Ok, "{:?}", obs.payload);
+        assert_eq!(obs.payload["exit_code"], 0);
+        assert!(
+            obs.payload["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("done"),
+            "the command was cut short: {:?}",
+            obs.payload
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The piped case from the report: `… | tail` swallows the resolver error,
+    /// so no output can ever prove the cause. The command has already failed, so
+    /// the grant is still offered — just under wording that claims less.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_under_a_net_denying_box_still_offers_a_grant_with_no_marker() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-netpipe-{}", ulid_like()));
+        let reg = reg_net_denied(&dir);
+        let obs = run(
+            &reg,
+            "shell.exec",
+            json!({
+                "command": "(echo 'getaddrinfo ENOTFOUND registry.example' >&2; sleep 30) 2>&1 | tail -5",
+                "timeout_s": 2
+            }),
+        )
+        .await;
+        assert_eq!(obs.status, kernel::ObsStatus::Error);
+        assert_eq!(obs.payload["timed_out"], true, "{:?}", obs.payload);
+        assert!(
+            obs.payload["stderr"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+                && !obs.payload["stdout"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("ENOTFOUND"),
+            "premise of this test is that the pipe hid the error: {:?}",
+            obs.payload
+        );
+        assert!(obs.net_denied, "a grant must still be offered");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same timeout on a box that permits network is just a timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_without_a_net_denying_box_offers_nothing() {
+        let dir = std::env::temp_dir().join(format!("medha-sh-nonet-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        let obs = run(
+            &reg,
+            "shell.exec",
+            json!({ "command": "sleep 30", "timeout_s": 1 }),
+        )
+        .await;
+        assert_eq!(obs.status, kernel::ObsStatus::Error);
+        assert!(!obs.net_denied, "no grant is on offer when network is open");
         std::fs::remove_dir_all(&dir).ok();
     }
 

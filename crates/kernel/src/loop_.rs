@@ -2027,7 +2027,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         );
         let decision = {
             let _one_gate = self.gate_serial.lock().await;
-            let detail = net_grant_detail(intent, web_tainted);
+            let detail = net_grant_detail(intent, web_tainted, &obs);
             self.executor.grant_network(Some(&detail), escalated).await
         };
         match decision {
@@ -2035,8 +2035,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             crate::NetworkDecision::Once => {
                 crate::network_once_scope(self.execute_with_effect_outbox(session, intent)).await
             }
-            crate::NetworkDecision::Session
-            | crate::NetworkDecision::Persistent => {
+            crate::NetworkDecision::Session | crate::NetworkDecision::Persistent => {
                 // The grant already flipped the shared network flag; the retry
                 // and every later command now reach the network.
                 self.execute_with_effect_outbox(session, intent).await
@@ -2048,12 +2047,29 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 /// Card detail for a network-grant prompt. Names the sandbox policy so the user
 /// is not left debugging a bare DNS error, and flags exfiltration risk when the
 /// command touched web content and does something consequential.
-fn net_grant_detail(intent: &ToolIntent, web_tainted: bool) -> String {
+///
+/// A command that merely ran out of time under a net-denying box gets separate
+/// wording: nothing there proves the network was the cause, and a card that
+/// asserts one about `sleep 90` teaches the user to stop reading these.
+fn net_grant_detail(intent: &ToolIntent, web_tainted: bool, obs: &Observation) -> String {
     let action = approval_key(intent);
-    let mut detail = format!(
-        "The sandbox denied network access, so this command could not reach the network:\n  {action}\n\
-         Grant network access and retry?"
-    );
+    let unproven = obs
+        .payload
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut detail = if unproven {
+        format!(
+            "This command hit its deadline under a sandbox that denies network access:\n  {action}\n\
+             If it was waiting on the network, its resolver error may have been hidden by a pipe. \
+             Grant network access and retry?"
+        )
+    } else {
+        format!(
+            "The sandbox denied network access, so this command could not reach the network:\n  {action}\n\
+             Grant network access and retry?"
+        )
+    };
     if web_tainted {
         detail.push_str(
             "\n\nThis command handled web-fetched content. Opening the network means it could \

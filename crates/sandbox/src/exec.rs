@@ -150,30 +150,109 @@ pub trait ExecBackend: Send + Sync {
     }
 }
 
-/// Curated resolver/socket failure markers. DNS libraries report the same text
-/// for a real lookup failure and for an OS policy rejection, so a match is only
-/// evidence, never proof — the caller gates it behind `denies_network` and bounds
-/// the retry to a single prompt.
-const NETWORK_DENIAL_MARKERS: &[&str] = &[
+/// Resolver/routing failure text every runtime on this platform ultimately
+/// prints, because it comes from this platform's own libc. Hand-listing these
+/// strings is what left macOS uncovered: the list carried glibc's wording, so
+/// `pip` and `cargo` — which surface `gai_strerror` verbatim — were invisible on
+/// darwin while `npm` was not. Asking libc removes the asymmetry by
+/// construction rather than by remembering.
+static NETWORK_DENIAL_MARKERS: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(build_network_denial_markers);
+
+/// Text the local `strerror` cannot supply. Two kinds only, and each has a
+/// reason it cannot be derived:
+///
+/// 1. Wording invented *above* libc by a language runtime or tool. No API
+///    enumerates these; node decided to print `ENOTFOUND` and curl decided to
+///    write its own sentence.
+/// 2. glibc's resolver text, which a macOS host still meets through the
+///    container backend — the image is Linux even when we are not. The
+///    derivation covers the host's own libc; it cannot cover the image's.
+///
+/// Everything else comes from [`build_network_denial_markers`]. Adding a line
+/// here should feel like a defeat: it means something was learned by hand that
+/// the platform could not be asked.
+const NETWORK_DENIAL_SUPPLEMENT: &[&str] = &[
+    // glibc, reachable from any host through a Linux container image.
+    "name or service not known",
+    "temporary failure in name resolution",
+    // Symbolic codes: node prints these instead of the libc sentence.
     "enotfound",
     "eai_again",
     "enetunreach",
     "ehostunreach",
-    // npm/node/curl/git DNS failures all surface a resolver call by name.
+    // A named resolver call in the failure is itself the signal.
     "getaddrinfo",
     "could not resolve host",
     "could not resolve proxy",
-    "temporary failure in name resolution",
-    "name or service not known",
-    "network is unreachable",
-    "network is down",
-    "no route to host",
-    // Deliberately NOT "operation not permitted": that is the filesystem-denial
-    // signature, and matching it here would offer a network grant for an fs jail
-    // block. Nor bare "failed to connect", which a down local service produces
-    // just as readily as a denied socket. DNS and routing markers keep the two
-    // escalations disjoint and keep false cards off a healthy box.
+    // libgit2 (cargo, git via libgit2) prefixes the libc text with its own.
+    "failed to resolve address",
+    // Trailing quote is load-bearing: it separates urllib3's "Failed to resolve
+    // 'host'" from rustc's "failed to resolve: use of undeclared crate".
+    "failed to resolve '",
+    "temporary failure resolving",
+    "no such host",
+    "no such host is known",
 ];
+
+/// Codes whose text names a resolver or routing failure specifically. Kept
+/// narrow on purpose: `EAI_SYSTEM` ("System error") and the memory/service
+/// codes describe a caller mistake, and admitting their generic wording as a
+/// substring would fire this signature on unrelated output.
+#[cfg(unix)]
+const NETWORK_DENIAL_ERRNOS: &[i32] = &[
+    libc::ENETUNREACH,
+    libc::EHOSTUNREACH,
+    libc::ENETDOWN,
+    libc::EHOSTDOWN,
+];
+
+#[cfg(unix)]
+const NETWORK_DENIAL_GAI_CODES: &[i32] = &[libc::EAI_NONAME, libc::EAI_AGAIN, libc::EAI_FAIL];
+
+/// Shortest marker admitted from libc. A terse translation ("Down") would match
+/// far more than a denied socket, and no genuine resolver sentence is this brief.
+#[cfg(unix)]
+const MIN_DERIVED_MARKER_LEN: usize = 10;
+
+fn build_network_denial_markers() -> Vec<String> {
+    let mut markers: Vec<String> = NETWORK_DENIAL_SUPPLEMENT
+        .iter()
+        .map(|marker| marker.to_ascii_lowercase())
+        .collect();
+    #[cfg(unix)]
+    {
+        for &code in NETWORK_DENIAL_ERRNOS {
+            let text = std::io::Error::from_raw_os_error(code).to_string();
+            // `io::Error` appends " (os error N)"; the libc sentence is the part
+            // a program actually prints.
+            let text = text.split(" (os error").next().unwrap_or_default();
+            push_derived_marker(&mut markers, text);
+        }
+        for &code in NETWORK_DENIAL_GAI_CODES {
+            // SAFETY: `gai_strerror` returns a pointer to a static, NUL-terminated
+            // string for any input, and never one the caller owns.
+            let text = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(code)) };
+            push_derived_marker(&mut markers, &text.to_string_lossy());
+        }
+    }
+    markers.sort();
+    markers.dedup();
+    markers
+}
+
+#[cfg(unix)]
+fn push_derived_marker(markers: &mut Vec<String>, text: &str) {
+    let marker = text.trim().to_ascii_lowercase();
+    if marker.len() >= MIN_DERIVED_MARKER_LEN {
+        markers.push(marker);
+    }
+}
+
+// Deliberately absent: "operation not permitted", which is the filesystem-denial
+// signature and would offer a network grant for an fs jail block; and bare
+// "failed to connect", which a down local service produces just as readily as a
+// denied socket. Resolver and routing text keeps the two escalations disjoint.
 
 /// True when output under a net-denying jail looks like a policy-blocked network
 /// attempt. `denies_network` is the backend's config intent (did we ask for
@@ -189,10 +268,102 @@ pub fn network_denial_signature(stdout: &str, stderr: &str, denies_network: bool
         return false;
     }
     let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-    NETWORK_DENIAL_MARKERS
-        .iter()
-        .any(|marker| output.contains(marker))
+    matches_network_denial(&output)
 }
+
+/// Match already-lowercased output. Split out so the streaming scanner and the
+/// post-hoc check cannot drift apart.
+fn matches_network_denial(lowercased: &str) -> bool {
+    if NETWORK_DENIAL_MARKERS
+        .iter()
+        .any(|marker| lowercased.contains(marker.as_str()))
+    {
+        return true;
+    }
+    lowercased.lines().any(refused_socket_line)
+}
+
+/// Socket operations whose refusal is the *only* thing a Landlock net-deny
+/// produces. Landlock covers TCP `bind`/`connect` and nothing else, so DNS
+/// (UDP) still resolves and the failure arrives as `connect … EACCES` — text
+/// containing no resolver wording whatsoever. Without this rule, Linux is the
+/// platform where the grant card almost never appears.
+const REFUSED_SOCKET_OPS: &[&str] = &["connect", "sendto", "sendmsg"];
+
+/// Paired with an operation above, on the same line. The conjunction is what
+/// keeps this disjoint from a filesystem denial: an fs refusal names `open` or
+/// a path, never a socket call. Matching either token alone would make every
+/// blocked file read look like a network problem.
+const REFUSED_SOCKET_ERRORS: &[&str] = &[
+    "eacces",
+    "eperm",
+    "permission denied",
+    "operation not permitted",
+];
+
+fn refused_socket_line(line: &str) -> bool {
+    REFUSED_SOCKET_OPS.iter().any(|op| line.contains(op))
+        && REFUSED_SOCKET_ERRORS
+            .iter()
+            .any(|error| line.contains(error))
+}
+
+/// Incremental form of [`network_denial_signature`], fed every captured byte as
+/// it arrives so a stalled command can be caught while it is still running
+/// rather than autopsied at its deadline.
+struct DenialScan {
+    /// Tail of the previous chunk, so a marker split across a pipe read is still
+    /// matched.
+    carry: Vec<u8>,
+    window: usize,
+    hit: bool,
+}
+
+impl DenialScan {
+    fn new() -> Self {
+        let longest = NETWORK_DENIAL_MARKERS
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(0);
+        Self {
+            carry: Vec::new(),
+            window: longest.saturating_sub(1),
+            hit: false,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        if self.hit {
+            return;
+        }
+        let mut buf = std::mem::take(&mut self.carry);
+        buf.extend(bytes.iter().map(u8::to_ascii_lowercase));
+        let text = String::from_utf8_lossy(&buf);
+        self.hit = matches_network_denial(&text);
+        if self.hit {
+            return;
+        }
+        // Carry whichever is longer: the unterminated final line, or a marker's
+        // worth of bytes. The line rule needs a whole line to judge, and a
+        // resolver failure is routinely longer than the longest single marker,
+        // so a marker-sized window alone would let a split line through.
+        let line_start = buf
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let keep = (buf.len() - line_start)
+            .max(self.window)
+            .min(MAX_SCAN_CARRY)
+            .min(buf.len());
+        buf.drain(..buf.len() - keep);
+        self.carry = buf;
+    }
+}
+
+/// Ceiling on carried bytes, so a command emitting one enormous unbroken line
+/// cannot grow the scanner without bound.
+const MAX_SCAN_CARRY: usize = 8 * 1024;
 
 /// Build a `tokio` command applying cwd and environment policy. Isolation into
 /// a process group and teardown are handled by [`spawn_and_wait`].
@@ -494,7 +665,7 @@ pub async fn run_command_bounded(
     // `max_output` is both the independent per-stream cap and the aggregate cap
     // for this combined-output API. Capture happens under the cap while the
     // process runs; it is never an after-the-fact truncation.
-    let process = spawn_background_with_limits(cmd, max_output, max_output, max_output)?;
+    let process = spawn_background_with_limits(cmd, max_output, max_output, max_output, false)?;
     let ended = match cancel {
         Some(token) => {
             let done = process.done_receiver();
@@ -663,18 +834,35 @@ struct CapturePair {
     stdout: TailBuf,
     stderr: TailBuf,
     aggregate_cap: usize,
+    /// Every byte ever captured, not what is currently retained. A rolling tail
+    /// makes the buffer length useless as a progress measure.
+    written: u64,
+    scan: Option<DenialScan>,
 }
 
 impl CapturePair {
-    fn new(stdout_cap: usize, stderr_cap: usize, aggregate_cap: usize) -> Self {
+    fn new(
+        stdout_cap: usize,
+        stderr_cap: usize,
+        aggregate_cap: usize,
+        watch_network: bool,
+    ) -> Self {
         Self {
             stdout: TailBuf::new(stdout_cap),
             stderr: TailBuf::new(stderr_cap),
             aggregate_cap,
+            written: 0,
+            scan: watch_network.then(DenialScan::new),
         }
     }
 
     fn push(&mut self, stream: CapturedStream, bytes: &[u8]) {
+        self.written = self.written.saturating_add(bytes.len() as u64);
+        // Scan before the aggregate trim below: a marker must not be lost to the
+        // rolling tail that a later, noisier stage of the same command overruns.
+        if let Some(scan) = self.scan.as_mut() {
+            scan.feed(bytes);
+        }
         match stream {
             CapturedStream::Stdout => self.stdout.push(bytes),
             CapturedStream::Stderr => self.stderr.push(bytes),
@@ -717,6 +905,9 @@ pub struct BgProc {
     capture: SharedCapture,
     done_rx: tokio::sync::watch::Receiver<bool>,
     code: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
+    /// Set by the seccomp watcher the instant this command tried to reach an IP
+    /// address under a net-denying jail. `None` where no such watcher exists.
+    net_flag: Option<std::sync::Arc<AtomicBool>>,
 }
 
 impl BgProc {
@@ -726,6 +917,31 @@ impl BgProc {
             .lock()
             .map(|capture| (capture.stdout.text(), capture.stderr.text()))
             .unwrap_or_default()
+    }
+    /// Whether this command has been seen trying, and failing, to reach the
+    /// network. The kernel watcher is exact and fires before any output exists;
+    /// the output scanner is the fallback where no watcher could be installed.
+    /// Always false unless the task was spawned under a net-denying backend.
+    pub fn network_denial_seen(&self) -> bool {
+        if self
+            .net_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return true;
+        }
+        self.capture
+            .lock()
+            .map(|capture| capture.scan.as_ref().is_some_and(|scan| scan.hit))
+            .unwrap_or(false)
+    }
+    /// Monotonic count of bytes captured so far — a progress measure that a
+    /// rolling tail cannot make go backwards.
+    pub fn bytes_seen(&self) -> u64 {
+        self.capture
+            .lock()
+            .map(|capture| capture.written)
+            .unwrap_or(0)
     }
     /// Whether either returned stream is a bounded tail rather than complete.
     pub fn truncation(&self) -> (bool, bool) {
@@ -1015,15 +1231,32 @@ fn spawn_background_with_limits(
     stdout_cap: usize,
     stderr_cap: usize,
     aggregate_cap: usize,
+    watch_network: bool,
 ) -> Result<BgProc, ExecError> {
     use std::sync::{Arc, Mutex};
     configure_for_spawn(&mut cmd, false);
+    // Arm kernel-level detection before the fork. Armed here rather than by the
+    // caller so the filter and the handle that reads it cannot be wired up
+    // separately and drift.
+    #[cfg(target_os = "linux")]
+    let pending = watch_network
+        .then(|| crate::netnotify::arm(cmd.as_std_mut()))
+        .flatten();
+    #[cfg(target_os = "linux")]
+    let net_flag = pending.as_ref().map(crate::netnotify::Pending::flag);
+    #[cfg(not(target_os = "linux"))]
+    let net_flag: Option<Arc<AtomicBool>> = None;
     // std Child, not tokio: the leader must stay unreaped (PID reserved) until
     // its group helpers are killed, or a later group kill races PID reuse.
     let mut child = cmd
         .as_std_mut()
         .spawn()
         .map_err(|e| ExecError::Spawn(e.to_string()))?;
+    let finished = Arc::new(AtomicBool::new(false));
+    #[cfg(target_os = "linux")]
+    if let Some(pending) = pending {
+        crate::netnotify::watch(pending, finished.clone());
+    }
     let pid = child.id();
     let out_pipe = child.stdout.take();
     let err_pipe = child.stderr.take();
@@ -1031,6 +1264,7 @@ fn spawn_background_with_limits(
         stdout_cap,
         stderr_cap,
         aggregate_cap,
+        watch_network,
     )));
     let code = Arc::new(Mutex::new(None));
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
@@ -1168,6 +1402,9 @@ fn spawn_background_with_limits(
         if let Ok(mut c) = code2.lock() {
             *c = status;
         }
+        // Release the network watcher before publishing completion, so it does
+        // not outlive the command it was watching.
+        finished.store(true, Ordering::Release);
         let _ = done_tx.send(true);
     });
 
@@ -1176,20 +1413,33 @@ fn spawn_background_with_limits(
         capture,
         done_rx,
         code,
+        net_flag,
     })
 }
 
 /// Spawn an owned command task using the standard independent and aggregate
-/// output ceilings.
-pub fn spawn_background(cmd: tokio::process::Command) -> Result<BgProc, ExecError> {
-    spawn_background_with_limits(cmd, EXEC_STDOUT_CAP, EXEC_STDERR_CAP, EXEC_AGGREGATE_CAP)
+/// output ceilings. `watch_network` arms live resolver-failure detection, which
+/// only a caller running under a net-denying backend has any use for.
+pub fn spawn_background(
+    cmd: tokio::process::Command,
+    watch_network: bool,
+) -> Result<BgProc, ExecError> {
+    spawn_background_with_limits(
+        cmd,
+        EXEC_STDOUT_CAP,
+        EXEC_STDERR_CAP,
+        EXEC_AGGREGATE_CAP,
+        watch_network,
+    )
 }
 
 /// Spawn, supervise, and capture a foreground command using fixed-memory
 /// rolling tails. Dropping this future drops its `BgProc`, which immediately
 /// signals the group; the detached owner still reaps and joins every resource.
 async fn spawn_and_wait(cmd: tokio::process::Command) -> Result<ExecOutput, ExecError> {
-    let process = spawn_background(cmd)?;
+    // Foreground: the complete output is checked post-hoc, so live detection
+    // would only duplicate work already bounded by this call's own deadline.
+    let process = spawn_background(cmd, false)?;
     process.wait().await;
     let (stdout, stderr, stdout_truncated, stderr_truncated) = process.raw_snapshot();
     Ok(ExecOutput {
@@ -1352,7 +1602,10 @@ fn native_sensitive_paths() -> Vec<PathBuf> {
 
 /// Resolve an absolute policy path through its deepest existing ancestor, so
 /// not-yet-created write roots stay usable and symlink aliases still resolve.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+///
+/// Deliberately not gated to the native-sandbox platforms: it is ordinary path
+/// normalization (it already handles `Component::Prefix`, which only Windows
+/// has), and [`escalation_candidates`] — which every platform compiles — calls it.
 fn resolve_native_policy_path(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
 
@@ -2738,7 +2991,7 @@ mod tests {
         let script = format!("(sleep 0.5; touch {}) & exit 0", marker.display());
         let mut command = tokio::process::Command::new("/bin/sh");
         command.args(["-c", &script]).current_dir(&dir);
-        let process = spawn_background(command).unwrap();
+        let process = spawn_background(command, false).unwrap();
         assert!(
             process.wait_until(std::time::Duration::from_secs(2)).await,
             "completion was held hostage by a descendant's pipe"
@@ -3343,11 +3596,200 @@ mod tests {
         assert!(!network_denial_signature("", "syntax error", true));
     }
 
+    /// The regression that motivated deriving markers from libc: these are the
+    /// verbatim failures `pip` and `cargo` produce, and on darwin neither
+    /// contains a single string the hand-written list carried.
+    #[test]
+    fn resolver_failures_are_matched_whatever_runtime_printed_them() {
+        // This platform's own libc sentence, whatever it happens to be, must be
+        // covered without anyone having typed it. On darwin that is pip's
+        // "nodename nor servname provided"; on Linux, "name or service not known".
+        // SAFETY: as in `build_network_denial_markers` — a static string.
+        #[cfg(unix)]
+        {
+            let native = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(libc::EAI_NONAME)) }
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                network_denial_signature(
+                    "",
+                    &format!("connection failed: [Errno 8] {native}"),
+                    true
+                ),
+                "this platform's own EAI_NONAME text must match: {native}"
+            );
+        }
+        for output in [
+            "Temporary failure in name resolution",
+            "warning: spurious network error: failed to resolve address for example.invalid: \
+             nodename nor servname provided, or not known; class=Net (12)",
+            "fatal: unable to access 'https://example.invalid/': Could not resolve host: example.invalid",
+            "dial tcp: lookup proxy.golang.org: no such host",
+            "getaddrinfo EAI_AGAIN registry.example",
+        ] {
+            assert!(
+                network_denial_signature("", output, true),
+                "unmatched resolver failure: {output}"
+            );
+        }
+    }
+
+    /// Every marker is a substring test against arbitrary command output, so a
+    /// too-generic entry silently turns ordinary compiler noise into a grant card.
+    /// Landlock denies TCP `connect` and leaves UDP alone, so a Linux net-deny
+    /// resolves the name fine and fails with a permission error carrying no
+    /// resolver wording at all. These are the shapes that reaches us.
+    #[test]
+    fn a_refused_socket_is_matched_even_with_no_resolver_wording() {
+        for output in [
+            "npm error request to https://registry.npmjs.org/x failed, reason: connect EACCES 104.16.24.35:443",
+            "curl: (7) Failed to connect to example.com port 443 after 1 ms: Permission denied",
+            "Failed to establish a new connection: [Errno 13] Permission denied')': /simple/x/",
+            "OSError: [Errno 1] Operation not permitted: connect",
+        ] {
+            assert!(
+                network_denial_signature("", output, true),
+                "unmatched socket refusal: {output}"
+            );
+        }
+    }
+
+    /// The conjunction must stay disjoint from the filesystem-denial signature,
+    /// or a blocked file read offers a network grant that cannot help.
+    #[test]
+    fn a_refused_file_is_never_a_refused_socket() {
+        for output in [
+            "open '/etc/shadow': Permission denied",
+            "mkdir: cannot create directory '/opt/x': Permission denied",
+            "EACCES: permission denied, open '/private/etc/hosts'",
+            // Operation and refusal on separate lines are not one event.
+            "connect to the server\nchmod: /root: Operation not permitted",
+        ] {
+            assert!(
+                !network_denial_signature("", output, true),
+                "filesystem denial misread as a network denial: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_scan_matches_a_refused_socket_line_split_across_reads() {
+        let mut scan = DenialScan::new();
+        scan.feed(b"npm error request to https://registry.npmjs.org/pptxgenjs failed, ");
+        assert!(!scan.hit, "half a line is not yet a match");
+        scan.feed(b"reason: connect EACCES 104.16.24.35:443\n");
+        assert!(
+            scan.hit,
+            "a refused-socket line spanning two reads must still match"
+        );
+    }
+
+    #[test]
+    fn ordinary_build_failures_do_not_look_like_a_denied_network() {
+        for output in [
+            "error[E0433]: failed to resolve: use of undeclared crate or module `foo`",
+            "error: linking with `cc` failed: exit status: 1",
+            "Operation not permitted (os error 1)",
+            "curl: (7) Failed to connect to localhost port 8080",
+            "System error",
+            "npm ERR! 404 Not Found - GET https://registry.npmjs.org/nope",
+        ] {
+            assert!(
+                !network_denial_signature("", output, true),
+                "false network denial on: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_markers_carry_this_platform_resolver_text() {
+        let markers = &*NETWORK_DENIAL_MARKERS;
+        assert!(
+            markers
+                .iter()
+                .all(|m| m.len() >= 3 && m == &m.to_ascii_lowercase()),
+            "markers must be lowercase and non-trivial: {markers:?}"
+        );
+        #[cfg(unix)]
+        {
+            // SAFETY: as in `build_network_denial_markers` — a static string.
+            let noname = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(libc::EAI_NONAME)) }
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            assert!(
+                markers.contains(&noname),
+                "the platform's own EAI_NONAME text must be a marker; had {markers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_scan_matches_a_marker_split_across_two_reads() {
+        let mut scan = DenialScan::new();
+        scan.feed(b"npm error code ENOTF");
+        assert!(!scan.hit, "half a marker is not a match");
+        scan.feed(b"OUND\nnpm error syscall getaddrinfo\n");
+        assert!(
+            scan.hit,
+            "a marker spanning two pipe reads must still match"
+        );
+    }
+
+    #[test]
+    fn live_scan_is_sticky_and_ignores_later_clean_output() {
+        let mut scan = DenialScan::new();
+        scan.feed(b"could not resolve host: registry.example\n");
+        assert!(scan.hit);
+        scan.feed(b"...retrying\n");
+        assert!(scan.hit, "a hit must survive subsequent output");
+    }
+
+    #[tokio::test]
+    async fn a_running_task_reports_its_resolver_failure_before_it_exits() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo 'getaddrinfo ENOTFOUND registry.example' >&2; sleep 30");
+        let process = spawn_background(command, true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !process.network_denial_seen() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            process.network_denial_seen(),
+            "the failure must be visible while the command is still running"
+        );
+        assert!(process.is_running(), "detection must not require an exit");
+        assert!(process.bytes_seen() > 0);
+        process.kill();
+        process.wait().await;
+    }
+
+    #[tokio::test]
+    async fn detection_stays_disarmed_when_the_backend_allows_network() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo 'getaddrinfo ENOTFOUND registry.example' >&2");
+        let process = spawn_background(command, false).unwrap();
+        process.wait().await;
+        assert!(
+            !process.network_denial_seen(),
+            "a box that permits network must never offer a grant"
+        );
+    }
+
     #[test]
     fn container_network_grant_opens_the_box_but_hermetic_stays_denied() {
         let grant = NetworkGrant::default();
-        let be = ContainerBackend::new("docker".into(), "alpine".into(), NetPolicy::Deny, None, None)
-            .with_network_grant(grant.clone());
+        let be = ContainerBackend::new(
+            "docker".into(),
+            "alpine".into(),
+            NetPolicy::Deny,
+            None,
+            None,
+        )
+        .with_network_grant(grant.clone());
         let r = req("sh", &["-c", "true"], std::env::temp_dir());
         assert!(
             be.build_run_argv(&r).join(" ").contains("--network none"),

@@ -12,6 +12,10 @@ use permissions::PermissionManager;
 use sha2::{Digest, Sha256};
 
 pub mod exec;
+/// Kernel-level network-denial detection. Linux only: it is built on seccomp's
+/// user-notification mechanism, which has no counterpart elsewhere.
+#[cfg(target_os = "linux")]
+pub(crate) mod netnotify;
 pub use exec::{
     BackendKind, ExecBackend, ExecError, ExecOutput, ExecRequest, HostBackend, NetPolicy,
     SandboxConfig, ShellOutcome, native_backend_available, native_sandbox_supported,
@@ -1921,7 +1925,7 @@ impl WorkspaceSandbox {
         env: Vec<(String, String)>,
         clear_env: bool,
     ) -> Result<crate::exec::BgProc, ExecError> {
-        let cmd = self.exec.build_command(&ExecRequest {
+        let request = ExecRequest {
             program: program.to_string(),
             args: args.to_vec(),
             cwd: self.root.clone(),
@@ -1929,8 +1933,11 @@ impl WorkspaceSandbox {
             clear_env,
             read_roots: Vec::new(),
             write_roots: Vec::new(),
-        })?;
-        crate::exec::spawn_background(cmd)
+        };
+        // Arm live resolver-failure detection only where a grant is on offer.
+        let watch_network = self.exec.denies_network(&request);
+        let cmd = self.exec.build_command(&request)?;
+        crate::exec::spawn_background(cmd, watch_network)
     }
 
     pub fn root(&self) -> &Path {

@@ -1029,8 +1029,12 @@ async fn main() -> Result<()> {
     // flips and persists it. One handle so a session/persistent grant reaches both.
     let net_grant = sandbox::NetworkGrant::default();
     let extra_writable = lock.sandbox.extra_writable_paths();
-    let exec_backend =
-        sandbox::select_backend(&sbx_cfg, extra_writable, approved.clone(), net_grant.clone());
+    let exec_backend = sandbox::select_backend(
+        &sbx_cfg,
+        extra_writable,
+        approved.clone(),
+        net_grant.clone(),
+    );
     let verifier_exec = Arc::clone(&exec_backend);
 
     // Writers re-root this template in their isolated worktrees.

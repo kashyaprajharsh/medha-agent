@@ -1705,7 +1705,10 @@ pub(super) fn handle_key<P, L>(
         // which is why entering the region is explicit rather than implied.
         KeyCode::Up if model.switching => {
             let rows = model.switch_rows().len();
-            model.switch_cursor = model.switch_cursor.saturating_sub(1).min(rows.saturating_sub(1));
+            model.switch_cursor = model
+                .switch_cursor
+                .saturating_sub(1)
+                .min(rows.saturating_sub(1));
         }
         KeyCode::Down if model.switching => {
             let rows = model.switch_rows().len();
@@ -6932,7 +6935,9 @@ mod retry_render_tests {
 
         let rendered = streamed(&m);
         assert!(
-            rendered.iter().any(|line| line == "assistant:settled answer"),
+            rendered
+                .iter()
+                .any(|line| line == "assistant:settled answer"),
             "the finished turn's answer must survive a later retry: {rendered:?}"
         );
         assert!(
@@ -7080,7 +7085,10 @@ mod agent_pane_tests {
         m.push_agent_step(worker.clone(), AgentStep::Text("working".into()));
         m.focus_pane(Some(worker));
         let rendered = shown(&m);
-        assert!(rendered[0].starts_with("user:audit the backend"), "{rendered:?}");
+        assert!(
+            rendered[0].starts_with("user:audit the backend"),
+            "{rendered:?}"
+        );
         assert!(rendered[0].contains("file:line list"), "{rendered:?}");
     }
 
@@ -7100,10 +7108,12 @@ mod agent_pane_tests {
         m.focus_pane(Some(worker));
         assert_eq!(m.items.len(), MAX_AGENT_PANE_ITEMS);
         // The oldest go first, so the view keeps what it is doing now.
-        assert!(shown(&m).last().unwrap().ends_with(&format!(
-            "tool-{}",
-            MAX_AGENT_PANE_ITEMS + 49
-        )));
+        assert!(
+            shown(&m)
+                .last()
+                .unwrap()
+                .ends_with(&format!("tool-{}", MAX_AGENT_PANE_ITEMS + 49))
+        );
     }
 
     #[test]

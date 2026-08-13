@@ -232,7 +232,12 @@ impl kernel::HumanGate for TuiGate {
             return kernel::NetworkDecision::Deny;
         }
         let (resp_tx, resp_rx) = oneshot::channel();
-        let req = TuiEvent::NetworkApproval(detail.map(str::to_string), escalated, cancel.clone(), resp_tx);
+        let req = TuiEvent::NetworkApproval(
+            detail.map(str::to_string),
+            escalated,
+            cancel.clone(),
+            resp_tx,
+        );
         if self.tx.send(req).is_err() {
             return kernel::NetworkDecision::Deny;
         }
@@ -3178,7 +3183,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn refresh_skill_manifest_injects_saved_skill_same_session() {
         let dir = std::env::temp_dir().join(format!("medha-skref-{}", ulid::Ulid::new()));
@@ -3220,7 +3224,6 @@ mod tests {
         assert!(transcript[0].content.ends_with("── MEMORY (0 entries) ──"));
         std::fs::remove_dir_all(&dir).ok();
     }
-
 
     #[test]
     fn rewind_scope_menu_hides_code_options_when_nothing_to_undo() {
@@ -3301,7 +3304,6 @@ mod tests {
         assert!(sel0.contains("▌ 1. Yes, allow once"));
         assert!(sel2.contains("▌ 3. No, deny"));
     }
-
 
     #[test]
     fn typing_and_editing_multibyte_does_not_panic() {

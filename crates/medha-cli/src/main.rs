@@ -1469,6 +1469,18 @@ async fn main() -> Result<()> {
                  reported as unknown; their transcripts are still readable"
             ),
         }
+        // A writer's diff outlives the process that produced it: it sits outside
+        // the repository until a human accepts it, and the outbox still owes it
+        // after a restart. The status line counts only what this process is
+        // holding, which is nothing yet — so without saying it here, finished work
+        // waits silently and is found by remembering to go looking.
+        match control.outstanding().await.len() {
+            0 => {}
+            n => eprintln!(
+                "note: {n} agent patch(es) from an earlier run are still waiting for you — \
+                 review them with /agents"
+            ),
+        }
     }
     if lock.memory.enabled {
         let session_events = log.events(session.id).await;

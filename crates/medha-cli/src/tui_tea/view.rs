@@ -218,6 +218,15 @@ pub(super) fn draw_agent_tree(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // Said on the tree itself. A way in that has to be known in advance is a way
+    // in nobody takes, and this is the only place the agents are already in view.
+    header.push(Span::styled(
+        match model.switching {
+            true => "   ↑↓ select · enter open".to_string(),
+            false => "   tab to open one".to_string(),
+        },
+        Style::default().fg(theme::faint()),
+    ));
     let mut lines = vec![Line::from(header)];
 
     let last = model.agent_runs.len().saturating_sub(1);

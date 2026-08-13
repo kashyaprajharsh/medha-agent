@@ -1901,3 +1901,37 @@ fn silence_budgets_differ_by_phase_and_exempt_a_person() {
         "must exceed the transport's own idle timeout plus its retries"
     );
 }
+
+#[tokio::test]
+async fn a_narrowed_child_can_still_read_a_file() {
+    let (recorder, control) = control();
+    // The shape that broke a live run: the caller listed what it thought the task
+    // needed and left out reading, so the child had no way to open a file and
+    // started guessing at tool names instead.
+    let mut spec = spec("inventory the backend");
+    spec.tools = Some(vec!["grep".into()]);
+    run(&control, spec, 5).await.expect("report");
+
+    let held = &recorder.seen.lock().unwrap()[0].0;
+    assert!(
+        held.contains(&"fs.read".to_string()),
+        "narrowing removes capability, not the ability to read: {held:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_floor_still_cannot_widen_past_the_parent() {
+    // `Tools` exposes fs.read and fs.write only; the floor names fs.list too,
+    // which the parent does not hold and so the child must not gain.
+    let (recorder, control) = control();
+    let mut spec = spec("look around");
+    spec.tools = Some(vec!["fs.list".into()]);
+    run(&control, spec, 5).await.expect("report");
+
+    let held = &recorder.seen.lock().unwrap()[0].0;
+    assert!(
+        !held.contains(&"fs.list".to_string()),
+        "a floor is not a way in: {held:?}"
+    );
+    assert!(held.contains(&"fs.read".to_string()), "{held:?}");
+}

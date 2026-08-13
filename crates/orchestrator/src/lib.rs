@@ -40,6 +40,32 @@ pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// only after the observation containing it is durably appended.
 pub const REPORT_ACKS_FIELD: &str = "_agent_report_dispatches";
 
+/// Tools a child keeps however narrowly it was asked for.
+///
+/// `tools` exists to remove capability — web access, say, or the shell. It is not
+/// meant to remove basic legibility, and a caller cannot reliably tell the
+/// difference: a model that lists what it thinks the task needs will omit
+/// something the child turns out to need, and the child is then stuck. Left to
+/// itself it starts guessing at tool names, because a session with no way to read
+/// a file has no way to do the job it was sent to do either.
+///
+/// Still intersected with the parent's own set afterwards, so this is a floor
+/// under narrowing and never a way to widen.
+const ESSENTIAL_CHILD_TOOLS: &[&str] = &["fs.read", "fs.list"];
+
+/// Add the floor to whatever the caller asked for. `None` inherits everything the
+/// parent holds, which already includes these.
+fn with_essentials(asked: Option<&[String]>) -> Option<Vec<String>> {
+    let asked = asked?;
+    let mut tools: Vec<String> = asked.to_vec();
+    for essential in ESSENTIAL_CHILD_TOOLS {
+        if !tools.iter().any(|name| name == essential) {
+            tools.push((*essential).to_string());
+        }
+    }
+    Some(tools)
+}
+
 /// Bounds on one [`AgentControl::wait`]. The floor is what stops a wait being
 /// turned back into a poll; the ceiling is what stops it being turned back into
 /// the unbounded block it replaced.
@@ -1209,7 +1235,7 @@ impl AgentControl {
                 .into_iter()
                 .map(|spec| spec.name)
                 .collect();
-            let requested: Vec<String> = match spec.tools.as_deref() {
+            let requested: Vec<String> = match with_essentials(spec.tools.as_deref()) {
                 Some(asked) => asked
                     .iter()
                     .filter(|name| parent_tools.contains(name))
@@ -1225,9 +1251,12 @@ impl AgentControl {
             // Read-only children may share the parent's tree safely; that is
             // what makes them safe to run in parallel.
             let narrowed: Arc<dyn Executor> = Arc::new(
-                NarrowedExecutor::new(parent_executor, spec.tools.as_deref())
-                    .read_only()
-                    .no_clarifying_questions(),
+                NarrowedExecutor::new(
+                    parent_executor,
+                    with_essentials(spec.tools.as_deref()).as_deref(),
+                )
+                .read_only()
+                .no_clarifying_questions(),
             );
             (narrowed, None)
         };

@@ -296,7 +296,7 @@ impl Tool for AgentSpawn {
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Narrow the child to these tools. Omit to inherit yours. Cannot exceed yours."
+                    "description": "Narrow the child to these tools. Omit this — inheriting your set is almost always right, and a child missing something it turns out to need cannot ask for it. Use it only to take a capability away deliberately, e.g. no web access. Cannot exceed yours, and reading files is always kept."
                 },
                 "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" },
                 "wait": {

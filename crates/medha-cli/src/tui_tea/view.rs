@@ -218,15 +218,28 @@ pub(super) fn draw_agent_tree(f: &mut Frame, model: &Model, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // Said on the tree itself. A way in that has to be known in advance is a way
-    // in nobody takes, and this is the only place the agents are already in view.
-    header.push(Span::styled(
-        match model.switching {
-            true => "   ↑↓ select · enter open".to_string(),
-            false => "   tab to open one".to_string(),
-        },
-        Style::default().fg(theme::faint()),
-    ));
+    // Said on the tree itself, beside the agents it acts on. A way in that has to
+    // be known in advance is a way in nobody takes — and until it has been taken
+    // once it is worth more than a faint aside, because someone watching three
+    // agents work and unable to open one will not guess that a key exists.
+    let (hint, hint_style) = match (model.switching, model.switched_before) {
+        (true, _) => (
+            "   ↑↓ select · enter open · x stop".to_string(),
+            Style::default().fg(theme::faint()),
+        ),
+        (false, true) => (
+            "   tab to open".to_string(),
+            Style::default().fg(theme::faint()),
+        ),
+        (false, false) => (
+            "   press tab to open one ".to_string(),
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+    header.push(Span::styled(hint, hint_style));
     let mut lines = vec![Line::from(header)];
 
     let last = model.agent_runs.len().saturating_sub(1);

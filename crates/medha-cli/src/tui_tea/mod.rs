@@ -1925,6 +1925,10 @@ struct Model {
     /// Whether the switcher owns the arrow keys. Off by default, because the
     /// input already claims them for history and the transcript for scrolling.
     switching: bool,
+    /// Whether the switcher has ever been opened. The way in is advertised on the
+    /// tree until it has been taken once, then stops competing for attention: a
+    /// hint that never quiets down is one that stops being read.
+    switched_before: bool,
 }
 
 /// How much of one child's stream is kept for viewing.
@@ -2065,6 +2069,7 @@ impl Model {
             parked_scroll: HashMap::new(),
             switch_cursor: 0,
             switching: false,
+            switched_before: false,
             known_tools: Arc::new(std::collections::HashSet::new()),
         }
     }

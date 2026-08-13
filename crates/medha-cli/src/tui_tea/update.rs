@@ -1543,6 +1543,7 @@ pub(super) fn handle_key<P, L>(
         && model.picker.is_none()
     {
         model.switching = true;
+        model.switched_before = true;
         let rows = model.switch_rows();
         // Start on what is displayed, so Enter without moving is a no-op rather
         // than a jump to whatever happened to be first.

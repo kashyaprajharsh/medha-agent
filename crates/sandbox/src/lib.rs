@@ -2716,6 +2716,20 @@ mod tests {
         (base, sandbox, approved)
     }
 
+    /// Filesystem escalation is a unix-only path, so its tests are too.
+    ///
+    /// A candidate root is recovered by reading absolute paths out of the jail's
+    /// denial text, and that reader takes only `/`-rooted tokens — it also splits
+    /// on `:`, which halves a `C:\…` path before the filter ever sees it. Windows
+    /// has no jail to be denied by either: `select_backend` hands it `HostBackend`
+    /// whatever the configuration asks for. So on Windows nothing denies, nothing
+    /// is extracted, no card is raised, and the scripted backend goes on reporting
+    /// the denial it was told to report.
+    ///
+    /// `escalation_candidates`' own tests in `exec.rs` are already `#[cfg(unix)]`
+    /// for the same reason; these arrived later and missed it, which only showed
+    /// once they first ran on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn unknown_exec_escalates_read_then_write_for_the_same_root() {
         let outside = std::env::temp_dir().join(format!(
@@ -2751,6 +2765,8 @@ mod tests {
         std::fs::remove_dir_all(outside).ok();
     }
 
+    // Unix-only for the reason on `unknown_exec_escalates_read_then_write_for_the_same_root`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn once_grants_accumulate_across_distinct_roots_for_one_exec() {
         let outside = std::env::temp_dir().join(format!(
@@ -2808,6 +2824,8 @@ mod tests {
         std::fs::remove_dir_all(outside).ok();
     }
 
+    // Unix-only for the reason on `unknown_exec_escalates_read_then_write_for_the_same_root`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn once_grants_accumulate_from_copy_source_read_to_destination_write() {
         let outside = std::env::temp_dir().join(format!(
@@ -2863,6 +2881,8 @@ mod tests {
         std::fs::remove_dir_all(outside).ok();
     }
 
+    // Unix-only for the reason on `unknown_exec_escalates_read_then_write_for_the_same_root`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn prompt_bound_allows_two_unknown_roots_to_escalate_read_then_write() {
         let outside = std::env::temp_dir().join(format!(
@@ -2902,6 +2922,8 @@ mod tests {
         std::fs::remove_dir_all(outside).ok();
     }
 
+    // Unix-only for the reason on `unknown_exec_escalates_read_then_write_for_the_same_root`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn once_and_always_grants_compose_across_distinct_roots() {
         let outside = std::env::temp_dir().join(format!(
@@ -3003,6 +3025,8 @@ mod tests {
         assert_eq!(request.write_roots, vec![base]);
     }
 
+    // Unix-only for the reason on `unknown_exec_escalates_read_then_write_for_the_same_root`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn read_only_exec_never_upgrades_a_repeated_denial_to_write() {
         let outside = std::env::temp_dir().join(format!(
@@ -3040,6 +3064,8 @@ mod tests {
         std::fs::remove_dir_all(outside).ok();
     }
 
+    // Unix-only for the reason on `unknown_exec_escalates_read_then_write_for_the_same_root`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn copy_source_gets_read_only_while_copy_destination_gets_write() {
         let outside =
@@ -3117,6 +3143,8 @@ mod tests {
         std::fs::remove_dir_all(outside).ok();
     }
 
+    // Unix-only for the reason on `unknown_exec_escalates_read_then_write_for_the_same_root`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_redirection_requests_write_on_its_output_root() {
         let outside = std::env::temp_dir().join(format!(

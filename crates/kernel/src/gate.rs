@@ -45,7 +45,10 @@ pub trait HumanGate: Send + Sync {
     /// not override this map their [`confirm`](Self::confirm) answer: a plain
     /// `Once` stays once, `Always` becomes a durable grant, `Deny` denies.
     async fn confirm_network(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
-        match self.confirm("grant network access and retry", detail, escalated).await {
+        match self
+            .confirm("grant network access and retry", detail, escalated)
+            .await
+        {
             Approval::Once => NetworkDecision::Once,
             Approval::Always => NetworkDecision::Persistent,
             Approval::Deny => NetworkDecision::Deny,

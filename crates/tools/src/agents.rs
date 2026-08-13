@@ -1173,4 +1173,3 @@ impl Tool for AgentApply {
         }
     }
 }
-

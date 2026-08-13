@@ -257,7 +257,10 @@ mod tests {
             error.is_retryable(),
             "a dead connection is transient; failing the turn strands the work"
         );
-        assert!(!error.is_context_overflow(), "compaction cannot fix a stall");
+        assert!(
+            !error.is_context_overflow(),
+            "compaction cannot fix a stall"
+        );
         assert!(error.to_string().contains("90s"), "{error}");
     }
 
@@ -283,7 +286,10 @@ mod tests {
             Some(Duration::from_millis(1500))
         );
         assert_eq!(
-            retry_after(&headers(&[("retry-after-ms", "250"), ("retry-after", "60")])),
+            retry_after(&headers(&[
+                ("retry-after-ms", "250"),
+                ("retry-after", "60")
+            ])),
             Some(Duration::from_millis(250)),
             "the finer unit wins when a provider sends both"
         );
@@ -297,7 +303,10 @@ mod tests {
     fn an_unusable_retry_after_leaves_the_caller_on_its_own_curve() {
         assert_eq!(retry_after(&headers(&[])), None);
         assert_eq!(
-            retry_after(&headers(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")])),
+            retry_after(&headers(&[(
+                "retry-after",
+                "Wed, 21 Oct 2026 07:28:00 GMT"
+            )])),
             None,
             "the HTTP-date form is deliberately not honoured"
         );

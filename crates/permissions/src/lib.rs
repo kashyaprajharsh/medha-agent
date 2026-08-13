@@ -1232,10 +1232,19 @@ mod tests {
         mgr.set_network_grant(grant.clone()).unwrap();
         // A gate that opts out of the network card returns Once → no live grant.
         mgr.set_human_gate(Arc::new(FixedGate(Approval::Once)));
-        assert_eq!(mgr.request_network(None, false).await, NetworkDecision::Once);
-        assert!(!grant.granted(), "a once grant never flips the shared handle");
+        assert_eq!(
+            mgr.request_network(None, false).await,
+            NetworkDecision::Once
+        );
         assert!(
-            !trust.exists() || !std::fs::read_to_string(&trust).unwrap().contains("network_allowed"),
+            !grant.granted(),
+            "a once grant never flips the shared handle"
+        );
+        assert!(
+            !trust.exists()
+                || !std::fs::read_to_string(&trust)
+                    .unwrap()
+                    .contains("network_allowed"),
             "once must not persist"
         );
     }
@@ -1256,7 +1265,9 @@ mod tests {
         );
         assert!(grant.granted(), "persistent grant flips the live handle");
         assert!(
-            std::fs::read_to_string(&trust).unwrap().contains("network_allowed"),
+            std::fs::read_to_string(&trust)
+                .unwrap()
+                .contains("network_allowed"),
             "persistent grant is recorded durably"
         );
 

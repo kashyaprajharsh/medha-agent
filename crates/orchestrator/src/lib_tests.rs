@@ -1742,9 +1742,15 @@ async fn a_running_child_reports_what_it_is_doing_not_merely_that_it_exists() {
         },
         "the roster must be able to name the tool, not just say 'running'"
     );
-    assert_eq!(seen.tokens, 1_500, "counters are live, not only in the report");
+    assert_eq!(
+        seen.tokens, 1_500,
+        "counters are live, not only in the report"
+    );
     assert_eq!(seen.tool_calls, 1);
-    assert!(seen.stalled_for().is_some(), "work is measurable as a stall");
+    assert!(
+        seen.stalled_for().is_some(),
+        "work is measurable as a stall"
+    );
     control.shutdown().await;
 }
 
@@ -1847,7 +1853,9 @@ async fn a_stalled_tool_is_bounded_too_not_only_a_stalled_stream() {
         tool: "shell".into(),
         target: Some("npm install".into()),
     });
-    let result = run(&control, spec("install deps"), 5).await.expect("report");
+    let result = run(&control, spec("install deps"), 5)
+        .await
+        .expect("report");
     assert_eq!(result.status, AgentStatus::Exhausted);
 }
 
@@ -1896,8 +1904,7 @@ fn silence_budgets_differ_by_phase_and_exempt_a_person() {
         "a long build is not a stalled stream"
     );
     assert!(
-        bounds.for_phase(&kernel::Phase::Generating).unwrap()
-            > std::time::Duration::from_secs(120),
+        bounds.for_phase(&kernel::Phase::Generating).unwrap() > std::time::Duration::from_secs(120),
         "must exceed the transport's own idle timeout plus its retries"
     );
 }

@@ -107,7 +107,11 @@ pub(super) fn draw_switcher(f: &mut Frame, model: &Model, area: Rect) {
         Style::default().fg(theme::faint()),
     ))];
     for (index, row) in rows.iter().enumerate() {
-        let cursor = if index == model.switch_cursor { "❯" } else { " " };
+        let cursor = if index == model.switch_cursor {
+            "❯"
+        } else {
+            " "
+        };
         let shown = if row == &model.focus { "●" } else { "○" };
         let (name, detail) = match row {
             None => ("main".to_string(), String::new()),
@@ -341,7 +345,11 @@ fn render_agents_done(rows: &[AgentDoneRow], expanded: bool) -> Vec<Line<'static
         let last = rows.len().saturating_sub(1);
         for (index, row) in rows.iter().enumerate() {
             let (mark, colour) = status_mark(row.status);
-            let branch = if index == last { "    └ " } else { "    ├ " };
+            let branch = if index == last {
+                "    └ "
+            } else {
+                "    ├ "
+            };
             lines.push(Line::from(vec![
                 Span::styled(branch, Style::default().fg(theme::faint())),
                 Span::styled(format!("{mark} "), Style::default().fg(colour)),
@@ -2699,7 +2707,10 @@ mod agent_view_tests {
             action: "shell: npm ls".into(),
         });
         assert!(label.contains("waiting on you"), "{label}");
-        assert!(label.contains("npm ls"), "it must say what it is waiting for");
+        assert!(
+            label.contains("npm ls"),
+            "it must say what it is waiting for"
+        );
         assert_eq!(
             colour,
             theme::warn(),
@@ -2737,7 +2748,11 @@ mod agent_view_tests {
             "no children, no screen taken from the conversation"
         );
         model.agent_runs = vec![running("worker")];
-        assert_eq!(agent_tree_height(&model), 3, "header plus two rows per agent");
+        assert_eq!(
+            agent_tree_height(&model),
+            3,
+            "header plus two rows per agent"
+        );
     }
 
     #[test]
@@ -2751,7 +2766,10 @@ mod agent_view_tests {
         assert!(collapsed.contains("2 agent(s) finished"), "{collapsed}");
         assert!(collapsed.contains("36 tools"), "counters sum: {collapsed}");
         assert!(collapsed.contains("61.5k"), "{collapsed}");
-        assert!(collapsed.contains("^E"), "the way to expand must be on the row");
+        assert!(
+            collapsed.contains("^E"),
+            "the way to expand must be on the row"
+        );
 
         let expanded = text(&render_agents_done(&rows, true));
         assert_eq!(expanded.lines().count(), 3, "summary plus a row each");

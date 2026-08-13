@@ -138,7 +138,8 @@ impl ProgressHandle {
     /// Note progress within the current phase without moving out of it. This is
     /// what separates a stream that is slow from one that is dead.
     pub fn ticked(&self) {
-        self.tx.send_modify(|progress| progress.since = Instant::now());
+        self.tx
+            .send_modify(|progress| progress.since = Instant::now());
     }
 
     pub fn tool_dispatched(&self) {
@@ -155,7 +156,8 @@ impl ProgressHandle {
     /// Record spend so far. The governor reports a running total, so this
     /// replaces rather than adds — accumulating a total would square it.
     pub fn priced(&self, total_usd: f64) {
-        self.tx.send_modify(|progress| progress.cost_usd = total_usd);
+        self.tx
+            .send_modify(|progress| progress.cost_usd = total_usd);
     }
 
     /// Terminal. Held by the registry afterwards so a settled agent still reads

@@ -7787,9 +7787,14 @@ mod tests {
     /// Runs commands unjailed but reports the net-denying posture, so the
     /// escalation path can be exercised without a real jail (which the CI box
     /// may not be able to build) and without touching the network.
+    /// Fixtures for the net-denial escalation tests, which are unix-only because
+    /// only unix has a jail to be denied by. Gated with them so Windows does not
+    /// compile a backend nothing constructs.
+    #[cfg(unix)]
     struct NetDenyingBackend;
 
     #[async_trait]
+    #[cfg(unix)]
     impl sandbox::exec::ExecBackend for NetDenyingBackend {
         fn build_command(
             &self,
@@ -7805,6 +7810,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn reg_net_denied(dir: &std::path::Path) -> ToolRegistry {
         std::fs::create_dir_all(dir).unwrap();
         let sbx = WorkspaceSandbox::new_jailed(dir)

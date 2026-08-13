@@ -2528,11 +2528,16 @@ mod tests {
     use super::*;
     use kernel::AutoDeny;
 
+    /// Fixtures for the filesystem-escalation tests, which are unix-only for the
+    /// reason recorded on `unknown_exec_escalates_read_then_write_for_the_same_root`.
+    /// Gated alongside them so Windows does not compile fixtures nothing uses.
+    #[cfg(unix)]
     struct SequenceGate {
         decisions: Mutex<std::collections::VecDeque<kernel::Approval>>,
         actions: Mutex<Vec<String>>,
     }
 
+    #[cfg(unix)]
     impl SequenceGate {
         fn new(decisions: impl IntoIterator<Item = kernel::Approval>) -> Arc<Self> {
             Arc::new(Self {
@@ -2549,6 +2554,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl HumanGate for SequenceGate {
         async fn confirm(
@@ -2569,12 +2575,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct CapabilityBackend {
         requirements: Vec<(PathBuf, permissions::PermissionType)>,
         persistent: Option<ApprovedRoots>,
         requests: Mutex<Vec<ExecRequest>>,
     }
 
+    #[cfg(unix)]
     impl CapabilityBackend {
         fn new(denied_path: PathBuf, required: permissions::PermissionType) -> Arc<Self> {
             Arc::new(Self {
@@ -2625,6 +2633,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl ExecBackend for CapabilityBackend {
         fn build_command(&self, _req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
@@ -2686,6 +2695,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn scripted_escalation_sandbox(
         tag: &str,
         gate: Arc<dyn HumanGate>,
@@ -2694,6 +2704,7 @@ mod tests {
         scripted_escalation_sandbox_with_roots(tag, gate, backend, ApprovedRoots::default())
     }
 
+    #[cfg(unix)]
     fn scripted_escalation_sandbox_with_roots(
         tag: &str,
         gate: Arc<dyn HumanGate>,

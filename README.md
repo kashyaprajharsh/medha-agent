@@ -49,7 +49,7 @@ One binary. No Python, no Node, no Docker daemon — SQLite is compiled in and T
 <summary>Pin a version, change the location, or build from source</summary>
 
 ```bash
-version=v0.1.7
+version=v0.1.8
 curl -fsSL "https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/$version/install.sh" \
   | MEDHA_VERSION="$version" sh                            # pin installer + binary
 
@@ -76,7 +76,8 @@ medha
 
 That's the whole setup. The first launch opens model setup inside the TUI, and after
 that everything lives there — switching models, connecting MCP servers, browsing
-memory, watching sub-agents, rewinding a session. **The TUI is the primary way to use
+memory, opening a running sub-agent to watch and steer it, rewinding a session.
+**The TUI is the primary way to use
 MEDHA**; the flags below exist for scripting and CI.
 
 Type a task, press **Enter**, and approve or deny the actions it proposes as they come
@@ -215,9 +216,10 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
 
 ## Status
 
-Pre-1.0 (`0.1.7`) — interfaces may still change.
+Pre-1.0 (`0.1.8`) — interfaces may still change.
 
-**Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 53 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation, graceful interrupts, the ACP bridge, and the Eval Gate.
+**Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 53 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation that you can open, watch and steer while they run,
+graceful interrupts, the ACP bridge, and the Eval Gate.
 
 **Next:** native Anthropic Messages and OpenAI Responses protocols, cross-vendor adversarial verification, span-level trust taint, and trace→skill distillation.
 

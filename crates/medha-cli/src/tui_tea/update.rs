@@ -1496,6 +1496,64 @@ pub(super) fn handle_key<P, L>(
         return;
     }
 
+    // Reading an agent, Esc comes back. Ahead of the cancel binding on purpose:
+    // leaving a view you opened is what Esc means here, and a turn is cancelled
+    // from the conversation it belongs to.
+    if key.code == KeyCode::Esc && model.focus.is_some() && model.pending_approval().is_none() {
+        model.focus_pane(None);
+        model.switching = false;
+        return;
+    }
+    // The agent switcher. Handled before the input so its keys are unambiguous
+    // while it is open, and it only opens when there is somewhere to go.
+    if model.switching {
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab => {
+                model.switching = false;
+                return;
+            }
+            KeyCode::Enter => {
+                let rows = model.switch_rows();
+                let target = rows.get(model.switch_cursor).cloned().flatten();
+                model.focus_pane(target);
+                model.switching = false;
+                return;
+            }
+            // Stop the agent under the cursor. Never `main` — the conversation is
+            // not something you stop, and Esc already interrupts a turn.
+            KeyCode::Char('x') => {
+                let rows = model.switch_rows();
+                match rows.get(model.switch_cursor).cloned().flatten() {
+                    Some(path) => agents_stop_path(model, &path),
+                    None => model.push_notice("that is the conversation — Esc interrupts a turn"),
+                }
+                return;
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                stop_every_agent(model);
+                return;
+            }
+            _ => {}
+        }
+    }
+    // Opening it needs somewhere to go, so it never steals Tab from nothing.
+    if key.code == KeyCode::Tab
+        && model.input.is_empty()
+        && !model.agent_runs.is_empty()
+        && model.picker.is_none()
+    {
+        model.switching = true;
+        let rows = model.switch_rows();
+        // Start on what is displayed, so Enter without moving is a no-op rather
+        // than a jump to whatever happened to be first.
+        model.switch_cursor = rows
+            .iter()
+            .position(|row| row == &model.focus)
+            .unwrap_or(0)
+            .min(rows.len().saturating_sub(1));
+        return;
+    }
+
     // Autocomplete handling
     if model.input.starts_with('/') {
         let matches = command_matches(&model.input);
@@ -1601,6 +1659,27 @@ pub(super) fn handle_key<P, L>(
             // Expand compact paste placeholders only at submission.
             let line = model.resolve_pastes(&raw);
 
+            // Typing while reading an agent addresses that agent, not the
+            // conversation. Anything else would be a trap: the text looks like it
+            // went to what is on screen and instead reaches whoever spawned it.
+            if let Some(path) = model.focus.clone() {
+                match model.agents.as_ref().map(|control| {
+                    control.steer(&orchestrator::AgentPath::root(), &path.to_string(), &line)
+                }) {
+                    Some(Ok(_)) => {
+                        let preview: String = line.chars().take(60).collect();
+                        model.push_agent_step(
+                            path.clone(),
+                            AgentStep::Text(format!("\n▌ you: {preview}\n")),
+                        );
+                        model.push_notice(format!("↳ sent to '{}'", path.name()));
+                    }
+                    _ => model.push_notice(
+                        "that agent is no longer running — its report arrives on its own",
+                    ),
+                }
+                return;
+            }
             if model.running {
                 // Mid-turn steer: the kernel injects it at the next turn
                 // boundary (same session, model sees it immediately after the
@@ -1620,6 +1699,17 @@ pub(super) fn handle_key<P, L>(
         KeyCode::Backspace => model.backspace(),
         KeyCode::Left => model.move_left(),
         KeyCode::Right => model.move_right(),
+        // While the switcher holds the arrows it owns them outright — the input's
+        // history and the transcript's scrolling both already claim bare Up/Down,
+        // which is why entering the region is explicit rather than implied.
+        KeyCode::Up if model.switching => {
+            let rows = model.switch_rows().len();
+            model.switch_cursor = model.switch_cursor.saturating_sub(1).min(rows.saturating_sub(1));
+        }
+        KeyCode::Down if model.switching => {
+            let rows = model.switch_rows().len();
+            model.switch_cursor = (model.switch_cursor + 1).min(rows.saturating_sub(1));
+        }
         // Scroll with Up/Down when input empty
         KeyCode::Up if model.input.is_empty() => model.scroll_by(-1),
         KeyCode::Down if model.input.is_empty() => model.scroll_by(1),
@@ -3021,6 +3111,10 @@ fn agent_rows(
         // A settled writer whose patch is still waiting appears as a patch row;
         // listing it twice would read as two separate pieces of work.
         .filter(|agent| agent.is_running() || !waiting.contains(&agent.session))
+        // Running children belong to the switcher now: it shows them live, opens
+        // them, steers them and stops them. Listing them here as well would be a
+        // second, staler answer to the same question.
+        .filter(|agent| !agent.is_running())
         .partition(orchestrator::Agent::is_running);
 
     let mut rows: Vec<AgentRow> = branched(running, progress);
@@ -3382,6 +3476,45 @@ fn agents_apply_patch(
             &control.progress(),
         )));
     });
+}
+
+/// Stop the agent at `path`. Cancelling is not discarding: the child settles its
+/// own in-flight tools and its partial findings still come back.
+fn agents_stop_path(model: &mut Model, path: &orchestrator::AgentPath) {
+    let Some(control) = model.agents.clone() else {
+        return;
+    };
+    match control.cancel(&orchestrator::AgentPath::root(), &path.to_string()) {
+        Ok(stopped) => model.push_notice(format!(
+            "stopped agent '{}' — whatever it had found still arrives with its report",
+            stopped.name()
+        )),
+        Err(_) => model.push_notice("that agent already finished"),
+    }
+}
+
+/// Stop every running child at once, for when a whole fan-out was a wrong turn.
+fn stop_every_agent(model: &mut Model) {
+    let Some(control) = model.agents.clone() else {
+        return;
+    };
+    let running = control.active();
+    if running.is_empty() {
+        model.push_notice("no agents are running");
+        return;
+    }
+    let mut stopped = 0usize;
+    for agent in &running {
+        if control
+            .cancel(&orchestrator::AgentPath::root(), &agent.path.to_string())
+            .is_ok()
+        {
+            stopped += 1;
+        }
+    }
+    model.push_notice(format!(
+        "stopped {stopped} agent(s) — their partial findings still arrive"
+    ));
 }
 
 /// Stop one agent by hand. `agent.cancel` gives the model this; the user needs
@@ -6830,5 +6963,159 @@ mod retry_render_tests {
         handle_agent_event(&mut m, TuiEvent::Restarted, &mut session, &mut transcript);
 
         assert_eq!(streamed(&m), before);
+    }
+}
+
+#[cfg(test)]
+mod agent_pane_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn model() -> Model {
+        let dir = std::env::temp_dir().join(format!("medha-pane-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            lockfile::UiConfig::default(),
+            HashMap::new(),
+            Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap()),
+        )
+    }
+
+    fn path(name: &str) -> orchestrator::AgentPath {
+        orchestrator::AgentPath::root().child(name).unwrap()
+    }
+
+    fn shown(model: &Model) -> Vec<String> {
+        model
+            .items
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                Item::User(text) => Some(format!("user:{text}")),
+                Item::Assistant(text) => Some(format!("assistant:{text}")),
+                Item::Thinking(text) => Some(format!("thinking:{text}")),
+                Item::ToolCall { tool, .. } => Some(format!("call:{tool}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_childs_stream_stays_out_of_the_conversation_until_it_is_opened() {
+        let mut m = model();
+        let worker = path("worker");
+        m.push_item(Item::User("the real question".into()));
+        m.push_agent_step(worker.clone(), AgentStep::Text("child chatter".into()));
+
+        assert_eq!(
+            shown(&m),
+            vec!["user:the real question"],
+            "three children streaming into one conversation is unreadable"
+        );
+
+        m.focus_pane(Some(worker));
+        assert_eq!(shown(&m), vec!["assistant:child chatter"]);
+    }
+
+    #[test]
+    fn returning_from_a_pane_restores_the_conversation_intact() {
+        let mut m = model();
+        let worker = path("worker");
+        m.push_item(Item::User("keep me".into()));
+        m.push_agent_step(worker.clone(), AgentStep::Text("theirs".into()));
+
+        m.focus_pane(Some(worker.clone()));
+        m.focus_pane(None);
+        assert_eq!(shown(&m), vec!["user:keep me"]);
+
+        // And the child's pane survived the round trip.
+        m.focus_pane(Some(worker));
+        assert_eq!(shown(&m), vec!["assistant:theirs"]);
+    }
+
+    #[test]
+    fn steps_arriving_while_a_pane_is_open_land_in_it() {
+        let mut m = model();
+        let worker = path("worker");
+        m.focus_pane(Some(worker.clone()));
+        m.push_agent_step(worker.clone(), AgentStep::Reasoning("mine".into()));
+        m.push_agent_step(worker.clone(), AgentStep::Text("answer".into()));
+        assert_eq!(shown(&m), vec!["thinking:mine", "assistant:answer"]);
+
+        // Parking and reopening must not lose what arrived while it was open.
+        m.focus_pane(None);
+        m.focus_pane(Some(worker));
+        assert_eq!(shown(&m), vec!["thinking:mine", "assistant:answer"]);
+    }
+
+    #[test]
+    fn streamed_deltas_coalesce_into_one_block() {
+        let mut m = model();
+        let worker = path("worker");
+        for delta in ["a", "b", "c"] {
+            m.push_agent_step(worker.clone(), AgentStep::Text(delta.into()));
+        }
+        m.focus_pane(Some(worker));
+        assert_eq!(
+            shown(&m),
+            vec!["assistant:abc"],
+            "a reply is a block, not a line per token"
+        );
+    }
+
+    #[test]
+    fn a_pane_opens_with_the_task_the_child_was_given() {
+        let mut m = model();
+        let worker = path("worker");
+        m.push_agent_step(
+            worker.clone(),
+            AgentStep::Task {
+                objective: "audit the backend".into(),
+                contract: Some("file:line list".into()),
+            },
+        );
+        m.push_agent_step(worker.clone(), AgentStep::Text("working".into()));
+        m.focus_pane(Some(worker));
+        let rendered = shown(&m);
+        assert!(rendered[0].starts_with("user:audit the backend"), "{rendered:?}");
+        assert!(rendered[0].contains("file:line list"), "{rendered:?}");
+    }
+
+    #[test]
+    fn a_childs_pane_is_bounded_however_much_it_says() {
+        let mut m = model();
+        let worker = path("worker");
+        for n in 0..(MAX_AGENT_PANE_ITEMS + 50) {
+            m.push_agent_step(
+                worker.clone(),
+                AgentStep::ToolCall {
+                    tool: format!("tool-{n}"),
+                    args: serde_json::json!({}),
+                },
+            );
+        }
+        m.focus_pane(Some(worker));
+        assert_eq!(m.items.len(), MAX_AGENT_PANE_ITEMS);
+        // The oldest go first, so the view keeps what it is doing now.
+        assert!(shown(&m).last().unwrap().ends_with(&format!(
+            "tool-{}",
+            MAX_AGENT_PANE_ITEMS + 49
+        )));
+    }
+
+    #[test]
+    fn the_switcher_keeps_the_open_pane_addressable_after_it_settles() {
+        let mut m = model();
+        let worker = path("worker");
+        m.focus_pane(Some(worker.clone()));
+        // `agent_runs` is empty: the child has settled and left the roster.
+        let rows = m.switch_rows();
+        assert!(
+            rows.contains(&Some(worker)),
+            "a reader must never be stranded in a pane the switcher denies exists"
+        );
+        assert!(rows.contains(&None), "main is always a destination");
     }
 }

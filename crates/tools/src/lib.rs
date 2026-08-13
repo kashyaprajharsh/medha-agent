@@ -8144,6 +8144,56 @@ mod tests {
         );
     }
 
+    /// The point of the blocking form: the answer comes back on the call that
+    /// asked for it, so a caller that cannot continue without it does not have to
+    /// compose a spawn and a wait correctly to get one.
+    #[tokio::test]
+    async fn a_waited_spawn_answers_on_the_call_that_asked() {
+        let (registry, _outbox, _owner) = registry_with_outbox();
+        let out = call(
+            &registry,
+            "agent.spawn",
+            json!({ "objective": "count the tests", "name": "counter", "wait": true }),
+        )
+        .await;
+
+        assert_eq!(out.get("waited").and_then(Value::as_bool), Some(true));
+        let reports = out
+            .get("reports")
+            .and_then(Value::as_array)
+            .expect("a waited spawn carries the answer, not a promise of one");
+        assert_eq!(reports.len(), 1, "got {out}");
+        assert_eq!(
+            reports[0].get("agent").and_then(Value::as_str),
+            Some("counter")
+        );
+        assert!(reports[0].get("report").is_some());
+        // Acknowledged through the observation, never here: execution precedes
+        // the durable append, and acknowledging early loses a report on a crash.
+        assert!(
+            out.get(orchestrator::REPORT_ACKS_FIELD)
+                .and_then(Value::as_array)
+                .is_some_and(|acks| !acks.is_empty()),
+            "the report has to be marked delivered by the append, or it arrives twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unwaited_spawn_still_returns_at_once() {
+        let (registry, _outbox, _owner) = registry_with_outbox();
+        let out = call(
+            &registry,
+            "agent.spawn",
+            json!({ "objective": "count the tests", "name": "counter" }),
+        )
+        .await;
+        assert_eq!(out.get("status").and_then(Value::as_str), Some("running"));
+        assert!(
+            out.get("reports").is_none(),
+            "the default must not hold the turn: {out}"
+        );
+    }
+
     #[tokio::test]
     async fn waiting_hands_back_the_reports_it_waited_for() {
         let (registry, _outbox, _owner) = registry_with_outbox();

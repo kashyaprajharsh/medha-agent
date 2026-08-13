@@ -299,6 +299,10 @@ impl Tool for AgentSpawn {
                     "description": "Narrow the child to these tools. Omit to inherit yours. Cannot exceed yours."
                 },
                 "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" },
+                "wait": {
+                    "type": "boolean",
+                    "description": "Hold this call until the child answers, and return its report here. Use it when you cannot take the next step without the result — a failure then comes back as an error on this call instead of as a report you have to notice later. Leave it off for a genuine fan-out you want to keep working alongside; those reports arrive on their own. Typing while it waits detaches it and the agent keeps running."
+                },
                 "write": {
                     "type": "boolean",
                     "description": "REQUIRED for any task that changes something — write, edit, add, fix, rename, create a file. Without it the child gets read-only tools, cannot edit anything, and will come back describing the change it would have made instead of making it. It works in a private checkout and returns a patch, so your files are never touched until you apply it with `agent.apply`. Refused if this workspace is not a git repository."
@@ -404,6 +408,14 @@ impl Tool for AgentSpawn {
                     },
                 );
             }
+            if args.get("wait").and_then(Value::as_bool).unwrap_or(false) {
+                let mine: Vec<AgentPath> = started
+                    .iter()
+                    .filter_map(|row| row.get("agent"))
+                    .filter_map(|path| serde_json::from_value(path.clone()).ok())
+                    .collect();
+                return wait_for(&self.control, &caller.path, caller.session, mine, started).await;
+            }
             return Ok(json!({
                 "agents": started,
                 "count": started.len(),
@@ -457,6 +469,21 @@ impl Tool for AgentSpawn {
             )
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let started = vec![json!({
+            "agent": agent.path,
+            "session": agent.session,
+            "status": "running",
+        })];
+        if args.get("wait").and_then(Value::as_bool).unwrap_or(false) {
+            return wait_for(
+                &self.control,
+                &caller.path,
+                caller.session,
+                vec![agent.path.clone()],
+                started,
+            )
+            .await;
+        }
         Ok(json!({
             "agent": agent.path,
             "session": agent.session,
@@ -488,6 +515,99 @@ pub type ParentHandle = Arc<Mutex<Option<std::sync::Weak<dyn kernel::Executor>>>
 
 fn parent_executor(slot: &ParentHandle) -> Option<Arc<dyn kernel::Executor>> {
     slot.lock().ok()?.as_ref()?.upgrade()
+}
+
+/// Hold the turn until `mine` have settled, then hand back their reports.
+///
+/// The alternative — return at once and let the reports arrive on a later turn —
+/// stays the default, and is the better shape for a genuine fan-out. This is for
+/// the case where the caller cannot continue without the answer: a failure then
+/// surfaces as a tool error it already knows how to handle, rather than as a
+/// report saying FAILED that it has to notice a turn later.
+///
+/// Typing detaches. The control plane watches the operator's interrupt handle, so
+/// a wait ends the moment its own operator speaks — the children carry on and
+/// their reports arrive through the outbox, exactly as an unwaited spawn's would.
+async fn wait_for(
+    control: &orchestrator::AgentControl,
+    from: &AgentPath,
+    owner: ulid::Ulid,
+    mine: Vec<AgentPath>,
+    started: Vec<Value>,
+) -> Result<Value, ToolError> {
+    let timeout = control.wait_bounds().max;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut outstanding: Vec<AgentPath> = mine;
+    loop {
+        // Only this call's children. Waiting on the whole roster would return as
+        // soon as any unrelated sibling finished.
+        outstanding.retain(|path| {
+            control
+                .address(from, &path.to_string())
+                .map(|agent| agent.is_running())
+                .unwrap_or(false)
+        });
+        if outstanding.is_empty() {
+            break;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ok(json!({
+                "agents": started,
+                "waited": false,
+                "note": "Still running past the wait ceiling. They were not stopped; their \
+                         reports arrive on their own.",
+            }));
+        }
+        match control.wait(from, left).await {
+            Waited::Settled(_) => continue,
+            Waited::TimedOut => continue,
+            // The operator spoke. Read what they said before anything else.
+            Waited::Interrupted => {
+                return Ok(json!({
+                    "agents": started,
+                    "waited": false,
+                    "detached": true,
+                    "note": "Stopped waiting — a message arrived for you, and it may change what \
+                             you were waiting for. The agents are untouched and still running; \
+                             their reports arrive on their own.",
+                }));
+            }
+            Waited::Cancelled => {
+                return Err(ToolError::Failed(
+                    "this session is shutting down; the agents were stopped".into(),
+                ));
+            }
+        }
+    }
+    let collected = control.collect(owner).await;
+    // Not acknowledged here: execution precedes the durable observation append,
+    // and a failure in that gap would lose a report the caller never saw. The
+    // outbox folds these ids out of the observation, so the append is the commit.
+    let acknowledgements: Vec<&str> = collected
+        .iter()
+        .map(|result| result.dispatch.as_str())
+        .collect();
+    let relayed = orchestrator::least_trusted(collected.iter().map(|result| result.trust));
+    let reports: Vec<Value> = collected
+        .iter()
+        .map(|result| {
+            json!({
+                "agent": result.agent,
+                "session": result.session,
+                "status": result.status,
+                "report": result.summary,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "agents": started,
+        "waited": true,
+        "reports": reports,
+        "note": "These are their answers. Do not read their transcripts.",
+        orchestrator::REPORT_ACKS_FIELD: acknowledgements,
+        crate::RELAYED_TRUST: relayed,
+    }))
 }
 
 /// An omitted fork mode starts the child cold, which is what its objective and
@@ -627,7 +747,22 @@ impl Tool for AgentControlTool {
         }
     }
     fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
+        match self.action {
+            // A follow-up starts a session. It restarts a settled agent under the
+            // contract it was admitted with — so a writer resumes as a writer,
+            // takes a fresh checkout and produces a new patch, at real cost. The
+            // rest of these only read, address or stop what already exists.
+            //
+            // It was declared `Read` alongside them, which meant the one verb here
+            // that spends money and can edit code was the one that raised no card.
+            AgentAction::Followup => BlastRadius::ReversibleLocal,
+            _ => BlastRadius::Read,
+        }
+    }
+    /// Delegation never holds the writer lane; see the note on `agent.spawn`.
+    /// A follow-up is admitted exactly as a spawn is, so it inherits that.
+    fn mutation_key(&self, _args: &Value) -> Option<String> {
+        None
     }
     fn timeout(&self) -> Option<std::time::Duration> {
         match self.action {
@@ -636,6 +771,9 @@ impl Tool for AgentControlTool {
             // legitimate long wait into an error, which reads as a failed agent
             // rather than as one still working.
             AgentAction::Wait => None,
+            // A follow-up runs a whole session, like a spawn; the child's own
+            // turn budget and inactivity bound are what limit it.
+            AgentAction::Followup => None,
             _ => Some(crate::TOOL_TIMEOUT),
         }
     }

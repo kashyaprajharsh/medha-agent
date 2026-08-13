@@ -980,6 +980,13 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             progress: run.progress.clone(),
             route: self.route.clone(),
         };
+        // A child's view opens with what it was asked to do, the way a session
+        // opens with the message that started it. Without this, looking at an
+        // agent shows working-out with no visible question behind it.
+        sink.show(crate::tui_tea::AgentStep::Task {
+            objective: run.spec.objective.clone(),
+            contract: run.spec.contract.clone(),
+        });
         let outcome = child
             .run_session(&session, messages, budget, &sink, Some(run.interrupts))
             .await;

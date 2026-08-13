@@ -92,7 +92,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/agents",
-        "what Medha delegated — running · patches · finished  ·  Enter watch · d stop · a apply",
+        "patches waiting and agents finished  ·  a apply  ·  running agents: tab",
     ),
     (
         "/steer",
@@ -531,6 +531,11 @@ enum Item {
 /// three children streaming into one conversation is unreadable.
 #[derive(Debug, Clone)]
 pub(crate) enum AgentStep {
+    /// What this child was sent to do, shown first in its own view.
+    Task {
+        objective: String,
+        contract: Option<String>,
+    },
     Text(String),
     Reasoning(String),
     ToolCall {
@@ -1479,7 +1484,7 @@ impl PickerKind {
                 }))
                 .collect(),
             PickerKind::Agents(rows) if rows.is_empty() => {
-                vec!["no sub-agents running, no patches waiting".to_string()]
+                vec!["nothing waiting — running agents are on tab".to_string()]
             }
             PickerKind::Agents(rows) => rows
                 .iter()
@@ -1904,10 +1909,69 @@ struct Model {
     /// Kept apart from the switcher's cursor so moving through the list does not
     /// yank the view out from under what is being read.
     focus: Option<orchestrator::AgentPath>,
+    /// The conversation, parked here while an agent's pane is on screen.
+    ///
+    /// One collection is displayed and every renderer reads it, so switching
+    /// panes moves content in and out of `items` rather than teaching the
+    /// renderer to choose — which it cannot do while holding a borrow of the
+    /// model for its render context.
+    parked_main: VecDeque<Entry>,
+    /// Scroll position of each pane that is not on screen, so returning to one
+    /// lands where it was left rather than at the bottom.
+    parked_scroll: HashMap<Option<orchestrator::AgentPath>, usize>,
+    /// Where the switcher's keyboard cursor sits, as an index into its rows.
+    /// Only meaningful while [`Model::switching`] is set.
+    switch_cursor: usize,
+    /// Whether the switcher owns the arrow keys. Off by default, because the
+    /// input already claims them for history and the transcript for scrolling.
+    switching: bool,
 }
 
 /// How much of one child's stream is kept for viewing.
 const MAX_AGENT_PANE_ITEMS: usize = 200;
+
+/// Add one step to a pane, coalescing streamed deltas onto the item they extend
+/// so a reply reads as a block rather than a line per token.
+fn append_agent_step(pane: &mut VecDeque<Entry>, step: AgentStep) {
+    let extend = |pane: &mut VecDeque<Entry>, delta: &str, thinking: bool| -> bool {
+        let Some(entry) = pane.back_mut() else {
+            return false;
+        };
+        let buffer = match (&mut entry.item, thinking) {
+            (Item::Assistant(buffer), false) => buffer,
+            (Item::Thinking(buffer), true) => buffer,
+            _ => return false,
+        };
+        buffer.push_str(delta);
+        entry.invalidate();
+        true
+    };
+    let item = match step {
+        // Rendered as a user turn, because that is what it is: the message this
+        // session was started with.
+        AgentStep::Task {
+            objective,
+            contract,
+        } => Item::User(match contract {
+            Some(contract) => format!("{objective}\n\nAnswer must be: {contract}"),
+            None => objective,
+        }),
+        AgentStep::Text(delta) => match extend(pane, &delta, false) {
+            true => return,
+            false => Item::Assistant(delta),
+        },
+        AgentStep::Reasoning(delta) => match extend(pane, &delta, true) {
+            true => return,
+            false => Item::Thinking(delta),
+        },
+        AgentStep::ToolCall { tool, args } => Item::ToolCall { tool, args },
+        AgentStep::ToolResult { tool, ok, payload } => Item::ToolResult { tool, ok, payload },
+    };
+    pane.push_back(Entry::new(item));
+    while pane.len() > MAX_AGENT_PANE_ITEMS {
+        pane.pop_front();
+    }
+}
 
 impl Model {
     fn new(
@@ -1997,6 +2061,10 @@ impl Model {
             agents_done: Vec::new(),
             agent_panes: HashMap::new(),
             focus: None,
+            parked_main: VecDeque::new(),
+            parked_scroll: HashMap::new(),
+            switch_cursor: 0,
+            switching: false,
             known_tools: Arc::new(std::collections::HashSet::new()),
         }
     }
@@ -2408,53 +2476,72 @@ impl Model {
         }
     }
 
-    /// File one step into that agent's own pane, coalescing streamed deltas onto
-    /// the item they extend so a reply is one block rather than a line per token.
+    /// File one step into that agent's pane — the displayed collection when the
+    /// agent is on screen, its parked one otherwise.
     fn push_agent_step(&mut self, path: orchestrator::AgentPath, step: AgentStep) {
         let showing = self.focus.as_ref() == Some(&path);
-        let pane = self.agent_panes.entry(path).or_default();
-        let item = match step {
-            AgentStep::Text(delta) => {
-                match pane.back_mut().map(|entry| &mut entry.item) {
-                    Some(Item::Assistant(buffer)) => {
-                        buffer.push_str(&delta);
-                        if let Some(entry) = pane.back_mut() {
-                            entry.invalidate();
-                        }
-                        if showing {
-                            self.dirty = true;
-                        }
-                        return;
-                    }
-                    _ => Item::Assistant(delta),
-                }
-            }
-            AgentStep::Reasoning(delta) => match pane.back_mut().map(|entry| &mut entry.item) {
-                Some(Item::Thinking(buffer)) => {
-                    buffer.push_str(&delta);
-                    if let Some(entry) = pane.back_mut() {
-                        entry.invalidate();
-                    }
-                    if showing {
-                        self.dirty = true;
-                    }
-                    return;
-                }
-                _ => Item::Thinking(delta),
-            },
-            AgentStep::ToolCall { tool, args } => Item::ToolCall { tool, args },
-            AgentStep::ToolResult { tool, ok, payload } => Item::ToolResult { tool, ok, payload },
+        let pane = match showing {
+            true => &mut self.items,
+            false => self.agent_panes.entry(path).or_default(),
         };
-        pane.push_back(Entry::new(item));
-        while pane.len() > MAX_AGENT_PANE_ITEMS {
-            pane.pop_front();
-        }
+        append_agent_step(pane, step);
         if showing {
             self.dirty = true;
             if self.auto_scroll {
                 self.scroll_to_bottom();
             }
         }
+    }
+
+    /// Show `target`, parking whatever is leaving the screen where it belongs.
+    ///
+    /// `None` is the conversation. Scroll position travels with the pane, so
+    /// looking at an agent and coming back does not lose the reader's place.
+    fn focus_pane(&mut self, target: Option<orchestrator::AgentPath>) {
+        if self.focus == target {
+            return;
+        }
+        self.parked_scroll
+            .insert(self.focus.clone(), self.scroll_offset);
+        let leaving = std::mem::take(&mut self.items);
+        match self.focus.take() {
+            Some(path) => {
+                self.agent_panes.insert(path, leaving);
+            }
+            None => self.parked_main = leaving,
+        }
+        self.items = match &target {
+            Some(path) => self.agent_panes.remove(path).unwrap_or_default(),
+            None => std::mem::take(&mut self.parked_main),
+        };
+        let restored = self.parked_scroll.get(&target).copied();
+        self.focus = target;
+        self.invalidate_all_renders();
+        self.dirty = true;
+        match restored {
+            Some(offset) => {
+                self.auto_scroll = false;
+                self.scroll_offset = offset;
+            }
+            None => {
+                self.auto_scroll = true;
+                self.scroll_to_bottom();
+            }
+        }
+    }
+
+    /// The switcher's rows: the conversation first, then every agent this session
+    /// knows about, so `main` is a destination like any other.
+    fn switch_rows(&self) -> Vec<Option<orchestrator::AgentPath>> {
+        let mut rows = vec![None];
+        rows.extend(self.agent_runs.iter().map(|run| Some(run.path.clone())));
+        // Whatever is on screen is always a row, even once it has settled.
+        // Dropping it the moment it finished would leave the reader looking at a
+        // pane the switcher no longer admits exists, with no way back.
+        if self.focus.is_some() && !rows.contains(&self.focus) {
+            rows.push(self.focus.clone());
+        }
+        rows
     }
 
     /// Forget what the abandoned attempt rendered, so a retried turn's reply

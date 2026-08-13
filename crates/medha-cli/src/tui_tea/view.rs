@@ -80,6 +80,107 @@ fn phase_line(phase: &kernel::Phase) -> (String, Color) {
     }
 }
 
+/// How many rows the switcher needs: a hint line, then one per destination.
+pub(super) fn switcher_height(model: &Model) -> u16 {
+    match model.switching {
+        false => 0,
+        true => 1 + model.switch_rows().len() as u16,
+    }
+}
+
+/// The switcher: every place the transcript can show, the conversation included.
+///
+/// Two markers, deliberately independent. `❯` is where the keyboard is; `●` is
+/// what the transcript area is showing. Browsing the list must not drag the view
+/// along with it, or you cannot look for an agent while reading another.
+pub(super) fn draw_switcher(f: &mut Frame, model: &Model, area: Rect) {
+    if !model.switching || area.height == 0 {
+        return;
+    }
+    let rows = model.switch_rows();
+    let hint = match model.focus.is_some() {
+        true => "↑↓ select · enter view · x stop · ctrl+k stop all · esc close",
+        false => "↑↓ select · enter view · x stop · esc close",
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        format!("  {hint}"),
+        Style::default().fg(theme::faint()),
+    ))];
+    for (index, row) in rows.iter().enumerate() {
+        let cursor = if index == model.switch_cursor { "❯" } else { " " };
+        let shown = if row == &model.focus { "●" } else { "○" };
+        let (name, detail) = match row {
+            None => ("main".to_string(), String::new()),
+            Some(path) => {
+                let progress = model.agent_progress.get(path);
+                let detail = match progress {
+                    Some(progress) => format!(
+                        "{} · {} · {}",
+                        progress.tool_calls,
+                        tokens_str(progress.tokens),
+                        progress.phase.label()
+                    ),
+                    None => String::new(),
+                };
+                (path.name().to_string(), detail)
+            }
+        };
+        // A child blocked on the operator is the one row that has to catch the
+        // eye: nothing else will move it, and it is invisible from the
+        // conversation.
+        let waiting = row.as_ref().is_some_and(|path| {
+            matches!(
+                model.agent_progress.get(path).map(|p| &p.phase),
+                Some(kernel::Phase::AwaitingApproval { .. })
+            )
+        });
+        let name_style = match (row == &model.focus, waiting) {
+            (_, true) => Style::default()
+                .fg(theme::warn())
+                .add_modifier(Modifier::BOLD),
+            (true, _) => Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD),
+            (false, _) => Style::default().fg(theme::text()),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{cursor} "), Style::default().fg(theme::accent())),
+            Span::styled(format!("{shown} "), Style::default().fg(theme::accent())),
+            Span::styled(name, name_style),
+            Span::styled(format!("   {detail}"), Style::default().fg(theme::faint())),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Which pane is on screen, so a stream of tool calls is never anonymous.
+pub(super) fn draw_breadcrumb(f: &mut Frame, model: &Model, area: Rect) {
+    let Some(path) = &model.focus else {
+        return;
+    };
+    if area.height == 0 {
+        return;
+    }
+    let label = format!(" {path} ");
+    let width = label.chars().count() as u16;
+    let x = area.x + area.width.saturating_sub(width).min(area.width);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ))),
+        Rect {
+            x,
+            width: width.min(area.width),
+            height: 1,
+            ..area
+        },
+    );
+}
+
 /// How many rows [`draw_agent_tree`] needs: a header, then two per agent.
 pub(super) fn agent_tree_height(model: &Model) -> u16 {
     match model.agent_runs.len() {
@@ -2021,13 +2122,16 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     // The fleet takes the gap above the composer, and gives it back the moment
     // nothing is running, so it costs no screen when there are no children.
     let tree_h = agent_tree_height(model);
+    let switch_h = switcher_height(model);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
             Constraint::Length(1 + tree_h),
             Constraint::Length(box_h),
-            Constraint::Length(1),
+            // The switcher takes the status row's place while it is open, so it
+            // never pushes the composer around as agents come and go.
+            Constraint::Length(1 + switch_h),
         ])
         .split(area);
 
@@ -2054,7 +2158,20 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
         );
     }
     draw_input(f, model, pad_h(chunks[2]));
-    draw_status(f, model, pad_h(chunks[3]));
+    match switch_h {
+        0 => draw_status(f, model, pad_h(chunks[3])),
+        _ => draw_switcher(f, model, pad_h(chunks[3])),
+    }
+    // Last, over the transcript's final row, so it reads as a tab on the divider.
+    draw_breadcrumb(
+        f,
+        model,
+        pad_h(Rect {
+            y: chunks[0].y + chunks[0].height.saturating_sub(1),
+            height: 1,
+            ..chunks[0]
+        }),
+    );
 
     // Hide inactive menus while an approval owns input.
     let gate_open = model.pending_approval().is_some() || model.clarify.is_some();

@@ -1489,9 +1489,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     }
 
     /// One turn: stream the model and collect a legacy control view plus the exact
-    /// canonical assistant message. Transient failures retry with capped backoff,
-    /// but only before anything has streamed; context overflow is surfaced to the
-    /// caller to compact and retry. Other errors are fatal for the turn.
+    /// canonical assistant message. Transient failures retry with capped backoff;
+    /// after output, only a sink that can explicitly rewind is retried. Context
+    /// overflow is surfaced to the caller to compact. Other errors are fatal.
     #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
@@ -1597,6 +1597,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         // exactly the turns most worth saving. The sink drops
                         // its partial render instead, and the reply arrives once.
                         if emitted {
+                            if !sink.supports_restart() {
+                                return Err(KernelError::Provider(format!(
+                                    "{e}; the stream stopped after partial output and this output surface cannot rewind it safely"
+                                )));
+                            }
                             sink.restarted();
                         }
                         // A retry is progress, not silence. Without this an

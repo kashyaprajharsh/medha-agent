@@ -38,6 +38,14 @@ pub struct PipelineEngine {
     ineffective: AtomicU32,
     /// Context size when anti-thrash latched; sufficient growth releases it.
     latched_at: AtomicU32,
+    /// Local estimate of the request most recently compiled, and the estimate
+    /// of the request whose authoritative usage we last received. Together they
+    /// anchor the size basis: growth is measured from a count the provider
+    /// actually reported, so a local tokenizer that disagrees with the model's
+    /// vocabulary is only wrong about one turn's new material rather than about
+    /// the whole history, where the error compounds with conversation length.
+    pending_estimate: AtomicU32,
+    estimate_at_last_usage: AtomicU32,
     summarizer: Arc<dyn Summarizer>,
     last_summary: std::sync::Mutex<Option<String>>,
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
@@ -67,6 +75,8 @@ impl PipelineEngine {
             verification_threshold: AtomicU32::new(0),
             ineffective: AtomicU32::new(0),
             latched_at: AtomicU32::new(0),
+            pending_estimate: AtomicU32::new(0),
+            estimate_at_last_usage: AtomicU32::new(0),
             summarizer: Arc::new(ExtractiveSummarizer),
             last_summary: std::sync::Mutex::new(None),
             artifacts: None,
@@ -175,6 +185,12 @@ impl ContextEngine for PipelineEngine {
         // Real usage already counts tool defs — store verbatim.
         self.last_prompt_tokens
             .store(prompt_tokens, Ordering::Relaxed);
+        // Pin the local estimate of the *same* request alongside it. The pair
+        // is the anchor: any later estimate above it is new material.
+        self.estimate_at_last_usage.store(
+            self.pending_estimate.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         if self
             .pending_usage_verification
             .swap(false, Ordering::AcqRel)
@@ -230,7 +246,7 @@ impl ContextEngine for PipelineEngine {
     }
 
     async fn compile(&self, messages: &[Message], max_input_tokens: Option<u32>) -> CompileResult {
-        self.compile_inner(
+        self.compile_controlled(
             messages,
             max_input_tokens,
             &kernel::CompileControl::unlimited(),
@@ -245,8 +261,16 @@ impl ContextEngine for PipelineEngine {
         max_input_tokens: Option<u32>,
         control: &kernel::CompileControl,
     ) -> Result<CompileResult, kernel::ContextCompileError> {
-        self.compile_inner(messages, max_input_tokens, control)
-            .await
+        let result = self.compile_inner(messages, max_input_tokens, control).await;
+        // `after_tokens` is this engine's estimate of the request as actually
+        // sent — the compacted size when compaction ran, the untouched size
+        // otherwise. Pairing it with the usage that comes back is what lets the
+        // next turn measure growth from a real count.
+        if let Ok(compiled) = &result {
+            self.pending_estimate
+                .store(compiled.after_tokens, Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -286,8 +310,17 @@ impl PipelineEngine {
         // Last-turn usage excludes new messages; the larger local count avoids
         // compacting one turn late when no provider preflight count exists.
         let actual = self.last_prompt_tokens.load(Ordering::Relaxed);
+        let anchor = self.estimate_at_last_usage.load(Ordering::Relaxed);
         let basis = if preflight > 0 {
             preflight as f32
+        } else if actual > 0 && anchor > 0 && before >= anchor {
+            // Anchored: a count the provider actually reported, plus only the
+            // locally-estimated material added since. `max(before)` keeps the
+            // raw estimate as a floor, and the plain `max` below still covers
+            // the cases this cannot serve — no usage yet, or a compaction that
+            // shrank history below the anchor, where `actual` is stale-high and
+            // erring high merely compacts early instead of overflowing.
+            (actual.saturating_add(before - anchor)).max(before) as f32
         } else {
             (actual as f32).max(before as f32)
         };
@@ -1209,6 +1242,62 @@ mod tests {
         assert!(
             r5.after_tokens < r5.before_tokens,
             "and this pass actually shrinks"
+        );
+    }
+
+    /// A local tokenizer that disagrees with the model's vocabulary undercounts
+    /// by a share of the *whole* history, so `max(last_usage, local_estimate)`
+    /// drifts further from the truth the longer a session runs — and compaction
+    /// never fires because the number it reads keeps looking safe. Anchoring on
+    /// the last count the provider actually reported, and estimating only what
+    /// was added since, keeps the error proportional to one turn's new material.
+    #[tokio::test]
+    async fn size_basis_anchors_on_reported_usage_and_estimates_only_new_material() {
+        // usable = 10_000 after the 10% local-estimate margin, so the prune band
+        // opens at 6_000 (0.60) and Full at 9_900 (0.99).
+        let input_limit = Some(local_input_limit(10_000));
+        // Enough turns that the default head (3) and tail (20) leave a real
+        // middle. With fewer, every message is protected and passthrough is the
+        // right answer whatever the size basis says — which would make this
+        // test pass or fail for reasons unrelated to the basis.
+        // chars/4: thirty 664-char messages ≈ 4_980 tokens, plus the system.
+        let mut msgs = vec![Message::system("S")];
+        for _ in 0..30 {
+            msgs.push(user(&"a".repeat(664)));
+        }
+
+        // Baseline: ~50% of usable, below the prune band — nothing happens.
+        let eng = engine(CompactionPolicy::default());
+        let first = eng.compile(&msgs, input_limit).await;
+        assert!(
+            !first.compacted,
+            "~50% of usable must not compact (estimate was {})",
+            first.before_tokens
+        );
+
+        // The provider reports 5_800 for that same request: the local estimate
+        // ran ~14% low, the kind of gap a foreign vocabulary produces.
+        eng.update_usage(5_800, 6_000);
+
+        // One more turn adds ~400 estimated tokens. The anchored basis is
+        // 5_800 + 400 = 6_200, over the band. The previous rule,
+        // max(5_800, ~5_380), read 58% and would have stayed idle.
+        msgs.push(user(&"b".repeat(1_600)));
+        let grown = eng.compile(&msgs, input_limit).await;
+        assert!(
+            grown.compacted,
+            "reported usage plus new material must cross the prune band \
+             (local estimate alone was {})",
+            grown.before_tokens
+        );
+
+        // Control: without a reported count there is nothing to anchor to, so
+        // the same history rides on the raw local estimate and stays under.
+        let fresh = engine(CompactionPolicy::default());
+        let unanchored = fresh.compile(&msgs, input_limit).await;
+        assert!(
+            !unanchored.compacted,
+            "the anchor, not the extra message, is what tripped compaction"
         );
     }
 

@@ -165,7 +165,7 @@ pub(super) fn draw_breadcrumb(f: &mut Frame, model: &Model, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let label = format!(" {path} ");
+    let label = format!(" {path} · esc main · tab switch ");
     let width = label.chars().count() as u16;
     let x = area.x + area.width.saturating_sub(width).min(area.width);
     f.render_widget(
@@ -2337,6 +2337,11 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
     }
     if model.auto_scroll {
         model.scroll_offset = model.max_scroll();
+    } else {
+        // A parked pane can shrink while it is off screen (its bounded ring may
+        // evict old rows). Never restore an offset beyond its new bottom: that
+        // rendered a blank transcript until the user happened to scroll.
+        model.scroll_offset = model.scroll_offset.min(model.max_scroll());
     }
 
     // Build only the visible physical-row window.

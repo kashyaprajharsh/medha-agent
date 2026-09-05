@@ -333,29 +333,13 @@ fn lower_tool_results(parts: &[ContentPart]) -> Result<Vec<ChatMessage>, Provide
 }
 
 pub(crate) fn wire_tool_name(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    kernel::portable_tool_name(name)
 }
 
 /// Construct the deterministic wire→canonical mapping used by both request
 /// lowering and response decoding. Sanitization collisions receive suffixes.
 pub(crate) fn wire_name_map(canonical: &[String]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for name in canonical {
-        let mut wire = wire_tool_name(name);
-        while map.contains_key(&wire) {
-            wire.push('_');
-        }
-        map.insert(wire, name.clone());
-    }
-    map
+    kernel::portable_tool_name_map(canonical)
 }
 
 /// vLLM's TokenizeChatRequest derives from the exact prepared generation body,
@@ -372,9 +356,21 @@ pub(crate) fn vllm_tokenize_body(request: &PreparedModelRequest) -> serde_json::
     body
 }
 
+/// Accept an explicitly `null` field as the type's default. `#[serde(default)]`
+/// alone only covers an *absent* key, so a server that serialises its whole
+/// schema and spells empties as `null` (mlx-vlm, some llama.cpp builds) would
+/// otherwise fail the whole response with "invalid type: null".
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct StreamChunk {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<UsageRaw>,
@@ -412,9 +408,15 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default, alias = "reasoning")]
+    /// Two wire spellings of the same field. Held separately rather than as one
+    /// `alias`, because a server that sends *both* makes `alias` report a
+    /// duplicate field and reject the response. `reasoning_content` wins when
+    /// both carry text: it is the canonical name.
+    #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
     tool_calls: Vec<DeltaToolCall>,
 }
 
@@ -437,7 +439,7 @@ struct DeltaFn {
 
 #[derive(Deserialize)]
 struct ChatCompletion {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     choices: Vec<CompletionChoice>,
     #[serde(default)]
     usage: Option<UsageRaw>,
@@ -455,9 +457,12 @@ struct CompletionChoice {
 struct CompletionMessage {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default, alias = "reasoning")]
+    /// See [`Delta`] for why these are two fields and not one `alias`.
+    #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
     tool_calls: Vec<CompletionToolCall>,
 }
 
@@ -532,7 +537,11 @@ pub(crate) fn parse_completion(
     let mut blocks = Vec::new();
     if let Some(choice) = parsed.choices.into_iter().next() {
         let message = choice.message;
-        if let Some(reasoning) = message.reasoning_content.filter(|value| !value.is_empty()) {
+        if let Some(reasoning) = message
+            .reasoning_content
+            .or(message.reasoning)
+            .filter(|value| !value.is_empty())
+        {
             blocks.push(Block::Reasoning(reasoning));
         }
         if let Some(content) = message.content.filter(|value| !value.is_empty()) {
@@ -612,6 +621,7 @@ pub(crate) fn process_sse_event(
         if let Some(reasoning) = choice
             .delta
             .reasoning_content
+            .or(choice.delta.reasoning)
             .filter(|value| !value.is_empty())
         {
             blocks.push(Block::Reasoning(reasoning));
@@ -868,6 +878,66 @@ mod tests {
             category: ToolCategory::Read,
             icon: "t".into(),
         }
+    }
+
+    /// Servers that serialise their whole schema (mlx-vlm, some llama.cpp
+    /// builds) send every field, empties spelled as `null`, and both reasoning
+    /// spellings at once. Absent-only defaults reject that; a `reasoning` alias
+    /// would call it a duplicate field and drop the entire turn.
+    #[test]
+    fn completion_accepts_null_fields_and_both_reasoning_spellings() {
+        let body = r#"{
+          "choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant",
+            "content": "Hello!",
+            "reasoning_content": null,
+            "reasoning": null,
+            "tool_calls": null,
+            "tool_call_id": null,
+            "name": null
+          }, "logprobs": null}],
+          "usage": null
+        }"#;
+        let blocks = parse_completion(body, &HashMap::new()).expect("null fields must parse");
+        assert!(
+            blocks.iter().any(|block| matches!(block, Block::Text(text) if text == "Hello!")),
+            "expected the assistant text, got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn stream_chunk_accepts_null_fields_and_both_reasoning_spellings() {
+        let chunk = r#"{"choices":[{"index":0,"finish_reason":null,"delta":{
+            "role":"assistant","content":"hi","reasoning_content":null,
+            "reasoning":null,"tool_calls":null}}],"usage":null}"#;
+        let parsed: StreamChunk = serde_json::from_str(chunk).expect("null fields must parse");
+        let delta = &parsed.choices.first().expect("one choice").delta;
+        assert_eq!(delta.content.as_deref(), Some("hi"));
+        assert!(delta.tool_calls.is_empty());
+    }
+
+    /// `reasoning_content` is canonical, so it wins; a gateway that only sends
+    /// `reasoning` still has its text surfaced.
+    #[test]
+    fn reasoning_content_takes_precedence_and_reasoning_alone_still_reads() {
+        let both = r#"{"choices":[{"message":{
+            "content":"a","reasoning_content":"canonical","reasoning":"fallback"}}]}"#;
+        let blocks = parse_completion(both, &HashMap::new()).expect("parses");
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Reasoning(text) if text == "canonical")),
+            "reasoning_content should win, got {blocks:?}"
+        );
+
+        let only_alias = r#"{"choices":[{"message":{"content":"a","reasoning":"fallback"}}]}"#;
+        let blocks = parse_completion(only_alias, &HashMap::new()).expect("parses");
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Reasoning(text) if text == "fallback")),
+            "reasoning alone should still surface, got {blocks:?}"
+        );
     }
 
     #[test]

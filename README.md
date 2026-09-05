@@ -8,6 +8,9 @@
 
 **A verification-first agent harness. One Rust binary, any model.**
 
+*An open-source, general-purpose CLI agent — for research, files, web tools,
+workflows, and code, not only coding tasks.*
+
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-macOS%20·%20Linux%20·%20Windows-lightgrey.svg)](#install)
@@ -25,7 +28,7 @@
 
 Most agents ask you to trust the model. MEDHA doesn't.
 
-Every action a model proposes runs **validate → police → verify → execute**. Unregistered tools are denied, shell commands pass a danger scanner, consequential actions stop for your approval, and everything runs inside an OS sandbox. Nothing the model *says* causes an effect — only a policy-approved, sandboxed tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
+Every action a model proposes runs **validate → police → approve when required → execute → observe**. When configured, a deterministic verifier follows turns containing local-effect tools. Unregistered tools are denied, shell commands pass a danger scanner, consequential actions stop for your approval, and everything runs inside an OS sandbox. Nothing the model *says* causes an effect — only a policy-approved, sandboxed tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
 
 It runs on whatever model you have — a local Ollama or vLLM server, a hosted gateway, or Gemini natively.
 
@@ -76,7 +79,8 @@ medha
 
 That's the whole setup. The first launch opens model setup inside the TUI, and after
 that everything lives there — switching models, connecting MCP servers, browsing
-memory, opening a running sub-agent to watch and steer it, rewinding a session.
+memory, opening a sub-agent to watch and steer it while it runs or revisit its
+work after it settles, rewinding a session.
 **The TUI is the primary way to use
 MEDHA**; the flags below exist for scripting and CI.
 
@@ -87,7 +91,10 @@ up. Press `/` for the command palette.
 |---|---|
 | **Enter** | Send |
 | **Shift/Alt+Enter** · **Ctrl-J** · trailing `\` | Newline — multi-line prompts |
-| **Esc** | Interrupt the running turn (graceful — in-flight tools settle) |
+| **Tab** (empty composer) | Open the agent-pane switcher |
+| **↑ / ↓** · **Enter** (switcher) | Select and open the main conversation or an agent pane |
+| **Esc** | From an agent pane, return to main. In main, first press gracefully interrupts a running turn; a second press force-aborts it. |
+| **x** · **Ctrl-K** (switcher) | Stop the selected agent (`main` is never stopped) · stop all agents |
 | **Ctrl-C** | Clear the input line |
 | **Ctrl-E** | Expand/collapse compaction summary cards |
 | **↑ / ↓** | Prompt history — or scroll the transcript when the input is empty |
@@ -96,6 +103,11 @@ up. Press `/` for the command palette.
 
 Slash commands only fire when the first word is a real command, so pasting
 `/Users/me/notes.md summarize this` is sent as chat, not misread as a command.
+
+Each sub-agent has its own pane. While it runs, you can switch to it to follow
+or steer its work; recently settled panes remain reopenable from the switcher.
+The main conversation keeps running in the background while you inspect a child,
+and the durable agent transcript remains available after a live pane is retired.
 
 <details>
 <summary>Headless and scripting</summary>
@@ -189,7 +201,7 @@ max_active = 3
 max_depth  = 1                # 1 keeps delegation flat
 
 [verify]
-command = "cargo check"       # deterministic check after file-modifying turns
+command = "cargo check"       # optional check after local-effect tool turns
 ```
 
 Project instructions go in `MEDHA.md`, or your existing `AGENTS.md` / `CLAUDE.md`, which work unchanged. See [`medha.lock.example`](medha.lock.example) for every option, annotated.
@@ -204,7 +216,7 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
   ┌─────────▼──────────────────────────────────────────────────┐
   │  KERNEL                                                    │
   │  compile context → call model → validate → police →        │
-  │  verify → approve → execute → observe → append             │
+  │  approve → execute → observe → optionally verify effects   │
   └──┬────────┬──────────┬──────────┬──────────┬───────────────┘
      │        │          │          │          │
  providers  context   policy    executor   event log

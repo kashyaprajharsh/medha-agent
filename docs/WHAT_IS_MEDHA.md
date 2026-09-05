@@ -37,7 +37,10 @@
 
 ## Overview
 
-MEDHA is a **verification-first AI agent harness** that runs autonomous, general-purpose agents on top of any OpenAI-compatible model. It transforms any AI model into a reliable, auditable, and safe agent by adding multiple layers of validation, policy enforcement, and human oversight.
+MEDHA is an **open-source, verification-first, general-purpose AI agent harness for
+the command line**. It runs against OpenAI-compatible endpoints and Google's native
+Gemini protocol, adding validation, policy enforcement and human oversight around
+the model.
 
 **The Core Bet:** The frontier of agent reliability has moved from the model to the harness. The same model behind a stronger harness is a dramatically more reliable agent. MEDHA is that harness.
 
@@ -143,15 +146,16 @@ The kernel runs a continuous loop for each session:
 │ 2. Budget gate — stop gracefully if a ceiling is hit        │
 │ 3. Prepare → count → compile, looping until the request     │
 │    fits (bounded to 3 compaction passes)                    │
-│ 4. Stream the model (transient failures retried with        │
-│    backoff, but only while nothing has been emitted yet)    │
+│ 4. Stream the model (transient failures retry with bounded  │
+│    provider-requested/fallback backoff; after output, only  │
+│    when the surface can safely restart)                     │
 │ 5. Log model text, reasoning, and the canonical message     │
 │ 6. No tool calls? → Finished                                │
 │ 7. Inject kernel-computed trust into any memory intents     │
 │ 8. Log every intent — dispatch admission, so a logged       │
 │    intent is guaranteed an observation                      │
-│ 9. Execute the turn's calls CONCURRENTLY (order-preserved,  │
-│    bounded), each one running:                              │
+│ 9. Dispatch reads concurrently (order-preserved, bounded);  │
+│    mutations cross a hard serialization barrier. Each call: │
 │    a. Policy authorize — deny-first, by declared radius     │
 │    b. Trust-flow escalation — Allow → Human if tainted      │
 │    c. Human gate, serialized so parallel calls cannot pop   │
@@ -159,8 +163,8 @@ The kernel runs a continuous loop for each session:
 │    d. Execute in the sandbox                                │
 │ 10. Log each observation with its trust label; spill any    │
 │     payload over 16 KB to the artifact store                │
-│ 11. If the turn modified files → run the verifier and feed  │
-│     the result back as tool-trust input                     │
+│ 11. If configured and armed by local-effect intent → run    │
+│     the verifier; feed its result as tool-trust input       │
 │ 12. Repeat                                                  │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -180,7 +184,7 @@ dropped *before* execution, so an approved slow tool doesn't block the next card
 | `gate.rs` | Human approval | Handles approval prompts |
 | `interrupts.rs` | Cancellation | Manages Esc key and message steering |
 | `executor.rs` | Tool dispatch | Bridges kernel to tool registry |
-| `verify.rs` | Post-edit checks | Runs tests/linters after edits |
+| `verify.rs` | Optional post-dispatch checks | Runs a configured verifier after local-effect intents |
 | `events.rs` | Event definitions | Defines loggable event types |
 
 ### Configuration
@@ -228,7 +232,7 @@ The gate activates when:
 | Caller | What `Always` means |
 |---|---|
 | A **tool approval** | "Don't ask again **this session**." Nothing is written to disk. |
-| A **file-permission prompt** | "Trust this path." Persisted to `medha.lock` under `[permissions] trusted_paths`. |
+| A **file-permission prompt** | "Trust this path." Persisted to the machine-local `$MEDHA_HOME/projects/<workspace-id>/trust.lock`. |
 
 > **An escalated prompt can never be remembered.** When a gate exists *only* because
 > of trust-flow escalation, the kernel passes `escalated: true` and that prompt is
@@ -708,8 +712,8 @@ Blast radius categorizes tools by **potential damage** if they malfunction or ar
 
 | Level | Tools | Undo Possible? | Policy Default |
 |-------|-------|----------------|----------------|
-| 🟢 **Read** | `fs.read`, `grep`, `glob`, `tree`, `references`, `code_outline`, `lsp.*` queries, `web.search`, `web.fetch`, `web.crawl`, `memory.*`, `read_artifact`, `clarify`, `update_plan`, `agent.*` control verbs | N/A (nothing changes) | Allow |
-| 🟡 **ReversibleLocal** | `fs.edit`, `fs.write`, `multi_edit`, `git` (add/commit), `task.kill`, `task.remove`, `agent.spawn`, `agent.apply` | Yes (snapshot or git) | Ask (careful) / Allow (yolo) |
+| 🟢 **Read** | `fs.read`, `grep`, `glob`, `tree`, `references`, `code_outline`, `lsp.*` queries, `web.search`, `web.fetch`, `web.crawl`, `memory.*`, `read_artifact`, `clarify`, `update_plan`, and the non-starting agent controls (`agent.list`, `agent.wait`, `agent.message`, `agent.steer`, `agent.transcript`, `agent.cancel`) | N/A (nothing changes) | Allow |
+| 🟡 **ReversibleLocal** | `fs.edit`, `fs.write`, `multi_edit`, `git` (add/commit), `task.kill`, `task.remove`, `agent.spawn`, `agent.followup`, `agent.apply` | Yes (snapshot, git, or bounded agent state) | Ask (careful) / Allow (yolo) |
 | 🟠 **IrreversibleLocal** | `shell.exec`, `diagnostics` | No | `diagnostics`: Ask Human. `shell.exec`: scanner decides Deny/Human/Allow, then the autonomy dial may tighten `Allow`. |
 | 🔴 **External** | `mcp__*` (every MCP tool), `lsp.start`, `mcp.start` | No + affects outside | Ask Human |
 
@@ -742,14 +746,18 @@ Blast radius categorizes tools by **potential damage** if they malfunction or ar
   escalation on whatever the model does *afterwards*.
 
 #### 🟡 ReversibleLocal
-- **What:** Modifies workspace files, with a snapshot taken first
+- **What:** Modifies workspace or bounded local agent state in a recoverable way
 - **Examples:** `fs.write`, `fs.edit`, `multi_edit`, `git add`/`commit`, `task.kill`,
-  `task.remove`, `agent.spawn`, `agent.apply`
+  `task.remove`, `agent.spawn`, `agent.followup`, `agent.apply`
 - **Base verdict:** `Allow` — the snapshot is what makes `medha undo` possible
 - **Then the dial:** `careful` gates whatever is in `[policy] approve`; `normal` drops
   the three edit tools from that set; `yolo` gates none of it. Some tools here carry
   their own rule regardless — `agent.apply` is always `Human`, because reviewing a
   sub-agent's diff *is* the feature.
+
+`agent.followup` is not a read: it admits and runs another child session, spends
+budget, and can resume a writing agent in a fresh private checkout. It therefore has
+the same `ReversibleLocal` classification as `agent.spawn`.
 
 #### 🟠 IrreversibleLocal
 - **What:** Runs code whose effects the snapshot system cannot capture
@@ -895,6 +903,12 @@ Session stops with StopReason::Interrupted
      ▼
 All admitted intents have observations (invariant maintained)
 ```
+
+In the TUI, Esc is deliberately contextual. While reading a child pane, the first
+Esc returns to the main conversation rather than cancelling the main turn. On the
+main conversation, the first Esc requests the graceful path above; pressing Esc
+again while that cancellation is still settling force-aborts owned foreground work.
+A visible approval, question or picker owns its own first Esc.
 
 ### Key Invariant
 
@@ -1166,7 +1180,7 @@ Tools are the **capabilities** the AI can use to interact with the world. Each t
 | **Diagnostics** | `diagnostics` | Structured compiler/linter output across 8 toolchains |
 | **Code Intelligence** | `lsp.*` (10 tools) | Semantic diagnostics, definitions, references, symbols (see [Code Intelligence](#code-intelligence-lsp)) |
 | **MCP** | `mcp.status`, `mcp.start`, `mcp__<server>__<tool>` | External Model Context Protocol servers (see [MCP Host](#mcp-host)) |
-| **Sub-agents** | `agent.spawn`, `wait`, `list`, `message`, `steer`, `followup`, `transcript`, `cancel`, `apply` | Delegation (see [Sub-Agents](#sub-agents)) |
+| **Sub-agents** | `agent.spawn`, `agent.wait`, `agent.list`, `agent.message`, `agent.steer`, `agent.followup`, `agent.transcript`, `agent.cancel`, `agent.apply` | Delegation (see [Sub-Agents](#sub-agents)) |
 | **Memory** | `memory.write`, `update`, `forget`, `search`, `sessions.search` | Manage persistent facts and recall past sessions |
 | **Skills** | `skill.list`, `skill.load`, `skill.save` | Load/save procedures |
 | **Artifacts** | `read_artifact` | Page through spilled output (see [Artifacts](#artifacts)) |
@@ -1308,6 +1322,23 @@ Built on The Elm Architecture: `Model → Update(model, msg) → Model → View(
 The view is a **pure function of the model**, so the same state always renders
 identically — there is no shared mutable UI state to drift.
 
+**Agent panes.** The main conversation and each recent child have separate transcript
+and scroll/follow state. With an empty composer, **Tab** opens a switcher containing
+`main`, running children and recent settled panes; ↑/↓ selects and Enter opens.
+`x` stops the selected child (`main` is never stopped), and Ctrl-K stops all running
+children. A settled pane can be reopened while it remains in the bounded recent-agent
+roster, so returning to main does not strand its output. Foreground events continue
+to land in `main` while a child is displayed. Submitting text with Enter while a live
+child pane is open steers that child; if it settles before accepting the text, the
+text is restored to the composer. Esc returns from a child pane to main before it can
+cancel the main turn.
+
+**Session boundaries.** `/resume`, `/rewind` and `/clear` refuse to cross a boundary
+while foreground work, active/admitting children, or child steers are unsettled, or
+while another session change is in progress. A successful boundary returns focus to
+main and retires the old session's pane roster, preventing old output from appearing
+under a new session id.
+
 **Theme.** Four palettes, each a whole visual identity rather than a set of text
 colours: `dark` (intellect-gold on warm ink) and `light` (ink on parchment) are the
 signature pair, joined by `indigo` — nīla, gold on resist-dyed cloth — and `copper`,
@@ -1328,8 +1359,9 @@ near-white text on white. Every other palette paints its own.
 extractor emits a warning on ligatures, which any `web.fetch` of an academic PDF
 triggers. On an alternate screen that spray corrupts the display. So the terminal is
 built on a *duplicated* tty handle and the real fd 1/2 are redirected to
-`.medha/logs/stray-stdout.log`. Stray output from anywhere lands in the log instead of
-on screen, and is restored on exit and via a panic hook.
+`$MEDHA_HOME/projects/<workspace-id>/logs/stray-stdout.log`. Stray output from
+anywhere lands in the log instead of on screen, and is restored on exit and via a
+panic hook.
 
 **Secrets never enter scrollback.** A slash command carrying a token is redacted from
 the transcript but stays recallable with ↑ — the key is already in the keychain, so a
@@ -1348,6 +1380,7 @@ balloon the process.
 | `kind` | Payload |
 |---|---|
 | `model.text` / `model.reasoning` | Streaming deltas |
+| `model.restarted` | Discard the current partial model reply; a transient stream failure is being retried |
 | `tool.call` | Tool name and arguments, before it runs |
 | `tool.observation` | The **raw payload** — when `old`/`new`/`path` are present the editor can open a native diff |
 | `usage` | Prompt and total tokens |
@@ -1358,9 +1391,10 @@ balloon the process.
 Plus a separate `approval` notification carrying `gate_id`, `action`, `detail` and
 `escalated`, answered with `approval.respond`.
 
-> **An editor approval is "allow once".** It never persists a path to `medha.lock`. If
-> the editor disconnects or never answers, the gate resolves to **deny** — an
-> unapproved action is never committed because a client went away.
+> **An editor approval is "allow once".** It never persists a path to the
+> machine-local `trust.lock`. If the editor disconnects or never answers, the gate
+> resolves to **deny** — an unapproved action is never committed because a client
+> went away.
 
 ---
 
@@ -1477,16 +1511,25 @@ addressable transcript. The parent receives only a bounded structured result.
 
 ### Capability Narrowing
 
-The requested tool set is intersected with the parent's at construction, then
-enforced **a second time on dispatch**. Both halves are load-bearing: `specs()`
-decides what the child is *shown*, but a model can name a tool it was never shown,
-so `execute()` must refuse independently. **A child can never widen beyond its
-parent.**
+Omitting `tools` inherits the parent's capabilities. A supplied narrowing list uses
+canonical registry names — often dotted, such as `web.search`, but also wire-safe
+names such as `mcp__server__tool`. An unambiguous provider-visible alias
+(`web_search`) is also accepted and normalized to the canonical name. Unknown or
+ambiguous names refuse admission instead of being silently dropped and launching a
+crippled child. `fs.read` and `fs.list` are retained as essential legibility tools
+when the parent has them.
+
+The normalized set is still intersected with the parent's executor and enforced **a
+second time on dispatch**. Both halves are load-bearing: `specs()` decides what the
+child is *shown*, but a model can name a tool it was never shown, so `execute()` must
+refuse independently. **A child can never widen beyond its parent.**
 
 ### Context Inheritance
 
-`fork` controls how much of the parent's conversation the child starts with: `all`
-(default), `none` for a cold start, or a number of recent turns.
+`fork` controls how much of the parent's conversation the child starts with: `none`
+(the cold-start default), `all`, or a positive number of recent user turns. Tool-call
+working state is not inherited; a delegated objective should contain the context the
+child needs unless inheritance is explicitly requested.
 
 ### Writers and Worktree Isolation
 
@@ -1507,15 +1550,27 @@ A patch **never applies itself**:
 
 | Tool | Purpose |
 |---|---|
-| `agent.spawn` | Delegate; `tasks` starts several at once, concurrently |
+| `agent.spawn` | Delegate; `tasks` starts several at once, concurrently; children always start asynchronously |
 | `agent.wait` | Block until one settles — bounded, and a timeout is an outcome, not a failure |
-| `agent.list` | What is running, with idle time |
+| `agent.list` | What is running: `doing`, `tool_calls`, `tokens`, and phase-aware nullable `quiet_ms` |
 | `agent.steer` | Correct one of your own children mid-run without restarting it |
 | `agent.message` | Note to any live agent, including your parent |
-| `agent.followup` | Give a finished agent more work; it resumes with what it found |
+| `agent.followup` | Add work to your child: queue it while live, or resume its prior session after it finishes |
 | `agent.transcript` | Read what an agent actually did (tail-bounded) |
 | `agent.cancel` | Stop one; siblings keep running |
 | `agent.apply` | Merge a writer's patch, behind the human gate |
+
+`agent.spawn` returns immediately by default and each durable report arrives on its
+own. Set its optional `wait: true` only when the caller cannot proceed without the
+new child or batch: the same tool call then waits for those children and returns their
+reports. Operator input interrupts that wait and detaches it without cancelling the
+children. The separate `agent.wait` waits for any owned child and returns as soon as
+one settles or its validated timeout expires.
+
+`agent.list` reports the current phase in `doing` plus running tool-call and token
+counters. `quiet_ms` is populated only in phases where silence can indicate a stall;
+it is `null` while a child is waiting on the operator or in another exempt phase, so
+null must not be interpreted as a hung agent.
 
 Agents are addressed hierarchically (`/survey/parser`). Defaults: 3 children alive
 at once, delegation depth 1 (flat), waits bounded between 1s and 10 minutes so a
@@ -1538,9 +1593,12 @@ another agent's raw tool output, so it relays as web trust unconditionally.
 
 The baseline adapter is the **OpenAI-compatible Chat Completions** API. Point
 `base_url` at any compatible server — vLLM, llama.cpp, Ollama, LM Studio, SGLang,
-Together, Groq, OpenRouter, OpenAI itself — and it works with no new code. Tool
-names are sanitized to the strict OpenAI contract on the wire, so endpoints that
-reject non-standard names work out of the box.
+Together, Groq, OpenRouter, OpenAI itself — and it works with no new code. Canonical
+registry tool names — dotted or already wire-safe — are mapped to strict portable
+wire names and decoded back with a deterministic, collision-safe map. The same map
+is used by OpenAI Chat and Gemini. Semantic arguments which themselves name tools,
+such as agent capability narrowing and skill requirements, accept an unambiguous
+portable alias and persist the provider-independent canonical name.
 
 ### Shipped Protocols
 
@@ -1567,12 +1625,23 @@ indicative and labelled as such.
 ### Failure Classification
 
 Provider errors are classified rather than lumped together, because the right
-recovery differs: an **input context overflow** triggers compaction and a retry, an
-**output-cap rejection** lowers `max_tokens` for that one call, a **payload too
-large** asks for less retained media, and only genuinely **transient** failures
-(429, 5xx, network drops) are retried with capped exponential backoff. Retries only
-happen while nothing has been streamed to the surface yet — re-running after partial
-output would duplicate it.
+recovery differs. An **input context overflow** triggers compaction and one retry. An
+**output-cap rejection** can retry once with a lower cap only when the provider
+reports a positive available allowance, nothing has been emitted, and the adapter
+can rebuild the request; otherwise it fails with guidance to lower the profile cap.
+A **payload too large** rejection fails with guidance to reduce retained media or
+byte-heavy tool results.
+
+Only genuinely **transient** failures (429, 5xx, network drops) receive the bounded
+retry loop. A valid numeric `Retry-After` from a 429/5xx response is preferred and
+capped at 60 seconds; otherwise MEDHA uses capped, jittered exponential backoff. Once
+the provider has emitted reply content, retry is allowed only when the output surface
+can retract or explicitly reset that attempt: the TUI removes abandoned
+text/reasoning, resets its in-progress tool label, and shows a retry notice, while ACP
+emits `model.restarted` so the editor can discard the attempt. Plain REPL and headless
+stdout cannot rewind printed bytes, so they fail that turn instead of risking a
+duplicated answer. A retry also counts as liveness progress for sub-agent stall
+detection.
 
 ---
 
@@ -2101,7 +2170,7 @@ version: 1
 | `description` | **yes** | The one line shown in the manifest |
 | `triggers` | no | Keywords used to trim the manifest when many skills are installed |
 | `domains` | no | Same, as broader categories |
-| `required_tools` | no | Validated against the session's registered tools; a skill needing one you don't have is listed **unavailable** rather than failing mid-procedure |
+| `required_tools` | no | Canonical registry tool names required by the procedure (often dotted, such as `shell.exec`; MCP names use `mcp__…`); a missing tool makes the skill **unavailable** |
 | `version` | no | Defaults to `1`; bumped automatically when `skill.save` overwrites |
 
 **Portable by design.** Unknown frontmatter keys (`license`, `allowed-tools`, …) parse
@@ -2111,6 +2180,17 @@ skipped on write, so a skill MEDHA saves stays portable back out.
 
 **Scope.** Project skills (committed to the workspace) **shadow** personal ones of the
 same name, so a repo can override a user's version of a procedure.
+
+The model-facing `skill.list`, `skill.load` and `skill.save` calls use a live catalogue:
+each combines the session's frozen built-in/static tools with the MCP tools available
+at that call. `skill.save` accepts unambiguous provider-facing aliases such as
+`shell_exec`, normalizes them to `shell.exec`, and rejects unknown or ambiguous
+requirements rather than writing a skill that can never run.
+
+The startup system manifest and the TUI `/skills` view currently use the static
+session catalogue only. An MCP-dependent skill can therefore appear unavailable in
+those two summaries even while the model-facing skill calls correctly see the live
+connection.
 
 ### Lifecycle
 
@@ -2184,7 +2264,11 @@ upstream changes. `/skill lock` and `/skill sync` pin a team's set.
 
 ### What Is `medha.lock`?
 
-`medha.lock` is a **single, declarative TOML file** that contains the **entire cognitive configuration** of your MEDHA harness. It defines budgets, policies, compaction settings, sandbox configuration, permissions, and more — all in one portable, diffable, versionable artifact.
+`medha.lock` is the **declarative, repository-safe cognitive configuration** of your
+MEDHA harness. It defines budgets, policies, compaction settings, sandbox
+configuration and more in one portable, diffable, versionable artifact. Machine-local
+authority is deliberately separate: persistent out-of-workspace path and network
+grants live in the project's state `trust.lock`, never in repository configuration.
 
 **Key Properties:**
 
@@ -2194,7 +2278,7 @@ upstream changes. `/skill lock` and `/skill sync` pin a team's set.
 | **Partial** | Only specify what you want to change |
 | **Overrideable** | Env vars > `medha.lock` > built-in defaults |
 | **Versionable** | Commit to git, diff, review changes |
-| **Portable** | Share with team, same behavior everywhere |
+| **Portable** | Share cognitive settings with the team; machine-local permission grants do not travel |
 
 ### Configuration Precedence
 
@@ -2363,10 +2447,10 @@ extra_writable = ["/path/to/shared/build/dir"]
 # remote_dir = "/home/user/project"
 
 # ───────────────────────────────────────────────────────────
-# 11. VERIFY — Post-edit checks
+# 11. VERIFY — Optional post-dispatch checks
 # ───────────────────────────────────────────────────────────
 [verify]
-# Run after every file-modifying turn
+# Run after turns containing a ReversibleLocal or IrreversibleLocal intent
 command = "cargo check"
 # command = "npm test"   # JavaScript
 # command = "pytest"     # Python
@@ -2388,22 +2472,14 @@ effort = "medium"           # low | medium | high
 stream = true               # Stream reasoning tokens live?
 
 # ───────────────────────────────────────────────────────────
-# 14. PERMISSIONS — Trusted paths (auto-populated)
-# ───────────────────────────────────────────────────────────
-[[permissions.trusted_paths]]
-path = "/Users/you/.medha/config.toml"
-permission = "Read"
-granted_at = 1721318400
-
-# ───────────────────────────────────────────────────────────
-# 15. PRICING — Custom token rates (optional)
+# 14. PRICING — Custom token rates (optional)
 # ───────────────────────────────────────────────────────────
 [pricing]
 input_per_mtok = 0.50   # USD per million input tokens
 output_per_mtok = 1.50  # USD per million output tokens
 
 # ───────────────────────────────────────────────────────────
-# 16. GATE — Eval scenario config
+# 15. GATE — Eval scenario config
 # ───────────────────────────────────────────────────────────
 [gate]
 scenarios_dir = "scenarios"
@@ -2557,10 +2633,9 @@ medha "fix the bug"
 | `[context_files]` | Project instructions | `enabled`, `progressive_discovery` |
 | `[policy]` | Authorization | `approve`, `autonomy` |
 | `[sandbox]` | Execution isolation | `backend`, `network` |
-| `[verify]` | Post-edit checks | `command` |
+| `[verify]` | Optional post-dispatch checks | `command` |
 | `[ui]` | TUI presentation | `show_thinking` |
 | `[reasoning]` | Thinking control | `enabled`, `effort` |
-| `[permissions]` | Trusted paths | `trusted_paths` (auto) |
 | `[pricing]` | Token rates | `input_per_mtok` |
 | `[gate]` | Eval scenarios | `pass_threshold`, `seeds` |
 
@@ -2572,15 +2647,17 @@ medha "fix the bug"
 
 ### What It Does
 
-Verify runs **deterministic checks after file-modifying turns** to catch broken builds or failing tests before the session ends.
+When a command is configured, Verify runs a **deterministic check after a turn that
+contains a `ReversibleLocal` or `IrreversibleLocal` intent**. With no configured
+command, MEDHA uses `NoVerify` and skips the check.
 
 ### How It Works
 
 ```
-AI edits files
+AI proposes a local-effect tool
      │
      ▼
-Kernel detects modified files (via blast radius)
+Kernel arms verification from the declared blast radius
      │
      ▼
 Runs configured command (e.g., cargo check)
@@ -2691,7 +2768,7 @@ Check: Is path in workspace?
 | Type | Behavior | Persisted? |
 |------|----------|------------|
 | Once | Allow single access | No |
-| Always | Allow and remember | Yes, to `medha.lock` |
+| Always | Allow and remember | Yes, to the machine-local project `trust.lock` |
 | Deny | Reject access | Logged for audit |
 
 ### Separate Read/Write
@@ -2702,6 +2779,12 @@ Read and write permissions are tracked **independently**:
 - Prevents privilege escalation
 
 ### Trusted Paths Storage
+
+Persistent grants are written to
+`$MEDHA_HOME/projects/<workspace-id>/trust.lock` under a sibling file lock and atomic
+replacement. Repository-provided `permissions.trusted_paths` entries in `medha.lock`
+are ignored with a warning: a cloned checkout cannot grant itself access to host
+paths. The machine-local file uses this shape:
 
 ```toml
 [[permissions.trusted_paths]]
@@ -2742,7 +2825,7 @@ Check: Exceeds threshold (16KB)?
           Compute SHA-256 hash
           │
           ▼
-          Save to: ~/.medha/artifacts/<hash>
+          Save to: $MEDHA_HOME/projects/<workspace-id>/artifacts/<hash>
           │
           ▼
           Return preview + reference:
@@ -3000,7 +3083,7 @@ USER: "Fix the failing test in tests/calc.rs"
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────┐
-│ VERIFY: turn modified files → run [verify] command       │
+│ VERIFY: local-effect turn → run configured command       │
 │ cargo check → PASS ✓  (fed back as TOOL trust)           │
 └─────────────────────────────────────────────────────────┘
                          │
@@ -3091,7 +3174,7 @@ MEDHA transforms any AI model into a **reliable, auditable, safe agent** through
 | **Tools** | 53 capabilities, sandbox-confined |
 | **Context** | Five-layer prompt assembly with compaction |
 | **Skills** | Reusable procedures loaded on demand |
-| **Verify** | Post-edit checks to catch broken builds |
+| **Verify** | Optional post-dispatch checks for local-effect turns |
 | **Permissions** | Ask-then-persist for out-of-workspace access |
 | **Artifacts** | Content-addressed storage for large outputs |
 | **Eval Gate** | CI-style testing for AI behavior |

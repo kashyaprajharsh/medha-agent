@@ -1130,24 +1130,22 @@ impl ToolRegistry {
     }
 
     /// Register the skill tools over the given store. Include the skill tools
-    /// themselves in the frozen capability set so manifest availability, save
-    /// validation, and actual loads agree.
+    /// themselves in the frozen static capability set, while consulting MCP's
+    /// live catalogue for availability on every skill call.
     pub fn register_skills(&mut self, store: Arc<SkillStore>) -> &mut Self {
         let mut names = self.tool_names();
         names.extend(["skill.load", "skill.save", "skill.list"].map(String::from));
         let known = Arc::new(names);
+        let catalog = Arc::new(skills::SkillToolCatalog::new(known, self.mcp.clone()));
         self.register(Arc::new(skills::SkillLoad {
             store: store.clone(),
-            known_tools: known.clone(),
+            catalog: catalog.clone(),
         }));
         self.register(Arc::new(skills::SkillList {
             store: store.clone(),
-            known_tools: known.clone(),
+            catalog: catalog.clone(),
         }));
-        self.register(Arc::new(skills::SkillSave {
-            store,
-            known_tools: known,
-        }));
+        self.register(Arc::new(skills::SkillSave { store, catalog }));
         self
     }
 
@@ -2141,15 +2139,30 @@ impl Tool for Grep {
         // we additionally skip build dirs that may not be gitignored.
         // Full walk + reads are blocking work — off the async runtime.
         tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&start).map_err(|error| {
+                ToolError::Failed(format!("cannot search {}: {error}", start.display()))
+            })?;
             let mut matches: Vec<Value> = Vec::new();
             let mut truncated = false;
             let mut skipped_large = 0usize;
+            let mut search_errors = Vec::new();
+            let mut error_count = 0usize;
             let walk = WalkBuilder::new(&start)
                 .standard_filters(true)
                 .filter_entry(|e| !skip_dir(e))
                 .build();
 
-            'outer: for dent in walk.flatten() {
+            'outer: for entry in walk {
+                let dent = match entry {
+                    Ok(dent) => dent,
+                    Err(error) => {
+                        error_count += 1;
+                        if search_errors.len() < 10 {
+                            search_errors.push(error.to_string());
+                        }
+                        continue;
+                    }
+                };
                 if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
@@ -2157,8 +2170,16 @@ impl Tool for Grep {
                     skipped_large += 1;
                     continue;
                 }
-                let Ok(content) = std::fs::read_to_string(dent.path()) else {
-                    continue; // skip binaries (non-UTF-8)
+                let content = match std::fs::read_to_string(dent.path()) {
+                    Ok(content) => content,
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+                    Err(error) => {
+                        error_count += 1;
+                        if search_errors.len() < 10 {
+                            search_errors.push(format!("{}: {error}", dent.path().display()));
+                        }
+                        continue;
+                    }
                 };
                 let rel = portable_rel(dent.path().strip_prefix(&root).unwrap_or(dent.path()));
                 let lines: Vec<&str> = content.lines().collect();
@@ -2175,7 +2196,7 @@ impl Tool for Grep {
                         });
                         if context > 0 {
                             let lo = i.saturating_sub(context);
-                            let hi = (i + context + 1).min(lines.len());
+                            let hi = i.saturating_add(context).saturating_add(1).min(lines.len());
                             let ctx: Vec<String> =
                                 (lo..hi).map(|j| format!("{}: {}", j + 1, lines[j])).collect();
                             m["context"] = json!(ctx);
@@ -2186,6 +2207,11 @@ impl Tool for Grep {
             }
             let count = matches.len();
             let mut out = json!({ "matches": matches, "count": count, "truncated": truncated });
+            if error_count > 0 {
+                out["incomplete"] = json!(true);
+                out["error_count"] = json!(error_count);
+                out["errors"] = json!(search_errors);
+            }
             if skipped_large > 0 {
                 out["note"] = json!(format!(
                     "[skipped {skipped_large} file(s) >1MB — not searched; use shell.exec grep for those]"
@@ -6841,6 +6867,40 @@ mod tests {
             "stale multi_edit preview must refuse"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn grep_reports_a_missing_search_path() {
+        let dir = std::env::temp_dir().join(format!("medha-grep-missing-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = Grep {
+            sbx: Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap()),
+        };
+        let result = tool
+            .execute(&json!({"pattern": "needle", "path": "missing"}))
+            .await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            result.is_err(),
+            "a missing search root must not look like zero matches: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_handles_large_context_without_overflow() {
+        let dir = std::env::temp_dir().join(format!("medha-grep-context-{}", ulid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sample.txt"), "before\nneedle\nafter\n").unwrap();
+        let tool = Grep {
+            sbx: Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap()),
+        };
+        let out = tool
+            .execute(&json!({"pattern": "needle", "context": u64::MAX}))
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["matches"][0]["context"].as_array().unwrap().len(), 3);
     }
 
     #[tokio::test]

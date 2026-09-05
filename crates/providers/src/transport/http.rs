@@ -115,7 +115,13 @@ pub(crate) async fn require_success(
     if status.is_success() {
         return Ok(response);
     }
-    let retry_after = retry_after(response.headers());
+    // Retry-After is scheduling metadata, not proof that the rejection is
+    // transient. Some gateways attach it to 400/401 responses; promoting those
+    // to throttling repeats invalid input or credentials and bypasses context
+    // compaction. Honour it only for statuses already safe to retry.
+    let retry_after = retry_after_status(status)
+        .then(|| retry_after(response.headers()))
+        .flatten();
     let status = status.as_u16();
     let body = read_error_body(response).await;
     match retry_after {
@@ -143,6 +149,10 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         return None;
     }
     Some(Duration::from_millis(millis.min(MAX_RETRY_AFTER_MS) as u64))
+}
+
+fn retry_after_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 /// Capture an unsuccessful response body without exceeding the transport cap.
@@ -321,6 +331,14 @@ mod tests {
             retry_after(&headers(&[("retry-after", "3600")])),
             Some(Duration::from_millis(MAX_RETRY_AFTER_MS as u64))
         );
+    }
+
+    #[test]
+    fn retry_after_does_not_make_client_or_auth_errors_transient() {
+        assert!(!retry_after_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!retry_after_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(retry_after_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(retry_after_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
     }
 
     #[test]

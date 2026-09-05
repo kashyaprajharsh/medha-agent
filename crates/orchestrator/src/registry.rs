@@ -84,6 +84,28 @@ impl AgentRegistry {
         }
     }
 
+    /// Retire one idle session's in-memory tree before the control plane adopts
+    /// another. Durable transcripts and separately retained patches remain
+    /// addressable; running or reserving a child makes the boundary refuse.
+    pub(crate) fn reset_idle(&self) -> bool {
+        let mut tree = self.lock();
+        if !tree.live.is_empty() || !tree.reserved.is_empty() {
+            return false;
+        }
+        let retired: Vec<_> = tree.agents.drain().collect();
+        for (path, agent) in retired {
+            tree.archived.retain(|(known, _)| known != &path);
+            tree.archived.push((path, agent.session));
+        }
+        if tree.archived.len() > MAX_ARCHIVED {
+            let drop_count = tree.archived.len() - MAX_ARCHIVED;
+            tree.archived.drain(..drop_count);
+        }
+        tree.progress.clear();
+        tree.settled.clear();
+        true
+    }
+
     /// Select and reserve a free child name under one lock.
     pub(crate) fn claim(
         self: &Arc<Self>,
@@ -197,6 +219,18 @@ impl AgentRegistry {
 
     pub fn running(&self) -> Vec<Agent> {
         self.select(|agent| agent.is_running())
+    }
+
+    /// Whether this exact path/session pair is still an executing member of
+    /// the current tree. Session adoption uses it to reject delayed calls from
+    /// a child that belonged to the surface just retired.
+    pub(crate) fn is_live_session(&self, path: &AgentPath, session: ulid::Ulid) -> bool {
+        let tree = self.lock();
+        tree.live.contains_key(path)
+            && tree
+                .agents
+                .get(path)
+                .is_some_and(|agent| agent.session == session.to_string())
     }
 
     pub fn all(&self) -> Vec<Agent> {

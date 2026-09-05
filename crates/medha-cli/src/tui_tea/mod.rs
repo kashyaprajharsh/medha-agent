@@ -306,6 +306,8 @@ pub(crate) enum TuiEvent {
     /// One step of a child agent's own working-out, addressed by its path so it
     /// lands in that agent's view rather than in the conversation that spawned it.
     AgentStep {
+        /// Root surface session captured when the child was admitted.
+        surface_session: Option<ulid::Ulid>,
         path: orchestrator::AgentPath,
         step: AgentStep,
     },
@@ -351,7 +353,7 @@ pub(crate) enum TuiEvent {
     ///
     /// Sent from the orchestrator *after* the outbox write, so acting on it can
     /// never read a report that is not there yet.
-    AgentReportReady,
+    AgentReportReady(Option<ulid::Ulid>),
     /// The `/agents` panel's rows, resolved off the UI thread. Patches live in
     /// the event log so they survive a restart, and reading the log is not
     /// something a keystroke handler may block on.
@@ -359,6 +361,9 @@ pub(crate) enum TuiEvent {
     /// A patch was viewed or applied. `Err` carries the refusal — an unverified
     /// patch or a conflict — which is the outcome that matters most.
     AgentPatchAction(Result<String, String>),
+    /// Detached follow-up admission finished; releases the session-boundary
+    /// guard before its success/failure notice is shown.
+    AgentFollowupFinished(Result<String, String>),
     McpStatus(Result<serde_json::Value, String>),
     /// A remote MCP server's browser sign-in is waiting on this URL.
     McpAuthUrl {
@@ -414,12 +419,17 @@ pub(crate) enum TuiEvent {
     /// is the branch's replayed conversation, `rolled` the files reverted,
     /// `prefill` the chosen prompt to drop back into the input box.
     Rewound {
+        source: ulid::Ulid,
         new_id: Option<ulid::Ulid>,
         msgs: Vec<Message>,
         memory_events: Vec<kernel::Event>,
         rolled: usize,
         scope: RewindScope,
         prefill: Option<String>,
+    },
+    RewindFailed {
+        source: ulid::Ulid,
+        error: String,
     },
 }
 
@@ -552,6 +562,14 @@ pub(crate) enum AgentStep {
         ok: bool,
         payload: serde_json::Value,
     },
+    /// A transient provider failure abandoned the trailing streamed attempt.
+    Restarted,
+    /// Optimistic local record while a steer waits for a turn boundary.
+    SteerQueued(String),
+    /// The queued text actually entered the child's canonical transcript.
+    Steered(String),
+    /// The child settled before these queued messages could be applied.
+    SteersReturned(Vec<String>),
 }
 
 /// One finished child, as its record reads afterwards.
@@ -1589,6 +1607,17 @@ struct Picker {
     selected: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionOp {
+    Resume {
+        source: ulid::Ulid,
+        target: ulid::Ulid,
+    },
+    Rewind {
+        source: ulid::Ulid,
+    },
+}
+
 /// Guided model setup keeps credentials out of history and the transcript.
 #[derive(Clone, Copy)]
 enum ModelSetupStep {
@@ -1805,6 +1834,14 @@ struct Model {
     /// session at the start of each turn; the safety floor is level-independent.
     autonomy: kernel::AutonomyLevel,
     running: bool,
+    /// An asynchronous resume/rewind owns the session boundary until its
+    /// terminal event. Composer submissions and other boundaries wait.
+    session_op: Option<SessionOp>,
+    /// Detached follow-up admissions not yet visible in the active roster.
+    pending_agent_launches: usize,
+    /// User messages accepted by a child but not yet reported as applied or
+    /// returned. Boundaries wait so typed text cannot vanish in an event tail.
+    pending_agent_steers: usize,
     /// A background report is collectable but a turn is already in flight. It
     /// cannot be injected mid-response, so the signal is held until this settles.
     agent_report_deferred: bool,
@@ -1921,9 +1958,9 @@ struct Model {
     /// renderer to choose — which it cannot do while holding a borrow of the
     /// model for its render context.
     parked_main: VecDeque<Entry>,
-    /// Scroll position of each pane that is not on screen, so returning to one
-    /// lands where it was left rather than at the bottom.
-    parked_scroll: HashMap<Option<orchestrator::AgentPath>, usize>,
+    /// Scroll position and follow mode of each pane that is not on screen, so
+    /// returning to one behaves exactly as it did when the reader left it.
+    parked_scroll: HashMap<Option<orchestrator::AgentPath>, (usize, bool)>,
     /// Where the switcher's keyboard cursor sits, as an index into its rows.
     /// Only meaningful while [`Model::switching`] is set.
     switch_cursor: usize,
@@ -1938,6 +1975,39 @@ struct Model {
 
 /// How much of one child's stream is kept for viewing.
 const MAX_AGENT_PANE_ITEMS: usize = 200;
+
+/// Append one rendered item while keeping the pane's physical history bounded.
+/// Returns whether an old entry was evicted.
+fn append_pane_item(pane: &mut VecDeque<Entry>, item: Item, limit: usize) -> bool {
+    pane.push_back(Entry::new(item));
+    let mut dropped = false;
+    while pane.len() > limit {
+        pane.pop_front();
+        dropped = true;
+    }
+    dropped
+}
+
+/// Notices sit before a live assistant block so later stream deltas continue
+/// extending that block instead of creating a second answer.
+fn append_pane_notice(pane: &mut VecDeque<Entry>, notice: String, limit: usize) -> bool {
+    let live = matches!(
+        pane.back().map(|entry| &entry.item),
+        Some(Item::Assistant(_))
+    )
+    .then(|| pane.pop_back())
+    .flatten();
+    pane.push_back(Entry::new(Item::Notice(notice)));
+    if let Some(live) = live {
+        pane.push_back(live);
+    }
+    let mut dropped = false;
+    while pane.len() > limit {
+        pane.pop_front();
+        dropped = true;
+    }
+    dropped
+}
 
 /// Add one step to a pane, coalescing streamed deltas onto the item they extend
 /// so a reply reads as a block rather than a line per token.
@@ -1955,6 +2025,7 @@ fn append_agent_step(pane: &mut VecDeque<Entry>, step: AgentStep) {
         entry.invalidate();
         true
     };
+    let queued_notice = |text: &str| format!("↳ queued for this agent: {text}");
     let item = match step {
         // Rendered as a user turn, because that is what it is: the message this
         // session was started with.
@@ -1975,11 +2046,57 @@ fn append_agent_step(pane: &mut VecDeque<Entry>, step: AgentStep) {
         },
         AgentStep::ToolCall { tool, args } => Item::ToolCall { tool, args },
         AgentStep::ToolResult { tool, ok, payload } => Item::ToolResult { tool, ok, payload },
+        AgentStep::Restarted => {
+            // A queued steer notice can arrive after the partial text. Work
+            // backwards to the last durable task/user/tool boundary, removing
+            // abandoned stream blocks while preserving that transient notice.
+            let attempt_start = pane
+                .iter()
+                .rposition(|entry| {
+                    matches!(
+                        entry.item,
+                        Item::User(_)
+                            | Item::ToolCall { .. }
+                            | Item::ToolResult { .. }
+                            | Item::Compaction { .. }
+                            | Item::Verify { .. }
+                            | Item::AgentsDone(_)
+                    )
+                })
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let mut tail = pane.split_off(attempt_start);
+            tail.retain(|entry| {
+                !matches!(entry.item, Item::Assistant(_) | Item::Thinking(_))
+                    && !matches!(&entry.item, Item::Notice(text) if text == "the model's connection dropped — retrying")
+            });
+            pane.append(&mut tail);
+            Item::Notice("the model's connection dropped — retrying".into())
+        }
+        AgentStep::SteerQueued(text) => Item::Notice(queued_notice(&text)),
+        AgentStep::Steered(text) => {
+            let notice = queued_notice(&text);
+            if let Some(index) = pane
+                .iter()
+                .rposition(|entry| matches!(&entry.item, Item::Notice(value) if value == &notice))
+            {
+                pane.remove(index);
+            }
+            Item::User(text)
+        }
+        AgentStep::SteersReturned(texts) => {
+            for text in &texts {
+                let notice = queued_notice(text);
+                if let Some(index) = pane.iter().rposition(
+                    |entry| matches!(&entry.item, Item::Notice(value) if value == &notice),
+                ) {
+                    pane.remove(index);
+                }
+            }
+            Item::Notice("queued message returned to the input box — not sent".into())
+        }
     };
-    pane.push_back(Entry::new(item));
-    while pane.len() > MAX_AGENT_PANE_ITEMS {
-        pane.pop_front();
-    }
+    append_pane_item(pane, item, MAX_AGENT_PANE_ITEMS);
 }
 
 impl Model {
@@ -2025,6 +2142,9 @@ impl Model {
             search_setup: None,
             autonomy: kernel::AutonomyLevel::Careful,
             running: false,
+            session_op: None,
+            pending_agent_launches: 0,
+            pending_agent_steers: 0,
             agent_report_deferred: false,
             current_tool: None,
             turn_started: None,
@@ -2405,32 +2525,44 @@ impl Model {
     }
 
     fn push_notice(&mut self, s: impl Into<String>) {
-        // Insert notices before a live reply so later deltas keep one item.
-        if matches!(self.items.back().map(|e| &e.item), Some(Item::Assistant(_))) {
-            let live = self.items.pop_back();
-            self.push_item(Item::Notice(s.into()));
-            if let Some(live) = live {
-                self.items.push_back(live);
-                self.dirty = true;
-                if self.auto_scroll {
-                    self.scroll_to_bottom();
-                }
-            }
+        let dropped = append_pane_notice(&mut self.items, s.into(), MAX_SCROLLBACK_LINES);
+        if dropped {
+            self.text_selection = None;
+        }
+        self.dirty = true;
+        if self.auto_scroll {
+            self.scroll_to_bottom();
+        }
+    }
+
+    /// File a conversation-owned notice into main even while a child pane is
+    /// displayed. Off-screen content is rendered and scrolled only when main is
+    /// opened again.
+    fn push_main_notice(&mut self, s: impl Into<String>) {
+        if self.focus.is_none() {
+            self.push_notice(s);
             return;
         }
-        self.push_item(Item::Notice(s.into()));
+        append_pane_notice(&mut self.parked_main, s.into(), MAX_SCROLLBACK_LINES);
     }
 
     /// Remove the most recent notice starting with `prefix` — e.g. a "queued"
     /// steer marker being promoted to a real user line once it applies.
     fn remove_last_notice(&mut self, prefix: &str) {
-        if let Some(idx) = self
-            .items
+        let showing = self.focus.is_none();
+        let pane = if showing {
+            &mut self.items
+        } else {
+            &mut self.parked_main
+        };
+        if let Some(idx) = pane
             .iter()
             .rposition(|e| matches!(&e.item, Item::Notice(n) if n.starts_with(prefix)))
         {
-            self.items.remove(idx);
-            self.dirty = true;
+            pane.remove(idx);
+            if showing {
+                self.dirty = true;
+            }
         }
     }
 
@@ -2453,12 +2585,7 @@ impl Model {
     }
 
     fn push_item(&mut self, item: Item) {
-        self.items.push_back(Entry::new(item));
-        let mut dropped = false;
-        while self.items.len() > MAX_SCROLLBACK_LINES {
-            self.items.pop_front();
-            dropped = true;
-        }
+        let dropped = append_pane_item(&mut self.items, item, MAX_SCROLLBACK_LINES);
         if dropped {
             self.text_selection = None;
         }
@@ -2468,27 +2595,63 @@ impl Model {
         }
     }
 
+    /// Append a conversation-owned item without leaking it into a child pane
+    /// that happens to be on screen.
+    fn push_main_item(&mut self, item: Item) {
+        if self.focus.is_none() {
+            self.push_item(item);
+        } else {
+            append_pane_item(&mut self.parked_main, item, MAX_SCROLLBACK_LINES);
+        }
+    }
+
     fn push_text_delta(&mut self, delta: &str) {
-        let appended = matches!(self.items.back().map(|e| &e.item), Some(Item::Assistant(_)));
+        let showing = self.focus.is_none();
+        let pane = if showing {
+            &mut self.items
+        } else {
+            &mut self.parked_main
+        };
+        let appended = matches!(pane.back().map(|e| &e.item), Some(Item::Assistant(_)));
         if appended {
-            let e = self.items.back_mut().unwrap();
+            let e = pane.back_mut().unwrap();
             if let Item::Assistant(buf) = &mut e.item {
                 buf.push_str(delta);
             }
             e.invalidate(); // only the streaming item re-renders next frame
-            self.dirty = true;
-            if self.auto_scroll {
-                self.scroll_to_bottom();
+            if showing {
+                self.dirty = true;
+                if self.auto_scroll {
+                    self.scroll_to_bottom();
+                }
             }
         } else {
             self.streamed_this_turn += 1;
-            self.push_item(Item::Assistant(delta.to_string()));
+            if showing {
+                self.push_item(Item::Assistant(delta.to_string()));
+            } else {
+                append_pane_item(
+                    &mut self.parked_main,
+                    Item::Assistant(delta.to_string()),
+                    MAX_SCROLLBACK_LINES,
+                );
+            }
         }
     }
 
     /// File one step into that agent's pane — the displayed collection when the
     /// agent is on screen, its parked one otherwise.
     fn push_agent_step(&mut self, path: orchestrator::AgentPath, step: AgentStep) {
+        let selected = self.switch_selection();
+        let settled_steers = match &step {
+            AgentStep::Steered(_) => 1,
+            AgentStep::SteersReturned(texts) => texts.len(),
+            _ => 0,
+        };
+        let returned = match &step {
+            AgentStep::SteersReturned(texts) => Some(texts.join("\n")),
+            _ => None,
+        };
         let showing = self.focus.as_ref() == Some(&path);
         let pane = match showing {
             true => &mut self.items,
@@ -2501,6 +2664,16 @@ impl Model {
                 self.scroll_to_bottom();
             }
         }
+        if let Some(returned) = returned {
+            if !self.input.is_empty() {
+                self.input.push('\n');
+            }
+            self.input.push_str(&returned);
+            self.cursor = self.input.len();
+            self.dirty = true;
+        }
+        self.pending_agent_steers = self.pending_agent_steers.saturating_sub(settled_steers);
+        self.reconcile_switch_cursor(selected);
     }
 
     /// Show `target`, parking whatever is leaving the screen where it belongs.
@@ -2512,7 +2685,7 @@ impl Model {
             return;
         }
         self.parked_scroll
-            .insert(self.focus.clone(), self.scroll_offset);
+            .insert(self.focus.clone(), (self.scroll_offset, self.auto_scroll));
         let leaving = std::mem::take(&mut self.items);
         match self.focus.take() {
             Some(path) => {
@@ -2529,8 +2702,8 @@ impl Model {
         self.invalidate_all_renders();
         self.dirty = true;
         match restored {
-            Some(offset) => {
-                self.auto_scroll = false;
+            Some((offset, follow)) => {
+                self.auto_scroll = follow;
                 self.scroll_offset = offset;
             }
             None => {
@@ -2540,52 +2713,172 @@ impl Model {
         }
     }
 
+    /// A session boundary owns a fresh set of live panes. Return to main before
+    /// discarding them so the previous conversation cannot be resurrected from
+    /// `parked_main` under the new session id.
+    fn clear_session_panes(&mut self) {
+        if self.focus.is_some() {
+            self.focus_pane(None);
+        }
+        self.agent_panes.clear();
+        self.parked_scroll.clear();
+        self.agent_runs.clear();
+        self.agent_progress.clear();
+        self.agents_done.clear();
+        self.agent_report_deferred = false;
+        self.pending_agent_steers = 0;
+        self.switching = false;
+        self.switch_cursor = 0;
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
+    }
+
+    /// Keep live panes only while their agent remains in the registry's bounded
+    /// running/settled window. The durable transcript remains addressable by
+    /// session id, so old panes need not accumulate for the life of the TUI.
+    fn retain_known_agent_panes(
+        &mut self,
+        known: &std::collections::HashSet<orchestrator::AgentPath>,
+    ) {
+        let selected = self.switch_selection();
+        let focus = self.focus.clone();
+        self.agent_panes
+            .retain(|path, _| known.contains(path) || focus.as_ref() == Some(path));
+        self.parked_scroll.retain(|path, _| match path {
+            None => true,
+            Some(path) => known.contains(path) || focus.as_ref() == Some(path),
+        });
+        self.reconcile_switch_cursor(selected);
+    }
+
+    fn has_active_agents(&self) -> bool {
+        self.pending_agent_launches > 0
+            || self.pending_agent_steers > 0
+            || self
+                .agents
+                .as_ref()
+                .is_some_and(|control| !control.active().is_empty())
+    }
+
+    fn foreground_owned(&self) -> bool {
+        self.running
+            || self.force_aborting
+            || self
+                .foreground_turn
+                .as_ref()
+                .is_some_and(|turn| !turn.is_finished())
+    }
+
     /// The switcher's rows: the conversation first, then every agent this session
     /// knows about, so `main` is a destination like any other.
     fn switch_rows(&self) -> Vec<Option<orchestrator::AgentPath>> {
         let mut rows = vec![None];
         rows.extend(self.agent_runs.iter().map(|run| Some(run.path.clone())));
-        // Whatever is on screen is always a row, even once it has settled.
-        // Dropping it the moment it finished would leave the reader looking at a
-        // pane the switcher no longer admits exists, with no way back.
+        // A settled live pane remains useful until the session ends. Previously
+        // it stayed allocated but disappeared from this list as soon as the user
+        // returned to main, making its contents permanently unreachable.
+        let mut parked: Vec<_> = self.agent_panes.keys().cloned().collect();
+        parked.sort();
+        for path in parked {
+            let row = Some(path);
+            if !rows.contains(&row) {
+                rows.push(row);
+            }
+        }
+        // Whatever is on screen is always a row, including the instant between
+        // settlement and parking it back into `agent_panes`.
         if self.focus.is_some() && !rows.contains(&self.focus) {
             rows.push(self.focus.clone());
         }
         rows
     }
 
+    fn switch_selection(&self) -> Option<Option<orchestrator::AgentPath>> {
+        self.switching
+            .then(|| self.switch_rows().get(self.switch_cursor).cloned())
+            .flatten()
+    }
+
+    /// Keep the switcher cursor attached to a path while live/parked rows are
+    /// inserted or removed underneath it.
+    fn reconcile_switch_cursor(&mut self, selected: Option<Option<orchestrator::AgentPath>>) {
+        if !self.switching {
+            return;
+        }
+        let rows = self.switch_rows();
+        self.switch_cursor = selected
+            .and_then(|target| rows.iter().position(|row| row == &target))
+            .or_else(|| rows.iter().position(|row| row == &self.focus))
+            .unwrap_or(0)
+            .min(rows.len().saturating_sub(1));
+    }
+
     /// Forget what the abandoned attempt rendered, so a retried turn's reply
     /// arrives once. Only this turn's streamed items are dropped; the answer
     /// above them belongs to a turn that finished.
     fn drop_streamed_this_turn(&mut self) {
-        for _ in 0..std::mem::take(&mut self.streamed_this_turn) {
-            self.items.pop_back();
+        let mut streamed = std::mem::take(&mut self.streamed_this_turn);
+        let showing = self.focus.is_none();
+        let pane = if showing {
+            &mut self.items
+        } else {
+            &mut self.parked_main
+        };
+        // Notices can be inserted while a response is streaming (most notably
+        // a queued steer). Remove the streamed blocks themselves rather than
+        // blindly popping the same number of tail entries, or a retry can erase
+        // the notice and leave an abandoned partial answer behind.
+        let mut index = pane.len();
+        while index > 0 && streamed > 0 {
+            index -= 1;
+            if matches!(pane[index].item, Item::Assistant(_) | Item::Thinking(_)) {
+                pane.remove(index);
+                streamed -= 1;
+            }
         }
         self.reasoning_received_this_turn = false;
         self.current_tool = None;
-        self.invalidate_all_renders();
-        self.dirty = true;
-        if self.auto_scroll {
-            self.scroll_to_bottom();
+        if showing {
+            self.invalidate_all_renders();
+            self.dirty = true;
+            if self.auto_scroll {
+                self.scroll_to_bottom();
+            }
         }
     }
 
     fn push_thinking_delta(&mut self, delta: &str) {
         self.reasoning_received_this_turn = true;
-        let appended = matches!(self.items.back().map(|e| &e.item), Some(Item::Thinking(_)));
+        let showing = self.focus.is_none();
+        let pane = if showing {
+            &mut self.items
+        } else {
+            &mut self.parked_main
+        };
+        let appended = matches!(pane.back().map(|e| &e.item), Some(Item::Thinking(_)));
         if appended {
-            let e = self.items.back_mut().unwrap();
+            let e = pane.back_mut().unwrap();
             if let Item::Thinking(buf) = &mut e.item {
                 buf.push_str(delta);
             }
             e.invalidate();
-            self.dirty = true;
-            if self.auto_scroll {
-                self.scroll_to_bottom();
+            if showing {
+                self.dirty = true;
+                if self.auto_scroll {
+                    self.scroll_to_bottom();
+                }
             }
         } else {
             self.streamed_this_turn += 1;
-            self.push_item(Item::Thinking(delta.to_string()));
+            if showing {
+                self.push_item(Item::Thinking(delta.to_string()));
+            } else {
+                append_pane_item(
+                    &mut self.parked_main,
+                    Item::Thinking(delta.to_string()),
+                    MAX_SCROLLBACK_LINES,
+                );
+            }
         }
     }
 
@@ -2744,8 +3037,8 @@ where
         && let Ok(mut slot) = control.notifier_handle().lock()
     {
         let ready = tx.clone();
-        *slot = Some(Arc::new(move || {
-            let _ = ready.send(TuiEvent::AgentReportReady);
+        *slot = Some(Arc::new(move |surface_session| {
+            let _ = ready.send(TuiEvent::AgentReportReady(surface_session));
         }));
     }
 
@@ -2855,6 +3148,7 @@ where
                 // Avoid redraws when no visible state is moving.
                 let running = model.bg_running();
                 if model.running || model.welcome || model.intro_frame.is_some() || model.dirty
+                    || !model.agent_runs.is_empty()
                     || running > 0
                     || running != model.bg_shown_running
                     || model

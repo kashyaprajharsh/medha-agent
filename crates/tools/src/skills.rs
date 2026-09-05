@@ -1462,14 +1462,53 @@ fn build_skill(fm_body: ParsedMd, scope: SkillScope, path: PathBuf) -> Skill {
 /// `skill.load` — read radius. The model pulls a full procedure by name.
 pub struct SkillLoad {
     pub store: Arc<SkillStore>,
-    pub known_tools: Arc<HashSet<String>>,
+    pub(crate) catalog: Arc<SkillToolCatalog>,
 }
 
 /// `skill.list` — compact index for large catalogs, separate from `skill.load`
 /// so a model can discover names before loading a full procedure.
 pub struct SkillList {
     pub store: Arc<SkillStore>,
-    pub known_tools: Arc<HashSet<String>>,
+    pub(crate) catalog: Arc<SkillToolCatalog>,
+}
+
+type LiveToolNames = dyn Fn() -> Vec<String> + Send + Sync;
+
+/// Static registry tools plus tool names projected by live providers such as
+/// MCP. Skill availability is read at call time so a server connecting or
+/// disconnecting mid-session is reflected without rebuilding the registry.
+pub(crate) struct SkillToolCatalog {
+    static_tools: Arc<HashSet<String>>,
+    live_tools: Option<Arc<LiveToolNames>>,
+}
+
+impl SkillToolCatalog {
+    pub(crate) fn new(
+        static_tools: Arc<HashSet<String>>,
+        mcp: Option<Arc<mcp::McpManager>>,
+    ) -> Self {
+        let live_tools = mcp.map(|manager| {
+            Arc::new(move || {
+                manager
+                    .tool_specs()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect()
+            }) as Arc<LiveToolNames>
+        });
+        Self {
+            static_tools,
+            live_tools,
+        }
+    }
+
+    fn current(&self) -> HashSet<String> {
+        let mut tools = self.static_tools.as_ref().clone();
+        if let Some(live) = &self.live_tools {
+            tools.extend(live());
+        }
+        tools
+    }
 }
 
 #[async_trait]
@@ -1491,7 +1530,7 @@ impl Tool for SkillList {
         json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _args: &Value) -> Result<Value, ToolError> {
-        Ok(self.store.list(&self.known_tools))
+        Ok(self.store.list(&self.catalog.current()))
     }
 }
 
@@ -1524,6 +1563,7 @@ impl Tool for SkillLoad {
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let known_tools = self.catalog.current();
         let name = args
             .get("name")
             .and_then(Value::as_str)
@@ -1544,14 +1584,14 @@ impl Tool for SkillLoad {
                 .load_file(
                     name,
                     file,
-                    &self.known_tools,
+                    &known_tools,
                     line_start as usize,
                     line_limit as usize,
                 )
                 .map_err(ToolError::Failed)
         } else {
             self.store
-                .load(name, &self.known_tools)
+                .load(name, &known_tools)
                 .map_err(ToolError::Failed)
         }
     }
@@ -1561,7 +1601,7 @@ impl Tool for SkillLoad {
 /// (it is on the policy approve list). The card previews the full SKILL.md.
 pub struct SkillSave {
     pub store: Arc<SkillStore>,
-    pub known_tools: Arc<HashSet<String>>,
+    pub(crate) catalog: Arc<SkillToolCatalog>,
 }
 
 impl SkillSave {
@@ -1569,15 +1609,23 @@ impl SkillSave {
     /// SkillStore::save does the semantic validation).
     fn spec_from(args: &Value) -> Result<SaveSpec, ToolError> {
         let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
-        let list = |k: &str| {
-            args.get(k)
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect::<Vec<_>>()
+        let list = |k: &str| -> Result<Vec<String>, ToolError> {
+            let Some(value) = args.get(k) else {
+                return Ok(Vec::new());
+            };
+            let values = value
+                .as_array()
+                .ok_or_else(|| ToolError::Args(format!("expected array '{k}'")))?;
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| ToolError::Args(format!("'{k}[{index}]' must be a string")))
                 })
-                .unwrap_or_default()
+                .collect()
         };
         let name = s("name").ok_or_else(|| ToolError::Args("expected string 'name'".into()))?;
         let description = s("description")
@@ -1596,12 +1644,29 @@ impl SkillSave {
         Ok(SaveSpec {
             name,
             description,
-            triggers: list("triggers"),
-            domains: list("domains"),
-            required_tools: list("required_tools"),
+            triggers: list("triggers")?,
+            domains: list("domains")?,
+            required_tools: list("required_tools")?,
             procedure,
             scope,
         })
+    }
+
+    /// Nested tool references are ordinary JSON strings, so provider adapters
+    /// do not translate the visible `shell_exec` spelling back to canonical
+    /// `shell.exec`. Normalize at this semantic boundary and persist only the
+    /// provider-independent canonical names.
+    fn normalized_spec(
+        &self,
+        args: &Value,
+        known_tools: &HashSet<String>,
+    ) -> Result<SaveSpec, ToolError> {
+        let mut spec = Self::spec_from(args)?;
+        let mut available: Vec<String> = known_tools.iter().cloned().collect();
+        available.sort();
+        spec.required_tools = kernel::canonical_tool_names(&spec.required_tools, &available)
+            .map_err(|error| ToolError::Args(format!("invalid required_tools: {error}")))?;
+        Ok(spec)
     }
 }
 
@@ -1635,14 +1700,15 @@ impl Tool for SkillSave {
                 "procedure": { "type": "string", "description": "the skill body: steps, decision points, known failure modes (markdown)" },
                 "triggers": { "type": "array", "items": { "type": "string" }, "description": "match hints (keywords)" },
                 "domains": { "type": "array", "items": { "type": "string" } },
-                "required_tools": { "type": "array", "items": { "type": "string" }, "description": "tool names the procedure needs; validated against the registry" },
+                "required_tools": { "type": "array", "items": { "type": "string" }, "description": "canonical dotted tool names the procedure needs, such as shell.exec or web.search; provider-facing underscore aliases are accepted and normalized" },
                 "scope": { "type": "string", "enum": ["user", "project"], "description": "user (personal, default) or project (committed with the repo)" }
             },
             "required": ["name", "description", "procedure"]
         })
     }
     async fn preview(&self, args: &Value) -> Option<String> {
-        let spec = Self::spec_from(args).ok()?;
+        let known_tools = self.catalog.current();
+        let spec = self.normalized_spec(args, &known_tools).ok()?;
         let dir = match spec.scope {
             SkillScope::Project => "<workspace>/.medha/skills",
             SkillScope::User => "~/.medha/skills",
@@ -1675,10 +1741,11 @@ impl Tool for SkillSave {
         ))
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let spec = Self::spec_from(args)?;
+        let known_tools = self.catalog.current();
+        let spec = self.normalized_spec(args, &known_tools)?;
         let (path, version) = self
             .store
-            .save(&spec, &self.known_tools)
+            .save(&spec, &known_tools)
             .map_err(ToolError::Failed)?;
         Ok(json!({
             "saved": true,
@@ -1698,6 +1765,20 @@ mod tests {
 
     fn tools(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn fixed_catalog(names: &[&str]) -> Arc<SkillToolCatalog> {
+        Arc::new(SkillToolCatalog {
+            static_tools: Arc::new(tools(names)),
+            live_tools: None,
+        })
+    }
+
+    fn catalog_from(static_tools: Arc<HashSet<String>>) -> Arc<SkillToolCatalog> {
+        Arc::new(SkillToolCatalog {
+            static_tools,
+            live_tools: None,
+        })
     }
 
     fn write_skill(dir: &Path, name: &str, body: &str) {
@@ -2174,6 +2255,69 @@ mod tests {
     }
 
     #[test]
+    fn skill_save_normalizes_nested_provider_tool_aliases() {
+        let root = tmp();
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let tool = SkillSave {
+            store: Arc::new(SkillStore::new(proj.clone(), Some(root.join("user")))),
+            catalog: fixed_catalog(&["shell.exec", "web.search"]),
+        };
+
+        let saved = futures::executor::block_on(tool.execute(&json!({
+            "name": "wire-aliases",
+            "description": "Checks nested tool names",
+            "procedure": "Run the required tools.",
+            "required_tools": ["shell_exec", "web_search"],
+            "scope": "project"
+        })))
+        .unwrap();
+        let text = std::fs::read_to_string(saved["path"].as_str().unwrap()).unwrap();
+        assert!(text.contains("shell.exec"), "{text}");
+        assert!(text.contains("web.search"), "{text}");
+        assert!(!text.contains("shell_exec"), "{text}");
+        assert!(!text.contains("web_search"), "{text}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn skill_save_rejects_unknown_tool_names_without_writing() {
+        let root = tmp();
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let tool = SkillSave {
+            store: Arc::new(SkillStore::new(proj.clone(), Some(root.join("user")))),
+            catalog: fixed_catalog(&["web.search"]),
+        };
+
+        let error = futures::executor::block_on(tool.execute(&json!({
+            "name": "bad-tool",
+            "description": "Must not be saved",
+            "procedure": "Nothing.",
+            "required_tools": ["web_serach"],
+            "scope": "project"
+        })))
+        .unwrap_err();
+        assert!(error.to_string().contains("web_serach"), "{error}");
+        assert!(!proj.join("bad-tool/SKILL.md").exists());
+
+        let malformed = futures::executor::block_on(tool.execute(&json!({
+            "name": "malformed-tools",
+            "description": "Must not be saved",
+            "procedure": "Nothing.",
+            "required_tools": "web.search",
+            "scope": "project"
+        })))
+        .unwrap_err();
+        assert!(
+            malformed.to_string().contains("expected array"),
+            "{malformed}"
+        );
+        assert!(!proj.join("malformed-tools/SKILL.md").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn skill_load_tool_parses_args_and_returns_body() {
         let root = tmp();
         let proj = root.join("proj");
@@ -2185,10 +2329,9 @@ mod tests {
         )
         .unwrap();
         let store = Arc::new(SkillStore::new(proj, Some(root.join("user"))));
-        let known = Arc::new(tools(&["shell.exec"]));
         let tool = SkillLoad {
             store,
-            known_tools: known,
+            catalog: fixed_catalog(&["shell.exec"]),
         };
         // happy path
         let v = futures::executor::block_on(tool.execute(&json!({"name": "deploy-fly"}))).unwrap();
@@ -2239,10 +2382,72 @@ mod tests {
         let store = Arc::new(SkillStore::new(proj, Some(root.join("user"))));
         let tool = SkillList {
             store,
-            known_tools: Arc::new(tools(&["shell.exec"])),
+            catalog: fixed_catalog(&["shell.exec"]),
         };
         let v = futures::executor::block_on(tool.execute(&json!({}))).unwrap();
         assert_eq!(v["skills"][0]["name"], "deploy-fly");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn skill_tools_read_the_live_provider_catalog_on_every_call() {
+        const MCP_NAME: &str = "mcp__fake__echo";
+        const MCP_SKILL: &str = "---\nname: mcp-echo\ndescription: Use the live MCP echo tool\nrequired_tools: [mcp__fake__echo]\nversion: 1\n---\n\nCall the echo tool.\n";
+
+        let root = tmp();
+        let proj = root.join("proj");
+        write_skill(&proj, "mcp-echo", MCP_SKILL);
+        let store = Arc::new(SkillStore::new(proj.clone(), Some(root.join("user"))));
+        let live = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let live_tools = {
+            let live = live.clone();
+            Arc::new(move || live.lock().unwrap().clone()) as Arc<LiveToolNames>
+        };
+        let catalog = Arc::new(SkillToolCatalog {
+            static_tools: Arc::new(tools(&["fs.read"])),
+            live_tools: Some(live_tools),
+        });
+        let list = SkillList {
+            store: store.clone(),
+            catalog: catalog.clone(),
+        };
+        let load = SkillLoad {
+            store: store.clone(),
+            catalog: catalog.clone(),
+        };
+        let save = SkillSave {
+            store,
+            catalog: catalog.clone(),
+        };
+
+        let before = futures::executor::block_on(list.execute(&json!({}))).unwrap();
+        assert_eq!(before["skills"][0]["available"], false);
+        assert!(futures::executor::block_on(load.execute(&json!({ "name": "mcp-echo" }))).is_err());
+
+        live.lock().unwrap().push(MCP_NAME.into());
+        let connected = futures::executor::block_on(list.execute(&json!({}))).unwrap();
+        assert_eq!(connected["skills"][0]["available"], true);
+        assert!(futures::executor::block_on(load.execute(&json!({ "name": "mcp-echo" }))).is_ok());
+        let saved = futures::executor::block_on(save.execute(&json!({
+            "name": "saved-mcp",
+            "description": "Saved while the MCP tool is connected",
+            "procedure": "Call the MCP tool.",
+            "required_tools": [MCP_NAME],
+            "scope": "project"
+        })))
+        .unwrap();
+        assert_eq!(saved["saved"], true);
+
+        live.lock().unwrap().clear();
+        let disconnected = futures::executor::block_on(list.execute(&json!({}))).unwrap();
+        assert!(
+            disconnected["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|skill| skill["available"] == false)
+        );
+        assert!(futures::executor::block_on(load.execute(&json!({ "name": "mcp-echo" }))).is_err());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2255,7 +2460,7 @@ mod tests {
         let known = Arc::new(tools(&["fs.read"]));
         let tool = SkillSave {
             store: store.clone(),
-            known_tools: known.clone(),
+            catalog: catalog_from(known.clone()),
         };
         let args = json!({
             "name": "note-taker",

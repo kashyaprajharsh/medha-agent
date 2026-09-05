@@ -1204,7 +1204,6 @@ async fn main() -> Result<()> {
         }
         Some(manager)
     };
-    registry.register_skills(skill_store.clone());
     let memory_store = Arc::new(memory::MemoryProjection::open(
         state.join("memory.db"),
         medha_home.join("memory.db"),
@@ -1219,7 +1218,6 @@ async fn main() -> Result<()> {
         );
     }
     registry.register_session_search(log.clone(), artifacts.clone());
-    let known_tools = registry.tool_names();
     let search_handle = registry.search_handle();
     if let Ok(cfg_guard) = model_profiles.lock() {
         *search_handle.lock().expect("search settings lock") = config::resolve_search(&cfg_guard);
@@ -1290,6 +1288,11 @@ async fn main() -> Result<()> {
         registry.register_agents(control.clone(), lock.agents.max_turns);
         control
     });
+    // Freeze the skill capability catalogue only after every static tool has
+    // been registered. Registering it earlier made valid requirements such as
+    // memory.write, sessions.search, and agent.spawn look unavailable.
+    registry.register_skills(skill_store.clone());
+    let known_tools = registry.tool_names();
     let agent_parent = registry.agent_parent_handle();
     let agent_session = registry.agent_session_handle();
     let executor = Arc::new(registry);
@@ -1326,6 +1329,7 @@ async fn main() -> Result<()> {
 
     let policy = Arc::new(
         policy::DefaultPolicy::requiring_approval(approve_list(lock.policy.approve.clone()))
+            .with_workspace(workspace.root())
             .with_memory_write_approval(&lock.memory.write_approval),
     );
 
@@ -2209,6 +2213,10 @@ impl PrintSink {
 }
 
 impl kernel::StreamSink for PrintSink {
+    fn supports_restart(&self) -> bool {
+        false
+    }
+
     fn text(&self, delta: &str) {
         print!("{delta}");
         let _ = std::io::stdout().flush();

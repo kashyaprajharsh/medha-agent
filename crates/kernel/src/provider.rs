@@ -287,9 +287,14 @@ impl ProviderError {
 
     pub fn classify(&self) -> ProviderFailure {
         match self {
-            ProviderError::Transport(_)
-            | ProviderError::Stream(_)
-            | ProviderError::Throttled { .. } => ProviderFailure::Transient,
+            ProviderError::Transport(_) | ProviderError::Stream(_) => ProviderFailure::Transient,
+            ProviderError::Throttled { status, body, .. } => {
+                if *status == 429 || (500..600).contains(status) {
+                    ProviderFailure::Transient
+                } else {
+                    classify_rejection(Some(*status), body)
+                }
+            }
             ProviderError::Decode(_) => ProviderFailure::Fatal,
             ProviderError::Response(message) => classify_rejection(None, message),
             ProviderError::Status(code, message) => {
@@ -328,7 +333,13 @@ fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
                 || lower.contains("too long")
                 || lower.contains("maximum")))
         || lower.contains("too many tokens in the prompt")
-        || lower.contains("input tokens exceed");
+        || lower.contains("input tokens exceed")
+        // Local servers name the KV cache rather than a "context length" or
+        // "context window", so the phrasings above all miss them. Failing to
+        // classify these is expensive: the overflow retry never fires, so the
+        // turn dies instead of compacting once and succeeding.
+        || lower.contains("max_kv_size")
+        || lower.contains("context tokens");
     if code.is_none_or(|code| code == 400 || code == 413) && input_shaped {
         return ProviderFailure::InputContextOverflow {
             reported_limit: number_after_any(
@@ -340,6 +351,12 @@ fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
                     "context window is",
                     "context window:",
                     "context_length:",
+                    // mlx-vlm: "…but MAX_KV_SIZE is 32768." The value covers
+                    // prompt *and* generation, so it slightly overstates the
+                    // input allowance; the budget's safety margin absorbs that,
+                    // and a known limit still beats falling back to a guess.
+                    "max_kv_size is",
+                    "max_kv_size:",
                 ],
             ),
         };
@@ -433,6 +450,36 @@ mod error_class_tests {
         assert!(!ProviderError::Status(429, "slow down".into()).is_context_overflow());
     }
 
+    /// Local servers describe the same condition in terms of their KV cache, so
+    /// none of the "context length"/"context window" phrasings match. Missing
+    /// the classification skips the overflow retry entirely — the turn fails
+    /// instead of compacting once and succeeding — so it is worth pinning.
+    #[test]
+    fn kv_cache_phrasings_from_local_servers_are_context_overflow() {
+        let mlx_vlm = ProviderError::Status(
+            400,
+            "Request needs 34402 context tokens (32354 prompt + 2048 max generation), \
+             but MAX_KV_SIZE is 32768."
+                .into(),
+        );
+        assert!(mlx_vlm.is_context_overflow(), "mlx-vlm overflow must classify");
+        assert!(!mlx_vlm.is_retryable(), "overflow compacts, it does not retry as-is");
+        assert_eq!(
+            mlx_vlm.classify(),
+            ProviderFailure::InputContextOverflow {
+                reported_limit: Some(32_768)
+            },
+            "the KV budget is the only limit the server reports"
+        );
+
+        // An output-shaped rejection must NOT be swept up by the new patterns.
+        let output = ProviderError::Status(
+            400,
+            "max_tokens is too large: available_tokens 512".into(),
+        );
+        assert!(!output.is_context_overflow(), "output limits stay output limits");
+    }
+
     #[test]
     fn in_band_rejections_are_classified_from_their_payload() {
         let overflow = ProviderError::Response(
@@ -514,6 +561,28 @@ mod error_class_tests {
             ProviderError::Status(413, "request body too large".into()).classify(),
             ProviderFailure::PayloadTooLarge
         );
+    }
+
+    #[test]
+    fn retry_after_metadata_cannot_reclassify_a_fatal_or_overflow_rejection() {
+        let auth = ProviderError::Throttled {
+            status: 401,
+            retry_after: std::time::Duration::from_secs(1),
+            body: "unauthorized".into(),
+        };
+        assert_eq!(auth.classify(), ProviderFailure::Fatal);
+        assert!(!auth.is_retryable());
+
+        let overflow = ProviderError::Throttled {
+            status: 400,
+            retry_after: std::time::Duration::from_secs(1),
+            body: "maximum context length is 32768 tokens".into(),
+        };
+        assert!(matches!(
+            overflow.classify(),
+            ProviderFailure::InputContextOverflow { .. }
+        ));
+        assert!(!overflow.is_retryable());
     }
 }
 

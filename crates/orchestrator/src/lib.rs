@@ -53,17 +53,30 @@ pub const REPORT_ACKS_FIELD: &str = "_agent_report_dispatches";
 /// under narrowing and never a way to widen.
 const ESSENTIAL_CHILD_TOOLS: &[&str] = &["fs.read", "fs.list"];
 
-/// Add the floor to whatever the caller asked for. `None` inherits everything the
-/// parent holds, which already includes these.
-fn with_essentials(asked: Option<&[String]>) -> Option<Vec<String>> {
-    let asked = asked?;
-    let mut tools: Vec<String> = asked.to_vec();
+/// Resolve a requested child capability list to canonical registry names, then
+/// add the readability floor. `None` inherits the parent unchanged.
+///
+/// Strict providers expose dotted function names with underscores. Models copy
+/// those visible names into the nested `tools` argument, which is ordinary JSON
+/// and is not rewritten by the provider decoder. Accept an unambiguous alias,
+/// but never silently drop an unknown capability and launch a crippled child.
+fn child_tools(
+    asked: Option<&[String]>,
+    available: &[String],
+) -> Result<Option<Vec<String>>, Error> {
+    let Some(asked) = asked else {
+        return Ok(None);
+    };
+    let mut tools = kernel::canonical_tool_names(asked, available)
+        .map_err(|error| Error::BadTools(error.to_string()))?;
     for essential in ESSENTIAL_CHILD_TOOLS {
-        if !tools.iter().any(|name| name == essential) {
+        if available.iter().any(|name| name == essential)
+            && !tools.iter().any(|name| name == essential)
+        {
             tools.push((*essential).to_string());
         }
     }
-    Some(tools)
+    Ok(Some(tools))
 }
 
 /// Bounds on one [`AgentControl::wait`]. The floor is what stops a wait being
@@ -199,6 +212,10 @@ pub enum Error {
     Unavailable,
     #[error("agent objective is empty")]
     NoObjective,
+    #[error("invalid child tool list: {0}")]
+    BadTools(String),
+    #[error("the caller belongs to a session this agent tree no longer owns")]
+    StaleCaller,
     #[error("delegation depth {depth} exceeds the limit of {max}")]
     TooDeep { depth: u32, max: u32 },
     #[error("too many agents already running (limit {0}); wait for one to finish")]
@@ -338,6 +355,9 @@ pub trait Transcripts: Send + Sync {
 /// Everything a runner needs to execute one child.
 pub struct ChildRun {
     pub session: Ulid,
+    /// Root surface session that admitted this tree. Live UI events use it to
+    /// reject a queued tail after `/clear`, `/resume`, or `/rewind`.
+    pub surface_session: Option<Ulid>,
     /// This child's address in the tree. The runner tags everything it emits
     /// with this, so a surface can route one child's stream to one view without
     /// having to guess from a name that siblings may share.
@@ -519,6 +539,11 @@ pub struct AgentControl {
     /// by the surface once the session id exists — the same deferred-handle
     /// shape the parent executor uses, for the same reason.
     owner: OwnerHandle,
+    /// Serializes session adoption with the short, synchronous part of child
+    /// admission that validates the caller and reserves its registry path.
+    /// Once a reservation exists, `reset_idle` refuses adoption; if adoption
+    /// wins first, the old caller is rejected before it can reserve anything.
+    session_gate: std::sync::Mutex<()>,
     budget: kernel::BudgetHandle,
     notifier: NotifierHandle,
     /// The root operator's interrupt handle, so a wait at the top of the tree
@@ -546,7 +571,7 @@ pub type OwnerHandle = Arc<std::sync::Mutex<Option<Ulid>>>;
 
 /// Told that a background child's report is durably recorded. Fired after the
 /// outbox write, never off the roster, which empties before the report persists.
-pub type Notifier = Arc<dyn Fn() + Send + Sync>;
+pub type Notifier = Arc<dyn Fn(Option<Ulid>) + Send + Sync>;
 
 /// Deferred slot for [`Notifier`] — the surface that wants the signal is built
 /// after the control plane that emits it.
@@ -590,6 +615,7 @@ impl AgentControl {
             transcripts: None,
             patches: Arc::new(std::sync::Mutex::new(Vec::new())),
             owner: Arc::new(std::sync::Mutex::new(None)),
+            session_gate: std::sync::Mutex::new(()),
             budget: Arc::new(std::sync::Mutex::new(None)),
             notifier: Arc::new(std::sync::Mutex::new(None)),
             root: std::sync::Mutex::new(None),
@@ -644,26 +670,40 @@ impl AgentControl {
     }
 
     fn owner(&self) -> Option<Ulid> {
-        self.owner.lock().ok().and_then(|slot| *slot)
+        *self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Point this tree at the session that now owns it. A surface that swaps its
     /// session — `/clear`, `/resume`, `/rewind` — must call this, or children
     /// keep addressing reports and patches to a session nobody collects from.
-    pub fn adopt(&self, session: Ulid) {
-        if let Ok(mut slot) = self.owner.lock() {
-            *slot = Some(session);
+    pub fn adopt(&self, session: Ulid) -> bool {
+        let _gate = self
+            .session_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.registry.reset_idle() {
+            return false;
         }
+        let mut slot = self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(session);
+        true
     }
 
     /// What a run borrows from this control plane. `owner` overrides the shared
     /// handle for a background child, whose owner is fixed at dispatch.
-    fn shared(&self, owner: Option<Ulid>) -> Shared {
+    fn shared(&self, owner: Option<Ulid>, surface_session: Option<Ulid>) -> Shared {
         Shared {
             runner: Arc::clone(&self.runner),
             workspaces: self.workspaces.clone(),
             outbox: self.outbox.clone(),
             owner: owner.or_else(|| self.owner()),
+            surface_session,
             patches: Arc::clone(&self.patches),
             registry: Arc::clone(&self.registry),
             settled: Arc::clone(&self.settled),
@@ -1176,6 +1216,33 @@ impl AgentControl {
         if spec.name.trim().is_empty() {
             spec.name = default_name(&spec.objective);
         }
+        // Validate before claiming a name, reserving capacity, or cutting a
+        // writer worktree. A bad nested tool name is an argument error, not a
+        // reason to spend a child run with capabilities silently missing.
+        let parent_tools: Vec<String> = parent_executor
+            .specs()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        spec.tools = child_tools(spec.tools.as_deref(), &parent_tools)?;
+        let admission_gate = self
+            .session_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // An async spawn can have been created by the old surface but reach
+        // admission only after `/clear` or `/resume` adopted a new session.
+        // Root callers must match the owner; nested callers must still be the
+        // live agent session represented by their path. Unowned controls keep
+        // the permissive construction used by headless/library callers.
+        if self.owner().is_some_and(|owner| {
+            if caller.path.is_root() {
+                caller.session != owner
+            } else {
+                !self.registry.is_live_session(&caller.path, caller.session)
+            }
+        }) {
+            return Err(Error::StaleCaller);
+        }
         let (path, reservation, session, inherit_from) = match resuming {
             // Same address and session, so the transcript stays one chain.
             Some(agent) => {
@@ -1199,6 +1266,9 @@ impl AgentControl {
                 (path, reservation, Ulid::new(), caller.session)
             }
         };
+        // The registry reservation now prevents session adoption until this
+        // admission either commits a live child or rolls itself back.
+        drop(admission_gate);
         spec.name = path.name().to_string();
         let permit = self.reserve()?;
         let mut supersedes: Option<String> = None;
@@ -1228,21 +1298,10 @@ impl AgentControl {
                 // or applying both double-applies them.
                 supersedes = Some(previous.dispatch);
             }
-            // Narrowed against the parent's names too. The sets should already
-            // match, but "cannot widen" must not rest on another crate's behaviour.
-            let parent_tools: Vec<String> = parent_executor
-                .specs()
-                .into_iter()
-                .map(|spec| spec.name)
-                .collect();
-            let requested: Vec<String> = match with_essentials(spec.tools.as_deref()) {
-                Some(asked) => asked
-                    .iter()
-                    .filter(|name| parent_tools.contains(name))
-                    .cloned()
-                    .collect(),
-                None => parent_tools,
-            };
+            // The request was already normalized against the parent above.
+            // Intersect once more with the rebased executor so a checkout can
+            // never widen capability even if its registry was built wrongly.
+            let requested = spec.tools.clone().unwrap_or(parent_tools);
             let narrowed: Arc<dyn Executor> = Arc::new(
                 NarrowedExecutor::new(executor, Some(&requested)).no_clarifying_questions(),
             );
@@ -1251,12 +1310,9 @@ impl AgentControl {
             // Read-only children may share the parent's tree safely; that is
             // what makes them safe to run in parallel.
             let narrowed: Arc<dyn Executor> = Arc::new(
-                NarrowedExecutor::new(
-                    parent_executor,
-                    with_essentials(spec.tools.as_deref()).as_deref(),
-                )
-                .read_only()
-                .no_clarifying_questions(),
+                NarrowedExecutor::new(parent_executor, spec.tools.as_deref())
+                    .read_only()
+                    .no_clarifying_questions(),
             );
             (narrowed, None)
         };
@@ -1416,7 +1472,8 @@ impl AgentControl {
 
         // The dispatching session as given, not the handle's current value — a
         // background child can finish after the surface has moved on.
-        let shared = self.shared(Some(parent));
+        let surface_session = self.owner();
+        let shared = self.shared(Some(parent), surface_session);
         let notifier = Arc::clone(&self.notifier);
         self.tasks.spawn(async move {
             // `execute` writes the report and only then leaves the roster, so a
@@ -1429,7 +1486,7 @@ impl AgentControl {
                 .ok()
                 .and_then(|slot| slot.as_ref().map(Arc::clone));
             if let Some(ready) = ready {
-                ready();
+                ready(surface_session);
             }
         });
         Ok(handle)
@@ -1494,6 +1551,7 @@ struct Shared {
     workspaces: Option<Arc<dyn Workspaces>>,
     outbox: Option<Arc<dyn Outbox>>,
     owner: Option<Ulid>,
+    surface_session: Option<Ulid>,
     patches: Patches,
     registry: Arc<AgentRegistry>,
     settled: Arc<tokio::sync::Notify>,
@@ -1515,6 +1573,7 @@ async fn execute(
         workspaces,
         outbox,
         owner,
+        surface_session,
         patches,
         registry,
         settled,
@@ -1537,6 +1596,7 @@ async fn execute(
     let started = Instant::now();
     let run = runner.run(ChildRun {
         session,
+        surface_session,
         path: path.clone(),
         spec: spec.clone(),
         history,

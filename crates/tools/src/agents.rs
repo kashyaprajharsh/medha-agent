@@ -296,7 +296,7 @@ impl Tool for AgentSpawn {
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Narrow the child to these tools. Omit this — inheriting your set is almost always right, and a child missing something it turns out to need cannot ask for it. Use it only to take a capability away deliberately, e.g. no web access. Cannot exceed yours, and reading files is always kept."
+                    "description": "Narrow the child to these tools. Omit this — inheriting your set is almost always right, and a child missing something it turns out to need cannot ask for it. Use canonical dotted names such as web.search, web.fetch, shell.exec, and fs.read; provider-facing aliases such as web_search are accepted but canonical names are persisted. Use this only to take a capability away deliberately. Cannot exceed yours, and reading files is always kept."
                 },
                 "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" },
                 "wait": {
@@ -320,7 +320,7 @@ impl Tool for AgentSpawn {
                             "objective": { "type": "string" },
                             "name": { "type": "string" },
                             "contract": { "type": "string" },
-                            "tools": { "type": "array", "items": { "type": "string" } },
+                            "tools": { "type": "array", "items": { "type": "string" }, "description": "Optional capability narrowing using canonical dotted names such as web.search; omit to inherit the parent's tools." },
                             "max_turns": { "type": "integer", "description": "Turn ceiling for this task, clamped to the caller and operator ceilings." },
                             "write": { "type": "boolean", "description": "REQUIRED if this task changes anything; without it the child is read-only and cannot edit." },
                             "fork": { "type": "string", "description": "How much of this conversation this child inherits: 'none' (default), 'all', or a number of turns." }
@@ -345,47 +345,28 @@ impl Tool for AgentSpawn {
         // Batch: independent questions run at once rather than one call after
         // another. Capacity is already bounded per tree, so an over-large batch
         // is refused by the runtime rather than flooding it.
-        if let Some(tasks) = args.get("tasks").and_then(Value::as_array) {
+        if let Some(tasks_value) = args.get("tasks") {
+            let tasks = tasks_value
+                .as_array()
+                .ok_or_else(|| ToolError::Args("expected array 'tasks'".into()))?;
             if tasks.is_empty() {
                 return Err(ToolError::Args("tasks is empty".into()));
             }
+            // Parse the complete batch before launching its first child. A bad
+            // later row must not return an error after earlier rows have already
+            // acquired capacity and started invisibly.
+            let specs: Vec<orchestrator::AgentSpec> = tasks
+                .iter()
+                .map(parse_agent_spec)
+                .collect::<Result<_, _>>()?;
             let Some(parent) = parent_executor(&self.executor) else {
                 return Err(ToolError::Failed(
                     "the agent runtime is not available in this session".into(),
                 ));
             };
             let caller = self.caller.resolve()?;
-            let mut started = Vec::with_capacity(tasks.len());
-            for task in tasks {
-                let spec = orchestrator::AgentSpec {
-                    name: task
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    objective: task
-                        .get("objective")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    contract: task
-                        .get("contract")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    tools: task.get("tools").and_then(Value::as_array).map(|names| {
-                        names
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    }),
-                    max_turns: task
-                        .get("max_turns")
-                        .and_then(Value::as_u64)
-                        .map(|turns| turns.min(u32::MAX as u64) as u32),
-                    write: task.get("write").and_then(Value::as_bool).unwrap_or(false),
-                    fork: parse_fork(task)?,
-                };
+            let mut started = Vec::with_capacity(specs.len());
+            for spec in specs {
                 // One refusal must not discard its siblings, so each is
                 // reported on its own terms.
                 started.push(
@@ -423,36 +404,11 @@ impl Tool for AgentSpawn {
                          unless you cannot continue without them, in which case call agent.wait.",
             }));
         }
-        let objective = arg_str(args, "objective")?;
+        let spec = parse_agent_spec(args)?;
         let Some(parent) = parent_executor(&self.executor) else {
             return Err(ToolError::Failed(
                 "the agent runtime is not available in this session".into(),
             ));
-        };
-        let spec = orchestrator::AgentSpec {
-            name: args
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            objective,
-            contract: args
-                .get("contract")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            tools: args.get("tools").and_then(Value::as_array).map(|names| {
-                names
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            }),
-            max_turns: args
-                .get("max_turns")
-                .and_then(Value::as_u64)
-                .map(|turns| turns.min(u32::MAX as u64) as u32),
-            write: args.get("write").and_then(Value::as_bool).unwrap_or(false),
-            fork: parse_fork(args)?,
         };
         // Every child runs asynchronously. Waiting inside the call blocked the
         // turn for as long as the child ran, with no timeout and no way out but
@@ -468,7 +424,10 @@ impl Tool for AgentSpawn {
                 child_budget(&self.control, &caller, self.max_turns),
             )
             .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
+            .map_err(|error| match error {
+                orchestrator::Error::BadTools(message) => ToolError::Args(message),
+                other => ToolError::Failed(other.to_string()),
+            })?;
         let started = vec![json!({
             "agent": agent.path,
             "session": agent.session,
@@ -613,10 +572,70 @@ async fn wait_for(
 /// An omitted fork mode starts the child cold, which is what its objective and
 /// its briefing both already promise.
 fn parse_fork(args: &Value) -> Result<orchestrator::Fork, ToolError> {
-    match args.get("fork").and_then(Value::as_str) {
+    match args.get("fork") {
         None => Ok(orchestrator::Fork::default()),
-        Some(text) => orchestrator::Fork::parse(text).map_err(ToolError::Args),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| ToolError::Args("'fork' must be a string".into()))
+            .and_then(|text| orchestrator::Fork::parse(text).map_err(ToolError::Args)),
     }
+}
+
+fn parse_agent_spec(args: &Value) -> Result<orchestrator::AgentSpec, ToolError> {
+    let optional_string = |key: &str| -> Result<Option<String>, ToolError> {
+        match args.get(key) {
+            None => Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(|text| Some(text.to_string()))
+                .ok_or_else(|| ToolError::Args(format!("'{key}' must be a string"))),
+        }
+    };
+    let max_turns = match args.get("max_turns") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| ToolError::Args("'max_turns' must be an integer".into()))?
+                .min(u32::MAX as u64) as u32,
+        ),
+    };
+    let write = match args.get("write") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| ToolError::Args("'write' must be a boolean".into()))?,
+    };
+    Ok(orchestrator::AgentSpec {
+        name: optional_string("name")?.unwrap_or_default(),
+        objective: arg_str(args, "objective")?,
+        contract: optional_string("contract")?,
+        tools: optional_string_list(args, "tools")?,
+        max_turns,
+        write,
+        fork: parse_fork(args)?,
+    })
+}
+
+/// Parse an optional string-array without turning malformed narrowing into
+/// `None`, which means "inherit every parent capability" to the orchestrator.
+fn optional_string_list(args: &Value, key: &str) -> Result<Option<Vec<String>>, ToolError> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| ToolError::Args(format!("expected array '{key}'")))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                ToolError::Args(format!("'{key}[{index}]' must be a tool-name string"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// Keeps nested reports addressed to the session that spawned them.
@@ -693,14 +712,11 @@ impl Tool for AgentControlTool {
                  whatever it had found is still reported."
             }
             AgentAction::List => {
-                "List the agents running right now, with what each was asked to do.\n\
-                 \n\
-                 `idle_ms` is time since the agent last *recorded* a step, and a model writes \
-                 nothing while it is composing a long answer — so a large value usually means it \
-                 is mid-generation, not stuck. Minutes of silence on a big model is ordinary. Do \
-                 not treat this as a fault signal, do not poll it, and do not cancel an agent \
-                 because it is quiet: you would be throwing away work that was nearly done and \
-                 paying for it twice."
+                "List the agents running right now, with their objective and live progress. \
+                 `doing` names the current phase; `tool_calls` and `tokens` are running counters. \
+                 `quiet_ms` is present only in phases where silence can indicate a stalled \
+                 operation, and is null while waiting on the operator or in other exempt phases. \
+                 Do not poll or cancel an agent merely because it is quiet."
             }
             AgentAction::Transcript => {
                 "Read what an agent actually did, by its session id. A report is a summary; when \
@@ -1171,5 +1187,27 @@ impl Tool for AgentApply {
                 patch.files.join(", ")
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_tool_narrowing_never_becomes_inherit_all() {
+        assert!(matches!(
+            optional_string_list(&json!({ "tools": "fs.read" }), "tools"),
+            Err(ToolError::Args(message)) if message.contains("expected array")
+        ));
+        assert!(matches!(
+            optional_string_list(&json!({ "tools": ["fs.read", 7] }), "tools"),
+            Err(ToolError::Args(message)) if message.contains("tools[1]")
+        ));
+        assert_eq!(
+            optional_string_list(&json!({ "tools": ["fs.read"] }), "tools").unwrap(),
+            Some(vec!["fs.read".into()])
+        );
+        assert_eq!(optional_string_list(&json!({}), "tools").unwrap(), None);
     }
 }

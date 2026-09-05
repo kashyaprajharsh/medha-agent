@@ -42,6 +42,12 @@ pub trait StreamSink: Send + Sync {
     /// could only choose between a doubled answer and never retrying a stream
     /// that died mid-flight.
     fn restarted(&self) {}
+    /// Whether [`Self::restarted`] can actually retract or explicitly reset
+    /// already rendered output. Irreversible stdout-like sinks return false so
+    /// the kernel fails once instead of printing a duplicated retry.
+    fn supports_restart(&self) -> bool {
+        false
+    }
     /// What this session is doing now. The one hook that carries liveness, so a
     /// watcher can tell a model that is thinking from a connection that has
     /// died — a distinction no amount of reading the event log recovers, because
@@ -54,4 +60,8 @@ pub trait StreamSink: Send + Sync {
 
 /// Discards every update — the headless default.
 pub struct NullSink;
-impl StreamSink for NullSink {}
+impl StreamSink for NullSink {
+    fn supports_restart(&self) -> bool {
+        true
+    }
+}

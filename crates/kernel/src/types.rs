@@ -2,6 +2,7 @@
 //! Providers translate to/from these — the core is never vendor-shaped.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use ulid::Ulid;
 
 /// Provenance/trust label carried by every span of context and every event.
@@ -518,6 +519,168 @@ pub struct ToolSpec {
     /// The tool's own display glyph (a single grapheme). Declared by the tool so
     /// each keeps a distinct icon without any surface holding a name→glyph table.
     pub icon: String,
+}
+
+/// Portable function-name form used by providers whose tool identifiers only
+/// admit ASCII letters, digits, `_`, and `-`.
+///
+/// Canonical tool names remain dotted inside MEDHA (`web.search`). Providers
+/// expose this form on the wire (`web_search`). Model-generated *arguments* can
+/// nevertheless copy that visible spelling, so structured fields which refer
+/// to tools use the same conversion when accepting an unambiguous legacy alias.
+pub fn portable_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Deterministic provider wire name → canonical name map.
+///
+/// Colliding sanitized names receive trailing underscores. Canonical names are
+/// sorted internally so providers and semantic nested-reference resolvers make
+/// the same choice even when one starts from an unordered catalogue.
+pub fn portable_tool_name_map(available: &[String]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut ordered: Vec<&String> = available.iter().collect();
+    ordered.sort();
+    ordered.dedup();
+    // Reserve canonical names that are already wire-safe before sanitizing any
+    // dotted name. This guarantees a persisted canonical reference remains an
+    // exact reference on follow-up instead of becoming another tool's alias.
+    for canonical in &ordered {
+        if portable_tool_name(canonical) == canonical.as_str() {
+            map.insert((*canonical).clone(), (*canonical).clone());
+        }
+    }
+    for canonical in ordered {
+        if portable_tool_name(canonical) == canonical.as_str() {
+            continue;
+        }
+        let mut wire = portable_tool_name(canonical);
+        while map.contains_key(&wire) {
+            wire.push('_');
+        }
+        map.insert(wire, canonical.clone());
+    }
+    map
+}
+
+/// Why a model-supplied tool reference could not be made canonical.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum ToolNameError {
+    #[error("unknown tool name '{name}'; use a canonical dotted tool name")]
+    Unknown { name: String },
+    #[error(
+        "tool alias '{name}' is ambiguous ({candidates:?}); use one of the canonical dotted names"
+    )]
+    Ambiguous {
+        name: String,
+        candidates: Vec<String>,
+    },
+}
+
+/// Resolve model-supplied references against the canonical tool catalog.
+///
+/// Exact canonical names win. A provider-facing alias such as `web_search` is
+/// accepted only when it identifies exactly one canonical name. Unknown or
+/// ambiguous names are errors rather than silently removing a capability from
+/// a delegated task. The result is canonical and de-duplicated in request order.
+pub fn canonical_tool_names(
+    requested: &[String],
+    available: &[String],
+) -> Result<Vec<String>, ToolNameError> {
+    let wire_names = portable_tool_name_map(available);
+    let mut resolved = Vec::with_capacity(requested.len());
+    for name in requested {
+        let exact = available.iter().find(|candidate| *candidate == name);
+        let wire = wire_names.get(name);
+        let canonical = match (exact, wire) {
+            // The spelling is simultaneously a canonical identifier and the
+            // provider-visible alias of a different tool. Guessing here can
+            // grant the wrong capability, so require the collision-suffixed
+            // wire spelling for the latter instead.
+            (Some(exact), Some(wire)) if exact != wire => {
+                let mut candidates = vec![(*exact).clone(), wire.clone()];
+                candidates.sort();
+                candidates.dedup();
+                return Err(ToolNameError::Ambiguous {
+                    name: name.clone(),
+                    candidates,
+                });
+            }
+            (Some(exact), _) => (*exact).clone(),
+            (None, Some(wire)) => wire.clone(),
+            (None, None) => return Err(ToolNameError::Unknown { name: name.clone() }),
+        };
+        if !resolved.contains(&canonical) {
+            resolved.push(canonical);
+        }
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tool_name_tests {
+    use super::*;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn nested_tool_references_accept_canonical_and_unambiguous_wire_names() {
+        let available = names(&["fs.read", "web.fetch", "web.search"]);
+        assert_eq!(
+            canonical_tool_names(&names(&["web_search", "fs.read", "web_search"]), &available)
+                .unwrap(),
+            names(&["web.search", "fs.read"])
+        );
+    }
+
+    #[test]
+    fn collision_suffixes_match_the_provider_wire_map() {
+        let available = names(&["a.b", "a:b"]);
+        let reversed = names(&["a:b", "a.b"]);
+        assert_eq!(
+            canonical_tool_names(&names(&["a_b", "a_b_"]), &available).unwrap(),
+            available
+        );
+        assert_eq!(
+            portable_tool_name_map(&available),
+            portable_tool_name_map(&reversed),
+            "collision aliases must not depend on registry iteration order"
+        );
+    }
+
+    #[test]
+    fn wire_safe_canonical_names_are_reserved_before_sanitized_aliases() {
+        let available = names(&["a.b", "a_b"]);
+        let normalized = canonical_tool_names(&names(&["a_b", "a_b_"]), &available).unwrap();
+        assert_eq!(
+            normalized,
+            names(&["a_b", "a.b"]),
+            "canonical replay and the provider's collision alias both remain usable"
+        );
+        assert_eq!(
+            canonical_tool_names(&normalized, &available).unwrap(),
+            normalized,
+            "persisted canonical names must survive follow-up normalization"
+        );
+    }
+
+    #[test]
+    fn unknown_nested_tool_references_are_errors() {
+        assert!(matches!(
+            canonical_tool_names(&names(&["web_search"]), &names(&["fs.read"])),
+            Err(ToolNameError::Unknown { name }) if name == "web_search"
+        ));
+    }
 }
 
 /// A model-proposed tool call.

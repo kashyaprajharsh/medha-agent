@@ -32,6 +32,7 @@ pub(super) fn update<P, L>(
             if model.agent_report_deferred
                 && !model.running
                 && !model.force_aborting
+                && model.session_op.is_none()
                 && model.picker.is_none()
             {
                 model.agent_report_deferred = false;
@@ -43,6 +44,7 @@ pub(super) fn update<P, L>(
             // Poll inexpensive live state a few times per second.
             if model.anim_frame % 16 == 0 {
                 model.bg_tasks = kernel.executor.background_tasks();
+                let selected_switch_target = model.switch_selection();
                 let running = model
                     .agents
                     .as_ref()
@@ -60,7 +62,14 @@ pub(super) fn update<P, L>(
                     .map(|previous| (previous.path.name().to_string(), previous.session.clone()))
                     .collect();
                 let fleet_emptied = running.is_empty();
+                let roster_changed = model
+                    .agent_runs
+                    .iter()
+                    .map(|agent| &agent.session)
+                    .ne(running.iter().map(|agent| &agent.session));
                 model.agent_runs = running;
+                model.reconcile_switch_cursor(selected_switch_target);
+                model.dirty |= roster_changed;
                 // The live plane, read in the same pass: `active()` says an
                 // agent exists, this says what it is doing.
                 model.agent_progress = model
@@ -75,6 +84,13 @@ pub(super) fn update<P, L>(
                     .as_ref()
                     .map(|control| control.agents())
                     .unwrap_or_default();
+                if model.agents.is_some() {
+                    let known_panes: std::collections::HashSet<_> = settled_states
+                        .iter()
+                        .map(|agent| agent.path.clone())
+                        .collect();
+                    model.retain_known_agent_panes(&known_panes);
+                }
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|since| since.as_millis() as u64)
@@ -101,7 +117,7 @@ pub(super) fn update<P, L>(
                 // the delegation leaves a trace once the live tree disappears.
                 if fleet_emptied && !model.agents_done.is_empty() {
                     let rows = std::mem::take(&mut model.agents_done);
-                    model.push_item(Item::AgentsDone(rows));
+                    model.push_main_item(Item::AgentsDone(rows));
                 }
                 for (agent, session) in finished {
                     // Use the cache here because this polling runs on the UI thread.
@@ -110,7 +126,7 @@ pub(super) fn update<P, L>(
                         .as_ref()
                         .and_then(|control| control.cached_patch(&session));
                     match patch {
-                        Some(patch) if !patch.is_empty() => model.push_notice(format!(
+                        Some(patch) if !patch.is_empty() => model.push_main_notice(format!(
                             "⎇ agent '{agent}' finished with a patch to {} file(s), {} — \
                              review it with /agents",
                             patch.files.len(),
@@ -120,7 +136,7 @@ pub(super) fn update<P, L>(
                                 None => "not verified",
                             }
                         )),
-                        _ => model.push_notice(format!(
+                        _ => model.push_main_notice(format!(
                             "⚇ agent '{agent}' finished — reading its report"
                         )),
                     }
@@ -905,12 +921,26 @@ pub(super) fn handle_key<P, L>(
         return;
     }
 
+    // Reading an agent, Esc comes back before it can cancel the foreground
+    // conversation that owns the running turn. A live approval still owns Esc.
+    if key.code == KeyCode::Esc
+        && model.focus.is_some()
+        && model.pending_approval().is_none()
+        && model.picker.is_none()
+        && model.model_setup.is_none()
+        && model.search_setup.is_none()
+    {
+        model.focus_pane(None);
+        model.switching = false;
+        return;
+    }
+
     // With no modal owner, Esc gracefully cancels the turn rather than a prompt.
     if key.code == KeyCode::Esc && model.running {
         if let Some(h) = &model.interrupt {
             h.cancel_turn();
             model.cancelling = true;
-            model.push_notice("⏹ stopping — letting in-flight tools settle…");
+            model.push_main_notice("⏹ stopping — letting in-flight tools settle…");
         }
         // Denying owned prompts unblocks gates during cancellation.
         model.deny_foreground_prompts();
@@ -923,7 +953,12 @@ pub(super) fn handle_key<P, L>(
     // Keep the editor usable while the aborted task's Drop cleanup joins, but
     // do not dispatch a command or consume a prompt until ownership is clear.
     if key.code == KeyCode::Enter && model.force_aborting {
-        model.push_notice("(force stop is still quiescing owned work…)");
+        model.push_main_notice("(force stop is still quiescing owned work…)");
+        return;
+    }
+
+    if key.code == KeyCode::Enter && model.session_op.is_some() {
+        model.push_main_notice("(session change is still finishing — input preserved)");
         return;
     }
 
@@ -1201,6 +1236,17 @@ pub(super) fn handle_key<P, L>(
                 if let PickerKind::Session(sessions) = &picker.kind {
                     if let Some(meta) = sessions.get(picker.selected) {
                         let id = meta.id;
+                        if model.foreground_owned() || model.has_active_agents() {
+                            model.picker = None;
+                            model.push_notice(
+                                "finish foreground and background work before resuming a session",
+                            );
+                            return;
+                        }
+                        model.session_op = Some(SessionOp::Resume {
+                            source: session.id,
+                            target: id,
+                        });
                         let log = kernel.log.clone();
                         let tx = tx.clone();
                         tokio::spawn(async move {
@@ -1227,8 +1273,16 @@ pub(super) fn handle_key<P, L>(
                     let at_event = point.at_event; // Copy — ends the picker borrow
                     match scope {
                         Some(scope) => {
+                            if model.foreground_owned() || model.has_active_agents() {
+                                model.picker = None;
+                                model.push_notice(
+                                    "finish foreground and background work before rewinding",
+                                );
+                                return;
+                            }
                             let restore = model.restore.clone();
                             model.picker = None;
+                            model.session_op = Some(SessionOp::Rewind { source: session.id });
                             spawn_rewind(kernel, restore, session.id, at_event, scope, tx);
                             model.push_notice("(rewinding …)");
                         }
@@ -1496,14 +1550,6 @@ pub(super) fn handle_key<P, L>(
         return;
     }
 
-    // Reading an agent, Esc comes back. Ahead of the cancel binding on purpose:
-    // leaving a view you opened is what Esc means here, and a turn is cancelled
-    // from the conversation it belongs to.
-    if key.code == KeyCode::Esc && model.focus.is_some() && model.pending_approval().is_none() {
-        model.focus_pane(None);
-        model.switching = false;
-        return;
-    }
     // The agent switcher. Handled before the input so its keys are unambiguous
     // while it is open, and it only opens when there is somewhere to go.
     if model.switching {
@@ -1514,7 +1560,10 @@ pub(super) fn handle_key<P, L>(
             }
             KeyCode::Enter => {
                 let rows = model.switch_rows();
-                let target = rows.get(model.switch_cursor).cloned().flatten();
+                let Some(target) = rows.get(model.switch_cursor).cloned() else {
+                    model.reconcile_switch_cursor(None);
+                    return;
+                };
                 model.focus_pane(target);
                 model.switching = false;
                 return;
@@ -1537,9 +1586,10 @@ pub(super) fn handle_key<P, L>(
         }
     }
     // Opening it needs somewhere to go, so it never steals Tab from nothing.
+    // The destination set includes parked settled panes, not only live agents.
     if key.code == KeyCode::Tab
         && model.input.is_empty()
-        && !model.agent_runs.is_empty()
+        && model.switch_rows().len() > 1
         && model.picker.is_none()
     {
         model.switching = true;
@@ -1668,16 +1718,17 @@ pub(super) fn handle_key<P, L>(
                     control.steer(&orchestrator::AgentPath::root(), &path.to_string(), &line)
                 }) {
                     Some(Ok(_)) => {
-                        let preview: String = line.chars().take(60).collect();
-                        model.push_agent_step(
-                            path.clone(),
-                            AgentStep::Text(format!("\n▌ you: {preview}\n")),
-                        );
-                        model.push_notice(format!("↳ sent to '{}'", path.name()));
+                        model.pending_agent_steers += 1;
+                        model.push_agent_step(path, AgentStep::SteerQueued(line));
                     }
-                    _ => model.push_notice(
-                        "that agent is no longer running — its report arrives on its own",
-                    ),
+                    _ => {
+                        model.input = raw;
+                        model.cursor = model.input.len();
+                        model.history.pop();
+                        model.push_notice(
+                            "that agent is no longer running — your message is back in the input",
+                        );
+                    }
                 }
                 return;
             }
@@ -1687,11 +1738,20 @@ pub(super) fn handle_key<P, L>(
                 // current tools settle). Never reaches here with an approval
                 // card open — the approval branch owns Enter above.
                 if let Some(h) = &model.interrupt {
-                    h.steer(line.clone());
-                    let preview: String = raw.chars().take(60).collect();
-                    model.push_notice(format!("↳ queued for this task: {preview}"));
+                    if h.steer_labelled(line, kernel::TrustLabel::User) {
+                        let preview: String = raw.chars().take(60).collect();
+                        model.push_notice(format!("↳ queued for this task: {preview}"));
+                    } else {
+                        model.input = raw;
+                        model.cursor = model.input.len();
+                        model.history.pop();
+                        model.push_notice("(turn finished — your message is back in the input)");
+                    }
                 } else {
-                    model.push_notice("(turn is finishing — try again in a moment)");
+                    model.input = raw;
+                    model.cursor = model.input.len();
+                    model.history.pop();
+                    model.push_notice("(turn is finishing — your message is back in the input)");
                 }
             } else {
                 spawn_turn(model, kernel, session, transcript, budget, tx, Some(line));
@@ -1806,7 +1866,10 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
                 model.auto_approve.insert(pending.action.clone());
             }
             let verb = pending.responder.verb(choice);
-            model.push_notice(format!("{verb} {}", pending.action));
+            model.push_main_notice(format!("{verb} {}", pending.action));
+            // The approval card is global even while a child pane is visible.
+            // Rebuild its cached rows before the next prompt can accept input.
+            model.dirty = true;
             pending.responder.answer(choice);
         }
     }
@@ -2057,7 +2120,7 @@ fn submit_clarify(model: &mut Model) {
         let summary = format!("✔ answered — {}", parts.join(" · "));
         let answers = state.answers();
         let _ = state.responder.send(Some(answers));
-        model.push_notice(summary);
+        model.push_main_notice(summary);
         model.dirty = true;
     }
 }
@@ -2067,7 +2130,7 @@ pub(super) fn cancel_clarify(model: &mut Model) {
     if let Some(state) = model.clarify.take() {
         model.clarify_cancel = None;
         let _ = state.responder.send(None);
-        model.push_notice("clarify dismissed — proceeding on best judgment");
+        model.push_main_notice("clarify dismissed — proceeding on best judgment");
         model.dirty = true;
     }
 }
@@ -2086,11 +2149,11 @@ pub(super) fn handle_agent_event(
             TuiEvent::ForegroundAbortSettled => {
                 model.foreground_turn.take();
                 model.force_aborting = false;
-                model.push_notice("⏹ force-stopped — prompt ready");
+                model.push_main_notice("⏹ force-stopped — prompt ready");
                 return;
             }
             TuiEvent::ForegroundAbortSlow => {
-                model.push_notice(
+                model.push_main_notice(
                     "⚠ force-stop cleanup is still running — the prompt stays locked to \
                      prevent overlapping process or file mutation cleanup; Ctrl-D exits",
                 );
@@ -2112,7 +2175,6 @@ pub(super) fn handle_agent_event(
             | TuiEvent::Compaction(_, _, _, _)
             | TuiEvent::Compacting(_)
             | TuiEvent::Restarted
-            | TuiEvent::AgentStep { .. }
             | TuiEvent::Usage(_, _)
             | TuiEvent::Cost(_, _)
             | TuiEvent::Verify(_, _) => return,
@@ -2123,7 +2185,10 @@ pub(super) fn handle_agent_event(
     };
     match ev {
         // The next UI tick owns starting the deferred turn.
-        TuiEvent::AgentReportReady => model.agent_report_deferred = true,
+        TuiEvent::AgentReportReady(owner) if owner.is_none() || owner == Some(session.id) => {
+            model.agent_report_deferred = true;
+        }
+        TuiEvent::AgentReportReady(_) => {}
         TuiEvent::ToolStarted(tool, target) => model.current_tool = Some((tool, target)),
         TuiEvent::Text(delta) => {
             model.current_tool = None;
@@ -2132,15 +2197,15 @@ pub(super) fn handle_agent_event(
         TuiEvent::Reasoning(delta) => model.push_thinking_delta(&delta),
         TuiEvent::ToolCall(tool, args) => {
             model.current_tool = None;
-            model.push_item(Item::ToolCall { tool, args });
+            model.push_main_item(Item::ToolCall { tool, args });
         }
         TuiEvent::ToolResult(tool, ok, payload) => {
             model.current_tool = None;
-            model.push_item(Item::ToolResult { tool, ok, payload });
+            model.push_main_item(Item::ToolResult { tool, ok, payload });
         }
         TuiEvent::Compaction(before, after, summarized, summary) => {
             model.compacting = false;
-            model.push_item(Item::Compaction {
+            model.push_main_item(Item::Compaction {
                 before,
                 after,
                 summarized,
@@ -2152,9 +2217,16 @@ pub(super) fn handle_agent_event(
         // alarming without a reason, and the retry is the reassuring part.
         TuiEvent::Restarted => {
             model.drop_streamed_this_turn();
-            model.push_notice("the model's connection dropped — retrying");
+            model.push_main_notice("the model's connection dropped — retrying");
         }
-        TuiEvent::AgentStep { path, step } => model.push_agent_step(path, step),
+        TuiEvent::AgentStep {
+            surface_session,
+            path,
+            step,
+        } if surface_session.is_none() || surface_session == Some(session.id) => {
+            model.push_agent_step(path, step);
+        }
+        TuiEvent::AgentStep { .. } => {}
         TuiEvent::Usage(prompt_tokens, _total) => {
             if let Some(mc) = model.max_ctx {
                 let usable = context::ContextBudget::from_max_ctx(mc).usable().max(1);
@@ -2162,7 +2234,7 @@ pub(super) fn handle_agent_event(
             }
         }
         TuiEvent::Cost(usd, indicative) => model.cost_usd = Some((usd, indicative)),
-        TuiEvent::Verify(ok, summary) => model.push_item(Item::Verify { ok, summary }),
+        TuiEvent::Verify(ok, summary) => model.push_main_item(Item::Verify { ok, summary }),
         TuiEvent::Approval(action, detail, escalated, cancel, responder) => {
             // A request cancelled in transit must never become an actionable card.
             if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
@@ -2267,19 +2339,19 @@ pub(super) fn handle_agent_event(
             model.deny_foreground_prompts();
             match reason {
                 StopReason::Budget(stop) => {
-                    model.push_notice(format!("(stopped: {} reached)", stop.label()));
+                    model.push_main_notice(format!("(stopped: {} reached)", stop.label()));
                 }
                 StopReason::Interrupted => {
                     // The kernel settled in-flight tools before returning —
                     // the transcript above is the consistent, resumable truth.
-                    model.push_notice("⏹ stopped — in-flight work settled");
+                    model.push_main_notice("⏹ stopped — in-flight work settled");
                 }
                 StopReason::Finished => {}
             }
         }
         TuiEvent::Error(e) => {
             model.last_turn_reasoning_received = Some(model.reasoning_received_this_turn);
-            model.push_notice(format!("error: {e}"));
+            model.push_main_notice(format!("error: {e}"));
             model.running = false;
             model.current_tool = None;
             model.turn_started = None;
@@ -2352,6 +2424,12 @@ pub(super) fn handle_agent_event(
         TuiEvent::AgentPatchAction(outcome) => match outcome {
             Ok(text) | Err(text) => model.push_notice(text),
         },
+        TuiEvent::AgentFollowupFinished(outcome) => {
+            model.pending_agent_launches = model.pending_agent_launches.saturating_sub(1);
+            match outcome {
+                Ok(text) | Err(text) => model.push_notice(text),
+            }
+        }
         TuiEvent::McpStatus(result) => {
             let text = match result {
                 Err(error) => format!("MCP: {error}"),
@@ -2426,7 +2504,7 @@ pub(super) fn handle_agent_event(
             // force-abort prevents that terminal reconciliation.
             transcript.push(Message::user(text.clone()));
             model.remove_last_notice("↳ queued for this task:");
-            model.push_item(Item::User(text));
+            model.push_main_item(Item::User(text));
         }
         // Steers the session never applied (cancel/finish raced them): give
         // the text back to the input box — typed text must never vanish.
@@ -2438,11 +2516,13 @@ pub(super) fn handle_agent_event(
             }
             model.input.push_str(&restored);
             model.cursor = model.input.len();
-            model.push_notice("(queued message returned to the input box — not sent)");
+            model.push_main_notice("(queued message returned to the input box — not sent)");
         }
         // `/resume` list arrived from the log — open the session picker.
         TuiEvent::SessionsLoaded(sessions) => {
-            if sessions.is_empty() {
+            if model.foreground_owned() || model.has_active_agents() {
+                model.push_notice("(session list dropped — work started while it was loading)");
+            } else if sessions.is_empty() {
                 model.push_notice("(no saved sessions in this workspace)");
             } else {
                 model.picker = Some(Picker::new(PickerKind::Session(sessions)));
@@ -2451,15 +2531,29 @@ pub(super) fn handle_agent_event(
         // A past session's events were replayed — swap session id, rebuild the
         // transcript (keeping the system message at [0]), and repaint the items.
         TuiEvent::Resumed(id, msgs, memory_events) => {
+            let expected = matches!(
+                model.session_op,
+                Some(SessionOp::Resume { source, target })
+                    if source == session.id && target == id
+            );
+            if !expected {
+                return;
+            }
+            model.session_op = None;
             // The replay is async, so a turn can have started since `/resume`
             // was accepted. Swapping the transcript under it would have the
             // running turn write its result back over the resumed session.
-            if model.running {
-                model.push_notice("(resume dropped — a turn started while it was loading)");
+            if model.foreground_owned() || model.has_active_agents() {
+                model.push_notice(
+                    "(resume dropped — a turn or background agent started while it was loading)",
+                );
+                return;
+            }
+            if !adopt_session(model, id) {
+                model.push_notice("(resume dropped — agent admission crossed the boundary)");
                 return;
             }
             session.id = id;
-            adopt_session(model, id);
             // Preserve transcript[0] (the system prompt); replace the rest.
             let mut system = transcript
                 .first()
@@ -2558,7 +2652,9 @@ pub(super) fn handle_agent_event(
         }
         // `/rewind` cut points arrived from the log — open the rewind picker.
         TuiEvent::RewindPointsLoaded(points) => {
-            if points.is_empty() {
+            if model.foreground_owned() || model.has_active_agents() {
+                model.push_notice("(rewind list dropped — work started while it was loading)");
+            } else if points.is_empty() {
                 model.push_notice("(nothing to rewind to — no earlier turns in this session)");
             } else {
                 model.picker = Some(Picker::new(PickerKind::Rewind(points)));
@@ -2608,6 +2704,7 @@ pub(super) fn handle_agent_event(
         // (non-destructive). Code-only (`new_id == None`) leaves the conversation
         // untouched and just reports the files reverted.
         TuiEvent::Rewound {
+            source,
             new_id,
             msgs,
             memory_events,
@@ -2615,6 +2712,18 @@ pub(super) fn handle_agent_event(
             scope,
             prefill,
         } => {
+            if !matches!(model.session_op, Some(SessionOp::Rewind { source: expected }) if expected == source)
+                || session.id != source
+            {
+                return;
+            }
+            model.session_op = None;
+            if model.foreground_owned() || model.has_active_agents() {
+                model.push_notice(
+                    "rewind finished, but work crossed its session boundary; view not replaced",
+                );
+                return;
+            }
             // Shell mutations without snapshots cannot be rolled back.
             let files = |n: usize| {
                 if n == 1 {
@@ -2624,8 +2733,13 @@ pub(super) fn handle_agent_event(
                 }
             };
             if let Some(id) = new_id {
+                if !adopt_session(model, id) {
+                    model.push_notice(
+                        "rewind finished, but an agent admission prevented switching branches",
+                    );
+                    return;
+                }
                 session.id = id;
-                adopt_session(model, id);
                 let mut system = transcript
                     .first()
                     .cloned()
@@ -2656,11 +2770,22 @@ pub(super) fn handle_agent_event(
             };
             model.push_notice(note);
         }
+        TuiEvent::RewindFailed { source, error } => {
+            if matches!(model.session_op, Some(SessionOp::Rewind { source: expected }) if expected == source)
+            {
+                model.session_op = None;
+                model.push_notice(format!("rewind failed: {error}"));
+            }
+        }
     }
 }
 
 /// Rebuilds the visible transcript, including tool calls and their results.
 pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
+    // Resume and conversation rewind cross a session boundary. Old child panes
+    // are path-addressed, not session-addressed, so retaining them could merge
+    // two sessions that happened to reuse the same agent name.
+    model.clear_session_panes();
     model.items.clear();
     // Tool results reference their call by id; remember each call's tool name
     // so the result row carries the right icon/label.
@@ -3294,6 +3419,7 @@ fn agents_followup<P, L>(
     let executor = Arc::clone(&kernel.executor);
     let caller = orchestrator::Caller::root(session.id);
     let tx = tx.clone();
+    model.pending_agent_launches += 1;
     // Resuming *runs* the agent, so it cannot happen on the keystroke.
     tokio::spawn(async move {
         let notice = control
@@ -3306,7 +3432,7 @@ fn agents_followup<P, L>(
                 )
             })
             .map_err(|error| format!("{id}: {error}"));
-        let _ = tx.send(TuiEvent::AgentPatchAction(notice));
+        let _ = tx.send(TuiEvent::AgentFollowupFinished(notice));
     });
 }
 
@@ -3373,10 +3499,13 @@ fn agents_steer(model: &mut Model, rest: &str) {
     };
     // The user is the root of the tree, so every agent is within reach.
     match control.steer(&orchestrator::AgentPath::root(), &id, &text) {
-        Ok(path) => model.push_notice(format!(
-            "sent to '{}' — it arrives at the agent's next step",
-            path.name()
-        )),
+        Ok(path) => {
+            model.pending_agent_steers += 1;
+            model.push_notice(format!(
+                "sent to '{}' — it arrives at the agent's next step",
+                path.name()
+            ));
+        }
         // Between listing and sending it can finish; saying so beats implying
         // the message landed.
         Err(error) => model.push_notice(format!("'{id}': {error} — nothing was sent")),
@@ -4051,8 +4180,16 @@ fn start_resume<L: EventLog + 'static>(
     kernel: &Arc<Kernel<impl Provider + 'static, L>>,
     tx: &mpsc::UnboundedSender<TuiEvent>,
 ) {
-    if model.running {
+    if model.foreground_owned() {
         model.push_notice("finish or Esc the current turn before resuming a session");
+        return;
+    }
+    if model.session_op.is_some() {
+        model.push_notice("a session change is already in progress");
+        return;
+    }
+    if model.has_active_agents() {
+        model.push_notice("wait for or stop the running agents before resuming a session");
         return;
     }
     spawn_sessions_fetch(kernel, tx);
@@ -4065,8 +4202,16 @@ fn start_rewind<L: EventLog + 'static>(
     session: &Session,
     tx: &mpsc::UnboundedSender<TuiEvent>,
 ) {
-    if model.running {
+    if model.foreground_owned() {
         model.push_notice("finish or Esc the current turn before rewinding");
+        return;
+    }
+    if model.session_op.is_some() {
+        model.push_notice("a session change is already in progress");
+        return;
+    }
+    if model.has_active_agents() {
+        model.push_notice("wait for or stop the running agents before rewinding");
         return;
     }
     let log = kernel.log.clone();
@@ -4129,14 +4274,19 @@ fn spawn_rewind<L: EventLog + 'static>(
         let _rewind_lease = match log.acquire_mutation_lease("state:*").await {
             Ok(lease) => lease,
             Err(error) => {
-                let _ = tx.send(TuiEvent::Error(format!(
-                    "rewind could not acquire the mutation lease: {error}"
-                )));
+                let _ = tx.send(TuiEvent::RewindFailed {
+                    source: session_id,
+                    error: format!("could not acquire the mutation lease: {error}"),
+                });
                 return;
             }
         };
         let events = log.events(session_id).await;
         let Some(idx) = kernel::cut_index(&events, at_event) else {
+            let _ = tx.send(TuiEvent::RewindFailed {
+                source: session_id,
+                error: "the selected rewind point no longer exists".into(),
+            });
             return;
         };
 
@@ -4160,7 +4310,13 @@ fn spawn_rewind<L: EventLog + 'static>(
         let (new_id, msgs, memory_events, prefill) = if scope.touches_conversation() {
             let new_id = match log.fork(session_id, at_event).await {
                 Ok(id) => id,
-                Err(_) => return,
+                Err(error) => {
+                    let _ = tx.send(TuiEvent::RewindFailed {
+                        source: session_id,
+                        error: format!("could not fork the conversation: {error}"),
+                    });
+                    return;
+                }
             };
             let prefill = events
                 .get(idx)
@@ -4178,6 +4334,7 @@ fn spawn_rewind<L: EventLog + 'static>(
             (None, Vec::new(), Vec::new(), None)
         };
         let _ = tx.send(TuiEvent::Rewound {
+            source: session_id,
             new_id,
             msgs,
             memory_events,
@@ -4215,6 +4372,10 @@ pub(super) fn spawn_turn<P, L>(
     P: Provider + 'static,
     L: EventLog + 'static,
 {
+    if model.session_op.is_some() {
+        model.push_main_notice("(session change is still finishing — turn not started)");
+        return;
+    }
     if model
         .foreground_turn
         .as_ref()
@@ -4229,9 +4390,19 @@ pub(super) fn spawn_turn<P, L>(
     model.welcome = false;
     let unprompted = line.is_none();
     if let Some(line) = &line {
-        model.push_item(Item::User(line.clone()));
+        model.push_main_item(Item::User(line.clone()));
     }
-    model.auto_scroll = true;
+    if model.focus.is_none() {
+        model.auto_scroll = true;
+    } else {
+        // The new foreground work belongs to parked main. Do not yank a child
+        // the user is reading to the bottom merely because a report arrived.
+        model
+            .parked_scroll
+            .entry(None)
+            .and_modify(|state| state.1 = true)
+            .or_insert((0, true));
+    }
     model.running = true;
     model.reasoning_received_this_turn = false;
     model.streamed_this_turn = 0;
@@ -4378,13 +4549,13 @@ fn force_abort_foreground_turn(model: &mut Model, tx: &mpsc::UnboundedSender<Tui
 
     let Some(task) = model.foreground_turn.take() else {
         model.force_aborting = false;
-        model.push_notice("⏹ force-stopped — prompt ready");
+        model.push_main_notice("⏹ force-stopped — prompt ready");
         return;
     };
 
     task.abort();
     model.force_aborting = true;
-    model.push_notice("⏹ force-stopping — aborting owned work…");
+    model.push_main_notice("⏹ force-stopping — aborting owned work…");
     model.foreground_turn = Some(spawn_foreground_abort_joiner(
         task,
         tx.clone(),
@@ -4453,6 +4624,9 @@ impl kernel::StreamSink for TuiSink {
     }
     fn restarted(&self) {
         self.emit("restarted", TuiEvent::Restarted);
+    }
+    fn supports_restart(&self) -> bool {
+        true
     }
     fn compaction(&self, before: u32, after: u32, summarized: bool, summary: Option<&str>) {
         self.emit(
@@ -4585,16 +4759,31 @@ fn handle_reasoning_picker_key<P: kernel::Provider>(
 }
 
 /// Re-points shared agent control to the session now owned by the surface.
-fn adopt_session(model: &Model, session: ulid::Ulid) {
+fn adopt_session(model: &Model, session: ulid::Ulid) -> bool {
     if let Some(control) = &model.agents {
-        control.adopt(session);
+        control.adopt(session)
+    } else {
+        true
     }
 }
 
 /// Clears projected conversation and starts a fresh event-log session while idle.
 fn do_clear(model: &mut Model, session: &mut Session, transcript: &mut Vec<Message>) {
-    if model.running {
+    if model.foreground_owned() {
         model.push_notice("finish or Esc the current turn before clearing");
+        return;
+    }
+    if model.session_op.is_some() {
+        model.push_notice("wait for the current session change before clearing");
+        return;
+    }
+    if model.has_active_agents() {
+        model.push_notice("wait for or stop the running agents before clearing");
+        return;
+    }
+    let next = Session::new();
+    if !adopt_session(model, next.id) {
+        model.push_notice("an agent admission is still starting — clear was not applied");
         return;
     }
     let system = transcript
@@ -4603,8 +4792,8 @@ fn do_clear(model: &mut Model, session: &mut Session, transcript: &mut Vec<Messa
         .unwrap_or_else(|| Message::system(""));
     transcript.clear();
     transcript.push(system);
-    *session = Session::new();
-    adopt_session(model, session.id);
+    *session = next;
+    model.clear_session_panes();
     model.items.clear();
     model.reasoning_received_this_turn = false;
     model.streamed_this_turn = 0;
@@ -6970,6 +7159,41 @@ mod retry_render_tests {
 
         assert_eq!(streamed(&m), before);
     }
+
+    #[test]
+    fn a_retry_preserves_a_queued_steer_between_streamed_blocks() {
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        m.running = true;
+
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Reasoning("partial thought".into()),
+            &mut session,
+            &mut transcript,
+        );
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Text("partial answer".into()),
+            &mut session,
+            &mut transcript,
+        );
+        m.push_notice("↳ queued for this task: keep this instruction");
+
+        handle_agent_event(&mut m, TuiEvent::Restarted, &mut session, &mut transcript);
+
+        assert!(
+            streamed(&m).is_empty(),
+            "every block from the abandoned attempt must be removed"
+        );
+        assert!(m.items.iter().any(|entry| {
+            matches!(
+                &entry.item,
+                Item::Notice(text) if text.contains("keep this instruction")
+            )
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -6994,6 +7218,20 @@ mod agent_pane_tests {
         orchestrator::AgentPath::root().child(name).unwrap()
     }
 
+    fn input_kernel() -> Arc<Kernel<providers::OpenAiCompat, kernel::InMemoryLog>> {
+        let dir = std::env::temp_dir().join(format!("medha-pane-input-{}", ulid::Ulid::new()));
+        Arc::new(Kernel::new(
+            Arc::new(providers::OpenAiCompat::new("http://localhost/v1", "", "m")),
+            Arc::new(kernel::InMemoryLog::new()),
+            Arc::new(tools::ToolRegistry::new()),
+            Arc::new(context::PipelineEngine::default()),
+            Arc::new(store::FileArtifactStore::open(dir).unwrap()),
+            Arc::new(kernel::AllowAll),
+            Arc::new(kernel::AutoDeny),
+            Arc::new(kernel::NoVerify),
+        ))
+    }
+
     fn shown(model: &Model) -> Vec<String> {
         model
             .items
@@ -7003,6 +7241,17 @@ mod agent_pane_tests {
                 Item::Assistant(text) => Some(format!("assistant:{text}")),
                 Item::Thinking(text) => Some(format!("thinking:{text}")),
                 Item::ToolCall { tool, .. } => Some(format!("call:{tool}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn notices(model: &Model) -> Vec<String> {
+        model
+            .items
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                Item::Notice(text) => Some(text.clone()),
                 _ => None,
             })
             .collect()
@@ -7054,6 +7303,153 @@ mod agent_pane_tests {
         m.focus_pane(None);
         m.focus_pane(Some(worker));
         assert_eq!(shown(&m), vec!["thinking:mine", "assistant:answer"]);
+    }
+
+    #[test]
+    fn foreground_events_stay_in_main_while_a_child_pane_is_open() {
+        let mut m = model();
+        let worker = path("worker");
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        m.push_item(Item::User("main question".into()));
+        m.push_agent_step(worker.clone(), AgentStep::Text("child answer".into()));
+        m.focus_pane(Some(worker.clone()));
+
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Text("parent answer".into()),
+            &mut session,
+            &mut transcript,
+        );
+        handle_agent_event(
+            &mut m,
+            TuiEvent::ToolCall("parent.tool".into(), serde_json::json!({})),
+            &mut session,
+            &mut transcript,
+        );
+
+        assert_eq!(
+            shown(&m),
+            vec!["assistant:child answer"],
+            "foreground output must not contaminate the child"
+        );
+        m.focus_pane(None);
+        assert_eq!(
+            shown(&m),
+            vec![
+                "user:main question",
+                "assistant:parent answer",
+                "call:parent.tool"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_retry_rewinds_the_partial_attempt_before_streaming_again() {
+        let mut m = model();
+        let worker = path("worker");
+        m.push_agent_step(worker.clone(), AgentStep::Text("partial".into()));
+        m.push_agent_step(
+            worker.clone(),
+            AgentStep::SteerQueued("keep the queue".into()),
+        );
+        m.push_agent_step(worker.clone(), AgentStep::Restarted);
+        m.push_agent_step(worker.clone(), AgentStep::Text("complete".into()));
+        m.focus_pane(Some(worker));
+
+        assert_eq!(shown(&m), vec!["assistant:complete"]);
+        assert_eq!(
+            notices(&m),
+            vec![
+                "↳ queued for this agent: keep the queue",
+                "the model's connection dropped — retrying"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unapplied_child_steer_returns_to_the_global_composer() {
+        let mut m = model();
+        let worker = path("worker");
+        m.input = "new draft".into();
+        m.cursor = m.input.len();
+        m.push_agent_step(
+            worker.clone(),
+            AgentStep::SteerQueued("do this instead".into()),
+        );
+        m.push_agent_step(
+            worker.clone(),
+            AgentStep::SteersReturned(vec!["do this instead".into()]),
+        );
+
+        assert_eq!(m.input, "new draft\ndo this instead");
+        assert_eq!(m.cursor, m.input.len());
+        m.focus_pane(Some(worker));
+        assert_eq!(
+            notices(&m),
+            vec!["queued message returned to the input box — not sent"]
+        );
+    }
+
+    #[test]
+    fn a_child_steer_keeps_the_session_boundary_owned_until_it_settles() {
+        let mut m = model();
+        m.pending_agent_steers = 1;
+        assert!(m.has_active_agents());
+
+        m.push_agent_step(
+            path("worker"),
+            AgentStep::SteersReturned(vec!["preserve this message".into()]),
+        );
+
+        assert!(!m.has_active_agents());
+        assert_eq!(m.input, "preserve this message");
+    }
+
+    #[test]
+    fn a_refused_child_steer_never_consumes_the_composer() {
+        let kernel = input_kernel();
+        let mut m = model();
+        let worker = path("worker");
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        m.focus_pane(Some(worker));
+        m.input = "please keep this".into();
+        m.cursor = m.input.len();
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+
+        assert_eq!(m.input, "please keep this");
+        assert_eq!(m.cursor, m.input.len());
+        assert!(m.history.is_empty());
+    }
+
+    #[test]
+    fn an_applied_child_steer_becomes_a_user_turn_not_assistant_text() {
+        let mut m = model();
+        let worker = path("worker");
+        m.push_agent_step(
+            worker.clone(),
+            AgentStep::SteerQueued("look at the tests".into()),
+        );
+        m.push_agent_step(
+            worker.clone(),
+            AgentStep::Steered("look at the tests".into()),
+        );
+        m.focus_pane(Some(worker));
+
+        assert_eq!(shown(&m), vec!["user:look at the tests"]);
+        assert!(notices(&m).is_empty());
     }
 
     #[test]
@@ -7128,5 +7524,304 @@ mod agent_pane_tests {
             "a reader must never be stranded in a pane the switcher denies exists"
         );
         assert!(rows.contains(&None), "main is always a destination");
+    }
+
+    #[test]
+    fn a_settled_pane_can_be_reopened_after_returning_to_main() {
+        let mut m = model();
+        let worker = path("worker");
+        m.push_agent_step(worker.clone(), AgentStep::Text("finished answer".into()));
+        assert!(m.agent_runs.is_empty());
+
+        m.focus_pane(Some(worker.clone()));
+        m.focus_pane(None);
+        assert!(
+            m.switch_rows().contains(&Some(worker.clone())),
+            "parking a settled pane must not make its retained content unreachable"
+        );
+        m.focus_pane(Some(worker));
+        assert_eq!(shown(&m), vec!["assistant:finished answer"]);
+    }
+
+    #[test]
+    fn panes_evicted_from_the_bounded_agent_registry_do_not_accumulate() {
+        let mut m = model();
+        let old = path("old");
+        let retained = path("retained");
+        m.push_agent_step(old.clone(), AgentStep::Text("old answer".into()));
+        m.push_agent_step(retained.clone(), AgentStep::Text("retained answer".into()));
+        m.parked_scroll.insert(Some(old.clone()), (7, false));
+
+        m.retain_known_agent_panes(&std::collections::HashSet::from([retained.clone()]));
+
+        assert!(!m.agent_panes.contains_key(&old));
+        assert!(!m.parked_scroll.contains_key(&Some(old)));
+        assert!(m.agent_panes.contains_key(&retained));
+    }
+
+    #[test]
+    fn tab_returns_from_the_last_settled_agent_to_main() {
+        let kernel = input_kernel();
+        let mut m = model();
+        let worker = path("worker");
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        m.push_item(Item::User("main question".into()));
+        m.push_agent_step(worker.clone(), AgentStep::Text("finished answer".into()));
+        m.focus_pane(Some(worker.clone()));
+        assert!(m.agent_runs.is_empty());
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+        assert!(m.switching);
+        assert_eq!(m.switch_rows(), vec![None, Some(worker)]);
+        assert_eq!(m.switch_cursor, 1, "selection starts on the visible pane");
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+        assert!(m.focus.is_none());
+        assert_eq!(shown(&m), vec!["user:main question"]);
+    }
+
+    #[test]
+    fn esc_leaves_a_child_pane_without_cancelling_the_running_parent() {
+        let kernel = input_kernel();
+        let mut m = model();
+        let worker = path("worker");
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (interrupt, queue) = kernel::InterruptQueue::pair();
+        m.push_item(Item::User("main question".into()));
+        m.push_agent_step(worker.clone(), AgentStep::Text("watching".into()));
+        m.focus_pane(Some(worker));
+        m.input = "draft survives".into();
+        m.cursor = m.input.len();
+        m.running = true;
+        m.interrupt = Some(interrupt);
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+
+        assert!(m.focus.is_none());
+        assert!(m.running);
+        assert!(!queue.cancel_requested());
+        assert_eq!(m.input, "draft survives");
+    }
+
+    #[test]
+    fn an_idle_picker_owns_esc_before_the_child_pane() {
+        let kernel = input_kernel();
+        let mut m = model();
+        let worker = path("worker");
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        m.focus_pane(Some(worker.clone()));
+        m.picker = Some(Picker::new(PickerKind::Theme));
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+
+        assert!(m.picker.is_none());
+        assert_eq!(m.focus, Some(worker));
+    }
+
+    #[test]
+    fn force_abort_keeps_unrelated_child_steps_and_discards_parent_tail() {
+        let mut m = model();
+        let worker = path("worker");
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        m.force_aborting = true;
+
+        handle_agent_event(
+            &mut m,
+            TuiEvent::AgentStep {
+                surface_session: Some(session.id),
+                path: worker.clone(),
+                step: AgentStep::Text("child survives".into()),
+            },
+            &mut session,
+            &mut transcript,
+        );
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Text("aborted parent tail".into()),
+            &mut session,
+            &mut transcript,
+        );
+
+        m.focus_pane(Some(worker));
+        assert_eq!(shown(&m), vec!["assistant:child survives"]);
+        m.focus_pane(None);
+        assert!(shown(&m).is_empty());
+    }
+
+    #[test]
+    fn stale_child_events_cannot_cross_a_session_boundary() {
+        let mut m = model();
+        let worker = path("worker");
+        let old_session = ulid::Ulid::new();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        m.input = "new-session draft".into();
+        m.cursor = m.input.len();
+
+        handle_agent_event(
+            &mut m,
+            TuiEvent::AgentStep {
+                surface_session: Some(old_session),
+                path: worker.clone(),
+                step: AgentStep::Text("old tail".into()),
+            },
+            &mut session,
+            &mut transcript,
+        );
+        handle_agent_event(
+            &mut m,
+            TuiEvent::AgentStep {
+                surface_session: Some(old_session),
+                path: worker,
+                step: AgentStep::SteersReturned(vec!["old steer".into()]),
+            },
+            &mut session,
+            &mut transcript,
+        );
+        handle_agent_event(
+            &mut m,
+            TuiEvent::AgentReportReady(Some(old_session)),
+            &mut session,
+            &mut transcript,
+        );
+
+        assert!(m.agent_panes.is_empty());
+        assert_eq!(m.input, "new-session draft");
+        assert!(!m.agent_report_deferred);
+    }
+
+    #[test]
+    fn a_pending_resume_blocks_clear_until_its_matching_result_arrives() {
+        let mut m = model();
+        let mut session = Session::new();
+        let source = session.id;
+        let target = ulid::Ulid::new();
+        let mut transcript = vec![Message::system("S"), Message::user("keep")];
+        m.session_op = Some(SessionOp::Resume { source, target });
+
+        do_clear(&mut m, &mut session, &mut transcript);
+
+        assert_eq!(session.id, source);
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(m.session_op, Some(SessionOp::Resume { source, target }));
+    }
+
+    #[test]
+    fn pane_scroll_offset_and_follow_mode_survive_round_trips() {
+        let mut m = model();
+        let worker = path("worker");
+        m.scroll_offset = 41;
+        m.auto_scroll = false;
+        m.focus_pane(Some(worker.clone()));
+        m.scroll_offset = 7;
+        m.auto_scroll = true;
+
+        m.focus_pane(None);
+        assert_eq!((m.scroll_offset, m.auto_scroll), (41, false));
+        m.focus_pane(Some(worker));
+        assert_eq!((m.scroll_offset, m.auto_scroll), (7, true));
+    }
+
+    #[test]
+    fn clear_from_a_child_cannot_resurrect_the_old_main_conversation() {
+        let mut m = model();
+        let worker = path("worker");
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S"), Message::user("old question")];
+        m.push_item(Item::User("old question".into()));
+        m.push_agent_step(worker.clone(), AgentStep::Text("old child".into()));
+        m.focus_pane(Some(worker));
+
+        do_clear(&mut m, &mut session, &mut transcript);
+
+        assert!(m.focus.is_none());
+        assert!(m.agent_panes.is_empty());
+        assert!(!shown(&m).iter().any(|item| item.contains("old question")));
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].role, kernel::Role::System);
+        assert_eq!(transcript[0].content, "S");
+    }
+
+    #[test]
+    fn repainting_a_session_drops_panes_from_the_previous_session() {
+        let mut m = model();
+        let worker = path("worker");
+        m.push_item(Item::User("old main".into()));
+        m.push_agent_step(worker.clone(), AgentStep::Text("old child".into()));
+        m.focus_pane(Some(worker));
+
+        repaint_history(&mut m, &[Message::user("resumed main")]);
+
+        assert!(m.focus.is_none());
+        assert!(m.agent_panes.is_empty());
+        assert_eq!(shown(&m), vec!["user:resumed main"]);
+        assert_eq!(m.switch_rows(), vec![None]);
+    }
+
+    #[test]
+    fn switcher_selection_follows_the_selected_path_when_rows_change() {
+        let mut m = model();
+        let a = path("a");
+        let b = path("b");
+        m.push_agent_step(b.clone(), AgentStep::Text("b".into()));
+        m.switching = true;
+        m.switch_cursor = m
+            .switch_rows()
+            .iter()
+            .position(|row| row == &Some(b.clone()))
+            .unwrap();
+        m.push_agent_step(a, AgentStep::Text("a".into()));
+        assert_eq!(m.switch_rows()[m.switch_cursor], Some(b));
     }
 }

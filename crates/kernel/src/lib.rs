@@ -49,6 +49,7 @@ pub use types::{
     AutonomyLevel, BlastRadius, Block, CompiledContext, Containment, ContentPart, Decision,
     LegacyMessageError, MediaPart, MediaSource, Message, ModelMessage, ObsStatus, Observation,
     Pricing, ProviderState, ReasoningPart, Role, Session, TextPart, ToolCallPart, ToolCategory,
-    ToolIntent, ToolResultPart, ToolSpec, TrustLabel, TurnResult, Usage,
+    ToolIntent, ToolNameError, ToolResultPart, ToolSpec, TrustLabel, TurnResult, Usage,
+    canonical_tool_names, portable_tool_name, portable_tool_name_map,
 };
 pub use verify::{NoVerify, Verifier, VerifyReport};

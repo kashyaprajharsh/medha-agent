@@ -95,7 +95,7 @@ async fn run_as(
     let ready = Arc::new(tokio::sync::Notify::new());
     if let Ok(mut slot) = control.notifier_handle().lock() {
         let wake = Arc::clone(&ready);
-        *slot = Some(Arc::new(move || wake.notify_one()));
+        *slot = Some(Arc::new(move |_| wake.notify_one()));
     }
     control
         .spawn_background(spec, caller, Arc::new(Tools), kernel::Budget::turns(turns))
@@ -931,7 +931,7 @@ async fn the_ready_signal_never_arrives_before_the_report_is_collectable() {
     let reader = Arc::new(control);
     let watched = Arc::clone(&reader);
     if let Ok(mut slot) = reader.notifier_handle().lock() {
-        *slot = Some(Arc::new(move || {
+        *slot = Some(Arc::new(move |_| {
             let ready = futures::executor::block_on(watched.collect(parent));
             probe.lock().unwrap().push(ready.len());
         }));
@@ -1602,6 +1602,71 @@ async fn finished_children_stay_visible_after_they_leave_the_roster() {
 }
 
 #[tokio::test]
+async fn adopting_a_new_session_retires_the_old_idle_agent_tree() {
+    let (recorder, control) = control();
+    run(&control, spec("first worker"), 5).await.unwrap();
+    assert_eq!(control.agents().len(), 1);
+
+    assert!(control.adopt(Ulid::new()));
+    assert!(control.agents().is_empty());
+
+    run(&control, spec("first worker"), 5).await.unwrap();
+    assert_eq!(recorder.seen.lock().unwrap().len(), 2);
+    assert_eq!(control.agents()[0].path.as_str(), "/first-worker");
+}
+
+#[tokio::test]
+async fn a_delayed_old_surface_spawn_cannot_cross_session_adoption() {
+    let old = Ulid::new();
+    let new = Ulid::new();
+    let owner = Arc::new(std::sync::Mutex::new(Some(old)));
+    let control = deliverable(
+        Arc::new(Recorder {
+            seen: std::sync::Mutex::new(Vec::new()),
+        }),
+        CancellationToken::new(),
+    )
+    .with_owner(owner);
+
+    assert!(control.adopt(new));
+    assert!(matches!(
+        control
+            .spawn_background(
+                spec("late old work"),
+                &Caller::root(old),
+                Arc::new(Tools),
+                kernel::Budget::turns(5),
+            )
+            .await,
+        Err(Error::StaleCaller)
+    ));
+    assert!(control.active().is_empty());
+}
+
+#[test]
+fn a_registry_reservation_blocks_session_adoption() {
+    let old = Ulid::new();
+    let new = Ulid::new();
+    let owner = Arc::new(std::sync::Mutex::new(Some(old)));
+    let control = deliverable(
+        Arc::new(Recorder {
+            seen: std::sync::Mutex::new(Vec::new()),
+        }),
+        CancellationToken::new(),
+    )
+    .with_owner(owner);
+    let (_path, reservation) = control
+        .registry
+        .claim(&AgentPath::root(), "starting")
+        .unwrap();
+
+    assert!(!control.adopt(new));
+    assert_eq!(control.owner(), Some(old));
+    drop(reservation);
+    assert!(control.adopt(new));
+}
+
+#[tokio::test]
 async fn durable_session_ids_keep_transcripts_addressable_after_eviction_and_restart() {
     let outbox = Arc::new(MemoryOutbox::default());
     let runner = Arc::new(Recorder {
@@ -1916,7 +1981,7 @@ async fn a_narrowed_child_can_still_read_a_file() {
     // needed and left out reading, so the child had no way to open a file and
     // started guessing at tool names instead.
     let mut spec = spec("inventory the backend");
-    spec.tools = Some(vec!["grep".into()]);
+    spec.tools = Some(vec!["fs.write".into()]);
     run(&control, spec, 5).await.expect("report");
 
     let held = &recorder.seen.lock().unwrap()[0].0;
@@ -1932,7 +1997,7 @@ async fn the_floor_still_cannot_widen_past_the_parent() {
     // which the parent does not hold and so the child must not gain.
     let (recorder, control) = control();
     let mut spec = spec("look around");
-    spec.tools = Some(vec!["fs.list".into()]);
+    spec.tools = Some(vec![]);
     run(&control, spec, 5).await.expect("report");
 
     let held = &recorder.seen.lock().unwrap()[0].0;
@@ -1941,4 +2006,52 @@ async fn the_floor_still_cannot_widen_past_the_parent() {
         "a floor is not a way in: {held:?}"
     );
     assert!(held.contains(&"fs.read".to_string()), "{held:?}");
+}
+
+#[test]
+fn child_tool_lists_canonicalize_provider_wire_aliases() {
+    let available = vec![
+        "fs.list".to_string(),
+        "fs.read".to_string(),
+        "shell.exec".to_string(),
+        "web.fetch".to_string(),
+        "web.search".to_string(),
+    ];
+    let asked = vec![
+        "fs_read".to_string(),
+        "web_search".to_string(),
+        "web_fetch".to_string(),
+        "shell_exec".to_string(),
+    ];
+
+    assert_eq!(
+        child_tools(Some(&asked), &available).unwrap(),
+        Some(vec![
+            "fs.read".to_string(),
+            "web.search".to_string(),
+            "web.fetch".to_string(),
+            "shell.exec".to_string(),
+            "fs.list".to_string(),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_requested_tool_refuses_the_spawn_instead_of_narrowing_silently() {
+    let (_, control) = control();
+    let mut spec = spec("research the web");
+    spec.tools = Some(vec!["web_serach".into()]);
+
+    assert!(matches!(
+        control
+            .spawn_background(
+                spec,
+                &Caller::root(control.owner().unwrap_or_default()),
+                Arc::new(Tools),
+                kernel::Budget::turns(5),
+            )
+            .await,
+        Err(Error::BadTools(message)) if message.contains("web_serach")
+    ));
+    assert!(control.active().is_empty(), "no crippled child was started");
 }

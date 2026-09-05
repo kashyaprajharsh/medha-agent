@@ -361,6 +361,12 @@ impl kernel::StreamSink for AcpSink {
         self.writer
             .event("message.returned", json!({ "contents": texts }));
     }
+    fn restarted(&self) {
+        self.writer.event("model.restarted", json!({}));
+    }
+    fn supports_restart(&self) -> bool {
+        true
+    }
 }
 
 enum TurnDone {

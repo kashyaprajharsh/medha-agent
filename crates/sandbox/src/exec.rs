@@ -441,7 +441,10 @@ fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool) {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.as_std_mut().creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
-    cmd.stdout(std::process::Stdio::piped())
+    // These are noninteractive tool processes. Inheriting stdin lets a command
+    // consume TUI/REPL input, or stop on SIGTTIN in its separate process group.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(kill_on_drop);
 }
@@ -1708,6 +1711,15 @@ fn native_intrinsic_read_roots() -> Vec<PathBuf> {
         "/private/var/db/xcode_select_link",
         "/Library/Developer",
         "/Applications/Xcode.app",
+        // Resolver config. `curl` resolves through getaddrinfo/mDNSResponder and
+        // needs none of this, but standalone resolvers (dig, nslookup, host)
+        // read the nameserver list from disk and fail on a network-allowed box
+        // if it is unreadable. Verified sufficient on its own — the wider
+        // SystemConfiguration store is not required, so it stays denied.
+        // `/etc/resolv.conf` is a symlink chain to the var/run target, which is
+        // the vnode Seatbelt actually matches.
+        "/private/var/run/resolv.conf",
+        "/private/etc/resolv.conf",
     ];
     #[cfg(target_os = "linux")]
     let roots = [
@@ -2823,6 +2835,72 @@ mod tests {
             read_roots: Vec::new(),
             write_roots: Vec::new(),
         }
+    }
+
+    /// Model commands must not consume input belonging to the Medha surface.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_commands_do_not_consume_surface_stdin() {
+        const CHILD: &str = "MEDHA_TEST_STDIN_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Explicit command input must remain usable despite detaching the
+            // surface's stdin. Exercise both a pipeline and shell redirection.
+            for script in ["printf supplied | cat", "cat <<'EOF'\nsupplied\nEOF"] {
+                let supplied = run_shell_bounded(
+                    script,
+                    &std::env::temp_dir(),
+                    std::time::Duration::from_secs(5),
+                    1024,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(supplied.passed(), "{supplied:?}");
+                assert_eq!(supplied.output.trim(), "supplied");
+            }
+            let output = run_shell_bounded(
+                "if read -r line; then printf 'stole:%s' \"$line\"; else printf eof; fi",
+                &std::env::temp_dir(),
+                std::time::Duration::from_secs(5),
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(output.passed(), "{output:?}");
+            assert_eq!(output.output, "eof");
+            return;
+        }
+        // Supply the test subprocess a real stdin stream. Ordinary test runners
+        // often have /dev/null as stdin, which would hide accidental inheritance.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::tests::shell_commands_do_not_consume_surface_stdin",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"user prompt\n")
+                .unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// A timed-out command must stop its whole process tree.

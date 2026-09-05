@@ -19,6 +19,7 @@ use orchestrator::{AgentStatus, ChildOutcome, ChildRun, ChildRunner};
 /// the event log — and why a wedged one looked exactly like a busy one.
 struct AgentSink {
     path: orchestrator::AgentPath,
+    surface_session: Option<ulid::Ulid>,
     progress: kernel::ProgressHandle,
     route: AgentRoute,
 }
@@ -30,6 +31,7 @@ impl AgentSink {
     fn show(&self, step: crate::tui_tea::AgentStep) {
         if let Some(tx) = &self.route {
             let _ = tx.send(crate::tui_tea::TuiEvent::AgentStep {
+                surface_session: self.surface_session,
                 path: self.path.clone(),
                 step,
             });
@@ -52,6 +54,22 @@ impl kernel::StreamSink for AgentSink {
 
     fn reasoning(&self, delta: &str) {
         self.show(crate::tui_tea::AgentStep::Reasoning(delta.to_string()));
+    }
+
+    fn restarted(&self) {
+        self.show(crate::tui_tea::AgentStep::Restarted);
+    }
+
+    fn supports_restart(&self) -> bool {
+        true
+    }
+
+    fn steered(&self, text: &str) {
+        self.show(crate::tui_tea::AgentStep::Steered(text.to_string()));
+    }
+
+    fn steers_returned(&self, texts: &[String]) {
+        self.show(crate::tui_tea::AgentStep::SteersReturned(texts.to_vec()));
     }
 
     fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) {
@@ -977,6 +995,7 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         // reaches the child's next turn boundary.
         let sink = AgentSink {
             path: run.path.clone(),
+            surface_session: run.surface_session,
             progress: run.progress.clone(),
             route: self.route.clone(),
         };
@@ -1081,6 +1100,46 @@ mod tests {
     use super::*;
     use orchestrator::{Dispatch, Outbox};
     use ulid::Ulid;
+
+    #[test]
+    fn child_sink_routes_retry_and_steer_lifecycle_to_its_pane() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress, _watch) = kernel::ProgressHandle::new();
+        let path = orchestrator::AgentPath::root().child("worker").unwrap();
+        let sink = AgentSink {
+            path: path.clone(),
+            surface_session: Some(ulid::Ulid::new()),
+            progress,
+            route: Some(tx),
+        };
+
+        kernel::StreamSink::restarted(&sink);
+        kernel::StreamSink::steered(&sink, "use the tests");
+        kernel::StreamSink::steers_returned(&sink, &["not applied".into()]);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::tui_tea::TuiEvent::AgentStep {
+                path: event_path,
+                step: crate::tui_tea::AgentStep::Restarted,
+                ..
+            }) if event_path == path
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::tui_tea::TuiEvent::AgentStep {
+                step: crate::tui_tea::AgentStep::Steered(text),
+                ..
+            }) if text == "use the tests"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::tui_tea::TuiEvent::AgentStep {
+                step: crate::tui_tea::AgentStep::SteersReturned(texts),
+                ..
+            }) if texts == ["not applied"]
+        ));
+    }
 
     fn log_at(name: &str) -> (Arc<store::SqliteLog>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("medha-{name}-{}", Ulid::new()));
@@ -1371,6 +1430,7 @@ mod child_prompt_tests {
     fn prompt_for(tools: Vec<&'static str>, workspace: Option<PathBuf>) -> String {
         child_prompt(&ChildRun {
             session: ulid::Ulid::new(),
+            surface_session: Some(ulid::Ulid::new()),
             path: orchestrator::AgentPath::root().child("survey").unwrap(),
             spec: AgentSpec {
                 objective: "survey the crate".into(),

@@ -863,6 +863,16 @@ pub(super) fn render_approval(
     sel: usize,
     opts: &[&str],
 ) -> Vec<Line<'static>> {
+    render_approval_detail(action, detail, sel, opts, 18)
+}
+
+fn render_approval_detail(
+    action: &str,
+    detail: Option<&str>,
+    sel: usize,
+    opts: &[&str],
+    detail_limit: usize,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
@@ -878,7 +888,7 @@ pub(super) fn render_approval(
     ];
     if let Some(detail) = detail {
         lines.push(Line::from(""));
-        for l in detail.lines().take(18) {
+        for l in detail.lines().take(detail_limit) {
             let style = if l.starts_with('+') && !l.starts_with("+++") {
                 Style::default().fg(theme::add_fg())
             } else if l.starts_with('-') && !l.starts_with("---") {
@@ -888,10 +898,17 @@ pub(super) fn render_approval(
             };
             lines.push(Line::from(Span::styled(l.to_string(), style)));
         }
-        let extra = detail.lines().count().saturating_sub(18);
+        let extra = detail.lines().count().saturating_sub(detail_limit);
         if extra > 0 {
             lines.push(Line::from(Span::styled(
-                format!("… {extra} more lines"),
+                format!(
+                    "… {extra} more lines{}",
+                    if detail_limit == 18 {
+                        " · d to expand"
+                    } else {
+                        " (display limit)"
+                    }
+                ),
                 Style::default().fg(theme::faint()),
             )));
         }
@@ -936,7 +953,11 @@ pub(super) fn render_approval(
         ),
     ]));
     lines.push(Line::from(Span::styled(
-        "↑↓ + enter · or press 1/2/3 · n to deny",
+        format!("↑↓ Enter · 1–{} · n deny", opts.len()),
+        Style::default().fg(theme::faint()),
+    )));
+    lines.push(Line::from(Span::styled(
+        "PgUp review · End back · d",
         Style::default().fg(theme::faint()),
     )));
     lines
@@ -1524,6 +1545,31 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
             Style::default().fg(theme::ok()),
         ));
     }
+    let left_width: usize = left
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    if left_width > area.width as usize {
+        let activity = if model.pending_approval().is_some() {
+            "Approval needed"
+        } else if model.clarify.is_some() {
+            "Answer needed"
+        } else if model.running {
+            "Working"
+        } else {
+            "Ready"
+        };
+        let candidates = [
+            format!("{activity} · {mode_txt} · {}", model.model),
+            format!("{activity} · {mode_txt}"),
+            activity.to_string(),
+        ];
+        let compact = candidates
+            .into_iter()
+            .find(|s| UnicodeWidthStr::width(s.as_str()) <= area.width as usize)
+            .unwrap_or_default();
+        left = vec![Span::styled(compact, Style::default().fg(theme::accent()))];
+    }
     let ctx = match model.ctx_pct {
         Some(pct) => format!("ctx {pct}%"),
         None => "ctx —".to_string(),
@@ -1855,7 +1901,17 @@ pub(super) fn draw_picker(f: &mut Frame, picker: &Picker, input_area: Rect) {
     fill_panel(f, area);
 
     // Title shows position (e.g. "3/27") when the list is windowed off-screen.
-    let mut title = picker.kind.title().trim().to_string();
+    let mut title = if input_area.width < 60 {
+        match &picker.kind {
+            PickerKind::Reasoning(state) if state.choosing_effort => {
+                "Effort · Enter · Esc".to_string()
+            }
+            PickerKind::Reasoning(_) => "Reasoning · Enter · Esc".to_string(),
+            _ => picker.kind.title().trim().to_string(),
+        }
+    } else {
+        picker.kind.title().trim().to_string()
+    };
     if n > visible {
         title = format!("{title}  ({}/{n})", picker.selected + 1);
     }
@@ -2143,7 +2199,7 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     );
 
     // Clamp a width-scaled gutter for narrow terminals.
-    let margin = (area.width / 30).clamp(3, 6);
+    let margin = (area.width / 30).clamp(1, 4);
     let content_w = area.width.saturating_sub(margin * 2);
 
     // Border and horizontal padding consume four cells of composer width.
@@ -2261,6 +2317,22 @@ fn highlight_cell_range(line: &Line<'static>, start: usize, end: usize) -> Line<
 }
 
 pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
+    // Keep the action visible while the user scrolls its evidence or options.
+    let area = if let Some(pending) = model.pending_approval()
+        && area.height > 4
+    {
+        f.render_widget(
+            Paragraph::new(format!("Allow {}?", tool_label(&pending.action))).style(
+                Style::default()
+                    .fg(theme::warn())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+    } else {
+        area
+    };
     // Scroll math uses transcript height, excluding composer and status rows.
     model.viewport_height = area.height as usize;
     model.transcript_area = area;
@@ -2292,12 +2364,22 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
         }
         // Approval rows participate in the same physical-row scroll model.
         model.approval_rows = if let Some(pending) = model.pending_approval() {
-            let mut rows = render_approval(
-                &pending.action,
-                pending.detail.as_deref(),
-                model.approval_sel,
-                pending.responder.options(),
-            );
+            let mut rows = if model.approval_expanded {
+                render_approval_detail(
+                    &pending.action,
+                    pending.detail.as_deref(),
+                    model.approval_sel,
+                    pending.responder.options(),
+                    MAX_TOOL_OUTPUT_LINES,
+                )
+            } else {
+                render_approval(
+                    &pending.action,
+                    pending.detail.as_deref(),
+                    model.approval_sel,
+                    pending.responder.options(),
+                )
+            };
             // If more approvals are queued behind the current one, say so — so the
             // user knows to expect another prompt right after this one.
             if model.pending_approvals.len() > 1 {
@@ -2329,10 +2411,8 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
     // is "working". The spinner is one virtual row appended at the very end.
     let show_spinner = model.running && model.pending_approval().is_none();
     model.content_height = model.total_rows + if show_spinner { 1 } else { 0 };
-    // A pending approval must always be on screen — pin to the bottom.
-    if model.pending_approval().is_some() {
-        model.auto_scroll = true;
-    }
+    // New cards start at the options, but explicit scroll must stay parked so
+    // the user can inspect the action and diff before making a decision.
     if model.auto_scroll {
         model.scroll_offset = model.max_scroll();
     } else {
@@ -2411,10 +2491,10 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
         f.render_stateful_widget(bar, gutter, &mut state);
     }
 
-    // The approval card is now guaranteed on screen — safe to accept selection input.
-    if model.pending_approval().is_some() && !model.approval_ready {
-        model.approval_ready = true;
-        tracing::debug!("approval card rendered");
+    // Selection is armed only while the decision area is visible. Paging back
+    // through evidence must not allow an off-screen Enter to grant access.
+    if model.pending_approval().is_some() {
+        model.approval_ready = area.height > 0 && model.scroll_offset == model.max_scroll();
     }
 }
 
@@ -2465,6 +2545,39 @@ mod clarify_view_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn reasoning_picker_keeps_current_level_and_exit_visible_when_small() {
+        for (width, height) in [(24, 10), (80, 24), (120, 36)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let picker = Picker {
+                selected: 6,
+                kind: PickerKind::Reasoning(ReasoningPanelState {
+                    enabled: Some(true),
+                    show: false,
+                    effort: Some(kernel::ReasoningEffort::XHigh),
+                    support: kernel::ReasoningSupport::Unknown,
+                    last_turn_received: None,
+                    choosing_effort: true,
+                    levels: kernel::ReasoningEffort::ALL
+                        .iter()
+                        .copied()
+                        .filter(|e| *e != kernel::ReasoningEffort::Ultra)
+                        .collect(),
+                }),
+            };
+            let input = Rect::new(0, height - 4, width, 3);
+            terminal.draw(|f| draw_picker(f, &picker, input)).unwrap();
+            let rendered = rendered_text(&terminal);
+            assert!(rendered.contains("xhigh"), "{width}x{height}: {rendered}");
+            assert!(rendered.contains("Esc"), "{width}x{height}: {rendered}");
+            for y in input.y..height {
+                for x in 0..width {
+                    assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), " ");
+                }
+            }
+        }
     }
 
     #[test]

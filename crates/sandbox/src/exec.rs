@@ -1773,7 +1773,19 @@ pub(crate) fn escalation_candidates(
     }
     let tokens: Vec<PathBuf> = denial_lines
         .iter()
-        .flat_map(|line| absolute_path_tokens(line))
+        .flat_map(|line| {
+            // `/bin/sh: /blocked/file: Permission denied` names the reporter
+            // first. Do not mistake its executable for the denied write target.
+            let line = line
+                .split_once(": ")
+                .filter(|(reporter, rest)| {
+                    Path::new(reporter).is_absolute()
+                        && Path::new(reporter).is_file()
+                        && absolute_path_tokens(rest).next().is_some()
+                })
+                .map_or(*line, |(_, rest)| rest);
+            absolute_path_tokens(line)
+        })
         .collect();
     // If the denial itself did not identify a path, there is no evidence that
     // approving an argv path could change the result. Falling back to argv made
@@ -1797,9 +1809,10 @@ pub(crate) fn escalation_candidates(
             }
         };
         if root.starts_with(&workspace)
-            || intrinsic_read
-                .iter()
-                .any(|allowed| root.starts_with(allowed))
+            || (permission == permissions::PermissionType::Read
+                && intrinsic_read
+                    .iter()
+                    .any(|allowed| root.starts_with(allowed)))
             || approved.is_allowed(&root, permission)
             || sensitive
                 .iter()

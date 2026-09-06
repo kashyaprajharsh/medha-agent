@@ -136,6 +136,9 @@ than silently proceeding.
 
 Just run `medha`. The first launch opens model setup right in the TUI: pick an endpoint or type your own, paste a key if the endpoint needs one, and it's saved — you only do this once. `/model` adds or switches models later.
 
+Reasoning controls: `medha --effort xhigh "your task"` or `/reasoning` in the TUI.
+See [reasoning levels and approval review](docs/REASONING_AND_APPROVALS.md).
+
 Setup suggests Ollama, LM Studio, llama.cpp, vLLM/SGLang, OpenRouter, Together, Groq and OpenAI. **Google Gemini** works through its native Interactions API.
 
 Everything lands under `~/.medha/` (or `$MEDHA_HOME`): model profiles in `config.toml`, and **API keys in `credentials.toml` with `0600` permissions** — or your OS keychain — never in a config file you might commit. Per-workspace session state lives under a canonical-path-hashed identity in `~/.medha/projects/`, so different workspaces cannot share trust or history and nothing is written into your repo.

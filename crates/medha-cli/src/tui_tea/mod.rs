@@ -870,7 +870,7 @@ impl ApprovalResponder {
         match self {
             Self::Standard(_) => match sel {
                 0 => "approved",
-                1 => "approved (allowing all this session)",
+                1 => "approved (always for this action)",
                 _ => "rejected",
             },
             Self::Network(_) => match sel {
@@ -960,6 +960,8 @@ struct ReasoningPanelState {
     effort: Option<kernel::ReasoningEffort>,
     support: kernel::ReasoningSupport,
     last_turn_received: Option<bool>,
+    choosing_effort: bool,
+    levels: Vec<kernel::ReasoningEffort>,
 }
 
 impl ReasoningPanelState {
@@ -970,6 +972,8 @@ impl ReasoningPanelState {
             effort: model.reasoning.effort,
             support: model.reasoning_support,
             last_turn_received: model.last_turn_reasoning_received,
+            choosing_effort: false,
+            levels: kernel::ReasoningEffort::ALL.to_vec(),
         }
     }
 
@@ -986,13 +990,9 @@ impl ReasoningPanelState {
     }
 
     fn effort_label(&self) -> &'static str {
-        match self.effort {
-            Some(kernel::ReasoningEffort::Minimal) => "Minimal",
-            Some(kernel::ReasoningEffort::Low) => "Low",
-            Some(kernel::ReasoningEffort::Medium) => "Medium",
-            Some(kernel::ReasoningEffort::High) => "High",
-            None => "Auto",
-        }
+        self.effort
+            .map(kernel::ReasoningEffort::as_str)
+            .unwrap_or("Auto")
     }
 
     fn last_turn_label(&self) -> &'static str {
@@ -1004,6 +1004,42 @@ impl ReasoningPanelState {
     }
 
     fn labels(&self) -> Vec<String> {
+        if self.choosing_effort {
+            let selected = if self.enabled == Some(false) {
+                Some(kernel::ReasoningEffort::None)
+            } else {
+                self.effort
+            };
+            return std::iter::once(None)
+                .chain(self.levels.iter().copied().map(Some))
+                .enumerate()
+                .map(|(i, effort)| {
+                    let description = match effort {
+                        None => "auto — let the server decide",
+                        Some(kernel::ReasoningEffort::None) => "none — disable reasoning",
+                        Some(kernel::ReasoningEffort::Minimal) => "minimal — least reasoning",
+                        Some(kernel::ReasoningEffort::Low) => "low — faster responses",
+                        Some(kernel::ReasoningEffort::Medium) => {
+                            "medium — balanced depth and speed"
+                        }
+                        Some(kernel::ReasoningEffort::High) => "high — more depth",
+                        Some(kernel::ReasoningEffort::XHigh) => "xhigh — deeper, slower reasoning",
+                        Some(kernel::ReasoningEffort::Max) => {
+                            "max — maximum depth on supporting models"
+                        }
+                        Some(kernel::ReasoningEffort::Ultra) => {
+                            "ultra — only where explicitly supported"
+                        }
+                    };
+                    format!(
+                        "{}. {} {}",
+                        i + 1,
+                        if selected == effort { "✓" } else { " " },
+                        description
+                    )
+                })
+                .collect();
+        }
         vec![
             format!("Mode:       {}", self.mode_label()),
             format!("Visibility: {}", self.visibility_label()),
@@ -1207,7 +1243,10 @@ const SEARCH_PROVIDERS: &[(tools::SearchProvider, &str)] = &[
 impl PickerKind {
     fn title(&self) -> String {
         match self {
-            PickerKind::Reasoning(_) => " reasoning — ↑↓ select, Enter change, Esc done ".into(),
+            PickerKind::Reasoning(state) if state.choosing_effort => {
+                " effort · ↑↓ choose · Enter apply · Esc back ".into()
+            }
+            PickerKind::Reasoning(_) => " reasoning · ↑↓ select · Enter change · Esc done ".into(),
             PickerKind::Session(_) => {
                 " resume a session — ↑↓ select, Enter open, Esc cancel ".into()
             }
@@ -1872,6 +1911,7 @@ struct Model {
     clarify_cancel: Option<CancellationToken>,
     /// Selected approval option: once, always, or deny.
     approval_sel: usize,
+    approval_expanded: bool,
     /// Session-scoped remembered approvals.
     auto_approve: std::collections::HashSet<String>,
     reasoning: kernel::ReasoningConfig,
@@ -2155,6 +2195,7 @@ impl Model {
             clarify: None,
             clarify_cancel: None,
             approval_sel: 0,
+            approval_expanded: false,
             auto_approve: std::collections::HashSet::new(),
             reasoning,
             reasoning_support: kernel::ReasoningSupport::Unknown,
@@ -2520,7 +2561,7 @@ impl Model {
 
     /// Whether the identity splash is currently visible.
     fn on_welcome_splash(&self) -> bool {
-        self.welcome && self.items.is_empty()
+        self.welcome && self.items.is_empty() && self.pending_approvals.is_empty()
     }
 
     fn push_notice(&mut self, s: impl Into<String>) {

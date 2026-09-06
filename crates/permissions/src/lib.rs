@@ -1021,10 +1021,11 @@ impl PermissionManager {
     /// Resolve only workspace or pre-approved paths without prompting. Intended
     /// for previews and other non-interrupting callers.
     pub fn resolve_if_permitted(&self, path: &Path, permission: PermissionType) -> Option<PathBuf> {
-        let resolved = match permission {
-            PermissionType::Read => self.resolve_path_for_read(path).ok()?,
-            PermissionType::Write => self.resolve_path_for_write(path).ok()?,
-        };
+        // Previews must resolve missing targets too: their absence is the state
+        // being approved and pinned against intervening creation. This resolver
+        // canonicalizes existing targets and the parents of prospective ones;
+        // the requested permission below still controls admission.
+        let resolved = self.resolve_path_for_write(path).ok()?;
         (self.is_inside_workspace(&resolved) || self.is_trusted(&resolved, permission))
             .then_some(resolved)
     }

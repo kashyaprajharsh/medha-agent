@@ -4,7 +4,7 @@
 //! never contains the credential itself: callers resolve that separately from
 //! the secret store and hand it to [`ProviderClient`](crate::ProviderClient).
 
-use kernel::{Protocol, ReasoningSupport, TokenAccountingMode};
+use kernel::{Protocol, ReasoningEffort, ReasoningSupport, TokenAccountingMode};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -51,6 +51,16 @@ pub enum TokenCounter {
     Vllm,
 }
 
+/// Chat output-limit spelling for gateways with older compatibility schemas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatTokenLimit {
+    #[default]
+    Auto,
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProviderProfile {
     pub protocol: Protocol,
@@ -72,6 +82,12 @@ pub struct ProviderProfile {
     pub token_accounting: TokenAccountingMode,
     #[serde(default, skip_serializing_if = "is_default")]
     pub reasoning: ReasoningSupport,
+    /// Exact levels supported by this model, when known. Missing means
+    /// unverified, not that every endpoint accepts every level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub chat_token_limit: ChatTokenLimit,
 }
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
@@ -95,6 +111,23 @@ impl ProviderProfile {
             token_counter: TokenCounter::None,
             token_accounting: TokenAccountingMode::Adaptive,
             reasoning: ReasoningSupport::Unknown,
+            reasoning_efforts: None,
+            chat_token_limit: ChatTokenLimit::Auto,
+        }
+    }
+
+    pub(crate) fn chat_token_limit_field(&self) -> &'static str {
+        match self.chat_token_limit {
+            ChatTokenLimit::MaxTokens => "max_tokens",
+            ChatTokenLimit::MaxCompletionTokens => "max_completion_tokens",
+            ChatTokenLimit::Auto
+                if reqwest::Url::parse(&self.base_url)
+                    .ok()
+                    .is_some_and(|url| url.host_str() == Some("api.openai.com")) =>
+            {
+                "max_completion_tokens"
+            }
+            ChatTokenLimit::Auto => "max_tokens",
         }
     }
 
@@ -186,6 +219,10 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             token_accounting: TokenAccountingMode,
             #[serde(default)]
             reasoning: ReasoningSupport,
+            #[serde(default)]
+            reasoning_efforts: Option<Vec<ReasoningEffort>>,
+            #[serde(default)]
+            chat_token_limit: ChatTokenLimit,
         }
 
         let raw = RawProfile::deserialize(deserializer)?;
@@ -204,6 +241,8 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             token_counter: raw.token_counter,
             token_accounting: raw.token_accounting,
             reasoning: raw.reasoning,
+            reasoning_efforts: raw.reasoning_efforts,
+            chat_token_limit: raw.chat_token_limit,
         })
     }
 }

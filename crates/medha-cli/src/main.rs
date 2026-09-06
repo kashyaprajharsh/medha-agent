@@ -83,6 +83,12 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
+    /// Reasoning level: auto, none, minimal, low, medium, high, xhigh, max,
+    /// or ultra. Supported values depend on the model/profile.
+    #[arg(long = "effort", alias = "reasoning-effort", value_name = "LEVEL",
+        value_parser = kernel::ReasoningConfig::from_effort_text)]
+    reasoning_effort: Option<kernel::ReasoningConfig>,
+
     /// Override the provider base URL for this run
     #[arg(long)]
     base_url: Option<String>,
@@ -751,6 +757,16 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    let effort_override = match cli.reasoning_effort.clone() {
+        Some(config) => Some(config),
+        None => match std::env::var("MEDHA_REASONING_EFFORT") {
+            Ok(value) => Some(
+                kernel::ReasoningConfig::from_effort_text(&value).map_err(anyhow::Error::msg)?,
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => anyhow::bail!("MEDHA_REASONING_EFFORT must contain valid Unicode"),
+        },
+    };
 
     // Invalid explicit limits must fail before provider discovery or startup effects.
     apply_budget_env(kernel::Budget::default())?;
@@ -873,8 +889,15 @@ async fn main() -> Result<()> {
 
     let lock = lockfile::MedhaLock::load_default()?;
 
-    let reasoning = lock.reasoning.to_config();
+    let reasoning = effort_override
+        .clone()
+        .unwrap_or(lock.reasoning.to_config().map_err(anyhow::Error::msg)?);
     if let Err(error) = provider.set_reasoning(reasoning.clone()) {
+        if effort_override.is_some() {
+            return Err(anyhow::anyhow!(
+                "reasoning setting was not applied: {error}"
+            ));
+        }
         eprintln!("note: saved reasoning setting was not applied: {error}");
     } else if reasoning != kernel::ReasoningConfig::default()
         && provider.reasoning_support() == kernel::ReasoningSupport::Unknown
@@ -2472,12 +2495,28 @@ where
 
                 if let Some(cmd) = line.strip_prefix('/') {
                     let cmd = cmd.trim();
-                    if let Some(rest) = cmd.strip_prefix("think") {
-                        println!("{}", apply_think_command(kernel.provider.as_ref(), rest));
+                    let (name, rest) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
+                    if name == "think" {
+                        println!(
+                            "{}",
+                            apply_think_command(kernel.provider.as_ref(), rest.trim())
+                        );
                         continue;
                     }
-                    if let Some(rest) = cmd.strip_prefix("effort") {
-                        println!("{}", apply_effort_command(kernel.provider.as_ref(), rest));
+                    if name == "effort" {
+                        println!(
+                            "{}",
+                            apply_effort_command(kernel.provider.as_ref(), rest.trim())
+                        );
+                        continue;
+                    }
+                    if name == "reasoning" {
+                        let rest = rest.trim();
+                        let message = match rest.strip_prefix("effort ") {
+                            Some(level) => apply_effort_command(kernel.provider.as_ref(), level),
+                            None => apply_think_command(kernel.provider.as_ref(), rest),
+                        };
+                        println!("{message}");
                         continue;
                     }
                     match cmd {
@@ -2535,8 +2574,8 @@ fn print_help() {
         "commands:\n  \
          /help                        show this\n  \
          /status                      model, context window, current pressure\n  \
-         /think [on|off|status]       enable/disable reasoning (§4.4)\n  \
-         /effort [minimal|low|medium|high]\n\
+         /reasoning [on|off|auto|status]  control reasoning\n  \
+         /effort LEVEL (auto|none|minimal|low|medium|high|xhigh|max|ultra)\n\
                                       set reasoning depth (turns thinking on)\n  \
          /clear                       reset the conversation (keep system prompt)\n  \
          /exit                        quit (also Ctrl-D)\n\
@@ -2546,29 +2585,21 @@ fn print_help() {
 
 /// Display label for a reasoning-effort setting.
 pub(crate) fn effort_label(e: Option<kernel::ReasoningEffort>) -> &'static str {
-    match e {
-        Some(kernel::ReasoningEffort::Minimal) => "minimal",
-        Some(kernel::ReasoningEffort::Low) => "low",
-        Some(kernel::ReasoningEffort::Medium) => "medium",
-        Some(kernel::ReasoningEffort::High) => "high",
-        None => "default",
-    }
+    e.map(kernel::ReasoningEffort::as_str).unwrap_or("auto")
 }
 
 /// Apply `/think`; reasoning effort remains a separate setting.
 fn apply_think_command<P: kernel::Provider>(provider: &P, args: &str) -> String {
     match args.trim() {
         "" | "status" => think_status(provider),
-        "on" => {
-            let effort = provider.reasoning().effort;
-            match provider.set_reasoning(kernel::ReasoningConfig {
-                enabled: Some(true),
-                effort,
-            }) {
-                Ok(()) => think_status(provider),
-                Err(error) => format!("thinking unchanged: {error}"),
-            }
-        }
+        "on" => match provider.set_reasoning(reasoning_on_config(provider)) {
+            Ok(()) => think_status(provider),
+            Err(error) => format!("thinking unchanged: {error}"),
+        },
+        "auto" | "default" => match provider.set_reasoning(kernel::ReasoningConfig::default()) {
+            Ok(()) => think_status(provider),
+            Err(error) => format!("thinking unchanged: {error}"),
+        },
         "off" => {
             match provider.set_reasoning(kernel::ReasoningConfig {
                 enabled: Some(false),
@@ -2597,30 +2628,46 @@ fn think_status<P: kernel::Provider>(provider: &P) -> String {
     )
 }
 
-/// Set reasoning depth and enable reasoning.
+/// Enabling reasoning chooses a supported explicit level so Chat endpoints
+/// receive a usable request. Existing effort is preserved.
+pub(crate) fn reasoning_on_config<P: kernel::Provider>(provider: &P) -> kernel::ReasoningConfig {
+    let levels = provider.reasoning_efforts();
+    let effort = provider
+        .reasoning()
+        .effort
+        .filter(|e| *e != kernel::ReasoningEffort::None)
+        .or_else(|| {
+            levels
+                .contains(&kernel::ReasoningEffort::Medium)
+                .then_some(kernel::ReasoningEffort::Medium)
+        })
+        .or_else(|| {
+            levels
+                .into_iter()
+                .find(|e| *e != kernel::ReasoningEffort::None)
+        });
+    kernel::ReasoningConfig {
+        enabled: Some(true),
+        effort,
+    }
+}
+
 pub(crate) fn apply_effort_command<P: kernel::Provider>(provider: &P, args: &str) -> String {
-    match args.trim() {
-        "minimal" | "low" | "medium" | "high" => {
-            let level = args.trim();
-            let effort = match level {
-                "minimal" => kernel::ReasoningEffort::Minimal,
-                "low" => kernel::ReasoningEffort::Low,
-                "medium" => kernel::ReasoningEffort::Medium,
-                _ => kernel::ReasoningEffort::High,
-            };
-            match provider.set_reasoning(kernel::ReasoningConfig {
-                enabled: Some(true),
-                effort: Some(effort),
-            }) {
-                Ok(()) if provider.reasoning_support() == kernel::ReasoningSupport::Unknown => {
-                    format!("effort: {level} — requested; profile support is unverified")
-                }
-                Ok(()) => format!("effort: {level}"),
-                Err(error) => format!("effort unchanged: {error}"),
+    let config = match kernel::ReasoningConfig::from_effort_text(args) {
+        Ok(config) => config,
+        Err(error) => return error,
+    };
+    match provider.set_reasoning(config) {
+        Ok(()) => format!(
+            "{}{}",
+            think_status(provider),
+            if provider.reasoning_support() == kernel::ReasoningSupport::Unknown {
+                " — requested; model support is unverified"
+            } else {
+                ""
             }
-        }
-        "" => "usage: /effort [minimal|low|medium|high]".to_string(),
-        other => format!("usage: /effort [minimal|low|medium|high]  (got '{other}')"),
+        ),
+        Err(error) => format!("effort unchanged: {error}"),
     }
 }
 
@@ -2843,5 +2890,25 @@ mod recent_write_tests {
         assert_eq!(writes[0].id, newest);
         assert_eq!(writes[0].path, "newest-by-time.txt");
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod reasoning_cli_tests {
+    use super::*;
+    #[test]
+    fn cli_accepts_extended_levels_and_rejects_typos() {
+        for level in [
+            "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ] {
+            let cli =
+                Cli::try_parse_from(["medha", "--effort", level, "inspect this project"]).unwrap();
+            assert_eq!(
+                cli.reasoning_effort.unwrap(),
+                kernel::ReasoningConfig::from_effort_text(level).unwrap()
+            );
+            assert_eq!(cli.prompt, ["inspect this project"]);
+        }
+        assert!(Cli::try_parse_from(["medha", "--effort", "extreme"]).is_err());
     }
 }

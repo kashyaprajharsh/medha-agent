@@ -593,15 +593,55 @@ mod error_class_tests {
     }
 }
 
-/// How hard the model should think before answering. Maps onto whatever knob
-/// the adapter's server actually exposes (e.g. vLLM/SGLang's `medium_effort`
-/// flag) — canonical here so the kernel/surfaces never see vendor JSON shapes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Exact request-side reasoning level. Absence means server default; `None`
+/// explicitly disables reasoning where supported. Adapters must not silently
+/// substitute a different level, since this affects cost and latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    None,
     Minimal,
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
+    Ultra,
+}
+
+impl ReasoningEffort {
+    pub const ALL: &'static [Self] = &[
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+        Self::Ultra,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim().to_ascii_lowercase();
+        Self::ALL.iter().copied().find(|effort| effort.as_str() == value)
+            .ok_or_else(|| format!("unknown reasoning effort '{value}'; use auto, none, minimal, low, medium, high, xhigh, max, or ultra (model support varies)"))
+    }
 }
 
 /// Profile/model-level reasoning controls known to be accepted. `Unknown`
@@ -635,6 +675,23 @@ impl ReasoningSupport {
 pub struct ReasoningConfig {
     pub enabled: Option<bool>,
     pub effort: Option<ReasoningEffort>,
+}
+
+impl ReasoningConfig {
+    /// Shared parser for configuration, CLI arguments, and interactive commands.
+    pub fn from_effort_text(value: &str) -> Result<Self, String> {
+        if matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "auto" | "default"
+        ) {
+            return Ok(Self::default());
+        }
+        let effort = value.parse::<ReasoningEffort>()?;
+        Ok(Self {
+            enabled: Some(effort != ReasoningEffort::None),
+            effort: (effort != ReasoningEffort::None).then_some(effort),
+        })
+    }
 }
 
 #[async_trait]
@@ -723,6 +780,16 @@ pub trait Provider: Send + Sync {
 
     fn reasoning_support(&self) -> ReasoningSupport {
         ReasoningSupport::Unsupported
+    }
+
+    /// Choices accepted by this adapter/profile. An unverified model may still
+    /// reject a choice; exact model restrictions belong in its profile.
+    fn reasoning_efforts(&self) -> Vec<ReasoningEffort> {
+        if self.reasoning_support() == ReasoningSupport::Unsupported {
+            Vec::new()
+        } else {
+            ReasoningEffort::ALL.to_vec()
+        }
     }
 
     /// Adjust reasoning/thinking behavior for calls made after this returns.

@@ -597,8 +597,8 @@ pub struct UiConfig {
 pub struct ReasoningLockConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// "minimal" | "low" | "medium" | "high" — unrecognized/absent values
-    /// map to `None`.
+    /// auto, none, minimal, low, medium, high, xhigh, max, or ultra.
+    /// Accepted levels depend on the selected protocol/model profile.
     #[serde(default)]
     pub effort: Option<String>,
     /// SSE streaming. Absent/true → stream token-by-token (the norm). `false` →
@@ -610,18 +610,20 @@ pub struct ReasoningLockConfig {
 }
 
 impl ReasoningLockConfig {
-    pub fn to_config(&self) -> kernel::ReasoningConfig {
-        let effort = match self.effort.as_deref() {
-            Some("minimal") => Some(kernel::ReasoningEffort::Minimal),
-            Some("low") => Some(kernel::ReasoningEffort::Low),
-            Some("medium") => Some(kernel::ReasoningEffort::Medium),
-            Some("high") => Some(kernel::ReasoningEffort::High),
-            _ => None,
-        };
-        kernel::ReasoningConfig {
-            enabled: self.enabled,
-            effort,
+    pub fn to_config(&self) -> Result<kernel::ReasoningConfig, String> {
+        let mut config = self
+            .effort
+            .as_deref()
+            .map(kernel::ReasoningConfig::from_effort_text)
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(enabled) = self.enabled {
+            if self.effort.is_some() && config.enabled.is_some_and(|value| value != enabled) {
+                return Err("reasoning.enabled conflicts with reasoning.effort; use none to disable or auto for server default".into());
+            }
+            config.enabled = Some(enabled);
         }
+        Ok(config)
     }
 }
 
@@ -630,6 +632,7 @@ impl MedhaLock {
     pub fn parse(text: &str) -> Result<Self, String> {
         let lock: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         lock.sandbox.validate()?;
+        lock.reasoning.to_config()?;
         if lock
             .budget
             .max_cost_usd
@@ -902,29 +905,34 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_maps_known_values_and_defaults_unknown_to_none() {
+    fn reasoning_effort_maps_known_values_and_rejects_unknown_levels() {
         let toml = r#"
             [reasoning]
             enabled = true
             effort = "medium"
         "#;
         let lock = MedhaLock::parse(toml).unwrap();
-        let cfg = lock.reasoning.to_config();
+        let cfg = lock.reasoning.to_config().unwrap();
         assert_eq!(cfg.enabled, Some(true));
         assert_eq!(cfg.effort, Some(kernel::ReasoningEffort::Medium));
 
         let minimal = MedhaLock::parse("[reasoning]\neffort = \"minimal\"\n")
             .unwrap()
             .reasoning
-            .to_config();
+            .to_config()
+            .unwrap();
         assert_eq!(minimal.effort, Some(kernel::ReasoningEffort::Minimal));
 
         let toml2 = "[reasoning]\neffort = \"extreme\"\n";
-        let cfg2 = MedhaLock::parse(toml2).unwrap().reasoning.to_config();
-        assert_eq!(cfg2.effort, None);
+        assert!(MedhaLock::parse(toml2).is_err());
+        for level in kernel::ReasoningEffort::ALL {
+            let text = format!("[reasoning]\neffort = \"{}\"\n", level.as_str());
+            assert!(MedhaLock::parse(&text).is_ok(), "{text}");
+        }
+        assert!(MedhaLock::parse("[reasoning]\nenabled = false\neffort = \"high\"\n").is_err());
 
         assert_eq!(
-            MedhaLock::default().reasoning.to_config(),
+            MedhaLock::default().reasoning.to_config().unwrap(),
             kernel::ReasoningConfig::default()
         );
     }

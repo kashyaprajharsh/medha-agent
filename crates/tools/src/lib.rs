@@ -4915,47 +4915,96 @@ impl Tool for ShellExec {
                 "timeout_s must be an integer from 1 to 600".into(),
             ));
         }
-        let deadline = std::time::Duration::from_secs(timeout_s);
-        // Reserve capacity before process creation. The reservation is
-        // synchronous and RAII-owned, so rejection, spawn failure, panic, or
-        // cancellation cannot leak a slot or briefly exceed the process cap.
-        let reservation = self.tasks.reserve(&command).map_err(ToolError::Failed)?;
-        // Spawn through the sandbox's execution backend (host or OS-native jail),
-        // rooted at the workspace, as an owned task. `clear_env`
-        // + the allowlist keep injected API keys out of the child so a command
-        // can't exfiltrate them via `printenv`. The process is its own group
-        // leader, so timeout, cancellation, or `task.kill` tears down the whole
-        // tree.
-        let bg = self
-            .sbx
-            .shell_background(&command, shell_env(), true)
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let mut deadline = std::time::Duration::from_secs(timeout_s);
+        let mut invocation = self.sbx.shell_invocation(&command, shell_env(), true);
+        loop {
+            let started = std::time::Instant::now();
+            // Reserve capacity before process creation. The reservation is
+            // synchronous and RAII-owned, so rejection, spawn failure, panic, or
+            // cancellation cannot leak a slot or briefly exceed the process cap.
+            let reservation = self.tasks.reserve(&command).map_err(ToolError::Failed)?;
+            // Spawn through the sandbox's execution backend (host or OS-native jail),
+            // rooted at the workspace, as an owned task. `clear_env`
+            // + the allowlist keep injected API keys out of the child so a command
+            // can't exfiltrate them via `printenv`. The process is its own group
+            // leader, so timeout, cancellation, or `task.kill` tears down the whole
+            // tree.
+            let bg = invocation
+                .spawn_background()
+                .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-        let mut registered = reservation.attach(bg).map_err(|proc| {
-            proc.kill();
-            ToolError::Failed("shell task reservation was lost before registration".into())
-        })?;
-        // Install the Drop guard before the first await. A dropped execute future
-        // synchronously signals the registered process group before the kernel
-        // can release its mutation lease.
-        let denies_network = self.sbx.denies_network();
-        let waited = self
-            .tasks
-            .watch_until(registered.id(), deadline, denies_network)
-            .await;
-        if let ShellWait::Finished = waited {
+            let mut registered = reservation.attach(bg).map_err(|proc| {
+                proc.kill();
+                ToolError::Failed("shell task reservation was lost before registration".into())
+            })?;
+            // Install the Drop guard before the first await. A dropped execute future
+            // synchronously signals the registered process group before the kernel
+            // can release its mutation lease.
+            let denies_network = self.sbx.denies_network();
+            let waited = self
+                .tasks
+                .watch_until(registered.id(), deadline, denies_network)
+                .await;
+            if let ShellWait::Finished = waited {
+                let (task_id, entry) = registered
+                    .take()
+                    .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
+                let completed = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
+                deadline = deadline.saturating_sub(started.elapsed());
+                let output = sandbox::ExecOutput {
+                    status: completed.exit_code,
+                    stdout: completed.stdout.as_bytes().to_vec(),
+                    stderr: completed.stderr.as_bytes().to_vec(),
+                    stdout_truncated: completed.stdout_truncated,
+                    stderr_truncated: completed.stderr_truncated,
+                };
+                if !deadline.is_zero() && invocation.approve_retry(&output).await {
+                    self.tasks.remember(task_id, completed);
+                    continue;
+                }
+                let net_denied = sandbox::network_denial_signature(
+                    &completed.stdout,
+                    &completed.stderr,
+                    denies_network,
+                );
+                let sandbox_hint =
+                    network_disabled_hint(denies_network, &completed.stdout, &completed.stderr);
+                let mut result = json!({
+                    "command": command,
+                    "exit_code": completed.exit_code,
+                    "stdout": completed.stdout,
+                    "stderr": completed.stderr,
+                    "stdout_truncated": completed.stdout_truncated,
+                    "stderr_truncated": completed.stderr_truncated,
+                });
+                if let Some(hint) = sandbox_hint {
+                    result["sandbox_hint"] = Value::String(hint.to_string());
+                }
+                if net_denied {
+                    result[NET_DENIED] = Value::Bool(true);
+                }
+                self.tasks.remember(task_id, completed);
+                return Ok(result);
+            }
+
+            // Stopped early or at the deadline: transfer ownership, kill the whole
+            // tree, and wait for the child waiter to settle before returning. The
+            // durable mutation lease remains held throughout this path.
             let (task_id, entry) = registered
                 .take()
                 .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
-            let completed = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
-            let net_denied = sandbox::network_denial_signature(
-                &completed.stdout,
-                &completed.stderr,
-                denies_network,
+            entry.proc.kill();
+            entry.proc.wait().await;
+            let stalled = matches!(waited, ShellWait::NetStalled);
+            let completed = CompletedTask::capture(
+                entry,
+                if stalled {
+                    TerminalTaskStatus::NetBlocked
+                } else {
+                    TerminalTaskStatus::TimedOut
+                },
             );
-            let sandbox_hint =
-                network_disabled_hint(denies_network, &completed.stdout, &completed.stderr);
-            let mut result = json!({
+            let mut payload = json!({
                 "command": command,
                 "exit_code": completed.exit_code,
                 "stdout": completed.stdout,
@@ -4963,63 +5012,29 @@ impl Tool for ShellExec {
                 "stdout_truncated": completed.stdout_truncated,
                 "stderr_truncated": completed.stderr_truncated,
             });
-            if let Some(hint) = sandbox_hint {
-                result["sandbox_hint"] = Value::String(hint.to_string());
+            if stalled {
+                payload["error"] = json!(
+                    "stopped early: this command reported a name-resolution failure under a \
+                 network-denying sandbox and then made no further progress"
+                );
+                payload["net_blocked"] = Value::Bool(true);
+            } else {
+                payload["error"] = json!(format!(
+                    "shell command timed out after {timeout_s}s; process tree was stopped"
+                ));
+                payload["timed_out"] = Value::Bool(true);
             }
-            if net_denied {
-                result[NET_DENIED] = Value::Bool(true);
+            // A timeout under a net-denying box escalates even with no marker: when
+            // the failing stderr went into a pipe (`| tail`), the kill leaves that
+            // filter's buffer unflushed and no amount of output matching can recover
+            // it. The command has already failed here, so offering the grant costs a
+            // dismissal at worst — the wording stays honest about which case it is.
+            if stalled || denies_network {
+                payload[NET_DENIED] = Value::Bool(true);
             }
             self.tasks.remember(task_id, completed);
-            return Ok(result);
+            return Err(ToolError::Structured(payload));
         }
-
-        // Stopped early or at the deadline: transfer ownership, kill the whole
-        // tree, and wait for the child waiter to settle before returning. The
-        // durable mutation lease remains held throughout this path.
-        let (task_id, entry) = registered
-            .take()
-            .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
-        entry.proc.kill();
-        entry.proc.wait().await;
-        let stalled = matches!(waited, ShellWait::NetStalled);
-        let completed = CompletedTask::capture(
-            entry,
-            if stalled {
-                TerminalTaskStatus::NetBlocked
-            } else {
-                TerminalTaskStatus::TimedOut
-            },
-        );
-        let mut payload = json!({
-            "command": command,
-            "exit_code": completed.exit_code,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "stdout_truncated": completed.stdout_truncated,
-            "stderr_truncated": completed.stderr_truncated,
-        });
-        if stalled {
-            payload["error"] = json!(
-                "stopped early: this command reported a name-resolution failure under a \
-                 network-denying sandbox and then made no further progress"
-            );
-            payload["net_blocked"] = Value::Bool(true);
-        } else {
-            payload["error"] = json!(format!(
-                "shell command timed out after {timeout_s}s; process tree was stopped"
-            ));
-            payload["timed_out"] = Value::Bool(true);
-        }
-        // A timeout under a net-denying box escalates even with no marker: when
-        // the failing stderr went into a pipe (`| tail`), the kill leaves that
-        // filter's buffer unflushed and no amount of output matching can recover
-        // it. The command has already failed here, so offering the grant costs a
-        // dismissal at worst — the wording stays honest about which case it is.
-        if stalled || denies_network {
-            payload[NET_DENIED] = Value::Bool(true);
-        }
-        self.tasks.remember(task_id, completed);
-        Err(ToolError::Structured(payload))
     }
 
     async fn preview(&self, args: &Value) -> Option<String> {
@@ -8847,3 +8862,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
+
+#[cfg(all(test, unix))]
+mod shell_approval_tests;

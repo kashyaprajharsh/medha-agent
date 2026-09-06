@@ -836,6 +836,8 @@ fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
         token_counter: providers::openai_compat::OpenAiTokenCounter::None,
         token_accounting: kernel::TokenAccountingMode::Adaptive,
         reasoning: kernel::ReasoningSupport::Unknown,
+        reasoning_efforts: None,
+        chat_token_limit: Default::default(),
     };
     if !completed.api_key.is_empty()
         && let Err(e) = config::store_key(&completed.base_url, &completed.api_key)
@@ -1814,6 +1816,31 @@ pub(super) fn handle_key<P, L>(
 
 /// Handles inline approval input.
 pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
+    // Reviewing a long command or diff must work before options are visible.
+    match key.code {
+        KeyCode::PageUp => {
+            model.scroll_by(-(model.viewport_height.clamp(2, i32::MAX as usize) as i32 / 2));
+            return;
+        }
+        KeyCode::PageDown => {
+            model.scroll_by(model.viewport_height.clamp(2, i32::MAX as usize) as i32 / 2);
+            return;
+        }
+        KeyCode::Home => {
+            model.scroll_to_top();
+            return;
+        }
+        KeyCode::End => {
+            model.scroll_to_bottom();
+            return;
+        }
+        KeyCode::Char('d') => {
+            model.approval_expanded = !model.approval_expanded;
+            model.dirty = true;
+            return;
+        }
+        _ => {}
+    }
     // Reject selection input until the card's options are actually on screen —
     // stops a blind Enter (queued behind stream backlog) from confirming an
     // approval the user never saw.
@@ -1858,6 +1885,8 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
         // will render on the next frame and re-arm `approval_ready` then.
         model.approval_ready = false;
         model.approval_sel = 0;
+        model.approval_expanded = false;
+        model.scroll_to_bottom();
         // "Always allow" on a standard prompt remembers the action. Network
         // grants persist through the shared grant handle, never here.
         if choice == 1
@@ -2258,6 +2287,7 @@ pub(super) fn handle_agent_event(
                 });
                 if was_empty {
                     model.approval_sel = 0;
+                    model.approval_expanded = false;
                     model.approval_ready = false;
                     model.dirty = true;
                     model.scroll_to_bottom();
@@ -2279,6 +2309,7 @@ pub(super) fn handle_agent_event(
             });
             if was_empty {
                 model.approval_sel = 0;
+                model.approval_expanded = false;
                 model.approval_ready = false;
                 model.dirty = true;
                 model.scroll_to_bottom();
@@ -4682,80 +4713,115 @@ fn handle_reasoning_picker_key<P: kernel::Provider>(
     key: KeyEvent,
     provider: &P,
 ) -> bool {
-    let selected = match model.picker.as_ref() {
+    let (selected, state) = match model.picker.as_ref() {
         Some(Picker {
-            kind: PickerKind::Reasoning(_),
+            kind: PickerKind::Reasoning(state),
             selected,
-        }) => *selected,
+        }) => (*selected, state.clone()),
         _ => return false,
     };
-
-    match key.code {
-        KeyCode::Up => {
-            if let Some(picker) = model.picker.as_mut() {
-                picker.selected = picker.selected.checked_sub(1).unwrap_or(2);
-            }
-        }
-        KeyCode::Down => {
-            if let Some(picker) = model.picker.as_mut() {
-                picker.selected = (picker.selected + 1) % 3;
-            }
-        }
-        KeyCode::Enter => {
-            match selected {
-                0 => {
-                    let cfg = provider.reasoning();
-                    let enabled = cfg.enabled != Some(true);
-                    if let Err(error) = set_reasoning_checked(
-                        model,
-                        provider,
-                        kernel::ReasoningConfig {
-                            enabled: Some(enabled),
-                            effort: if enabled { cfg.effort } else { None },
-                        },
-                    ) {
-                        model.push_notice(format!("reasoning unchanged: {error}"));
-                    }
+    let count = if state.choosing_effort {
+        state.levels.len() + 1
+    } else {
+        3
+    };
+    let chosen = match key.code {
+        KeyCode::Char(c) if state.choosing_effort => c
+            .to_digit(10)
+            .map(|n| n as usize)
+            .filter(|n| *n > 0 && *n <= count)
+            .map(|n| n - 1),
+        KeyCode::Enter | KeyCode::Right => Some(selected),
+        _ => None,
+    };
+    if let Some(selected) = chosen {
+        if state.choosing_effort {
+            let level = selected
+                .checked_sub(1)
+                .and_then(|i| state.levels.get(i))
+                .map(|e| e.as_str())
+                .unwrap_or("auto");
+            let config = kernel::ReasoningConfig::from_effort_text(level)
+                .expect("picker has canonical levels");
+            match set_reasoning_checked(model, provider, config) {
+                Ok(()) => {
+                    open_reasoning_panel(model, provider);
+                    model.picker.as_mut().unwrap().selected = 2;
                 }
-                1 => {
-                    model.show_thinking = !model.show_thinking;
-                    model.invalidate_all_renders();
-                }
-                2 => {
-                    let cfg = provider.reasoning();
-                    let effort = match cfg.effort {
-                        None => Some(kernel::ReasoningEffort::Minimal),
-                        Some(kernel::ReasoningEffort::Minimal) => {
-                            Some(kernel::ReasoningEffort::Low)
-                        }
-                        Some(kernel::ReasoningEffort::Low) => Some(kernel::ReasoningEffort::Medium),
-                        Some(kernel::ReasoningEffort::Medium) => {
-                            Some(kernel::ReasoningEffort::High)
-                        }
-                        Some(kernel::ReasoningEffort::High) => None,
-                    };
-                    if let Err(error) = set_reasoning_checked(
-                        model,
-                        provider,
-                        kernel::ReasoningConfig {
-                            enabled: effort.map(|_| true),
-                            effort,
-                        },
-                    ) {
-                        model.push_notice(format!("reasoning unchanged: {error}"));
-                    }
-                }
-                _ => {}
+                Err(error) => model.push_notice(format!("reasoning unchanged: {error}")),
             }
-            let state = ReasoningPanelState::from_model(model);
+        } else if selected == 2 {
             if let Some(picker) = model.picker.as_mut() {
+                let mut state = state;
+                state.choosing_effort = true;
+                state.levels = provider.reasoning_efforts();
+                let current = if state.enabled == Some(false) {
+                    Some(kernel::ReasoningEffort::None)
+                } else {
+                    state.effort
+                };
+                picker.selected = current
+                    .and_then(|e| state.levels.iter().position(|x| *x == e))
+                    .map_or(0, |i| i + 1);
                 picker.kind = PickerKind::Reasoning(state);
             }
-            model.dirty = true;
+        } else {
+            if selected == 1 {
+                model.show_thinking = !model.show_thinking;
+                model.invalidate_all_renders();
+            } else {
+                let config = match provider.reasoning().enabled {
+                    None => crate::reasoning_on_config(provider),
+                    Some(true)
+                        if provider
+                            .reasoning_efforts()
+                            .contains(&kernel::ReasoningEffort::None) =>
+                    {
+                        kernel::ReasoningConfig {
+                            enabled: Some(false),
+                            effort: None,
+                        }
+                    }
+                    _ => kernel::ReasoningConfig::default(),
+                };
+                if let Err(error) = set_reasoning_checked(model, provider, config) {
+                    model.push_notice(format!("reasoning unchanged: {error}"));
+                }
+            }
+            open_reasoning_panel(model, provider);
+            model.picker.as_mut().unwrap().selected = selected;
         }
-        KeyCode::Esc => model.picker = None,
-        _ => {}
+    } else {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(picker) = model.picker.as_mut() {
+                    picker.selected = (selected + count - 1) % count;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(picker) = model.picker.as_mut() {
+                    picker.selected = (selected + 1) % count;
+                }
+            }
+            KeyCode::Home => {
+                if let Some(picker) = model.picker.as_mut() {
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(picker) = model.picker.as_mut() {
+                    picker.selected = count - 1;
+                }
+            }
+            KeyCode::Esc | KeyCode::Left if state.choosing_effort => {
+                open_reasoning_panel(model, provider);
+                model.picker.as_mut().unwrap().selected = 2;
+            }
+            KeyCode::Esc | KeyCode::Left => model.picker = None,
+            _ => {}
+        }
     }
+    model.dirty = true;
     true
 }
 
@@ -5530,7 +5596,7 @@ pub(super) fn run_slash<P: kernel::Provider>(
     if let Some(rest) = cmd.strip_prefix("think").filter(|r| is_cmd_boundary(r)) {
         let rest = rest.trim();
         if rest.is_empty() {
-            open_reasoning_panel(model);
+            open_reasoning_panel(model, provider);
         } else if rest == "status" {
             model.push_notice(model.reasoning_status_block());
         } else {
@@ -5541,7 +5607,7 @@ pub(super) fn run_slash<P: kernel::Provider>(
     if let Some(rest) = cmd.strip_prefix("effort").filter(|r| is_cmd_boundary(r)) {
         let rest = rest.trim();
         if rest.is_empty() {
-            open_reasoning_panel(model);
+            open_reasoning_panel(model, provider);
         } else {
             apply_reasoning_command(model, provider, &format!("effort {rest}"));
         }
@@ -5717,8 +5783,9 @@ fn set_theme(model: &mut Model, id: &str) {
     }
 }
 
-fn open_reasoning_panel(model: &mut Model) {
-    let state = ReasoningPanelState::from_model(model);
+fn open_reasoning_panel<P: kernel::Provider>(model: &mut Model, provider: &P) {
+    let mut state = ReasoningPanelState::from_model(model);
+    state.levels = provider.reasoning_efforts();
     model.picker = Some(Picker::new(PickerKind::Reasoning(state)));
 }
 
@@ -5746,21 +5813,11 @@ fn apply_stream_command<P: kernel::Provider>(model: &mut Model, provider: &P, ar
 fn apply_reasoning_command<P: kernel::Provider>(model: &mut Model, provider: &P, args: &str) {
     let result = match args {
         "" => {
-            open_reasoning_panel(model);
+            open_reasoning_panel(model, provider);
             return;
         }
         "status" => Ok(()),
-        "on" => {
-            let effort = provider.reasoning().effort;
-            set_reasoning_checked(
-                model,
-                provider,
-                kernel::ReasoningConfig {
-                    enabled: Some(true),
-                    effort,
-                },
-            )
-        }
+        "on" => set_reasoning_checked(model, provider, crate::reasoning_on_config(provider)),
         "off" => set_reasoning_checked(
             model,
             provider,
@@ -5774,34 +5831,12 @@ fn apply_reasoning_command<P: kernel::Provider>(model: &mut Model, provider: &P,
             model.invalidate_all_renders();
             Ok(())
         }
-        "effort auto" => set_reasoning_checked(
-            model,
-            provider,
-            kernel::ReasoningConfig {
-                enabled: None,
-                effort: None,
-            },
-        ),
-        "effort minimal" | "effort low" | "effort medium" | "effort high" => {
-            let effort = match args.strip_prefix("effort ").unwrap_or("") {
-                "minimal" => kernel::ReasoningEffort::Minimal,
-                "low" => kernel::ReasoningEffort::Low,
-                "medium" => kernel::ReasoningEffort::Medium,
-                _ => kernel::ReasoningEffort::High,
-            };
-            set_reasoning_checked(
-                model,
-                provider,
-                kernel::ReasoningConfig {
-                    enabled: Some(true),
-                    effort: Some(effort),
-                },
-            )
-        }
-        _ => Err(
-            "usage: /reasoning [on|off|show|hide|status|effort auto|minimal|low|medium|high]"
-                .to_string(),
-        ),
+        "auto" | "default" => set_reasoning_checked(model, provider, kernel::ReasoningConfig::default()),
+        _ if args.starts_with("effort ") => match kernel::ReasoningConfig::from_effort_text(args.trim_start_matches("effort ")) {
+            Ok(config) => set_reasoning_checked(model, provider, config),
+            Err(error) => Err(error),
+        },
+        _ => Err("usage: /reasoning [on|off|auto|show|hide|status|effort LEVEL]; levels: auto, none, minimal, low, medium, high, xhigh, max, ultra (model support varies)".into()),
     };
 
     match result {
@@ -6095,18 +6130,179 @@ mod fix_tests {
     }
 
     #[test]
+    fn reasoning_picker_applies_xhigh_and_resets_to_auto() {
+        let provider = providers::OpenAiCompat::new("http://localhost/v1", "", "m");
+        let mut m = model();
+        open_reasoning_panel(&mut m, &provider);
+        m.picker.as_mut().unwrap().selected = 2;
+        handle_reasoning_picker_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &provider,
+        );
+        let labels = m.picker.as_ref().unwrap().kind.labels();
+        assert!(labels.iter().any(|label| label.contains("xhigh")));
+        assert!(
+            !labels.iter().any(|label| label.contains("ultra")),
+            "undeclared ultra must not be offered"
+        );
+        handle_reasoning_picker_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+            &provider,
+        );
+        assert_eq!(
+            provider.reasoning().effort,
+            Some(kernel::ReasoningEffort::XHigh)
+        );
+        assert_eq!(m.reasoning, provider.reasoning());
+        handle_reasoning_picker_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &provider,
+        );
+        handle_reasoning_picker_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            &provider,
+        );
+        assert_eq!(provider.reasoning(), kernel::ReasoningConfig::default());
+    }
+
+    #[test]
+    fn startup_approval_is_visible_and_readable_across_terminal_sizes() {
+        use ratatui::{Terminal, backend::TestBackend};
+        for (width, height) in [(32, 12), (80, 24), (120, 36)] {
+            let mut m = model();
+            m.model = "a-provider-model-name-that-is-longer-than-a-small-terminal".into();
+            let (responder, _rx) = oneshot::channel();
+            m.pending_approvals.push_back(PendingApproval {
+                action: "Read access to /project/docs".into(),
+                detail: Some("Allow this folder so the command can continue.".into()),
+                escalated: false,
+                cancel: None,
+                responder: ApprovalResponder::Standard(responder),
+            });
+            m.dirty = true;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| view(f, &mut m)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..height)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let rendered = rows.join("\n");
+            assert!(
+                rendered.contains("Approval needed")
+                    || rendered.contains("waiting for your approval"),
+                "{width}x{height}: {rendered}"
+            );
+            assert!(m.approval_ready, "startup approval was hidden");
+            if let Ok(directory) = std::env::var("MEDHA_TEST_RENDER_DIR") {
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(
+                    std::path::Path::new(&directory).join(format!("approval-{width}x{height}.txt")),
+                    rendered,
+                )
+                .unwrap();
+            }
+            m.pending_approvals.clear();
+            m.model = "example-model".into();
+            let provider = providers::OpenAiCompat::new("http://localhost/v1", "", "example-model");
+            open_reasoning_panel(&mut m, &provider);
+            m.picker.as_mut().unwrap().selected = 2;
+            handle_reasoning_picker_key(
+                &mut m,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &provider,
+            );
+            m.picker.as_mut().unwrap().selected = 6;
+            terminal.draw(|f| view(f, &mut m)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rendered = (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains("xhigh"), "{width}x{height}: {rendered}");
+            if let Ok(directory) = std::env::var("MEDHA_TEST_RENDER_DIR") {
+                std::fs::write(
+                    std::path::Path::new(&directory)
+                        .join(format!("reasoning-{width}x{height}.txt")),
+                    rendered,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn approval_review_can_scroll_expand_and_return_without_answering() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut m = model();
+        let (responder, mut rx) = oneshot::channel();
+        m.pending_approvals.push_back(PendingApproval {
+            action: "shell.exec".into(),
+            detail: Some((0..40).map(|i| format!("command evidence {i}\n")).collect()),
+            escalated: false,
+            cancel: None,
+            responder: ApprovalResponder::Standard(responder),
+        });
+        m.viewport_height = 16;
+        m.dirty = true;
+        let mut terminal = Terminal::new(TestBackend::new(72, 16)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_transcript(f, &mut m, area);
+            })
+            .unwrap();
+        assert!(m.approval_ready);
+        handle_approval_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        handle_approval_key(&mut m, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_transcript(f, &mut m, area);
+            })
+            .unwrap();
+        assert!(!m.auto_scroll);
+        assert!(!m.approval_ready);
+        assert!(m.approval_expanded);
+        handle_approval_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            rx.try_recv().is_err(),
+            "reviewing evidence must not approve off-screen"
+        );
+        handle_approval_key(&mut m, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_transcript(f, &mut m, area);
+            })
+            .unwrap();
+        assert!(m.approval_ready);
+        handle_approval_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        );
+        assert_eq!(rx.try_recv().unwrap(), kernel::Approval::Once);
+    }
+
+    #[test]
     fn unified_reasoning_command_controls_every_setting() {
         let provider = providers::OpenAiCompat::new("http://localhost/v1", "", "m");
         let mut m = model();
         let transcript = vec![Message::system("S")];
 
         run_slash(&mut m, "reasoning on", &transcript, &provider);
-        assert_eq!(m.reasoning.enabled, None);
-        assert_eq!(m.reasoning.effort, None);
-        assert!(matches!(
-            m.items.back().map(|entry| &entry.item),
-            Some(Item::Notice(message)) if message.contains("explicit effort")
-        ));
+        assert_eq!(m.reasoning.enabled, Some(true));
+        assert_eq!(m.reasoning.effort, Some(kernel::ReasoningEffort::Medium));
 
         run_slash(&mut m, "reasoning show", &transcript, &provider);
         assert!(m.show_thinking);

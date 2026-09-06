@@ -93,12 +93,23 @@ fn generation_config(
             "gemini-interactions v1 has no portable thinking-disable control".into(),
         ));
     }
-    let thinking_level = reasoning.effort.map(|effort| match effort {
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-    });
+    let thinking_level = reasoning
+        .effort
+        .map(|effort| {
+            Ok(match effort {
+                ReasoningEffort::Minimal => "minimal",
+                ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                ReasoningEffort::High => "high",
+                other => {
+                    return Err(ProviderError::Decode(format!(
+                        "gemini-interactions does not support reasoning effort '{}'",
+                        other.as_str()
+                    )));
+                }
+            })
+        })
+        .transpose()?;
     let thinking_summaries =
         (reasoning.enabled == Some(true) || thinking_level.is_some()).then_some("auto");
     if max_output_tokens.is_none() && thinking_level.is_none() && thinking_summaries.is_none() {

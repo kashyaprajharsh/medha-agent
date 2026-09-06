@@ -1597,6 +1597,100 @@ fn add_request_grant(
     }
 }
 
+/// Invocation-local admission shared by fixed-program and owned shell runners.
+/// Call `approve_retry` only after the previous process has fully settled.
+pub struct ExecInvocation<'a> {
+    sandbox: &'a WorkspaceSandbox,
+    request: ExecRequest,
+    prompted: Vec<(PathBuf, permissions::PermissionType)>,
+}
+
+impl<'a> ExecInvocation<'a> {
+    fn new(sandbox: &'a WorkspaceSandbox, request: ExecRequest) -> Self {
+        Self {
+            sandbox,
+            request,
+            prompted: Vec::new(),
+        }
+    }
+
+    pub fn spawn_background(&self) -> Result<crate::exec::BgProc, ExecError> {
+        let watch_network = self.sandbox.exec.denies_network(&self.request);
+        let cmd = self.sandbox.exec.build_command(&self.request)?;
+        crate::exec::spawn_background(cmd, watch_network)
+    }
+
+    /// Ask for the minimum missing path capability supported by a native-jail
+    /// denial. Host/container failures cannot be repaired by local path grants.
+    pub async fn approve_retry(&mut self, output: &ExecOutput) -> bool {
+        if output.status == Some(0)
+            || self.sandbox.exec.label() != "native"
+            || self.prompted.len() >= MAX_EXEC_ESCALATION_PROMPTS
+        {
+            return false;
+        }
+        let approved = self.sandbox.permission_manager.approved_roots();
+        // Discover candidates against both capabilities. A root already
+        // approved for Read must still be visible here if the read-only
+        // retry proves that this unknown command genuinely needs Write.
+        let mut candidates = exec::escalation_candidates(
+            output,
+            &self.sandbox.root,
+            &approved,
+            permissions::PermissionType::Read,
+        );
+        for candidate in exec::escalation_candidates(
+            output,
+            &self.sandbox.root,
+            &approved,
+            permissions::PermissionType::Write,
+        ) {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        let next = candidates.into_iter().find_map(|candidate| {
+            let intent = exec_denial_intent(&self.request, &candidate);
+            let permissions: &[permissions::PermissionType] = match intent {
+                ExecIntent::ReadOnly => &[permissions::PermissionType::Read],
+                ExecIntent::Write => &[permissions::PermissionType::Write],
+                ExecIntent::Unknown => &[
+                    permissions::PermissionType::Read,
+                    permissions::PermissionType::Write,
+                ],
+            };
+            permissions.iter().copied().find_map(|permission| {
+                let key = (candidate.clone(), permission);
+                (!self.prompted.contains(&key) && !approved.is_allowed(&candidate, permission))
+                    .then_some(key)
+            })
+        });
+        let Some((candidate, permission)) = next else {
+            return false;
+        };
+        self.prompted.push((candidate.clone(), permission));
+        let shown = match self.request.args.as_slice() {
+            [flag, command] if flag == "-c" => command.clone(),
+            _ => format!("{} {}", self.request.program, self.request.args.join(" ")),
+        };
+        let detail =
+            format!("Allow access to the displayed path and retry this command:\n  {shown}");
+        let Ok(resolved) = self
+            .sandbox
+            .permission_manager
+            .request_permission_with_detail(&candidate, permission, Some(&detail))
+            .await
+        else {
+            return false;
+        };
+        let once = !approved.is_allowed(&resolved, permission);
+        if once {
+            add_request_grant(&mut self.request, resolved, permission);
+        }
+        true
+    }
+}
+
 impl WorkspaceSandbox {
     /// Create a new sandbox with permission management. `trust_path` must be a
     /// machine-local file outside the workspace — repository files such as
@@ -1842,82 +1936,39 @@ impl WorkspaceSandbox {
             read_roots: Vec::new(),
             write_roots: Vec::new(),
         };
-        let mut admitted = req.clone();
-        let mut output = self.exec.run(admitted.clone()).await?;
-        if self.exec.label() != "native" {
-            // Host/container/ssh denials are real permission errors, not jail
-            // policy — an approval card could not change them.
-            return Ok(output);
-        }
-        let approved = self.permission_manager.approved_roots();
-        let mut prompted: Vec<(PathBuf, permissions::PermissionType)> = Vec::new();
-        while output.status != Some(0) && prompted.len() < MAX_EXEC_ESCALATION_PROMPTS {
-            // Discover candidates against both capabilities. A root already
-            // approved for Read must still be visible here if the read-only
-            // retry proves that this unknown command genuinely needs Write.
-            let mut candidates = exec::escalation_candidates(
-                &output,
-                &self.root,
-                &approved,
-                permissions::PermissionType::Read,
-            );
-            for candidate in exec::escalation_candidates(
-                &output,
-                &self.root,
-                &approved,
-                permissions::PermissionType::Write,
-            ) {
-                if !candidates.contains(&candidate) {
-                    candidates.push(candidate);
-                }
-            }
-            let next = candidates.into_iter().find_map(|candidate| {
-                let intent = exec_denial_intent(&req, &candidate);
-                let permissions: &[permissions::PermissionType] = match intent {
-                    ExecIntent::ReadOnly => &[permissions::PermissionType::Read],
-                    ExecIntent::Write => &[permissions::PermissionType::Write],
-                    ExecIntent::Unknown => &[
-                        permissions::PermissionType::Read,
-                        permissions::PermissionType::Write,
-                    ],
-                };
-                permissions.iter().copied().find_map(|permission| {
-                    let key = (candidate.clone(), permission);
-                    (!prompted.contains(&key) && !approved.is_allowed(&candidate, permission))
-                        .then_some(key)
-                })
-            });
-            let Some((candidate, permission)) = next else {
-                break;
-            };
-            prompted.push((candidate.clone(), permission));
-            let shown = match req.args.as_slice() {
-                [flag, command] if flag == "-c" => command.clone(),
-                _ => format!("{} {}", req.program, req.args.join(" ")),
-            };
-            let detail = format!(
-                "The OS sandbox blocked this command on a path outside the workspace:\n  {shown}"
-            );
-            let Ok(resolved) = self
-                .permission_manager
-                .request_permission_with_detail(&candidate, permission, Some(&detail))
-                .await
-            else {
-                break;
-            };
-            let once = !approved.is_allowed(&resolved, permission);
-            if once {
-                add_request_grant(&mut admitted, resolved, permission);
-            }
-            output = self.exec.run(admitted.clone()).await?;
+        let mut invocation = ExecInvocation::new(self, req);
+        let mut output = self.exec.run(invocation.request.clone()).await?;
+        while invocation.approve_retry(&output).await {
+            output = self.exec.run(invocation.request.clone()).await?;
         }
         Ok(output)
     }
 
-    /// Spawn an owned command task through the active backend (same jail as
-    /// [`exec`]). Returns immediately with a [`BgProc`] handle whose output
-    /// streams into a rolling buffer. Callers must install cancellation cleanup
-    /// before awaiting.
+    /// Create one shell invocation. Extra path grants belong only to this
+    /// invocation and survive its approved retries, never another command.
+    pub fn shell_invocation(
+        &self,
+        command: &str,
+        env: Vec<(String, String)>,
+        clear_env: bool,
+    ) -> ExecInvocation<'_> {
+        let (program, args) = crate::exec::shell_argv(self.backend_label(), command);
+        ExecInvocation::new(
+            self,
+            ExecRequest {
+                program,
+                args,
+                cwd: self.root.clone(),
+                env,
+                clear_env,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+            },
+        )
+    }
+
+    /// Spawn an owned task without detaching it. For filesystem approval and
+    /// retry, retain a shell invocation and use its `approve_retry` method.
     pub fn exec_background(
         &self,
         program: &str,
@@ -1925,19 +1976,19 @@ impl WorkspaceSandbox {
         env: Vec<(String, String)>,
         clear_env: bool,
     ) -> Result<crate::exec::BgProc, ExecError> {
-        let request = ExecRequest {
-            program: program.to_string(),
-            args: args.to_vec(),
-            cwd: self.root.clone(),
-            env,
-            clear_env,
-            read_roots: Vec::new(),
-            write_roots: Vec::new(),
-        };
-        // Arm live resolver-failure detection only where a grant is on offer.
-        let watch_network = self.exec.denies_network(&request);
-        let cmd = self.exec.build_command(&request)?;
-        crate::exec::spawn_background(cmd, watch_network)
+        ExecInvocation::new(
+            self,
+            ExecRequest {
+                program: program.into(),
+                args: args.to_vec(),
+                cwd: self.root.clone(),
+                env,
+                clear_env,
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+            },
+        )
+        .spawn_background()
     }
 
     pub fn root(&self) -> &Path {
@@ -1954,8 +2005,8 @@ impl WorkspaceSandbox {
         env: Vec<(String, String)>,
         clear_env: bool,
     ) -> Result<crate::exec::BgProc, ExecError> {
-        let (program, args) = crate::exec::shell_argv(self.backend_label(), command);
-        self.exec_background(&program, &args, env, clear_env)
+        self.shell_invocation(command, env, clear_env)
+            .spawn_background()
     }
 
     pub fn permission_manager(&self) -> Arc<PermissionManager> {
@@ -2034,7 +2085,14 @@ impl WorkspaceSandbox {
             }
             // Resolve symlinks and re-check under the canonical root: a textual
             // prefix check alone lets an in-workspace symlink escape the jail.
-            self.canonicalize_within_root(&out, &path.display().to_string())
+            match self.canonicalize_within_root(&out, &path.display().to_string()) {
+                Err(SandboxError::Escape(_)) => {
+                    // A linked folder may be outside the workspace but already
+                    // approved. Resolve and gate its canonical target normally.
+                    Ok(self.permission_manager.request_read(&out).await?)
+                }
+                result => result,
+            }
         } else {
             Ok(self
                 .permission_manager
@@ -2071,7 +2129,14 @@ impl WorkspaceSandbox {
             }
             // Resolve symlinks and re-check under the canonical root (see
             // `canonicalize_within_root`): handles new files under the jail too.
-            self.canonicalize_within_root(&out, &path.display().to_string())
+            match self.canonicalize_within_root(&out, &path.display().to_string()) {
+                Err(SandboxError::Escape(_)) => {
+                    // A linked folder may be outside the workspace but already
+                    // approved. Resolve and gate its canonical target normally.
+                    Ok(self.permission_manager.request_write(&out).await?)
+                }
+                result => result,
+            }
         } else {
             Ok(self
                 .permission_manager
@@ -2093,20 +2158,8 @@ impl WorkspaceSandbox {
     /// permission dialog in front of a user who has not yet been told what the
     /// operation is — and would then be asked again when it runs.
     pub async fn resolve_if_permitted(&self, path: &str) -> Option<PathBuf> {
-        let p = Path::new(path);
-        let simple_relative = p.is_relative()
-            && !p.components().any(|c| {
-                matches!(
-                    c,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            });
-        if simple_relative {
-            // Stays inside the jail, so this never reaches the human gate.
-            return self.resolve(path).await.ok();
-        }
         self.permission_manager
-            .resolve_if_permitted(p, permissions::PermissionType::Read)
+            .resolve_if_permitted(Path::new(path), permissions::PermissionType::Read)
     }
 
     /// Read a file only if it is already permitted, never prompting.
@@ -3655,7 +3708,7 @@ mod tests {
         // Reading an existing file through the symlink is refused as an escape.
         let read = sbx.resolve("escape/secret.txt").await;
         assert!(
-            matches!(read, Err(SandboxError::Escape(_))),
+            matches!(read, Err(SandboxError::Permission(_))),
             "symlink read escape not blocked: {read:?}"
         );
 
@@ -3663,9 +3716,30 @@ mod tests {
         // ancestor resolves outside root).
         let write = sbx.resolve_for_write("escape/planted.txt").await;
         assert!(
-            matches!(write, Err(SandboxError::Escape(_))),
+            matches!(write, Err(SandboxError::Permission(_))),
             "symlink write escape not blocked: {write:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_symlink_target_is_accessible_without_granting_writes() {
+        let base =
+            std::env::temp_dir().join(format!("medha-sbx-approved-link-{}", ulid::Ulid::new()));
+        let root = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("data.txt"), "linked content").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        let sbx = WorkspaceSandbox::new_jailed(&root)
+            .unwrap()
+            .with_readable_roots(std::slice::from_ref(&outside));
+        assert_eq!(sbx.read("linked/data.txt").await.unwrap(), "linked content");
+        assert!(sbx.resolve_if_permitted("linked/data.txt").await.is_some());
+        assert!(sbx.write("linked/new.txt", "denied").await.is_err());
+        assert!(!outside.join("new.txt").exists());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// Creating a brand-new file under not-yet-existing nested dirs must still

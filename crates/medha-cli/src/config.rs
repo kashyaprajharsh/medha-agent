@@ -833,6 +833,8 @@ fn resolve_inner(
         token_counter,
         token_accounting,
         reasoning,
+        reasoning_efforts: configured.and_then(|p| p.reasoning_efforts.clone()),
+        chat_token_limit: configured.map(|p| p.chat_token_limit).unwrap_or_default(),
     };
     provider.validate().map_err(anyhow::Error::msg)?;
     if provider.auth.requires_credential() && api_key.is_empty() {
@@ -1918,6 +1920,8 @@ mod tests {
             token_counter: providers::openai_compat::OpenAiTokenCounter::None,
             token_accounting: kernel::TokenAccountingMode::Adaptive,
             reasoning: kernel::ReasoningSupport::Unknown,
+            reasoning_efforts: None,
+            chat_token_limit: Default::default(),
         }
     }
 

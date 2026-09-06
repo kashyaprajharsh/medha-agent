@@ -350,6 +350,7 @@ pub(crate) fn vllm_tokenize_body(request: &PreparedModelRequest) -> serde_json::
         object.remove("stream");
         object.remove("stream_options");
         object.remove("max_tokens");
+        object.remove("max_completion_tokens");
         object.remove("reasoning_effort");
         object.insert("add_generation_prompt".into(), serde_json::json!(true));
     }

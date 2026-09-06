@@ -53,6 +53,24 @@ fn validate_reasoning(
             "reasoning controls are disabled by this model profile".into(),
         ));
     }
+    let effort = if config.enabled == Some(false) {
+        Some(ReasoningEffort::None)
+    } else {
+        config.effort
+    };
+    if let Some(effort) = effort
+        && !profile_reasoning_efforts(profile).contains(&effort)
+    {
+        return Err(ProviderError::Decode(format!(
+            "reasoning effort '{}' is not supported by this protocol/model profile; available: {}",
+            effort.as_str(),
+            profile_reasoning_efforts(profile)
+                .iter()
+                .map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     match profile.protocol {
         Protocol::OpenAiChat => {
             // Compatible servers use `reasoning_effort: "none"` to disable.
@@ -75,6 +93,31 @@ fn validate_reasoning(
     Ok(())
 }
 
+fn profile_reasoning_efforts(profile: &ProviderProfile) -> Vec<ReasoningEffort> {
+    if profile.reasoning == ReasoningSupport::Unsupported {
+        return Vec::new();
+    }
+    let levels = profile
+        .reasoning_efforts
+        .as_deref()
+        .unwrap_or(ReasoningEffort::ALL);
+    levels
+        .iter()
+        .copied()
+        .filter(|effort| profile.reasoning_efforts.is_some() || *effort != ReasoningEffort::Ultra)
+        .filter(|effort| {
+            profile.protocol != Protocol::GeminiInteractions
+                || matches!(
+                    effort,
+                    ReasoningEffort::Minimal
+                        | ReasoningEffort::Low
+                        | ReasoningEffort::Medium
+                        | ReasoningEffort::High
+                )
+        })
+        .collect()
+}
+
 /// Neutralize a carried reasoning setting that the target profile can't accept,
 /// so a model switch never hard-fails on a protocol/support mismatch. Returns
 /// the default ("untouched" — let the server decide) in those cases; otherwise
@@ -83,19 +126,10 @@ fn reconcile_reasoning_for_switch(
     profile: &ProviderProfile,
     config: ReasoningConfig,
 ) -> ReasoningConfig {
-    if config == ReasoningConfig::default() {
-        return config;
-    }
-    match profile.protocol {
-        // open-ai-chat can't enable reasoning without a concrete effort; a
-        // carried "on, no effort" (valid on Gemini) becomes server-default here.
-        Protocol::OpenAiChat if config.enabled == Some(true) && config.effort.is_none() => {
-            ReasoningConfig::default()
-        }
-        // gemini-interactions has no portable disable; a carried "off" becomes
-        // server-default rather than blocking the switch.
-        Protocol::GeminiInteractions if config.enabled == Some(false) => ReasoningConfig::default(),
-        _ => config,
+    if validate_reasoning(profile, &config).is_err() {
+        ReasoningConfig::default()
+    } else {
+        config
     }
 }
 
@@ -331,15 +365,7 @@ impl ProviderClient {
         if cfg.enabled == Some(false) {
             return Some("none"); // explicit disable for compatible servers
         }
-        cfg.effort.map(|effort| match effort {
-            // Preserve the user's exact canonical level. Current compatible
-            // servers may support `minimal`; silently raising it to `low`
-            // changes cost/latency and can violate a model's contract.
-            ReasoningEffort::Minimal => "minimal",
-            ReasoningEffort::Low => "low",
-            ReasoningEffort::Medium => "medium",
-            ReasoningEffort::High => "high",
-        })
+        cfg.effort.map(ReasoningEffort::as_str)
     }
 
     async fn stream_gemini_prepared(
@@ -807,6 +833,10 @@ impl Provider for ProviderClient {
         self.connection.lock().unwrap().profile.reasoning
     }
 
+    fn reasoning_efforts(&self) -> Vec<ReasoningEffort> {
+        profile_reasoning_efforts(&self.connection.lock().unwrap().profile)
+    }
+
     fn set_reasoning(&self, config: ReasoningConfig) -> Result<(), ProviderError> {
         let connection = self.connection.lock().unwrap().clone();
         validate_reasoning(&connection.profile, &config)?;
@@ -839,13 +869,21 @@ impl Provider for ProviderClient {
         };
         let streaming = self.streaming();
         let body = match connection.profile.protocol {
-            Protocol::OpenAiChat => openai_chat::prepare_body(
-                ctx,
-                &model,
-                streaming,
-                self.reasoning_effort_value(),
-                connection.profile.max_output_tokens,
-            )?,
+            Protocol::OpenAiChat => {
+                let mut body = openai_chat::prepare_body(
+                    ctx,
+                    &model,
+                    streaming,
+                    self.reasoning_effort_value(),
+                    connection.profile.max_output_tokens,
+                )?;
+                if connection.profile.chat_token_limit_field() == "max_completion_tokens"
+                    && let Some(cap) = body.as_object_mut().and_then(|o| o.remove("max_tokens"))
+                {
+                    body["max_completion_tokens"] = cap;
+                }
+                body
+            }
             Protocol::GeminiInteractions => {
                 gemini_interactions::prepare_body(
                     ctx,
@@ -893,7 +931,18 @@ impl Provider for ProviderClient {
         })?;
         match request.protocol {
             Protocol::OpenAiChat => {
-                object.insert("max_tokens".into(), serde_json::json!(max_output_tokens));
+                let field = if object.contains_key("max_completion_tokens") {
+                    "max_completion_tokens"
+                } else if object.contains_key("max_tokens") {
+                    "max_tokens"
+                } else {
+                    self.connection
+                        .lock()
+                        .unwrap()
+                        .profile
+                        .chat_token_limit_field()
+                };
+                object.insert(field.into(), serde_json::json!(max_output_tokens));
             }
             Protocol::GeminiInteractions => {
                 let generation_config = object
@@ -2154,7 +2203,7 @@ mod reasoning_request_tests {
     }
 
     #[test]
-    fn profile_switch_rejects_carrying_effort_into_an_unsupported_model() {
+    fn profile_switch_resets_carried_effort_for_an_unsupported_model() {
         let provider = OpenAiCompat::new("http://one", "", "model")
             .with_reasoning(ReasoningConfig {
                 enabled: Some(true),
@@ -2164,8 +2213,9 @@ mod reasoning_request_tests {
         let mut next = ProviderProfile::openai_chat("http://two", "other-model", AuthKind::None);
         next.reasoning = ReasoningSupport::Unsupported;
 
-        assert!(provider.switch_provider_profile(next, "").is_err());
-        assert_eq!(provider.active_model(), "model");
+        provider.switch_provider_profile(next, "").unwrap();
+        assert_eq!(provider.active_model(), "other-model");
+        assert_eq!(provider.reasoning(), ReasoningConfig::default());
     }
 
     #[test]
@@ -2207,6 +2257,90 @@ mod reasoning_request_tests {
         let connection = provider.connection.lock().unwrap();
         assert!(connection.profile.base_url.is_empty());
         assert!(connection.profile.model.is_empty());
+    }
+
+    #[test]
+    fn every_declared_effort_reaches_the_wire_without_substitution() {
+        let mut profile =
+            ProviderProfile::openai_chat("http://example.test/v1", "custom", AuthKind::None);
+        profile.reasoning_efforts = Some(ReasoningEffort::ALL.to_vec());
+        let provider = ProviderClient::from_profile(profile, "").unwrap();
+        let context = CompiledContext {
+            model: String::new(),
+            messages: vec![kernel::Message::user("hi")],
+            ordered: None,
+            tools: Vec::new(),
+        };
+        for effort in ReasoningEffort::ALL {
+            provider
+                .set_reasoning(ReasoningConfig::from_effort_text(effort.as_str()).unwrap())
+                .unwrap();
+            let body = provider.prepare_request(&context).unwrap().body;
+            assert_eq!(body["reasoning_effort"], effort.as_str());
+        }
+        provider
+            .set_reasoning(ReasoningConfig::from_effort_text("auto").unwrap())
+            .unwrap();
+        assert!(
+            provider
+                .prepare_request(&context)
+                .unwrap()
+                .body
+                .get("reasoning_effort")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn model_and_protocol_effort_restrictions_fail_before_sending() {
+        let mut profile =
+            ProviderProfile::openai_chat("http://example.test/v1", "custom", AuthKind::None);
+        profile.reasoning_efforts = Some(vec![ReasoningEffort::Low, ReasoningEffort::High]);
+        let provider = ProviderClient::from_profile(profile, "").unwrap();
+        provider
+            .set_reasoning(ReasoningConfig::from_effort_text("high").unwrap())
+            .unwrap();
+        assert!(
+            provider
+                .set_reasoning(ReasoningConfig::from_effort_text("xhigh").unwrap())
+                .is_err()
+        );
+        assert_eq!(provider.reasoning().effort, Some(ReasoningEffort::High));
+        let mut gemini =
+            ProviderProfile::openai_chat("http://example.test/v1", "gemini", AuthKind::None);
+        gemini.protocol = Protocol::GeminiInteractions;
+        provider.switch_provider_profile(gemini, "").unwrap();
+        for effort in ["xhigh", "max", "ultra", "none"] {
+            assert!(
+                provider
+                    .set_reasoning(ReasoningConfig::from_effort_text(effort).unwrap())
+                    .is_err()
+            );
+        }
+        assert_eq!(provider.reasoning().effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn openai_output_caps_use_modern_field_and_survive_correction() {
+        let mut profile =
+            ProviderProfile::openai_chat("https://api.openai.com/v1", "o3", AuthKind::Bearer);
+        profile.max_output_tokens = Some(4096);
+        let provider = ProviderClient::from_profile(profile, "test").unwrap();
+        let request = provider
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: vec![kernel::Message::user("hi")],
+                ordered: None,
+                tools: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(request.body["max_completion_tokens"], 4096);
+        assert!(request.body.get("max_tokens").is_none());
+        let corrected = provider.with_output_limit(&request, 2048).unwrap().unwrap();
+        assert_eq!(corrected.body["max_completion_tokens"], 2048);
+        assert!(corrected.body.get("max_tokens").is_none());
+        let count = openai_chat::vllm_tokenize_body(&corrected);
+        assert!(count.get("max_completion_tokens").is_none());
     }
 
     #[test]

@@ -518,8 +518,15 @@ pub(super) fn open_mode_picker(model: &mut Model) {
 /// Set the session autonomy dial live and confirm with a level-appropriate notice
 /// (yolo gets a warning glyph — autonomous mode is never silent).
 fn set_autonomy(model: &mut Model, level: kernel::AutonomyLevel) {
+    if model.foreground_owned() || model.has_active_agents() || model.bg_running() > 0 {
+        model.push_notice(
+            "finish or stop active turns, agents, and shell tasks before changing mode",
+        );
+        return;
+    }
     model.autonomy = level;
     let note = match level {
+        kernel::AutonomyLevel::Plan => "✔ mode: plan — read-only investigation; /mode careful to implement".to_string(),
         kernel::AutonomyLevel::Careful => {
             "✔ mode: careful — edits and shell ask for approval".to_string()
         }
@@ -2378,6 +2385,9 @@ pub(super) fn handle_agent_event(
                     // the transcript above is the consistent, resumable truth.
                     model.push_main_notice("⏹ stopped — in-flight work settled");
                 }
+                StopReason::VerificationFailed => {
+                    model.push_main_notice("✗ completion blocked — required verification failed; review the check output and continue to fix it");
+                }
                 StopReason::Finished => {}
             }
         }
@@ -2947,6 +2957,7 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "model add" => SlashAction::AddModel,
         "search" => SlashAction::SearchConfig,
         "mode" => SlashAction::ModePicker,
+        "plan" => SlashAction::SwitchMode("plan".into()),
         c if c.starts_with("mode ") => {
             SlashAction::SwitchMode(c.strip_prefix("mode ").unwrap_or("").trim().to_string())
         }
@@ -3054,9 +3065,10 @@ fn dispatch_slash<P, L>(
         SlashAction::AddModel => begin_model_setup(model),
         SlashAction::SearchConfig => begin_search_setup(model),
         SlashAction::ModePicker => open_mode_picker(model),
-        SlashAction::SwitchMode(level) => {
-            set_autonomy(model, kernel::AutonomyLevel::from_id(&level))
-        }
+        SlashAction::SwitchMode(level) => match kernel::AutonomyLevel::parse(&level) {
+            Ok(level) => set_autonomy(model, level),
+            Err(error) => model.push_notice(error),
+        },
         SlashAction::SwitchModel(name) => {
             switch_saved_model(model, kernel.provider.as_ref(), &name)
         }
@@ -6127,6 +6139,34 @@ mod fix_tests {
         assert!(is_cmd_boundary("")); // /think
         assert!(is_cmd_boundary(" high")); // /think high
         assert!(!is_cmd_boundary("ing")); // /thinking → must fall through
+    }
+
+    #[test]
+    fn plan_mode_is_discoverable_and_cannot_change_during_owned_work() {
+        let mut m = model();
+        assert!(matches!(classify_slash("plan"), SlashAction::SwitchMode(mode) if mode == "plan"));
+        open_mode_picker(&mut m);
+        assert!(
+            m.picker
+                .as_ref()
+                .unwrap()
+                .kind
+                .labels()
+                .iter()
+                .any(|label| label.contains("read-only"))
+        );
+        m.running = true;
+        set_autonomy(&mut m, kernel::AutonomyLevel::Plan);
+        assert_eq!(m.autonomy, kernel::AutonomyLevel::Careful);
+        m.running = false;
+        m.pending_agent_launches = 1;
+        set_autonomy(&mut m, kernel::AutonomyLevel::Plan);
+        assert_eq!(m.autonomy, kernel::AutonomyLevel::Careful);
+        m.pending_agent_launches = 0;
+        set_autonomy(&mut m, kernel::AutonomyLevel::Plan);
+        assert_eq!(m.autonomy, kernel::AutonomyLevel::Plan);
+        set_autonomy(&mut m, kernel::AutonomyLevel::Normal);
+        assert_eq!(m.autonomy, kernel::AutonomyLevel::Normal);
     }
 
     #[test]

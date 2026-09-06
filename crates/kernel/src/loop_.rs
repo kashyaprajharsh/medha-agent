@@ -284,6 +284,8 @@ async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
 pub enum StopReason {
     /// The model finished with a text-only turn (task complete).
     Finished,
+    /// Required completion checks failed or could not run.
+    VerificationFailed,
     /// A budget ceiling was reached (the continuation policy can resume).
     Budget(crate::budgets::BudgetStop),
     /// The surface cancelled the turn; in-flight work settled gracefully and
@@ -841,7 +843,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     ) -> Result<(Vec<Message>, StopReason), KernelError> {
         // `None` (headless) → a token that never trips; every cancel path is dead.
         let cancel = interrupts.as_ref().map(|q| q.token()).unwrap_or_default();
-        let specs = self.executor.specs();
+        let planning = session.autonomy == crate::types::AutonomyLevel::Plan;
+        let specs: Vec<_> = self
+            .executor
+            .specs()
+            .into_iter()
+            .filter(|spec| {
+                !planning || self.executor.blast_radius(&spec.name) == Some(BlastRadius::Read)
+            })
+            .collect();
         // Tool definitions are sent every turn and count toward the request.
         self.context.note_tools(&specs);
         let mut gov = crate::budgets::Governor::new(budget);
@@ -973,12 +983,25 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     let input_limit = limits
                         .input_allowance(self.provider.requested_output_tokens())
                         .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32);
-                    let candidate = CompiledContext {
+                    let mut candidate = CompiledContext {
                         model: String::new(),
                         messages: messages.clone(),
                         ordered: Some(ordered_messages.clone()),
                         tools: specs.clone(),
                     };
+                    // Transient session instructions stay out of durable history:
+                    // resuming or leaving Plan must not retain a stale restriction.
+                    if planning {
+                        let directive = Message::system(
+                            "Plan mode is active. Investigate using read-only tools and present an actionable plan with affected files, risks, and validation steps. Do not implement changes, execute commands, or delegate work. The user must switch to careful/normal/yolo mode before implementation.",
+                        );
+                        candidate
+                            .ordered
+                            .as_mut()
+                            .expect("ordered candidate")
+                            .insert(0, directive.ordered());
+                        candidate.messages.insert(0, directive);
+                    }
                     let prepared = self
                         .provider
                         .prepare_request(&candidate)
@@ -1200,13 +1223,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             ordered_messages.push(canonical);
             messages.push(assistant);
 
-            if intents.is_empty() {
-                // A steer that raced this final turn goes back to the surface.
-                if let Some(q) = interrupts.as_mut() {
-                    Self::return_unapplied_steers(q, sink);
-                }
-                return Ok((messages, StopReason::Finished)); // text-only finish
-            }
+            let finishing = intents.is_empty();
 
             // Model-supplied trust/confidence/provenance is stripped and replaced
             // with taint-window values, which stop at this turn's dispatch.
@@ -1440,7 +1457,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 return Ok((messages, StopReason::Interrupted));
             }
 
-            if modified_files {
+            let mut completion_verified = false;
+            // Required checks run again at completion, including resumed sessions
+            // and text-only claims. Plan never launches a verification command.
+            if !planning && (modified_files || (finishing && self.verifier.required())) {
                 let verification = tokio::select! {
                     biased;
                     _ = wait_for_deadline(dispatch_wall_deadline) => {
@@ -1464,7 +1484,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                     return Ok((messages, StopReason::Interrupted));
                 }
+                let verification = verification.or_else(|| self.verifier.required().then(|| crate::verify::VerifyReport {
+                    ok: false,
+                    summary: "required verification returned no result".into(),
+                    output: "Configure a working verification command before completing this task.".into(),
+                }));
                 if let Some(rep) = verification {
+                    completion_verified = rep.ok;
                     sink.verify(rep.ok, &rep.summary);
                     let mut tail: Vec<&str> = rep.output.lines().rev().take(40).collect();
                     tail.reverse();
@@ -1484,6 +1510,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     ordered_messages.push(message.ordered());
                     messages.push(message);
                 }
+            }
+            if finishing {
+                if let Some(q) = interrupts.as_mut() {
+                    Self::return_unapplied_steers(q, sink);
+                }
+                let reason = if !planning && self.verifier.required() && !completion_verified {
+                    StopReason::VerificationFailed
+                } else {
+                    StopReason::Finished
+                };
+                return Ok((messages, reason));
             }
         }
     }
@@ -1931,7 +1968,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink: &dyn StreamSink,
     ) -> Observation {
         let radius = self.executor.blast_radius(&intent.tool);
-        let raw = self.policy.authorize(session.autonomy, intent, radius);
+        // Enforce before policy/human approval so custom AllowAll policies and
+        // remembered approvals cannot turn Plan into an editing session.
+        let raw = if session.autonomy == crate::types::AutonomyLevel::Plan
+            && radius != Some(BlastRadius::Read)
+        {
+            crate::types::Decision::Deny {
+                reason: "plan mode permits read-only tools; switch mode to implement".into(),
+            }
+        } else {
+            self.policy.authorize(session.autonomy, intent, radius)
+        };
         // Trust-flow escalations must never be auto-approved.
         let raw_permissive = matches!(raw, crate::types::Decision::Allow);
         let decision =

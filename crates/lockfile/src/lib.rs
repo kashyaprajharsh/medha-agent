@@ -576,6 +576,12 @@ impl Default for PolicyConfig {
 pub struct VerifyConfig {
     #[serde(default)]
     pub command: Option<String>,
+    /// Require passing checks before the session can report completion.
+    #[serde(default)]
+    pub required: bool,
+    /// Override the shared agent verification timeout, in seconds.
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
 }
 
 /// Initial TUI presentation settings; live toggles remain session-scoped.
@@ -633,6 +639,18 @@ impl MedhaLock {
         let lock: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         lock.sandbox.validate()?;
         lock.reasoning.to_config()?;
+        kernel::AutonomyLevel::parse(&lock.policy.autonomy)?;
+        if lock.verify.timeout_s == Some(0) {
+            return Err("verify.timeout_s must be greater than zero".into());
+        }
+        if lock
+            .verify
+            .command
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            return Err("verify.command must not be empty".into());
+        }
         if lock
             .budget
             .max_cost_usd

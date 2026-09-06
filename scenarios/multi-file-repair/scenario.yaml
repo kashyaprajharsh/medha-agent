@@ -1,0 +1,15 @@
+id: multi-file-repair
+task: >
+  Run python3 -B -m unittest -v. Fix the implementation bugs in pricing.py and
+  invoice.py so every test passes. Keep test_invoice.py and medha.lock unchanged.
+contract:
+  mode: normal
+  max_turns: 24
+  max_wall_s: 300
+checks:
+  - command: { run: "python3 -B -m unittest -v", expect_exit: 0 }
+  - changed: { pattern: "pricing.py", allow_zero_matches: false }
+  - changed: { pattern: "invoice.py", allow_zero_matches: false }
+  - unchanged: { pattern: "test_invoice.py", allow_zero_matches: false }
+  - unchanged: { pattern: "medha.lock", allow_zero_matches: false }
+labels: [coding, multi-file, verification]

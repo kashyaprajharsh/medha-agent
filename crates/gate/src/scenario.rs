@@ -41,6 +41,8 @@ fn default_fixture() -> String {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Contract {
+    /// Explicit mode for reproducible planning/permission scenarios.
+    pub mode: Option<String>,
     pub max_turns: Option<u32>,
     pub max_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
@@ -301,6 +303,11 @@ impl Scenario {
         if self.checks.is_empty() {
             // Checkless scenarios would accept every run.
             return bad("a scenario must declare at least one check".into());
+        }
+        if let Some(mode) = &self.contract.mode {
+            kernel::AutonomyLevel::parse(mode).map_err(|error| {
+                GateError::Scenario(format!("{}: contract.mode: {error}", file.display()))
+            })?;
         }
         if let Some(wall_s) = self.contract.max_wall_s {
             validate_gate_wall_seconds(wall_s).map_err(|error| {

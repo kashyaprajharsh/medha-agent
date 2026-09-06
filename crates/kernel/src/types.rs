@@ -833,6 +833,8 @@ impl CompiledContext {
 /// `Human` or `Deny` decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AutonomyLevel {
+    /// Read-only investigation. Mutating/unknown tools cannot be approved.
+    Plan,
     /// Edits and shell both ask for approval (safest).
     #[default]
     Careful,
@@ -845,14 +847,28 @@ pub enum AutonomyLevel {
 impl AutonomyLevel {
     pub fn as_str(self) -> &'static str {
         match self {
+            AutonomyLevel::Plan => "plan",
             AutonomyLevel::Careful => "careful",
             AutonomyLevel::Normal => "normal",
             AutonomyLevel::Yolo => "yolo",
         }
     }
+    /// Strict parsing for user configuration; typos must be visible.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "plan" => Ok(Self::Plan),
+            "careful" => Ok(Self::Careful),
+            "normal" => Ok(Self::Normal),
+            "yolo" => Ok(Self::Yolo),
+            _ => Err(format!(
+                "unknown mode '{s}'; choose plan, careful, normal, or yolo"
+            )),
+        }
+    }
     /// Parse a level id; unknown → `Careful` (the safe default).
     pub fn from_id(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
+            "plan" => AutonomyLevel::Plan,
             "normal" => AutonomyLevel::Normal,
             "yolo" => AutonomyLevel::Yolo,
             _ => AutonomyLevel::Careful,

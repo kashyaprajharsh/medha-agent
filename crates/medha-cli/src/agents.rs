@@ -1062,6 +1062,7 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
                 .map(|event| event.trust),
         );
         let status = match stop {
+            StopReason::VerificationFailed => AgentStatus::Failed,
             StopReason::Finished => AgentStatus::Completed,
             StopReason::Budget(_) => AgentStatus::Exhausted,
             StopReason::Interrupted => AgentStatus::Cancelled,

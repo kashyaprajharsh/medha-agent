@@ -79,6 +79,18 @@ struct Cli {
     #[arg(long)]
     setup: bool,
 
+    /// Investigate and propose a plan using read-only tools.
+    #[arg(long, conflicts_with = "mode")]
+    plan: bool,
+
+    /// Execution mode: plan, careful, normal, or yolo.
+    #[arg(long, value_parser = kernel::AutonomyLevel::parse)]
+    mode: Option<kernel::AutonomyLevel>,
+
+    /// Require the configured verification command to pass before completion.
+    #[arg(long)]
+    require_verify: bool,
+
     /// Override the model for this run
     #[arg(long)]
     model: Option<String>,
@@ -786,6 +798,34 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let lock = lockfile::MedhaLock::load_default()?;
+    let autonomy = if cli.plan {
+        kernel::AutonomyLevel::Plan
+    } else if let Some(mode) = cli.mode {
+        mode
+    } else {
+        let mode = match std::env::var("MEDHA_MODE") {
+            Ok(mode) => mode,
+            Err(std::env::VarError::NotPresent) => lock.policy.autonomy.clone(),
+            Err(_) => anyhow::bail!("MEDHA_MODE must contain valid Unicode"),
+        };
+        kernel::AutonomyLevel::parse(&mode).map_err(anyhow::Error::msg)?
+    };
+    let verify_cmd = match std::env::var("MEDHA_VERIFY") {
+        Ok(command) if !command.trim().is_empty() => Some(command),
+        Ok(_) | Err(std::env::VarError::NotPresent) => lock.verify.command.clone(),
+        Err(_) => anyhow::bail!("MEDHA_VERIFY must contain valid Unicode"),
+    };
+    let verify_required = cli.require_verify || lock.verify.required;
+    if verify_required && verify_cmd.is_none() {
+        anyhow::bail!("required verification needs [verify].command in medha.lock or MEDHA_VERIFY");
+    }
+    let verify_timeout = std::time::Duration::from_secs(
+        lock.verify
+            .timeout_s
+            .unwrap_or(lock.agents.verify_timeout_secs),
+    );
+
     // Headless callers fail instead of hanging on first-run setup.
     let cfg = config::load()?;
     let is_tty_early = std::io::stdin().is_terminal();
@@ -887,11 +927,10 @@ async fn main() -> Result<()> {
     };
     let provider = Arc::new(provider);
 
-    let lock = lockfile::MedhaLock::load_default()?;
-
     let reasoning = effort_override
         .clone()
         .unwrap_or(lock.reasoning.to_config().map_err(anyhow::Error::msg)?);
+    let reasoning = normalize_reasoning_on(provider.as_ref(), reasoning);
     if let Err(error) = provider.set_reasoning(reasoning.clone()) {
         if effort_override.is_some() {
             return Err(anyhow::anyhow!(
@@ -1252,10 +1291,6 @@ async fn main() -> Result<()> {
         *slot = Some(asker);
     }
     // Parent and writer worktrees use the same verifier command.
-    let verify_cmd = std::env::var("MEDHA_VERIFY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or(lock.verify.command.clone());
 
     let agent_runner = Arc::new(orchestrator::DeferredRunner::default());
     let agent_registry = agents::WorktreeWorkspaces::registry_handle();
@@ -1267,7 +1302,7 @@ async fn main() -> Result<()> {
             Arc::clone(&agent_registry),
             sandbox_template,
             verify_cmd.clone(),
-            std::time::Duration::from_secs(lock.agents.verify_timeout_secs),
+            verify_timeout,
             lock.agents.max_patch_bytes,
         )
         .await
@@ -1363,7 +1398,8 @@ async fn main() -> Result<()> {
         Some(cmd) => Arc::new(CommandVerifier {
             command: cmd,
             dir: cwd.clone(),
-            limit: std::time::Duration::from_secs(lock.agents.verify_timeout_secs),
+            limit: verify_timeout,
+            required: verify_required,
             exec: Arc::clone(&verifier_exec),
         }),
         None => Arc::new(kernel::NoVerify),
@@ -1542,9 +1578,15 @@ async fn main() -> Result<()> {
         )?;
         system = memory::recall::replace_k3(&system, &k3);
     }
-    session.autonomy = kernel::AutonomyLevel::from_id(
-        &std::env::var("MEDHA_MODE").unwrap_or_else(|_| lock.policy.autonomy.clone()),
-    );
+    session.autonomy = autonomy;
+    if autonomy == kernel::AutonomyLevel::Plan {
+        eprintln!("Plan mode: read-only investigation; /mode careful enables implementation.");
+    }
+    if verify_required {
+        eprintln!(
+            "Required verification: completion must pass the configured check (skipped in Plan mode)."
+        );
+    }
     for file in startup_context.iter().chain(persona_file.iter()) {
         log.append(kernel::Event::context_file(
             &session,
@@ -1697,6 +1739,9 @@ async fn main() -> Result<()> {
         Ok((_t, kernel::StopReason::Interrupted)) => {
             Err(anyhow::anyhow!("headless run was interrupted"))
         }
+        Ok((_t, kernel::StopReason::VerificationFailed)) => Err(anyhow::anyhow!(
+            "completion blocked: required verification failed; review the check output and continue to fix it"
+        )),
         Ok((_t, kernel::StopReason::Finished)) => {
             println!();
             Ok(())
@@ -2136,6 +2181,7 @@ const VERIFY_MAX_OUTPUT: usize = 8_192;
 /// Run the configured verification command after edits.
 struct CommandVerifier {
     command: String,
+    required: bool,
     dir: std::path::PathBuf,
     limit: std::time::Duration,
     exec: Arc<dyn sandbox::ExecBackend>,
@@ -2143,6 +2189,10 @@ struct CommandVerifier {
 
 #[async_trait::async_trait]
 impl kernel::Verifier for CommandVerifier {
+    fn required(&self) -> bool {
+        self.required
+    }
+
     async fn check(
         &self,
         cancel: &tokio_util::sync::CancellationToken,
@@ -2477,6 +2527,7 @@ where
     use rustyline::error::ReadlineError;
 
     println!("MEDHA — interactive session. /help for commands, /exit to quit.\n");
+    let mut session = session.clone();
     let mut rl = DefaultEditor::new()?;
     let mut transcript = session_transcript(system, resumed);
 
@@ -2496,6 +2547,24 @@ where
                 if let Some(cmd) = line.strip_prefix('/') {
                     let cmd = cmd.trim();
                     let (name, rest) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
+                    if name == "plan" || name == "mode" {
+                        let choice = if name == "plan" { "plan" } else { rest.trim() };
+                        if choice.is_empty() {
+                            println!(
+                                "mode: {} — /mode plan|careful|normal|yolo",
+                                session.autonomy.as_str()
+                            );
+                        } else {
+                            match kernel::AutonomyLevel::parse(choice) {
+                                Ok(level) => {
+                                    session.autonomy = level;
+                                    println!("mode: {}", level.as_str());
+                                }
+                                Err(error) => println!("{error}"),
+                            }
+                        }
+                        continue;
+                    }
                     if name == "think" {
                         println!(
                             "{}",
@@ -2540,7 +2609,7 @@ where
                 let sink = PrintSink::tracking(usage.clone());
                 let budget = task_budget(&base_budget, &agent_budget);
                 match kernel
-                    .run_session(session, transcript.clone(), budget, &sink, None)
+                    .run_session(&session, transcript.clone(), budget, &sink, None)
                     .await
                 {
                     Ok((updated, kernel::StopReason::Budget(stop))) => {
@@ -2548,6 +2617,12 @@ where
                         println!(
                             "\n(stopped: {} reached — say \"continue\" or raise the limit)",
                             stop.label()
+                        );
+                    }
+                    Ok((updated, kernel::StopReason::VerificationFailed)) => {
+                        transcript = updated;
+                        eprintln!(
+                            "completion blocked: required verification failed; continue to fix it"
                         );
                     }
                     Ok((updated, _)) => {
@@ -2577,6 +2652,8 @@ fn print_help() {
          /reasoning [on|off|auto|status]  control reasoning\n  \
          /effort LEVEL (auto|none|minimal|low|medium|high|xhigh|max|ultra)\n\
                                       set reasoning depth (turns thinking on)\n  \
+         /plan                        investigate without edits or commands\n  \
+         /mode plan|careful|normal|yolo  choose execution mode\n  \
          /clear                       reset the conversation (keep system prompt)\n  \
          /exit                        quit (also Ctrl-D)\n\
          anything else is sent to the agent."
@@ -2630,6 +2707,17 @@ fn think_status<P: kernel::Provider>(provider: &P) -> String {
 
 /// Enabling reasoning chooses a supported explicit level so Chat endpoints
 /// receive a usable request. Existing effort is preserved.
+fn normalize_reasoning_on<P: kernel::Provider>(
+    provider: &P,
+    config: kernel::ReasoningConfig,
+) -> kernel::ReasoningConfig {
+    if config.enabled == Some(true) && config.effort.is_none() {
+        reasoning_on_config(provider)
+    } else {
+        config
+    }
+}
+
 pub(crate) fn reasoning_on_config<P: kernel::Provider>(provider: &P) -> kernel::ReasoningConfig {
     let levels = provider.reasoning_efforts();
     let effort = provider
@@ -2896,6 +2984,37 @@ mod recent_write_tests {
 #[cfg(test)]
 mod reasoning_cli_tests {
     use super::*;
+    #[test]
+    fn planning_and_verification_flags_are_validated() {
+        assert!(
+            Cli::try_parse_from(["medha", "--plan", "inspect"])
+                .unwrap()
+                .plan
+        );
+        assert!(
+            Cli::try_parse_from(["medha", "--require-verify", "fix"])
+                .unwrap()
+                .require_verify
+        );
+        assert_eq!(
+            Cli::try_parse_from(["medha", "--mode", "plan"])
+                .unwrap()
+                .mode,
+            Some(kernel::AutonomyLevel::Plan)
+        );
+        assert!(Cli::try_parse_from(["medha", "--mode", "yoloo"]).is_err());
+        assert!(Cli::try_parse_from(["medha", "--plan", "--mode", "normal"]).is_err());
+    }
+
+    #[test]
+    fn saved_reasoning_on_selects_a_supported_effort() {
+        let provider = providers::OpenAiCompat::new("http://localhost/v1", "", "test");
+        let saved = lockfile::MedhaLock::parse("[reasoning]\nenabled = true").unwrap();
+        let config = normalize_reasoning_on(&provider, saved.reasoning.to_config().unwrap());
+        assert_eq!(config.effort, Some(kernel::ReasoningEffort::Medium));
+        assert!(provider.set_reasoning(config).is_ok());
+    }
+
     #[test]
     fn cli_accepts_extended_levels_and_rejects_typos() {
         for level in [

@@ -83,6 +83,7 @@ impl DefaultPolicy {
     /// `careful` gates the full set, `normal` allows reversible edits, `yolo` none.
     fn escalates(&self, autonomy: AutonomyLevel, tool: &str) -> bool {
         match autonomy {
+            AutonomyLevel::Plan => false,
             AutonomyLevel::Careful => self.approve.contains(tool),
             AutonomyLevel::Normal => {
                 tool != "fs.write"
@@ -102,6 +103,11 @@ impl Policy for DefaultPolicy {
         intent: &ToolIntent,
         blast_radius: Option<BlastRadius>,
     ) -> Decision {
+        if autonomy == AutonomyLevel::Plan && blast_radius != Some(BlastRadius::Read) {
+            return Decision::Deny {
+                reason: "plan mode permits read-only tools; switch mode to implement".into(),
+            };
+        }
         let verdict = match intent.tool.as_str() {
             // These tools need constraints beyond their declared blast radius.
             "shell.exec" => scan_command(intent, self.workspace.as_deref()),

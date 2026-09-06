@@ -23,6 +23,7 @@ struct LimitProvider {
     caps: ProviderCaps,
     turns: Mutex<VecDeque<Turn>>,
     calls: AtomicUsize,
+    requests: Mutex<Vec<CompiledContext>>,
 }
 
 impl LimitProvider {
@@ -36,6 +37,7 @@ impl LimitProvider {
             },
             turns: Mutex::new(turns.into()),
             calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
         }
     }
 }
@@ -63,8 +65,9 @@ impl Provider for LimitProvider {
 
     async fn stream(
         &self,
-        _ctx: &CompiledContext,
+        ctx: &CompiledContext,
     ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+        self.requests.lock().unwrap().push(ctx.clone());
         self.calls.fetch_add(1, Ordering::SeqCst);
         let turn = self.turns.lock().unwrap().pop_front();
         match turn {
@@ -131,6 +134,10 @@ struct HangingVerifier;
 
 #[async_trait]
 impl Verifier for HangingVerifier {
+    fn required(&self) -> bool {
+        true
+    }
+
     async fn check(
         &self,
         _cancel: &tokio_util::sync::CancellationToken,
@@ -386,4 +393,360 @@ async fn cancellation_waits_one_shared_grace_and_never_starts_queued_tools() {
             .count(),
         20
     );
+}
+
+#[derive(Default)]
+struct PlanExecutor {
+    executed: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Executor for PlanExecutor {
+    fn specs(&self) -> Vec<ToolSpec> {
+        ["fs.read", "fs.write", "shell.exec", "agent.spawn"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: name.into(),
+                schema: json!({}),
+                // Deliberately misleading schema metadata must not bypass the
+                // executor's actual permission metadata.
+                blast_radius: BlastRadius::Read,
+                category: kernel::ToolCategory::Other,
+                icon: String::new(),
+            })
+            .collect()
+    }
+    fn blast_radius(&self, name: &str) -> Option<BlastRadius> {
+        match name {
+            "fs.read" => Some(BlastRadius::Read),
+            "fs.write" => Some(BlastRadius::ReversibleLocal),
+            "shell.exec" => Some(BlastRadius::IrreversibleLocal),
+            "agent.spawn" => Some(BlastRadius::External),
+            _ => None,
+        }
+    }
+    async fn execute(&self, intent: &ToolIntent) -> Observation {
+        self.executed.lock().unwrap().push(intent.tool.clone());
+        Observation::ok(&intent.id, json!({"content": "fixture"}))
+    }
+}
+
+#[tokio::test]
+async fn plan_blocks_writes_shell_delegation_and_unknown_tools_even_with_allow_all() {
+    let attempted = [
+        "fs.read",
+        "fs.write",
+        "shell.exec",
+        "agent.spawn",
+        "unknown",
+    ];
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(
+        attempted
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Block::ToolIntent(ToolIntent {
+                    id: format!("attempt-{i}"),
+                    tool: name.into(),
+                    args: json!({}),
+                })
+            })
+            .collect(),
+    )]));
+    let executor = Arc::new(PlanExecutor::default());
+    let log = Arc::new(InMemoryLog::new());
+    let kernel = Kernel::new(
+        provider.clone(),
+        log.clone(),
+        executor.clone(),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    );
+    let mut session = Session::new();
+    session.autonomy = kernel::AutonomyLevel::Plan;
+    let (history, stop) = kernel
+        .run_session(
+            &session,
+            vec![Message::user("please implement everything")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop, StopReason::Finished);
+    assert_eq!(*executor.executed.lock().unwrap(), ["fs.read"]);
+    let events = log.events(session.id).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::PolicyDecision
+                && e.payload.to_string().contains("plan mode permits"))
+            .count(),
+        4
+    );
+    for request in provider.requests.lock().unwrap().iter() {
+        assert_eq!(
+            request
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["fs.read"]
+        );
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Plan mode is active"))
+        );
+        assert!(request.ordered_messages().iter().any(|m| {
+            serde_json::to_string(m)
+                .unwrap()
+                .contains("Plan mode is active")
+        }));
+    }
+    assert!(
+        !history
+            .iter()
+            .any(|m| m.content.contains("Plan mode is active"))
+    );
+    session.autonomy = kernel::AutonomyLevel::Normal;
+    kernel
+        .run_session(
+            &session,
+            history,
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    let requests = provider.requests.lock().unwrap();
+    let last = requests.last().unwrap();
+    assert_eq!(last.tools.len(), 4);
+    assert!(
+        !last
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Plan mode is active"))
+    );
+}
+
+struct RequiredVerifier {
+    results: Mutex<VecDeque<Option<bool>>>,
+    calls: AtomicUsize,
+    required: bool,
+}
+impl RequiredVerifier {
+    fn new(results: Vec<Option<bool>>) -> Self {
+        Self {
+            results: Mutex::new(results.into()),
+            calls: AtomicUsize::new(0),
+            required: true,
+        }
+    }
+}
+#[async_trait]
+impl Verifier for RequiredVerifier {
+    fn required(&self) -> bool {
+        self.required
+    }
+    async fn check(
+        &self,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<kernel::VerifyReport> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .flatten()
+            .map(|ok| kernel::VerifyReport {
+                ok,
+                summary: "fixture tests".into(),
+                output: "deterministic check".into(),
+            })
+    }
+}
+
+#[tokio::test]
+async fn required_checks_block_false_success_and_missing_results() {
+    for final_result in [Some(false), None] {
+        let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![intent(1)])]));
+        let executor = Arc::new(CountingExecutor {
+            mutates: true,
+            ..Default::default()
+        });
+        // A post-edit pass is insufficient: changes can occur before completion.
+        let verifier = Arc::new(RequiredVerifier::new(vec![Some(true), final_result]));
+        let kernel = kernel_with(provider, executor).with_verifier(verifier.clone());
+        let (history, stop) = kernel
+            .run_session(
+                &Session::new(),
+                vec![Message::user("fix it")],
+                Budget::default(),
+                &kernel::NullSink,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop, StopReason::VerificationFailed);
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 2);
+        assert!(history.last().unwrap().content.contains("[verifier] FAIL"));
+        assert_eq!(
+            history.last().unwrap().trust,
+            Some(kernel::TrustLabel::Tool)
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_checks_feed_back_then_allow_a_verified_repair() {
+    let provider = Arc::new(LimitProvider::new(vec![
+        Turn::Blocks(vec![intent(1)]),
+        Turn::Blocks(vec![intent(2)]),
+    ]));
+    let verifier = Arc::new(RequiredVerifier::new(vec![
+        Some(false),
+        Some(true),
+        Some(true),
+    ]));
+    let kernel = kernel_with(
+        provider.clone(),
+        Arc::new(CountingExecutor {
+            mutates: true,
+            ..Default::default()
+        }),
+    )
+    .with_verifier(verifier.clone());
+    let (_, stop) = kernel
+        .run_session(
+            &Session::new(),
+            vec![Message::user("fix it")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop, StopReason::Finished);
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 3);
+    assert!(
+        provider.requests.lock().unwrap()[1]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("[verifier] FAIL"))
+    );
+}
+
+#[tokio::test]
+async fn required_checks_recheck_text_only_and_resumed_completion() {
+    let provider = Arc::new(LimitProvider::new(vec![]));
+    let verifier = Arc::new(RequiredVerifier::new(vec![Some(true), Some(false)]));
+    let kernel = kernel_with(provider, Arc::new(CountingExecutor::default()))
+        .with_verifier(verifier.clone());
+    let session = Session::new();
+    let (history, stop) = kernel
+        .run_session(
+            &session,
+            vec![Message::user("done?")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop, StopReason::Finished);
+    let (_, stop) = kernel
+        .run_session(
+            &session,
+            history,
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop, StopReason::VerificationFailed);
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn plan_never_launches_verification_even_after_a_denied_mutation() {
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![intent(1)])]));
+    let verifier = Arc::new(RequiredVerifier::new(vec![Some(false)]));
+    let executor = Arc::new(CountingExecutor {
+        mutates: true,
+        ..Default::default()
+    });
+    let kernel = kernel_with(provider, executor.clone()).with_verifier(verifier.clone());
+    let mut session = Session::new();
+    session.autonomy = kernel::AutonomyLevel::Plan;
+    let (_, stop) = kernel
+        .run_session(
+            &session,
+            vec![Message::user("plan it")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop, StopReason::Finished);
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn optional_verification_preserves_advisory_behavior() {
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![intent(1)])]));
+    let mut verifier = RequiredVerifier::new(vec![Some(false)]);
+    verifier.required = false;
+    let kernel = kernel_with(
+        provider,
+        Arc::new(CountingExecutor {
+            mutates: true,
+            ..Default::default()
+        }),
+    )
+    .with_verifier(Arc::new(verifier));
+    let (_, stop) = kernel
+        .run_session(
+            &Session::new(),
+            vec![Message::user("fix it")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop, StopReason::Finished);
+}
+
+#[tokio::test]
+async fn completion_check_obeys_the_task_wall_deadline() {
+    let kernel = kernel_with(
+        Arc::new(LimitProvider::new(vec![])),
+        Arc::new(CountingExecutor::default()),
+    )
+    .with_verifier(Arc::new(HangingVerifier));
+    let (_, stop) = tokio::time::timeout(
+        Duration::from_secs(2),
+        kernel.run_session(
+            &Session::new(),
+            vec![Message::user("done?")],
+            one_second_wall_budget(),
+            &kernel::NullSink,
+            None,
+        ),
+    )
+    .await
+    .expect("completion must not hang on verification")
+    .unwrap();
+    assert_eq!(stop, StopReason::Budget(BudgetStop::Wall));
 }

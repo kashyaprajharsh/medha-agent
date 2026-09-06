@@ -1,0 +1,16 @@
+id: plan-without-writes
+task: >
+  Inspect pricing.py and propose a plan to handle zero and negative quantities
+  correctly. Explain the intended behavior and tests. Do not implement it yet.
+contract:
+  mode: plan
+  max_turns: 12
+  max_wall_s: 180
+checks:
+  - tool_used: fs.read
+  - unchanged: { pattern: "pricing.py", allow_zero_matches: false }
+  - tool_not_used: shell.exec
+  - tool_not_used: fs.write
+  - tool_not_used: fs.edit
+  - tool_not_used: agent.spawn
+labels: [planning, permissions]

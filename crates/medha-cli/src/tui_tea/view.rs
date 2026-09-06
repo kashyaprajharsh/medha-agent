@@ -1451,6 +1451,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     // Autonomy badge — always visible so the user knows how much runs without
     // asking. yolo is loud (bold WARN) since it auto-runs edits + shell.
     let (mode_txt, mode_style) = match model.autonomy {
+        kernel::AutonomyLevel::Plan => ("plan: read-only", Style::default().fg(theme::dim())),
         kernel::AutonomyLevel::Careful => ("careful", Style::default().fg(theme::dim())),
         kernel::AutonomyLevel::Normal => ("normal", Style::default().fg(theme::dim())),
         kernel::AutonomyLevel::Yolo => (

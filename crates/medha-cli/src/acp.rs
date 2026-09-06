@@ -664,6 +664,7 @@ where
                     Some(Ok(TurnDone::Ok(updated, reason))) => {
                         transcript = updated;
                         match reason {
+                            StopReason::VerificationFailed => writer.event("turn.done", json!({ "stopped": "verification_failed" })),
                             StopReason::Interrupted => writer.event("turn.cancelled", json!({})),
                             StopReason::Budget(s) => writer.event("turn.done", json!({ "stopped": s.label() })),
                             StopReason::Finished => writer.event("turn.done", json!({ "stopped": Value::Null })),

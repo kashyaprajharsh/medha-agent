@@ -155,6 +155,9 @@ async fn run_once_owned(
         for (k, v) in &cfg.provider_env {
             cmd.env(k, v);
         }
+        if let Some(mode) = &scn.contract.mode {
+            cmd.env("MEDHA_MODE", mode);
+        }
         // Eval runs are unattended.
         cmd.env("MEDHA_APPROVE", "none");
         if let Some(t) = scn.contract.max_turns {

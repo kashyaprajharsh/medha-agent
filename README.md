@@ -255,3 +255,12 @@ Apache-2.0.
 <div align="center">
 <sub><i>मेधा सूक्ताय नमः — salutations to the hymn of sharp intelligence.</i></sub>
 </div>
+
+### Planning, verification, and audit
+
+Use `medha --plan "inspect this project"` for read-only investigation, or
+`medha --require-verify "fix the tests"` with a configured verification command
+to require passing checks before completion. See
+[planning and verification](docs/PLANNING_AND_VERIFICATION.md),
+[reasoning and approval controls](docs/REASONING_AND_APPROVALS.md), and the
+[source-based feature comparison](docs/FEATURE_AUDIT.md).

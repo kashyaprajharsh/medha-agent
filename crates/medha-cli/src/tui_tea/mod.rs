@@ -75,7 +75,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/mode",
-        "autonomy: how much runs without asking (careful · normal · yolo)",
+        "execution: read-only plan · careful · normal · yolo",
+    ),
+    (
+        "/plan",
+        "investigate and propose a plan; /mode careful to implement",
     ),
     ("/detail", "expand/collapse full tool input & output"),
     ("/theme", "light · dark · auto (bare /theme toggles)"),
@@ -1205,6 +1209,10 @@ pub(crate) const MODEL_PROTOCOLS: &[(&str, bool, kernel::Protocol)] = &[
 ];
 
 const AUTONOMY_MODES: &[(kernel::AutonomyLevel, &str)] = &[
+    (
+        kernel::AutonomyLevel::Plan,
+        "plan — read-only investigation; no edits, shell, or delegation",
+    ),
     (
         kernel::AutonomyLevel::Careful,
         "careful — ask before every edit and shell command (safest)",

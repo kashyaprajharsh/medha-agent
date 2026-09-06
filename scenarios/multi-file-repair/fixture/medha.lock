@@ -1,0 +1,4 @@
+[verify]
+command = "python3 -B -m unittest -v"
+required = true
+timeout_s = 30

@@ -16,17 +16,16 @@ use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use tools::ToolRegistry;
 
-fn env_u32(name: &str) -> Option<u32> {
-    std::env::var(name).ok().and_then(|s| s.parse().ok())
-}
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|s| s.parse().ok())
-}
-fn env_f64(name: &str) -> Option<f64> {
-    std::env::var(name).ok().and_then(|s| s.parse().ok())
-}
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|s| s.parse().ok())
+fn env_number<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{name} must be a valid numeric limit")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => anyhow::bail!("{name} must contain valid Unicode"),
+    }
 }
 
 /// Apply environment overrides to one task's shared budget pool.
@@ -49,20 +48,24 @@ pub(crate) fn session_transcript(
     transcript
 }
 
-fn apply_budget_env(mut b: kernel::Budget) -> kernel::Budget {
-    if let Some(t) = env_u32("MEDHA_MAX_TURNS") {
+fn apply_budget_env(mut b: kernel::Budget) -> Result<kernel::Budget> {
+    if let Some(t) = env_number("MEDHA_MAX_TURNS")? {
         b.max_turns = Some(t);
     }
-    if let Some(t) = env_u64("MEDHA_MAX_TOKENS") {
+    if let Some(t) = env_number("MEDHA_MAX_TOKENS")? {
         b.max_tokens = Some(t);
     }
-    if let Some(c) = env_f64("MEDHA_MAX_COST") {
+    if let Some(c) = env_number::<f64>("MEDHA_MAX_COST")? {
+        anyhow::ensure!(
+            c.is_finite() && c >= 0.0,
+            "MEDHA_MAX_COST must be finite and non-negative"
+        );
         b.max_cost_usd = Some(c);
     }
-    if let Some(w) = env_u64("MEDHA_MAX_WALL") {
+    if let Some(w) = env_number("MEDHA_MAX_WALL")? {
         b.max_wall_s = Some(w);
     }
-    b
+    Ok(b)
 }
 
 #[derive(Parser, Debug)]
@@ -749,6 +752,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Invalid explicit limits must fail before provider discovery or startup effects.
+    apply_budget_env(kernel::Budget::default())?;
+    let parallel_override = env_number::<usize>("MEDHA_MAX_PARALLEL_TOOLS")?;
+
     if cli.setup && !std::io::stdin().is_terminal() {
         anyhow::bail!("--setup opens the interactive TUI and needs a terminal");
     }
@@ -804,28 +811,25 @@ async fn main() -> Result<()> {
             resolved.provider.protocol,
             kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
         )
-    {
-        if let Ok(models) = providers::openai_compat::list_models_for_profile(
+        && let Ok(models) = providers::openai_compat::list_models_for_profile(
             &resolved.provider,
             &resolved.credential,
         )
         .await
-        {
-            if let Some(c) = models
-                .iter()
-                .find(|m| m.id == model_name)
-                .and_then(|m| m.context_length)
-            {
-                max_ctx = Some(c);
-                ctx_source = "discovered from /v1/models";
-            }
-        }
+        && let Some(c) = models
+            .iter()
+            .find(|m| m.id == model_name)
+            .and_then(|m| m.context_length)
+    {
+        max_ctx = Some(c);
+        ctx_source = "discovered from /v1/models";
     }
-    if max_ctx.is_none() && !model_name.is_empty() {
-        if let Some(c) = providers::models_dev::context_window(&model_name).await {
-            max_ctx = Some(c);
-            ctx_source = "models.dev";
-        }
+    if max_ctx.is_none()
+        && !model_name.is_empty()
+        && let Some(c) = providers::models_dev::context_window(&model_name).await
+    {
+        max_ctx = Some(c);
+        ctx_source = "models.dev";
     }
     match max_ctx {
         _ if model_name.is_empty() => {} // nothing configured yet — stay quiet
@@ -910,10 +914,9 @@ async fn main() -> Result<()> {
         medha_home.join("mutations.db"),
     )?);
 
-    // A damaged log remains recoverable, but never silently trusted.
-    if let Err(e) = log.verify() {
-        eprintln!("warning: event log integrity check failed: {e}");
-    }
+    // Preserve a damaged log for recovery without using it as trusted history.
+    log.verify()
+        .context("event log integrity check failed; refusing to start")?;
 
     let artifacts = Arc::new(store::FileArtifactStore::open(state.join("artifacts"))?);
 
@@ -1344,7 +1347,7 @@ async fn main() -> Result<()> {
     };
 
     // Children inherit this already-resolved budget.
-    let base_budget = apply_budget_env(lock.budget.to_budget());
+    let base_budget = apply_budget_env(lock.budget.to_budget())?;
     let ui_config = lock.ui.clone();
 
     // models.dev prices are advisory for self-hosted routes.
@@ -1373,14 +1376,14 @@ async fn main() -> Result<()> {
             if base_budget.max_cost_usd.is_some() {
                 eprintln!(
                     "warning: max_cost_usd is set but no pricing is known for '{model_name}' — \
-                     the cost budget cannot be enforced. Set [pricing] input_per_mtok / \
+                     model requests will be refused. Set [pricing] input_per_mtok / \
                      output_per_mtok in medha.lock."
                 );
             }
         }
     }
 
-    let max_parallel_tools = env_usize("MEDHA_MAX_PARALLEL_TOOLS")
+    let max_parallel_tools = parallel_override
         .or(lock.budget.max_parallel_tools)
         .unwrap_or(kernel::DEFAULT_MAX_PARALLEL_TOOLS);
     let mut kernel = Kernel::new(
@@ -2424,7 +2427,7 @@ async fn resolve_resume(
     } else {
         return Ok(None);
     };
-    let events = kernel::EventLog::events(log, id).await;
+    let events = log.checked_events(id).await?;
     if events.is_empty() {
         anyhow::bail!("session {id} has no events (not found)");
     }

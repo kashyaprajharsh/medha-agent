@@ -391,10 +391,10 @@ impl ArtifactStore for FileArtifactStore {
 
         // Same-directory rename is atomic. Concurrent writers publish identical
         // bytes because the destination name is the content digest.
-        if let Err(error) = atomic_replace(&temporary.0, &path) {
-            if open_verified_artifact(&path, &hash).is_err() {
-                return Err(format!("could not atomically publish artifact: {error}"));
-            }
+        if let Err(error) = atomic_replace(&temporary.0, &path)
+            && open_verified_artifact(&path, &hash).is_err()
+        {
+            return Err(format!("could not atomically publish artifact: {error}"));
         }
         let final_file = open_verified_artifact_for_sync(&path, &hash)?;
         final_file.sync_all().map_err(|e| e.to_string())?;
@@ -662,38 +662,26 @@ impl SqliteLog {
         Ok(out)
     }
 
+    /// Read and verify a single SQLite snapshot before trusting serialized events.
     pub fn all_events(&self) -> Result<Vec<Event>, StoreError> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| StoreError::Db("lock poisoned".into()))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, session_id, parent_id, kind, payload, trust, provenance,
-                        prev_hash, hash_version, ts
-                 FROM events ORDER BY rowid ASC",
-            )
-            .map_err(|error| StoreError::Db(error.to_string()))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(Row {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    parent_id: row.get(2)?,
-                    kind: row.get(3)?,
-                    payload: row.get(4)?,
-                    trust: row.get(5)?,
-                    provenance: row.get(6)?,
-                    prev_hash: row.get(7)?,
-                    hash_version: row.get(8)?,
-                    ts: row.get(9)?,
-                })
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let rows = load_chain_rows(&tx)?;
+        verify_chain_anchor(&tx, &rows)?;
+        let events = rows
+            .into_iter()
+            .map(|(_, row, _)| {
+                row.into_event()
+                    .ok_or_else(|| StoreError::Db("verified event could not be decoded".into()))
             })
-            .map_err(|error| StoreError::Db(error.to_string()))?;
-        Ok(rows
-            .filter_map(Result::ok)
-            .filter_map(Row::into_event)
-            .collect())
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(events)
     }
 
     /// Search text-bearing events. Interactive sessions rank ahead of
@@ -996,42 +984,6 @@ impl SqliteLog {
             .map_err(|err| KernelError::Log(err.to_string()))?;
         Ok(e)
     }
-
-    fn events_sync(&self, session: Ulid) -> Vec<Event> {
-        let Ok(conn) = self.conn.lock() else {
-            return Vec::new();
-        };
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session_id, parent_id, kind, payload, trust, provenance,
-                    prev_hash, hash_version, ts
-             FROM events WHERE session_id = ?1 ORDER BY rowid ASC",
-        ) else {
-            return Vec::new();
-        };
-        let rows = stmt.query_map([session.to_string()], |r| {
-            Ok(Row {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                parent_id: r.get(2)?,
-                kind: r.get(3)?,
-                payload: r.get(4)?,
-                trust: r.get(5)?,
-                provenance: r.get(6)?,
-                prev_hash: r.get(7)?,
-                hash_version: r.get(8)?,
-                ts: r.get(9)?,
-            })
-        });
-        let mut out = Vec::new();
-        if let Ok(rows) = rows {
-            for row in rows.flatten() {
-                if let Some(event) = row.into_event() {
-                    out.push(event);
-                }
-            }
-        }
-        out
-    }
 }
 
 #[async_trait]
@@ -1042,9 +994,19 @@ impl EventLog for SqliteLog {
     }
 
     async fn events(&self, session: Ulid) -> Vec<Event> {
-        self.run_store_task(move |log| Ok(log.events_sync(session)))
-            .await
-            .unwrap_or_default()
+        self.checked_events(session).await.unwrap_or_default()
+    }
+
+    async fn checked_events(&self, session: Ulid) -> Result<Vec<Event>, KernelError> {
+        self.run_store_task(move |log| {
+            Ok(log
+                .all_events()?
+                .into_iter()
+                .filter(|e| e.session_id == session)
+                .collect())
+        })
+        .await
+        .map_err(|e| KernelError::Log(e.to_string()))
     }
 
     async fn acquire_mutation_lease(
@@ -1991,6 +1953,19 @@ mod tests {
         // Verification now fails.
         let err = SqliteLog::open(&db).unwrap().verify().unwrap_err();
         assert!(format!("{err}").contains("hash chain broken"), "got: {err}");
+        let log = SqliteLog::open(&db).unwrap();
+        assert!(
+            log.all_events().is_err(),
+            "memory replay accepted tampered history"
+        );
+        assert!(
+            log.checked_events(s.id).await.is_err(),
+            "kernel replay accepted tampered history"
+        );
+        assert!(
+            log.events(s.id).await.is_empty(),
+            "legacy reads exposed tampered events"
+        );
     }
 
     async fn seeded_chain(tag: &str) -> (PathBuf, PathBuf, SqliteLog) {

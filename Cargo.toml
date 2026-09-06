@@ -10,7 +10,7 @@ members = [
 edition = "2024"
 version = "0.1.8"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -25,6 +25,6 @@ thiserror = "2"
 anyhow = "1"
 
 # Local crates
-kernel = { path = "crates/kernel" }
-providers = { path = "crates/providers" }
-context = { path = "crates/context" }
+kernel = { version = "0.1.8", path = "crates/kernel" }
+providers = { version = "0.1.8", path = "crates/providers" }
+context = { version = "0.1.8", path = "crates/context" }

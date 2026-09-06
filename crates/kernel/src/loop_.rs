@@ -853,7 +853,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut window_taint = TrustLabel::User;
         // Skip what the log already ends with: a retry would append the run
         // twice, and the projection only collapses adjacent identical turns.
-        let prior_events = self.log.events(session.id).await;
+        let prior_events = self.log.checked_events(session.id).await?;
         let already = logged_tail(&prior_events);
         // Retried input is already durable but still belongs to this evidence
         // window. Skipping its append must not also erase its provenance or
@@ -889,7 +889,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
         let mut ordered_messages: Vec<ModelMessage> =
             messages.iter().map(Message::ordered).collect();
-        let logged_events = self.log.events(session.id).await;
+        let logged_events = self.log.checked_events(session.id).await?;
         let has_checkpoint = logged_events.iter().any(|event| {
             event.kind == EventKind::Compaction
                 && crate::events::has_valid_compaction_snapshot(&event.payload)

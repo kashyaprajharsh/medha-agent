@@ -189,15 +189,13 @@ fn scan_text_with_mode(path: &str, text: &str, executable: bool, out: &mut Vec<F
                 severity: Severity::Dangerous,
                 reason,
             });
-        } else if !docs_only {
-            if let Some(reason) = crate::needs_review(&c, None) {
-                out.push(Finding {
-                    file: path.to_string(),
-                    line: Some(line),
-                    severity: Severity::Caution,
-                    reason: reason.to_string(),
-                });
-            }
+        } else if !docs_only && let Some(reason) = crate::needs_review(&c, None) {
+            out.push(Finding {
+                file: path.to_string(),
+                line: Some(line),
+                severity: Severity::Caution,
+                reason: reason.to_string(),
+            });
         }
     }
 }

@@ -52,5 +52,5 @@ jobs:
       - name: RustSec advisories and yanked crates
         run: cargo deny --all-features check advisories
 
-      - name: Licenses and dependency sources
-        run: cargo deny --all-features check licenses sources
+      - name: Licenses, dependency bans, and sources
+        run: cargo deny --all-features check licenses bans sources

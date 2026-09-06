@@ -1059,25 +1059,24 @@ fn diagnose_checks(
         }),
     }
 
-    if let Some(cfg) = cfg {
-        if let Some(def) = &cfg.default_model {
-            if !cfg.models.contains_key(def) {
-                let has_others = !cfg.models.is_empty();
-                checks.push(Check {
-                    health: Health::Warn,
-                    title: "Stale default model".into(),
-                    detail: format!(
-                        "default_model = '{def}' but no such profile exists.{}",
-                        if has_others {
-                            " `pulse --fix` will promote the first saved profile."
-                        } else {
-                            " Add a model to fix."
-                        }
-                    ),
-                    auto_fixable: has_others,
-                });
-            }
-        }
+    if let Some(cfg) = cfg
+        && let Some(def) = &cfg.default_model
+        && !cfg.models.contains_key(def)
+    {
+        let has_others = !cfg.models.is_empty();
+        checks.push(Check {
+            health: Health::Warn,
+            title: "Stale default model".into(),
+            detail: format!(
+                "default_model = '{def}' but no such profile exists.{}",
+                if has_others {
+                    " `pulse --fix` will promote the first saved profile."
+                } else {
+                    " Add a model to fix."
+                }
+            ),
+            auto_fixable: has_others,
+        });
     }
 
     if !ignored_env.is_empty() {
@@ -1104,19 +1103,19 @@ fn diagnose_checks(
 pub fn apply_safe_fixes(cfg: &mut Config) -> Vec<String> {
     let mut fixed = Vec::new();
 
-    if let Some(def) = cfg.default_model.clone() {
-        if !cfg.models.contains_key(&def) {
-            match cfg.models.keys().next().cloned() {
-                Some(first) => {
-                    cfg.default_model = Some(first.clone());
-                    fixed.push(format!("stale default model '{def}' → promoted '{first}'"));
-                }
-                None => {
-                    cfg.default_model = None;
-                    fixed.push(format!(
-                        "stale default model '{def}' cleared (no saved profiles)"
-                    ));
-                }
+    if let Some(def) = cfg.default_model.clone()
+        && !cfg.models.contains_key(&def)
+    {
+        match cfg.models.keys().next().cloned() {
+            Some(first) => {
+                cfg.default_model = Some(first.clone());
+                fixed.push(format!("stale default model '{def}' → promoted '{first}'"));
+            }
+            None => {
+                cfg.default_model = None;
+                fixed.push(format!(
+                    "stale default model '{def}' cleared (no saved profiles)"
+                ));
             }
         }
     }

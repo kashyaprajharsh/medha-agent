@@ -114,3 +114,28 @@ fn an_unreadable_present_lockfile_fails_instead_of_using_defaults() {
     assert!(stderr.contains("could not read medha.lock"), "{stderr}");
     assert!(stderr.contains(&lock.display().to_string()), "{stderr}");
 }
+
+#[test]
+fn malformed_budget_environment_fails_before_provider_access() {
+    let root = tempfile::tempdir().unwrap();
+    for (name, value) in [
+        ("MEDHA_MAX_COST", "NaN"),
+        ("MEDHA_MAX_COST", "inf"),
+        ("MEDHA_MAX_COST", "-1"),
+        ("MEDHA_MAX_TOKENS", "not-a-number"),
+        ("MEDHA_MAX_WALL", "-1"),
+        ("MEDHA_MAX_PARALLEL_TOOLS", "abc"),
+    ] {
+        let output = configured_medha(root.path(), &root.path().join("home"))
+            .env(name, value)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(name), "{name}: {stderr}");
+        assert!(
+            !stderr.contains("headless run failed"),
+            "contacted provider: {stderr}"
+        );
+    }
+}

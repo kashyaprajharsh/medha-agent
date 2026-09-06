@@ -49,10 +49,10 @@ pub fn system_identity() -> String {
 
 fn override_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Ok(d) = std::env::var("MEDHA_PROMPTS_DIR") {
-        if !d.is_empty() {
-            dirs.push(PathBuf::from(d));
-        }
+    if let Ok(d) = std::env::var("MEDHA_PROMPTS_DIR")
+        && !d.is_empty()
+    {
+        dirs.push(PathBuf::from(d));
     }
     dirs.push(PathBuf::from(".medha/prompts"));
     dirs

@@ -70,6 +70,9 @@ async fn collect_text(provider: &dyn Provider, ctx: &CompiledContext) -> Result<
     let mut out = String::new();
     while let Some(block) = stream.next().await {
         if let Block::Text(t) = block.map_err(|e| e.to_string())? {
+            if out.len().saturating_add(t.len()) > 64 * 1024 {
+                return Err("security review response exceeded 64 KiB".into());
+            }
             out.push_str(&t);
         }
     }

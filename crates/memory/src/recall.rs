@@ -201,8 +201,8 @@ fn compile_with_counter(
         )) <= budget_tokens
         {
             selected = trial;
-        } else if entry.pinned {
-            if let Some(clipped) = fit_pinned_description(
+        } else if entry.pinned
+            && let Some(clipped) = fit_pinned_description(
                 &selected,
                 &entry,
                 &description,
@@ -210,9 +210,9 @@ fn compile_with_counter(
                 now,
                 stale_after_days,
                 counter,
-            ) {
-                selected.push((entry, clipped));
-            }
+            )
+        {
+            selected.push((entry, clipped));
         }
     }
     Ok(render(

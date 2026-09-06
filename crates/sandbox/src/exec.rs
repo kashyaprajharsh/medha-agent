@@ -395,10 +395,10 @@ impl GroupReaper {
 
 impl Drop for GroupReaper {
     fn drop(&mut self) {
-        if self.armed {
-            if let Some(pid) = self.pid {
-                quiesce_process_tree(pid);
-            }
+        if self.armed
+            && let Some(pid) = self.pid
+        {
+            quiesce_process_tree(pid);
         }
     }
 }
@@ -2389,10 +2389,10 @@ pub fn locate_on_path(program: &str) -> Option<PathBuf> {
 /// The container runtime to use: honor `configured`, else prefer docker, then
 /// podman; fall back to "docker" as the name to report if neither is present.
 fn detect_container_runtime(configured: &Option<String>) -> String {
-    if let Some(r) = configured {
-        if !r.trim().is_empty() {
-            return r.clone();
-        }
+    if let Some(r) = configured
+        && !r.trim().is_empty()
+    {
+        return r.clone();
     }
     for candidate in ["docker", "podman"] {
         if program_on_path(candidate) {

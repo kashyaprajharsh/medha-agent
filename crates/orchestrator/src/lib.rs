@@ -735,7 +735,7 @@ impl AgentControl {
     }
 
     pub fn with_limits(mut self, max_active: usize, max_depth: u32) -> Self {
-        self.max_active = max_active.max(1);
+        self.max_active = max_active.clamp(1, Semaphore::MAX_PERMITS);
         self.max_depth = max_depth;
         self.capacity = Arc::new(Semaphore::new(self.max_active));
         self

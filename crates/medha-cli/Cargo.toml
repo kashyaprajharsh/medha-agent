@@ -13,17 +13,17 @@ path = "src/main.rs"
 kernel.workspace = true
 providers.workspace = true
 context.workspace = true
-tools = { path = "../tools" }
-memory = { path = "../memory" }
-sandbox = { path = "../sandbox" }
-store = { path = "../store" }
+tools = { version = "0.1.8", path = "../tools" }
+memory = { version = "0.1.8", path = "../memory" }
+sandbox = { version = "0.1.8", path = "../sandbox" }
+store = { version = "0.1.8", path = "../store" }
 ulid.workspace = true
-policy = { path = "../policy" }
-lockfile = { path = "../lockfile" }
-lsp = { path = "../lsp" }
-mcp = { path = "../mcp" }
-orchestrator = { path = "../orchestrator" }
-gate = { path = "../gate" }
+policy = { version = "0.1.8", path = "../policy" }
+lockfile = { version = "0.1.8", path = "../lockfile" }
+lsp = { version = "0.1.8", path = "../lsp" }
+mcp = { version = "0.1.8", path = "../mcp" }
+orchestrator = { version = "0.1.8", path = "../orchestrator" }
+gate = { version = "0.1.8", path = "../gate" }
 tokio = { workspace = true, features = ["process", "io-std", "io-util"] }
 tokio-util = { version = "0.7" }
 serde.workspace = true

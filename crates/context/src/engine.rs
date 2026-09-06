@@ -261,7 +261,9 @@ impl ContextEngine for PipelineEngine {
         max_input_tokens: Option<u32>,
         control: &kernel::CompileControl,
     ) -> Result<CompileResult, kernel::ContextCompileError> {
-        let result = self.compile_inner(messages, max_input_tokens, control).await;
+        let result = self
+            .compile_inner(messages, max_input_tokens, control)
+            .await;
         // `after_tokens` is this engine's estimate of the request as actually
         // sent — the compacted size when compaction ran, the untouched size
         // otherwise. Pairing it with the usage that comes back is what lets the
@@ -489,17 +491,17 @@ impl PipelineEngine {
                     source_index: Some(tail_start + offset),
                 }),
         );
-        if summarized {
-            if let (Some(refresh), Some(system)) = (
+        if summarized
+            && let (Some(refresh), Some(system)) = (
                 &self.full_compaction_refresh,
                 out.iter_mut()
                     .find(|tracked| tracked.message.role == Role::System),
-            ) {
-                system.message.content = refresh(&system.message.content);
-                // A refreshed system sheath is generated content, even if a
-                // particular refresh happens to return the same visible text.
-                system.source_index = None;
-            }
+            )
+        {
+            system.message.content = refresh(&system.message.content);
+            // A refreshed system sheath is generated content, even if a
+            // particular refresh happens to return the same visible text.
+            system.source_index = None;
         }
         let after = out
             .iter()

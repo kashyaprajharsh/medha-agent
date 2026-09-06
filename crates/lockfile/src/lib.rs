@@ -31,7 +31,10 @@ mod serde_ts {
     where
         S: Serializer,
     {
-        serializer.serialize_u64(time.duration_since(UNIX_EPOCH).unwrap().as_secs())
+        let elapsed = time
+            .duration_since(UNIX_EPOCH)
+            .map_err(serde::ser::Error::custom)?;
+        serializer.serialize_u64(elapsed.as_secs())
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
@@ -39,7 +42,9 @@ mod serde_ts {
         D: Deserializer<'de>,
     {
         let secs = u64::deserialize(deserializer)?;
-        Ok(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(secs))
+            .ok_or_else(|| serde::de::Error::custom("timestamp is out of range"))
     }
 }
 
@@ -625,6 +630,32 @@ impl MedhaLock {
     pub fn parse(text: &str) -> Result<Self, String> {
         let lock: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         lock.sandbox.validate()?;
+        if lock
+            .budget
+            .max_cost_usd
+            .is_some_and(|n| !n.is_finite() || n < 0.0)
+        {
+            return Err("budget.max_cost_usd must be finite and non-negative".into());
+        }
+        match (lock.pricing.input_per_mtok, lock.pricing.output_per_mtok) {
+            (None, None) => {}
+            (Some(input), Some(output))
+                if input.is_finite() && output.is_finite() && input >= 0.0 && output >= 0.0 => {}
+            _ => return Err(
+                "pricing requires both input_per_mtok and output_per_mtok, finite and non-negative"
+                    .into(),
+            ),
+        }
+        for (name, value) in [
+            ("trigger_ratio", lock.context.trigger_ratio),
+            ("microcompact_ratio", lock.context.microcompact_ratio),
+            ("tail_ratio", lock.context.tail_ratio),
+            ("emergency_ratio", lock.context.emergency_ratio),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(format!("context.{name} must be finite and between 0 and 1"));
+            }
+        }
         Ok(lock)
     }
 
@@ -699,6 +730,24 @@ mod tests {
 
         assert_eq!(lock.permissions.trusted_paths.len(), 1);
         assert_eq!(lock.permissions.trusted_paths[0].path, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn invalid_numeric_limits_are_configuration_errors() {
+        for text in [
+            "[budget]\nmax_cost_usd = nan",
+            "[budget]\nmax_cost_usd = inf",
+            "[budget]\nmax_cost_usd = -1.0",
+            "[pricing]\ninput_per_mtok = 1.0",
+            "[pricing]\ninput_per_mtok = -1.0\noutput_per_mtok = 1.0",
+            "[context]\ntrigger_ratio = nan",
+            "[context]\nemergency_ratio = 1.5",
+            "[context]\ntail_ratio = -0.5",
+        ] {
+            assert!(MedhaLock::parse(text).is_err(), "accepted {text}");
+        }
+        assert!(MedhaLock::parse("[budget]\nmax_cost_usd = 0.0").is_ok());
+        assert!(MedhaLock::parse("[pricing]\ninput_per_mtok = 0.0\noutput_per_mtok = 0.0").is_ok());
     }
 
     #[test]

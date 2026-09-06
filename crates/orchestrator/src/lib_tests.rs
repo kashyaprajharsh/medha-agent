@@ -3,6 +3,13 @@ use async_trait::async_trait;
 use kernel::{BlastRadius, Message, Observation, Role, ToolCategory, ToolIntent, ToolSpec};
 use serde_json::json;
 
+#[test]
+fn oversized_concurrency_does_not_panic() {
+    let (_, control) = control();
+    let control = control.with_limits(usize::MAX, 1);
+    assert_eq!(control.max_active, tokio::sync::Semaphore::MAX_PERMITS);
+}
+
 struct Tools;
 
 #[async_trait]

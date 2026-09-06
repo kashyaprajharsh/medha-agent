@@ -672,14 +672,13 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
             used += cw;
             hard_end += 1;
         }
-        if hard_end < n {
-            if let Some(sp) = (i..hard_end).rev().find(|&k| chars[k].0 == ' ') {
-                if sp > i {
-                    ranges.push((i, sp)); // drop the breaking space
-                    i = sp + 1;
-                    continue;
-                }
-            }
+        if hard_end < n
+            && let Some(sp) = (i..hard_end).rev().find(|&k| chars[k].0 == ' ')
+            && sp > i
+        {
+            ranges.push((i, sp)); // drop the breaking space
+            i = sp + 1;
+            continue;
         }
         ranges.push((i, hard_end));
         i = hard_end;
@@ -2570,16 +2569,16 @@ impl Model {
     /// notice with this `prefix`, update it in place — re-running the command
     /// must refresh one block, not stack identical copies in the scrollback.
     fn upsert_notice(&mut self, prefix: &str, text: String) {
-        if let Some(e) = self.items.back_mut() {
-            if matches!(&e.item, Item::Notice(n) if n.starts_with(prefix)) {
-                e.item = Item::Notice(text);
-                e.invalidate();
-                self.dirty = true;
-                if self.auto_scroll {
-                    self.scroll_to_bottom();
-                }
-                return;
+        if let Some(e) = self.items.back_mut()
+            && matches!(&e.item, Item::Notice(n) if n.starts_with(prefix))
+        {
+            e.item = Item::Notice(text);
+            e.invalidate();
+            self.dirty = true;
+            if self.auto_scroll {
+                self.scroll_to_bottom();
             }
+            return;
         }
         self.push_item(Item::Notice(text));
     }

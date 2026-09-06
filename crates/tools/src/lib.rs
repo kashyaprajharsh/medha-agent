@@ -2515,11 +2515,11 @@ impl Tool for CodeOutline {
         let mut symbols: Vec<Value> = Vec::new();
         for (i, line) in content.lines().enumerate() {
             for (kind, re) in &rules {
-                if let Some(caps) = re.captures(line) {
-                    if let Some(name) = caps.name("name") {
-                        symbols.push(json!({ "kind": kind, "name": name.as_str(), "line": i + 1 }));
-                        break; // one symbol per line
-                    }
+                if let Some(caps) = re.captures(line)
+                    && let Some(name) = caps.name("name")
+                {
+                    symbols.push(json!({ "kind": kind, "name": name.as_str(), "line": i + 1 }));
+                    break; // one symbol per line
                 }
             }
         }
@@ -3069,12 +3069,12 @@ fn resolve_public_url(url: &reqwest::Url) -> Result<PublicTarget, String> {
 /// front, so the cap also bounds peak memory use.
 async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>, ToolError> {
     use futures::StreamExt;
-    if let Some(len) = resp.content_length() {
-        if len as usize > max {
-            return Err(ToolError::Failed(format!(
-                "response too large: Content-Length {len} exceeds {max}-byte cap"
-            )));
-        }
+    if let Some(len) = resp.content_length()
+        && len as usize > max
+    {
+        return Err(ToolError::Failed(format!(
+            "response too large: Content-Length {len} exceeds {max}-byte cap"
+        )));
     }
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
@@ -3494,10 +3494,10 @@ async fn tavily_crawl(
         "extract_depth": "basic",
         "format": "markdown",
     });
-    if let Some(i) = instructions {
-        if !i.trim().is_empty() {
-            body["instructions"] = json!(i.trim());
-        }
+    if let Some(i) = instructions
+        && !i.trim().is_empty()
+    {
+        body["instructions"] = json!(i.trim());
     }
     let resp = client
         .post("https://api.tavily.com/crawl")
@@ -5492,11 +5492,11 @@ impl Tool for Git {
             other => return Err(ToolError::Args(format!("unknown git subcommand '{other}'"))),
         }
         // User paths go after `--` so they can never be read as flags.
-        if matches!(sub.as_str(), "diff" | "log" | "blame") {
-            if let Some(p) = path {
-                ga.push("--".into());
-                ga.push(safe_git_arg(p)?.into());
-            }
+        if matches!(sub.as_str(), "diff" | "log" | "blame")
+            && let Some(p) = path
+        {
+            ga.push("--".into());
+            ga.push(safe_git_arg(p)?.into());
         }
         if sub == "add" {
             ga.push("--".into());
@@ -6211,10 +6211,10 @@ impl Tool for UpdatePlan {
         }
         let done = out.iter().filter(|s| s["status"] == "completed").count();
         let mut result = json!({ "steps": out, "total": out.len(), "done": done });
-        if let Some(exp) = args.get("explanation").and_then(Value::as_str) {
-            if !exp.trim().is_empty() {
-                result["explanation"] = json!(exp.trim());
-            }
+        if let Some(exp) = args.get("explanation").and_then(Value::as_str)
+            && !exp.trim().is_empty()
+        {
+            result["explanation"] = json!(exp.trim());
         }
         Ok(result)
     }
@@ -6230,11 +6230,11 @@ mod tests {
         let mut out = Vec::new();
         for (i, line) in src.lines().enumerate() {
             for (kind, re) in &rules {
-                if let Some(c) = re.captures(line) {
-                    if let Some(n) = c.name("name") {
-                        out.push((kind.to_string(), n.as_str().to_string(), i + 1));
-                        break;
-                    }
+                if let Some(c) = re.captures(line)
+                    && let Some(n) = c.name("name")
+                {
+                    out.push((kind.to_string(), n.as_str().to_string(), i + 1));
+                    break;
                 }
             }
         }

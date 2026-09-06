@@ -399,10 +399,9 @@ pub async fn check_update(store: &crate::skills::SkillStore, name: &str) -> Upda
         return UpdateStatus::Unmanaged("no recorded source");
     };
     if let (Some(recorded), Some(disk)) = (prov.content_hash.as_deref(), store.installed_hash(name))
+        && recorded != disk
     {
-        if recorded != disk {
-            return UpdateStatus::ModifiedLocally;
-        }
+        return UpdateStatus::ModifiedLocally;
     }
     if prov.kind != "github-folder" {
         return UpdateStatus::Unmanaged("installed from a non-GitHub source");

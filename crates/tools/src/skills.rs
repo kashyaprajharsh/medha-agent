@@ -811,12 +811,12 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
         let Ok(ty) = entry.file_type() else { continue };
         if ty.is_dir() {
             collect_files(root, &path, out);
-        } else if ty.is_file() {
-            if let Ok(rel) = path.strip_prefix(root) {
-                let rel = crate::portable_rel(rel);
-                if rel != "SKILL.md" {
-                    out.push(rel);
-                }
+        } else if ty.is_file()
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            let rel = crate::portable_rel(rel);
+            if rel != "SKILL.md" {
+                out.push(rel);
             }
         }
     }

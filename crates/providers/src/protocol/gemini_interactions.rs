@@ -1326,7 +1326,7 @@ mod tests {
             let mut decoder = ResponseDecoder::new(HashMap::new());
             let mut blocks = Vec::new();
             for chunk in [&fixture[..split], &fixture[split..]] {
-                for event in framing.push(chunk) {
+                for event in framing.push(chunk).unwrap() {
                     blocks.extend(decoder.push(&event).unwrap());
                 }
             }

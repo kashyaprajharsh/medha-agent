@@ -385,10 +385,7 @@ impl ProviderClient {
         let resp = http::require_success(resp).await?;
 
         if !streaming {
-            let body = resp
-                .text()
-                .await
-                .map_err(|error| ProviderError::Transport(error.to_string()))?;
+            let body = http::response_text(resp).await?;
             let blocks = gemini_interactions::parse_interaction(&body, &names)?;
             return Ok(futures::stream::iter(blocks.into_iter().map(Ok)).boxed());
         }
@@ -416,7 +413,11 @@ impl ProviderClient {
                         return;
                     }
                     Ok(bytes) => {
-                        for event in sse.push(&bytes) {
+                        let events = match sse.push(&bytes) {
+                            Ok(events) => events,
+                            Err(error) => { yield Err(error); return; }
+                        };
+                        for event in events {
                             match decoder.push(&event) {
                                 Ok(blocks) => {
                                     for block in blocks {
@@ -977,10 +978,7 @@ impl Provider for ProviderClient {
         // of blocks (reasoning → text → tool intents → usage). The kernel loop
         // is identical; only the arrival shape differs.
         if !streaming {
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            let body = http::response_text(resp).await?;
             let blocks = openai_chat::parse_completion(&body, &names)?;
             return Ok(futures::stream::iter(blocks.into_iter().map(Ok)).boxed());
         }
@@ -1017,11 +1015,17 @@ impl Provider for ProviderClient {
                         yield Err(ProviderError::Transport(e.to_string()));
                         return;
                     }
-                    Ok(bytes) => for event in sse.push(&bytes) {
-                    match decoder.push(&event) {
-                        Ok(blocks) => for b in blocks { yield Ok(b); },
-                        Err(e) => { yield Err(e); return; }
-                    }
+                    Ok(bytes) => {
+                        let events = match sse.push(&bytes) {
+                            Ok(events) => events,
+                            Err(error) => { yield Err(error); return; }
+                        };
+                        for event in events {
+                            match decoder.push(&event) {
+                                Ok(blocks) => for b in blocks { yield Ok(b); },
+                                Err(e) => { yield Err(e); return; }
+                            }
+                        }
                     },
                 }
             }

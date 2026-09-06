@@ -15,9 +15,17 @@ pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
 }
 
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 impl SseDecoder {
     /// Append one arbitrary network chunk and return every complete event.
-    pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, kernel::ProviderError> {
+        if self.buffer.len().saturating_add(chunk.len()) > MAX_FRAME_BYTES {
+            self.buffer.clear();
+            return Err(kernel::ProviderError::Decode(
+                "provider SSE frame exceeds 8 MiB".into(),
+            ));
+        }
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
         while let Some(end) = find_record_end(&self.buffer) {
@@ -26,7 +34,7 @@ impl SseDecoder {
                 events.push(event);
             }
         }
-        events
+        Ok(events)
     }
 
     /// Preserve the existing tolerant EOF behavior: if a server closes after
@@ -112,7 +120,7 @@ mod tests {
         ] {
             let mut decoder = SseDecoder::default();
             assert_eq!(
-                decoder.push(bytes),
+                decoder.push(bytes).unwrap(),
                 vec![SseEvent {
                     event: None,
                     data: "one".into(),
@@ -126,8 +134,8 @@ mod tests {
         let fixture = b"event: content.delta\r\ndata: {\"value\":\r\ndata: \"hello\"}\r\n\r\n";
         for split in 0..=fixture.len() {
             let mut decoder = SseDecoder::default();
-            let mut events = decoder.push(&fixture[..split]);
-            events.extend(decoder.push(&fixture[split..]));
+            let mut events = decoder.push(&fixture[..split]).unwrap();
+            events.extend(decoder.push(&fixture[split..]).unwrap());
             assert_eq!(
                 events,
                 vec![SseEvent {
@@ -142,7 +150,7 @@ mod tests {
     #[test]
     fn finish_decodes_an_unterminated_final_record_and_ignores_comments() {
         let mut decoder = SseDecoder::default();
-        assert!(decoder.push(b": keepalive\n").is_empty());
+        assert!(decoder.push(b": keepalive\n").unwrap().is_empty());
         assert_eq!(
             decoder.finish(),
             None,
@@ -150,7 +158,7 @@ mod tests {
         );
 
         let mut decoder = SseDecoder::default();
-        assert!(decoder.push(b"data: final").is_empty());
+        assert!(decoder.push(b"data: final").unwrap().is_empty());
         assert_eq!(
             decoder.finish(),
             Some(SseEvent {
@@ -158,5 +166,18 @@ mod tests {
                 data: "final".into(),
             })
         );
+    }
+
+    #[test]
+    fn unterminated_frames_cannot_grow_without_bound() {
+        let mut decoder = SseDecoder::default();
+        assert!(
+            decoder
+                .push(&vec![b'x'; MAX_FRAME_BYTES])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(decoder.push(b"x").is_err());
+        assert!(decoder.buffer.is_empty());
     }
 }

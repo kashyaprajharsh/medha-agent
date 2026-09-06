@@ -645,14 +645,15 @@ pub(crate) fn process_sse_event(
                 }
                 if let Some(arguments) = function.arguments {
                     entry.2.push_str(&arguments);
-                    if !entry.1.is_empty() && !target_announced.contains(&index) {
-                        if let Some(target) = sniff_target(&entry.2) {
-                            target_announced.insert(index);
-                            blocks.push(Block::ToolStarted {
-                                name: entry.1.clone(),
-                                target: Some(target),
-                            });
-                        }
+                    if !entry.1.is_empty()
+                        && !target_announced.contains(&index)
+                        && let Some(target) = sniff_target(&entry.2)
+                    {
+                        target_announced.insert(index);
+                        blocks.push(Block::ToolStarted {
+                            name: entry.1.clone(),
+                            target: Some(target),
+                        });
                     }
                 }
             }
@@ -698,20 +699,19 @@ pub(crate) fn repair_args(arguments: serde_json::Value) -> serde_json::Value {
         }
         return arguments;
     }
-    if let Value::Object(map) = &arguments {
-        if map.len() == 1 {
-            let (key, value) = map.iter().next().expect("length checked");
-            if matches!(key.as_str(), "arguments" | "input" | "parameters" | "args") {
-                match value {
-                    Value::Object(_) => return value.clone(),
-                    Value::String(encoded) => {
-                        if let Ok(inner @ Value::Object(_)) = serde_json::from_str::<Value>(encoded)
-                        {
-                            return inner;
-                        }
+    if let Value::Object(map) = &arguments
+        && map.len() == 1
+    {
+        let (key, value) = map.iter().next().expect("length checked");
+        if matches!(key.as_str(), "arguments" | "input" | "parameters" | "args") {
+            match value {
+                Value::Object(_) => return value.clone(),
+                Value::String(encoded) => {
+                    if let Ok(inner @ Value::Object(_)) = serde_json::from_str::<Value>(encoded) {
+                        return inner;
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -900,7 +900,9 @@ mod tests {
         }"#;
         let blocks = parse_completion(body, &HashMap::new()).expect("null fields must parse");
         assert!(
-            blocks.iter().any(|block| matches!(block, Block::Text(text) if text == "Hello!")),
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text(text) if text == "Hello!")),
             "expected the assistant text, got {blocks:?}"
         );
     }

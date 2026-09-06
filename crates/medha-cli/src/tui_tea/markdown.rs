@@ -170,7 +170,7 @@ impl Renderer {
                 }
                 None => {
                     // Alternate bullet glyph by depth for visual nesting.
-                    let glyph = if self.lists.len() % 2 == 0 {
+                    let glyph = if self.lists.len().is_multiple_of(2) {
                         "◦ "
                     } else {
                         "• "
@@ -398,16 +398,17 @@ impl Renderer {
             TagEnd::Strikethrough => self.inline.strike = false,
             TagEnd::Link | TagEnd::Image => {
                 // Keep the target visible in either the cell or the transcript.
-                if let Some(dest) = self.link_dest.take() {
-                    if !dest.is_empty() && !dest.starts_with('#') {
-                        if let Some(tb) = self.table.as_mut() {
-                            tb.cur_cell.push_str(&format!(" ({dest})"));
-                        } else {
-                            self.cur.push(Span::styled(
-                                format!(" ({dest})"),
-                                Style::default().fg(theme::faint()),
-                            ));
-                        }
+                if let Some(dest) = self.link_dest.take()
+                    && !dest.is_empty()
+                    && !dest.starts_with('#')
+                {
+                    if let Some(tb) = self.table.as_mut() {
+                        tb.cur_cell.push_str(&format!(" ({dest})"));
+                    } else {
+                        self.cur.push(Span::styled(
+                            format!(" ({dest})"),
+                            Style::default().fg(theme::faint()),
+                        ));
                     }
                 }
                 self.inline.link = false;

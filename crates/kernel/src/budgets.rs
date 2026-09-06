@@ -167,6 +167,13 @@ impl Governor {
     /// `Some(reason)` if any ceiling is reached — stop before the turn. Turns are
     /// this session's; everything else measures against the pool when there is one.
     pub fn check(&self) -> Option<BudgetStop> {
+        if self
+            .budget
+            .max_cost_usd
+            .is_some_and(|n| !n.is_finite() || n < 0.0)
+        {
+            return Some(BudgetStop::Cost);
+        }
         if matches!(self.budget.max_turns, Some(m) if self.turns >= m) {
             return Some(BudgetStop::Turns);
         }
@@ -226,6 +233,13 @@ impl Governor {
         output_tokens: Option<u64>,
         pricing: Option<Pricing>,
     ) -> Result<ModelReservation, BudgetStop> {
+        if self
+            .budget
+            .max_cost_usd
+            .is_some_and(|n| !n.is_finite() || n < 0.0)
+        {
+            return Err(BudgetStop::Cost);
+        }
         if self.budget.max_tokens.is_some() && (prompt_tokens.is_none() || output_tokens.is_none())
         {
             return Err(BudgetStop::Tokens);
@@ -393,6 +407,29 @@ impl Drop for ModelReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_cost_limits_never_admit_spend() {
+        for limit in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let mut governor = Governor::new(Budget {
+                max_cost_usd: Some(limit),
+                ..Budget::default()
+            });
+            assert_eq!(governor.check(), Some(BudgetStop::Cost));
+            assert!(matches!(
+                governor.reserve_model(
+                    Some(1),
+                    Some(1),
+                    Some(Pricing {
+                        input_per_mtok: 1.0,
+                        output_per_mtok: 1.0,
+                        indicative: false,
+                    })
+                ),
+                Err(BudgetStop::Cost)
+            ));
+        }
+    }
 
     #[test]
     fn turn_cap_trips() {

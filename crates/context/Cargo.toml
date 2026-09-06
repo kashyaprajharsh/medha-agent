@@ -13,7 +13,7 @@ async-trait.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tiktoken-rs = "0.12.0"
-guard-policy = { package = "policy", path = "../policy" }
+guard-policy = { package = "policy", version = "0.1.8", path = "../policy" }
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]

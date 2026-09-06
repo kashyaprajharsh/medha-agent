@@ -8,7 +8,7 @@ rust-version.workspace = true
 [dependencies]
 kernel.workspace = true
 context.workspace = true
-sandbox = { path = "../sandbox" }
+sandbox = { version = "0.1.8", path = "../sandbox" }
 serde.workspace = true
 thiserror.workspace = true
 toml = "0.8"

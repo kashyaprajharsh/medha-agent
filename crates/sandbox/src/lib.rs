@@ -1531,10 +1531,10 @@ fn shell_redirection_roots(command: &str, cwd: &Path) -> Vec<PathBuf> {
             cwd.join(path)
         };
         let mut root = path;
-        if !root.is_dir() {
-            if let Some(parent) = root.parent() {
-                root = parent.to_path_buf();
-            }
+        if !root.is_dir()
+            && let Some(parent) = root.parent()
+        {
+            root = parent.to_path_buf();
         }
         if let Some(root) = resolve_prospective(&root) {
             roots.push(root);

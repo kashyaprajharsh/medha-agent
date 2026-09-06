@@ -12,6 +12,32 @@ use kernel::ProviderError;
 use crate::{AuthKind, ProviderProfile};
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bound successful non-streaming responses before allocating their full body.
+pub(crate) async fn response_text(response: reqwest::Response) -> Result<String, ProviderError> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(ProviderError::Decode(
+            "provider response exceeds 32 MiB".into(),
+        ));
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ProviderError::Transport(e.to_string()))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
+            return Err(ProviderError::Decode(
+                "provider response exceeds 32 MiB".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| ProviderError::Decode("provider response is not UTF-8".into()))
+}
 const REDACTED: &str = "<redacted>";
 
 /// Connection-establishment ceiling. An endpoint that never finishes a
@@ -259,6 +285,46 @@ fn is_sensitive_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn successful_responses_are_bounded_with_or_without_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for announced in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let header = if announced {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        MAX_RESPONSE_BODY_BYTES + 1
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".into()
+                };
+                socket.write_all(header.as_bytes()).await.unwrap();
+                if !announced {
+                    let chunk = vec![b'x'; 1024 * 1024];
+                    for _ in 0..=32 {
+                        if socket.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            let response = client()
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .unwrap();
+            let error = response_text(response).await.unwrap_err();
+            assert!(matches!(error, ProviderError::Decode(_)), "{error}");
+            assert!(error.to_string().contains("32 MiB"));
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn a_stalled_stream_retries_rather_than_failing_the_turn() {

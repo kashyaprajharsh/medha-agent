@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-kernel = { path = "../kernel" }
+kernel = { version = "0.1.8", path = "../kernel" }
 async-trait.workspace = true
 futures.workspace = true
 fd-lock = "4"

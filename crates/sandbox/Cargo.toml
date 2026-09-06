@@ -11,8 +11,8 @@ thiserror.workspace = true
 ulid.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "sync", "time", "rt"] }
-permissions = { path = "../permissions" }
-kernel = { path = "../kernel" }
+permissions = { version = "0.1.8", path = "../permissions" }
+kernel = { version = "0.1.8", path = "../kernel" }
 sha2 = "0.10"
 
 # Linux OS-native sandbox: Landlock LSM (kernel ≥5.13), no external binary.

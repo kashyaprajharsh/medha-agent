@@ -12,7 +12,7 @@
 workflows, and code, not only coding tasks.*
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-macOS%20·%20Linux%20·%20Windows-lightgrey.svg)](#install)
 [![Status](https://img.shields.io/badge/status-pre--1.0-yellow.svg)](#status)
 
@@ -28,7 +28,7 @@ workflows, and code, not only coding tasks.*
 
 Most agents ask you to trust the model. MEDHA doesn't.
 
-Every action a model proposes runs **validate → police → approve when required → execute → observe**. When configured, a deterministic verifier follows turns containing local-effect tools. Unregistered tools are denied, shell commands pass a danger scanner, consequential actions stop for your approval, and everything runs inside an OS sandbox. Nothing the model *says* causes an effect — only a policy-approved, sandboxed tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
+Every action a model proposes runs **validate → police → approve when required → execute → observe**. When configured, a deterministic verifier follows turns containing local-effect tools. Unregistered tools are denied, shell commands pass a danger scanner, consequential actions stop for your approval, and native OS isolation is used where available. If unavailable, Medha warns and falls back to host execution; the scanner and approval gate still apply. Nothing the model *says* causes an effect — only a policy-approved, sandboxed tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
 
 It runs on whatever model you have — a local Ollama or vLLM server, a hosted gateway, or Gemini natively.
 
@@ -59,7 +59,7 @@ curl -fsSL "https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/$versi
 curl -fsSL https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/main/install.sh \
   | MEDHA_INSTALL_DIR="$HOME/bin" sh                       # choose the destination
 
-git clone https://github.com/kashyaprajharsh/medha-agent   # build it yourself (Rust 1.85+)
+git clone https://github.com/kashyaprajharsh/medha-agent   # build it yourself (Rust 1.88+)
 cd medha-agent && cargo build --release
 ```
 

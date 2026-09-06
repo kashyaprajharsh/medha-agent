@@ -42,7 +42,7 @@ pub(super) fn update<P, L>(
                 model.intro_frame = if f >= 40 { None } else { Some(f + 1) };
             }
             // Poll inexpensive live state a few times per second.
-            if model.anim_frame % 16 == 0 {
+            if model.anim_frame.is_multiple_of(16) {
                 model.bg_tasks = kernel.executor.background_tasks();
                 let selected_switch_target = model.switch_selection();
                 let running = model
@@ -573,11 +573,11 @@ fn advance_search_setup(model: &mut Model) {
                 return;
             }
             let provider = setup.provider;
-            if let Some(cred_id) = config::search_cred_id(provider) {
-                if let Err(e) = config::store_key(cred_id, &value) {
-                    model.push_notice(format!("could not store API key: {e}"));
-                    return;
-                }
+            if let Some(cred_id) = config::search_cred_id(provider)
+                && let Err(e) = config::store_key(cred_id, &value)
+            {
+                model.push_notice(format!("could not store API key: {e}"));
+                return;
             }
             commit_search(model, provider, None);
         }
@@ -689,10 +689,10 @@ fn advance_model_setup<P: ProfileProvider>(
                 model.model_setup = None;
                 let resolved: Result<config::Resolved, String> = match model.model_config.lock() {
                     Ok(mut cfg) => {
-                        if let Some(saved) = cfg.models.get_mut(&profile) {
-                            if !saved.auth.requires_credential() {
-                                saved.auth = providers::AuthKind::for_protocol(saved.protocol);
-                            }
+                        if let Some(saved) = cfg.models.get_mut(&profile)
+                            && !saved.auth.requires_credential()
+                        {
+                            saved.auth = providers::AuthKind::for_protocol(saved.protocol);
                         }
                         config::save(&cfg)
                             .map_err(|e| format!("could not write config: {e}"))
@@ -837,11 +837,11 @@ fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
         token_accounting: kernel::TokenAccountingMode::Adaptive,
         reasoning: kernel::ReasoningSupport::Unknown,
     };
-    if !completed.api_key.is_empty() {
-        if let Err(e) = config::store_key(&completed.base_url, &completed.api_key) {
-            model.push_notice(format!("could not store API key: {e}"));
-            return;
-        }
+    if !completed.api_key.is_empty()
+        && let Err(e) = config::store_key(&completed.base_url, &completed.api_key)
+    {
+        model.push_notice(format!("could not store API key: {e}"));
+        return;
     }
     let saved: Result<(String, config::Resolved), String> = match model.model_config.lock() {
         Ok(mut cfg) => {
@@ -1233,37 +1233,37 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
-                if let PickerKind::Session(sessions) = &picker.kind {
-                    if let Some(meta) = sessions.get(picker.selected) {
-                        let id = meta.id;
-                        if model.foreground_owned() || model.has_active_agents() {
-                            model.picker = None;
-                            model.push_notice(
-                                "finish foreground and background work before resuming a session",
-                            );
-                            return;
-                        }
-                        model.session_op = Some(SessionOp::Resume {
-                            source: session.id,
-                            target: id,
-                        });
-                        let log = kernel.log.clone();
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let events = log.events(id).await;
-                            let msgs = kernel::project_messages(&events);
-                            let _ = tx.send(TuiEvent::Resumed(id, msgs, events));
-                        });
+                if let PickerKind::Session(sessions) = &picker.kind
+                    && let Some(meta) = sessions.get(picker.selected)
+                {
+                    let id = meta.id;
+                    if model.foreground_owned() || model.has_active_agents() {
                         model.picker = None;
-                        model.push_notice(format!("(loading session {id} …)"));
+                        model.push_notice(
+                            "finish foreground and background work before resuming a session",
+                        );
                         return;
                     }
+                    model.session_op = Some(SessionOp::Resume {
+                        source: session.id,
+                        target: id,
+                    });
+                    let log = kernel.log.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let events = log.events(id).await;
+                        let msgs = kernel::project_messages(&events);
+                        let _ = tx.send(TuiEvent::Resumed(id, msgs, events));
+                    });
+                    model.picker = None;
+                    model.push_notice(format!("(loading session {id} …)"));
+                    return;
                 }
-                if let PickerKind::Rewind(points) = &picker.kind {
-                    if let Some(point) = points.get(picker.selected).cloned() {
-                        model.picker = Some(Picker::new(PickerKind::RewindMode(point)));
-                        return;
-                    }
+                if let PickerKind::Rewind(points) = &picker.kind
+                    && let Some(point) = points.get(picker.selected).cloned()
+                {
+                    model.picker = Some(Picker::new(PickerKind::RewindMode(point)));
+                    return;
                 }
                 if let PickerKind::RewindMode(point) = &picker.kind {
                     let scope = point
@@ -1851,27 +1851,27 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
         }
         _ => None,
     };
-    if let Some(choice) = sel {
-        if let Some(pending) = model.pending_approvals.pop_front() {
-            // Card is about to leave the screen; the next queued approval (if any)
-            // will render on the next frame and re-arm `approval_ready` then.
-            model.approval_ready = false;
-            model.approval_sel = 0;
-            // "Always allow" on a standard prompt remembers the action. Network
-            // grants persist through the shared grant handle, never here.
-            if choice == 1
-                && !pending.escalated
-                && matches!(pending.responder, super::ApprovalResponder::Standard(_))
-            {
-                model.auto_approve.insert(pending.action.clone());
-            }
-            let verb = pending.responder.verb(choice);
-            model.push_main_notice(format!("{verb} {}", pending.action));
-            // The approval card is global even while a child pane is visible.
-            // Rebuild its cached rows before the next prompt can accept input.
-            model.dirty = true;
-            pending.responder.answer(choice);
+    if let Some(choice) = sel
+        && let Some(pending) = model.pending_approvals.pop_front()
+    {
+        // Card is about to leave the screen; the next queued approval (if any)
+        // will render on the next frame and re-arm `approval_ready` then.
+        model.approval_ready = false;
+        model.approval_sel = 0;
+        // "Always allow" on a standard prompt remembers the action. Network
+        // grants persist through the shared grant handle, never here.
+        if choice == 1
+            && !pending.escalated
+            && matches!(pending.responder, super::ApprovalResponder::Standard(_))
+        {
+            model.auto_approve.insert(pending.action.clone());
         }
+        let verb = pending.responder.verb(choice);
+        model.push_main_notice(format!("{verb} {}", pending.action));
+        // The approval card is global even while a child pane is visible.
+        // Rebuild its cached rows before the next prompt can accept input.
+        model.dirty = true;
+        pending.responder.answer(choice);
     }
 }
 
@@ -1968,11 +1968,12 @@ pub(super) fn handle_clarify_key(model: &mut Model, key: KeyEvent) {
         // the Other editor (Space does) — so it's never a dead end on the Other
         // row of a multi-question form.
         KeyCode::Enter => {
-            if !multi && cursor < other_row {
-                if let Some(s) = model.clarify.as_mut() {
-                    toggle_option(s, cursor, false);
-                    s.validation = None;
-                }
+            if !multi
+                && cursor < other_row
+                && let Some(s) = model.clarify.as_mut()
+            {
+                toggle_option(s, cursor, false);
+                s.validation = None;
             }
             let (idx, last) = model
                 .clarify
@@ -2074,22 +2075,22 @@ fn submit_clarify(model: &mut Model) {
     // A radio question promises exactly one answer. Keep the form open and move
     // focus to the first incomplete question instead of returning an ambiguous
     // empty selection to the agent.
-    if let Some(state) = model.clarify.as_mut() {
-        if let Some(i) = state.questions.iter().enumerate().find_map(|(i, q)| {
+    if let Some(state) = model.clarify.as_mut()
+        && let Some(i) = state.questions.iter().enumerate().find_map(|(i, q)| {
             let d = &state.drafts[i];
             (!q.multi_select && d.selected.is_empty() && d.other.is_none()).then_some(i)
-        }) {
-            state.idx = i;
-            state.cursor = 0;
-            let label = state.questions[i].header.trim();
-            state.validation = Some(if label.is_empty() {
-                "Choose one option or enter an Other answer before submitting.".to_string()
-            } else {
-                format!("Choose an answer for {label}, or enter Other.")
-            });
-            model.dirty = true;
-            return;
-        }
+        })
+    {
+        state.idx = i;
+        state.cursor = 0;
+        let label = state.questions[i].header.trim();
+        state.validation = Some(if label.is_empty() {
+            "Choose one option or enter an Other answer before submitting.".to_string()
+        } else {
+            format!("Choose an answer for {label}, or enter Other.")
+        });
+        model.dirty = true;
+        return;
     }
 
     if let Some(state) = model.clarify.take() {
@@ -2299,10 +2300,10 @@ pub(super) fn handle_agent_event(
                     .iter()
                     .map(|q| {
                         let mut d = ClarifyDraft::default();
-                        if !q.multi_select {
-                            if let Some(i) = q.options.iter().position(|o| o.recommended) {
-                                d.selected = vec![i];
-                            }
+                        if !q.multi_select
+                            && let Some(i) = q.options.iter().position(|o| o.recommended)
+                        {
+                            d.selected = vec![i];
                         }
                         d
                     })
@@ -5195,10 +5196,10 @@ fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEve
     let arg = arg.trim();
     let apply_all = arg == "--all" || arg == "all";
     let single = (!arg.is_empty() && !apply_all).then(|| arg.to_string());
-    if let Some(name) = &single {
-        if !names.iter().any(|n| n == name) {
-            return model.push_notice(format!("no installed user skill named '{name}'"));
-        }
+    if let Some(name) = &single
+        && !names.iter().any(|n| n == name)
+    {
+        return model.push_notice(format!("no installed user skill named '{name}'"));
     }
     let notice = match &single {
         _ if apply_all => "updating all skills".to_string(),

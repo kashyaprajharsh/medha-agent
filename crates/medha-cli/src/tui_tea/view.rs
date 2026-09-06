@@ -633,15 +633,15 @@ pub(super) fn render_plan(payload: &serde_json::Value) -> Vec<Line<'static>> {
         ),
     ])];
     // Optional one-line note about this update, rendered inline.
-    if let Some(exp) = payload.get("explanation").and_then(|v| v.as_str()) {
-        if !exp.trim().is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", exp.trim()),
-                Style::default()
-                    .fg(theme::faint())
-                    .add_modifier(Modifier::ITALIC),
-            )));
-        }
+    if let Some(exp) = payload.get("explanation").and_then(|v| v.as_str())
+        && !exp.trim().is_empty()
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", exp.trim()),
+            Style::default()
+                .fg(theme::faint())
+                .add_modifier(Modifier::ITALIC),
+        )));
     }
     for s in steps {
         let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -770,14 +770,14 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
                 format!("  ↯ {how} context · {before} → {after} tokens{hint}"),
                 Style::default().fg(theme::warn()),
             ))];
-            if cx.show_summary {
-                if let Some(s) = summary {
-                    for l in s.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("    {l}"),
-                            Style::default().fg(theme::dim()),
-                        )));
-                    }
+            if cx.show_summary
+                && let Some(s) = summary
+            {
+                for l in s.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {l}"),
+                        Style::default().fg(theme::dim()),
+                    )));
                 }
             }
             lines
@@ -2212,10 +2212,8 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     {
         draw_autocomplete(f, model, pad_h(chunks[2]));
     }
-    if !gate_open {
-        if let Some(picker) = &model.picker {
-            draw_picker(f, picker, pad_h(chunks[2]));
-        }
+    if !gate_open && let Some(picker) = &model.picker {
+        draw_picker(f, picker, pad_h(chunks[2]));
     }
     // The clarify form owns the overlay space while it's up (like the approval card).
     if let Some(state) = &model.clarify {

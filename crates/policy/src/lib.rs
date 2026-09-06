@@ -586,10 +586,10 @@ fn rm_delete_tier(c: &str, workspace: Option<&str>) -> Option<RmTier> {
             }
             // An absolute target at/under the workspace root is as safe as a
             // workspace-relative one (`<workspace>/build` == `./build`) → skip.
-            if let Some(ws) = workspace {
-                if p == ws || p.starts_with(&format!("{ws}/")) {
-                    continue;
-                }
+            if let Some(ws) = workspace
+                && (p == ws || p.starts_with(&format!("{ws}/")))
+            {
+                continue;
             }
             // Filesystem root, home root, or a system dir → never (strictest wins).
             if is_system_path(p) {

@@ -462,8 +462,14 @@ mod error_class_tests {
              but MAX_KV_SIZE is 32768."
                 .into(),
         );
-        assert!(mlx_vlm.is_context_overflow(), "mlx-vlm overflow must classify");
-        assert!(!mlx_vlm.is_retryable(), "overflow compacts, it does not retry as-is");
+        assert!(
+            mlx_vlm.is_context_overflow(),
+            "mlx-vlm overflow must classify"
+        );
+        assert!(
+            !mlx_vlm.is_retryable(),
+            "overflow compacts, it does not retry as-is"
+        );
         assert_eq!(
             mlx_vlm.classify(),
             ProviderFailure::InputContextOverflow {
@@ -473,11 +479,12 @@ mod error_class_tests {
         );
 
         // An output-shaped rejection must NOT be swept up by the new patterns.
-        let output = ProviderError::Status(
-            400,
-            "max_tokens is too large: available_tokens 512".into(),
+        let output =
+            ProviderError::Status(400, "max_tokens is too large: available_tokens 512".into());
+        assert!(
+            !output.is_context_overflow(),
+            "output limits stay output limits"
         );
-        assert!(!output.is_context_overflow(), "output limits stay output limits");
     }
 
     #[test]

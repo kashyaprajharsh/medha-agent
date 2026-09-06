@@ -499,6 +499,12 @@ pub trait EventLog: Send + Sync {
     async fn append(&self, e: Event) -> Result<Event, KernelError>;
     async fn events(&self, session: Ulid) -> Vec<Event>;
 
+    /// Read trusted history, propagating integrity and storage failures. Durable
+    /// backends override this; ephemeral logs have no serialized trust boundary.
+    async fn checked_events(&self, session: Ulid) -> Result<Vec<Event>, KernelError> {
+        Ok(self.events(session).await)
+    }
+
     /// Acquire the durable writer lane for one state identity. The lease must
     /// stay alive from before the side effect through its `ToolObs` and any
     /// derived event. Single-process backends can use this no-op default.
@@ -520,7 +526,7 @@ pub trait EventLog: Send + Sync {
     /// This is what makes rewind non-destructive. `at_event` is a cut *before* it.
     /// The default impl rebuilds via [`Self::events`] + [`Self::append`].
     async fn fork(&self, session: Ulid, at_event: Ulid) -> Result<Ulid, KernelError> {
-        let events = self.events(session).await;
+        let events = self.checked_events(session).await?;
         let idx = cut_index(&events, at_event).ok_or_else(|| {
             KernelError::Log(format!("event {at_event} not in session {session}"))
         })?;
@@ -1120,19 +1126,19 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                 if e.payload.get("snapshot").is_some() {
                     continue;
                 }
-                if let Some(summary) = e.payload.get("summary").and_then(Value::as_str) {
-                    if !summary.trim().is_empty() {
-                        canonical_call_ids.clear();
-                        if retain_checkpoint_system {
-                            out.retain(|message| message.role == crate::types::Role::System);
-                        } else {
-                            out.clear();
-                        }
-                        text.clear();
-                        intents.clear();
-                        assistant_open = false;
-                        out.push(Message::new(crate::types::Role::Assistant, summary));
+                if let Some(summary) = e.payload.get("summary").and_then(Value::as_str)
+                    && !summary.trim().is_empty()
+                {
+                    canonical_call_ids.clear();
+                    if retain_checkpoint_system {
+                        out.retain(|message| message.role == crate::types::Role::System);
+                    } else {
+                        out.clear();
                     }
+                    text.clear();
+                    intents.clear();
+                    assistant_open = false;
+                    out.push(Message::new(crate::types::Role::Assistant, summary));
                 }
             }
             _ => {} // reasoning / policy / session — not conversation
@@ -1290,17 +1296,17 @@ fn project_ordered_messages_impl(
                 if event.payload.get("snapshot").is_some() {
                     continue;
                 }
-                if let Some(summary) = event.payload.get("summary").and_then(Value::as_str) {
-                    if !summary.trim().is_empty() {
-                        canonical_call_ids.clear();
-                        if retain_checkpoint_system {
-                            out.retain(|message| message.role == crate::types::Role::System);
-                        } else {
-                            out.clear();
-                        }
-                        assistant_parts.clear();
-                        out.push(Message::new(crate::types::Role::Assistant, summary).ordered());
+                if let Some(summary) = event.payload.get("summary").and_then(Value::as_str)
+                    && !summary.trim().is_empty()
+                {
+                    canonical_call_ids.clear();
+                    if retain_checkpoint_system {
+                        out.retain(|message| message.role == crate::types::Role::System);
+                    } else {
+                        out.clear();
                     }
+                    assistant_parts.clear();
+                    out.push(Message::new(crate::types::Role::Assistant, summary).ordered());
                 }
             }
             _ => {}

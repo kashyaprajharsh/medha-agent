@@ -26,6 +26,25 @@ env:
   MEDHA_LSP_E2E: "0"
 
 jobs:
+  minimum-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: "1.88"
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: minimum-rust-1.88
+      - name: Check minimum supported Rust
+        run: cargo +1.88 check --workspace --all-targets --locked
+
   # Formatting and linting are platform-independent.
   lint:
     runs-on: ubuntu-latest

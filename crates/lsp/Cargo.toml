@@ -8,7 +8,7 @@ license.workspace = true
 dirs = "5"
 fd-lock = "4"
 futures.workspace = true
-sandbox = { path = "../sandbox" }
+sandbox = { version = "0.1.8", path = "../sandbox" }
 serde.workspace = true
 serde_json.workspace = true
 similar = "2"

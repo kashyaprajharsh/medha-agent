@@ -52,7 +52,10 @@ mod serde_ts {
     where
         S: Serializer,
     {
-        serializer.serialize_u64(time.duration_since(UNIX_EPOCH).unwrap().as_secs())
+        let elapsed = time
+            .duration_since(UNIX_EPOCH)
+            .map_err(serde::ser::Error::custom)?;
+        serializer.serialize_u64(elapsed.as_secs())
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
@@ -60,7 +63,9 @@ mod serde_ts {
         D: Deserializer<'de>,
     {
         let secs = u64::deserialize(deserializer)?;
-        Ok(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(secs))
+            .ok_or_else(|| serde::de::Error::custom("timestamp is out of range"))
     }
 }
 
@@ -1122,6 +1127,18 @@ impl PermissionManager {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_persisted_timestamps_return_errors_without_panicking() {
+        let value =
+            serde_json::json!({"path": "/tmp", "permission": "Read", "granted_at": u64::MAX});
+        assert!(serde_json::from_value::<super::TrustedPath>(value).is_err());
+        let grant = super::TrustedPath {
+            path: "/tmp".into(),
+            permission: super::PermissionType::Read,
+            granted_at: std::time::UNIX_EPOCH - std::time::Duration::from_secs(1),
+        };
+        assert!(serde_json::to_value(grant).is_err());
+    }
     use super::*;
     use kernel::Approval;
     use std::process::Command;

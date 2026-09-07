@@ -600,6 +600,8 @@ pub async fn list_models_for_profile(
     // unreachable endpoint must not hang the launch (it falls back gracefully).
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(6))
+        // Model discovery carries the credential too — see transport::http::client.
+        .no_proxy()
         .build()
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
     match profile.protocol {

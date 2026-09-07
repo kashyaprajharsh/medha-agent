@@ -245,6 +245,19 @@ fn required_completion_failure_exits_nonzero_but_plan_does_not_run_checks() {
         let ws = root.path().join(format!("{mode}-{success}"));
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("medha.lock"), format!("[verify]\ncommand = {check:?}\nrequired = true\ntimeout_s = 2\n[agents]\nenabled = false\n[lsp]\nenabled = false\n")).unwrap();
+        // `verify.command` is repo-supplied privilege; accept it the way an
+        // operator would before exercising what it does.
+        let accept = Command::new(env!("CARGO_BIN_EXE_medha"))
+            .args(["trust", "--yes"])
+            .current_dir(&ws)
+            .env("MEDHA_HOME", ws.join("home"))
+            .output()
+            .unwrap();
+        assert!(
+            accept.status.success(),
+            "{}",
+            String::from_utf8_lossy(&accept.stderr)
+        );
         let output = configured_medha(&ws, &ws.join("home"))
             .env("MEDHA_MODE", mode)
             .env_remove("MEDHA_VERIFY")

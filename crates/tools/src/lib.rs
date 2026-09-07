@@ -1469,7 +1469,9 @@ impl Tool for FsRead {
          whole file by default; for large files pass `offset` (1-based start line) \
          and/or `limit` (line count) to read just a slice and save context. Typical \
          flow: `glob`/`grep` to locate the file and line, then read the range around \
-         it rather than the whole file."
+         it rather than the whole file. Content is returned verbatim without line \
+         numbers; `start_line` anchors a ranged read, and `grep` reports the line \
+         number when you need to cite one."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -2966,9 +2968,9 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct PublicTarget {
-    host: String,
-    addrs: Vec<SocketAddr>,
+pub(crate) struct PublicTarget {
+    pub(crate) host: String,
+    pub(crate) addrs: Vec<SocketAddr>,
 }
 
 fn parse_host_ip(host: &str) -> Option<IpAddr> {
@@ -3093,10 +3095,18 @@ async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>
 /// Build a one-hop client whose resolver override is the exact public address
 /// set already validated above. Environment proxies are disabled: a proxy
 /// would otherwise perform its own, unvalidated DNS lookup for the target.
-fn fetch_client(target: &PublicTarget) -> Result<reqwest::Client, ToolError> {
+pub(crate) fn fetch_client(target: &PublicTarget) -> Result<reqwest::Client, ToolError> {
+    pinned_http_client(target, BROWSER_UA, std::time::Duration::from_secs(20))
+}
+
+pub(crate) fn pinned_http_client(
+    target: &PublicTarget,
+    user_agent: &str,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, ToolError> {
     let mut builder = reqwest::Client::builder()
-        .user_agent(BROWSER_UA)
-        .timeout(std::time::Duration::from_secs(20))
+        .user_agent(user_agent)
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy();
     if parse_host_ip(&target.host).is_none() {
@@ -3109,7 +3119,9 @@ fn fetch_client(target: &PublicTarget) -> Result<reqwest::Client, ToolError> {
 
 /// Resolve and validate a URL on the blocking pool. The returned addresses, not
 /// the hostname, are what the caller connects to.
-async fn resolve_public_url_async(url: &reqwest::Url) -> Result<PublicTarget, ToolError> {
+pub(crate) async fn resolve_public_url_async(
+    url: &reqwest::Url,
+) -> Result<PublicTarget, ToolError> {
     let u = url.clone();
     tokio::task::spawn_blocking(move || resolve_public_url(&u))
         .await
@@ -3130,7 +3142,7 @@ fn normalized_ip(ip: IpAddr) -> IpAddr {
 /// Defense in depth after reqwest connects: the observed peer must be one of
 /// the pinned public sockets. Missing peer metadata fails closed rather than
 /// silently weakening the check.
-fn validate_connected_peer(
+pub(crate) fn validate_connected_peer(
     peer: Option<SocketAddr>,
     target: &PublicTarget,
 ) -> Result<(), ToolError> {
@@ -5102,8 +5114,11 @@ impl Tool for TaskKill {
         ToolCategory::Shell
     }
     fn description(&self) -> &str {
-        "Stop a foreground shell task owned by a concurrent MEDHA session — \
-         SIGKILLs its whole process group."
+        "Stop a running shell task by id — SIGKILLs its whole process group. \
+         Shell commands hold the mutation lane while they run, so a task started \
+         by this agent has already finished by the time you could call this; use \
+         `task.list` to find one still running and `task.output` to read a \
+         finished one."
     }
     fn blast_radius(&self) -> BlastRadius {
         // A local, expected action on a task this agent started — no approval nag.

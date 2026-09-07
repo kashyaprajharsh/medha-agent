@@ -69,6 +69,9 @@ pub(crate) fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        // Medha reads only its own MEDHA_* namespace; an ambient *_PROXY would
+        // otherwise reroute model traffic and hand the credential to the proxy.
+        .no_proxy()
         .build()
         .expect("provider HTTP client")
 }

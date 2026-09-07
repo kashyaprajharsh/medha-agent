@@ -336,7 +336,40 @@ fn kill_git_process_tree(pid: u32) {
     }
 }
 
+/// Environment entries that let a caller hand `git` an arbitrary program to run.
+const GIT_EXECUTABLE_ENV: &[&str] = &[
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_ASKPASS",
+    "GIT_PROXY_COMMAND",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_TEMPLATE_DIR",
+    "GIT_NAMESPACE",
+];
+
 fn configure_git_process(command: &mut tokio::process::Command) {
+    // These worktree calls run outside the sandbox against the user's real repo,
+    // so a hook-shaped environment entry must not reach them.
+    for name in GIT_EXECUTABLE_ENV {
+        command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        let text = name.to_string_lossy();
+        if text.starts_with("GIT_CONFIG_KEY_") || text.starts_with("GIT_CONFIG_VALUE_") {
+            drop(text);
+            command.env_remove(&name);
+        }
+    }
+    command.env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]

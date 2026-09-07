@@ -607,6 +607,12 @@ fn set_file_mode(file: &std::fs::File, mode: u32) -> Result<(), SandboxError> {
     }
 }
 
+/// A lost group is best effort (only root may chgrp into it); a lost owner is not.
+#[cfg(unix)]
+fn restore_failure_is_fatal(source_uid: u32, destination_uid: u32) -> bool {
+    source_uid != destination_uid
+}
+
 #[cfg(unix)]
 fn copy_file_owner_and_mode(
     source: &std::fs::File,
@@ -631,7 +637,9 @@ fn copy_file_owner_and_mode(
                 source_metadata.gid(),
             )
         };
-        if result != 0 {
+        if result != 0
+            && restore_failure_is_fatal(source_metadata.uid(), destination_metadata.uid())
+        {
             return Err(SandboxError::Io(format!(
                 "cannot preserve file ownership: {}",
                 std::io::Error::last_os_error()
@@ -2580,6 +2588,21 @@ impl kernel::ProgressiveContextPathAuthorizer for WorkspaceSandbox {
 mod tests {
     use super::*;
     use kernel::AutoDeny;
+
+    /// A file in a `wheel`-owned directory has a gid the user is not in, and only
+    /// root may chgrp into it. Treating that as fatal blocked every edit there.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreachable_group_does_not_fail_a_write_the_owner_may_make() {
+        assert!(
+            !restore_failure_is_fatal(501, 501),
+            "same owner, only the group could not be restored — the write must still land"
+        );
+        assert!(
+            restore_failure_is_fatal(0, 501),
+            "a changed owner is a real transfer and must still refuse"
+        );
+    }
 
     /// Fixtures for the filesystem-escalation tests, which are unix-only for the
     /// reason recorded on `unknown_exec_escalates_read_then_write_for_the_same_root`.

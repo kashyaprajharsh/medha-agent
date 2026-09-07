@@ -38,7 +38,7 @@ pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// Private field placed in an `agent.wait` tool observation. The log outbox
 /// folds these ids as delivery acknowledgements, so a report is acknowledged
 /// only after the observation containing it is durably appended.
-pub const REPORT_ACKS_FIELD: &str = "_agent_report_dispatches";
+pub const REPORT_ACKS_FIELD: &str = kernel::AGENT_REPORT_ACKS_FIELD;
 
 /// Tools a child keeps however narrowly it was asked for.
 ///

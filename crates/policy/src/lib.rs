@@ -46,7 +46,7 @@ impl DefaultPolicy {
     /// Treats absolute paths beneath `root` as in-workspace scan targets.
     pub fn with_workspace(mut self, root: impl AsRef<std::path::Path>) -> Self {
         let s = root.as_ref().to_string_lossy().to_lowercase();
-        let s = s.trim_end_matches('/').to_string();
+        let s = s.replace('\\', "/").trim_end_matches('/').to_string();
         self.workspace = (!s.is_empty()).then_some(s);
         self
     }
@@ -648,7 +648,11 @@ fn is_system_path(p: &str) -> bool {
         return true;
     }
     // A home root itself (delete-everything) — but a deeper subdir is a user path.
-    if Regex::new(r"^(/users|/home)/[^/]+$").unwrap().is_match(p) {
+    static HOME_ROOT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    if HOME_ROOT
+        .get_or_init(|| Regex::new(r"^(/users|/home)/[^/]+$").expect("static pattern"))
+        .is_match(p)
+    {
         return true;
     }
     // A recursive root-level glob or brace expression can expand to system
@@ -746,6 +750,14 @@ pub(crate) fn hard_dangerous(c: &str, workspace: Option<&str>) -> Option<String>
             if encoded_powershell {
                 return Some("blocked dangerous command: encoded PowerShell payload".into());
             }
+            // Word-level, so a tab-separated `sudo` is caught and `pseudocode` is not.
+            if words
+                .iter()
+                .map(|word| program_basename(word))
+                .any(|word| matches!(word, "sudo" | "doas"))
+            {
+                return Some("blocked dangerous command: privilege escalation".into());
+            }
             let piped_interpreter = effective_program(words).is_some_and(|(program_i, program)| {
                 is_interpreter(program)
                     || program == "eval"
@@ -767,10 +779,13 @@ pub(crate) fn hard_dangerous(c: &str, workspace: Option<&str>) -> Option<String>
     // `os.system("curl ... | env sh")`) when scanning skill scripts. The shell
     // AST correctly treats quoted text as one word, but the skill guard must
     // still flag code that hands that string to another interpreter later.
-    let embedded_pipe = Regex::new(
-        r"\|[ \t]*(?:(?:env|command|nohup)[ \t]+(?:(?:-[^ \t]+|[a-z_][a-z0-9_]*=[^ \t]+)[ \t]+)*)?(?:/[a-z0-9_./-]+/)?(?:sh|dash|bash|zsh|fish|ksh|python[23]?|perl|ruby|node|php|lua)\b",
-    )
-    .unwrap();
+    static EMBEDDED_PIPE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let embedded_pipe = EMBEDDED_PIPE.get_or_init(|| {
+        Regex::new(
+            r"\|[ \t]*(?:(?:env|command|nohup)[ \t]+(?:(?:-[^ \t]+|[a-z_][a-z0-9_]*=[^ \t]+)[ \t]+)*)?(?:/[a-z0-9_./-]+/)?(?:sh|dash|bash|zsh|fish|ksh|python[23]?|perl|ruby|node|php|lua)\b",
+        )
+        .expect("static pattern")
+    });
     if embedded_pipe.is_match(c) {
         return Some("blocked dangerous command: piping data into a shell or interpreter".into());
     }
@@ -782,19 +797,41 @@ pub(crate) fn hard_dangerous(c: &str, workspace: Option<&str>) -> Option<String>
 /// legitimate uses) but must never be silently allowed — they route to the
 /// human gate, so under a no-human policy (`MEDHA_APPROVE=none`, `AutoDeny`)
 /// they fail closed rather than open.
+/// True for an absolute path in either separator style, including a Windows
+/// drive (`c:\…`, `c:/…`) and a UNC share (`\\host\share`).
+fn is_absolute_path(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with('\\') {
+        return true;
+    }
+    let mut chars = value.chars();
+    matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(drive), Some(':'), Some('/' | '\\')) if drive.is_ascii_alphabetic()
+    )
+}
+
 fn argument_escapes_workspace(argument: &str, workspace: Option<&str>) -> bool {
     let value = argument
         .split_once('=')
         .map(|(_, value)| value)
         .unwrap_or(argument);
-    if value == ".." || value.starts_with("../") || value.contains("/../") || value.starts_with('~')
+    // Both separators: a Windows shell reaches the same parent with `..\`.
+    let normalized = value.replace('\\', "/");
+    if normalized == ".."
+        || normalized.starts_with("../")
+        || normalized.contains("/../")
+        || normalized.ends_with("/..")
+        || normalized.starts_with('~')
     {
         return true;
     }
-    if !value.starts_with('/') {
+    if !is_absolute_path(value) {
         return false;
     }
-    workspace.is_none_or(|root| value != root && !value.starts_with(&format!("{root}/")))
+    workspace.is_none_or(|root| {
+        let root = root.replace('\\', "/");
+        normalized != root && !normalized.starts_with(&format!("{root}/"))
+    })
 }
 
 pub(crate) fn needs_review(c: &str, workspace: Option<&str>) -> Option<&'static str> {
@@ -1182,6 +1219,42 @@ mod tests {
             assert!(
                 matches!(auth(&p, &shell(ask)), Decision::Human),
                 "must ask: {ask}"
+            );
+        }
+    }
+
+    #[test]
+    fn privilege_escalation_is_matched_as_a_word_not_a_substring() {
+        assert!(hard_dangerous("sudo\trm -rf /etc", None).is_some());
+        assert!(hard_dangerous("doas reboot", None).is_some());
+        assert!(hard_dangerous("/usr/bin/sudo id", None).is_some());
+        assert!(
+            hard_dangerous("cat pseudocode.py", None).is_none(),
+            "'pseudo' contains 'sudo' and must not be refused"
+        );
+    }
+
+    /// Windows has no native jail, so the escape check is the only boundary an
+    /// auto-allowed reader crosses. It used to exit early on any non-`/` path.
+    #[test]
+    fn a_windows_path_outside_the_workspace_still_escapes() {
+        let workspace = Some("c:/users/dev/proj");
+        for outside in [
+            r"c:\users\other\secrets.txt",
+            "c:/users/other/secrets.txt",
+            r"\\host\share\secrets.txt",
+            r"..\..\windows\system32\config",
+            r"c:\users\dev\proj\..\..\other",
+        ] {
+            assert!(
+                argument_escapes_workspace(outside, workspace),
+                "{outside} must be treated as leaving the workspace"
+            );
+        }
+        for inside in ["c:/users/dev/proj/src/main.rs", r"c:\users\dev\proj\src"] {
+            assert!(
+                !argument_escapes_workspace(inside, workspace),
+                "{inside} is in the workspace"
             );
         }
     }

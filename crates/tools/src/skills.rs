@@ -614,8 +614,7 @@ impl SkillStore {
                 let revision = download_github_tree(&tree, &stage, &mut budget).await?;
                 ("github-folder".to_string(), Some(revision))
             } else if src.starts_with("http://") || src.starts_with("https://") {
-                let client = install_client()?;
-                let body = fetch_limited(&client, src, MAX_SKILL_MD_BYTES).await?;
+                let body = fetch_limited(src, MAX_SKILL_MD_BYTES).await?;
                 let text =
                     std::str::from_utf8(&body).map_err(|_| format!("{src} is not UTF-8 text"))?;
                 let head = text
@@ -1119,35 +1118,61 @@ fn parse_github_tree_url(src: &str) -> Result<Option<GitHubTree>, String> {
     }))
 }
 
-pub(crate) fn install_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(INSTALL_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("medha-skills/1")
-        .build()
-        .map_err(|e| e.to_string())
-}
+pub(crate) async fn fetch_limited(url: &str, cap: usize) -> Result<Vec<u8>, String> {
+    const MAX_REDIRECTS: usize = 5;
+    let mut current = reqwest::Url::parse(url).map_err(|e| format!("invalid URL {url}: {e}"))?;
+    let mut redirects = 0;
+    let response = loop {
+        // Resolve once and pin the exact validated public addresses into the
+        // connector. This closes both redirect-to-private and DNS-rebinding
+        // gaps for third-party `download_url` values.
+        let target = crate::resolve_public_url_async(&current)
+            .await
+            .map_err(|e| e.to_string())?;
+        let client = crate::pinned_http_client(&target, "medha-skills/1", INSTALL_TIMEOUT)
+            .map_err(|e| e.to_string())?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| format!("fetching {current}: {e}"))?;
+        crate::validate_connected_peer(response.remote_addr(), &target)
+            .map_err(|e| e.to_string())?;
 
-pub(crate) async fn fetch_limited(
-    client: &reqwest::Client,
-    url: &str,
-    cap: usize,
-) -> Result<Vec<u8>, String> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("fetching {url}: {e}"))?;
+        if !response.status().is_redirection() {
+            break response
+                .error_for_status()
+                .map_err(|e| format!("fetching {current}: {e}"))?;
+        }
+        if redirects == MAX_REDIRECTS {
+            return Err(format!("fetching {url}: too many redirects"));
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| format!("redirect from {current} omitted Location"))?
+            .to_str()
+            .map_err(|_| format!("redirect from {current} has an invalid Location"))?;
+        let next = current
+            .join(location)
+            .map_err(|e| format!("invalid redirect from {current}: {e}"))?;
+        if current.scheme() == "https" && next.scheme() != "https" {
+            return Err(format!(
+                "blocked redirect downgrade from {current} to {next}"
+            ));
+        }
+        current = next;
+        redirects += 1;
+    };
     if response.content_length().is_some_and(|n| n > cap as u64) {
-        return Err(format!("{url} exceeds the {cap}-byte download limit"));
+        return Err(format!("{current} exceeds the {cap}-byte download limit"));
     }
     let mut out = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("reading {url}: {e}"))?;
+        let chunk = chunk.map_err(|e| format!("reading {current}: {e}"))?;
         if out.len().saturating_add(chunk.len()) > cap {
-            return Err(format!("{url} exceeds the {cap}-byte download limit"));
+            return Err(format!("{current} exceeds the {cap}-byte download limit"));
         }
         out.extend_from_slice(&chunk);
     }
@@ -1172,18 +1197,17 @@ pub(crate) fn pin_tree_url(source: &str, revision: &str) -> String {
 /// tree URL. A pinned-sha source resolves to itself → never reports an update.
 pub(crate) async fn current_revision(source: &str) -> Option<String> {
     let tree = parse_github_tree_url(source).ok().flatten()?;
-    let client = install_client().ok()?;
-    Some(github_revision(&client, &tree).await)
+    Some(github_revision(&tree).await)
 }
 
-async fn github_revision(client: &reqwest::Client, tree: &GitHubTree) -> String {
+async fn github_revision(tree: &GitHubTree) -> String {
     let url = format!(
         "https://api.github.com/repos/{}/{}/commits/{}",
         urlencoding::encode(&tree.owner),
         urlencoding::encode(&tree.repo),
         urlencoding::encode(&tree.git_ref),
     );
-    fetch_limited(client, &url, 512 * 1024)
+    fetch_limited(&url, 512 * 1024)
         .await
         .ok()
         .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
@@ -1200,8 +1224,7 @@ async fn download_github_tree(
 ) -> Result<String, String> {
     use std::collections::VecDeque;
 
-    let client = install_client()?;
-    let revision = github_revision(&client, tree).await;
+    let revision = github_revision(tree).await;
     let mut dirs = VecDeque::from([tree.path.clone()]);
     while let Some(dir) = dirs.pop_front() {
         let encoded_path = dir
@@ -1216,7 +1239,7 @@ async fn download_github_tree(
             encoded_path,
             urlencoding::encode(&revision),
         );
-        let listing = fetch_limited(&client, &api, 2 * 1024 * 1024).await?;
+        let listing = fetch_limited(&api, 2 * 1024 * 1024).await?;
         let entries: Value = serde_json::from_slice(&listing)
             .map_err(|e| format!("invalid GitHub directory response for {dir}: {e}"))?;
         let entries = entries
@@ -1253,7 +1276,7 @@ async fn download_github_tree(
                         .get("download_url")
                         .and_then(Value::as_str)
                         .ok_or_else(|| format!("GitHub omitted a download URL for {remote}"))?;
-                    let bytes = fetch_limited(&client, download, MAX_INSTALL_FILE_BYTES).await?;
+                    let bytes = fetch_limited(download, MAX_INSTALL_FILE_BYTES).await?;
                     if size != 0 && size != bytes.len() {
                         return Err(format!("GitHub size changed while downloading {remote}"));
                     }
@@ -2660,6 +2683,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn remote_skill_download_rejects_non_public_targets_before_connecting() {
+        let error = fetch_limited("http://127.0.0.1:9/SKILL.md", 1024)
+            .await
+            .unwrap_err();
+        assert!(error.contains("non-public"), "{error}");
     }
 
     #[cfg(unix)]

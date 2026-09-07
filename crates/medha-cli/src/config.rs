@@ -84,6 +84,9 @@ pub struct McpServer {
 
 pub const MCP_SECRET_FLAGS: &[&str] = &["--key", "--bearer", "--token", "--password"];
 
+/// Carries `NAME=VALUE`; the value is how MCP servers are handed a token.
+pub const MCP_ENV_FLAG: &str = "--env";
+
 pub struct ParsedMcpAdd {
     pub id: String,
     pub server: McpServer,
@@ -652,11 +655,28 @@ fn workspace_path_digest(p: &std::path::Path) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Narrow a config written before MCP `env` values counted as secret-bearing.
+#[cfg(unix)]
+fn tighten_config_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700));
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_config_permissions(_path: &std::path::Path) {}
+
 pub fn load() -> Result<Option<Config>> {
     let path = config_path()?;
     if !path.exists() {
         return Ok(None);
     }
+    tighten_config_permissions(&path);
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut cfg: Config = toml::from_str(&text).context("parsing config.toml")?;
@@ -679,7 +699,16 @@ fn write_config_file(path: &std::path::Path, text: &str) -> Result<()> {
     let temporary = path.with_extension(format!("tmp{}-{}", std::process::id(), ulid::Ulid::new()));
     let write_result = (|| {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&temporary)
+        // 0600: MCP `env` values may carry an inlined token.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
             .with_context(|| format!("opening {}", temporary.display()))?;
         file.write_all(text.as_bytes())
             .with_context(|| format!("writing {}", temporary.display()))?;

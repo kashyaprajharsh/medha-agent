@@ -15,8 +15,17 @@ pub trait StreamSink: Send + Sync {
     fn tool_started(&self, _tool: &str, _target: Option<&str>) {}
     /// A tool call the model just requested (about to execute).
     fn tool_call(&self, _tool: &str, _args: &Value) {}
+    /// A tool call with its provider-assigned correlation id. Older surfaces
+    /// keep working through the name-only callback.
+    fn tool_call_with_id(&self, _id: &str, tool: &str, args: &Value) {
+        self.tool_call(tool, args);
+    }
     /// A tool's result, after it ran — lets a surface render diffs, errors, etc.
     fn tool_result(&self, _tool: &str, _ok: bool, _payload: &Value) {}
+    /// A tool result carrying the same correlation id as its call.
+    fn tool_result_with_id(&self, _id: &str, tool: &str, ok: bool, payload: &Value) {
+        self.tool_result(tool, ok, payload);
+    }
     /// Real token usage for the turn, reported by the provider (authoritative).
     fn usage(&self, _prompt_tokens: u32, _total_tokens: u32) {}
     /// Session cost so far, when pricing is known. `indicative` means the

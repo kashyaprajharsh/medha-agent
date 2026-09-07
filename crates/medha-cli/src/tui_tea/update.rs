@@ -1859,7 +1859,7 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
     let count = model
         .pending_approvals
         .front()
-        .map(|p| p.responder.len())
+        .map(|p| p.responder.len_for(p.escalated))
         .unwrap_or(3);
     let last = count - 1;
     let sel: Option<usize> = match key.code {
@@ -1902,12 +1902,13 @@ pub(super) fn handle_approval_key(model: &mut Model, key: KeyEvent) {
         {
             model.auto_approve.insert(pending.action.clone());
         }
-        let verb = pending.responder.verb(choice);
+        let verb = pending.responder.verb_for(choice, pending.escalated);
         model.push_main_notice(format!("{verb} {}", pending.action));
         // The approval card is global even while a child pane is visible.
         // Rebuild its cached rows before the next prompt can accept input.
         model.dirty = true;
-        pending.responder.answer(choice);
+        let escalated = pending.escalated;
+        pending.responder.answer_for(choice, escalated);
     }
 }
 
@@ -3162,20 +3163,44 @@ fn open_mcp_picker(model: &mut Model) {
 }
 
 /// Redacts both separated and joined credential flags before storing history.
+/// `--env NAME=VALUE` keeps its name; the value is a credential like any other.
+fn redact_env_pair(pair: &str) -> String {
+    match pair.split_once('=') {
+        Some((name, _)) if !name.is_empty() => format!("{name}=<redacted>"),
+        _ => "<redacted>".into(),
+    }
+}
+
 fn redact_secrets(line: &str) -> String {
     let mut out: Vec<String> = Vec::new();
-    let mut redact_next = false;
+    let mut pending: Option<&'static str> = None;
     for word in line.split_whitespace() {
-        if std::mem::take(&mut redact_next) {
-            out.push("<redacted>".into());
-            continue;
+        match pending.take() {
+            Some("env") => {
+                out.push(redact_env_pair(word));
+                continue;
+            }
+            Some(_) => {
+                out.push("<redacted>".into());
+                continue;
+            }
+            None => {}
         }
         match word.split_once('=') {
             Some((flag, _)) if config::MCP_SECRET_FLAGS.contains(&flag) => {
                 out.push(format!("{flag}=<redacted>"));
             }
+            Some((flag, rest)) if flag == config::MCP_ENV_FLAG => {
+                out.push(format!("{flag}={}", redact_env_pair(rest)));
+            }
             _ => {
-                redact_next = config::MCP_SECRET_FLAGS.contains(&word);
+                pending = if word == config::MCP_ENV_FLAG {
+                    Some("env")
+                } else if config::MCP_SECRET_FLAGS.contains(&word) {
+                    Some("secret")
+                } else {
+                    None
+                };
                 out.push(word.to_string());
             }
         }
@@ -5872,6 +5897,15 @@ mod fix_tests {
         );
         assert_eq!(redact_secrets("/mcp list"), "/mcp list");
         assert_eq!(redact_secrets("/mcp add gh --key"), "/mcp add gh --key");
+        // `--env NAME=VALUE` is how an MCP server is handed a token.
+        let env = redact_secrets("/mcp add gh --env GITHUB_TOKEN=ghp_live -- npx server");
+        assert!(!env.contains("ghp_live"), "{env}");
+        assert_eq!(
+            env, "/mcp add gh --env GITHUB_TOKEN=<redacted> -- npx server",
+            "the variable name stays readable, the value does not"
+        );
+        let joined = redact_secrets("/mcp add gh --env=GITHUB_TOKEN=ghp_live");
+        assert!(!joined.contains("ghp_live"), "{joined}");
         assert_eq!(
             redact_secrets("/mcp add gh --bearer=sk-live-abc"),
             "/mcp add gh --bearer=<redacted>"

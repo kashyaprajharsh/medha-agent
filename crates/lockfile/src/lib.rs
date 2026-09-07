@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use thiserror::Error;
 
+pub mod trust;
+pub use trust::{AcceptedLocks, RiskySetting};
+
 /// Legacy permission type accepted when parsing old `medha.lock` files. Never a
 /// source of runtime authority — retained only to warn about obsolete grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -404,6 +407,28 @@ impl SandboxLockConfig {
                 self.network
             ));
         }
+        for path in &self.extra_writable {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return Err("sandbox.extra_writable entries must not be empty".into());
+            }
+            if !Path::new(trimmed).is_absolute() {
+                return Err(format!(
+                    "sandbox.extra_writable {trimmed:?} must be an absolute path"
+                ));
+            }
+            if trimmed.contains("..") {
+                return Err(format!(
+                    "sandbox.extra_writable {trimmed:?} must not traverse with '..'"
+                ));
+            }
+            // A jail that may write `/` is not a jail.
+            if matches!(trimmed.trim_end_matches('/'), "" | "/users" | "/home") {
+                return Err(format!(
+                    "sandbox.extra_writable {trimmed:?} would widen the jail to the whole filesystem"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -444,7 +469,8 @@ impl SandboxLockConfig {
     }
 }
 
-/// Optional model routes by execution role.
+/// Parsed for forward compatibility and reported by `medha pulse`; no runtime
+/// path selects a model from it yet, so setting it changes nothing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoutingConfig {
     #[serde(default)]

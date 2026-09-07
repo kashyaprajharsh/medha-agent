@@ -826,38 +826,43 @@ enum ApprovalResponder {
 }
 
 impl ApprovalResponder {
-    /// Option labels shown on the card, in selection-index order.
-    fn options(&self) -> &'static [&'static str] {
-        match self {
-            Self::Standard(_) => &["Yes, allow once", "Yes, always allow", "No, deny"],
-            Self::Network(_) => &[
+    /// Option labels shown on the card, in selection-index order. An escalated
+    /// action drops every remembering tier: it is re-reviewed every time, so
+    /// offering "always" would promise a suppression that never happens.
+    fn options_for(&self, escalated: bool) -> &'static [&'static str] {
+        match (self, escalated) {
+            (Self::Standard(_), false) => &["Yes, allow once", "Yes, always allow", "No, deny"],
+            (Self::Standard(_), true) => &["Yes, allow once", "No, deny"],
+            (Self::Network(_), false) => &[
                 "Allow once and retry",
                 "Allow for this session",
                 "Always allow for this project",
                 "No, deny",
             ],
+            (Self::Network(_), true) => &["Allow once and retry", "No, deny"],
         }
     }
 
-    fn len(&self) -> usize {
-        self.options().len()
+    fn len_for(&self, escalated: bool) -> usize {
+        self.options_for(escalated).len()
     }
 
     /// Send the decision for the selected option index (last option is deny).
-    fn answer(self, sel: usize) {
+    fn answer_for(self, sel: usize, escalated: bool) {
+        let label = self.options_for(escalated).get(sel).copied();
         match self {
             Self::Standard(tx) => {
-                let _ = tx.send(match sel {
-                    0 => kernel::Approval::Once,
-                    1 => kernel::Approval::Always,
+                let _ = tx.send(match label {
+                    Some("Yes, allow once") => kernel::Approval::Once,
+                    Some("Yes, always allow") => kernel::Approval::Always,
                     _ => kernel::Approval::Deny,
                 });
             }
             Self::Network(tx) => {
-                let _ = tx.send(match sel {
-                    0 => kernel::NetworkDecision::Once,
-                    1 => kernel::NetworkDecision::Session,
-                    2 => kernel::NetworkDecision::Persistent,
+                let _ = tx.send(match label {
+                    Some("Allow once and retry") => kernel::NetworkDecision::Once,
+                    Some("Allow for this session") => kernel::NetworkDecision::Session,
+                    Some("Always allow for this project") => kernel::NetworkDecision::Persistent,
                     _ => kernel::NetworkDecision::Deny,
                 });
             }
@@ -865,24 +870,19 @@ impl ApprovalResponder {
     }
 
     fn deny(self) {
-        let last = self.len() - 1;
-        self.answer(last);
+        self.answer_for(usize::MAX, false);
     }
 
     /// Past-tense notice shown after the user picks option `sel`.
-    fn verb(&self, sel: usize) -> &'static str {
-        match self {
-            Self::Standard(_) => match sel {
-                0 => "approved",
-                1 => "approved (always for this action)",
-                _ => "rejected",
-            },
-            Self::Network(_) => match sel {
-                0 => "network allowed (once)",
-                1 => "network allowed (this session)",
-                2 => "network allowed (persisted)",
-                _ => "network denied",
-            },
+    fn verb_for(&self, sel: usize, escalated: bool) -> &'static str {
+        match self.options_for(escalated).get(sel).copied() {
+            Some("Yes, allow once") => "approved",
+            Some("Yes, always allow") => "approved (always for this action)",
+            Some("Allow once and retry") => "network allowed (once)",
+            Some("Allow for this session") => "network allowed (this session)",
+            Some("Always allow for this project") => "network allowed (persisted)",
+            _ if matches!(self, Self::Network(_)) => "network denied",
+            _ => "rejected",
         }
     }
 }
@@ -3620,6 +3620,7 @@ mod tests {
             Some("+ added line\n- removed line"),
             0,
             &["Yes, allow once", "Yes, always allow", "No, deny"],
+            false,
         );
         let out = block(&lines);
         assert!(out.contains("Allow"), "missing heading: {out}");
@@ -3637,11 +3638,30 @@ mod tests {
         );
     }
 
+    /// The plain gate and the ACP bridge both surface `escalated`; the primary
+    /// surface must not silently offer a suppression it will never honour.
+    #[test]
+    fn an_escalated_card_warns_and_never_offers_always() {
+        let responder = ApprovalResponder::Standard(oneshot::channel().0);
+        let opts = responder.options_for(true);
+        assert_eq!(opts, &["Yes, allow once", "No, deny"]);
+        let card = block(&render_approval("fs_write", None, 0, opts, true));
+        assert!(card.contains("untrusted web content"), "{card}");
+        assert!(!card.contains("always"), "{card}");
+        assert_eq!(responder.verb_for(1, true), "rejected");
+        let network = ApprovalResponder::Network(oneshot::channel().0);
+        assert_eq!(
+            network.options_for(true),
+            &["Allow once and retry", "No, deny"]
+        );
+        assert_eq!(network.verb_for(1, true), "network denied");
+    }
+
     #[test]
     fn approval_selection_marker_tracks_index() {
         let opts = &["Yes, allow once", "Yes, always allow", "No, deny"];
-        let sel0 = block(&render_approval("fs_write", None, 0, opts));
-        let sel2 = block(&render_approval("fs_write", None, 2, opts));
+        let sel0 = block(&render_approval("fs_write", None, 0, opts, false));
+        let sel2 = block(&render_approval("fs_write", None, 2, opts, false));
         // The accent marker sits on the selected option's line.
         assert!(sel0.contains("▌ 1. Yes, allow once"));
         assert!(sel2.contains("▌ 3. No, deny"));
@@ -4267,6 +4287,7 @@ mod tests {
             None,
             0,
             &["Yes, allow once", "Yes, always allow", "No, deny"],
+            false,
         );
         let help = block(&lines);
         assert!(

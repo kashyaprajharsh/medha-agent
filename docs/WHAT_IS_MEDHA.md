@@ -2837,7 +2837,7 @@ Check: Exceeds threshold (16KB)?
 
 Files are named by their **SHA-256 hash**:
 - Same content = same hash = stored once
-- Cannot tamper (change content → hash changes)
+- Cannot tamper undetected (change content → hash chain breaks at that link)
 - Easy to locate (compute hash, read file)
 
 ### Benefits

@@ -117,7 +117,7 @@ medha "fix the failing test in tests/calc.rs"    # one-shot, headless
 medha --continue               # resume the last session here      (-c)
 medha --sessions               # list past sessions
 medha --plain                  # scrolling REPL instead of the TUI
-medha --acp                    # editor bridge (JSON-RPC over stdio)
+medha --acp                    # editor bridge (Agent Client Protocol over stdio)
 
 medha pulse                    # which model/key resolved, and from where  (--fix repairs)
 medha memory list              # what the agent has learned
@@ -126,6 +126,10 @@ medha gate scenarios/          # run eval scenarios — CI for agent behavior
 medha mcp                      # add, connect, authorize MCP servers
 medha lsp                      # language-server sessions and health
 ```
+
+`--acp` serves one workspace session per process. Configure MCP servers with
+`medha mcp` before launch; request-level ACP server attachment is rejected until
+dynamic attachment is supported.
 
 Headless runs have no human to ask, so anything needing approval is **denied** rather
 than silently proceeding.
@@ -234,7 +238,7 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
 Pre-1.0 (`0.1.8`) — interfaces may still change.
 
 **Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 53 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation that you can open, watch and steer while they run,
-graceful interrupts, the ACP bridge, and the Eval Gate.
+graceful interrupts, the ACP editor bridge, and the Eval Gate.
 
 **Next:** native Anthropic Messages and OpenAI Responses protocols, cross-vendor adversarial verification, span-level trust taint, and trace→skill distillation.
 

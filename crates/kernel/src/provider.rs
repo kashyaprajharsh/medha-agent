@@ -207,6 +207,9 @@ pub enum ToolCallStrategy {
 
 #[derive(Debug, Clone)]
 pub struct ProviderCaps {
+    /// Reserved. No adapter lowers media and no caller branches on these yet, so
+    /// both are always `false`; they exist so adding a protocol that supports
+    /// them does not change this struct's shape.
     pub vision: bool,
     pub caching: bool,
     /// Context-window size in tokens. `None` = **unknown** — not a guess. The

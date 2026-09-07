@@ -1,10 +1,6 @@
 # Copy to `medha.lock` in the project root to share portable settings.
 # Environment variables remain session-level overrides.
 
-[routing]
-# executor = "openai-compat://localhost:8000/qwen3-coder"
-# verifier = "openai-compat://together/llama-3.3-70b"
-
 [budget]
 # Per-task ceilings; omitted fields use built-in defaults.
 max_turns = 200

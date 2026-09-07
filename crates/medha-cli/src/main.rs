@@ -110,7 +110,8 @@ struct Cli {
     #[arg(long)]
     plain: bool,
 
-    /// Expose the session over line-delimited Agent Client Protocol JSON-RPC.
+    /// Expose the session over stdio to an editor. Speaks Agent Client Protocol
+    /// when the client sends `protocolVersion`, and Medha's own bridge otherwise.
     #[arg(long)]
     acp: bool,
 
@@ -189,7 +190,15 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
-    let lock = lockfile::MedhaLock::load_default()?;
+    let workspace = std::env::current_dir()?;
+    let workspace = workspace.canonicalize().unwrap_or(workspace);
+    let state = config::state_dir(&workspace)?;
+    let lock = apply_lock_trust(
+        lockfile::MedhaLock::load_default()?,
+        &workspace.join("medha.lock"),
+        &workspace,
+        &state,
+    );
     let seeds = gc.seeds.unwrap_or(lock.gate.seeds);
     let threshold = gc.threshold.unwrap_or(lock.gate.pass_threshold);
     gate::validate_run_inputs(seeds, threshold, gc.yes)
@@ -767,6 +776,9 @@ async fn main() -> Result<()> {
     if raw.get(1).map(|s| s == "lsp").unwrap_or(false) {
         return run_lsp_command(&raw[2..]).await;
     }
+    if raw.get(1).map(|s| s == "trust").unwrap_or(false) {
+        return run_trust_command(&raw[2..]);
+    }
 
     let cli = Cli::parse();
     let effort_override = match cli.reasoning_effort.clone() {
@@ -798,7 +810,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let lock = lockfile::MedhaLock::load_default()?;
+    let lock_cwd = std::env::current_dir()?;
+    let lock = apply_lock_trust(
+        lockfile::MedhaLock::load_default()?,
+        &lock_cwd.join("medha.lock"),
+        &lock_cwd,
+        &config::state_dir(&lock_cwd)?,
+    );
     let autonomy = if cli.plan {
         kernel::AutonomyLevel::Plan
     } else if let Some(mode) = cli.mode {
@@ -993,12 +1011,17 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let acp_bridge = if use_acp { Some(acp::bridge()) } else { None };
+    let acp_bridge = if use_acp {
+        Some(acp::bridge(cwd.clone()))
+    } else {
+        None
+    };
 
     let gate: Arc<dyn kernel::HumanGate> = if let Some(bridge) = &acp_bridge {
         Arc::new(acp::AcpGate::new(
             bridge.writer.clone(),
             bridge.pending.clone(),
+            bridge.peer.clone(),
         ))
     } else if let Some((tx, _)) = &tui_channel {
         Arc::new(tui_tea::TuiGate { tx: tx.clone() })
@@ -1988,7 +2011,11 @@ async fn run_lsp_command(args: &[String]) -> Result<()> {
         ..lsp::Config::default()
     };
     for configured in &lock.lsp.servers {
-        if configured.command.is_empty() || configured.languages.is_empty() {
+        // Same acceptance the session path applies: a repo cannot self-escalate.
+        if configured.command.is_empty()
+            || configured.languages.is_empty()
+            || configured.trust != "workspace"
+        {
             continue;
         }
         config
@@ -2179,6 +2206,68 @@ fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
 const VERIFY_MAX_OUTPUT: usize = 8_192;
 
 /// Run the configured verification command after edits.
+/// `medha trust [--revoke]` — accept this workspace's `medha.lock` privilege.
+fn run_trust_command(args: &[String]) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let state = config::state_dir(&cwd)?;
+    let record = state.join("lock_trust.toml");
+    let key = cwd.display().to_string();
+    let mut accepted = lockfile::AcceptedLocks::load(&record);
+    if args.iter().any(|arg| arg == "--revoke") {
+        accepted.revoke(&key);
+        accepted.save(&record).map_err(anyhow::Error::msg)?;
+        println!("revoked lockfile privilege for {key}");
+        return Ok(());
+    }
+    let risky = lockfile::MedhaLock::load_default()?.risky_settings();
+    if risky.is_empty() {
+        println!("medha.lock asks for no privilege here — nothing to accept.");
+        return Ok(());
+    }
+    println!("{} asks for:", cwd.join("medha.lock").display());
+    for setting in &risky {
+        println!("  · {setting}");
+    }
+    if !args.iter().any(|arg| arg == "--yes") {
+        println!("\nre-run with `medha trust --yes` to accept these for this workspace.");
+        return Ok(());
+    }
+    accepted.accept(&key, &risky);
+    accepted.save(&record).map_err(anyhow::Error::msg)?;
+    println!("\naccepted for {key}; editing any of these values asks again.");
+    Ok(())
+}
+
+/// Ignore privilege a repository asked for until it is accepted for this
+/// workspace. `medha.lock` ships inside a checkout, so it is untrusted input.
+fn apply_lock_trust(
+    lock: lockfile::MedhaLock,
+    lock_path: &std::path::Path,
+    workspace: &std::path::Path,
+    state: &std::path::Path,
+) -> lockfile::MedhaLock {
+    let risky = lock.risky_settings();
+    if risky.is_empty() {
+        return lock;
+    }
+    let key = workspace.display().to_string();
+    let accepted = lockfile::AcceptedLocks::load(&state.join("lock_trust.toml"));
+    if accepted.allows(&key, &risky) {
+        return lock;
+    }
+    eprintln!(
+        "warning: ignoring {} privilege-relaxing setting(s) in {} — this file ships \
+         inside the repository and cannot grant itself authority:",
+        risky.len(),
+        lock_path.display()
+    );
+    for setting in &risky {
+        eprintln!("  · {setting}");
+    }
+    eprintln!("  run `medha trust` in this directory to accept them.");
+    lock.without_risky_settings()
+}
+
 struct CommandVerifier {
     command: String,
     required: bool,
@@ -2316,8 +2405,10 @@ impl kernel::StreamSink for PrintSink {
                 }
             }
         } else if !ok {
+            // Failures carry {"error": …}; policy denials carry {"reason": …}.
             let err = payload
                 .get("error")
+                .or_else(|| payload.get("reason"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("error");
             println!("  ⎿ \x1b[31m✗ {err}\x1b[0m");

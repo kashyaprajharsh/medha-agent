@@ -4,9 +4,10 @@
 
 use kernel::{Budget, EventLog, Kernel, Message, Provider, Session, StopReason};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -188,11 +189,119 @@ impl Drop for WriterTask {
     }
 }
 
-pub(crate) type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>;
+/// Agent Client Protocol major version this bridge negotiates.
+pub(crate) const ACP_PROTOCOL_VERSION: i64 = 1;
+
+/// Which dialect the connected peer speaks. Chosen once, at `initialize`: a
+/// peer sending `protocolVersion` is an ACP client, anything else is a caller
+/// of Medha's original bridge, which stays supported.
+#[derive(Clone)]
+pub(crate) struct Peer {
+    acp: Arc<AtomicBool>,
+    workspace: Arc<PathBuf>,
+    session_id: Arc<Mutex<Option<String>>>,
+}
+
+impl Peer {
+    #[cfg(test)]
+    fn new() -> Self {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::for_workspace(workspace)
+    }
+
+    fn for_workspace(workspace: PathBuf) -> Self {
+        let workspace = workspace.canonicalize().unwrap_or(workspace);
+        Self {
+            acp: Arc::new(AtomicBool::new(false)),
+            workspace: Arc::new(workspace),
+            session_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn select_acp(&self) {
+        self.acp.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_acp(&self) -> bool {
+        self.acp.load(Ordering::Acquire)
+    }
+
+    fn session_id(&self) -> Option<String> {
+        self.session_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn start_session(&self, cwd: &str, mcp_servers: Option<&Value>) -> Result<String, String> {
+        let requested = Path::new(cwd);
+        if !requested.is_absolute() {
+            return Err("session/new cwd must be an absolute path".into());
+        }
+        let requested = requested
+            .canonicalize()
+            .map_err(|error| format!("session/new cwd cannot be opened: {error}"))?;
+        if requested != *self.workspace {
+            return Err(format!(
+                "session/new cwd {} does not match Medha workspace {}",
+                requested.display(),
+                self.workspace.display()
+            ));
+        }
+        if let Some(servers) = mcp_servers {
+            let servers = servers
+                .as_array()
+                .ok_or("session/new mcpServers must be an array")?;
+            if !servers.is_empty() {
+                return Err(
+                    "per-session MCP servers are not supported; configure MCP before starting Medha"
+                        .into(),
+                );
+            }
+        }
+        let mut session = self
+            .session_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if session.is_some() {
+            return Err("this Medha process already owns an ACP session".into());
+        }
+        let id = format!("medha-{}", ulid::Ulid::new());
+        *session = Some(id.clone());
+        Ok(id)
+    }
+
+    fn validate_session(&self, params: &Value) -> Result<String, &'static str> {
+        let requested = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or("sessionId must be a string")?;
+        let active = self
+            .session_id()
+            .ok_or("session/new must be called first")?;
+        if requested != active {
+            return Err("sessionId does not belong to this Medha process");
+        }
+        Ok(active)
+    }
+
+    /// Emit one `session/update` notification carrying `update`.
+    fn update(&self, writer: &Writer, update: Value) -> bool {
+        let Some(session_id) = self.session_id() else {
+            return false;
+        };
+        writer.notify(
+            "session/update",
+            json!({ "sessionId": session_id, "update": update }),
+        )
+    }
+}
+
+pub(crate) type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<kernel::Approval>>>>;
 
 fn lock_pending(
     pending: &Pending,
-) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<bool>>> {
+) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<kernel::Approval>>> {
     pending
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -201,14 +310,24 @@ fn lock_pending(
 pub(crate) struct Bridge {
     pub(crate) writer: Arc<Writer>,
     pub(crate) pending: Pending,
+    pub(crate) peer: Peer,
     writer_task: WriterTask,
 }
 
-pub(crate) fn bridge() -> Bridge {
-    bridge_with_output(tokio::io::stdout(), OUTBOUND_FRAMES)
+pub(crate) fn bridge(workspace: PathBuf) -> Bridge {
+    bridge_with_output_in(tokio::io::stdout(), OUTBOUND_FRAMES, workspace)
 }
 
+#[cfg(test)]
 fn bridge_with_output<W>(output: W, capacity: usize) -> Bridge
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    bridge_with_output_in(output, capacity, workspace)
+}
+
+fn bridge_with_output_in<W>(output: W, capacity: usize, workspace: PathBuf) -> Bridge
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -228,6 +347,7 @@ where
             cancelled: cancelled.clone(),
         }),
         pending: Arc::new(Mutex::new(HashMap::new())),
+        peer: Peer::for_workspace(workspace),
         writer_task: WriterTask {
             handle: Some(handle),
             cancelled,
@@ -239,17 +359,80 @@ where
 pub struct AcpGate {
     writer: Arc<Writer>,
     pending: Pending,
+    peer: Peer,
     next_id: AtomicU64,
+    always: Mutex<HashSet<String>>,
 }
 
 impl AcpGate {
-    pub fn new(writer: Arc<Writer>, pending: Pending) -> Self {
+    pub(crate) fn new(writer: Arc<Writer>, pending: Pending, peer: Peer) -> Self {
         Self {
             writer,
             pending,
+            peer,
             next_id: AtomicU64::new(1),
+            always: Mutex::new(HashSet::new()),
         }
     }
+
+    /// ACP carries the request as a real JSON-RPC request the client answers by
+    /// `optionId`; an escalated action is never offered a remembering tier.
+    fn request_acp_permission(
+        &self,
+        gate_id: u64,
+        action: &str,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> bool {
+        let mut options = vec![json!({
+            "optionId": "allow-once",
+            "name": "Allow once",
+            "kind": "allow_once",
+        })];
+        if !escalated {
+            options.push(json!({
+                "optionId": "allow-always",
+                "name": "Allow always",
+                "kind": "allow_always",
+            }));
+        }
+        options.push(json!({
+            "optionId": "reject-once",
+            "name": "Reject",
+            "kind": "reject_once",
+        }));
+        self.writer.write_value(&json!({
+            "jsonrpc": "2.0",
+            "id": acp_gate_request_id(gate_id),
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": self.peer.session_id(),
+                "toolCall": {
+                    "toolCallId": acp_gate_request_id(gate_id),
+                    "title": action,
+                    "kind": "other",
+                    "status": "pending",
+                    "rawInput": { "detail": detail },
+                },
+                "options": options,
+            },
+        }))
+    }
+}
+
+/// Gate ids share the outbound request-id space; the prefix keeps an editor's
+/// reply unambiguous without a second table.
+pub(crate) fn acp_gate_request_id(gate_id: u64) -> String {
+    format!("medha-gate-{gate_id}")
+}
+
+/// The gate id inside an ACP permission response id, if it is one of ours.
+pub(crate) fn acp_gate_id_from(value: &Value) -> Option<u64> {
+    value
+        .as_str()?
+        .strip_prefix("medha-gate-")?
+        .parse::<u64>()
+        .ok()
 }
 
 /// Removes a pending approval if its await is cancelled.
@@ -272,6 +455,15 @@ impl kernel::HumanGate for AcpGate {
         detail: Option<&str>,
         escalated: bool,
     ) -> kernel::Approval {
+        if !escalated
+            && self
+                .always
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(action)
+        {
+            return kernel::Approval::Always;
+        }
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         lock_pending(&self.pending).insert(gate_id, tx);
@@ -279,23 +471,30 @@ impl kernel::HumanGate for AcpGate {
             pending: Arc::clone(&self.pending),
             gate_id,
         };
-        if !self.writer.notify(
-            "approval",
-            json!({ "gate_id": gate_id, "action": action, "detail": detail, "escalated": escalated }),
-        ) {
+        let sent = if self.peer.is_acp() {
+            self.request_acp_permission(gate_id, action, detail, escalated)
+        } else {
+            self.writer.notify(
+                "approval",
+                json!({ "gate_id": gate_id, "action": action, "detail": detail, "escalated": escalated }),
+            )
+        };
+        if !sent {
             return kernel::Approval::Deny;
         }
-        // Disconnect or no response denies the action. Editor approval is
-        // allow-once and never persists a path to medha.lock.
-        let approved = tokio::select! {
-            result = rx => result.unwrap_or(false),
-            _ = self.writer.cancelled() => false,
+        // Disconnect or no response denies the action. Remembering applies to
+        // this live bridge only; it never writes authority into the repository.
+        let approval = tokio::select! {
+            result = rx => result.unwrap_or(kernel::Approval::Deny),
+            _ = self.writer.cancelled() => kernel::Approval::Deny,
         };
-        if approved {
-            kernel::Approval::Once
-        } else {
-            kernel::Approval::Deny
+        if approval == kernel::Approval::Always && !escalated {
+            self.always
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(action.to_string());
         }
+        approval
     }
 }
 
@@ -306,7 +505,7 @@ fn deny_pending(pending: &Pending) -> usize {
         .collect::<Vec<_>>();
     let count = approvals.len();
     for sender in approvals {
-        let _ = sender.send(false);
+        let _ = sender.send(kernel::Approval::Deny);
     }
     count
 }
@@ -314,24 +513,128 @@ fn deny_pending(pending: &Pending) -> usize {
 /// Streams kernel updates as JSON-RPC `event` notifications.
 struct AcpSink {
     writer: Arc<Writer>,
+    peer: Peer,
+}
+
+/// Map a Medha tool to the closest ACP `ToolKind`, so an editor can pick an icon.
+fn acp_tool_kind(tool: &str) -> &'static str {
+    match tool {
+        "fs.read" | "read_artifact" | "fs.list" | "tree" | "code_outline" => "read",
+        "fs.write" | "fs.edit" | "multi_edit" => "edit",
+        "grep" | "glob" | "references" | "sessions.search" => "search",
+        "shell.exec" | "git" => "execute",
+        "web.fetch" | "web.search" | "web.crawl" => "fetch",
+        "update_plan" | "clarify" => "think",
+        _ => "other",
+    }
 }
 
 impl kernel::StreamSink for AcpSink {
     fn text(&self, delta: &str) {
+        if self.peer.is_acp() {
+            self.peer.update(
+                &self.writer,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": delta },
+                }),
+            );
+            return;
+        }
         self.writer.event("model.text", json!({ "delta": delta }));
     }
     fn reasoning(&self, delta: &str) {
+        if self.peer.is_acp() {
+            self.peer.update(
+                &self.writer,
+                json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": delta },
+                }),
+            );
+            return;
+        }
         self.writer
             .event("model.reasoning", json!({ "delta": delta }));
     }
     fn tool_call(&self, tool: &str, args: &Value) {
+        if self.peer.is_acp() {
+            self.peer.update(
+                &self.writer,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool,
+                    "title": tool,
+                    "kind": acp_tool_kind(tool),
+                    "status": "in_progress",
+                    "rawInput": args,
+                }),
+            );
+            return;
+        }
         self.writer
             .event("tool.call", json!({ "tool": tool, "args": args }));
     }
+    fn tool_call_with_id(&self, id: &str, tool: &str, args: &Value) {
+        if self.peer.is_acp() {
+            self.peer.update(
+                &self.writer,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": id,
+                    "title": tool,
+                    "kind": acp_tool_kind(tool),
+                    "status": "in_progress",
+                    "rawInput": args,
+                }),
+            );
+            return;
+        }
+        self.writer
+            .event("tool.call", json!({ "id": id, "tool": tool, "args": args }));
+    }
     fn tool_result(&self, tool: &str, ok: bool, payload: &Value) {
+        if self.peer.is_acp() {
+            let text = serde_json::to_string(payload).unwrap_or_default();
+            self.peer.update(
+                &self.writer,
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tool,
+                    "status": if ok { "completed" } else { "failed" },
+                    "content": [{
+                        "type": "content",
+                        "content": { "type": "text", "text": text },
+                    }],
+                }),
+            );
+            return;
+        }
         self.writer.event(
             "tool.observation",
             json!({ "tool": tool, "ok": ok, "payload": payload }),
+        );
+    }
+    fn tool_result_with_id(&self, id: &str, tool: &str, ok: bool, payload: &Value) {
+        if self.peer.is_acp() {
+            let text = serde_json::to_string(payload).unwrap_or_default();
+            self.peer.update(
+                &self.writer,
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": id,
+                    "status": if ok { "completed" } else { "failed" },
+                    "content": [{
+                        "type": "content",
+                        "content": { "type": "text", "text": text },
+                    }],
+                }),
+            );
+            return;
+        }
+        self.writer.event(
+            "tool.observation",
+            json!({ "id": id, "tool": tool, "ok": ok, "payload": payload }),
         );
     }
     fn usage(&self, prompt_tokens: u32, total_tokens: u32) {
@@ -401,8 +704,55 @@ async fn read_frame(
 #[derive(Debug, PartialEq, Eq)]
 enum RpcAction {
     None,
-    StartTurn(String),
+    /// `reply_to` is set for `session/prompt`, whose JSON-RPC response is the
+    /// turn's `stopReason` and therefore cannot be sent until the turn settles.
+    StartTurn {
+        content: String,
+        reply_to: Option<Value>,
+    },
     Shutdown,
+}
+
+impl RpcAction {
+    fn turn(content: String) -> Self {
+        Self::StartTurn {
+            content,
+            reply_to: None,
+        }
+    }
+}
+
+/// Flatten ACP prompt content blocks into the text Medha's kernel consumes.
+fn acp_prompt_text(prompt: Option<&Value>) -> String {
+    let mut text = String::new();
+    for block in prompt.and_then(Value::as_array).into_iter().flatten() {
+        let part = match block.get("type").and_then(Value::as_str) {
+            Some("text") => block.get("text").and_then(Value::as_str),
+            Some("resource") => block
+                .get("resource")
+                .and_then(|resource| resource.get("text"))
+                .and_then(Value::as_str),
+            _ => None,
+        };
+        if let Some(part) = part {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(part);
+        }
+    }
+    text
+}
+
+/// Medha's stop reasons in ACP's vocabulary.
+fn acp_stop_reason(reason: &StopReason) -> &'static str {
+    match reason {
+        StopReason::Finished => "end_turn",
+        StopReason::Interrupted => "cancelled",
+        StopReason::VerificationFailed => "refusal",
+        StopReason::Budget(kernel::BudgetStop::Tokens) => "max_tokens",
+        StopReason::Budget(_) => "max_turn_requests",
+    }
 }
 
 fn rpc_result(writer: &Writer, id: &Option<Value>, result: Value) {
@@ -425,6 +775,7 @@ fn dispatch_rpc(
     interrupt: Option<&kernel::InterruptHandle>,
     pending: &Pending,
     writer: &Writer,
+    peer: &Peer,
 ) -> RpcAction {
     let Some(object) = message.as_object() else {
         writer.error(Value::Null, -32600, "invalid JSON-RPC request");
@@ -433,6 +784,29 @@ fn dispatch_rpc(
     let id = object.get("id").cloned();
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         writer.error(id.unwrap_or(Value::Null), -32600, "jsonrpc must be \"2.0\"");
+        return RpcAction::None;
+    }
+    // An ACP client answers `session/request_permission` with a response frame,
+    // which carries no method. Route it to the waiting gate.
+    if object.get("method").is_none()
+        && let Some(gate_id) = id.as_ref().and_then(acp_gate_id_from)
+    {
+        let chosen = object
+            .get("result")
+            .and_then(|result| result.get("outcome"))
+            .and_then(|outcome| {
+                (outcome.get("outcome").and_then(Value::as_str) == Some("selected"))
+                    .then(|| outcome.get("optionId").and_then(Value::as_str))
+                    .flatten()
+            });
+        let approval = match chosen {
+            Some("allow-once") => kernel::Approval::Once,
+            Some("allow-always") => kernel::Approval::Always,
+            _ => kernel::Approval::Deny,
+        };
+        if let Some(sender) = lock_pending(pending).remove(&gate_id) {
+            let _ = sender.send(approval);
+        }
         return RpcAction::None;
     }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
@@ -446,6 +820,88 @@ fn dispatch_rpc(
     let params = object.get("params").cloned().unwrap_or(Value::Null);
 
     match method {
+        // A peer that names a protocolVersion is an ACP client; everything else
+        // is a caller of Medha's original bridge, which keeps working unchanged.
+        "initialize" if params.get("protocolVersion").is_some() => {
+            peer.select_acp();
+            rpc_result(
+                writer,
+                &id,
+                json!({
+                    "protocolVersion": ACP_PROTOCOL_VERSION,
+                    "agentInfo": { "name": "medha", "version": env!("CARGO_PKG_VERSION") },
+                    "agentCapabilities": {
+                        "loadSession": false,
+                        "promptCapabilities": {
+                            "image": false,
+                            "audio": false,
+                            "embeddedContext": true,
+                        },
+                    },
+                    "authMethods": [],
+                }),
+            );
+            RpcAction::None
+        }
+        "authenticate" => {
+            rpc_result(writer, &id, json!({}));
+            RpcAction::None
+        }
+        "session/new" => {
+            if !peer.is_acp() {
+                rpc_error(
+                    writer,
+                    &id,
+                    -32000,
+                    "initialize must be called before session/new",
+                );
+                return RpcAction::None;
+            }
+            let Some(cwd) = params.get("cwd").and_then(Value::as_str) else {
+                rpc_error(writer, &id, -32602, "session/new cwd must be a string");
+                return RpcAction::None;
+            };
+            match peer.start_session(cwd, params.get("mcpServers")) {
+                Ok(session_id) => rpc_result(writer, &id, json!({ "sessionId": session_id })),
+                Err(error) => rpc_error(writer, &id, -32602, error),
+            }
+            RpcAction::None
+        }
+        "session/prompt" => {
+            if let Err(error) = peer.validate_session(&params) {
+                rpc_error(writer, &id, -32602, error);
+                return RpcAction::None;
+            }
+            let content = acp_prompt_text(params.get("prompt"));
+            if content.trim().is_empty() {
+                rpc_error(writer, &id, -32602, "prompt must contain text content");
+                return RpcAction::None;
+            }
+            if running {
+                if let Some(handle) = interrupt {
+                    handle.steer(content);
+                    rpc_result(writer, &id, json!({ "stopReason": "end_turn" }));
+                } else {
+                    rpc_error(writer, &id, -32000, "a turn is already running");
+                }
+                return RpcAction::None;
+            }
+            RpcAction::StartTurn {
+                content,
+                reply_to: id,
+            }
+        }
+        "session/cancel" => {
+            if let Err(error) = peer.validate_session(&params) {
+                rpc_error(writer, &id, -32602, error);
+                return RpcAction::None;
+            }
+            if let Some(handle) = interrupt {
+                handle.cancel_turn();
+            }
+            deny_pending(pending);
+            RpcAction::None
+        }
         "initialize" | "hello" => {
             rpc_result(
                 writer,
@@ -475,7 +931,7 @@ fn dispatch_rpc(
                 RpcAction::None
             } else {
                 rpc_result(writer, &id, json!({ "accepted": true, "steered": false }));
-                RpcAction::StartTurn(content)
+                RpcAction::turn(content)
             }
         }
         "approval.respond" => {
@@ -484,12 +940,13 @@ fn dispatch_rpc(
                 params.get("approve").and_then(Value::as_bool),
                 params.get("decision").and_then(Value::as_str),
             ) {
-                (Some(approve), _) => Some(approve),
-                (None, Some("approve")) => Some(true),
-                (None, Some("deny")) => Some(false),
+                (Some(true), _) => Some(kernel::Approval::Once),
+                (Some(false), _) => Some(kernel::Approval::Deny),
+                (None, Some("approve")) => Some(kernel::Approval::Once),
+                (None, Some("deny")) => Some(kernel::Approval::Deny),
                 _ => None,
             };
-            let (Some(gate_id), Some(approve)) = (gate_id, decision) else {
+            let (Some(gate_id), Some(approval)) = (gate_id, decision) else {
                 rpc_error(
                     writer,
                     &id,
@@ -500,7 +957,7 @@ fn dispatch_rpc(
             };
             let sender = lock_pending(pending).remove(&gate_id);
             if let Some(sender) = sender {
-                let _ = sender.send(approve);
+                let _ = sender.send(approval);
                 rpc_result(writer, &id, json!({ "accepted": true }));
             } else {
                 rpc_error(writer, &id, -32001, "approval is not pending");
@@ -544,9 +1001,10 @@ fn dispatch_line(
     interrupt: Option<&kernel::InterruptHandle>,
     pending: &Pending,
     writer: &Writer,
+    peer: &Peer,
 ) -> RpcAction {
     match serde_json::from_str::<Value>(line) {
-        Ok(message) => dispatch_rpc(message, model, running, interrupt, pending, writer),
+        Ok(message) => dispatch_rpc(message, model, running, interrupt, pending, writer, peer),
         Err(_) => {
             // A malformed peer message cannot approve safely. Reject any gate
             // waiting on that peer instead of retaining it indefinitely.
@@ -601,8 +1059,10 @@ where
     let Bridge {
         writer,
         pending,
+        peer,
         writer_task,
     } = bridge;
+    let mut prompt_reply: Option<Value> = None;
     writer.notify(
         "ready",
         json!({ "proto": "1.0", "model": model, "caps": { "cards": ["approval", "diff"] } }),
@@ -625,10 +1085,11 @@ where
                 if trimmed.is_empty() {
                     continue;
                 }
-                match dispatch_line(trimmed, &model, running, interrupt.as_ref(), &pending, &writer) {
+                match dispatch_line(trimmed, &model, running, interrupt.as_ref(), &pending, &writer, &peer) {
                     RpcAction::None => {}
                     RpcAction::Shutdown => break,
-                    RpcAction::StartTurn(content) => {
+                    RpcAction::StartTurn { content, reply_to } => {
+                        prompt_reply = reply_to;
                         transcript.push(Message::user(content));
                         running = true;
                         let (handle, queue) = kernel::InterruptQueue::pair();
@@ -640,8 +1101,9 @@ where
                         // with descendants spawned during that turn.
                         let budget = crate::task_budget(&base_budget, &agent_budget);
                         let writer = writer.clone();
+                        let peer = peer.clone();
                         turns.spawn(async move {
-                            let sink = AcpSink { writer };
+                            let sink = AcpSink { writer, peer };
                             let result = kernel
                                 .run_session(&session, messages, budget, &sink, Some(queue))
                                 .await;
@@ -660,24 +1122,41 @@ where
                 // also releases a gate whose task ended with an error before
                 // consuming its response.
                 deny_pending(&pending);
+                // `session/prompt` is answered here, not at dispatch: its result
+                // is the turn's stopReason.
+                let reply = prompt_reply.take();
                 match joined {
                     Some(Ok(TurnDone::Ok(updated, reason))) => {
                         transcript = updated;
-                        match reason {
-                            StopReason::VerificationFailed => writer.event("turn.done", json!({ "stopped": "verification_failed" })),
-                            StopReason::Interrupted => writer.event("turn.cancelled", json!({})),
-                            StopReason::Budget(s) => writer.event("turn.done", json!({ "stopped": s.label() })),
-                            StopReason::Finished => writer.event("turn.done", json!({ "stopped": Value::Null })),
-                        };
+                        if let Some(id) = reply {
+                            writer.respond(id, json!({ "stopReason": acp_stop_reason(&reason) }));
+                        } else {
+                            match reason {
+                                StopReason::VerificationFailed => writer.event("turn.done", json!({ "stopped": "verification_failed" })),
+                                StopReason::Interrupted => writer.event("turn.cancelled", json!({})),
+                                StopReason::Budget(s) => writer.event("turn.done", json!({ "stopped": s.label() })),
+                                StopReason::Finished => writer.event("turn.done", json!({ "stopped": Value::Null })),
+                            };
+                        }
                     }
                     Some(Ok(TurnDone::Err(e))) => {
-                        writer.event("turn.error", json!({ "message": e }));
+                        match reply {
+                            Some(id) => { writer.error(id, -32000, e); }
+                            None => { writer.event("turn.error", json!({ "message": e })); }
+                        }
                     }
                     Some(Err(error)) => {
-                        writer.event("turn.error", json!({ "message": format!("turn task failed: {error}") }));
+                        let message = format!("turn task failed: {error}");
+                        match reply {
+                            Some(id) => { writer.error(id, -32000, message); }
+                            None => { writer.event("turn.error", json!({ "message": message })); }
+                        }
                     }
                     None => {
-                        writer.event("turn.error", json!({ "message": "turn task disappeared" }));
+                        match reply {
+                            Some(id) => { writer.error(id, -32000, "turn task disappeared"); }
+                            None => { writer.event("turn.error", json!({ "message": "turn task disappeared" })); }
+                        }
                     }
                 }
             }
@@ -694,7 +1173,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kernel::{Approval, HumanGate, Role};
+    use kernel::{Approval, HumanGate, Role, StreamSink};
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
@@ -749,8 +1228,322 @@ mod tests {
         pending: &Pending,
     ) -> (RpcAction, Vec<Value>) {
         let (writer, mut rx) = capture_writer(32);
-        let action = dispatch_rpc(message, "test-model", running, interrupt, pending, &writer);
+        let action = dispatch_rpc(
+            message,
+            "test-model",
+            running,
+            interrupt,
+            pending,
+            &writer,
+            &Peer::new(),
+        );
         (action, captured_values(&mut rx))
+    }
+
+    /// An ACP client's whole opening exchange, in the order an editor sends it.
+    #[test]
+    fn an_acp_client_completes_the_standard_session_handshake() {
+        let peer = Peer::new();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (writer, mut rx) = capture_writer(32);
+        let send = |message: Value, running: bool| -> RpcAction {
+            dispatch_rpc(message, "m", running, None, &pending, &writer, &peer)
+        };
+
+        send(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": 1, "clientCapabilities": {}}}),
+            false,
+        );
+        assert!(
+            peer.is_acp(),
+            "protocolVersion selects the standard dialect"
+        );
+        let initialized = captured_values(&mut rx);
+        assert_eq!(initialized[0]["result"]["protocolVersion"], json!(1));
+        assert_eq!(
+            initialized[0]["result"]["agentCapabilities"]["loadSession"],
+            json!(false)
+        );
+
+        let cwd = peer.workspace.display().to_string();
+        send(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                   "params": {"cwd": cwd, "mcpServers": []}}),
+            false,
+        );
+        let created = captured_values(&mut rx);
+        let session_id = created[0]["result"]["sessionId"].clone();
+        assert_eq!(session_id, json!(peer.session_id()));
+
+        let action = send(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                   "params": {"sessionId": session_id,
+                              "prompt": [{"type": "text", "text": "fix the test"}]}}),
+            false,
+        );
+        // The response is the turn's stopReason, so it must be deferred.
+        assert_eq!(
+            action,
+            RpcAction::StartTurn {
+                content: "fix the test".into(),
+                reply_to: Some(json!(3)),
+            }
+        );
+        assert!(
+            captured_values(&mut rx).is_empty(),
+            "session/prompt must not answer before the turn ends"
+        );
+    }
+
+    #[test]
+    fn acp_rejects_duplicate_foreign_and_unimplemented_session_inputs() {
+        fn initialize(peer: &Peer, writer: &Writer, pending: &Pending) {
+            dispatch_rpc(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": 1}}),
+                "m",
+                false,
+                None,
+                pending,
+                writer,
+                peer,
+            );
+        }
+
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (writer, mut rx) = capture_writer(32);
+        let peer = Peer::new();
+        initialize(&peer, &writer, &pending);
+        captured_values(&mut rx);
+        let cwd = peer.workspace.display().to_string();
+        dispatch_rpc(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                   "params": {"cwd": cwd, "mcpServers": []}}),
+            "m",
+            false,
+            None,
+            &pending,
+            &writer,
+            &peer,
+        );
+        let created = captured_values(&mut rx);
+        let session_id = created[0]["result"]["sessionId"].clone();
+
+        dispatch_rpc(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/new",
+                   "params": {"cwd": peer.workspace.display().to_string(), "mcpServers": []}}),
+            "m",
+            false,
+            None,
+            &pending,
+            &writer,
+            &peer,
+        );
+        assert!(captured_values(&mut rx)[0].get("error").is_some());
+
+        dispatch_rpc(
+            json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+                   "params": {"sessionId": "foreign", "prompt": [{"type": "text", "text": "x"}]}}),
+            "m",
+            false,
+            None,
+            &pending,
+            &writer,
+            &peer,
+        );
+        assert!(captured_values(&mut rx)[0].get("error").is_some());
+
+        let second = Peer::new();
+        initialize(&second, &writer, &pending);
+        captured_values(&mut rx);
+        dispatch_rpc(
+            json!({"jsonrpc": "2.0", "id": 5, "method": "session/new",
+                   "params": {"cwd": second.workspace.display().to_string(),
+                              "mcpServers": [{"name": "repo-server"}]}}),
+            "m",
+            false,
+            None,
+            &pending,
+            &writer,
+            &second,
+        );
+        assert!(captured_values(&mut rx)[0].get("error").is_some());
+        assert_eq!(peer.session_id().map(Value::String), Some(session_id));
+    }
+
+    #[test]
+    fn an_acp_permission_response_reaches_the_waiting_gate() {
+        let peer = Peer::new();
+        peer.select_acp();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (writer, mut rx) = capture_writer(8);
+        let (tx, mut answered) = oneshot::channel();
+        lock_pending(&pending).insert(7, tx);
+
+        dispatch_rpc(
+            json!({"jsonrpc": "2.0", "id": acp_gate_request_id(7),
+                   "result": {"outcome": {"outcome": "selected", "optionId": "allow-once"}}}),
+            "m",
+            true,
+            None,
+            &pending,
+            &writer,
+            &peer,
+        );
+        assert_eq!(answered.try_recv(), Ok(Approval::Once));
+        assert!(lock_pending(&pending).is_empty());
+
+        let (tx, mut cancelled) = oneshot::channel();
+        lock_pending(&pending).insert(8, tx);
+        dispatch_rpc(
+            json!({"jsonrpc": "2.0", "id": acp_gate_request_id(8),
+                   "result": {"outcome": {"outcome": "cancelled"}}}),
+            "m",
+            true,
+            None,
+            &pending,
+            &writer,
+            &peer,
+        );
+        assert_eq!(
+            cancelled.try_recv(),
+            Ok(Approval::Deny),
+            "cancelled is not consent"
+        );
+        captured_values(&mut rx);
+    }
+
+    #[test]
+    fn escalated_permission_options_omit_the_remembering_tier() {
+        let peer = Peer::new();
+        peer.select_acp();
+        let (writer, mut rx) = capture_writer(8);
+        let gate = AcpGate::new(
+            Arc::clone(&writer),
+            Arc::new(Mutex::new(HashMap::new())),
+            peer,
+        );
+
+        gate.request_acp_permission(1, "shell.exec", Some("cargo test"), true);
+        let escalated = captured_values(&mut rx);
+        assert_eq!(
+            escalated[0]["params"]["toolCall"]["rawInput"]["detail"],
+            "cargo test"
+        );
+        let kinds: Vec<&str> = escalated[0]["params"]["options"]
+            .as_array()
+            .expect("options array")
+            .iter()
+            .filter_map(|option| option["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["allow_once", "reject_once"]);
+
+        gate.request_acp_permission(2, "shell.exec", None, false);
+        let plain = captured_values(&mut rx);
+        assert!(
+            plain[0]["params"]["options"]
+                .as_array()
+                .expect("options array")
+                .iter()
+                .any(|option| option["kind"] == "allow_always")
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_always_is_remembered_for_the_live_non_escalated_action() {
+        let peer = Peer::new();
+        peer.select_acp();
+        peer.start_session(&peer.workspace.display().to_string(), Some(&json!([])))
+            .unwrap();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (writer, mut rx) = capture_writer(8);
+        let gate = Arc::new(AcpGate::new(
+            Arc::clone(&writer),
+            Arc::clone(&pending),
+            peer.clone(),
+        ));
+        let waiting = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move { gate.confirm("fs.edit", Some("a.rs"), false).await })
+        };
+        let frame = rx.recv().await.expect("permission request");
+        let request: Value = match frame {
+            Outbound::Frame(frame) => serde_json::from_slice(&frame).unwrap(),
+            Outbound::Close(_) => panic!("writer closed"),
+        };
+        dispatch_rpc(
+            json!({"jsonrpc": "2.0", "id": request["id"].clone(),
+                   "result": {"outcome": {"outcome": "selected", "optionId": "allow-always"}}}),
+            "m",
+            true,
+            None,
+            &pending,
+            &writer,
+            &peer,
+        );
+        assert_eq!(waiting.await.unwrap(), Approval::Always);
+        assert_eq!(
+            gate.confirm("fs.edit", Some("b.rs"), false).await,
+            Approval::Always
+        );
+        assert!(rx.try_recv().is_err(), "remembered approval prompted again");
+    }
+
+    #[test]
+    fn acp_tool_updates_keep_the_provider_call_id() {
+        let peer = Peer::new();
+        peer.select_acp();
+        peer.start_session(&peer.workspace.display().to_string(), Some(&json!([])))
+            .unwrap();
+        let (writer, mut rx) = capture_writer(8);
+        let sink = AcpSink { writer, peer };
+        sink.tool_call_with_id("call-17", "fs.read", &json!({"path": "a.rs"}));
+        sink.tool_result_with_id("call-17", "fs.read", true, &json!({"content": "x"}));
+        let updates = captured_values(&mut rx);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0]["params"]["update"]["toolCallId"], "call-17");
+        assert_eq!(updates[1]["params"]["update"]["toolCallId"], "call-17");
+    }
+
+    #[test]
+    fn medha_stop_reasons_map_onto_the_acp_vocabulary() {
+        assert_eq!(acp_stop_reason(&StopReason::Finished), "end_turn");
+        assert_eq!(acp_stop_reason(&StopReason::Interrupted), "cancelled");
+        assert_eq!(acp_stop_reason(&StopReason::VerificationFailed), "refusal");
+        assert_eq!(
+            acp_stop_reason(&StopReason::Budget(kernel::BudgetStop::Tokens)),
+            "max_tokens"
+        );
+    }
+
+    #[test]
+    fn acp_prompt_blocks_flatten_text_and_embedded_resources() {
+        let prompt = json!([
+            {"type": "text", "text": "explain"},
+            {"type": "resource", "resource": {"uri": "file:///a.rs", "text": "fn main() {}"}},
+            {"type": "image", "data": "ignored"},
+        ]);
+        assert_eq!(acp_prompt_text(Some(&prompt)), "explain\nfn main() {}");
+        assert_eq!(acp_prompt_text(None), "");
+    }
+
+    /// The original bridge must keep working for callers that already use it.
+    #[test]
+    fn a_legacy_initialize_does_not_switch_dialects() {
+        let peer = Peer::new();
+        let (writer, mut rx) = capture_writer(8);
+        dispatch_rpc(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+            "m",
+            false,
+            None,
+            &Arc::new(Mutex::new(HashMap::new())),
+            &writer,
+            &peer,
+        );
+        assert!(!peer.is_acp());
+        assert_eq!(captured_values(&mut rx)[0]["result"]["proto"], json!("1.0"));
     }
 
     #[test]
@@ -773,7 +1566,7 @@ mod tests {
             None,
             &empty_pending(),
         );
-        assert_eq!(action, RpcAction::StartTurn("hello".into()));
+        assert_eq!(action, RpcAction::turn("hello".into()));
         assert_exactly_one_response(&values, json!(3));
 
         let (steer, _queue) = kernel::InterruptQueue::pair();
@@ -794,7 +1587,7 @@ mod tests {
             None,
             &pending,
         );
-        assert_eq!(approval_rx.try_recv(), Ok(true));
+        assert_eq!(approval_rx.try_recv(), Ok(Approval::Once));
         assert_exactly_one_response(&values, json!(5));
 
         for (id, method) in [(6, "cancel"), (7, "interrupt")] {
@@ -809,7 +1602,7 @@ mod tests {
                 &pending,
             );
             assert!(queue.cancel_requested());
-            assert_eq!(approval_rx.try_recv(), Ok(false));
+            assert_eq!(approval_rx.try_recv(), Ok(Approval::Deny));
             assert!(lock_pending(&pending).is_empty());
             assert_exactly_one_response(&values, json!(id));
         }
@@ -827,7 +1620,7 @@ mod tests {
             );
             assert_eq!(action, RpcAction::Shutdown);
             assert!(queue.cancel_requested());
-            assert_eq!(approval_rx.try_recv(), Ok(false));
+            assert_eq!(approval_rx.try_recv(), Ok(Approval::Deny));
             assert_exactly_one_response(&values, json!(id));
         }
     }
@@ -867,6 +1660,7 @@ mod tests {
                 None,
                 &Arc::new(Mutex::new(HashMap::new())),
                 &writer,
+                &Peer::new(),
             ),
             RpcAction::None
         );
@@ -906,10 +1700,11 @@ mod tests {
                 running.then_some(&handle),
                 &pending,
                 &writer,
+                &Peer::new(),
             );
         }
 
-        assert_eq!(approval_rx.try_recv(), Ok(false));
+        assert_eq!(approval_rx.try_recv(), Ok(Approval::Deny));
         let values = captured_values(&mut rx);
         assert!(
             values.iter().all(|value| value.get("id").is_none()),
@@ -946,7 +1741,11 @@ mod tests {
     async fn approval_entries_are_raii_scoped_and_disconnect_denies_them() {
         let (writer, mut rx) = capture_writer(8);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let gate = Arc::new(AcpGate::new(Arc::clone(&writer), Arc::clone(&pending)));
+        let gate = Arc::new(AcpGate::new(
+            Arc::clone(&writer),
+            Arc::clone(&pending),
+            Peer::new(),
+        ));
 
         let dropped_gate = Arc::clone(&gate);
         let dropped =
@@ -976,8 +1775,16 @@ mod tests {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (malformed_tx, mut malformed_rx) = oneshot::channel();
         lock_pending(&pending).insert(1, malformed_tx);
-        dispatch_line("{broken", "model", true, None, &pending, &writer);
-        assert_eq!(malformed_rx.try_recv(), Ok(false));
+        dispatch_line(
+            "{broken",
+            "model",
+            true,
+            None,
+            &pending,
+            &writer,
+            &Peer::new(),
+        );
+        assert_eq!(malformed_rx.try_recv(), Ok(Approval::Deny));
         assert!(lock_pending(&pending).is_empty());
         captured_values(&mut rx);
 
@@ -992,11 +1799,12 @@ mod tests {
                 Some(&handle),
                 &pending,
                 &writer,
+                &Peer::new(),
             ),
             RpcAction::Shutdown
         );
         assert!(queue.cancel_requested());
-        assert_eq!(shutdown_rx.try_recv(), Ok(false));
+        assert_eq!(shutdown_rx.try_recv(), Ok(Approval::Deny));
         assert!(lock_pending(&pending).is_empty());
     }
 
@@ -1009,8 +1817,8 @@ mod tests {
         lock_pending(&pending).insert(2, second_tx);
 
         assert_eq!(deny_pending(&pending), 2);
-        assert_eq!(first_rx.try_recv(), Ok(false));
-        assert_eq!(second_rx.try_recv(), Ok(false));
+        assert_eq!(first_rx.try_recv(), Ok(Approval::Deny));
+        assert_eq!(second_rx.try_recv(), Ok(Approval::Deny));
         assert!(lock_pending(&pending).is_empty());
     }
 
@@ -1026,14 +1834,14 @@ mod tests {
         let mut turns = JoinSet::new();
         turns.spawn(async move {
             cancellation.cancelled().await;
-            let denied = approval_rx.await.unwrap_or(true);
+            let denied = approval_rx.await.unwrap_or(Approval::Deny);
             let _ = settled_tx.send(denied);
             TurnDone::Err("cancelled for shutdown".into())
         });
 
         settle_turn(&mut interrupt, &pending, &mut turns, Duration::from_secs(1)).await;
 
-        assert!(!settled_rx.await.unwrap());
+        assert_eq!(settled_rx.await.unwrap(), Approval::Deny);
         assert!(interrupt.is_none());
         assert!(lock_pending(&pending).is_empty());
         assert!(turns.is_empty());
@@ -1065,6 +1873,7 @@ mod tests {
         let Bridge {
             writer: blocked_writer,
             pending: _,
+            peer: _,
             writer_task: blocked_task,
         } = bridge_with_output(blocked_output, 2);
 
@@ -1096,6 +1905,7 @@ mod tests {
         let Bridge {
             writer: healthy_writer,
             pending: _,
+            peer: _,
             writer_task: healthy_task,
         } = bridge_with_output(healthy_output, 2);
         assert!(healthy_writer.notify("healthy", json!({"ok": true})));
@@ -1113,6 +1923,7 @@ mod tests {
         let Bridge {
             writer,
             pending: _,
+            peer: _,
             writer_task,
         } = bridge_with_output(BrokenOutput, 2);
         assert!(writer.notify("event", json!({"delta": "x"})));

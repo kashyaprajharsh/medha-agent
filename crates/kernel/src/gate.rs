@@ -41,6 +41,12 @@ pub trait HumanGate: Send + Sync {
     /// Ask about a specific action. Trust-flow escalations must not be remembered.
     async fn confirm(&self, action: &str, detail: Option<&str>, escalated: bool) -> Approval;
 
+    /// Why a denial happened, so the model is never told a person refused when
+    /// no person was asked. Gates backed by a human keep the default.
+    fn denial_reason(&self) -> &'static str {
+        "rejected by human"
+    }
+
     /// Ask whether to grant the sandbox network access and retry. Gates that do
     /// not override this map their [`confirm`](Self::confirm) answer: a plain
     /// `Once` stays once, `Always` becomes a durable grant, `Deny` denies.
@@ -81,6 +87,10 @@ pub struct AutoDeny;
 impl HumanGate for AutoDeny {
     async fn confirm(&self, _action: &str, _detail: Option<&str>, _escalated: bool) -> Approval {
         Approval::Deny
+    }
+
+    fn denial_reason(&self) -> &'static str {
+        "this action needs approval and the run is headless, so no one could be asked"
     }
 }
 

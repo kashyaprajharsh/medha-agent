@@ -2662,6 +2662,17 @@ impl SshBackend {
         if let Some(dir) = &self.remote_dir {
             parts.push(format!("cd {} &&", shell_quote(dir)));
         }
+        // The caller's env contract has to cross the link too: `env -i` reproduces
+        // `clear_env`, and each pair is quoted like any other operand.
+        if req.clear_env {
+            parts.push("env".into());
+            parts.push("-i".into());
+        } else if !req.env.is_empty() {
+            parts.push("env".into());
+        }
+        for (name, value) in &req.env {
+            parts.push(shell_quote(&format!("{name}={value}")));
+        }
         parts.push(shell_quote(&req.program));
         for arg in &req.args {
             parts.push(shell_quote(arg));

@@ -18,6 +18,22 @@ use ulid::Ulid;
 /// persisted event field with unambiguous length framing.
 pub const EVENT_HASH_VERSION: u8 = 2;
 
+/// Durable-only acknowledgement metadata used by the sub-agent outbox. It is
+/// retained in the event log, but must never be shown to a model or UI.
+pub const AGENT_REPORT_ACKS_FIELD: &str = "_agent_report_dispatches";
+
+pub(crate) fn strip_private_observation_fields(payload: &mut Value) {
+    if let Some(object) = payload.as_object_mut() {
+        object.remove(AGENT_REPORT_ACKS_FIELD);
+    }
+}
+
+fn visible_observation_payload(event_payload: &Value) -> Value {
+    let mut payload = event_payload.get("payload").cloned().unwrap_or(Value::Null);
+    strip_private_observation_fields(&mut payload);
+    payload
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
     UserMessage,
@@ -1098,11 +1114,7 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                     .get("intent_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let content = e
-                    .payload
-                    .get("payload")
-                    .map(|p| p.to_string())
-                    .unwrap_or_default();
+                let content = visible_observation_payload(&e.payload).to_string();
                 out.push(Message::tool_result(id, content));
             }
             EventKind::Compaction => {
@@ -1268,11 +1280,7 @@ fn project_ordered_messages_impl(
                     .get("intent_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let content = event
-                    .payload
-                    .get("payload")
-                    .map(Value::to_string)
-                    .unwrap_or_default();
+                let content = visible_observation_payload(&event.payload).to_string();
                 out.push(ModelMessage {
                     role: crate::types::Role::Tool,
                     parts: vec![ContentPart::ToolResult(ToolResultPart {
@@ -1494,6 +1502,36 @@ mod tests {
         assert!(matches!(msgs[2].role, Role::Tool) && msgs[2].tool_call_id.as_deref() == Some("1"));
         assert!(msgs[2].content.contains("a.rs"));
         assert!(matches!(msgs[3].role, Role::Assistant) && msgs[3].content.contains("a.rs"));
+    }
+
+    #[test]
+    fn agent_report_acknowledgements_stay_durable_but_never_reach_replay() {
+        let session = Session::new();
+        let event = Event::tool_obs(
+            &session,
+            &Observation::ok(
+                "wait-1",
+                json!({
+                    "reports": [{"summary": "done"}],
+                    AGENT_REPORT_ACKS_FIELD: ["dispatch-1"],
+                }),
+            ),
+            TrustLabel::Tool,
+        );
+        assert_eq!(
+            event.payload["payload"][AGENT_REPORT_ACKS_FIELD],
+            json!(["dispatch-1"]),
+            "the durable outbox acknowledgement was lost"
+        );
+
+        let legacy = project_messages(std::slice::from_ref(&event));
+        let ordered = project_ordered_messages(std::slice::from_ref(&event));
+        assert!(!legacy[0].content.contains(AGENT_REPORT_ACKS_FIELD));
+        let ContentPart::ToolResult(result) = &ordered[0].parts[0] else {
+            panic!("expected ordered tool result")
+        };
+        assert!(!result.content.contains(AGENT_REPORT_ACKS_FIELD));
+        assert!(result.content.contains("reports"));
     }
 
     #[test]

@@ -862,8 +862,9 @@ pub(super) fn render_approval(
     detail: Option<&str>,
     sel: usize,
     opts: &[&str],
+    escalated: bool,
 ) -> Vec<Line<'static>> {
-    render_approval_detail(action, detail, sel, opts, 18)
+    render_approval_detail(action, detail, sel, opts, 18, escalated)
 }
 
 fn render_approval_detail(
@@ -872,6 +873,7 @@ fn render_approval_detail(
     sel: usize,
     opts: &[&str],
     detail_limit: usize,
+    escalated: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(""),
@@ -886,6 +888,14 @@ fn render_approval_detail(
             Span::styled("?", Style::default().fg(theme::text())),
         ]),
     ];
+    if escalated {
+        lines.push(Line::from(Span::styled(
+            "⚠ this action follows untrusted web content — reviewed every time",
+            Style::default()
+                .fg(theme::del_fg())
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
     if let Some(detail) = detail {
         lines.push(Line::from(""));
         for l in detail.lines().take(detail_limit) {
@@ -2370,15 +2380,17 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
                     &pending.action,
                     pending.detail.as_deref(),
                     model.approval_sel,
-                    pending.responder.options(),
+                    pending.responder.options_for(pending.escalated),
                     MAX_TOOL_OUTPUT_LINES,
+                    pending.escalated,
                 )
             } else {
                 render_approval(
                     &pending.action,
                     pending.detail.as_deref(),
                     model.approval_sel,
-                    pending.responder.options(),
+                    pending.responder.options_for(pending.escalated),
+                    pending.escalated,
                 )
             };
             // If more approvals are queued behind the current one, say so — so the

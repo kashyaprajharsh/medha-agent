@@ -267,11 +267,10 @@ pub struct SearchResults {
 
 /// Searches metadata across sources without letting one failure abort the rest.
 pub async fn search(taps: &[Tap], query: &str) -> Result<SearchResults, String> {
-    let client = crate::skills::install_client()?;
     let q = query.trim().to_lowercase();
     let mut out = SearchResults::default();
     for tap in taps {
-        match search_tap(&client, tap, &q).await {
+        match search_tap(tap, &q).await {
             Ok(mut hits) => out.hits.append(&mut hits),
             Err(e) => out.errors.push(format!("{}: {e}", tap.key())),
         }
@@ -281,7 +280,7 @@ pub async fn search(taps: &[Tap], query: &str) -> Result<SearchResults, String> 
     Ok(out)
 }
 
-async fn search_tap(client: &reqwest::Client, tap: &Tap, q: &str) -> Result<Vec<SkillHit>, String> {
+async fn search_tap(tap: &Tap, q: &str) -> Result<Vec<SkillHit>, String> {
     let ref_qs = tap
         .git_ref
         .as_deref()
@@ -292,7 +291,7 @@ async fn search_tap(client: &reqwest::Client, tap: &Tap, q: &str) -> Result<Vec<
         tap.repo,
         encode_path(&tap.path),
     );
-    let body = crate::skills::fetch_limited(client, &api, 4 * 1024 * 1024).await?;
+    let body = crate::skills::fetch_limited(&api, 4 * 1024 * 1024).await?;
     let entries: Value = serde_json::from_slice(&body)
         .map_err(|e| format!("unexpected listing for {}: {e}", tap.path))?;
     let dirs: Vec<String> = entries
@@ -308,9 +307,8 @@ async fn search_tap(client: &reqwest::Client, tap: &Tap, q: &str) -> Result<Vec<
     //    the API rate limit), bounded-concurrently, keeping only query matches.
     let hits = futures::stream::iter(dirs)
         .map(|dir| {
-            let client = client.clone();
             let (repo, path, git_ref) = (tap.repo.clone(), tap.path.clone(), tap.git_ref.clone());
-            async move { fetch_hit(&client, &repo, &path, &dir, git_ref.as_deref()).await }
+            async move { fetch_hit(&repo, &path, &dir, git_ref.as_deref()).await }
         })
         .buffer_unordered(SEARCH_CONCURRENCY)
         .filter_map(|hit| async move { hit.and_then(|h| score(h, q)) })
@@ -319,13 +317,7 @@ async fn search_tap(client: &reqwest::Client, tap: &Tap, q: &str) -> Result<Vec<
     Ok(hits)
 }
 
-async fn fetch_hit(
-    client: &reqwest::Client,
-    repo: &str,
-    path: &str,
-    dir: &str,
-    git_ref: Option<&str>,
-) -> Option<SkillHit> {
+async fn fetch_hit(repo: &str, path: &str, dir: &str, git_ref: Option<&str>) -> Option<SkillHit> {
     let r = git_ref.unwrap_or("HEAD");
     let raw = format!(
         "https://raw.githubusercontent.com/{repo}/{}/{}/{}/SKILL.md",
@@ -333,9 +325,7 @@ async fn fetch_hit(
         encode_path(path),
         urlencoding::encode(dir),
     );
-    let bytes = crate::skills::fetch_limited(client, &raw, 128 * 1024)
-        .await
-        .ok()?;
+    let bytes = crate::skills::fetch_limited(&raw, 128 * 1024).await.ok()?;
     let (name, description, version) =
         crate::skills::skill_meta(std::str::from_utf8(&bytes).ok()?).ok()?;
     let install_url = format!("https://github.com/{repo}/tree/{r}/{path}/{dir}");

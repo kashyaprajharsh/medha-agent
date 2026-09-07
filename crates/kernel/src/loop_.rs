@@ -712,8 +712,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // Label web-tool output as untrusted content: a fetched page must
         // not be treated like a local file read. A tool relaying content it did
         // not produce declares that content's label, and the weaker wins.
-        let trust = match self.executor.category(&tool) {
-            Some(ToolCategory::Web) => TrustLabel::Web,
+        // An External tool answers from outside this machine's trust boundary —
+        // an MCP server is at least as untrusted as a fetched page.
+        let trust = match (
+            self.executor.category(&tool),
+            self.executor.blast_radius(&tool),
+        ) {
+            (Some(ToolCategory::Web), _) | (_, Some(BlastRadius::External)) => TrustLabel::Web,
             _ => TrustLabel::Tool,
         };
         let trust = obs
@@ -750,6 +755,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .log
             .append(Event::tool_obs(session, &obs, trust))
             .await?;
+        crate::events::strip_private_observation_fields(&mut obs.payload);
         window_events.push(event.id);
         *window_taint = window_taint.min(trust);
         // Once untrusted web content lands, taint the following provider turn
@@ -758,7 +764,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             *web_tainted = true;
         }
         let ok = matches!(obs.status, crate::types::ObsStatus::Ok);
-        sink.tool_result(&tool, ok, &obs.payload);
+        sink.tool_result_with_id(&id, &tool, ok, &obs.payload);
         let content = self
             .maybe_spill(serde_json::to_string(&obs.payload).unwrap_or_default())
             .await;
@@ -1243,7 +1249,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             }
             // Notify the surface of the calls before they run (live feedback).
             for it in &intents {
-                sink.tool_call(&it.tool, &it.args);
+                sink.tool_call_with_id(&it.id, &it.tool, &it.args);
             }
             // Blast radius, not tool name, determines whether verification runs.
             let modified_files = intents.iter().any(|i| {
@@ -2026,7 +2032,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     self.execute_with_net_retry(session, intent, web_tainted, radius)
                         .await
                 } else {
-                    Observation::denial(&intent.id, "rejected by human".to_string())
+                    Observation::denial(&intent.id, self.gate.denial_reason().to_string())
                 }
             }
             crate::types::Decision::Allow => {

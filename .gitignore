@@ -23,6 +23,8 @@ medha.lock
 /audit/
 
 # Local design/audit notes; only the public Medha overview belongs in docs.
-/docs/*.md
-/docs/**/*.md
-!/docs/WHAT_IS_MEDHA.md
+/docs/ENGINEERING_AUDIT.md
+/docs/FEATURE_AUDIT.md
+/docs/PLANNING_AND_VERIFICATION.md
+/docs/REASONING_AND_APPROVALS.md
+/docs/assets/README.md

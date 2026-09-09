@@ -1,7 +1,9 @@
 //! SQLite event log with a tamper-evident SHA-256 chain.
 
 use async_trait::async_trait;
-use kernel::events::{EVENT_HASH_VERSION, chain_hash};
+#[cfg(test)]
+use kernel::events::chain_hash;
+use kernel::events::{EVENT_HASH_VERSION, chain_hash_with_payload};
 use kernel::{
     ArtifactStore, Event, EventKind, EventLog, KernelError, MutationLease, Provenance, SessionMeta,
     TrustLabel,
@@ -941,7 +943,8 @@ impl SqliteLog {
         }
         e.prev_hash = prev;
         e.hash_version = EVENT_HASH_VERSION;
-        let hash = chain_hash(&e.prev_hash, &e);
+        let payload = e.payload.to_string();
+        let hash = chain_hash_with_payload(&e.prev_hash, &e, payload.as_bytes());
 
         tx.execute(
             "INSERT INTO events
@@ -953,7 +956,7 @@ impl SqliteLog {
                 e.session_id.to_string(),
                 e.parent_id.map(|p| p.to_string()),
                 e.kind.as_str(),
-                e.payload.to_string(),
+                payload,
                 e.trust.as_str(),
                 &e.provenance.source,
                 e.prev_hash.to_vec(),
@@ -1181,7 +1184,7 @@ fn validated_chain(rows: &[(i64, Row, Vec<u8>)]) -> Result<(u64, [u8; 32]), Stor
                 "hash chain broken at event index {index}: prev_hash does not link"
             )));
         }
-        let computed = chain_hash(&prev, &event);
+        let computed = chain_hash_with_payload(&prev, &event, row.payload.as_bytes());
         if computed.as_slice() != stored_hash.as_slice() {
             return Err(StoreError::Db(format!(
                 "hash chain broken at event index {index}: content does not match stored hash"
@@ -1226,12 +1229,13 @@ fn migrate_event_chain_v2(conn: &mut Connection) -> Result<(), StoreError> {
 
     let mut prev = [0u8; 32];
     for (rowid, row, _) in rows {
+        let payload = row.payload.clone();
         let mut event = row
             .into_event()
             .ok_or_else(|| StoreError::Db(format!("corrupt event row at rowid {rowid}")))?;
         event.hash_version = EVENT_HASH_VERSION;
         event.prev_hash = prev;
-        let hash = chain_hash(&prev, &event);
+        let hash = chain_hash_with_payload(&prev, &event, payload.as_bytes());
         tx.execute(
             "UPDATE events
              SET prev_hash = ?1, hash = ?2, hash_version = ?3
@@ -2062,7 +2066,12 @@ mod tests {
         let mut event = Event::model_text(&session, "legacy");
         event.hash_version = 1;
         event.prev_hash = [0u8; 32];
-        let legacy_hash = kernel::events::legacy_chain_hash(&event.prev_hash, &event);
+        // A durable hash authenticates the stored JSON bytes. Parsing and
+        // serializing this equivalent spelling would remove its whitespace;
+        // migration must still validate the row on every platform.
+        let stored_payload = r#"{ "text": "legacy" }"#;
+        let legacy_hash =
+            chain_hash_with_payload(&event.prev_hash, &event, stored_payload.as_bytes());
 
         {
             let conn = Connection::open(&db).unwrap();
@@ -2094,7 +2103,7 @@ mod tests {
                     event.id.to_string(),
                     event.session_id.to_string(),
                     event.kind.as_str(),
-                    event.payload.to_string(),
+                    stored_payload,
                     event.trust.as_str(),
                     event.provenance.source,
                     event.prev_hash.to_vec(),

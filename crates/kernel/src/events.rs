@@ -728,9 +728,20 @@ fn now_ts() -> f64 {
 /// on-disk logs hash identically. Version 2 is domain-separated and length-framed
 /// and authenticates every stored field; v1 rows are migrated at open.
 pub fn chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
+    let payload = serde_json::to_vec(&e.payload).unwrap_or_else(|_| b"null".to_vec());
+    chain_hash_with_payload(prev, e, &payload)
+}
+
+/// Hash an event using the exact JSON bytes held by its durable backend.
+///
+/// Persistent logs use this entry point so verification authenticates what was
+/// stored instead of parsing and reserializing JSON first. That distinction is
+/// observable for valid JSON number spellings and object order, and the latter
+/// can vary across serializer implementations and platforms.
+pub fn chain_hash_with_payload(prev: &[u8; 32], e: &Event, payload: &[u8]) -> [u8; 32] {
     match e.hash_version {
-        1 => legacy_chain_hash(prev, e),
-        EVENT_HASH_VERSION => full_chain_hash(prev, e),
+        1 => legacy_chain_hash_with_payload(prev, e, payload),
+        EVENT_HASH_VERSION => full_chain_hash(prev, e, payload),
         // Unknown versions must never accidentally verify as a known format.
         // Hashing a version-specific rejection domain gives callers a stable
         // mismatch while store verification reports the unsupported version.
@@ -748,19 +759,24 @@ pub fn chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
 /// Compatibility decoder for pre-v2 databases. It is public only so the store
 /// can verify the old chain before rewriting it to the complete v2 encoding.
 pub fn legacy_chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
+    let payload = e.payload.to_string();
+    legacy_chain_hash_with_payload(prev, e, payload.as_bytes())
+}
+
+fn legacy_chain_hash_with_payload(prev: &[u8; 32], e: &Event, payload: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(prev);
     h.update(e.kind.as_str().as_bytes());
     h.update(e.session_id.to_string().as_bytes());
-    h.update(e.payload.to_string().as_bytes());
+    h.update(payload);
     h.update(e.ts.to_le_bytes());
     let mut out = [0u8; 32];
     out.copy_from_slice(&h.finalize());
     out
 }
 
-fn full_chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
+fn full_chain_hash(prev: &[u8; 32], e: &Event, payload: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
     fn framed(hasher: &mut Sha256, bytes: &[u8]) {
@@ -786,8 +802,7 @@ fn full_chain_hash(prev: &[u8; 32], e: &Event) -> [u8; 32] {
         None => h.update([0]),
     }
     framed(&mut h, e.kind.as_str().as_bytes());
-    let payload = serde_json::to_vec(&e.payload).unwrap_or_else(|_| b"null".to_vec());
-    framed(&mut h, &payload);
+    framed(&mut h, payload);
     framed(&mut h, e.trust.as_str().as_bytes());
     framed(&mut h, e.provenance.source.as_bytes());
     h.update(e.ts.to_bits().to_le_bytes());

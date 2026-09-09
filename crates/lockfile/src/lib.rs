@@ -412,7 +412,8 @@ impl SandboxLockConfig {
             if trimmed.is_empty() {
                 return Err("sandbox.extra_writable entries must not be empty".into());
             }
-            if !Path::new(trimmed).is_absolute() {
+            let parsed = Path::new(trimmed);
+            if !parsed.is_absolute() {
                 return Err(format!(
                     "sandbox.extra_writable {trimmed:?} must be an absolute path"
                 ));
@@ -422,8 +423,21 @@ impl SandboxLockConfig {
                     "sandbox.extra_writable {trimmed:?} must not traverse with '..'"
                 ));
             }
-            // A jail that may write `/` is not a jail.
-            if matches!(trimmed.trim_end_matches('/'), "" | "/users" | "/home") {
+            // A jail that may write a filesystem root, an entire UNC share, or
+            // the platform's top-level user directory is not a jail. Inspect
+            // parsed components so this works for `/`, `C:\`, and UNC paths.
+            let normal_components = parsed
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(name) => {
+                        Some(name.to_string_lossy().to_ascii_lowercase())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let is_broad_user_root = normal_components.len() == 1
+                && matches!(normal_components[0].as_str(), "users" | "home");
+            if normal_components.is_empty() || is_broad_user_root {
                 return Err(format!(
                     "sandbox.extra_writable {trimmed:?} would widen the jail to the whole filesystem"
                 ));

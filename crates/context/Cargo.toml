@@ -17,5 +17,5 @@ guard-policy = { package = "policy", version = "0.1.8", path = "../policy" }
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 ulid.workspace = true

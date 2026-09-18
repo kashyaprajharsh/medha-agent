@@ -90,6 +90,7 @@ fn successful_observed_path(observation: &Observation) -> Option<&std::path::Pat
 
 fn same_legacy_message(left: &Message, right: &Message) -> bool {
     left.role == right.role
+        && left.attachments == right.attachments
         && left.content == right.content
         && left.trust == right.trust
         && left.tool_call_id == right.tool_call_id
@@ -148,6 +149,14 @@ fn legacy_views(message: &ModelMessage) -> Vec<Message> {
                 Message::new(message.role.clone(), text)
             };
             legacy.trust = message.trust;
+            legacy.attachments = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Media(media) => Some(media.clone()),
+                    _ => None,
+                })
+                .collect();
             vec![legacy]
         }
     }
@@ -302,6 +311,9 @@ pub struct Kernel<P: Provider, L: EventLog> {
     pub policy: Arc<dyn crate::policy::Policy>,
     pub gate: Arc<dyn crate::gate::HumanGate>,
     pub verifier: Arc<dyn crate::verify::Verifier>,
+    /// Reads images for a route whose own model cannot. `None` means an image
+    /// reaching such a route fails the turn instead of being dropped.
+    vision: Option<Arc<dyn crate::vision::VisionDescriber>>,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     max_parallel_tools: usize,
     pricing: Option<crate::types::Pricing>,
@@ -321,8 +333,10 @@ pub struct Kernel<P: Provider, L: EventLog> {
 }
 
 /// Tool-result payloads larger than this spill to the artifact store and are
-/// replaced in-context by a head and a `read_artifact` reference.
-const SPILL_THRESHOLD: usize = 16_000;
+/// replaced in-context by a head and a `read_artifact` reference. Public
+/// because the paging tool must size its pages to survive this threshold: a
+/// page that spills costs a round trip instead of saving one.
+pub const SPILL_THRESHOLD: usize = 16_000;
 
 /// Absolute per-turn ingestion limits. These are deliberately independent of
 /// provider/model limits: a broken or adversarial stream must not be able to
@@ -402,6 +416,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             policy,
             gate,
             verifier,
+            vision: None,
             progressive_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             pricing: None,
@@ -429,6 +444,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             policy: Arc::clone(&self.policy),
             gate,
             verifier: Arc::clone(&self.verifier),
+            vision: self.vision.clone(),
             progressive_context: self.progressive_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
             pricing: self.pricing,
@@ -438,6 +454,19 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             mutation_serial: Arc::clone(&self.mutation_serial),
             settle_grace: self.settle_grace,
         }
+    }
+
+    /// Whether this route can carry images itself: the wire contract must
+    /// support them and the model must not declare that it cannot see.
+    fn route_reads_images(&self) -> bool {
+        self.provider.protocol().carries_images()
+            && self.provider.image_support() != crate::ImageSupport::Unsupported
+    }
+
+    /// Auxiliary model that reads images for a route that cannot.
+    pub fn with_vision(mut self, vision: Arc<dyn crate::vision::VisionDescriber>) -> Self {
+        self.vision = Some(vision);
+        self
     }
 
     /// Set resolved model pricing so the governor meters real dollars.
@@ -771,6 +800,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let message = Message::tool_result(&id, content);
         ordered_messages.push(message.ordered());
         messages.push(message);
+        if !obs.media.is_empty() {
+            let carrier = crate::events::tool_media_message(&id, std::mem::take(&mut obs.media))
+                .carrying(trust);
+            ordered_messages.push(carrier.ordered());
+            messages.push(carrier);
+        }
         Ok(())
     }
 
@@ -885,16 +920,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // Membership matching reordered duplicate lines, while comparing
             // text alone could treat a Tool/Web report as a trusted retry.
             let trust = message.trust.unwrap_or(TrustLabel::User);
-            if already
-                .get(logged_cursor)
-                .is_some_and(|input| input.content == message.content && input.trust == trust)
-            {
+            if already.get(logged_cursor).is_some_and(|input| {
+                input.content == message.content
+                    && input.trust == trust
+                    && input.attachments == serde_json::json!(message.attachments)
+            }) {
                 logged_cursor += 1;
                 continue;
             }
             let e = self
                 .log
-                .append(Event::user_input(session, &message.content, trust))
+                .append(Event::user_input_message(session, message))
                 .await?;
             window_events.push(e.id);
             // A report carries the weakest label its agent touched; injected
@@ -1008,10 +1044,46 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             .insert(0, directive.ordered());
                         candidate.messages.insert(0, directive);
                     }
+                    // Images either go to the model as pixels or reach it as a
+                    // described, clearly-labelled substitute. They are never
+                    // dropped on the way to a model that cannot see.
+                    if self.route_reads_images() {
+                        crate::artifacts::resolve_media(
+                            &mut candidate,
+                            Arc::clone(&self.artifacts),
+                        )
+                        .await
+                        .map_err(KernelError::Provider)?;
+                    } else {
+                        let describer = self
+                            .vision
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(crate::vision::NoVision));
+                        let described = crate::vision::describe_media(
+                            &mut candidate,
+                            Arc::clone(&self.artifacts),
+                            describer.as_ref(),
+                        )
+                        .await
+                        .map_err(KernelError::Provider)?;
+                        if described > 0 {
+                            sink.notice(&format!(
+                                "{described} image(s) described by {} — this model has no image input",
+                                describer.model()
+                            ));
+                        }
+                    }
                     let prepared = self
                         .provider
                         .prepare_request(&candidate)
                         .map_err(|error| KernelError::Provider(error.to_string()))?;
+
+                    self.context.begin_request(&format!(
+                        "{}:{}:{}:{limits:?}",
+                        session.id,
+                        self.provider.context_identity(),
+                        prepared.model,
+                    ));
 
                     self.context.clear_preflight();
                     let preflight = match self
@@ -1061,7 +1133,28 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             ));
                         }
                     };
-                    if compiled.overflow {
+                    let pressure = self.context.pressure().unwrap_or_else(|| {
+                        crate::ContextPressure::new(
+                            preflight
+                                .as_ref()
+                                .map_or(u64::from(compiled.before_tokens), |count| count.tokens),
+                            input_limit,
+                            preflight
+                                .as_ref()
+                                .map_or(crate::TokenCountQuality::LocalEstimate, |count| {
+                                    count.quality
+                                }),
+                        )
+                    });
+                    sink.context_pressure(pressure);
+                    // A compaction result must be checkpointed and recounted,
+                    // even if the compiler still considers it too large. Never
+                    // discard useful reductions or send an unrecounted body.
+                    let counted_overflow = preflight
+                        .as_ref()
+                        .zip(input_limit)
+                        .is_some_and(|(count, limit)| count.tokens >= u64::from(limit));
+                    if !compiled.compacted && (compiled.overflow || counted_overflow) {
                         if let Some(q) = interrupts.as_mut() {
                             Self::return_unapplied_steers(q, sink);
                         }
@@ -1125,6 +1218,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // that may be prepared and sent.
                     ordered_messages = compacted_ordered;
                     messages = compiled.messages;
+                    // With no real limit there is no next preflight ceiling to
+                    // re-check. The synthetic recovery pass must itself prove
+                    // enough reduction; checkpoint its work, then stop if not.
+                    if compiled.overflow && input_limit.is_none() {
+                        if let Some(q) = interrupts.as_mut() {
+                            Self::return_unapplied_steers(q, sink);
+                        }
+                        return Ok((
+                            messages,
+                            StopReason::Budget(crate::budgets::BudgetStop::ContextOverflow),
+                        ));
+                    }
                 };
 
                 let wall_deadline = gov.deadline();
@@ -1618,10 +1723,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             }
                         }
                         crate::provider::ProviderFailure::OutputLimit { .. } => {
-                            return Err(KernelError::Provider(
-                                "the provider rejected the requested output-token cap; lower the profile's max_output_tokens (context compaction cannot fix an output-cap error)"
-                                    .into(),
-                            ));
+                            return Err(KernelError::Provider(format!(
+                                "the provider rejected the output-token allowance; check the profile's max_output_tokens. Original rejection: {e}"
+                            )));
                         }
                         crate::provider::ProviderFailure::PayloadTooLarge => {
                             return Err(KernelError::Provider(
@@ -2003,6 +2107,78 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 ),
             );
         }
+        if !matches!(decision, crate::types::Decision::Deny { .. }) {
+            let access = match self.executor.missing_access(intent) {
+                Ok(access) => access,
+                Err(error) => return Observation::error(&intent.id, error),
+            };
+            if !access.is_empty() {
+                // This card reviews both the command and its missing capabilities,
+                // so a policy Human decision does not create a second prompt.
+                let access_escalated = escalated
+                    || (access.network
+                        && web_tainted
+                        && matches!(
+                            escalate_for_trust_flow(
+                                crate::types::Decision::Allow,
+                                radius,
+                                true,
+                                crate::types::Containment::OsFsJail,
+                            ),
+                            crate::types::Decision::Human
+                        ));
+                sink.phase(crate::progress::Phase::AwaitingApproval {
+                    action: approval_key(intent),
+                });
+                let answer = {
+                    let _one_gate = self.gate_serial.lock().await;
+                    let mut detail = self
+                        .executor
+                        .preview(intent)
+                        .await
+                        .unwrap_or_else(|| approval_detail(intent));
+                    detail.push_str("\n\nAdditional access required before running:");
+                    if access.network {
+                        detail.push_str("\n- Network access");
+                    }
+                    for path in &access.read_paths {
+                        detail.push_str(&format!(
+                            "\n- Read {} (including subdirectories)",
+                            path.display()
+                        ));
+                    }
+                    for path in &access.write_paths {
+                        detail.push_str(&format!(
+                            "\n- Read/write {} (including subdirectories)",
+                            path.display()
+                        ));
+                    }
+                    if access_escalated {
+                        detail.push_str("\nThis command handled untrusted content; approve this invocation only.");
+                    }
+                    self.executor
+                        .grant_access(&access, &detail, access_escalated)
+                        .await
+                };
+                match answer {
+                    Err(error) => return Observation::error(&intent.id, error),
+                    Ok(crate::NetworkDecision::Deny) => {
+                        return Observation::denial(
+                            &intent.id,
+                            "requested command access was denied; command was not run",
+                        );
+                    }
+                    Ok(_) => {
+                        self.running_tool(intent, sink);
+                        return crate::execution_access_scope(
+                            access,
+                            self.execute_with_effect_outbox(session, intent),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
         match decision {
             crate::types::Decision::Deny { reason } => Observation::denial(&intent.id, reason),
             crate::types::Decision::Human => {
@@ -2068,7 +2244,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         radius: Option<BlastRadius>,
     ) -> Observation {
         let obs = self.execute_with_effect_outbox(session, intent).await;
-        if !obs.net_denied {
+        if !obs.net_denied || !self.executor.allows_network_retry(intent) {
             return obs;
         }
         // Trust-flow escalation only, not the policy engine: argv is unchanged, so
@@ -2204,6 +2380,7 @@ struct LoggedInput {
     id: ulid::Ulid,
     content: String,
     trust: TrustLabel,
+    attachments: serde_json::Value,
 }
 
 fn logged_tail(events: &[Event]) -> Vec<LoggedInput> {
@@ -2217,6 +2394,11 @@ fn logged_tail(events: &[Event]) -> Vec<LoggedInput> {
                     .unwrap_or_default()
                     .to_string(),
                 trust: event.trust,
+                attachments: event
+                    .payload
+                    .get("attachments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
             }),
             // Anything else ends the run: only the trailing block is this
             // turn's, and an identical prompt from an earlier turn is a real
@@ -2440,6 +2622,7 @@ mod progressive_context_tests {
                 intent_id: "failed".into(),
                 status,
                 payload: json!({ "path": "/tmp/untrusted/file" }),
+                media: Vec::new(),
                 relayed_trust: None,
                 net_denied: false,
             };

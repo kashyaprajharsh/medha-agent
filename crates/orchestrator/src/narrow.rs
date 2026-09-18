@@ -95,6 +95,37 @@ impl Executor for NarrowedExecutor {
         self.inner.containment()
     }
 
+    fn missing_access(&self, intent: &ToolIntent) -> Result<kernel::ExecutionAccess, String> {
+        if !self.allows(&intent.tool) {
+            return Err(format!(
+                "'{}' is outside this agent's capabilities",
+                intent.tool
+            ));
+        }
+        self.inner.missing_access(intent)
+    }
+
+    async fn grant_access(
+        &self,
+        access: &kernel::ExecutionAccess,
+        detail: &str,
+        escalated: bool,
+    ) -> Result<kernel::NetworkDecision, String> {
+        self.inner.grant_access(access, detail, escalated).await
+    }
+
+    fn allows_network_retry(&self, intent: &ToolIntent) -> bool {
+        self.allows(&intent.tool) && self.inner.allows_network_retry(intent)
+    }
+
+    async fn grant_network(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        self.inner.grant_network(detail, escalated).await
+    }
+
     async fn execute(&self, intent: &ToolIntent) -> Observation {
         // Second gate. The child was never shown this tool, but being unable to
         // see it is not the same as being unable to call it.

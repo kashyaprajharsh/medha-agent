@@ -1,12 +1,50 @@
 //! Context compilation from full durable history. Compaction changes only the
 //! provider view, not the event log.
 
-use crate::provider::InputTokenCount;
+use crate::provider::{InputTokenCount, TokenCountQuality};
 use crate::types::{Message, ToolSpec, TrustLabel};
 use async_trait::async_trait;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
+
+/// The same input budget used by the compiler and every output surface.
+/// Unknown limits remain unknown; estimated counts are explicitly labelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextPressure {
+    pub input_tokens: u64,
+    pub input_limit: Option<u32>,
+    pub usable_input_tokens: Option<u32>,
+    pub quality: TokenCountQuality,
+}
+
+impl ContextPressure {
+    pub fn new(input_tokens: u64, input_limit: Option<u32>, quality: TokenCountQuality) -> Self {
+        let margin_bps = match quality {
+            TokenCountQuality::Authoritative => 0,
+            TokenCountQuality::ProviderEstimate => 200,
+            TokenCountQuality::LocalEstimate => 1_000,
+        };
+        Self {
+            input_tokens,
+            input_limit,
+            usable_input_tokens: input_limit
+                .map(|limit| limit - (u64::from(limit) * margin_bps / 10_000) as u32),
+            quality,
+        }
+    }
+
+    pub fn percent(self) -> Option<u32> {
+        self.usable_input_tokens.map(|limit| {
+            (self
+                .input_tokens
+                .saturating_mul(100)
+                .saturating_add(u64::from(limit) / 2)
+                / u64::from(limit.max(1)))
+            .min(u64::from(u32::MAX)) as u32
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ContextCompileError {
@@ -105,6 +143,14 @@ pub struct CompileResult {
 
 #[async_trait]
 pub trait ContextEngine: Send + Sync {
+    /// Reset usage calibration when the session, deployment, model or limits
+    /// change. This does not discard the conversation or its checkpoints.
+    fn begin_request(&self, _scope: &str) {}
+
+    fn pressure(&self) -> Option<ContextPressure> {
+        None
+    }
+
     /// Real usage from the last response — authoritative; includes tool defs.
     fn update_usage(&self, _prompt_tokens: u32, _total_tokens: u32) {}
 
@@ -185,6 +231,22 @@ pub trait ProgressiveContext: Send + Sync {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn pressure_uses_the_compiler_margin_without_integer_overflow() {
+        let p = ContextPressure::new(6_480, Some(8_000), TokenCountQuality::LocalEstimate);
+        assert_eq!(p.usable_input_tokens, Some(7_200));
+        assert_eq!(p.percent(), Some(90));
+        let p = ContextPressure::new(0, Some(u32::MAX), TokenCountQuality::LocalEstimate);
+        assert_eq!(
+            p.usable_input_tokens,
+            Some(u32::MAX - (u64::from(u32::MAX) / 10) as u32)
+        );
+        assert_eq!(
+            ContextPressure::new(100, None, TokenCountQuality::LocalEstimate).percent(),
+            None
+        );
+    }
 
     struct NeverCompile(AtomicBool);
 

@@ -170,7 +170,7 @@ impl ApprovedRoots {
         };
         let mut current = Some(path);
         while let Some(p) = current {
-            if roots.contains(p) {
+            if roots.contains(p) || (perm == PermissionType::Read && inner.write.contains(p)) {
                 return true;
             }
             current = p.parent();
@@ -701,6 +701,74 @@ impl PermissionManager {
         }
     }
 
+    /// Review all missing command capabilities together. Once grants are
+    /// returned to the caller and never published into the shared roots.
+    pub async fn request_execution_access(
+        &self,
+        access: &kernel::ExecutionAccess,
+        detail: &str,
+        escalated: bool,
+    ) -> Result<NetworkDecision, PermissionError> {
+        let _guard = self.prompt_mutex.lock().await;
+        let gate = self
+            .human_gate
+            .as_ref()
+            .ok_or(PermissionError::NoHumanGate)?;
+        let mut decision = gate.confirm_access(Some(detail), escalated).await;
+        if escalated
+            && matches!(
+                decision,
+                NetworkDecision::Session | NetworkDecision::Persistent
+            )
+        {
+            decision = NetworkDecision::Once;
+        }
+        let audit = match decision {
+            NetworkDecision::Deny => "denied",
+            NetworkDecision::Once => "allowed (user approved, once)",
+            NetworkDecision::Session => "allowed (user approved, session)",
+            NetworkDecision::Persistent => "allowed (user approved, persistence requested)",
+        };
+        // Record approval before publishing any capability.
+        if access.network {
+            self.audit_network(audit)?;
+        }
+        for (paths, permission) in [
+            (&access.read_paths, PermissionType::Read),
+            (&access.write_paths, PermissionType::Write),
+        ] {
+            for path in paths {
+                self.audit_log(path, path, permission, audit)?;
+            }
+        }
+        if decision == NetworkDecision::Persistent {
+            if access.network {
+                self.persist_network_allowed(None)?;
+            }
+            for path in &access.read_paths {
+                self.trust_path(path.clone(), PermissionType::Read)?;
+            }
+            for path in &access.write_paths {
+                self.trust_path(path.clone(), PermissionType::Write)?;
+            }
+        }
+        if matches!(
+            decision,
+            NetworkDecision::Session | NetworkDecision::Persistent
+        ) {
+            if access.network {
+                self.network.grant();
+            }
+            for path in &access.read_paths {
+                self.trusted.allow_read(path.clone());
+            }
+            for path in &access.write_paths {
+                self.trusted.allow_write(path.clone());
+            }
+        }
+        Ok(decision)
+    }
+
     fn resolve_path_for_read(&self, path: &Path) -> Result<PathBuf, PermissionError> {
         let path = self.workspace_path(path)?;
 
@@ -1156,6 +1224,17 @@ mod tests {
         let path = PathBuf::from("/tmp/medha-poison-recovery");
         roots.allow_write(path.clone());
         assert!(roots.is_allowed(&path, PermissionType::Write));
+    }
+
+    #[test]
+    fn write_grants_include_reads_but_read_grants_never_include_writes() {
+        let roots = ApprovedRoots::default();
+        let writable = std::env::temp_dir().join("medha-write-grant");
+        let readable = std::env::temp_dir().join("medha-read-grant");
+        roots.allow_write(writable.clone());
+        roots.allow_read(readable.clone());
+        assert!(roots.is_allowed(&writable.join("child"), PermissionType::Read));
+        assert!(!roots.is_allowed(&readable.join("child"), PermissionType::Write));
     }
 
     struct FixedGate(Approval);

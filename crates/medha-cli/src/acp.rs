@@ -643,6 +643,18 @@ impl kernel::StreamSink for AcpSink {
             json!({ "prompt_tokens": prompt_tokens, "total_tokens": total_tokens }),
         );
     }
+    fn context_pressure(&self, pressure: kernel::ContextPressure) {
+        self.writer.event(
+            "context_pressure",
+            json!({
+                "input_tokens": pressure.input_tokens,
+                "input_limit": pressure.input_limit,
+                "usable_input_tokens": pressure.usable_input_tokens,
+                "quality": pressure.quality,
+                "percent": pressure.percent(),
+            }),
+        );
+    }
     fn verify(&self, ok: bool, summary: &str) {
         self.writer
             .event("verify", json!({ "ok": ok, "summary": summary }));
@@ -708,6 +720,9 @@ enum RpcAction {
     /// turn's `stopReason` and therefore cannot be sent until the turn settles.
     StartTurn {
         content: String,
+        /// Admitted into the artifact store as the turn starts, so pixels never
+        /// sit in the transcript or the log.
+        images: Vec<AcpImage>,
         reply_to: Option<Value>,
     },
     Shutdown,
@@ -717,31 +732,200 @@ impl RpcAction {
     fn turn(content: String) -> Self {
         Self::StartTurn {
             content,
+            images: Vec::new(),
             reply_to: None,
         }
     }
 }
 
-/// Flatten ACP prompt content blocks into the text Medha's kernel consumes.
-fn acp_prompt_text(prompt: Option<&Value>) -> String {
-    let mut text = String::new();
-    for block in prompt.and_then(Value::as_array).into_iter().flatten() {
-        let part = match block.get("type").and_then(Value::as_str) {
-            Some("text") => block.get("text").and_then(Value::as_str),
-            Some("resource") => block
-                .get("resource")
-                .and_then(|resource| resource.get("text"))
-                .and_then(Value::as_str),
-            _ => None,
-        };
-        if let Some(part) = part {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(part);
+/// Decode, normalise and store what the editor attached. Errors name the image
+/// by position, because the editor sends bytes rather than a path.
+async fn admit_acp_images(
+    images: Vec<AcpImage>,
+    artifacts: &std::sync::Arc<dyn kernel::ArtifactStore>,
+) -> Result<Vec<kernel::MediaPart>, String> {
+    use base64::Engine;
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    let artifacts = artifacts.clone();
+    tokio::task::spawn_blocking(move || {
+        images
+            .into_iter()
+            .enumerate()
+            .map(|(index, image)| {
+                let position = index + 1;
+                let label = image.label(position);
+                let bytes = match &image {
+                    AcpImage::Inline(_, data) => base64::engine::general_purpose::STANDARD
+                        .decode(data.as_bytes())
+                        .map_err(|error| {
+                            format!("image {position} is not valid base64: {error}")
+                        })?,
+                    AcpImage::Linked(path) => std::fs::read(path)
+                        .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+                };
+                crate::attachments::admit(bytes, label, &artifacts)
+                    .map(|attachment| attachment.part)
+                    .map_err(|error| format!("image {position}: {error:#}"))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| format!("image admission task failed: {error}"))?
+}
+
+/// One editor prompt: its text, and any images the editor attached.
+#[derive(Default, Debug, PartialEq)]
+struct AcpPrompt {
+    text: String,
+    images: Vec<AcpImage>,
+}
+
+/// An image an editor attached. It arrives either as bytes in the prompt or as
+/// a link to a file on this machine — dragging a file into the composer usually
+/// produces the link, so reading only the inline form loses the attachment.
+#[derive(Debug, PartialEq, Eq)]
+enum AcpImage {
+    /// `(mime type, base64 payload)`.
+    Inline(String, String),
+    Linked(std::path::PathBuf),
+}
+
+impl AcpImage {
+    fn label(&self, position: usize) -> String {
+        match self {
+            Self::Inline(mime, _) => format!("image {position} ({mime})"),
+            Self::Linked(path) => crate::attachments::label_for(path),
         }
     }
-    text
+}
+
+impl AcpPrompt {
+    fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.images.is_empty()
+    }
+
+    fn push_text(&mut self, part: &str) {
+        if !self.text.is_empty() {
+            self.text.push('\n');
+        }
+        self.text.push_str(part);
+    }
+}
+
+/// The local file a `file://` URI names, if it is one.
+fn acp_file_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // `file:///path` and `file://localhost/path` both address this machine.
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let decoded = percent_decode(rest);
+    Some(std::path::PathBuf::from(decoded))
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                match u8::from_str_radix(&raw[index + 1..index + 3], 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_image_mime(mime: Option<&str>) -> bool {
+    mime.is_some_and(|mime| {
+        mime.split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("image/")
+    })
+}
+
+/// Split ACP prompt content blocks into what the kernel consumes. Image blocks
+/// were previously dropped here; an editor that attached a screenshot got an
+/// answer about the text alone and no indication anything was missing.
+fn acp_prompt(prompt: Option<&Value>) -> AcpPrompt {
+    let mut parsed = AcpPrompt::default();
+    for block in prompt.and_then(Value::as_array).into_iter().flatten() {
+        let mime = block.get("mimeType").and_then(Value::as_str);
+        match block.get("type").and_then(Value::as_str) {
+            Some("image") => {
+                if let Some(data) = block.get("data").and_then(Value::as_str) {
+                    parsed.images.push(AcpImage::Inline(
+                        mime.unwrap_or("image/png").to_string(),
+                        data.to_string(),
+                    ));
+                }
+            }
+            // A file dragged into the composer. The editor sends where it is,
+            // not what is in it, and only names the type some of the time — so
+            // the extension decides when the header does not.
+            Some("resource_link") => {
+                let uri = block.get("uri").and_then(Value::as_str).unwrap_or_default();
+                if let Some(path) = acp_file_path(uri).filter(|path| {
+                    is_image_mime(mime)
+                        || crate::attachments::refs::has_image_extension(&path.to_string_lossy())
+                }) {
+                    parsed.images.push(AcpImage::Linked(path));
+                } else {
+                    parsed.push_text(&format!("[attached resource: {uri}]"));
+                }
+            }
+            Some("resource") => {
+                let resource = block.get("resource");
+                let resource_mime = resource
+                    .and_then(|resource| resource.get("mimeType"))
+                    .and_then(Value::as_str);
+                let blob = resource
+                    .and_then(|resource| resource.get("blob"))
+                    .and_then(Value::as_str);
+                match blob.filter(|_| is_image_mime(resource_mime)) {
+                    Some(blob) => parsed.images.push(AcpImage::Inline(
+                        resource_mime.unwrap_or("image/png").to_string(),
+                        blob.to_string(),
+                    )),
+                    None => {
+                        if let Some(text) = resource
+                            .and_then(|resource| resource.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            parsed.push_text(text);
+                        }
+                    }
+                }
+            }
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    parsed.push_text(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    parsed
 }
 
 /// Medha's stop reasons in ACP's vocabulary.
@@ -833,7 +1017,7 @@ fn dispatch_rpc(
                     "agentCapabilities": {
                         "loadSession": false,
                         "promptCapabilities": {
-                            "image": false,
+                            "image": true,
                             "audio": false,
                             "embeddedContext": true,
                         },
@@ -872,14 +1056,35 @@ fn dispatch_rpc(
                 rpc_error(writer, &id, -32602, error);
                 return RpcAction::None;
             }
-            let content = acp_prompt_text(params.get("prompt"));
-            if content.trim().is_empty() {
-                rpc_error(writer, &id, -32602, "prompt must contain text content");
+            let prompt = acp_prompt(params.get("prompt"));
+            if prompt.is_empty() {
+                rpc_error(writer, &id, -32602, "prompt must contain text or an image");
+                return RpcAction::None;
+            }
+            if prompt.images.len() > crate::attachments::MAX_PER_MESSAGE {
+                rpc_error(
+                    writer,
+                    &id,
+                    -32602,
+                    format!(
+                        "at most {} images per prompt",
+                        crate::attachments::MAX_PER_MESSAGE
+                    ),
+                );
                 return RpcAction::None;
             }
             if running {
-                if let Some(handle) = interrupt {
-                    handle.steer(content);
+                // A steer carries text only. Refusing is the honest answer:
+                // accepting would drop the image the editor just attached.
+                if !prompt.images.is_empty() {
+                    rpc_error(
+                        writer,
+                        &id,
+                        -32000,
+                        "images cannot be added to a turn that is already running",
+                    );
+                } else if let Some(handle) = interrupt {
+                    handle.steer(prompt.text);
                     rpc_result(writer, &id, json!({ "stopReason": "end_turn" }));
                 } else {
                     rpc_error(writer, &id, -32000, "a turn is already running");
@@ -887,7 +1092,12 @@ fn dispatch_rpc(
                 return RpcAction::None;
             }
             RpcAction::StartTurn {
-                content,
+                content: if prompt.text.trim().is_empty() {
+                    crate::attachments::IMAGE_ONLY_PROMPT.to_string()
+                } else {
+                    prompt.text
+                },
+                images: prompt.images,
                 reply_to: id,
             }
         }
@@ -1088,9 +1298,22 @@ where
                 match dispatch_line(trimmed, &model, running, interrupt.as_ref(), &pending, &writer, &peer) {
                     RpcAction::None => {}
                     RpcAction::Shutdown => break,
-                    RpcAction::StartTurn { content, reply_to } => {
+                    RpcAction::StartTurn { content, images, reply_to } => {
                         prompt_reply = reply_to;
-                        transcript.push(Message::user(content));
+                        let mut prompt = Message::user(content);
+                        match admit_acp_images(images, &kernel.artifacts).await {
+                            Ok(attachments) => prompt.attachments = attachments,
+                            Err(error) => {
+                                // The editor attached an image Medha cannot
+                                // read. Answering the text alone would look
+                                // like it was seen, so the turn does not start.
+                                if let Some(id) = prompt_reply.take() {
+                                    rpc_error(&writer, &Some(id), -32602, &error);
+                                }
+                                continue;
+                            }
+                        }
+                        transcript.push(prompt);
                         running = true;
                         let (handle, queue) = kernel::InterruptQueue::pair();
                         interrupt = Some(handle);
@@ -1287,6 +1510,7 @@ mod tests {
             action,
             RpcAction::StartTurn {
                 content: "fix the test".into(),
+                images: Vec::new(),
                 reply_to: Some(json!(3)),
             }
         );
@@ -1518,14 +1742,182 @@ mod tests {
     }
 
     #[test]
-    fn acp_prompt_blocks_flatten_text_and_embedded_resources() {
+    fn acp_prompt_blocks_keep_text_resources_and_images() {
         let prompt = json!([
             {"type": "text", "text": "explain"},
             {"type": "resource", "resource": {"uri": "file:///a.rs", "text": "fn main() {}"}},
-            {"type": "image", "data": "ignored"},
+            {"type": "image", "mimeType": "image/jpeg", "data": "QUJD"},
+            {"type": "audio", "data": "not supported"},
         ]);
-        assert_eq!(acp_prompt_text(Some(&prompt)), "explain\nfn main() {}");
-        assert_eq!(acp_prompt_text(None), "");
+
+        let parsed = acp_prompt(Some(&prompt));
+
+        assert_eq!(parsed.text, "explain\nfn main() {}");
+        assert_eq!(
+            parsed.images,
+            [AcpImage::Inline("image/jpeg".into(), "QUJD".into())]
+        );
+        assert_eq!(acp_prompt(None), AcpPrompt::default());
+        assert!(acp_prompt(None).is_empty());
+    }
+
+    /// Dragging a file into an editor's composer usually sends a link to it,
+    /// not its bytes. Reading only the inline form loses the attachment with no
+    /// sign anything was missing.
+    #[test]
+    fn a_linked_image_file_is_an_attachment() {
+        let by_mime = acp_prompt(Some(&json!([
+            {"type": "resource_link", "uri": "file:///tmp/a%20shot.png",
+             "name": "a shot.png", "mimeType": "image/png"},
+        ])));
+        assert_eq!(
+            by_mime.images,
+            [AcpImage::Linked("/tmp/a shot.png".into())],
+            "a percent-encoded file URI names a real path"
+        );
+
+        // Editors do not always send a mimeType; the extension decides then.
+        let by_extension = acp_prompt(Some(&json!([
+            {"type": "resource_link", "uri": "file:///tmp/diagram.JPEG"},
+        ])));
+        assert_eq!(
+            by_extension.images,
+            [AcpImage::Linked("/tmp/diagram.JPEG".into())]
+        );
+    }
+
+    /// A linked file that is not an image still has to be visible: saying so is
+    /// what stops the model answering as though nothing was attached.
+    #[test]
+    fn a_linked_non_image_is_named_rather_than_dropped() {
+        let parsed = acp_prompt(Some(&json!([
+            {"type": "resource_link", "uri": "file:///tmp/report.pdf", "mimeType": "application/pdf"},
+            {"type": "resource_link", "uri": "https://example.com/remote.png", "mimeType": "image/png"},
+        ])));
+
+        assert!(parsed.images.is_empty(), "no bytes to attach");
+        assert_eq!(
+            parsed.text,
+            "[attached resource: file:///tmp/report.pdf]\n\
+             [attached resource: https://example.com/remote.png]"
+        );
+    }
+
+    #[test]
+    fn an_embedded_blob_resource_is_an_image_and_text_resources_still_are_not() {
+        let parsed = acp_prompt(Some(&json!([
+            {"type": "resource", "resource": {"uri": "file:///a.png", "mimeType": "image/png", "blob": "QUJD"}},
+            {"type": "resource", "resource": {"uri": "file:///a.rs", "mimeType": "text/rust", "text": "fn main() {}"}},
+        ])));
+
+        assert_eq!(
+            parsed.images,
+            [AcpImage::Inline("image/png".into(), "QUJD".into())]
+        );
+        assert_eq!(parsed.text, "fn main() {}");
+    }
+
+    #[test]
+    fn an_image_only_prompt_is_a_prompt() {
+        let parsed = acp_prompt(Some(&json!([
+            {"type": "image", "data": "QUJD"},
+        ])));
+
+        assert!(!parsed.is_empty(), "an image alone is enough to answer");
+        assert_eq!(
+            parsed.images,
+            [AcpImage::Inline("image/png".into(), "QUJD".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_only_prompt_carries_the_shared_default_text() {
+        let peer = Peer::new();
+        let (writer, mut rx) = capture_writer(8);
+        let session = peer
+            .start_session(&peer.workspace.display().to_string(), Some(&json!([])))
+            .unwrap();
+
+        let action = dispatch_line(
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+                    "params": {"sessionId": session,
+                               "prompt": [{"type": "image", "mimeType": "image/png", "data": "QUJD"}]}})
+                .to_string(),
+            "m",
+            false,
+            None,
+            &Default::default(),
+            &writer,
+            &peer,
+        );
+
+        assert_eq!(
+            action,
+            RpcAction::StartTurn {
+                content: crate::attachments::IMAGE_ONLY_PROMPT.to_string(),
+                images: vec![AcpImage::Inline("image/png".into(), "QUJD".into())],
+                reply_to: Some(json!(4)),
+            }
+        );
+        let _ = captured_values(&mut rx);
+    }
+
+    /// Steering carries text only, so an image arriving mid-turn is refused
+    /// rather than quietly dropped from the message that mentions it.
+    #[tokio::test]
+    async fn an_image_cannot_join_a_running_turn() {
+        let peer = Peer::new();
+        let (writer, mut rx) = capture_writer(8);
+        let session = peer
+            .start_session(&peer.workspace.display().to_string(), Some(&json!([])))
+            .unwrap();
+        let (handle, _queue) = kernel::InterruptQueue::pair();
+
+        let action = dispatch_line(
+            &json!({"jsonrpc": "2.0", "id": 5, "method": "session/prompt",
+                    "params": {"sessionId": session,
+                               "prompt": [{"type": "text", "text": "and this"},
+                                          {"type": "image", "data": "QUJD"}]}})
+            .to_string(),
+            "m",
+            true,
+            Some(&handle),
+            &Default::default(),
+            &writer,
+            &peer,
+        );
+
+        assert_eq!(action, RpcAction::None);
+        let replies = captured_values(&mut rx);
+        let message = replies
+            .iter()
+            .filter_map(|value| value.pointer("/error/message").and_then(Value::as_str))
+            .collect::<String>();
+        assert!(message.contains("already running"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn editors_are_told_images_are_accepted() {
+        let peer = Peer::new();
+        let (writer, mut rx) = capture_writer(8);
+
+        dispatch_line(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": ACP_PROTOCOL_VERSION}})
+            .to_string(),
+            "m",
+            false,
+            None,
+            &Default::default(),
+            &writer,
+            &peer,
+        );
+
+        let replies = captured_values(&mut rx);
+        assert_eq!(
+            replies[0].pointer("/result/agentCapabilities/promptCapabilities/image"),
+            Some(&json!(true))
+        );
     }
 
     /// The original bridge must keep working for callers that already use it.

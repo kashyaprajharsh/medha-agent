@@ -161,7 +161,9 @@ pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observatio
         Ok(mut payload) => {
             let relayed = take_relayed_trust(&mut payload);
             let net_denied = take_net_denied(&mut payload);
+            let media = take_media(&mut payload);
             let mut obs = Observation::ok(&intent.id, payload);
+            obs.media = media;
             if let Some(trust) = relayed {
                 obs = obs.relaying(trust);
             }
@@ -176,6 +178,7 @@ pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observatio
                 intent_id: intent.id.clone(),
                 status: kernel::ObsStatus::Error,
                 payload,
+                media: Vec::new(),
                 relayed_trust: None,
                 net_denied: false,
             };
@@ -192,6 +195,19 @@ pub(crate) const RELAYED_TRUST: &str = "_relayed_trust";
 fn take_relayed_trust(payload: &mut Value) -> Option<kernel::TrustLabel> {
     let taken = payload.as_object_mut()?.remove(RELAYED_TRUST)?;
     serde_json::from_value(taken).ok()
+}
+
+/// Key a tool sets to return images it produced, as artifact references.
+/// Stripped here: the kernel routes them to the model as pixels or as a
+/// described substitute, and either way the payload the model reads is text.
+pub(crate) const MEDIA: &str = "_media";
+
+fn take_media(payload: &mut Value) -> Vec<kernel::MediaPart> {
+    payload
+        .as_object_mut()
+        .and_then(|object| object.remove(MEDIA))
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
 }
 
 /// Key a tool sets when a command failed because the sandbox denied network.
@@ -1200,6 +1216,10 @@ impl ToolRegistry {
         r.register(Arc::new(FsRead {
             sbx: sandbox.clone(),
         }));
+        r.register(Arc::new(ImageView {
+            sbx: sandbox.clone(),
+            artifacts: artifacts.clone(),
+        }));
         r.register(Arc::new(FsWrite {
             sbx: sandbox.clone(),
             pins: Default::default(),
@@ -1399,6 +1419,38 @@ impl Executor for ToolRegistry {
         }
     }
 
+    fn missing_access(&self, intent: &ToolIntent) -> Result<kernel::ExecutionAccess, String> {
+        if intent.tool != "shell.exec" {
+            return Ok(Default::default());
+        }
+        let sbx = self
+            .sandbox
+            .as_ref()
+            .ok_or("shell workspace is unavailable")?;
+        let plan = ShellPlan::parse(&intent.args, sbx).map_err(|error| error.to_string())?;
+        sbx.missing_execution_access(&plan.access)
+    }
+
+    async fn grant_access(
+        &self,
+        access: &kernel::ExecutionAccess,
+        detail: &str,
+        escalated: bool,
+    ) -> Result<kernel::NetworkDecision, String> {
+        let sbx = self
+            .sandbox
+            .as_ref()
+            .ok_or("shell workspace is unavailable")?;
+        sbx.permission_manager()
+            .request_execution_access(access, detail, escalated)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    fn allows_network_retry(&self, intent: &ToolIntent) -> bool {
+        intent.tool != "shell.exec"
+    }
+
     async fn execute(&self, intent: &ToolIntent) -> Observation {
         if mcp::McpManager::is_mcp_tool(&intent.tool) {
             let Some(mcp) = &self.mcp else {
@@ -1424,6 +1476,7 @@ impl Executor for ToolRegistry {
                             intent_id: intent.id.clone(),
                             status: kernel::ObsStatus::Error,
                             payload,
+                            media: Vec::new(),
                             relayed_trust: None,
                             net_denied: false,
                         }
@@ -1450,6 +1503,91 @@ impl Executor for ToolRegistry {
 
 struct FsRead {
     sbx: Arc<WorkspaceSandbox>,
+}
+
+/// Lets the model look at an image file itself, instead of the user having to
+/// attach it. The pixels reach the model only if its route can carry them; the
+/// kernel substitutes a description otherwise.
+struct ImageView {
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
+}
+
+#[async_trait]
+impl Tool for ImageView {
+    fn name(&self) -> &str {
+        "image.view"
+    }
+    fn description(&self) -> &str {
+        "Look at an image file: screenshots, diagrams, photos, rendered output. \
+         Accepts PNG, JPEG, WebP, GIF, BMP, TIFF and ICO, and returns the picture \
+         itself, not a text extract — use it instead of `fs.read`, which only reads \
+         text. Oversized images are scaled down and rotated photos are made upright \
+         before you see them. An image already marked `[attached image: …]` in the \
+         conversation is one you can see: do not call this for it, and do not go \
+         looking for the path it came from — a dropped screenshot is usually a \
+         temporary file that no longer exists."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn icon(&self) -> &'static str {
+        "▣"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative or absolute path to the image" }
+            },
+            "required": ["path"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        let path = arg_str(args, "path")?;
+        let resolved = self.sbx.resolve(&path).await.map_err(|error| {
+            // A screenshot dragged into the composer is already attached, and
+            // its temporary file is usually gone by now. Say that instead of
+            // reporting a path-resolution failure the model will try to debug.
+            ToolError::Args(if std::path::Path::new(&path).exists() {
+                format!("{path} is outside this workspace: {error}")
+            } else {
+                format!(
+                    "{path} does not exist. If it was attached to the conversation you can \
+                     already see it — look at the image rather than the path."
+                )
+            })
+        })?;
+        let raw = tokio::fs::read(&resolved)
+            .await
+            .map_err(|error| ToolError::Failed(format!("cannot read {path}: {error}")))?;
+        let artifacts = self.artifacts.clone();
+        let image = tokio::task::spawn_blocking(move || media::normalize(raw))
+            .await
+            .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
+            .map_err(|error| ToolError::Args(format!("{path}: {error}")))?;
+        let (width, height, mime, note) = (image.width, image.height, image.mime, image.note);
+        let hash = artifacts
+            .put_async(image.bytes)
+            .await
+            .map_err(ToolError::Failed)?;
+        let part = kernel::MediaPart {
+            mime_type: mime.to_string(),
+            source: kernel::MediaSource::Artifact(hash),
+            label: resolved
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            provider_state: Vec::new(),
+        };
+        Ok(json!({
+            "path": resolved.display().to_string(),
+            "width": width,
+            "height": height,
+            "mime": mime,
+            "note": note,
+            MEDIA: [serde_json::to_value(part).map_err(|e| ToolError::Failed(e.to_string()))?],
+        }))
+    }
 }
 
 const FS_READ_MAX_WHOLE_BYTES: u64 = 2_000_000;
@@ -2809,6 +2947,36 @@ impl Tool for Tree {
     }
 }
 
+/// Largest page `read_artifact` will hand back. A result above the kernel's
+/// spill threshold is itself spilled to a fresh artifact and shown to the model
+/// as a 2k head, so an oversized page costs a round trip instead of saving one —
+/// the paging tool then pages its own output, and never converges. The margin
+/// below the threshold absorbs the JSON envelope; escaping is content-dependent,
+/// so the payload is fitted exactly rather than estimated.
+const MAX_PAGE_BYTES: usize = kernel::SPILL_THRESHOLD * 3 / 4;
+
+/// Decode the longest valid UTF-8 prefix of `slice`, returning it with the
+/// number of bytes it consumed so a caller can resume exactly where it ended.
+fn decode_utf8_prefix(slice: &[u8]) -> (String, usize) {
+    match std::str::from_utf8(slice) {
+        Ok(s) => (s.to_string(), slice.len()),
+        Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => {
+            let v = e.valid_up_to();
+            (String::from_utf8_lossy(&slice[..v]).into_owned(), v)
+        }
+        Err(_) => (String::from_utf8_lossy(slice).into_owned(), slice.len()),
+    }
+}
+
+/// Round `at` down to a UTF-8 character boundary within `bytes`.
+fn floor_utf8_boundary(bytes: &[u8], at: usize) -> usize {
+    let mut at = at.min(bytes.len());
+    while at > 0 && at < bytes.len() && (bytes[at] & 0xC0) == 0x80 {
+        at -= 1;
+    }
+    at
+}
+
 struct ReadArtifact {
     store: Arc<dyn kernel::ArtifactStore>,
 }
@@ -2839,8 +3007,9 @@ impl Tool for ReadArtifact {
                 "length": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 1048576,
-                    "description": "Bytes to read (default/max: one 1 MiB page)"
+                    "maximum": MAX_PAGE_BYTES,
+                    "description": "Bytes to read. Defaults to a full page; \
+                                    omit it and follow `next_offset`."
                 }
             },
             "required": ["hash"]
@@ -2857,8 +3026,8 @@ impl Tool for ReadArtifact {
             .get("length")
             .and_then(Value::as_u64)
             .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-            .unwrap_or(store::MAX_ARTIFACT_READ_BYTES)
-            .min(store::MAX_ARTIFACT_READ_BYTES);
+            .unwrap_or(MAX_PAGE_BYTES)
+            .min(MAX_PAGE_BYTES);
         // Name the actual failure. A raw `No such file` from the store reads as a
         // transient IO fault, so a model that guessed a hash guesses again rather
         // than changing approach — the observed failure mode is several invented
@@ -2885,26 +3054,30 @@ impl Tool for ReadArtifact {
             0
         };
         let slice = &bytes[lead.min(bytes.len())..];
-        let (content, consumed) = match std::str::from_utf8(slice) {
-            Ok(s) => (s.to_string(), slice.len()),
-            Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => {
-                let v = e.valid_up_to();
-                (String::from_utf8_lossy(&slice[..v]).into_owned(), v)
+        // Fit the encoded payload under the spill threshold. Shrinking on the
+        // measured length rather than a guessed escape ratio keeps the
+        // invariant exact for any content, including artifacts that escape
+        // badly; `consumed` always shrinks, so this terminates.
+        let mut take = slice.len();
+        loop {
+            let (content, consumed) = decode_utf8_prefix(&slice[..take]);
+            let next_offset = offset + lead + consumed;
+            let mut out = json!({
+                "hash": hash,
+                "offset": offset,
+                "length": lead + consumed,
+                "total_size": total,
+                "content": content
+            });
+            if next_offset < total {
+                out["next_offset"] = json!(next_offset);
             }
-            Err(_) => (String::from_utf8_lossy(slice).into_owned(), slice.len()),
-        };
-        let next_offset = offset + lead + consumed;
-        let mut out = json!({
-            "hash": hash,
-            "offset": offset,
-            "length": lead + consumed,
-            "total_size": total,
-            "content": content
-        });
-        if next_offset < total {
-            out["next_offset"] = json!(next_offset);
+            let encoded = serde_json::to_string(&out).map_or(0, |s| s.len());
+            if encoded <= kernel::SPILL_THRESHOLD || consumed == 0 {
+                return Ok(out);
+            }
+            take = floor_utf8_boundary(slice, consumed * kernel::SPILL_THRESHOLD / encoded);
         }
-        Ok(out)
     }
 }
 
@@ -4289,6 +4462,98 @@ struct ShellExec {
     tasks: Arc<TaskTable>,
 }
 
+/// Validated once before approval and again before spawning. Canonical paths
+/// prevent a symlink change between review and execution from widening a grant.
+struct ShellPlan {
+    command: String,
+    workdir: std::path::PathBuf,
+    timeout_s: u64,
+    access: kernel::ExecutionAccess,
+}
+
+impl ShellPlan {
+    fn parse(args: &Value, sbx: &WorkspaceSandbox) -> Result<Self, ToolError> {
+        let command = arg_str(args, "command")?;
+        if args.get("background").and_then(Value::as_bool) == Some(true) {
+            return Err(ToolError::Args(
+                "background shell execution is disabled: run a bounded foreground command".into(),
+            ));
+        }
+        let timeout_s = args
+            .get("timeout_s")
+            .map_or(Some(SHELL_TIMEOUT_SECS), Value::as_u64)
+            .filter(|seconds| (1..=SHELL_TIMEOUT_MAX_SECS).contains(seconds))
+            .ok_or_else(|| ToolError::Args("timeout_s must be an integer from 1 to 600".into()))?;
+        let network = args
+            .get("network")
+            .map_or(Some(false), Value::as_bool)
+            .ok_or_else(|| ToolError::Args("network must be a boolean".into()))?;
+        let workdir = match args.get("workdir") {
+            None => sbx.root().to_path_buf(),
+            Some(value) => {
+                if !matches!(sbx.backend_label(), "host" | "native") {
+                    return Err(ToolError::Args(
+                        "workdir is supported by native and host execution only".into(),
+                    ));
+                }
+                let path = value
+                    .as_str()
+                    .filter(|path| !path.is_empty())
+                    .ok_or_else(|| ToolError::Args("workdir must be a directory path".into()))?;
+                let path = sbx.root().join(path);
+                path.canonicalize()
+                    .ok()
+                    .filter(|path| path.is_dir())
+                    .ok_or_else(|| {
+                        ToolError::Args("workdir must be an existing directory".into())
+                    })?
+            }
+        };
+        let mut access = kernel::ExecutionAccess {
+            network,
+            ..Default::default()
+        };
+        for (key, paths) in [
+            ("read_paths", &mut access.read_paths),
+            ("write_paths", &mut access.write_paths),
+        ] {
+            if let Some(value) = args.get(key) {
+                let entries = value
+                    .as_array()
+                    .filter(|entries| entries.len() <= 16)
+                    .ok_or_else(|| {
+                        ToolError::Args(format!(
+                            "{key} must be an array of at most 16 absolute directories"
+                        ))
+                    })?;
+                for value in entries {
+                    let path = value
+                        .as_str()
+                        .map(std::path::Path::new)
+                        .filter(|path| path.is_absolute())
+                        .and_then(|path| path.canonicalize().ok())
+                        .filter(|path| path.is_dir())
+                        .ok_or_else(|| {
+                            ToolError::Args(format!(
+                                "{key} must contain existing absolute directories"
+                            ))
+                        })?;
+                    paths.push(path);
+                }
+            }
+        }
+        if workdir != sbx.root() {
+            access.read_paths.push(workdir.clone());
+        }
+        Ok(Self {
+            command,
+            workdir,
+            timeout_s,
+            access,
+        })
+    }
+}
+
 /// Default and maximum foreground deadlines. On expiry the whole process tree
 /// is killed and awaited before the tool returns an error; it is never detached.
 const SHELL_TIMEOUT_SECS: u64 = 50;
@@ -4317,9 +4582,9 @@ const MAX_RECENT_SHELL_TASKS: usize = 64;
 const MAX_RECENT_SHELL_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const RECENT_SHELL_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const MAX_TASK_COMMAND_BYTES: usize = 4096;
-const NETWORK_DISABLED_HINT: &str = "The active sandbox denied network access. Medha offers to grant \
-     network and retry when this happens; if that grant was declined, the command cannot reach the \
-     network. This is an advisory; the original error may also have another cause.";
+const NETWORK_DISABLED_HINT: &str = "The active sandbox denies network access. Set network=true to \
+     request a grant before running. This command was not automatically replayed; inspect partial \
+     side effects before rerunning. The original error may also have another cause.";
 
 /// Add configuration context to otherwise opaque resolver/socket failures.
 ///
@@ -4884,7 +5149,12 @@ impl Tool for ShellExec {
          timeout or cancellation MEDHA kills and settles the whole process tree \
          before reporting the result. Prefer fs.edit for exact string-replace edits \
          (it produces a reviewable diff) and glob/grep for finding files — use this \
-         for everything else, including multi-step shell pipelines."
+         for everything else, including multi-step shell pipelines. Set network=true \
+         for dependency installs, downloads, or other commands needing the network: \
+         Medha requests access before running if the sandbox denies it. Keep error \
+         output visible; tail and curl -s can hide failures and prevent automatic retry. \
+         For access outside the workspace, request absolute directory paths with \
+         read_paths or write_paths; approval is scoped to this command unless persisted."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::IrreversibleLocal
@@ -4899,6 +5169,22 @@ impl Tool for ShellExec {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Command line to run via the shell" },
+                "network": {
+                    "type": "boolean",
+                    "description": "Set true when the command needs network access (npm/pip installs, downloads, git fetch). Requests approval before execution when access is denied; does not bypass approval."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Working directory, absolute or relative to the workspace. Defaults to the workspace. Outside directories request read access; add write_paths when modifying them."
+                },
+                "read_paths": {
+                    "type": "array", "maxItems": 16, "items": { "type": "string" },
+                    "description": "Existing absolute directories outside the workspace that this command needs to read. Requests native sandbox access before running."
+                },
+                "write_paths": {
+                    "type": "array", "maxItems": 16, "items": { "type": "string" },
+                    "description": "Existing absolute directories outside the workspace that this command needs to write (also permits reads). Requests native sandbox access before running."
+                },
                 "timeout_s": {
                     "type": "integer",
                     "minimum": 1,
@@ -4906,153 +5192,162 @@ impl Tool for ShellExec {
                     "description": "Hard foreground deadline in seconds (default 50, maximum 600). Expiry kills the whole process tree and returns an error."
                 }
             },
-            "required": ["command"]
+            "required": ["command", "network"]
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let command = arg_str(args, "command")?;
-        if args.get("background").and_then(Value::as_bool) == Some(true) {
-            return Err(ToolError::Args(
-                "background shell execution is disabled: run a bounded foreground command".into(),
+        let plan = ShellPlan::parse(args, &self.sbx)?;
+        let missing = self
+            .sbx
+            .missing_execution_access(&plan.access)
+            .map_err(ToolError::Args)?;
+        if !missing.is_empty() {
+            return Err(ToolError::Failed(
+                "command access has not been approved; command was not run".into(),
             ));
         }
-        let timeout_s = match args.get("timeout_s") {
-            None => SHELL_TIMEOUT_SECS,
-            Some(value) => value.as_u64().ok_or_else(|| {
-                ToolError::Args("timeout_s must be an integer from 1 to 600".into())
-            })?,
-        };
-        if !(1..=SHELL_TIMEOUT_MAX_SECS).contains(&timeout_s) {
-            return Err(ToolError::Args(
-                "timeout_s must be an integer from 1 to 600".into(),
-            ));
-        }
-        let mut deadline = std::time::Duration::from_secs(timeout_s);
-        let mut invocation = self.sbx.shell_invocation(&command, shell_env(), true);
-        loop {
-            let started = std::time::Instant::now();
-            // Reserve capacity before process creation. The reservation is
-            // synchronous and RAII-owned, so rejection, spawn failure, panic, or
-            // cancellation cannot leak a slot or briefly exceed the process cap.
-            let reservation = self.tasks.reserve(&command).map_err(ToolError::Failed)?;
-            // Spawn through the sandbox's execution backend (host or OS-native jail),
-            // rooted at the workspace, as an owned task. `clear_env`
-            // + the allowlist keep injected API keys out of the child so a command
-            // can't exfiltrate them via `printenv`. The process is its own group
-            // leader, so timeout, cancellation, or `task.kill` tears down the whole
-            // tree.
-            let bg = invocation
-                .spawn_background()
-                .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let command = plan.command;
+        let timeout_s = plan.timeout_s;
+        let workdir = plan.workdir;
+        let deadline = std::time::Duration::from_secs(timeout_s);
+        let invocation = self
+            .sbx
+            .shell_invocation(&command, shell_env(), true)
+            .with_working_dir(workdir.clone());
+        // Reserve capacity before process creation. The reservation is
+        // synchronous and RAII-owned, so rejection, spawn failure, panic, or
+        // cancellation cannot leak a slot or briefly exceed the process cap.
+        let reservation = self.tasks.reserve(&command).map_err(ToolError::Failed)?;
+        // Spawn through the sandbox's execution backend (host or OS-native jail),
+        // rooted at the workspace, as an owned task. `clear_env`
+        // + the allowlist keep injected API keys out of the child so a command
+        // can't exfiltrate them via `printenv`. The process is its own group
+        // leader, so timeout, cancellation, or `task.kill` tears down the whole
+        // tree.
+        let bg = invocation
+            .spawn_background()
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-            let mut registered = reservation.attach(bg).map_err(|proc| {
-                proc.kill();
-                ToolError::Failed("shell task reservation was lost before registration".into())
-            })?;
-            // Install the Drop guard before the first await. A dropped execute future
-            // synchronously signals the registered process group before the kernel
-            // can release its mutation lease.
-            let denies_network = self.sbx.denies_network();
-            let waited = self
-                .tasks
-                .watch_until(registered.id(), deadline, denies_network)
-                .await;
-            if let ShellWait::Finished = waited {
-                let (task_id, entry) = registered
-                    .take()
-                    .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
-                let completed = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
-                deadline = deadline.saturating_sub(started.elapsed());
-                let output = sandbox::ExecOutput {
-                    status: completed.exit_code,
-                    stdout: completed.stdout.as_bytes().to_vec(),
-                    stderr: completed.stderr.as_bytes().to_vec(),
-                    stdout_truncated: completed.stdout_truncated,
-                    stderr_truncated: completed.stderr_truncated,
-                };
-                if !deadline.is_zero() && invocation.approve_retry(&output).await {
-                    self.tasks.remember(task_id, completed);
-                    continue;
-                }
-                let net_denied = sandbox::network_denial_signature(
-                    &completed.stdout,
-                    &completed.stderr,
-                    denies_network,
-                );
-                let sandbox_hint =
-                    network_disabled_hint(denies_network, &completed.stdout, &completed.stderr);
-                let mut result = json!({
-                    "command": command,
-                    "exit_code": completed.exit_code,
-                    "stdout": completed.stdout,
-                    "stderr": completed.stderr,
-                    "stdout_truncated": completed.stdout_truncated,
-                    "stderr_truncated": completed.stderr_truncated,
-                });
-                if let Some(hint) = sandbox_hint {
-                    result["sandbox_hint"] = Value::String(hint.to_string());
-                }
-                if net_denied {
-                    result[NET_DENIED] = Value::Bool(true);
-                }
-                self.tasks.remember(task_id, completed);
-                return Ok(result);
-            }
-
-            // Stopped early or at the deadline: transfer ownership, kill the whole
-            // tree, and wait for the child waiter to settle before returning. The
-            // durable mutation lease remains held throughout this path.
+        let mut registered = reservation.attach(bg).map_err(|proc| {
+            proc.kill();
+            ToolError::Failed("shell task reservation was lost before registration".into())
+        })?;
+        // Install the Drop guard before the first await. A dropped execute future
+        // synchronously signals the registered process group before the kernel
+        // can release its mutation lease.
+        let denies_network = self.sbx.denies_network();
+        let waited = self
+            .tasks
+            .watch_until(registered.id(), deadline, denies_network)
+            .await;
+        if let ShellWait::Finished = waited {
             let (task_id, entry) = registered
                 .take()
                 .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
-            entry.proc.kill();
-            entry.proc.wait().await;
-            let stalled = matches!(waited, ShellWait::NetStalled);
-            let completed = CompletedTask::capture(
-                entry,
-                if stalled {
-                    TerminalTaskStatus::NetBlocked
-                } else {
-                    TerminalTaskStatus::TimedOut
-                },
+            let completed = CompletedTask::capture(entry, TerminalTaskStatus::Exited);
+            let output = sandbox::ExecOutput {
+                status: completed.exit_code,
+                stdout: completed.stdout.as_bytes().to_vec(),
+                stderr: completed.stderr.as_bytes().to_vec(),
+                stdout_truncated: completed.stdout_truncated,
+                stderr_truncated: completed.stderr_truncated,
+            };
+            let denied_paths = invocation.denied_paths(&output);
+            let net_denied = sandbox::network_denial_signature(
+                &completed.stdout,
+                &completed.stderr,
+                denies_network,
             );
-            let mut payload = json!({
+            let sandbox_hint =
+                network_disabled_hint(denies_network, &completed.stdout, &completed.stderr);
+            let mut result = json!({
                 "command": command,
+                "workdir": workdir,
                 "exit_code": completed.exit_code,
                 "stdout": completed.stdout,
                 "stderr": completed.stderr,
                 "stdout_truncated": completed.stdout_truncated,
                 "stderr_truncated": completed.stderr_truncated,
             });
-            if stalled {
-                payload["error"] = json!(
-                    "stopped early: this command reported a name-resolution failure under a \
-                 network-denying sandbox and then made no further progress"
-                );
-                payload["net_blocked"] = Value::Bool(true);
-            } else {
-                payload["error"] = json!(format!(
-                    "shell command timed out after {timeout_s}s; process tree was stopped"
-                ));
-                payload["timed_out"] = Value::Bool(true);
+            if let Some(hint) = sandbox_hint {
+                result["sandbox_hint"] = Value::String(hint.to_string());
             }
-            // A timeout under a net-denying box escalates even with no marker: when
-            // the failing stderr went into a pipe (`| tail`), the kill leaves that
-            // filter's buffer unflushed and no amount of output matching can recover
-            // it. The command has already failed here, so offering the grant costs a
-            // dismissal at worst — the wording stays honest about which case it is.
-            if stalled || denies_network {
-                payload[NET_DENIED] = Value::Bool(true);
+            if net_denied {
+                result[NET_DENIED] = Value::Bool(true);
+            }
+            if !denied_paths.is_empty() {
+                result["denied_paths"] = json!(denied_paths);
+            }
+            let denied_filesystem = !net_denied
+                && [&completed.stdout, &completed.stderr].iter().any(|text| {
+                    text.contains("Operation not permitted")
+                        || text.contains("Permission denied")
+                        || text.contains("uv_cwd")
+                });
+            if denied_filesystem {
+                result["filesystem_hint"] = json!(
+                    "The command may lack filesystem access. Use workdir for the intended directory and request needed directories in read_paths/write_paths before rerunning. A blocked read does not mean a file or program is missing. The command was not replayed; check for partial side effects first."
+                );
             }
             self.tasks.remember(task_id, completed);
-            return Err(ToolError::Structured(payload));
+            return Ok(result);
         }
+
+        // Stopped early or at the deadline: transfer ownership, kill the whole
+        // tree, and wait for the child waiter to settle before returning. The
+        // durable mutation lease remains held throughout this path.
+        let (task_id, entry) = registered
+            .take()
+            .ok_or_else(|| ToolError::Failed("shell task ownership was lost".into()))?;
+        entry.proc.kill();
+        entry.proc.wait().await;
+        let stalled = matches!(waited, ShellWait::NetStalled);
+        let completed = CompletedTask::capture(
+            entry,
+            if stalled {
+                TerminalTaskStatus::NetBlocked
+            } else {
+                TerminalTaskStatus::TimedOut
+            },
+        );
+        let mut payload = json!({
+            "command": command,
+            "workdir": workdir,
+            "exit_code": completed.exit_code,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "stdout_truncated": completed.stdout_truncated,
+            "stderr_truncated": completed.stderr_truncated,
+        });
+        if stalled {
+            payload["error"] = json!(
+                "stopped early: this command reported a name-resolution failure under a \
+             network-denying sandbox and then made no further progress"
+            );
+            payload["net_blocked"] = Value::Bool(true);
+        } else {
+            payload["error"] = json!(format!(
+                "shell command timed out after {timeout_s}s; process tree was stopped"
+            ));
+            payload["timed_out"] = Value::Bool(true);
+        }
+        // A timeout alone says nothing about networking. Only observed
+        // failures carry a network hint; the kernel never replays a shell.
+        if stalled {
+            payload[NET_DENIED] = Value::Bool(true);
+            payload["sandbox_hint"] = json!(NETWORK_DISABLED_HINT);
+        }
+        self.tasks.remember(task_id, completed);
+        Err(ToolError::Structured(payload))
     }
 
     async fn preview(&self, args: &Value) -> Option<String> {
-        args.get("command")
-            .and_then(|v| v.as_str())
-            .map(|c| format!("$ {c}"))
+        let plan = ShellPlan::parse(args, &self.sbx).ok()?;
+        Some(format!(
+            "Working directory: {}\n$ {}",
+            plan.workdir.display(),
+            plan.command
+        ))
     }
 }
 
@@ -6761,7 +7056,7 @@ mod tests {
     #[tokio::test]
     async fn read_artifact_caps_omitted_and_oversized_page_lengths() {
         let store = mem_artifacts();
-        let bytes = vec![b'x'; store::MAX_ARTIFACT_READ_BYTES + 17];
+        let bytes = vec![b'x'; MAX_PAGE_BYTES + 17];
         let hash = store.put(&bytes).unwrap();
         let tool = ReadArtifact {
             store: store.clone(),
@@ -6773,20 +7068,59 @@ mod tests {
         ] {
             let page = tool.execute(&args).await.unwrap();
             assert_eq!(
-                page["length"],
-                store::MAX_ARTIFACT_READ_BYTES,
+                page["length"], MAX_PAGE_BYTES,
                 "every tool page must stay within the hard allocation ceiling"
             );
+            assert_eq!(page["content"].as_str().unwrap().len(), MAX_PAGE_BYTES);
             assert_eq!(
-                page["content"].as_str().unwrap().len(),
-                store::MAX_ARTIFACT_READ_BYTES
-            );
-            assert_eq!(
-                page["next_offset"],
-                store::MAX_ARTIFACT_READ_BYTES,
+                page["next_offset"], MAX_PAGE_BYTES,
                 "the caller can continue without losing bytes"
             );
         }
+    }
+
+    /// The paging tool must never hand back a result that the kernel then
+    /// spills: that replaces the page with a 2k head plus a *new* hash, so the
+    /// model pages its own output and converges only at the head size. This is
+    /// the invariant that keeps a large artifact a few calls instead of dozens.
+    #[tokio::test]
+    async fn a_read_artifact_page_never_itself_spills() {
+        let store = mem_artifacts();
+        // Content that escapes badly: every quote and newline doubles in JSON,
+        // so a page sized on raw bytes alone would encode past the threshold.
+        let text = "\"quoted\"\n\ttabbed\\\n".repeat(4_000);
+        let hash = store.put(text.as_bytes()).unwrap();
+        let tool = ReadArtifact {
+            store: store.clone(),
+        };
+
+        let mut offset = 0u64;
+        let mut pages = 0;
+        let mut seen = String::new();
+        loop {
+            let page = tool
+                .execute(&json!({ "hash": hash, "offset": offset }))
+                .await
+                .unwrap();
+            let encoded = serde_json::to_string(&page).unwrap().len();
+            assert!(
+                encoded <= kernel::SPILL_THRESHOLD,
+                "page at offset {offset} encodes to {encoded} bytes, over the \
+                 {} spill threshold — it would be re-spilled",
+                kernel::SPILL_THRESHOLD
+            );
+            seen.push_str(page["content"].as_str().unwrap());
+            pages += 1;
+            assert!(pages < 100, "paging must make progress, not stall");
+            match page["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset, "next_offset must advance");
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen, text, "paging reassembles the artifact byte for byte");
     }
 
     #[tokio::test]
@@ -7659,7 +7993,7 @@ mod tests {
         let hint = network_disabled_hint(true, "", "getaddrinfo ENOTFOUND registry.example")
             .expect("a resolver-shaped failure in a no-network sandbox needs context");
         assert!(hint.contains("network access"));
-        assert!(hint.contains("grant network"));
+        assert!(hint.contains("network=true"));
         assert!(hint.contains("may also have another cause"));
 
         assert_eq!(
@@ -7969,12 +8303,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The piped case from the report: `… | tail` swallows the resolver error,
-    /// so no output can ever prove the cause. The command has already failed, so
-    /// the grant is still offered — just under wording that claims less.
+    /// Silence at a deadline is not evidence of denied networking.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_timeout_under_a_net_denying_box_still_offers_a_grant_with_no_marker() {
+    async fn a_timeout_under_a_net_denying_box_does_not_invent_a_network_failure() {
         let dir = std::env::temp_dir().join(format!("medha-sh-netpipe-{}", ulid_like()));
         let reg = reg_net_denied(&dir);
         let obs = run(
@@ -8000,7 +8332,10 @@ mod tests {
             "premise of this test is that the pipe hid the error: {:?}",
             obs.payload
         );
-        assert!(obs.net_denied, "a grant must still be offered");
+        assert!(
+            !obs.net_denied,
+            "a timeout alone must not request network access"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8880,3 +9215,7 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod shell_approval_tests;
+
+#[cfg(test)]
+#[path = "image_view_tests.rs"]
+mod image_view_tests;

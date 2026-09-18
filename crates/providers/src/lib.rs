@@ -6,5 +6,8 @@ pub mod profile;
 pub(crate) mod protocol;
 pub(crate) mod transport;
 
+pub use models_dev::{
+    CapabilityResolution, CapabilitySource, CapabilityState, ModalitySet, ModelCapabilities,
+};
 pub use openai_compat::{OpenAiCompat, ProviderClient};
 pub use profile::{AuthKind, ProviderProfile, TokenCounter};

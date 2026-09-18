@@ -22,7 +22,7 @@ impl Approval {
     }
 }
 
-/// The human's answer to a network-grant prompt. Distinct from [`Approval`] so a
+/// The human's answer to a network or command-access prompt. Distinct from [`Approval`] so a
 /// third "session" tier does not have to be forced onto every other card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkDecision {
@@ -34,6 +34,21 @@ pub enum NetworkDecision {
     Persistent,
     /// Reject.
     Deny,
+}
+
+/// Capabilities requested together for one command. Paths are resolved by the
+/// executor before review; these are grants, never a replacement workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionAccess {
+    pub network: bool,
+    pub read_paths: Vec<std::path::PathBuf>,
+    pub write_paths: Vec<std::path::PathBuf>,
+}
+
+impl ExecutionAccess {
+    pub fn is_empty(&self) -> bool {
+        !self.network && self.read_paths.is_empty() && self.write_paths.is_empty()
+    }
 }
 
 #[async_trait]
@@ -60,10 +75,38 @@ pub trait HumanGate: Send + Sync {
             Approval::Deny => NetworkDecision::Deny,
         }
     }
+
+    /// One review for a command and its missing network/filesystem capabilities.
+    async fn confirm_access(&self, detail: Option<&str>, escalated: bool) -> NetworkDecision {
+        // Some plain/editor gates remember Standard approvals by action. Include
+        // the reviewed request so remembering one card cannot approve new roots.
+        let action = format!("command access: {}", detail.unwrap_or_default());
+        match self.confirm(&action, detail, escalated).await {
+            Approval::Once => NetworkDecision::Once,
+            Approval::Always if !escalated => NetworkDecision::Persistent,
+            Approval::Always => NetworkDecision::Once,
+            Approval::Deny => NetworkDecision::Deny,
+        }
+    }
 }
 
 tokio::task_local! {
     static NETWORK_ONCE: bool;
+    static EXECUTION_ACCESS: ExecutionAccess;
+}
+
+pub async fn execution_access_scope<F: std::future::Future>(
+    access: ExecutionAccess,
+    fut: F,
+) -> F::Output {
+    let network = access.network || network_once_active();
+    EXECUTION_ACCESS
+        .scope(access, NETWORK_ONCE.scope(network, fut))
+        .await
+}
+
+pub fn execution_access() -> ExecutionAccess {
+    EXECUTION_ACCESS.try_with(Clone::clone).unwrap_or_default()
 }
 
 /// Run `fut` with a one-shot network grant in scope. The value is visible to any
@@ -137,5 +180,44 @@ mod tests {
         })
         .await;
         assert!(!network_once_active());
+    }
+
+    #[tokio::test]
+    async fn execution_access_is_isolated_across_concurrent_futures() {
+        let access = ExecutionAccess {
+            network: true,
+            read_paths: vec![std::path::PathBuf::from("/approved")],
+            ..Default::default()
+        };
+        tokio::join!(
+            execution_access_scope(access.clone(), async {
+                tokio::task::yield_now().await;
+                assert_eq!(execution_access(), access);
+                assert!(network_once_active());
+            }),
+            async {
+                tokio::task::yield_now().await;
+                assert!(execution_access().is_empty());
+                assert!(!network_once_active());
+            }
+        );
+        assert!(execution_access().is_empty());
+        assert!(!network_once_active());
+    }
+
+    #[tokio::test]
+    async fn escalated_access_never_defaults_to_a_remembered_grant() {
+        assert_eq!(
+            Fixed(Approval::Always)
+                .confirm_access(Some("network"), true)
+                .await,
+            NetworkDecision::Once
+        );
+        assert_eq!(
+            Fixed(Approval::Always)
+                .confirm_access(Some("network"), false)
+                .await,
+            NetworkDecision::Persistent
+        );
     }
 }

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod attach;
 mod markdown;
 mod spin;
 mod tty;
@@ -52,6 +53,9 @@ tokio::task_local! {
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
+    ("/attach", "attach an image file: /attach PATH"),
+    ("/paste", "attach an image from the clipboard (Ctrl-V)"),
+    ("/detach", "remove pending images: /detach [number|all]"),
     ("/status", "model, context window, current pressure"),
     (
         "/pulse",
@@ -229,6 +233,14 @@ impl kernel::HumanGate for TuiGate {
         detail: Option<&str>,
         escalated: bool,
     ) -> kernel::NetworkDecision {
+        self.confirm_access(detail, escalated).await
+    }
+
+    async fn confirm_access(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
         let cancel = FOREGROUND_TURN_CANCEL
             .try_with(CancellationToken::clone)
             .ok();
@@ -236,7 +248,7 @@ impl kernel::HumanGate for TuiGate {
             return kernel::NetworkDecision::Deny;
         }
         let (resp_tx, resp_rx) = oneshot::channel();
-        let req = TuiEvent::NetworkApproval(
+        let req = TuiEvent::AccessApproval(
             detail.map(str::to_string),
             escalated,
             cancel.clone(),
@@ -296,6 +308,14 @@ impl kernel::Asker for TuiAsker {
 /// Events from the agent to the UI.
 #[derive(Debug)]
 pub(crate) enum TuiEvent {
+    ImagesLoaded {
+        session: ulid::Ulid,
+        generation: u64,
+        result: Result<Vec<crate::attachments::Attachment>, String>,
+    },
+    /// How the running turn differs from what was asked, e.g. an image the
+    /// model cannot see being described by another model instead.
+    TurnNotice(String),
     Text(String),
     Reasoning(String),
     ToolStarted(String, Option<String>),
@@ -315,7 +335,7 @@ pub(crate) enum TuiEvent {
         path: orchestrator::AgentPath,
         step: AgentStep,
     },
-    Usage(u32, u32),
+    ContextPressure(kernel::ContextPressure),
     /// Session cost so far in USD; `true` = indicative list price (shown "est.").
     Cost(f64, bool),
     Verify(bool, String),
@@ -326,9 +346,9 @@ pub(crate) enum TuiEvent {
         Option<CancellationToken>,
         oneshot::Sender<kernel::Approval>,
     ),
-    /// Network-grant prompt after a command was denied network; four-way answer
+    /// Command-capability prompt for network and/or directories; four-way answer
     /// (once / session / persistent / deny).
-    NetworkApproval(
+    AccessApproval(
         Option<String>,
         bool,
         Option<CancellationToken>,
@@ -822,7 +842,7 @@ fn word_cell_range(text: &str, target: usize) -> Option<(usize, usize)> {
 /// cancellation, and ready-signal logic is written once.
 enum ApprovalResponder {
     Standard(oneshot::Sender<kernel::Approval>),
-    Network(oneshot::Sender<kernel::NetworkDecision>),
+    Access(oneshot::Sender<kernel::NetworkDecision>),
 }
 
 impl ApprovalResponder {
@@ -833,13 +853,13 @@ impl ApprovalResponder {
         match (self, escalated) {
             (Self::Standard(_), false) => &["Yes, allow once", "Yes, always allow", "No, deny"],
             (Self::Standard(_), true) => &["Yes, allow once", "No, deny"],
-            (Self::Network(_), false) => &[
-                "Allow once and retry",
+            (Self::Access(_), false) => &[
+                "Allow once and run",
                 "Allow for this session",
                 "Always allow for this project",
                 "No, deny",
             ],
-            (Self::Network(_), true) => &["Allow once and retry", "No, deny"],
+            (Self::Access(_), true) => &["Allow once and run", "No, deny"],
         }
     }
 
@@ -858,9 +878,9 @@ impl ApprovalResponder {
                     _ => kernel::Approval::Deny,
                 });
             }
-            Self::Network(tx) => {
+            Self::Access(tx) => {
                 let _ = tx.send(match label {
-                    Some("Allow once and retry") => kernel::NetworkDecision::Once,
+                    Some("Allow once and run") => kernel::NetworkDecision::Once,
                     Some("Allow for this session") => kernel::NetworkDecision::Session,
                     Some("Always allow for this project") => kernel::NetworkDecision::Persistent,
                     _ => kernel::NetworkDecision::Deny,
@@ -878,10 +898,10 @@ impl ApprovalResponder {
         match self.options_for(escalated).get(sel).copied() {
             Some("Yes, allow once") => "approved",
             Some("Yes, always allow") => "approved (always for this action)",
-            Some("Allow once and retry") => "network allowed (once)",
-            Some("Allow for this session") => "network allowed (this session)",
-            Some("Always allow for this project") => "network allowed (persisted)",
-            _ if matches!(self, Self::Network(_)) => "network denied",
+            Some("Allow once and run") => "access allowed (once)",
+            Some("Allow for this session") => "access allowed (this session)",
+            Some("Always allow for this project") => "access allowed (persisted)",
+            _ if matches!(self, Self::Access(_)) => "access denied",
             _ => "rejected",
         }
     }
@@ -1820,6 +1840,9 @@ struct Model {
     /// name→glyph table here.
     tool_viz: HashMap<String, ToolViz>,
     input: String,
+    attachments: attach::PendingImages,
+    /// A message held back until its attachments finish being admitted.
+    submit_deferred: Option<String>,
     /// UTF-8 byte offset, always on a character boundary.
     cursor: usize,
     history: Vec<String>,
@@ -1853,7 +1876,7 @@ struct Model {
     /// The pending approval card has been rendered at least once, so its options
     /// are on screen and selection input is safe to accept (blocks blind-Enter).
     approval_ready: bool,
-    ctx_pct: Option<u32>,
+    context_pressure: Option<kernel::ContextPressure>,
     /// Session cost so far (USD, `true` = indicative "est." figure), when known.
     cost_usd: Option<(f64, bool)>,
     model: String,
@@ -2159,6 +2182,8 @@ impl Model {
             items: VecDeque::with_capacity(MAX_SCROLLBACK_LINES),
             tool_viz,
             input: String::new(),
+            attachments: attach::PendingImages::default(),
+            submit_deferred: None,
             cursor: 0,
             history: Vec::new(),
             history_idx: None,
@@ -2177,7 +2202,7 @@ impl Model {
             pending_clipboard: None,
             clipboard_status: None,
             approval_ready: false,
-            ctx_pct: None,
+            context_pressure: None,
             cost_usd: None,
             model,
             protocol: kernel::Protocol::OpenAiChat,
@@ -2765,6 +2790,9 @@ impl Model {
     /// discarding them so the previous conversation cannot be resurrected from
     /// `parked_main` under the new session id.
     fn clear_session_panes(&mut self) {
+        self.context_pressure = None;
+        self.attachments.reset();
+        self.submit_deferred = None;
         if self.focus.is_some() {
             self.focus_pane(None);
         }
@@ -3649,12 +3677,12 @@ mod tests {
         assert!(card.contains("untrusted web content"), "{card}");
         assert!(!card.contains("always"), "{card}");
         assert_eq!(responder.verb_for(1, true), "rejected");
-        let network = ApprovalResponder::Network(oneshot::channel().0);
+        let network = ApprovalResponder::Access(oneshot::channel().0);
         assert_eq!(
             network.options_for(true),
-            &["Allow once and retry", "No, deny"]
+            &["Allow once and run", "No, deny"]
         );
-        assert_eq!(network.verb_for(1, true), "network denied");
+        assert_eq!(network.verb_for(1, true), "access denied");
     }
 
     #[test]

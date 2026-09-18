@@ -22,7 +22,7 @@ impl OneMutationProvider {
     fn new(value: &'static str) -> Self {
         Self {
             caps: ProviderCaps {
-                vision: false,
+                images: kernel::ImageSupport::Unsupported,
                 caching: false,
                 max_ctx: None,
                 tool_calls: ToolCallStrategy::Native,

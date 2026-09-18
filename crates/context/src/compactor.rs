@@ -262,6 +262,8 @@ pub struct LlmSummarizer<P: kernel::Provider> {
 const MAX_SUMMARY_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUMMARY_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_SUMMARY_STREAM_BLOCKS: usize = 4_096;
+// Task policy, not a claim about any model's maximum output capacity.
+const SUMMARY_OUTPUT_TOKENS: u64 = 2_048;
 
 impl<P: kernel::Provider> LlmSummarizer<P> {
     pub fn new(provider: std::sync::Arc<P>) -> Self {
@@ -325,9 +327,67 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
             ordered: None,
             tools: Vec::new(),
         };
+        let limits = self.provider.model_limits();
+        let output_cap = self
+            .provider
+            .requested_output_tokens()
+            .map_or(SUMMARY_OUTPUT_TOKENS, |limit| {
+                limit.min(SUMMARY_OUTPUT_TOKENS)
+            });
+        let input_limit = limits.input_allowance(Some(output_cap)).ok_or_else(|| {
+            SummarizeError::Unavailable("summary model context limit is unknown".into())
+        })?;
+        let request = self
+            .provider
+            .prepare_request(&ctx)
+            .map_err(|error| SummarizeError::Unavailable(error.to_string()))?;
+        let request = self
+            .provider
+            .with_output_limit(&request, output_cap)
+            .map_err(|error| SummarizeError::Unavailable(error.to_string()))?
+            .ok_or_else(|| {
+                SummarizeError::Unavailable("summary provider cannot bound output".into())
+            })?;
+        let count = self
+            .provider
+            .count_input_tokens(&request)
+            .await
+            .ok()
+            .flatten()
+            .filter(|count| count.request_fingerprint == request.request_fingerprint);
+        if self.provider.token_accounting_mode() == kernel::TokenAccountingMode::Strict
+            && count
+                .as_ref()
+                .is_none_or(|count| count.quality != kernel::TokenCountQuality::Authoritative)
+        {
+            return Err(SummarizeError::Unavailable(
+                "summary requires an authoritative token count".into(),
+            ));
+        }
+        let (tokens, quality) = match count {
+            Some(count) => (count.tokens, count.quality),
+            None => {
+                use crate::tokens::TokenCounter;
+                let counter = crate::tokens::BpeCounter::o200k();
+                (
+                    u64::from(counter.count(&request.body.to_string())),
+                    kernel::TokenCountQuality::LocalEstimate,
+                )
+            }
+        };
+        let budget = kernel::ContextPressure::new(
+            tokens,
+            Some(input_limit.min(u64::from(u32::MAX)) as u32),
+            quality,
+        );
+        if tokens >= u64::from(budget.usable_input_tokens.unwrap_or(0)) {
+            return Err(SummarizeError::Unavailable(
+                "summary input exceeds its token budget".into(),
+            ));
+        }
         let mut stream = self
             .provider
-            .stream(&ctx)
+            .stream_prepared(&request)
             .await
             .map_err(|e| SummarizeError::Unavailable(e.to_string()))?;
         let mut text = String::new();

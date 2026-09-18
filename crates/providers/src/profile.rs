@@ -8,6 +8,8 @@ use kernel::{Protocol, ReasoningEffort, ReasoningSupport, TokenAccountingMode};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
+use crate::models_dev::ModelCapabilities;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthKind {
@@ -86,6 +88,11 @@ pub struct ProviderProfile {
     /// unverified, not that every endpoint accepts every level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
+    /// Optional exact per-model capability override. This is intentionally
+    /// separate from catalog metadata: a deployment may expose a different
+    /// capability set than the public model listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ModelCapabilities>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub chat_token_limit: ChatTokenLimit,
 }
@@ -112,6 +119,7 @@ impl ProviderProfile {
             token_accounting: TokenAccountingMode::Adaptive,
             reasoning: ReasoningSupport::Unknown,
             reasoning_efforts: None,
+            capabilities: None,
             chat_token_limit: ChatTokenLimit::Auto,
         }
     }
@@ -164,6 +172,15 @@ impl ProviderProfile {
         }
         if self.max_output_tokens == Some(0) {
             return Err("provider output limit must be positive".into());
+        }
+        if self
+            .max_ctx
+            .zip(self.max_output_tokens)
+            .is_some_and(|(context, output)| output >= u64::from(context))
+        {
+            return Err(
+                "provider output limit must leave room for input within the context window".into(),
+            );
         }
         if self.token_counter == TokenCounter::Vllm && self.protocol != Protocol::OpenAiChat {
             return Err("the vLLM counter is only valid with the open-ai-chat protocol".into());
@@ -222,6 +239,8 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             #[serde(default)]
             reasoning_efforts: Option<Vec<ReasoningEffort>>,
             #[serde(default)]
+            capabilities: Option<ModelCapabilities>,
+            #[serde(default)]
             chat_token_limit: ChatTokenLimit,
         }
 
@@ -242,6 +261,7 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             token_accounting: raw.token_accounting,
             reasoning: raw.reasoning,
             reasoning_efforts: raw.reasoning_efforts,
+            capabilities: raw.capabilities,
             chat_token_limit: raw.chat_token_limit,
         })
     }
@@ -250,6 +270,21 @@ impl<'de> Deserialize<'de> for ProviderProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_reservation_cannot_consume_the_entire_window() {
+        let mut profile =
+            ProviderProfile::openai_chat("https://example.test/v1", "model", AuthKind::None);
+        profile.max_ctx = Some(8_000);
+        assert!(
+            profile.validate().is_ok(),
+            "server-default output remains valid"
+        );
+        profile.max_output_tokens = Some(8_000);
+        assert!(profile.validate().is_err());
+        profile.max_output_tokens = Some(4_000);
+        assert!(profile.validate().is_ok());
+    }
 
     #[test]
     fn legacy_needs_key_migrates_to_bearer_auth() {
@@ -290,5 +325,31 @@ mod tests {
             AuthKind::None,
         );
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn capability_override_round_trips_without_becoming_a_secret() {
+        let mut profile = ProviderProfile::openai_chat(
+            "https://example.test/v1",
+            "vision-model",
+            AuthKind::Bearer,
+        );
+        profile.capabilities = Some(ModelCapabilities {
+            modalities: Some(crate::models_dev::ModalitySet {
+                input: Some(["text".into(), "image".into()].into_iter().collect()),
+                output: Some(["text".into()].into_iter().collect()),
+            }),
+            attachment: Some(true),
+            tool_calls: Some(true),
+            reasoning: Some(false),
+        });
+
+        let encoded = serde_json::to_value(&profile).unwrap();
+        assert_eq!(encoded["capabilities"]["attachment"], true);
+        assert!(encoded.to_string().contains("vision-model"));
+        assert!(!encoded.to_string().contains("Bearer"));
+
+        let decoded: ProviderProfile = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.capabilities, profile.capabilities);
     }
 }

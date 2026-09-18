@@ -1581,8 +1581,18 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
             .unwrap_or_default();
         left = vec![Span::styled(compact, Style::default().fg(theme::accent()))];
     }
-    let ctx = match model.ctx_pct {
-        Some(pct) => format!("ctx {pct}%"),
+    let ctx = match model
+        .context_pressure
+        .and_then(|p| p.percent().map(|pct| (p, pct)))
+    {
+        Some((p, pct)) => format!(
+            "ctx {}{pct}%",
+            if p.quality != kernel::TokenCountQuality::Authoritative {
+                "~"
+            } else {
+                ""
+            }
+        ),
         None => "ctx —".to_string(),
     };
     // Mark indicative list prices; self-hosted routes may not incur them.
@@ -1720,6 +1730,10 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
         // Horizontal breathing room only. Vertical padding cost two rows of
         // transcript and made an empty composer five rows tall.
         .padding(ratatui::widgets::Padding::new(1, 1, 0, 0));
+    let block = match model.attachments.title() {
+        Some(title) => block.title(title),
+        None => block,
+    };
     let inner = block.inner(area);
     f.render_widget(block, area);
     if model.input.is_empty() && !model.running {

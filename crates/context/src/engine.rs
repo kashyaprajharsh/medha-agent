@@ -14,6 +14,8 @@ type SystemRefresh = dyn Fn(&str) -> String + Send + Sync;
 
 pub struct PipelineEngine {
     policy: CompactionPolicy,
+    request_scope: std::sync::Mutex<String>,
+    pressure: std::sync::Mutex<Option<kernel::ContextPressure>>,
     /// Token counter for the pre-flight estimate and per-item boundaries. A real
     /// BPE tokenizer in production; injectable (a model-exact tokenizer, or the
     /// heuristic for tests) via [`PipelineEngine::with_counter`].
@@ -36,6 +38,9 @@ pub struct PipelineEngine {
     /// Consecutive compactions that barely helped; backs off to avoid the
     /// "compact every turn" thrash.
     ineffective: AtomicU32,
+    /// Backoff belongs to the attempted stage; failed pruning must never
+    /// suppress promotion to full summarization.
+    ineffective_full: AtomicBool,
     /// Context size when anti-thrash latched; sufficient growth releases it.
     latched_at: AtomicU32,
     /// Local estimate of the request most recently compiled, and the estimate
@@ -65,6 +70,8 @@ impl PipelineEngine {
     pub fn with_counter(policy: CompactionPolicy, counter: Arc<dyn TokenCounter>) -> Self {
         Self {
             policy,
+            request_scope: std::sync::Mutex::new(String::new()),
+            pressure: std::sync::Mutex::new(None),
             counter,
             last_prompt_tokens: AtomicU32::new(0),
             preflight_tokens: AtomicU32::new(0),
@@ -74,6 +81,7 @@ impl PipelineEngine {
             pending_usage_verification: AtomicBool::new(false),
             verification_threshold: AtomicU32::new(0),
             ineffective: AtomicU32::new(0),
+            ineffective_full: AtomicBool::new(false),
             latched_at: AtomicU32::new(0),
             pending_estimate: AtomicU32::new(0),
             estimate_at_last_usage: AtomicU32::new(0),
@@ -121,7 +129,12 @@ impl Default for PipelineEngine {
 
 /// Count the full tool-call envelope, including arguments and ids.
 fn count_msg(m: &Message, counter: &dyn TokenCounter) -> u32 {
-    let mut t = counter.count(&m.content);
+    // A local image estimate is not a model-specific token count. Keep binary
+    // encodings out of the text tokenizer; authoritative endpoint counts and
+    // observed usage still take precedence through the existing calibration.
+    let mut t = counter
+        .count(&m.content)
+        .saturating_add((m.attachments.len() as u32).saturating_mul(4096));
     for tc in &m.tool_calls {
         t += counter.count(&tc.tool) + counter.count(&tc.args.to_string()) + 4;
     }
@@ -177,6 +190,28 @@ const PER_TOOL_SCAFFOLD_TOKENS: u32 = 18;
 
 #[async_trait]
 impl ContextEngine for PipelineEngine {
+    fn begin_request(&self, scope: &str) {
+        let mut current = self.request_scope.lock().unwrap();
+        if *current != scope {
+            *current = scope.to_string();
+            self.last_prompt_tokens.store(0, Ordering::Relaxed);
+            self.estimate_at_last_usage.store(0, Ordering::Relaxed);
+            self.pending_estimate.store(0, Ordering::Relaxed);
+            self.pending_usage_verification
+                .store(false, Ordering::Relaxed);
+            self.ineffective.store(0, Ordering::Relaxed);
+            self.ineffective_full.store(false, Ordering::Relaxed);
+            self.latched_at.store(0, Ordering::Relaxed);
+            *self.last_summary.lock().unwrap() = None;
+            *self.pressure.lock().unwrap() = None;
+            self.clear_preflight();
+        }
+    }
+
+    fn pressure(&self) -> Option<kernel::ContextPressure> {
+        *self.pressure.lock().unwrap()
+    }
+
     fn fork(&self) -> Option<Arc<dyn ContextEngine>> {
         Some(Arc::new(self.forked()))
     }
@@ -298,7 +333,14 @@ impl PipelineEngine {
         let mc = match max_input_tokens {
             Some(limit) => limit,
             None if forced => before.saturating_mul(3).checked_div(4).unwrap_or(1).max(1),
-            None => return Ok(passthrough(messages, before, false)),
+            None => {
+                *self.pressure.lock().unwrap() = Some(kernel::ContextPressure::new(
+                    u64::from(before),
+                    None,
+                    TokenCountQuality::LocalEstimate,
+                ));
+                return Ok(passthrough(messages, before, false));
+            }
         };
         let preflight = self.preflight_tokens.load(Ordering::Acquire);
         let quality = if preflight > 0 {
@@ -327,20 +369,11 @@ impl PipelineEngine {
             (actual as f32).max(before as f32)
         };
         let near_hard_ceiling = is_overflow(basis, mc, &self.policy);
-
-        // Anti-thrash: if the last couple of compactions barely helped, stop —
-        // UNLESS we're at the hard safety ceiling (must keep trying rather than
-        // silently send an overflowing turn), or the context has since GROWN
-        // ≥10% past where the backoff latched (new material = new cuts to make;
-        // holding the latch there left sessions stuck over 100% of usable).
-        if self.ineffective.load(Ordering::Relaxed) >= 2 && !near_hard_ceiling {
-            let latched = self.latched_at.load(Ordering::Relaxed);
-            if basis as u32 > latched.saturating_add(latched / 10) {
-                self.ineffective.store(0, Ordering::Relaxed);
-            } else {
-                return Ok(passthrough(messages, before, false));
-            }
-        }
+        *self.pressure.lock().unwrap() = Some(kernel::ContextPressure::new(
+            basis as u64,
+            max_input_tokens,
+            quality,
+        ));
 
         let action = if forced || basis >= usable * self.policy.trigger_ratio || near_hard_ceiling {
             CompactionAction::Full
@@ -351,6 +384,24 @@ impl PipelineEngine {
         };
         if action == CompactionAction::None {
             return Ok(passthrough(messages, before, false));
+        }
+        let full = action == CompactionAction::Full;
+        if self.ineffective_full.swap(full, Ordering::Relaxed) != full {
+            self.ineffective.store(0, Ordering::Relaxed);
+        }
+
+        // Anti-thrash: if the last couple of attempts at this stage barely helped, stop —
+        // UNLESS we're at the hard safety ceiling (must keep trying rather than
+        // silently send an overflowing turn), or the context has since GROWN
+        // ≥10% past where the backoff latched (new material = new cuts to make;
+        // holding the latch there left sessions stuck over 100% of usable).
+        if self.ineffective.load(Ordering::Relaxed) >= 2 && !near_hard_ceiling && !forced {
+            let latched = self.latched_at.load(Ordering::Relaxed);
+            if basis as u32 > latched.saturating_add(latched / 10) {
+                self.ineffective.store(0, Ordering::Relaxed);
+            } else {
+                return Ok(passthrough(messages, before, false));
+            }
         }
 
         let n = messages.len();
@@ -456,11 +507,14 @@ impl PipelineEngine {
                     .collect();
                 let previous = self.last_summary.lock().ok().and_then(|g| g.clone());
                 let primary = control
-                    .run(self.summarizer.summarize(previous.as_deref(), &items))
+                    .run(tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        self.summarizer.summarize(previous.as_deref(), &items),
+                    ))
                     .await?;
                 let text = match primary {
-                    Ok(s) => s,
-                    Err(_) => control
+                    Ok(Ok(s)) => s,
+                    Ok(Err(_)) | Err(_) => control
                         .run(ExtractiveSummarizer.summarize(previous.as_deref(), &items))
                         .await?
                         .unwrap_or_else(|_| extractive_stub(&items)),
@@ -477,6 +531,13 @@ impl PipelineEngine {
                     message: Message::new(Role::Assistant, text),
                     source_index: None,
                 });
+                // The text summarizer cannot see pixels. Preserve older images
+                // explicitly instead of pretending the text summary covers them.
+                for tracked in middle {
+                    if !tracked.message.attachments.is_empty() {
+                        out.push(tracked.clone());
+                    }
+                }
             }
             CompactionAction::None => unreachable!(),
         }
@@ -514,7 +575,12 @@ impl PipelineEngine {
         // Remember the size we latched at so growth can release the backoff.
         if before.saturating_sub(after) < before / 10 {
             self.ineffective.fetch_add(1, Ordering::Relaxed);
-            self.latched_at.store(after, Ordering::Relaxed);
+            // Compare future growth in the same calibrated count domain as
+            // `basis`, not a potentially much smaller local token estimate.
+            self.latched_at.store(
+                (basis - before.saturating_sub(after) as f32).max(after as f32) as u32,
+                Ordering::Relaxed,
+            );
         } else {
             self.ineffective.store(0, Ordering::Relaxed);
         }
@@ -531,9 +597,31 @@ impl PipelineEngine {
         self.pending_usage_verification
             .store(true, Ordering::Release);
         self.verification_threshold.store(
-            (usable * self.policy.trigger_ratio) as u32,
+            (usable
+                * if full {
+                    self.policy.trigger_ratio
+                } else {
+                    self.policy.microcompact_ratio
+                }) as u32,
             Ordering::Release,
         );
+
+        // Source indices are retained only for untouched messages. Equal token
+        // counts alone cannot establish a no-op: a useful rewrite may happen
+        // to have the same size. Do not checkpoint or recount identical history.
+        if out.len() == messages.len()
+            && out
+                .iter()
+                .enumerate()
+                .all(|(index, tracked)| tracked.source_index == Some(index))
+        {
+            return Ok(passthrough(messages, before, overflow));
+        }
+
+        // Usage describes the old request. Reusing it after replacing history
+        // immediately retriggers full compaction even when the result fits.
+        self.last_prompt_tokens.store(0, Ordering::Relaxed);
+        self.estimate_at_last_usage.store(0, Ordering::Relaxed);
 
         Ok(CompileResult {
             source_indices: out.iter().map(|tracked| tracked.source_index).collect(),
@@ -1102,6 +1190,21 @@ mod tests {
         assert_eq!(recovered.summary.as_deref(), Some("RECOVERED SUMMARY"));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stalled_summarizer_times_out_and_uses_extractive_fallback() {
+        let summarizer = Arc::new(CancellableSummarizer {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+        });
+        let eng = engine(full_policy()).with_summarizer(summarizer.clone());
+        let result = eng
+            .compile(&full_compaction_history(), Some(local_input_limit(1_300)))
+            .await;
+        assert!(result.compacted && result.summarized && !result.overflow);
+        assert!(result.summary.is_some());
+        assert_eq!(summarizer.calls.load(Ordering::SeqCst), 1);
+    }
+
     struct RecordingSummarizer(std::sync::Mutex<Vec<Option<String>>>);
     #[async_trait]
     impl Summarizer for RecordingSummarizer {
@@ -1219,11 +1322,11 @@ mod tests {
         let input_limit = Some(local_input_limit(5_200));
         let r1 = eng.compile(&msgs, input_limit).await;
         assert!(
-            r1.compacted && r1.before_tokens == r1.after_tokens,
-            "nothing prunable"
+            !r1.compacted && r1.before_tokens == r1.after_tokens,
+            "nothing prunable must not create a checkpoint"
         );
         let r2 = eng.compile(&msgs, input_limit).await;
-        assert!(r2.compacted);
+        assert!(!r2.compacted);
         let r3 = eng.compile(&msgs, input_limit).await;
         assert!(!r3.compacted, "latched after two ineffective passes");
 
@@ -1245,6 +1348,72 @@ mod tests {
             r5.after_tokens < r5.before_tokens,
             "and this pass actually shrinks"
         );
+    }
+
+    #[tokio::test]
+    async fn unchanged_pruning_keeps_its_backoff_across_provider_usage() {
+        let eng = engine(CompactionPolicy {
+            protect_first_n: 1,
+            protect_last_n: 2,
+            tail_ratio: 0.05,
+            ..Default::default()
+        });
+        let mut messages = vec![Message::system("S")];
+        messages.extend((0..8).map(|_| user(&"x".repeat(1_600))));
+        let limit = Some(local_input_limit(5_200));
+        for _ in 0..4 {
+            let result = eng.compile(&messages, limit).await;
+            assert!(!result.compacted, "unchanged history is not a compaction");
+            eng.update_usage(result.after_tokens, result.after_tokens);
+        }
+        assert!(eng.ineffective.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[tokio::test]
+    async fn prune_backoff_uses_the_same_count_domain_as_preflight() {
+        let eng = engine(CompactionPolicy {
+            protect_first_n: 1,
+            protect_last_n: 2,
+            tail_ratio: 0.05,
+            ..Default::default()
+        });
+        let mut messages = vec![Message::system("S")];
+        messages.extend((0..8).map(|_| user(&"x".repeat(1_600))));
+        eng.update_preflight(&InputTokenCount {
+            tokens: 7_000, // Higher than the local estimate, but in the prune band.
+            quality: TokenCountQuality::Authoritative,
+            request_fingerprint: "test".into(),
+        });
+        for _ in 0..3 {
+            assert!(!eng.compile(&messages, Some(10_000)).await.compacted);
+        }
+        assert_eq!(
+            eng.ineffective.load(Ordering::Relaxed),
+            2,
+            "the identical third request must back off, not mistake count disagreement for growth"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_backoff_cannot_suppress_promotion_to_full_compaction() {
+        let eng = engine(CompactionPolicy {
+            protect_first_n: 1,
+            protect_last_n: 2,
+            tail_ratio: 0.05,
+            trigger_ratio: 0.85,
+            ..Default::default()
+        });
+        let mut messages = vec![Message::system("S")];
+        messages.extend((0..8).map(|_| user(&"x".repeat(1_600))));
+        let before = eng.compile(&messages, Some(100_000)).await.before_tokens;
+        let limit = Some(local_input_limit(before * 100 / 84));
+        // Start at 84% of usable; a <10% increase crosses into Full at 85%.
+        eng.compile(&messages, limit).await;
+        eng.compile(&messages, limit).await;
+        assert!(eng.ineffective.load(Ordering::Relaxed) >= 2);
+        messages.push(user(&"y".repeat((before / 10) as usize)));
+        let result = eng.compile(&messages, limit).await;
+        assert!(result.compacted && result.summarized);
     }
 
     /// A local tokenizer that disagrees with the model's vocabulary undercounts
@@ -1287,11 +1456,12 @@ mod tests {
         msgs.push(user(&"b".repeat(1_600)));
         let grown = eng.compile(&msgs, input_limit).await;
         assert!(
-            grown.compacted,
+            eng.pressure().unwrap().input_tokens >= 6_000,
             "reported usage plus new material must cross the prune band \
              (local estimate alone was {})",
             grown.before_tokens
         );
+        assert!(!grown.compacted, "user-only history has nothing to prune");
 
         // Control: without a reported count there is nothing to anchor to, so
         // the same history rides on the raw local estimate and stays under.
@@ -1301,6 +1471,7 @@ mod tests {
             !unanchored.compacted,
             "the anchor, not the extra message, is what tripped compaction"
         );
+        assert!(fresh.pressure().unwrap().input_tokens < 6_000);
     }
 
     #[tokio::test]
@@ -1437,6 +1608,50 @@ mod tests {
         let msgs = vec![Message::system("sys"), user(&"x".repeat(100_000))];
         let r = eng.compile(&msgs, None).await;
         assert!(!r.compacted, "no window => no guessing => no compaction");
+    }
+
+    #[tokio::test]
+    async fn known_window_without_output_cap_compacts_at_228_percent() {
+        let eng = engine(full_policy()).with_summarizer(Arc::new(OkSummarizer("task summary")));
+        let limits = kernel::ModelLimits {
+            max_combined_tokens: Some(8_000),
+            ..Default::default()
+        };
+        let input = limits.input_allowance(None).map(|n| n as u32);
+        eng.update_preflight(&InputTokenCount {
+            tokens: 18_240,
+            quality: TokenCountQuality::Authoritative,
+            request_fingerprint: "overfull".into(),
+        });
+        let result = eng.compile(&full_compaction_history(), input).await;
+        assert!(result.compacted);
+        assert_eq!(eng.pressure().unwrap().percent(), Some(228));
+        eng.clear_preflight();
+        let next = eng.compile(&result.messages, input).await;
+        assert!(!next.overflow);
+        assert!(eng.pressure().unwrap().percent().unwrap() < 100);
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_reuse_usage_from_the_uncompacted_request() {
+        let eng = engine(full_policy()).with_summarizer(Arc::new(OkSummarizer("task summary")));
+        eng.update_usage(18_240, 19_000);
+        let result = eng.compile(&full_compaction_history(), Some(8_000)).await;
+        assert!(result.compacted);
+        let next = eng.compile(&result.messages, Some(8_000)).await;
+        assert!(!next.compacted && !next.overflow);
+    }
+
+    #[tokio::test]
+    async fn switching_deployment_resets_usage_but_still_checks_new_history() {
+        let eng = engine(full_policy());
+        eng.begin_request("deployment-a");
+        eng.update_usage(100_000, 101_000);
+        eng.begin_request("deployment-b");
+        let result = eng.compile(&[user("small new request")], Some(8_000)).await;
+        assert!(!result.overflow && !result.compacted);
+        let result = eng.compile(&full_compaction_history(), Some(900)).await;
+        assert!(result.compacted || result.overflow);
     }
 
     #[tokio::test]

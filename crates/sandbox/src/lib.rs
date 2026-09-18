@@ -1610,29 +1610,57 @@ fn add_request_grant(
 pub struct ExecInvocation<'a> {
     sandbox: &'a WorkspaceSandbox,
     request: ExecRequest,
+    working_dir: Option<PathBuf>,
     prompted: Vec<(PathBuf, permissions::PermissionType)>,
 }
 
 impl<'a> ExecInvocation<'a> {
-    fn new(sandbox: &'a WorkspaceSandbox, request: ExecRequest) -> Self {
+    fn new(sandbox: &'a WorkspaceSandbox, mut request: ExecRequest) -> Self {
+        let access = kernel::execution_access();
+        request.read_roots.extend(access.read_paths);
+        request.write_roots.extend(access.write_paths);
         Self {
             sandbox,
             request,
+            working_dir: None,
             prompted: Vec::new(),
         }
     }
 
     pub fn spawn_background(&self) -> Result<crate::exec::BgProc, ExecError> {
         let watch_network = self.sandbox.exec.denies_network(&self.request);
-        let cmd = self.sandbox.exec.build_command(&self.request)?;
+        let mut cmd = self.sandbox.exec.build_command(&self.request)?;
+        if let Some(dir) = &self.working_dir {
+            // Build the profile against the original workspace, then set only
+            // the child's working directory. A read grant must not imply writes.
+            cmd.current_dir(dir);
+        }
         crate::exec::spawn_background(cmd, watch_network)
+    }
+
+    pub fn with_working_dir(mut self, dir: PathBuf) -> Self {
+        self.working_dir = Some(dir);
+        self
+    }
+
+    /// Permission evidence only; arbitrary shell commands must not be replayed.
+    pub fn denied_paths(&self, output: &ExecOutput) -> Vec<PathBuf> {
+        if self.sandbox.exec.label() != "native" {
+            return Vec::new();
+        }
+        exec::escalation_candidates(
+            output,
+            &self.sandbox.root,
+            &self.sandbox.permission_manager.approved_roots(),
+            permissions::PermissionType::Write,
+        )
     }
 
     /// Ask for the minimum missing path capability supported by a native-jail
     /// denial. Host/container failures cannot be repaired by local path grants.
     pub async fn approve_retry(&mut self, output: &ExecOutput) -> bool {
-        if output.status == Some(0)
-            || self.sandbox.exec.label() != "native"
+        // Pipelines and trailing commands can mask the failing exit code.
+        if self.sandbox.exec.label() != "native"
             || self.prompted.len() >= MAX_EXEC_ESCALATION_PROMPTS
         {
             return false;
@@ -1894,6 +1922,86 @@ impl WorkspaceSandbox {
             read_roots: Vec::new(),
             write_roots: Vec::new(),
         })
+    }
+
+    /// Resolve explicit shell capabilities before displaying the approval card.
+    pub fn missing_execution_access(
+        &self,
+        requested: &kernel::ExecutionAccess,
+    ) -> Result<kernel::ExecutionAccess, String> {
+        let mut missing = kernel::ExecutionAccess {
+            network: requested.network && self.denies_network(),
+            ..Default::default()
+        };
+        let approved = self.permission_manager.approved_roots();
+        let once = kernel::execution_access();
+        for (paths, write) in [
+            (&requested.write_paths, true),
+            (&requested.read_paths, false),
+        ] {
+            for path in paths {
+                let resolved = exec::resolve_native_policy_path(path)
+                    .filter(|path| path.is_dir())
+                    .ok_or_else(|| {
+                        format!(
+                            "expected an existing absolute directory: {}",
+                            path.display()
+                        )
+                    })?;
+                if matches!(self.exec.label(), "host") {
+                    continue;
+                }
+                if self.exec.label() != "native" {
+                    return Err(
+                        "explicit directory access is supported by native and host execution only"
+                            .into(),
+                    );
+                }
+                let permitted = resolved.starts_with(&self.root)
+                    || approved.is_allowed(&resolved, permissions::PermissionType::Write)
+                    || once
+                        .write_paths
+                        .iter()
+                        .any(|root| resolved.starts_with(root))
+                    || (!write
+                        && (approved.is_allowed(&resolved, permissions::PermissionType::Read)
+                            || once
+                                .read_paths
+                                .iter()
+                                .any(|root| resolved.starts_with(root))));
+                if permitted {
+                    continue;
+                }
+                if !exec::path_grant_is_safe(&resolved) {
+                    return Err(format!(
+                        "{} overlaps protected credential/state paths",
+                        resolved.display()
+                    ));
+                }
+                if write {
+                    missing.write_paths.push(resolved);
+                } else {
+                    missing.read_paths.push(resolved);
+                }
+            }
+        }
+        for paths in [&mut missing.read_paths, &mut missing.write_paths] {
+            paths.sort();
+            paths.dedup();
+            let roots = paths.clone();
+            paths.retain(|path| {
+                !roots
+                    .iter()
+                    .any(|root| root != path && path.starts_with(root))
+            });
+        }
+        missing.read_paths.retain(|path| {
+            !requested
+                .write_paths
+                .iter()
+                .any(|root| path.starts_with(root))
+        });
+        Ok(missing)
     }
 
     /// Prompt-free read access to harness-owned directories outside the workspace,

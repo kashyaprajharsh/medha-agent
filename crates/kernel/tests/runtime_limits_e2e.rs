@@ -30,7 +30,7 @@ impl LimitProvider {
     fn new(turns: Vec<Turn>) -> Self {
         Self {
             caps: ProviderCaps {
-                vision: false,
+                images: kernel::ImageSupport::Unsupported,
                 caching: false,
                 max_ctx: Some(32_000),
                 tool_calls: ToolCallStrategy::Native,

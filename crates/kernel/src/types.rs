@@ -109,6 +109,9 @@ pub enum Role {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// User attachments. Bytes live in the artifact store, not the event log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MediaPart>,
     pub role: Role,
     pub content: String,
     /// Assistant messages: the tool calls the model requested this turn.
@@ -129,6 +132,7 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            attachments: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
             trust: None,
@@ -149,6 +153,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            attachments: Vec::new(),
             tool_calls,
             tool_call_id: None,
             trust: None,
@@ -158,6 +163,7 @@ impl Message {
         Self {
             role: Role::Tool,
             content: content.into(),
+            attachments: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             trust: None,
@@ -225,11 +231,14 @@ pub struct ReasoningPart {
 pub enum MediaSource {
     Url(String),
     Base64(String),
+    /// Content hash in the session artifact store; resolved only for transmission.
+    Artifact(String),
 }
 
 impl std::fmt::Debug for MediaSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Artifact(hash) => formatter.debug_tuple("Artifact").field(hash).finish(),
             Self::Url(url) => formatter.debug_tuple("Url").field(url).finish(),
             Self::Base64(_) => formatter
                 .debug_tuple("Base64")
@@ -243,6 +252,11 @@ impl std::fmt::Debug for MediaSource {
 pub struct MediaPart {
     pub mime_type: String,
     pub source: MediaSource,
+    /// What the surface calls this image, usually its file name. Carried so a
+    /// message with several images can be numbered the same way on screen and
+    /// in the request — "the second screenshot" then means one thing to both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_state: Vec<ProviderState>,
 }
@@ -326,6 +340,28 @@ impl From<&Message> for ModelMessage {
                 }));
             }
         }
+        // Every image is announced. Without this the model receives a bare
+        // image beside text that may name a file, cannot tell that the two are
+        // the same thing, and goes looking for the path — which for a dropped
+        // screenshot has usually already been deleted. Several images are also
+        // numbered, so "the second screenshot" means one thing to both sides.
+        let numbered = message.attachments.len() > 1;
+        for (index, media) in message.attachments.iter().enumerate() {
+            let position = if numbered {
+                format!(" {}", index + 1)
+            } else {
+                String::new()
+            };
+            let caption = match &media.label {
+                Some(label) => format!("[attached image{position}: {label}]"),
+                None => format!("[attached image{position}]"),
+            };
+            parts.push(ContentPart::Text(TextPart {
+                text: caption,
+                provider_state: Vec::new(),
+            }));
+            parts.push(ContentPart::Media(media.clone()));
+        }
         Self {
             role: message.role.clone(),
             parts,
@@ -376,6 +412,7 @@ impl TryFrom<&ModelMessage> for Message {
         Ok(Message {
             role: message.role.clone(),
             content,
+            attachments: Vec::new(),
             tool_calls,
             tool_call_id,
             trust: message.trust,
@@ -626,6 +663,87 @@ pub fn canonical_tool_names(
 }
 
 #[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    fn image(label: &str) -> MediaPart {
+        MediaPart {
+            mime_type: "image/png".into(),
+            source: MediaSource::Artifact(label.into()),
+            label: Some(label.into()),
+            provider_state: Vec::new(),
+        }
+    }
+
+    fn texts(message: &ModelMessage) -> Vec<&str> {
+        message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn several_images_are_numbered_so_the_model_can_be_told_which_is_which() {
+        let mut message = Message::user("compare image 1 with image 2");
+        message.attachments = vec![image("before.png"), image("after.png")];
+
+        let ordered = message.ordered();
+
+        assert_eq!(
+            texts(&ordered),
+            [
+                "compare image 1 with image 2",
+                "[attached image 1: before.png]",
+                "[attached image 2: after.png]"
+            ]
+        );
+        assert!(matches!(ordered.parts[2], ContentPart::Media(_)));
+        assert!(matches!(ordered.parts[4], ContentPart::Media(_)));
+    }
+
+    /// The model must be able to tell that the path in the text and the image
+    /// beside it are the same thing, or it goes looking for a file that a
+    /// dropped screenshot no longer has.
+    #[test]
+    fn a_lone_image_is_still_announced() {
+        let mut message = Message::user("'/tmp/shot.png' what is wrong here?");
+        message.attachments = vec![image("shot.png")];
+
+        let ordered = message.ordered();
+
+        assert_eq!(
+            texts(&ordered),
+            [
+                "'/tmp/shot.png' what is wrong here?",
+                "[attached image: shot.png]"
+            ]
+        );
+        assert_eq!(ordered.parts.len(), 3);
+    }
+
+    #[test]
+    fn an_unlabelled_image_is_still_numbered() {
+        let mut message = Message::user("two views");
+        let mut plain = image("a.png");
+        plain.label = None;
+        message.attachments = vec![plain, image("b.png")];
+
+        assert_eq!(
+            texts(&message.ordered()),
+            [
+                "two views",
+                "[attached image 1]",
+                "[attached image 2: b.png]"
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod tool_name_tests {
     use super::*;
 
@@ -750,6 +868,11 @@ pub struct Observation {
     pub intent_id: String,
     pub status: ObsStatus,
     pub payload: serde_json::Value,
+    /// Images the tool produced, as artifact references. Pixels never enter the
+    /// payload: it is logged, summarized and shown, and none of those want a
+    /// megabyte of base64 in them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<MediaPart>,
     /// Provenance for relayed content; the kernel applies the weaker trust label.
     pub relayed_trust: Option<TrustLabel>,
     /// The command failed because the sandbox denied network; the kernel may
@@ -764,6 +887,7 @@ impl Observation {
             intent_id: intent_id.into(),
             status: ObsStatus::Ok,
             payload,
+            media: Vec::new(),
             relayed_trust: None,
             net_denied: false,
         }
@@ -773,6 +897,7 @@ impl Observation {
             intent_id: intent_id.into(),
             status: ObsStatus::Denied,
             payload: serde_json::json!({ "reason": reason.into() }),
+            media: Vec::new(),
             relayed_trust: None,
             net_denied: false,
         }
@@ -782,6 +907,7 @@ impl Observation {
             intent_id: intent_id.into(),
             status: ObsStatus::Error,
             payload: serde_json::json!({ "error": message.into() }),
+            media: Vec::new(),
             relayed_trust: None,
             net_denied: false,
         }

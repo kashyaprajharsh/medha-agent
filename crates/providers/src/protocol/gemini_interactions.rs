@@ -202,7 +202,7 @@ fn lower_messages(
                         ContentPart::Media(part) => {
                             reject_gemini_state(&part.provider_state, "media")?;
                             return Err(ProviderError::Decode(
-                                "Gemini media lowering is deferred to Stage 7".into(),
+                                "gemini-interactions accepts images only in user messages, not in model output".into(),
                             ));
                         }
                     }
@@ -232,7 +232,7 @@ fn lower_messages(
                         ContentPart::Media(part) => {
                             reject_gemini_state(&part.provider_state, "media")?;
                             return Err(ProviderError::Decode(
-                                "Gemini media lowering is deferred to Stage 7".into(),
+                                "gemini-interactions cannot return an image in a function result yet".into(),
                             ));
                         }
                         ContentPart::Text(part) => {
@@ -267,9 +267,12 @@ fn content_values(parts: &[ContentPart], role: &str) -> Result<Vec<Value>, Provi
             ContentPart::Reasoning(part) => reject_gemini_state(&part.provider_state, role)?,
             ContentPart::Media(part) => {
                 reject_gemini_state(&part.provider_state, "media")?;
-                return Err(ProviderError::Decode(
-                    "Gemini media lowering is deferred to Stage 7".into(),
-                ));
+                if role != "user" {
+                    return Err(ProviderError::Decode(format!(
+                        "gemini-interactions accepts images only in user messages, not in a {role} message"
+                    )));
+                }
+                content.push(media_value(part)?);
             }
             ContentPart::ToolCall(part) => {
                 reject_gemini_state(&part.provider_state, role)?;
@@ -286,6 +289,36 @@ fn content_values(parts: &[ContentPart], role: &str) -> Result<Vec<Value>, Provi
         }
     }
     Ok(content)
+}
+
+/// Inline bytes travel as `data`; an uploaded file is referenced by `uri`.
+/// Interactions v1 names the part `image` and carries the media type beside it.
+fn media_value(media: &kernel::MediaPart) -> Result<Value, ProviderError> {
+    if !matches!(
+        media.mime_type.as_str(),
+        "image/png" | "image/jpeg" | "image/webp" | "image/heic" | "image/heif"
+    ) {
+        return Err(ProviderError::Decode(format!(
+            "gemini-interactions images must be PNG, JPEG, WebP, HEIC, or HEIF, not {}",
+            media.mime_type
+        )));
+    }
+    match &media.source {
+        kernel::MediaSource::Base64(data) if !data.is_empty() => Ok(json!({
+            "type": "image",
+            "mime_type": media.mime_type,
+            "data": data,
+        })),
+        kernel::MediaSource::Url(uri) if !uri.is_empty() => Ok(json!({
+            "type": "image",
+            "mime_type": media.mime_type,
+            "uri": uri,
+        })),
+        kernel::MediaSource::Artifact(_) => Err(ProviderError::Decode(
+            "image artifact must be resolved before provider encoding".into(),
+        )),
+        _ => Err(ProviderError::Decode("invalid image source".into())),
+    }
 }
 
 fn text_parts(parts: &[ContentPart], role: &str) -> Result<String, ProviderError> {
@@ -848,6 +881,88 @@ mod tests {
             category: ToolCategory::Read,
             icon: "t".into(),
         }
+    }
+
+    fn user_with_image(mime: &str, source: kernel::MediaSource) -> CompiledContext {
+        CompiledContext {
+            model: String::new(),
+            messages: Vec::new(),
+            ordered: Some(vec![ModelMessage {
+                role: Role::User,
+                parts: vec![
+                    ContentPart::Text(TextPart {
+                        text: "what is this?".into(),
+                        provider_state: Vec::new(),
+                    }),
+                    ContentPart::Media(kernel::MediaPart {
+                        mime_type: mime.into(),
+                        source,
+                        label: None,
+                        provider_state: Vec::new(),
+                    }),
+                ],
+                trust: None,
+            }]),
+            tools: Vec::new(),
+        }
+    }
+
+    fn gemini_body(context: &CompiledContext) -> Result<Value, ProviderError> {
+        prepare_body(
+            context,
+            "gemini-model",
+            false,
+            &ReasoningConfig::default(),
+            None,
+        )
+        .map(|(body, _)| body)
+    }
+
+    #[test]
+    fn a_user_image_lowers_to_an_inline_interactions_image_part() {
+        let context = user_with_image("image/png", kernel::MediaSource::Base64("QUJD".into()));
+        let body = gemini_body(&context).unwrap();
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([
+                {"type": "text", "text": "what is this?"},
+                {"type": "image", "mime_type": "image/png", "data": "QUJD"},
+            ])
+        );
+    }
+
+    #[test]
+    fn an_uploaded_image_is_referenced_by_uri_instead_of_bytes() {
+        let context = user_with_image(
+            "image/jpeg",
+            kernel::MediaSource::Url("https://generativelanguage.googleapis.com/v1/files/x".into()),
+        );
+        let body = gemini_body(&context).unwrap();
+        assert_eq!(
+            body["input"][0]["content"][1],
+            json!({
+                "type": "image",
+                "mime_type": "image/jpeg",
+                "uri": "https://generativelanguage.googleapis.com/v1/files/x",
+            })
+        );
+    }
+
+    #[test]
+    fn unresolved_and_unsupported_images_are_refused_with_the_reason() {
+        let unresolved = user_with_image("image/png", kernel::MediaSource::Artifact("h".into()));
+        assert!(
+            gemini_body(&unresolved)
+                .unwrap_err()
+                .to_string()
+                .contains("must be resolved")
+        );
+        let gif = user_with_image("image/gif", kernel::MediaSource::Base64("QUJD".into()));
+        let error = gemini_body(&gif).unwrap_err().to_string();
+        assert!(
+            error.contains("image/gif") && error.contains("PNG, JPEG, WebP"),
+            "{error}"
+        );
     }
 
     #[test]

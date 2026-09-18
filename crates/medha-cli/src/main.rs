@@ -3,9 +3,11 @@
 
 mod acp;
 mod agents;
+mod attachments;
 mod config;
 mod skill_judge;
 mod tui_tea;
+mod vision;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -131,6 +133,10 @@ struct Cli {
     /// List past sessions in this workspace and exit.
     #[arg(long)]
     sessions: bool,
+
+    /// Attach a local PNG, JPEG, WebP, or GIF (repeat for multiple images).
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["acp", "setup", "sessions"])]
+    attach: Vec<std::path::PathBuf>,
 
     /// The task / prompt
     #[arg(trailing_var_arg = true)]
@@ -847,9 +853,13 @@ async fn main() -> Result<()> {
     // Headless callers fail instead of hanging on first-run setup.
     let cfg = config::load()?;
     let is_tty_early = std::io::stdin().is_terminal();
-    let tui_possible =
-        !cli.acp && !cli.plain && cli.prompt.join(" ").trim().is_empty() && is_tty_early;
-    let resolved = match config::resolve(cfg.as_ref(), cli.base_url.clone(), cli.model.clone())? {
+    let tui_possible = !cli.acp
+        && !cli.plain
+        && cli.attach.is_empty()
+        && cli.prompt.join(" ").trim().is_empty()
+        && is_tty_early;
+    let mut resolved = match config::resolve(cfg.as_ref(), cli.base_url.clone(), cli.model.clone())?
+    {
         Some(r) => r,
         None if tui_possible || cli.setup => config::Resolved {
             name: String::new(),
@@ -870,7 +880,75 @@ async fn main() -> Result<()> {
     };
     let open_setup = cli.setup || resolved.provider.base_url.is_empty();
 
-    let prompt = cli.prompt.join(" ");
+    // Resolve exact model capability metadata before constructing the provider.
+    // A saved profile override wins over models.dev; unknown remains visible so
+    // a future media pipeline can choose a safe fallback instead of guessing.
+    if !open_setup {
+        let capability_resolution = providers::models_dev::resolve_capabilities(
+            &resolved.provider.model,
+            resolved.provider.capabilities.as_ref(),
+        )
+        .await;
+        if resolved.provider.capabilities.is_none() {
+            resolved.provider.capabilities = capability_resolution.capabilities;
+        }
+        let capability_summary = resolved
+            .provider
+            .capabilities
+            .as_ref()
+            .map(|capabilities| {
+                format!(
+                    "image input {}, image output {}, attachments {}, tool calls {}, reasoning {}",
+                    capabilities.input_state("image").as_str(),
+                    capabilities.output_state("image").as_str(),
+                    capabilities.attachment_state().as_str(),
+                    capabilities.tool_call_state().as_str(),
+                    capabilities.reasoning_state().as_str(),
+                )
+            })
+            .unwrap_or_else(|| "capabilities unknown".to_string());
+        eprintln!(
+            "model capabilities: {capability_summary} ({})",
+            capability_resolution.source.as_str()
+        );
+        eprintln!(
+            "Medha image input: {}",
+            if resolved.provider.protocol.carries_images() {
+                "images available (requires a vision-capable model and endpoint)"
+            } else {
+                "not implemented for this protocol"
+            }
+        );
+    }
+
+    if !cli.attach.is_empty() {
+        anyhow::ensure!(
+            resolved.provider.protocol.carries_images(),
+            "the {} protocol cannot carry images yet",
+            resolved.provider.protocol.as_str()
+        );
+        let state = resolved
+            .provider
+            .capabilities
+            .as_ref()
+            .map_or(providers::CapabilityState::Unknown, |caps| {
+                caps.input_state("image")
+            });
+        anyhow::ensure!(
+            state != providers::CapabilityState::Unsupported,
+            "selected model declares image input unsupported; select a vision-capable profile"
+        );
+        if state == providers::CapabilityState::Unknown {
+            eprintln!(
+                "image support is unknown for this custom route; attempting native image input on the configured endpoint"
+            );
+        }
+    }
+    let prompt = if cli.prompt.is_empty() && !cli.attach.is_empty() {
+        "Describe the attached image(s).".to_string()
+    } else {
+        cli.prompt.join(" ")
+    };
     let use_plain_repl = cli.plain;
 
     let model_name = resolved.provider.model.clone();
@@ -909,6 +987,15 @@ async fn main() -> Result<()> {
         _ if model_name.is_empty() => {} // nothing configured yet — stay quiet
         Some(n) => {
             eprintln!("context window: {n} tokens ({ctx_source}) — compaction enabled");
+            match resolved.provider.max_output_tokens {
+                Some(output) => eprintln!(
+                    "  output reservation: {output} tokens; input ceiling: {} tokens",
+                    u64::from(n).saturating_sub(output)
+                ),
+                None => eprintln!(
+                    "  output allowance: server default (unknown); context ceiling is enforced with proactive compaction"
+                ),
+            }
             if ctx_source == "models.dev" {
                 eprintln!(
                     "  note: that's {model_name}'s spec maximum from models.dev — your deployment \
@@ -999,6 +1086,63 @@ async fn main() -> Result<()> {
         .context("event log integrity check failed; refusing to start")?;
 
     let artifacts = Arc::new(store::FileArtifactStore::open(state.join("artifacts"))?);
+
+    // A model with no image input is not a dead end when an auxiliary vision
+    // profile is configured: the kernel has it describe the image instead.
+    let configured_vision = {
+        let configured = model_profiles.lock().unwrap().clone();
+        configured
+            .auxiliary
+            .vision
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| (name, configured))
+    };
+    let auxiliary_vision = configured_vision.and_then(|(name, configured)| {
+        match vision::connect(&configured, &name) {
+            Ok(provider) => {
+                eprintln!("auxiliary vision: '{name}' reads images this model cannot");
+                Some(Arc::new(vision::AuxiliaryVision::new(provider)))
+            }
+            Err(error) => {
+                eprintln!("auxiliary vision profile '{name}' unavailable: {error:#}");
+                None
+            }
+        }
+    });
+
+    // `--attach` is explicit; a path written into the prompt attaches too, so
+    // `medha "explain ./shot.png"` behaves the way it reads.
+    let mut attach_paths = cli.attach.clone();
+    let scanned = attachments::refs::scan(&prompt, &cwd);
+    for path in &scanned {
+        if !attach_paths.contains(path) {
+            attach_paths.push(path.clone());
+        }
+    }
+    // An unreachable path carries no meaning once its image is attached.
+    let prompt = match attachments::refs::strip_unreachable(&prompt, &scanned, &cwd) {
+        stripped if stripped.trim().is_empty() && !attach_paths.is_empty() => {
+            attachments::IMAGE_ONLY_PROMPT.to_string()
+        }
+        stripped => stripped,
+    };
+    let attached_images: Vec<_> = attachments::ingest(attach_paths, artifacts.clone())
+        .await?
+        .into_iter()
+        .inspect(|image| {
+            eprintln!(
+                "attached {}{}",
+                image.summary(),
+                image
+                    .note
+                    .as_deref()
+                    .map(|note| format!(" ({note})"))
+                    .unwrap_or_default()
+            )
+        })
+        .map(|image| image.part)
+        .collect();
 
     // The active surface supplies the human gate; non-interactive runs deny.
     let has_task = !cli.setup && !prompt.trim().is_empty();
@@ -1480,6 +1624,9 @@ async fn main() -> Result<()> {
     )
     .with_pricing(pricing)
     .with_max_parallel_tools(max_parallel_tools);
+    if let Some(auxiliary) = auxiliary_vision {
+        kernel = kernel.with_vision(auxiliary);
+    }
     if let Some(progressive_context) = progressive_context {
         kernel = kernel.with_progressive_context(progressive_context);
     }
@@ -1742,7 +1889,9 @@ async fn main() -> Result<()> {
             );
         }
     }
-    messages.push(Message::user(prompt));
+    let mut input = Message::user(prompt);
+    input.attachments = attached_images;
+    messages.push(input);
     let sink = PrintSink::plain();
     let run = kernel
         .run_session(
@@ -2364,15 +2513,15 @@ impl kernel::HumanGate for TerminalGate {
 
 /// Compact streaming output for the plain and headless surfaces.
 struct PrintSink {
-    /// Last provider-reported prompt size for the REPL pressure meter.
-    usage: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// Compiler budget for the REPL pressure meter.
+    usage: Option<Arc<std::sync::Mutex<Option<kernel::ContextPressure>>>>,
 }
 
 impl PrintSink {
     fn plain() -> Self {
         Self { usage: None }
     }
-    fn tracking(cell: Arc<std::sync::atomic::AtomicU32>) -> Self {
+    fn tracking(cell: Arc<std::sync::Mutex<Option<kernel::ContextPressure>>>) -> Self {
         Self { usage: Some(cell) }
     }
 }
@@ -2382,6 +2531,9 @@ impl kernel::StreamSink for PrintSink {
         false
     }
 
+    fn notice(&self, text: &str) {
+        eprintln!("· {text}");
+    }
     fn text(&self, delta: &str) {
         print!("{delta}");
         let _ = std::io::stdout().flush();
@@ -2420,9 +2572,9 @@ impl kernel::StreamSink for PrintSink {
         let how = if summarized { "summarized" } else { "pruned" };
         println!("\n↯ {how} context {before}→{after} tokens");
     }
-    fn usage(&self, prompt_tokens: u32, _total_tokens: u32) {
+    fn context_pressure(&self, pressure: kernel::ContextPressure) {
         if let Some(c) = &self.usage {
-            c.store(prompt_tokens, std::sync::atomic::Ordering::Relaxed);
+            *c.lock().unwrap() = Some(pressure);
         }
     }
     fn verify(&self, ok: bool, summary: &str) {
@@ -2622,11 +2774,10 @@ where
     let mut rl = DefaultEditor::new()?;
     let mut transcript = session_transcript(system, resumed);
 
-    let usage = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let usage = Arc::new(std::sync::Mutex::new(None));
 
     loop {
-        let actual = usage.load(std::sync::atomic::Ordering::Relaxed);
-        let prompt_str = pressure_prompt(actual, max_ctx);
+        let prompt_str = pressure_prompt(*usage.lock().unwrap());
         match rl.readline(&prompt_str) {
             Ok(line) => {
                 let line = line.trim().to_string();
@@ -2684,13 +2835,10 @@ where
                         "help" => print_help(),
                         "clear" => {
                             transcript.truncate(1); // keep the system message
+                            *usage.lock().unwrap() = None;
                             println!("(conversation cleared)");
                         }
-                        "status" => print_status(
-                            model,
-                            max_ctx,
-                            usage.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
+                        "status" => print_status(model, max_ctx, *usage.lock().unwrap()),
                         other => println!("unknown command: /{other}   (try /help)"),
                     }
                     continue;
@@ -2850,36 +2998,34 @@ pub(crate) fn apply_effort_command<P: kernel::Provider>(provider: &P, args: &str
     }
 }
 
-/// Add provider-reported context pressure to the prompt when available.
-fn pressure_prompt(actual_tokens: u32, max_ctx: Option<u32>) -> String {
-    match max_ctx {
-        Some(mc) if actual_tokens > 0 => {
-            let usable = context::ContextBudget::from_max_ctx(mc).usable().max(1);
-            let pct = (actual_tokens as f32 / usable as f32 * 100.0).round() as u32;
-            format!("medha [{pct}% ctx]› ")
-        }
-        _ => "medha› ".to_string(),
+/// Render the compiler's current pressure without inventing a second budget.
+fn pressure_prompt(pressure: Option<kernel::ContextPressure>) -> String {
+    match pressure.and_then(|p| p.percent().map(|pct| (p, pct))) {
+        Some((p, pct)) => format!(
+            "medha [{}{pct}% ctx]› ",
+            if p.quality == kernel::TokenCountQuality::Authoritative {
+                ""
+            } else {
+                "~"
+            }
+        ),
+        None => "medha› ".to_string(),
     }
 }
 
-fn print_status(model: &str, max_ctx: Option<u32>, actual_tokens: u32) {
+fn print_status(model: &str, max_ctx: Option<u32>, pressure: Option<kernel::ContextPressure>) {
     println!("model: {model}");
-    match max_ctx {
-        Some(mc) => {
-            let usable = context::ContextBudget::from_max_ctx(mc).usable().max(1);
-            let trigger = context::CompactionPolicy::default().trigger_ratio;
-            let pct = (actual_tokens as f32 / usable as f32 * 100.0).round() as u32;
-            let used = if actual_tokens > 0 {
-                format!("{actual_tokens} tokens used ({pct}%, real)")
-            } else {
-                "no usage reported yet".to_string()
-            };
-            println!(
-                "context: {mc} window, {usable} usable — {used}; compacts at {}%",
-                (trigger * 100.0) as u32
-            );
-        }
-        None => println!("context: window unknown — compaction off (set MEDHA_MAX_CTX)"),
+    match pressure {
+        Some(p) => println!(
+            "context: {} input tokens ({:?}); input ceiling {:?}, usable {:?}",
+            p.input_tokens, p.quality, p.input_limit, p.usable_input_tokens
+        ),
+        None => match max_ctx {
+            Some(mc) => println!("context: {mc} configured window; no request measured yet"),
+            None => println!(
+                "context: window unknown; proactive compaction unavailable (set MEDHA_MAX_CTX)"
+            ),
+        },
     }
 }
 

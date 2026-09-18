@@ -27,7 +27,7 @@ impl RecordingProvider {
     fn new(turns: Vec<Result<Vec<Block>, ProviderError>>) -> Self {
         Self {
             caps: ProviderCaps {
-                vision: false,
+                images: kernel::ImageSupport::Unsupported,
                 caching: false,
                 max_ctx: Some(32_000),
                 tool_calls: ToolCallStrategy::Native,
@@ -196,6 +196,7 @@ impl ContextEngine for Passthrough {
 struct ForcedCompactor {
     force: AtomicBool,
     limits: Mutex<Vec<Option<u32>>>,
+    still_overflow: bool,
 }
 
 impl ForcedCompactor {
@@ -203,6 +204,7 @@ impl ForcedCompactor {
         Self {
             force: AtomicBool::new(false),
             limits: Mutex::new(Vec::new()),
+            still_overflow: false,
         }
     }
 }
@@ -223,7 +225,7 @@ impl ContextEngine for ForcedCompactor {
                 summarized: true,
                 before_tokens: 100,
                 after_tokens: 50,
-                overflow: false,
+                overflow: self.still_overflow,
                 summary: Some("older context compacted".into()),
             };
         }
@@ -949,10 +951,51 @@ async fn output_cap_error_retries_with_a_lower_cap_without_compacting_history() 
 }
 
 #[tokio::test]
+async fn unknown_limit_recovery_that_still_overflows_keeps_checkpoint_without_resending() {
+    let mut provider = RecordingProvider::new(vec![Err(ProviderError::Response(
+        "context_length_exceeded".into(),
+    ))]);
+    provider.caps.max_ctx = None;
+    let provider = Arc::new(provider);
+    let mut context = ForcedCompactor::new();
+    context.still_overflow = true;
+    let kernel = kernel_with_context(provider.clone(), Arc::new(context));
+    let session = Session::new();
+    let (retained, stop) = kernel
+        .run_session(
+            &session,
+            vec![Message::system("system"), Message::user("go")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stop,
+        StopReason::Budget(kernel::BudgetStop::ContextOverflow)
+    );
+    assert_eq!(
+        provider.sent.lock().unwrap().len(),
+        1,
+        "failed recovery must not send again"
+    );
+    let events = kernel.log.events(session.id).await;
+    let checkpoint = events
+        .iter()
+        .find(|event| event.kind == kernel::EventKind::Compaction)
+        .unwrap();
+    assert_eq!(
+        checkpoint.payload["snapshot"]["messages"],
+        serde_json::to_value(retained).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn in_band_input_overflow_forces_compaction_without_halving_the_known_window() {
     let provider = Arc::new(RecordingProvider::new(vec![
         Err(ProviderError::Response(
-            "input exceeds the context window".into(),
+            "input plus max_tokens exceeds the context window".into(),
         )),
         Ok(vec![Block::Text("finished".into())]),
     ]));

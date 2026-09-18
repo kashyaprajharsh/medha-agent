@@ -172,11 +172,12 @@ impl ProviderClient {
 
     fn with_connection(connection: Connection) -> Self {
         let max_ctx = connection.profile.max_ctx;
+        let images = Self::image_support(&connection.profile);
         Self {
             connection: Mutex::new(connection),
             http: http::client(),
             caps: ProviderCaps {
-                vision: false,
+                images,
                 caching: false,
                 // Unknown until discovered/configured; a fabricated value would
                 // mislead the context compiler.
@@ -187,6 +188,24 @@ impl ProviderClient {
             },
             reasoning: Mutex::new(ReasoningConfig::default()),
             streaming: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// What the profile's resolved metadata says about image input. Missing
+    /// metadata stays `Unknown` so a custom endpoint is attempted rather than
+    /// diverted to a described substitute it never needed.
+    fn image_support(profile: &ProviderProfile) -> kernel::ImageSupport {
+        if !profile.protocol.carries_images() {
+            return kernel::ImageSupport::Unsupported;
+        }
+        match profile
+            .capabilities
+            .as_ref()
+            .map(|capabilities| capabilities.input_state("image"))
+        {
+            Some(crate::CapabilityState::Supported) => kernel::ImageSupport::Supported,
+            Some(crate::CapabilityState::Unsupported) => kernel::ImageSupport::Unsupported,
+            _ => kernel::ImageSupport::Unknown,
         }
     }
 
@@ -419,7 +438,10 @@ impl ProviderClient {
         let byte_stream = resp.bytes_stream();
         let stream = async_stream::stream! {
             let mut sse = crate::transport::sse::SseDecoder::default();
-            let mut decoder = gemini_interactions::ResponseDecoder::new(names);
+            let mut decoder = gemini_interactions::ResponseDecoder::new(names.clone());
+            // Dropped as soon as anything decodes; see the chat path for why
+            // this is a buffer rather than a content-type check.
+            let mut unread = Some(Vec::new());
 
             futures::pin_mut!(byte_stream);
             loop {
@@ -439,6 +461,13 @@ impl ProviderClient {
                         return;
                     }
                     Ok(bytes) => {
+                        if let Some(buffer) = unread.as_mut() {
+                            if buffer.len() + bytes.len() <= http::MAX_RESPONSE_BODY_BYTES {
+                                buffer.extend_from_slice(&bytes);
+                            } else {
+                                unread = None;
+                            }
+                        }
                         let events = match sse.push(&bytes) {
                             Ok(events) => events,
                             Err(error) => { yield Err(error); return; }
@@ -447,6 +476,7 @@ impl ProviderClient {
                             match decoder.push(&event) {
                                 Ok(blocks) => {
                                     for block in blocks {
+                                        unread = None;
                                         yield Ok(block);
                                     }
                                 }
@@ -464,6 +494,7 @@ impl ProviderClient {
                 match decoder.push(&event) {
                     Ok(blocks) => {
                         for block in blocks {
+                            unread = None;
                             yield Ok(block);
                         }
                     }
@@ -476,6 +507,17 @@ impl ProviderClient {
 
             if let Err(error) = decoder.finish() {
                 yield Err(error);
+                return;
+            }
+
+            // Nothing decoded as a stream: read it as the single interaction
+            // body an endpoint that ignored `stream` would have sent.
+            if let Some(buffer) = unread.filter(|buffer| !buffer.is_empty()) {
+                let body = String::from_utf8_lossy(&buffer).into_owned();
+                match gemini_interactions::parse_interaction(&body, &names) {
+                    Ok(blocks) => for block in blocks { yield Ok(block); },
+                    Err(error) => yield Err(error),
+                }
             }
         };
         Ok(stream.boxed())
@@ -803,6 +845,20 @@ impl Provider for ProviderClient {
         self.connection.lock().unwrap().profile.max_ctx
     }
 
+    fn image_support(&self) -> kernel::ImageSupport {
+        Self::image_support(&self.connection.lock().unwrap().profile)
+    }
+
+    fn context_identity(&self) -> String {
+        let connection = self.connection.lock().unwrap();
+        format!(
+            "{}:{}:{}",
+            connection.profile.protocol.as_str(),
+            connection.profile.base_url,
+            connection.profile.model
+        )
+    }
+
     fn protocol(&self) -> Protocol {
         self.connection.lock().unwrap().profile.protocol
     }
@@ -869,6 +925,25 @@ impl Provider for ProviderClient {
         } else {
             ctx.model.clone()
         };
+        if ctx.ordered_messages().iter().any(|message| {
+            message
+                .parts
+                .iter()
+                .any(|part| matches!(part, kernel::ContentPart::Media(_)))
+        }) && model == connection.profile.model
+            && connection
+                .profile
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| {
+                    caps.input_state("image") == crate::models_dev::CapabilityState::Unsupported
+                })
+        {
+            return Err(ProviderError::Decode(
+                "selected model declares image input unsupported; select a vision-capable model"
+                    .into(),
+            ));
+        }
         let streaming = self.streaming();
         let body = match connection.profile.protocol {
             Protocol::OpenAiChat => {
@@ -1037,7 +1112,13 @@ impl Provider for ProviderClient {
         let byte_stream = resp.bytes_stream();
         let s = async_stream::stream! {
             let mut sse = crate::transport::sse::SseDecoder::default();
-            let mut decoder = openai_chat::ResponseDecoder::new(names);
+            let mut decoder = openai_chat::ResponseDecoder::new(names.clone());
+            // Held only until the first block is produced. An endpoint that
+            // ignored `stream` and answered with one completion decodes to
+            // nothing as an event stream, and this is what it is read from.
+            // Deciding by content type instead would make every unlabelled
+            // stream wait for its last byte before showing its first word.
+            let mut unread = Some(Vec::new());
 
             futures::pin_mut!(byte_stream);
             loop {
@@ -1067,13 +1148,20 @@ impl Provider for ProviderClient {
                         return;
                     }
                     Ok(bytes) => {
+                        if let Some(buffer) = unread.as_mut() {
+                            if buffer.len() + bytes.len() <= http::MAX_RESPONSE_BODY_BYTES {
+                                buffer.extend_from_slice(&bytes);
+                            } else {
+                                unread = None;
+                            }
+                        }
                         let events = match sse.push(&bytes) {
                             Ok(events) => events,
                             Err(error) => { yield Err(error); return; }
                         };
                         for event in events {
                             match decoder.push(&event) {
-                                Ok(blocks) => for b in blocks { yield Ok(b); },
+                                Ok(blocks) => for b in blocks { unread = None; yield Ok(b); },
                                 Err(e) => { yield Err(e); return; }
                             }
                         }
@@ -1085,13 +1173,26 @@ impl Provider for ProviderClient {
             // final SSE blank line.
             if let Some(event) = sse.finish() {
                 match decoder.push(&event) {
-                    Ok(blocks) => for b in blocks { yield Ok(b); },
+                    Ok(blocks) => for b in blocks { unread = None; yield Ok(b); },
                     Err(e) => { yield Err(e); return; }
                 }
             }
 
-            for block in decoder.finish() {
-                yield Ok(block);
+            let mut spoke = false;
+            match decoder.finish() {
+                Ok(blocks) => for block in blocks { spoke = true; yield Ok(block); },
+                Err(error) => { yield Err(error); return; }
+            }
+
+            // Nothing decoded as a stream. Read the body as the completion it
+            // probably is, so a server that ignores `stream` still answers
+            // rather than ending the turn in silence.
+            if !spoke && let Some(buffer) = unread.filter(|buffer| !buffer.is_empty()) {
+                let body = String::from_utf8_lossy(&buffer).into_owned();
+                match openai_chat::parse_completion(&body, &names) {
+                    Ok(blocks) => for block in blocks { yield Ok(block); },
+                    Err(error) => yield Err(error),
+                }
             }
         };
 
@@ -1323,7 +1424,7 @@ mod sse_tests {
                 r#"{"path":"a"}"#.to_string(),
             ),
         );
-        let intents = finalize_tool_calls(accum, &std::collections::HashMap::new());
+        let intents = finalize_tool_calls(accum, &std::collections::HashMap::new()).unwrap();
         assert_eq!(intents.len(), 1);
         assert_eq!(
             intents[0].id, "call_0",
@@ -1340,7 +1441,7 @@ mod sse_tests {
             0u32,
             ("real-id".to_string(), "fs.read".to_string(), String::new()),
         );
-        let intents = finalize_tool_calls(accum, &std::collections::HashMap::new());
+        let intents = finalize_tool_calls(accum, &std::collections::HashMap::new()).unwrap();
         assert_eq!(intents[0].id, "real-id");
         assert_eq!(
             intents[0].args,
@@ -1619,6 +1720,161 @@ mod count_tokens_tests {
         assert_ne!(without.request_fingerprint, with.request_fingerprint);
     }
 
+    /// Serve `body` with `content_type` to one streaming request and return the
+    /// blocks the provider produced from it.
+    async fn answer_streaming_request(
+        content_type: &'static str,
+        body: &'static str,
+    ) -> Result<Vec<Block>, ProviderError> {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 8192];
+            let _ = socket.read(&mut buffer).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let provider = ProviderClient::new(format!("http://{address}/v1"), "key", "m");
+        assert!(provider.streaming(), "the request must ask for a stream");
+        let context = CompiledContext {
+            model: "m".into(),
+            messages: vec![Message::user("hello")],
+            ordered: None,
+            tools: Vec::new(),
+        };
+        let mut stream = provider.stream(&context).await?;
+        let mut blocks = Vec::new();
+        while let Some(block) = stream.next().await {
+            blocks.push(block?);
+        }
+        Ok(blocks)
+    }
+
+    /// Text arrives in whatever chunks the decoder emits; the reply is their sum.
+    fn spoken(blocks: &[Block]) -> String {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Streaming must not wait for the last byte to show the first word — not
+    /// even when the endpoint mislabels its content type. Deciding how to read
+    /// a response from its header did exactly that, turning every unlabelled
+    /// stream into a full buffer before anything appeared.
+    #[tokio::test]
+    async fn the_first_token_does_not_wait_for_the_last() {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 8192];
+            let _ = socket.read(&mut buffer).await.unwrap();
+            // Deliberately not text/event-stream: plenty of gateways are.
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                      transfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let first = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello there, this is the first chunk.\"},\"finish_reason\":null}]}\n\n";
+            socket
+                .write_all(format!("{:X}\r\n{first}\r\n", first.len()).as_bytes())
+                .await
+                .unwrap();
+            // The rest of the answer arrives much later.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let last = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                        data: [DONE]\n\n";
+            socket
+                .write_all(format!("{:X}\r\n{last}\r\n0\r\n\r\n", last.len()).as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let provider = ProviderClient::new(format!("http://{address}/v1"), "key", "m");
+        let context = CompiledContext {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            ordered: None,
+            tools: Vec::new(),
+        };
+        let mut stream = provider.stream(&context).await.unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("the first token must not wait for the rest of the answer")
+            .expect("a block")
+            .unwrap();
+        assert!(
+            matches!(&first, Block::Text(text) if text.starts_with("Hello there")),
+            "{first:?}"
+        );
+    }
+
+    /// A deployment that ignores `stream: true` and answers with one ordinary
+    /// completion must still produce the reply. Decoding that as an event
+    /// stream yields nothing, which reaches the user as a turn that printed
+    /// no answer and reported no error.
+    #[tokio::test]
+    async fn a_completion_answering_a_streaming_request_is_still_delivered() {
+        let blocks = answer_streaming_request(
+            "application/json",
+            r#"{"choices":[{"message":{"role":"assistant","content":"hello there"},"finish_reason":"stop"}]}"#,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(spoken(&blocks), "hello there", "{blocks:?}");
+    }
+
+    /// The same body correctly streamed but mislabelled as JSON still works:
+    /// the completion reading fails and the event-stream reading takes over.
+    #[tokio::test]
+    async fn a_mislabelled_event_stream_is_still_decoded() {
+        let blocks = answer_streaming_request(
+            "application/json",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(spoken(&blocks), "hi", "{blocks:?}");
+    }
+
+    /// A body that is neither reports the decode failure rather than ending the
+    /// turn with nothing.
+    #[tokio::test]
+    async fn an_undecodable_body_fails_loudly() {
+        let error = answer_streaming_request("application/json", "<html>gateway error</html>")
+            .await
+            .expect_err("silence is not an acceptable outcome")
+            .to_string();
+        assert!(error.contains("parse"), "{error}");
+    }
+
     #[tokio::test]
     async fn declared_vllm_counter_posts_the_full_prepared_input() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1703,8 +1959,14 @@ mod count_tokens_tests {
         ];
         let built = build_chat_messages(&msgs);
         assert_eq!(built[0].role, "system");
-        assert!(built[0].content.starts_with("SYS PROMPT"));
-        assert!(built[0].content.contains("earlier conversation summary"));
+        assert!(built[0].content.as_str().unwrap().starts_with("SYS PROMPT"));
+        assert!(
+            built[0]
+                .content
+                .as_str()
+                .unwrap()
+                .contains("earlier conversation summary")
+        );
         assert_eq!(built.iter().filter(|m| m.role == "system").count(), 1);
         // non-system messages keep their exact order (tool pairing untouched)
         assert_eq!(built[1].role, "user");
@@ -1768,7 +2030,7 @@ mod wire_tool_name_tests {
             ),
         );
         let map = wire_name_map(&["fs.edit".to_string()]);
-        let intents: Vec<ToolIntent> = finalize_tool_calls(accum, &map);
+        let intents: Vec<ToolIntent> = finalize_tool_calls(accum, &map).unwrap();
         assert_eq!(
             intents[0].tool, "fs.edit",
             "kernel must see the canonical name"
@@ -2168,6 +2430,27 @@ mod reasoning_request_tests {
             .expect("model_limits deadlocked while reading the connection");
         assert_eq!(limits.max_combined_tokens, Some(32_768));
         assert_eq!(limits.max_output_tokens, Some(4_096));
+    }
+
+    #[test]
+    fn server_default_output_keeps_context_protection_without_inventing_a_wire_cap() {
+        let provider = OpenAiCompat::new("http://x", "", "m").with_max_ctx(128_000);
+        assert_eq!(
+            provider
+                .model_limits()
+                .input_allowance(provider.requested_output_tokens()),
+            Some(128_000)
+        );
+        let request = provider
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: vec![Message::user("hello")],
+                ordered: None,
+                tools: Vec::new(),
+            })
+            .unwrap();
+        assert!(request.body.get("max_tokens").is_none());
+        assert!(request.body.get("max_completion_tokens").is_none());
     }
 
     #[test]

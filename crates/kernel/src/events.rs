@@ -28,6 +28,35 @@ pub(crate) fn strip_private_observation_fields(payload: &mut Value) {
     }
 }
 
+/// Images a tool produced ride in their own user turn: every protocol Medha
+/// speaks accepts text-only tool messages, so this is the one place an image
+/// from a tool can legally sit. The call id ties it back to its result and is
+/// the one identifier both a live turn and a replayed one have, so the two
+/// build identical context.
+pub fn tool_media_message(call_id: &str, media: Vec<crate::types::MediaPart>) -> crate::Message {
+    let mut message = crate::Message::user(format!(
+        "[{} image(s) returned by tool call {call_id}]",
+        media.len()
+    ));
+    message.attachments = media;
+    message
+}
+
+/// Rebuild that carrier when replaying a logged observation, so a resumed
+/// session sees the same images the live turn did.
+fn replayed_tool_media(payload: &Value, trust: TrustLabel) -> Option<crate::Message> {
+    let media: Vec<crate::types::MediaPart> =
+        serde_json::from_value(payload.get("media")?.clone()).ok()?;
+    if media.is_empty() {
+        return None;
+    }
+    let call_id = payload
+        .get("intent_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(tool_media_message(call_id, media).carrying(trust))
+}
+
 fn visible_observation_payload(event_payload: &Value) -> Value {
     let mut payload = event_payload.get("payload").cloned().unwrap_or(Value::Null);
     strip_private_observation_fields(&mut payload);
@@ -205,6 +234,18 @@ impl Event {
     /// came from. Recording a sub-agent's report as `User` lost its taint on resume.
     pub fn user_input(s: &Session, text: &str, trust: TrustLabel) -> Self {
         Self::new(s, EventKind::UserMessage, json!({ "text": text }), trust)
+    }
+
+    pub fn user_input_message(s: &Session, message: &Message) -> Self {
+        let mut event = Self::user_input(
+            s,
+            &message.content,
+            message.trust.unwrap_or(TrustLabel::User),
+        );
+        if !message.attachments.is_empty() {
+            event.payload["attachments"] = serde_json::json!(message.attachments);
+        }
+        event
     }
 
     /// An explicit retry of an already-admitted user-channel event. Coalesced on
@@ -818,6 +859,7 @@ struct CompactionSnapshotV1 {
 
 fn same_snapshot_message(left: &Message, right: &Message) -> bool {
     left.role == right.role
+        && left.attachments == right.attachments
         && left.content == right.content
         && left.tool_call_id == right.tool_call_id
         && left.trust == right.trust
@@ -874,6 +916,14 @@ fn snapshot_legacy_views(message: &ModelMessage) -> Vec<Message> {
         Message::new(message.role.clone(), text)
     };
     legacy.trust = message.trust;
+    legacy.attachments = message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Media(media) => Some(media.clone()),
+            _ => None,
+        })
+        .collect();
     vec![legacy]
 }
 
@@ -967,6 +1017,7 @@ struct UserAdmission {
     text: String,
     trust: TrustLabel,
     provenance: String,
+    attachments: Value,
 }
 
 /// Whether this event is a new admitted input. Text equality is irrelevant unless
@@ -986,6 +1037,11 @@ fn is_new_user_admission(
             .to_string(),
         trust: event.trust,
         provenance: event.provenance.source.clone(),
+        attachments: event
+            .payload
+            .get("attachments")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
     };
     let is_exact_retry = event
         .payload
@@ -1051,6 +1107,13 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                     // Carry the recorded label back onto the message so a
                     // resumed session taints exactly as the live one did.
                     let mut message = Message::user(t);
+                    message.attachments = serde_json::from_value(
+                        e.payload
+                            .get("attachments")
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                    )
+                    .unwrap_or_default();
                     if e.trust != TrustLabel::User {
                         message.trust = Some(e.trust);
                     }
@@ -1131,6 +1194,9 @@ fn project_messages_impl(events: &[Event], retain_checkpoint_system: bool) -> Ve
                     .unwrap_or_default();
                 let content = visible_observation_payload(&e.payload).to_string();
                 out.push(Message::tool_result(id, content));
+                if let Some(carrier) = replayed_tool_media(&e.payload, e.trust) {
+                    out.push(carrier);
+                }
             }
             EventKind::Compaction => {
                 if let Some(mut snapshot) = compacted_legacy_snapshot(&e.payload) {
@@ -1219,6 +1285,14 @@ fn project_ordered_messages_impl(
                     .unwrap_or_default();
                 if is_new_user_admission(event, &mut user_admissions) {
                     let mut message = Message::user(text);
+                    message.attachments = serde_json::from_value(
+                        event
+                            .payload
+                            .get("attachments")
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                    )
+                    .unwrap_or_default();
                     if event.trust != TrustLabel::User {
                         message.trust = Some(event.trust);
                     }
@@ -1305,6 +1379,9 @@ fn project_ordered_messages_impl(
                     })],
                     trust: None,
                 });
+                if let Some(carrier) = replayed_tool_media(&event.payload, event.trust) {
+                    out.push(carrier.ordered());
+                }
             }
             EventKind::Compaction => {
                 if let Some(mut snapshot) = compacted_ordered_snapshot(&event.payload) {
@@ -1482,6 +1559,60 @@ mod tests {
         for kind in [EventKind::ContextFileLoaded, EventKind::ContextFileBlocked] {
             assert_eq!(EventKind::parse(kind.as_str()), Some(kind));
         }
+    }
+
+    /// An image a tool produced has to survive a restart: the observation event
+    /// carries its reference, and both projectors rebuild the same carrier turn
+    /// the live run made.
+    #[test]
+    fn a_tool_image_is_replayed_as_the_same_carrier_turn() {
+        use crate::types::{ContentPart, MediaPart, MediaSource, Role};
+        let session = Session::new();
+        let mut observation = Observation::ok("call-7", json!({ "path": "shot.png" }));
+        observation.media = vec![MediaPart {
+            mime_type: "image/png".into(),
+            source: MediaSource::Artifact("hash-7".into()),
+            label: None,
+            provider_state: Vec::new(),
+        }];
+        let events = vec![
+            Event::user_message(&session, "what does the screenshot show?"),
+            Event::model_intent(
+                &session,
+                &ToolIntent {
+                    id: "call-7".into(),
+                    tool: "image.view".into(),
+                    args: json!({ "path": "shot.png" }),
+                },
+            ),
+            Event::tool_obs(&session, &observation, TrustLabel::Tool),
+        ];
+
+        let messages = project_messages(&events);
+        let carrier = messages.last().expect("a carrier turn follows the result");
+        assert!(matches!(carrier.role, Role::User));
+        assert_eq!(carrier.content, "[1 image(s) returned by tool call call-7]");
+        assert_eq!(carrier.attachments, observation.media);
+        assert_eq!(carrier.trust, Some(TrustLabel::Tool));
+
+        let ordered = project_ordered_messages(&events);
+        let last = ordered.last().expect("the request projector agrees");
+        assert!(matches!(
+            last.parts.last(),
+            Some(ContentPart::Media(part)) if part.source == MediaSource::Artifact("hash-7".into())
+        ));
+    }
+
+    #[test]
+    fn an_observation_without_images_gains_no_extra_turn() {
+        let session = Session::new();
+        let events = vec![Event::tool_obs(
+            &session,
+            &Observation::ok("1", json!({ "entries": [] })),
+            TrustLabel::Tool,
+        )];
+        assert_eq!(project_messages(&events).len(), 1);
+        assert_eq!(project_ordered_messages(&events).len(), 1);
     }
 
     #[test]

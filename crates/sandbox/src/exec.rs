@@ -185,6 +185,10 @@ const NETWORK_DENIAL_SUPPLEMENT: &[&str] = &[
     "getaddrinfo",
     "could not resolve host",
     "could not resolve proxy",
+    // npm's trailing summary can survive `2>&1 | tail` after the error code is gone.
+    "npm error network",
+    "npm err! network",
+    "no servers could be reached",
     // libgit2 (cargo, git via libgit2) prefixes the libc text with its own.
     "failed to resolve address",
     // Trailing quote is load-bearing: it separates urllib3's "Failed to resolve
@@ -1609,7 +1613,7 @@ fn native_sensitive_paths() -> Vec<PathBuf> {
 /// Deliberately not gated to the native-sandbox platforms: it is ordinary path
 /// normalization (it already handles `Component::Prefix`, which only Windows
 /// has), and [`escalation_candidates`] — which every platform compiles — calls it.
-fn resolve_native_policy_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_native_policy_path(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
 
     if !path.is_absolute() {
@@ -1641,6 +1645,13 @@ fn resolve_native_policy_path(path: &Path) -> Option<PathBuf> {
         resolved.push(component);
     }
     Some(resolved)
+}
+
+pub(crate) fn path_grant_is_safe(path: &Path) -> bool {
+    !native_sensitive_paths().iter().any(|secret| {
+        resolve_native_policy_path(secret)
+            .is_some_and(|secret| secret.starts_with(path) || path.starts_with(secret))
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1681,6 +1692,41 @@ fn safe_request_readable(paths: &[PathBuf]) -> Vec<PathBuf> {
                 .any(|secret| secret.starts_with(path) || path.starts_with(secret))
         })
         .collect()
+}
+
+/// Skill assets are deliberately shared with file tools by the harness. Allow
+/// those same read roots beneath ~/.medha/skills in the exec jail, while keeping
+/// the rest of ~/.medha private. Resolve each root before comparing so a skill
+/// symlink cannot expose credentials or project history.
+#[cfg(target_os = "macos")]
+fn skill_read_exceptions(secret: &Path, approved: &ApprovedRoots) -> Vec<PathBuf> {
+    let Some(state) = home_dir_from_env().map(|home| home.join(".medha")) else {
+        return Vec::new();
+    };
+    if secret != state {
+        return Vec::new();
+    }
+    let Some(state) = resolve_native_policy_path(&state) else {
+        return Vec::new();
+    };
+    let skills = state.join("skills");
+    approved
+        .read_roots()
+        .iter()
+        .filter_map(|root| resolve_native_policy_path(root))
+        .filter(|root| root.starts_with(&skills))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn sensitive_read_deny(secret: &Path, exceptions: &[PathBuf]) -> String {
+    let secret = sbpl_escape(&secret.to_string_lossy());
+    let mut filter = format!("(require-any (literal \"{secret}\") (subpath \"{secret}\"))");
+    for root in exceptions {
+        let root = sbpl_escape(&root.to_string_lossy());
+        filter = format!("(require-all {filter} (require-not (subpath \"{root}\")))");
+    }
+    format!("(deny file-read* {filter})\n")
 }
 
 /// Absolute-path tokens in a line of tool output or an argv entry. Utilities
@@ -1753,7 +1799,7 @@ fn native_intrinsic_read_roots() -> Vec<PathBuf> {
 }
 
 /// Out-of-workspace roots a failed command was plausibly denied on — the input
-/// to the escalation prompt. Only paths named in stderr; files widen to their
+/// to the escalation prompt. Only paths named in output; files widen to their
 /// parent; credential paths and already-approved roots are never offered.
 pub(crate) fn escalation_candidates(
     output: &ExecOutput,
@@ -1762,8 +1808,10 @@ pub(crate) fn escalation_candidates(
     permission: permissions::PermissionType,
 ) -> Vec<PathBuf> {
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let denial_lines: Vec<&str> = stderr
         .lines()
+        .chain(stdout.lines())
         .filter(|line| {
             line.contains("Operation not permitted") || line.contains("Permission denied")
         })
@@ -1962,6 +2010,10 @@ impl SeatbeltBackend {
             PathBuf::from("/opt/homebrew"),
             PathBuf::from("/usr/local"),
             PathBuf::from("/private/etc/ssl"),
+            // Standalone resolvers (nslookup/dig) read this symlink target;
+            // allowing sockets alone does not let them discover DNS servers.
+            PathBuf::from("/private/var/run/resolv.conf"),
+            PathBuf::from("/private/etc/resolv.conf"),
             // `/bin/sh` resolves its real interpreter through this indirection;
             // without it every command spews "Operation not permitted" noise.
             PathBuf::from("/private/var/select"),
@@ -1979,6 +2031,11 @@ impl SeatbeltBackend {
         readable.extend(self.approved.write_roots());
         readable.extend(safe_request_readable(&req.read_roots));
         readable.extend(safe_extra_writable(&req.write_roots));
+        // Seatbelt matches resolved vnodes, including /var -> /private/var.
+        readable = readable
+            .iter()
+            .filter_map(|path| resolve_native_policy_path(path))
+            .collect();
         readable.sort();
         readable.dedup();
         readable
@@ -2036,10 +2093,12 @@ impl SeatbeltBackend {
         // A workspace that is nested near HOME cannot accidentally broaden a
         // more-specific credential path through the workspace subpath rule.
         for secret in native_sensitive_paths() {
-            let secret = sbpl_escape(&secret.to_string_lossy());
+            let exceptions = skill_read_exceptions(&secret, &self.approved);
+            let resolved = resolve_native_policy_path(&secret).unwrap_or(secret);
+            p.push_str(&sensitive_read_deny(&resolved, &exceptions));
+            let secret = sbpl_escape(&resolved.to_string_lossy());
             p.push_str(&format!(
-                "(deny file-read* (literal \"{secret}\") (subpath \"{secret}\"))\n\
-                 (deny file-write* (literal \"{secret}\") (subpath \"{secret}\"))\n"
+                "(deny file-write* (literal \"{secret}\") (subpath \"{secret}\"))\n"
             ));
         }
         if self.effective_net(req) == NetPolicy::Deny {
@@ -3931,6 +3990,135 @@ mod tests {
         grant.grant();
         assert!(!be.profile(&r).contains("(deny network*)"));
         assert_eq!(be.containment(), kernel::Containment::OsFsJail);
+    }
+
+    /// Opt-in smoke test: needs macOS Seatbelt and access to the public npm registry.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires native macOS sandbox and public network access"]
+    async fn seatbelt_network_grant_reaches_npm_registry() {
+        assert!(native_sandbox_supported(), "native sandbox is required");
+        let ws = std::env::temp_dir().join(format!("medha-network-smoke-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let grant = NetworkGrant::default();
+        let backend = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default())
+            .with_network_grant(grant.clone());
+        let mut request = req(
+            "/usr/bin/curl",
+            &[
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "15",
+                "https://registry.npmjs.org/pptxgenjs/latest",
+            ],
+            ws.clone(),
+        );
+        request.clear_env = true;
+        request.env.clear();
+        let host = HostBackend.run(request.clone()).await.unwrap();
+        assert_eq!(
+            host.status,
+            Some(0),
+            "host network unavailable: {}",
+            String::from_utf8_lossy(&host.stderr)
+        );
+        grant.grant();
+        let output = backend.run(request).await.unwrap();
+        std::fs::remove_dir_all(&ws).unwrap();
+        assert_eq!(
+            output.status,
+            Some(0),
+            "approved network must work: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("pptxgenjs"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_trusted_skill_scripts_run_without_exposing_state_or_symlink_targets() {
+        const CHILD: &str = "MEDHA_SKILL_ACCESS_TEST_CHILD";
+        if let Some(base) = std::env::var_os(CHILD) {
+            let base = PathBuf::from(base);
+            let skills = base.join("home/.medha/skills");
+            let workspace = base.join("workspace");
+            let approved = ApprovedRoots::default();
+            approved.allow_read(skills.clone());
+            let backend = SeatbeltBackend::new(NetPolicy::Deny, vec![], approved);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let allowed = backend
+                    .run(req(
+                        "/bin/sh",
+                        &[skills.join("validator.sh").to_str().unwrap()],
+                        workspace.clone(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    allowed.status,
+                    Some(0),
+                    "{}",
+                    String::from_utf8_lossy(&allowed.stderr)
+                );
+                assert_eq!(allowed.stdout, b"verified");
+                for path in [
+                    base.join("home/.medha/config.toml"),
+                    skills.join("secret-link"),
+                ] {
+                    let denied = backend
+                        .run(req(
+                            "/bin/cat",
+                            &[path.to_str().unwrap()],
+                            workspace.clone(),
+                        ))
+                        .await
+                        .unwrap();
+                    assert_ne!(
+                        denied.status,
+                        Some(0),
+                        "state must stay protected: {}",
+                        path.display()
+                    );
+                    assert!(denied.stdout.is_empty());
+                }
+                let denied = backend
+                    .run(req(
+                        "/usr/bin/touch",
+                        &[skills.join("new-file").to_str().unwrap()],
+                        workspace,
+                    ))
+                    .await
+                    .unwrap();
+                assert_ne!(denied.status, Some(0), "skills must remain read-only");
+            });
+            return;
+        }
+        if !native_sandbox_supported() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("medha-skill-access-{}", ulid::Ulid::new()));
+        let skills = base.join("home/.medha/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::create_dir_all(base.join("workspace")).unwrap();
+        std::fs::write(skills.join("validator.sh"), "printf verified").unwrap();
+        std::fs::write(base.join("home/.medha/config.toml"), "private fixture").unwrap();
+        std::os::unix::fs::symlink("../config.toml", skills.join("secret-link")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "exec::tests::seatbelt_trusted_skill_scripts_run_without_exposing_state_or_symlink_targets", "--nocapture"])
+            .env(CHILD, &base).env("HOME", base.join("home")).output().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// The one-shot grant reaches the profile only because `build_command` is

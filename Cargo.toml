@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/kernel",
     "crates/providers",
-    "crates/medha-cli", "crates/context", "crates/lsp", "crates/mcp", "crates/sandbox", "crates/tools", "crates/store", "crates/policy", "crates/lockfile", "crates/permissions", "crates/gate", "crates/memory", "crates/orchestrator",
+    "crates/medha-cli", "crates/context", "crates/lsp", "crates/mcp", "crates/sandbox", "crates/tools", "crates/store", "crates/policy", "crates/lockfile", "crates/permissions", "crates/gate", "crates/media", "crates/memory", "crates/orchestrator",
 ]
 
 [workspace.package]
@@ -28,3 +28,4 @@ anyhow = "1"
 kernel = { version = "0.1.8", path = "crates/kernel" }
 providers = { version = "0.1.8", path = "crates/providers" }
 context = { version = "0.1.8", path = "crates/context" }
+media = { version = "0.1.8", path = "crates/media" }

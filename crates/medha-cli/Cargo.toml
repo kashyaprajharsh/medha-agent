@@ -58,6 +58,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 unicode-width = "0.2"
 # OSC 52 terminal clipboard transport for transcript selection.
 base64 = "0.22"
+arboard = { version = "3", features = ["image-data"] }
+media.workspace = true
+# Only the TUI test fixtures build images directly; admission lives in `media`.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(unix)'.dependencies]
 # TUI stdout-corruption fix: dup/dup2 the real tty so the terminal draws on a

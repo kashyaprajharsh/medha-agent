@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
+    pub auxiliary: AuxiliaryConfig,
+    #[serde(default)]
     pub search: SearchConfig,
     /// User-scoped, secret-free MCP definitions.
     #[serde(default)]
@@ -233,6 +235,14 @@ pub struct SearchConfig {
 pub struct AgentConfig {
     #[serde(default)]
     pub identity: Option<String>,
+}
+
+/// Models used beside the main one for work it cannot do itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuxiliaryConfig {
+    /// Saved profile that reads images when the main model has no image input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<String>,
 }
 
 pub type ProviderConfig = providers::ProviderProfile;
@@ -863,6 +873,7 @@ fn resolve_inner(
         token_accounting,
         reasoning,
         reasoning_efforts: configured.and_then(|p| p.reasoning_efforts.clone()),
+        capabilities: configured.and_then(|p| p.capabilities.clone()),
         chat_token_limit: configured.map(|p| p.chat_token_limit).unwrap_or_default(),
     };
     provider.validate().map_err(anyhow::Error::msg)?;
@@ -1950,6 +1961,7 @@ mod tests {
             token_accounting: kernel::TokenAccountingMode::Adaptive,
             reasoning: kernel::ReasoningSupport::Unknown,
             reasoning_efforts: None,
+            capabilities: None,
             chat_token_limit: Default::default(),
         }
     }

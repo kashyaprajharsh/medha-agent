@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 kernel.workspace = true
+media.workspace = true
 lsp = { version = "0.1.8", path = "../lsp" }
 mcp = { version = "0.1.8", path = "../mcp" }
 orchestrator = { version = "0.1.8", path = "../orchestrator" }

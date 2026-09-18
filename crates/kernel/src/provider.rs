@@ -21,6 +21,13 @@ pub enum Protocol {
 }
 
 impl Protocol {
+    /// Whether this wire contract carries user images. Says nothing about the
+    /// selected model: an endpoint can speak a protocol that supports images
+    /// while serving a model that cannot see them.
+    pub const fn carries_images(self) -> bool {
+        matches!(self, Self::OpenAiChat | Self::GeminiInteractions)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenAiChat => "open-ai-chat",
@@ -83,14 +90,13 @@ pub struct ModelLimits {
 }
 
 impl ModelLimits {
-    /// Maximum input for this request. A combined window reserves only the
-    /// explicitly requested output allowance, never a guessed percentage, so
-    /// without a requested cap the input allowance stays unknown.
+    /// Input ceiling for this request. Reserve an explicitly requested output
+    /// cap when present. A server-default output cap is unknown, but does not
+    /// erase the known combined ceiling; proactive compaction must still run.
     pub fn input_allowance(self, requested_output: Option<u64>) -> Option<u64> {
         let combined = self
             .max_combined_tokens
-            .zip(requested_output)
-            .map(|(limit, output)| limit.saturating_sub(output));
+            .map(|limit| limit.saturating_sub(requested_output.unwrap_or(0)));
         match (self.max_input_tokens, combined) {
             (Some(input), Some(combined)) => Some(input.min(combined)),
             (Some(input), None) => Some(input),
@@ -105,14 +111,14 @@ mod model_limit_tests {
     use super::ModelLimits;
 
     #[test]
-    fn combined_limit_requires_an_explicit_output_allowance() {
+    fn combined_limit_remains_a_ceiling_without_an_output_allowance() {
         let limits = ModelLimits {
             max_input_tokens: None,
             max_output_tokens: Some(8_000),
             max_combined_tokens: Some(32_000),
         };
         assert_eq!(limits.input_allowance(Some(4_000)), Some(28_000));
-        assert_eq!(limits.input_allowance(None), None);
+        assert_eq!(limits.input_allowance(None), Some(32_000));
     }
 
     #[test]
@@ -207,10 +213,10 @@ pub enum ToolCallStrategy {
 
 #[derive(Debug, Clone)]
 pub struct ProviderCaps {
-    /// Reserved. No adapter lowers media and no caller branches on these yet, so
-    /// both are always `false`; they exist so adding a protocol that supports
-    /// them does not change this struct's shape.
-    pub vision: bool,
+    /// Whether the selected model accepts images in user messages. `Unknown` is
+    /// not `Unsupported`: a custom endpoint serving an unlisted vision model
+    /// must stay attemptable rather than be refused on missing metadata.
+    pub images: ImageSupport,
     pub caching: bool,
     /// Context-window size in tokens. `None` = **unknown** — not a guess. The
     /// context compiler must never trust a fabricated number (it sizes
@@ -221,6 +227,15 @@ pub struct ProviderCaps {
     /// *capability* default; an unknown context window is not — hence `Option`.
     pub max_ctx: Option<u32>,
     pub tool_calls: ToolCallStrategy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSupport {
+    Supported,
+    Unsupported,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -312,22 +327,6 @@ impl ProviderError {
 
 fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
     let lower = message.to_ascii_lowercase();
-    let output_shaped = (lower.contains("max_tokens")
-        || lower.contains("max output")
-        || lower.contains("output token"))
-        && (lower.contains("too large")
-            || lower.contains("exceed")
-            || lower.contains("maximum")
-            || lower.contains("available"));
-    if output_shaped {
-        return ProviderFailure::OutputLimit {
-            available_output: number_after_any(
-                &lower,
-                &["available_tokens", "available tokens", "available output"],
-            ),
-        };
-    }
-
     let input_shaped = lower.contains("context_length_exceeded")
         || lower.contains("maximum context")
         || (lower.contains("context")
@@ -343,7 +342,7 @@ fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
         // turn dies instead of compacting once and succeeding.
         || lower.contains("max_kv_size")
         || lower.contains("context tokens");
-    if code.is_none_or(|code| code == 400 || code == 413) && input_shaped {
+    if code.is_none_or(|code| code == 400 || code == 413 || code == 422) && input_shaped {
         return ProviderFailure::InputContextOverflow {
             reported_limit: number_after_any(
                 &lower,
@@ -363,6 +362,30 @@ fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
                 ],
             ),
         };
+    }
+    // Combined-window errors often mention max_tokens as well as input. Their
+    // explicit context evidence above takes precedence over output wording.
+    let output_shaped = (lower.contains("max_tokens")
+        || lower.contains("max_completion_tokens")
+        || lower.contains("max_output_tokens")
+        || lower.contains("max output")
+        || lower.contains("output token"))
+        && (lower.contains("too large")
+            || lower.contains("exceed")
+            || lower.contains("maximum")
+            || lower.contains("available"));
+    if code.is_none_or(|code| code == 400 || code == 422) && output_shaped {
+        let available_output = number_after_any(
+            &lower,
+            &["available_tokens", "available tokens", "available output"],
+        );
+        // No room for even one generated token requires reducing input.
+        if available_output == Some(0) {
+            return ProviderFailure::InputContextOverflow {
+                reported_limit: None,
+            };
+        }
+        return ProviderFailure::OutputLimit { available_output };
     }
     // Retry HTTP-200 error objects only for explicit transient declarations.
     let transient_shaped = structured_google_rpc_transient_status(message)
@@ -416,6 +439,42 @@ fn number_after_any(text: &str, markers: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod error_class_tests {
     use super::{ProviderError, ProviderFailure};
+
+    #[test]
+    fn explicit_context_overflow_wins_over_output_cap_wording() {
+        for body in [
+            "context_length_exceeded: maximum context length is 128000 tokens; input plus max_tokens exceeds this limit",
+            "maximum context length is 128000 tokens, max_completion_tokens is too large for this input",
+        ] {
+            assert_eq!(
+                ProviderError::Status(400, body.into()).classify(),
+                ProviderFailure::InputContextOverflow {
+                    reported_limit: Some(128_000)
+                }
+            );
+        }
+        assert_eq!(
+            ProviderError::Status(400, "max_tokens exceeds available_tokens: 0".into()).classify(),
+            ProviderFailure::InputContextOverflow {
+                reported_limit: None
+            }
+        );
+        assert_eq!(
+            ProviderError::Status(
+                400,
+                "max_completion_tokens exceeds available output: 2048".into()
+            )
+            .classify(),
+            ProviderFailure::OutputLimit {
+                available_output: Some(2048)
+            }
+        );
+        assert_eq!(
+            ProviderError::Status(401, "max_tokens exceeds available output: 2048".into())
+                .classify(),
+            ProviderFailure::Fatal
+        );
+    }
 
     #[test]
     fn transient_failures_are_retryable() {
@@ -707,6 +766,19 @@ pub trait Provider: Send + Sync {
     /// with their active connection's value.
     fn context_window(&self) -> Option<u32> {
         self.capabilities().max_ctx
+    }
+
+    /// Image support for the connection currently serving requests. Adapters
+    /// that allow a between-turn profile switch override this so a switch to a
+    /// text-only model takes effect on the next turn.
+    fn image_support(&self) -> ImageSupport {
+        self.capabilities().images
+    }
+
+    /// Scope for usage calibration. Adapters include their endpoint so counts
+    /// from one deployment are not carried into another serving the same model.
+    fn context_identity(&self) -> String {
+        self.protocol().as_str().to_string()
     }
 
     fn protocol(&self) -> Protocol {

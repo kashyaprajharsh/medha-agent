@@ -19,7 +19,7 @@ pub(super) fn update<P, L>(
         Msg::KeyPress(key) => handle_key(model, key, kernel, session, transcript, budget, tx),
         Msg::MouseScroll(delta) => model.scroll_by(delta),
         Msg::Mouse(event) => handle_mouse(model, event),
-        Msg::Paste(data) => handle_paste(model, data),
+        Msg::Paste(data) => handle_paste(model, data, kernel, session, tx),
         Msg::Resize(height) => {
             model.viewport_height = height as usize;
             model.auto_scroll = model.scroll_offset >= model.max_scroll();
@@ -37,6 +37,18 @@ pub(super) fn update<P, L>(
             {
                 model.agent_report_deferred = false;
                 spawn_turn(model, kernel, session, transcript, budget, tx, None);
+            }
+            // A submission held for its attachments goes as soon as admission
+            // settles, whether the image landed or failed with a visible notice.
+            if model.submit_deferred.is_some()
+                && !model.attachments.is_loading()
+                && !model.running
+                && !model.force_aborting
+                && model.session_op.is_none()
+                && model.picker.is_none()
+                && let Some(line) = model.submit_deferred.take()
+            {
+                spawn_turn(model, kernel, session, transcript, budget, tx, Some(line));
             }
             if let Some(f) = model.intro_frame {
                 model.intro_frame = if f >= 40 { None } else { Some(f + 1) };
@@ -383,8 +395,34 @@ pub(super) fn expand_paste_tokens(pastes: &[String], s: &str) -> String {
 }
 
 /// Inserts a paste atomically, collapsing large content to a placeholder.
-pub(super) fn handle_paste(model: &mut Model, data: String) {
-    let clean = strip_paste_markers(&data);
+/// A file dropped on the terminal arrives here as text. When the paste is
+/// nothing but image paths it becomes an attachment instead of a wall of path
+/// characters; a path inside a sentence attaches and stays in the sentence.
+pub(super) fn handle_paste<P, L>(
+    model: &mut Model,
+    data: String,
+    kernel: &Arc<Kernel<P, L>>,
+    session: &Session,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) where
+    P: ProfileProvider + 'static,
+    L: EventLog + 'static,
+{
+    let mut clean = strip_paste_markers(&data);
+    let images = unstaged_images(model, &clean);
+    if !images.is_empty() {
+        let only_paths =
+            crate::attachments::refs::only_paths(&clean, &images, model.restore.root());
+        // What is left of the paste once its images are attachments. A dropped
+        // screenshot contributes nothing to type: its path is unreachable and
+        // the picture already rides with the message.
+        clean = crate::attachments::refs::strip_unreachable(&clean, &images, model.restore.root());
+        stage_images(model, kernel, session, tx, ImageSource::Paths(images));
+        if only_paths || clean.is_empty() {
+            model.ac_sel = 0;
+            return;
+        }
+    }
     let count = clean.chars().count();
     if count > PASTE_COLLAPSE_THRESHOLD {
         // Keep the full text in the model; show only a compact placeholder inline.
@@ -723,7 +761,7 @@ fn advance_model_setup<P: ProfileProvider>(
                             model.protocol = resolved.provider.protocol;
                             model.reasoning_support = resolved.provider.reasoning;
                             model.max_ctx = resolved.provider.max_ctx;
-                            model.ctx_pct = None;
+                            model.context_pressure = None;
                             model.active_profile = resolved.name;
                         }
                         model.push_notice(if activate {
@@ -844,6 +882,7 @@ fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
         token_accounting: kernel::TokenAccountingMode::Adaptive,
         reasoning: kernel::ReasoningSupport::Unknown,
         reasoning_efforts: None,
+        capabilities: None,
         chat_token_limit: Default::default(),
     };
     if !completed.api_key.is_empty()
@@ -882,7 +921,7 @@ fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
             model.protocol = resolved.provider.protocol;
             model.reasoning_support = resolved.provider.reasoning;
             model.max_ctx = resolved.provider.max_ctx;
-            model.ctx_pct = None;
+            model.context_pressure = None;
             model.active_profile = resolved.name;
             model.push_notice(format!("✔ saved '{name}' and switched to it"));
         }
@@ -1651,6 +1690,9 @@ pub(super) fn handle_key<P, L>(
     }
 
     match key.code {
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            stage_images(model, kernel, session, tx, ImageSource::Clipboard);
+        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if !model.running {
                 model.input.clear();
@@ -1708,16 +1750,43 @@ pub(super) fn handle_key<P, L>(
                 dispatch_slash(model, cmd, kernel, session, transcript, tx);
                 return;
             }
-            if model.input.trim().is_empty() {
+            if model.attachments.is_loading() {
+                model.push_notice("wait for the image attachment to finish loading");
                 return;
             }
-            let raw = std::mem::take(&mut model.input);
+            // A steer and an agent pane both carry text only, so images would be
+            // silently dropped there rather than reaching the model.
+            if !model.attachments.is_empty() && (model.running || model.focus.is_some()) {
+                model.push_notice(
+                    "attached images need a fresh main-chat turn — finish this one first",
+                );
+                return;
+            }
+            if model.input.trim().is_empty() && model.attachments.is_empty() {
+                return;
+            }
+            let mut raw = std::mem::take(&mut model.input);
+            if raw.trim().is_empty() {
+                raw = crate::attachments::IMAGE_ONLY_PROMPT.to_string();
+            }
             model.cursor = 0;
             model.history.push(raw.clone());
             model.history_idx = None;
             model.welcome = false;
             // Expand compact paste placeholders only at submission.
             let line = model.resolve_pastes(&raw);
+
+            // A path typed out rather than dropped still attaches. Admission is
+            // off-thread, so the turn waits for the bytes instead of the UI.
+            if !model.running && model.focus.is_none() {
+                let images = unstaged_images(model, &line);
+                if !images.is_empty() {
+                    let line = message_for(model, &line, &images);
+                    stage_images(model, kernel, session, tx, ImageSource::Paths(images));
+                    model.submit_deferred = Some(line);
+                    return;
+                }
+            }
 
             // Typing while reading an agent addresses that agent, not the
             // conversation. Anything else would be a trap: the text looks like it
@@ -2213,7 +2282,7 @@ pub(super) fn handle_agent_event(
             | TuiEvent::Compaction(_, _, _, _)
             | TuiEvent::Compacting(_)
             | TuiEvent::Restarted
-            | TuiEvent::Usage(_, _)
+            | TuiEvent::ContextPressure(_)
             | TuiEvent::Cost(_, _)
             | TuiEvent::Verify(_, _) => return,
             other => other,
@@ -2222,6 +2291,18 @@ pub(super) fn handle_agent_event(
         ev
     };
     match ev {
+        TuiEvent::ImagesLoaded {
+            session: owner,
+            generation,
+            result,
+        } => {
+            if owner != session.id {
+                return;
+            }
+            if let Some(notice) = model.attachments.accept(generation, result) {
+                model.push_notice(notice);
+            }
+        }
         // The next UI tick owns starting the deferred turn.
         TuiEvent::AgentReportReady(owner) if owner.is_none() || owner == Some(session.id) => {
             model.agent_report_deferred = true;
@@ -2250,6 +2331,7 @@ pub(super) fn handle_agent_event(
                 summary,
             });
         }
+        TuiEvent::TurnNotice(text) => model.push_main_notice(&text),
         TuiEvent::Compacting(active) => model.compacting = active,
         // Said out loud: a reply that visibly rewinds and starts again is
         // alarming without a reason, and the retry is the reassuring part.
@@ -2265,11 +2347,8 @@ pub(super) fn handle_agent_event(
             model.push_agent_step(path, step);
         }
         TuiEvent::AgentStep { .. } => {}
-        TuiEvent::Usage(prompt_tokens, _total) => {
-            if let Some(mc) = model.max_ctx {
-                let usable = context::ContextBudget::from_max_ctx(mc).usable().max(1);
-                model.ctx_pct = Some((prompt_tokens as f32 / usable as f32 * 100.0).round() as u32);
-            }
+        TuiEvent::ContextPressure(pressure) => {
+            model.context_pressure = Some(pressure);
         }
         TuiEvent::Cost(usd, indicative) => model.cost_usd = Some((usd, indicative)),
         TuiEvent::Verify(ok, summary) => model.push_main_item(Item::Verify { ok, summary }),
@@ -2302,18 +2381,18 @@ pub(super) fn handle_agent_event(
                 }
             }
         }
-        TuiEvent::NetworkApproval(detail, escalated, cancel, responder) => {
+        TuiEvent::AccessApproval(detail, escalated, cancel, responder) => {
             if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
                 let _ = responder.send(kernel::NetworkDecision::Deny);
                 return;
             }
             let was_empty = model.pending_approvals.is_empty();
             model.pending_approvals.push_back(PendingApproval {
-                action: "network access".to_string(),
+                action: "command access".to_string(),
                 detail,
                 escalated,
                 cancel,
-                responder: ApprovalResponder::Network(responder),
+                responder: ApprovalResponder::Access(responder),
             });
             if was_empty {
                 model.approval_sel = 0;
@@ -2830,6 +2909,7 @@ pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
     // two sessions that happened to reuse the same agent name.
     model.clear_session_panes();
     model.items.clear();
+    model.context_pressure = None;
     // Tool results reference their call by id; remember each call's tool name
     // so the result row carries the right icon/label.
     let mut call_tools: std::collections::HashMap<String, String> =
@@ -2879,6 +2959,12 @@ enum SlashAction {
     Resume,
     Rewind,
     Clear,
+    /// `/attach <path>` — stage a local image on the composer.
+    Attach(String),
+    /// `/paste` — stage an image from the system clipboard (also Ctrl-V).
+    Paste,
+    /// `/detach [number|all]` — unstage images before sending.
+    Detach(String),
     Lsp,
     /// `/mcp` — open the MCP management picker.
     Mcp,
@@ -2934,6 +3020,13 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "resume" => SlashAction::Resume,
         "rewind" => SlashAction::Rewind,
         "clear" => SlashAction::Clear,
+        "paste" => SlashAction::Paste,
+        c if c.strip_prefix("attach").is_some_and(is_cmd_boundary) => {
+            SlashAction::Attach(c.strip_prefix("attach").unwrap_or("").trim().to_string())
+        }
+        c if c.strip_prefix("detach").is_some_and(is_cmd_boundary) => {
+            SlashAction::Detach(c.strip_prefix("detach").unwrap_or("").trim().to_string())
+        }
         "lsp" => SlashAction::Lsp,
         "mcp" => SlashAction::Mcp,
         "agents" => SlashAction::Agents,
@@ -3029,6 +3122,76 @@ fn classify_slash(cmd: &str) -> SlashAction {
     }
 }
 
+/// Where a staging request came from: explicit paths, or the system clipboard.
+pub(super) enum ImageSource {
+    Clipboard,
+    Paths(Vec<std::path::PathBuf>),
+}
+
+/// Admission reads, decodes and hashes bytes off the UI thread; the result
+/// returns as `ImagesLoaded` and is matched to this session and generation
+/// before it can touch the composer.
+fn stage_images<P: Provider + 'static, L: EventLog + 'static>(
+    model: &mut Model,
+    kernel: &Arc<Kernel<P, L>>,
+    session: &Session,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+    source: ImageSource,
+) {
+    if !model.protocol.carries_images() {
+        model.push_notice(format!(
+            "the {} protocol cannot carry images yet",
+            model.protocol.as_str()
+        ));
+        return;
+    }
+    if model.session_op.is_some() {
+        model.push_notice("a session change is in flight — attach once it settles");
+        return;
+    }
+    let generation = match model.attachments.begin() {
+        Ok(generation) => generation,
+        Err(notice) => return model.push_notice(notice),
+    };
+    let session = session.id;
+    let store = kernel.artifacts.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = match source {
+            ImageSource::Paths(paths) => crate::attachments::ingest(paths, store).await,
+            ImageSource::Clipboard => crate::attachments::clipboard(store).await,
+        };
+        let _ = tx.send(TuiEvent::ImagesLoaded {
+            session,
+            generation,
+            result: result.map_err(|error| format!("{error:#}")),
+        });
+    });
+}
+
+/// Image paths the composer just received that are not already staged. This is
+/// how a file dropped on the terminal becomes an attachment: the terminal
+/// delivers it as text, and only paths that exist are ever picked up.
+fn unstaged_images(model: &Model, text: &str) -> Vec<std::path::PathBuf> {
+    crate::attachments::refs::scan(text, model.restore.root())
+        .into_iter()
+        .filter(|path| !model.attachments.holds(path))
+        .collect()
+}
+
+/// The message once its images are attachments rather than paths. A dropped
+/// screenshot leaves nothing behind; if it was the whole message, the shared
+/// image-only line stands in for it.
+fn message_for(model: &Model, line: &str, attached: &[std::path::PathBuf]) -> String {
+    let stripped =
+        crate::attachments::refs::strip_unreachable(line, attached, model.restore.root());
+    if stripped.trim().is_empty() {
+        crate::attachments::IMAGE_ONLY_PROMPT.to_string()
+    } else {
+        stripped
+    }
+}
+
 /// Routes both typed and autocomplete-accepted slash commands.
 fn dispatch_slash<P, L>(
     model: &mut Model,
@@ -3049,6 +3212,18 @@ fn dispatch_slash<P, L>(
         SlashAction::Resume => start_resume(model, kernel, tx),
         SlashAction::Rewind => start_rewind(model, kernel, session, tx),
         SlashAction::Clear => do_clear(model, session, transcript),
+        SlashAction::Attach(path) if path.is_empty() => {
+            model.push_notice("usage: /attach PATH (PNG, JPEG, WebP, GIF, BMP, TIFF, or ICO)")
+        }
+        SlashAction::Attach(path) => {
+            let path = crate::attachments::refs::expand(model.restore.root(), &path);
+            stage_images(model, kernel, session, tx, ImageSource::Paths(vec![path]))
+        }
+        SlashAction::Paste => stage_images(model, kernel, session, tx, ImageSource::Clipboard),
+        SlashAction::Detach(arg) => {
+            let notice = model.attachments.detach(&arg);
+            model.push_notice(notice);
+        }
         SlashAction::Lsp => show_lsp_status(kernel, tx),
         SlashAction::Mcp => open_mcp_picker(model),
         SlashAction::Agents => open_agents_picker(model, tx),
@@ -4459,7 +4634,8 @@ pub(super) fn spawn_turn<P, L>(
     model.welcome = false;
     let unprompted = line.is_none();
     if let Some(line) = &line {
-        model.push_main_item(Item::User(line.clone()));
+        let label = model.attachments.submission_label(line);
+        model.push_main_item(Item::User(label));
     }
     if model.focus.is_none() {
         model.auto_scroll = true;
@@ -4480,7 +4656,9 @@ pub(super) fn spawn_turn<P, L>(
     // current this turn (not just next session).
     model.refresh_skill_manifest(transcript);
     if let Some(line) = line {
-        transcript.push(Message::user(line));
+        let mut input = Message::user(line);
+        input.attachments = model.attachments.take();
+        transcript.push(input);
     }
 
     // Graceful interruption: the kernel owns cancellation now. Esc trips the
@@ -4691,6 +4869,9 @@ impl kernel::StreamSink for TuiSink {
     fn compacting(&self, active: bool) {
         self.emit("compacting", TuiEvent::Compacting(active));
     }
+    fn notice(&self, text: &str) {
+        self.emit("notice", TuiEvent::TurnNotice(text.to_string()));
+    }
     fn restarted(&self) {
         self.emit("restarted", TuiEvent::Restarted);
     }
@@ -4703,8 +4884,8 @@ impl kernel::StreamSink for TuiSink {
             TuiEvent::Compaction(before, after, summarized, summary.map(str::to_string)),
         );
     }
-    fn usage(&self, prompt_tokens: u32, total_tokens: u32) {
-        self.emit("usage", TuiEvent::Usage(prompt_tokens, total_tokens));
+    fn context_pressure(&self, pressure: kernel::ContextPressure) {
+        self.emit("context_pressure", TuiEvent::ContextPressure(pressure));
     }
     fn cost(&self, total_usd: f64, indicative: bool) {
         self.emit("cost", TuiEvent::Cost(total_usd, indicative));
@@ -5013,7 +5194,7 @@ fn switch_saved_model<P: ProfileProvider>(model: &mut Model, provider: &P, name:
             model.protocol = resolved.provider.protocol;
             model.reasoning_support = resolved.provider.reasoning;
             model.max_ctx = resolved.provider.max_ctx;
-            model.ctx_pct = None;
+            model.context_pressure = None;
             model.active_profile = resolved.name;
             model.push_notice(format!("switched to model profile '{name}'"));
         }
@@ -5615,7 +5796,7 @@ fn load_skill_by_name(model: &mut Model, name: &str, transcript: &mut Vec<Messag
 pub(super) fn run_slash<P: kernel::Provider>(
     model: &mut Model,
     cmd: &str,
-    transcript: &[Message],
+    _transcript: &[Message],
     provider: &P,
 ) {
     if let Some(rest) = cmd.strip_prefix("reasoning").filter(|r| is_cmd_boundary(r)) {
@@ -5716,13 +5897,18 @@ pub(super) fn run_slash<P: kernel::Provider>(
         // transcript and session are mutable; this arm is only a fallback.
         "clear" => model.push_notice("(use /clear to reset the conversation)"),
         "status" => {
-            let toks: usize = transcript.iter().map(|m| m.content.len() / 4).sum();
-            let ctx = match model.max_ctx {
-                Some(mc) => format!("{mc} window"),
-                None => "unknown window".to_string(),
+            let ctx = match model.context_pressure {
+                Some(p) => format!(
+                    "{} input tokens ({:?}); input ceiling {:?}, usable {:?}",
+                    p.input_tokens, p.quality, p.input_limit, p.usable_input_tokens
+                ),
+                None => match model.max_ctx {
+                    Some(mc) => format!("{mc} configured window; no request measured yet"),
+                    None => "unknown window; proactive compaction unavailable".to_string(),
+                },
             };
             model.push_notice(format!(
-                "model: {} ({})  |  {ctx}  |  ~{toks} est. tokens\n\n{}",
+                "model: {} ({})  |  {ctx}\n\n{}",
                 model.model,
                 model.active_profile,
                 model.reasoning_status_block()
@@ -5926,6 +6112,31 @@ mod fix_tests {
         )
     }
 
+    #[test]
+    fn context_meter_and_status_use_the_compiler_budget_and_reset_with_session() {
+        let mut m = model();
+        m.max_ctx = Some(1_000_000); // Deliberately different from the active budget.
+        let mut session = Session::new();
+        let mut transcript = vec![Message::user("unrelated UI transcript")];
+        let pressure = kernel::ContextPressure::new(
+            6_480,
+            Some(8_000),
+            kernel::TokenCountQuality::LocalEstimate,
+        );
+        handle_agent_event(
+            &mut m,
+            TuiEvent::ContextPressure(pressure),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(m.context_pressure.unwrap().percent(), Some(90));
+        let provider = providers::OpenAiCompat::new("http://localhost/v1", "", "m");
+        run_slash(&mut m, "status", &transcript, &provider);
+        assert!(m.items.iter().any(|item| matches!(&item.item, Item::Notice(text) if text.contains("6480 input tokens") && text.contains("7200"))));
+        m.clear_session_panes();
+        assert!(m.context_pressure.is_none());
+    }
+
     fn input_kernel() -> Arc<Kernel<providers::OpenAiCompat, kernel::InMemoryLog>> {
         let dir = std::env::temp_dir().join(format!("medha-input-{}", ulid::Ulid::new()));
         Arc::new(Kernel::new(
@@ -5938,6 +6149,145 @@ mod fix_tests {
             Arc::new(kernel::AutoDeny),
             Arc::new(kernel::NoVerify),
         ))
+    }
+
+    fn drop_png(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([9, 8, 7, 255]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+        let path = root.join(name);
+        std::fs::write(&path, png).unwrap();
+        path
+    }
+
+    /// A terminal delivers a dropped file as pasted text. On its own it is an
+    /// attachment, not a wall of path characters in the composer.
+    #[tokio::test]
+    async fn a_dropped_image_becomes_an_attachment_instead_of_composer_text() {
+        let mut m = model();
+        let kernel = input_kernel();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let path = drop_png(m.restore.root(), "Screen Shot 1.png");
+
+        handle_paste(
+            &mut m,
+            format!("'{}'", path.display()),
+            &kernel,
+            &session,
+            &tx,
+        );
+        assert!(
+            m.input.is_empty(),
+            "the path must not be typed into the composer"
+        );
+        assert!(m.attachments.is_loading());
+
+        let event = rx.recv().await.unwrap();
+        handle_agent_event(&mut m, event, &mut session, &mut transcript);
+        assert!(m.attachments.holds(&path));
+        let title = m.attachments.title().unwrap();
+        assert!(title.contains("1. Screen Shot 1.png  1×1"), "{title}");
+    }
+
+    /// The reported failure: a screenshot dropped into the composer arrived as
+    /// a temporary path, the path rode along as text, and the model went
+    /// looking for a file macOS had already deleted. The picture is the
+    /// attachment; the path is not part of the message.
+    #[tokio::test]
+    async fn a_dropped_screenshot_path_does_not_travel_as_text() {
+        let mut m = model();
+        let kernel = input_kernel();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Outside the workspace, the way a screenshot temp folder is.
+        let outside = std::env::temp_dir().join(format!("medha-shot-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = drop_png(&outside, "Screen Shot 1.png");
+
+        m.input = format!("'{}' what is on my screen", path.display());
+        m.cursor = m.input.len();
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+
+        assert_eq!(
+            m.submit_deferred.as_deref(),
+            Some("what is on my screen"),
+            "the unreachable path must not reach the model"
+        );
+        let event = rx.recv().await.unwrap();
+        handle_agent_event(&mut m, event, &mut session, &mut transcript);
+        assert!(
+            m.attachments.holds(&path),
+            "the picture is what was attached"
+        );
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn a_path_inside_a_sentence_attaches_and_stays_in_the_sentence() {
+        let mut m = model();
+        let kernel = input_kernel();
+        let session = Session::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        drop_png(m.restore.root(), "shot.png");
+
+        handle_paste(
+            &mut m,
+            "why is shot.png misaligned?".into(),
+            &kernel,
+            &session,
+            &tx,
+        );
+        assert_eq!(m.input, "why is shot.png misaligned?");
+        assert!(m.attachments.is_loading());
+    }
+
+    /// Typed rather than dropped: the turn waits for admission instead of
+    /// sending the path as bare text.
+    #[tokio::test]
+    async fn enter_holds_the_turn_until_a_typed_path_is_admitted() {
+        let mut m = model();
+        let kernel = input_kernel();
+        let mut session = Session::new();
+        let mut transcript = vec![Message::system("S")];
+        let budget = Budget::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let path = drop_png(m.restore.root(), "typed.png");
+        m.input = "explain typed.png".into();
+        m.cursor = m.input.len();
+
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &kernel,
+            &mut session,
+            &mut transcript,
+            &budget,
+            &tx,
+        );
+        assert_eq!(m.submit_deferred.as_deref(), Some("explain typed.png"));
+        assert!(!m.running, "the turn waits for the image");
+
+        let event = rx.recv().await.unwrap();
+        handle_agent_event(&mut m, event, &mut session, &mut transcript);
+        assert!(m.attachments.holds(&path));
+        assert!(!m.attachments.is_loading());
     }
 
     #[test]
@@ -6992,7 +7342,7 @@ mod fix_tests {
                 detail: None,
                 escalated: false,
                 cancel: None,
-                responder: crate::tui_tea::ApprovalResponder::Network(tx),
+                responder: crate::tui_tea::ApprovalResponder::Access(tx),
             });
             m.approval_ready = true;
             handle_approval_key(&mut m, KeyEvent::new(key, KeyModifiers::NONE));
@@ -7010,7 +7360,7 @@ mod fix_tests {
             detail: None,
             escalated: false,
             cancel: None,
-            responder: crate::tui_tea::ApprovalResponder::Network(tx),
+            responder: crate::tui_tea::ApprovalResponder::Access(tx),
         });
         m.approval_ready = true;
         // Up from the first option wraps to the fourth (deny), not the third.

@@ -13,16 +13,11 @@ pub struct ContextBudget {
 }
 
 impl ContextBudget {
-    const PROVIDER_ESTIMATE_MARGIN_BPS: u32 = 200; // 2%
-    const LOCAL_ESTIMATE_MARGIN_BPS: u32 = 1_000; // 10%
-
     pub fn from_input_limit(input_limit: u32, quality: TokenCountQuality) -> Self {
-        let basis_points = match quality {
-            TokenCountQuality::Authoritative => 0,
-            TokenCountQuality::ProviderEstimate => Self::PROVIDER_ESTIMATE_MARGIN_BPS,
-            TokenCountQuality::LocalEstimate => Self::LOCAL_ESTIMATE_MARGIN_BPS,
-        };
-        let safety_buffer = input_limit.saturating_mul(basis_points) / 10_000;
+        let usable = kernel::ContextPressure::new(0, Some(input_limit), quality)
+            .usable_input_tokens
+            .expect("known input limit");
+        let safety_buffer = input_limit - usable;
         Self {
             input_limit,
             safety_buffer,

@@ -35,7 +35,7 @@ struct StreamOptions {
 #[derive(Serialize)]
 pub(crate) struct ChatMessage {
     pub role: &'static str,
-    pub content: String,
+    pub content: serde_json::Value,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<OutgoingToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,7 +153,7 @@ fn lower_chat_messages(
             Role::System => unreachable!("system messages were handled above"),
             Role::User => rest.push(ChatMessage {
                 role: "user",
-                content: lower_text_only(&message.parts, "user")?,
+                content: lower_user(&message.parts)?,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }),
@@ -168,7 +168,7 @@ fn lower_chat_messages(
     if !system.is_empty() {
         out.push(ChatMessage {
             role: "system",
-            content: system,
+            content: system.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -188,6 +188,58 @@ fn check_replay_state(states: &[ProviderState]) -> Result<(), ProviderError> {
         )));
     }
     Ok(())
+}
+
+fn lower_user(parts: &[ContentPart]) -> Result<serde_json::Value, ProviderError> {
+    use kernel::MediaSource;
+    use serde_json::json;
+    if !parts
+        .iter()
+        .any(|part| matches!(part, ContentPart::Media(_)))
+    {
+        return lower_text_only(parts, "user").map(Into::into);
+    }
+    let mut content = Vec::new();
+    for part in parts {
+        match part {
+            ContentPart::Text(text) => {
+                check_replay_state(&text.provider_state)?;
+                content.push(json!({"type": "text", "text": text.text}));
+            }
+            ContentPart::Media(media) => {
+                check_replay_state(&media.provider_state)?;
+                if !matches!(
+                    media.mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                ) {
+                    return Err(ProviderError::Decode(
+                        "open-ai-chat user images require PNG, JPEG, WebP, or GIF".into(),
+                    ));
+                }
+                let url = match &media.source {
+                    MediaSource::Url(url)
+                        if url.starts_with("https://") || url.starts_with("http://") =>
+                    {
+                        url.clone()
+                    }
+                    MediaSource::Base64(data) if !data.is_empty() => {
+                        format!("data:{};base64,{data}", media.mime_type)
+                    }
+                    MediaSource::Artifact(_) => {
+                        return Err(ProviderError::Decode(
+                            "image artifact must be resolved before provider encoding".into(),
+                        ));
+                    }
+                    _ => return Err(ProviderError::Decode("invalid image source".into())),
+                };
+                content.push(json!({"type": "image_url", "image_url": {"url": url}}));
+            }
+            _ => {
+                lower_text_only(std::slice::from_ref(part), "user")?;
+            }
+        }
+    }
+    Ok(content.into())
 }
 
 fn lower_text_only(parts: &[ContentPart], role: &str) -> Result<String, ProviderError> {
@@ -277,7 +329,7 @@ fn lower_assistant(
     }
     Ok(ChatMessage {
         role: "assistant",
-        content,
+        content: content.into(),
         tool_calls,
         tool_call_id: None,
     })
@@ -290,7 +342,7 @@ fn lower_tool_results(parts: &[ContentPart]) -> Result<Vec<ChatMessage>, Provide
     if !has_result {
         return Ok(vec![ChatMessage {
             role: "tool",
-            content: lower_text_only(parts, "tool")?,
+            content: lower_text_only(parts, "tool")?.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }]);
@@ -303,7 +355,7 @@ fn lower_tool_results(parts: &[ContentPart]) -> Result<Vec<ChatMessage>, Provide
                 check_replay_state(&part.provider_state)?;
                 messages.push(ChatMessage {
                     role: "tool",
-                    content: part.content.clone(),
+                    content: part.content.clone().into(),
                     tool_calls: Vec::new(),
                     tool_call_id: Some(part.tool_call_id.clone()),
                 });
@@ -387,6 +439,8 @@ struct ResponseError {
     message: Option<String>,
     #[serde(default, rename = "type")]
     kind: Option<String>,
+    #[serde(default)]
+    code: Option<serde_json::Value>,
 }
 
 #[derive(Default, Clone, Copy, Deserialize)]
@@ -401,6 +455,8 @@ struct UsageRaw {
 
 #[derive(Deserialize)]
 struct StreamChoice {
+    #[serde(default)]
+    finish_reason: Option<String>,
     #[serde(default)]
     delta: Delta,
 }
@@ -451,6 +507,8 @@ struct ChatCompletion {
 #[derive(Deserialize)]
 struct CompletionChoice {
     #[serde(default)]
+    finish_reason: Option<String>,
+    #[serde(default)]
     message: CompletionMessage,
 }
 
@@ -482,6 +540,7 @@ pub(crate) struct ResponseDecoder {
     accum: BTreeMap<u32, (String, String, String)>,
     target_announced: HashSet<u32>,
     think_filter: ThinkTagFilter,
+    completed: bool,
 }
 
 impl ResponseDecoder {
@@ -491,16 +550,26 @@ impl ResponseDecoder {
             accum: BTreeMap::new(),
             target_announced: HashSet::new(),
             think_filter: ThinkTagFilter::default(),
+            completed: false,
         }
     }
 
     pub(crate) fn push(&mut self, event: &SseEvent) -> Result<Vec<Block>, ProviderError> {
-        process_sse_event(
+        let blocks = process_sse_event(
             event,
             &mut self.accum,
             &mut self.think_filter,
             &mut self.target_announced,
-        )
+        )?;
+        if event.data.trim() == "[DONE]"
+            || serde_json::from_str::<StreamChunk>(&event.data)
+                .ok()
+                .and_then(|chunk| chunk.choices.into_iter().next())
+                .is_some_and(|choice| choice.finish_reason.is_some())
+        {
+            self.completed = true;
+        }
+        Ok(blocks)
     }
 
     /// Preserve visible text that the inline-thinking filter held while
@@ -509,17 +578,20 @@ impl ResponseDecoder {
         self.think_filter.flush()
     }
 
-    pub(crate) fn finish(mut self) -> Vec<Block> {
+    pub(crate) fn finish(mut self) -> Result<Vec<Block>, ProviderError> {
         let mut blocks = Vec::new();
         if let Some(block) = self.think_filter.flush() {
             blocks.push(block);
         }
-        blocks.extend(
-            finalize_tool_calls(self.accum, &self.names)
-                .into_iter()
-                .map(Block::ToolIntent),
-        );
-        blocks
+        let intents = finalize_tool_calls(self.accum, &self.names)?;
+        if !intents.is_empty() && !self.completed {
+            return Err(ProviderError::Stream(
+                "stream ended before completing the tool-call response; no tools were executed"
+                    .into(),
+            ));
+        }
+        blocks.extend(intents.into_iter().map(Block::ToolIntent));
+        Ok(blocks)
     }
 }
 
@@ -537,6 +609,7 @@ pub(crate) fn parse_completion(
 
     let mut blocks = Vec::new();
     if let Some(choice) = parsed.choices.into_iter().next() {
+        validate_finish_reason(choice.finish_reason.as_deref())?;
         let message = choice.message;
         if let Some(reasoning) = message
             .reasoning_content
@@ -563,15 +636,12 @@ pub(crate) fn parse_completion(
                 .id
                 .filter(|id| !id.is_empty())
                 .unwrap_or_else(|| format!("call_{index}"));
-            let arguments = match function.arguments {
-                Some(arguments) if !arguments.trim().is_empty() => serde_json::from_str(&arguments)
-                    .unwrap_or_else(|_| serde_json::json!({ "_raw": arguments })),
-                _ => serde_json::json!({}),
-            };
+            let arguments =
+                parse_tool_arguments(&name, function.arguments.as_deref().unwrap_or_default())?;
             blocks.push(Block::ToolIntent(ToolIntent {
                 id,
                 tool: names.get(&name).cloned().unwrap_or(name),
-                args: repair_args(arguments),
+                args: arguments,
             }));
         }
     }
@@ -582,11 +652,15 @@ pub(crate) fn parse_completion(
 }
 
 fn error_message(error: ResponseError) -> String {
-    match (error.message, error.kind) {
+    let message = match (error.message, error.kind) {
         (Some(message), Some(kind)) => format!("{message} ({kind})"),
         (Some(message), None) => message,
         (None, Some(kind)) => kind,
         (None, None) => "provider returned an error frame".to_string(),
+    };
+    match error.code.filter(|code| !code.is_null()) {
+        Some(code) => format!("{message} (code: {code})"),
+        None => message,
     }
 }
 
@@ -609,9 +683,9 @@ pub(crate) fn process_sse_event(
     if data.is_empty() || data == "[DONE]" {
         return Ok(blocks);
     }
-    let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
-        return Ok(blocks);
-    };
+    let chunk: StreamChunk = serde_json::from_str(data).map_err(|error| {
+        ProviderError::Decode(format!("invalid completion stream frame: {error}"))
+    })?;
     if let Some(error) = chunk.error {
         return Err(ProviderError::Response(error_message(error)));
     }
@@ -619,6 +693,7 @@ pub(crate) fn process_sse_event(
         blocks.push(usage_block(usage));
     }
     if let Some(choice) = chunk.choices.into_iter().next() {
+        validate_finish_reason(choice.finish_reason.as_deref())?;
         if let Some(reasoning) = choice
             .delta
             .reasoning_content
@@ -666,7 +741,7 @@ pub(crate) fn process_sse_event(
 pub(crate) fn finalize_tool_calls(
     accum: BTreeMap<u32, (String, String, String)>,
     names: &HashMap<String, String>,
-) -> Vec<ToolIntent> {
+) -> Result<Vec<ToolIntent>, ProviderError> {
     let mut intents = Vec::new();
     for (index, (id, name, arguments)) in accum {
         if name.is_empty() {
@@ -677,19 +752,43 @@ pub(crate) fn finalize_tool_calls(
         } else {
             id
         };
-        let arguments = if arguments.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&arguments)
-                .unwrap_or_else(|_| serde_json::json!({ "_raw": arguments }))
-        };
+        let arguments = parse_tool_arguments(&name, &arguments)?;
         intents.push(ToolIntent {
             id,
             tool: names.get(&name).cloned().unwrap_or(name),
-            args: repair_args(arguments),
+            args: arguments,
         });
     }
-    intents
+    Ok(intents)
+}
+
+fn validate_finish_reason(reason: Option<&str>) -> Result<(), ProviderError> {
+    match reason {
+        Some("length" | "max_tokens") => Err(ProviderError::Decode(
+            "model response was truncated at its output limit; no tools from this response were executed. Retry with smaller writes or adjust the output allowance".into(),
+        )),
+        Some("content_filter") => Err(ProviderError::Decode(
+            "provider filtered the response; no tools from this response were executed".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn parse_tool_arguments(name: &str, arguments: &str) -> Result<serde_json::Value, ProviderError> {
+    let value = if arguments.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(arguments).map_err(|error| ProviderError::Decode(format!(
+            "invalid or incomplete JSON arguments for tool '{name}': {error}; no tools from this response were executed",
+        )))?
+    };
+    let value = repair_args(value);
+    if !value.is_object() {
+        return Err(ProviderError::Decode(format!(
+            "arguments for tool '{name}' must be a JSON object; no tools from this response were executed"
+        )));
+    }
+    Ok(value)
 }
 
 pub(crate) fn repair_args(arguments: serde_json::Value) -> serde_json::Value {
@@ -865,6 +964,119 @@ impl ThinkTagFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_tool_json_is_rejected_in_both_response_modes() {
+        let arguments = r#"{"path":"build_deck.js","content":"unfinished"#;
+        let body = serde_json::json!({"choices":[{"message":{"tool_calls":[
+            {"id":"write","function":{"name":"fs_write","arguments":arguments}}
+        ]}}]})
+        .to_string();
+        let error = parse_completion(&body, &HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("incomplete JSON arguments"));
+        assert!(error.to_string().contains("fs_write"));
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        decoder
+            .push(&SseEvent {
+                event: None,
+                data: serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"write","function":{"name":"fs_write","arguments":arguments}}
+                ]}}]})
+                .to_string(),
+            })
+            .unwrap();
+        assert!(
+            decoder
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete JSON arguments")
+        );
+    }
+
+    #[test]
+    fn invalid_parallel_call_never_yields_a_partial_executable_batch() {
+        let accum = BTreeMap::from([
+            (
+                0,
+                (
+                    "a".into(),
+                    "fs_write".into(),
+                    r#"{"path":"a","content":"ok"}"#.into(),
+                ),
+            ),
+            (1, ("b".into(), "fs_write".into(), r#"{"path":"b"#.into())),
+        ]);
+        assert!(finalize_tool_calls(accum, &HashMap::new()).is_err());
+        assert!(parse_tool_arguments("fs_write", "[]").is_err());
+    }
+
+    #[test]
+    fn output_truncation_is_a_fatal_diagnostic_not_a_missing_path() {
+        let body = r#"{"choices":[{"finish_reason":"length","message":{"content":"partial"}}]}"#;
+        let error = parse_completion(body, &HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("truncated at its output limit"));
+        assert!(!error.is_retryable());
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        let error = decoder
+            .push(&SseEvent {
+                event: None,
+                data: r#"{"choices":[{"finish_reason":"length","delta":{}}]}"#.into(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("truncated at its output limit"));
+    }
+
+    #[test]
+    fn clean_eof_cannot_authorize_an_unfinished_tool_batch() {
+        let event = SseEvent {
+            event: None,
+            data: serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"write","function":{"name":"fs_write","arguments":"{}"}}
+            ]}}]})
+            .to_string(),
+        };
+        let mut incomplete = ResponseDecoder::new(HashMap::new());
+        incomplete.push(&event).unwrap();
+        assert!(matches!(incomplete.finish(), Err(ProviderError::Stream(_))));
+        for terminal in [
+            r#"{"choices":[{"finish_reason":"tool_calls","delta":{}}]}"#,
+            "[DONE]",
+        ] {
+            let mut complete = ResponseDecoder::new(HashMap::new());
+            complete.push(&event).unwrap();
+            complete
+                .push(&SseEvent {
+                    event: None,
+                    data: terminal.into(),
+                })
+                .unwrap();
+            assert!(
+                complete
+                    .finish()
+                    .unwrap()
+                    .iter()
+                    .any(|b| matches!(b, Block::ToolIntent(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn in_band_error_preserves_the_structured_context_code() {
+        let body = r#"{"error":{"message":"request too large","code":"context_length_exceeded"}}"#;
+        let error = parse_completion(body, &HashMap::new()).unwrap_err();
+        assert!(error.is_context_overflow());
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        assert!(
+            decoder
+                .push(&SseEvent {
+                    event: None,
+                    data: body.into()
+                })
+                .unwrap_err()
+                .is_context_overflow()
+        );
+    }
     use kernel::{
         BlastRadius, MediaPart, MediaSource, Message, ProviderState, TextPart, ToolCallPart,
         ToolCategory, ToolIntent, ToolResultPart, ToolSpec,
@@ -1028,24 +1240,23 @@ mod tests {
     }
 
     #[test]
-    fn ordered_media_is_rejected_until_chat_media_lowering_exists() {
+    fn ordered_user_image_is_lowered_to_chat_content() {
         let messages = vec![ModelMessage {
             role: Role::User,
             parts: vec![ContentPart::Media(MediaPart {
                 mime_type: "image/png".into(),
                 source: MediaSource::Url("https://example.test/image.png".into()),
+                label: None,
                 provider_state: Vec::new(),
             })],
             trust: None,
         }];
 
-        let error = lower_chat_messages(&messages, &HashMap::new())
-            .err()
-            .expect("media must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("media lowering is not implemented")
+        let lowered = lower_chat_messages(&messages, &HashMap::new()).unwrap();
+        assert_eq!(lowered[0].content[0]["type"], "image_url");
+        assert_eq!(
+            lowered[0].content[0]["image_url"]["url"],
+            "https://example.test/image.png"
         );
     }
 

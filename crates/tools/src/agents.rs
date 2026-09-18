@@ -138,6 +138,34 @@ impl kernel::Executor for Rebound {
         self.inner.containment()
     }
 
+    fn missing_access(
+        &self,
+        intent: &kernel::ToolIntent,
+    ) -> Result<kernel::ExecutionAccess, String> {
+        self.inner.missing_access(intent)
+    }
+
+    async fn grant_access(
+        &self,
+        access: &kernel::ExecutionAccess,
+        detail: &str,
+        escalated: bool,
+    ) -> Result<kernel::NetworkDecision, String> {
+        self.inner.grant_access(access, detail, escalated).await
+    }
+
+    fn allows_network_retry(&self, intent: &kernel::ToolIntent) -> bool {
+        self.inner.allows_network_retry(intent)
+    }
+
+    async fn grant_network(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        self.inner.grant_network(detail, escalated).await
+    }
+
     async fn execute(&self, intent: &kernel::ToolIntent) -> kernel::Observation {
         let Some(tool) = self.tools.get(&intent.tool) else {
             return self.inner.execute(intent).await;

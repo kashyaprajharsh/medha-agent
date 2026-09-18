@@ -15,6 +15,7 @@ pub mod provider;
 pub mod sink;
 pub mod types;
 pub mod verify;
+pub mod vision;
 
 #[path = "loop_.rs"]
 pub mod kernel_loop;
@@ -24,7 +25,7 @@ pub use budgets::{Budget, BudgetHandle, BudgetStop, DEFAULT_MAX_TURNS, Governor,
 pub use clarify::{Answer, Asker, NoAsker, QOption, Question};
 pub use context::{
     AuthorizedContextPath, CompileControl, CompileResult, ContextCompileError, ContextEngine,
-    DiscoveredContext, ProgressiveContext, ProgressiveContextPathAuthorizer,
+    ContextPressure, DiscoveredContext, ProgressiveContext, ProgressiveContextPathAuthorizer,
 };
 pub use errors::KernelError;
 pub use events::{
@@ -34,16 +35,17 @@ pub use events::{
 };
 pub use executor::{BackgroundTask, Executor};
 pub use gate::{
-    Approval, AutoDeny, HumanGate, NetworkDecision, network_once_active, network_once_scope,
+    Approval, AutoDeny, ExecutionAccess, HumanGate, NetworkDecision, execution_access,
+    execution_access_scope, network_once_active, network_once_scope,
 };
 pub use interrupts::{Activity, Interrupt, InterruptHandle, InterruptQueue};
-pub use kernel_loop::{DEFAULT_MAX_PARALLEL_TOOLS, Kernel, StopReason};
+pub use kernel_loop::{DEFAULT_MAX_PARALLEL_TOOLS, Kernel, SPILL_THRESHOLD, StopReason};
 pub use policy::{AllowAll, Policy};
 pub use progress::{Phase, Progress, ProgressHandle, ProgressWatch};
 pub use provider::{
-    InputTokenCount, ModelLimits, PreparedModelRequest, Protocol, Provider, ProviderCaps,
-    ProviderError, ProviderFailure, ReasoningConfig, ReasoningEffort, ReasoningSupport,
-    TokenAccountingMode, TokenCountError, TokenCountQuality, ToolCallStrategy,
+    ImageSupport, InputTokenCount, ModelLimits, PreparedModelRequest, Protocol, Provider,
+    ProviderCaps, ProviderError, ProviderFailure, ReasoningConfig, ReasoningEffort,
+    ReasoningSupport, TokenAccountingMode, TokenCountError, TokenCountQuality, ToolCallStrategy,
 };
 pub use sink::{NullSink, StreamSink};
 pub use types::{
@@ -54,3 +56,4 @@ pub use types::{
     canonical_tool_names, portable_tool_name, portable_tool_name_map,
 };
 pub use verify::{NoVerify, Verifier, VerifyReport};
+pub use vision::{NoVision, VisionDescriber, describe_media};

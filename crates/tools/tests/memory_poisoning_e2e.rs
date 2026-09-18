@@ -21,7 +21,7 @@ impl ScriptedProvider {
     fn new(turns: Vec<Vec<Block>>) -> Self {
         Self {
             caps: ProviderCaps {
-                vision: false,
+                images: kernel::ImageSupport::Unsupported,
                 caching: false,
                 max_ctx: None,
                 tool_calls: ToolCallStrategy::Native,

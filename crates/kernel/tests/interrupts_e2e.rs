@@ -30,7 +30,7 @@ impl ScriptedProvider {
     fn new(turns: Vec<Turn>) -> Self {
         Self {
             caps: ProviderCaps {
-                vision: false,
+                images: kernel::ImageSupport::Unsupported,
                 caching: false,
                 max_ctx: None,
                 tool_calls: ToolCallStrategy::Native,
@@ -77,6 +77,7 @@ impl Executor for SleepyExecutor {
             intent_id: intent.id.clone(),
             status: ObsStatus::Ok,
             payload: json!({ "ok": true, "tool": intent.tool }),
+            media: Vec::new(),
             relayed_trust: None,
             net_denied: false,
         }

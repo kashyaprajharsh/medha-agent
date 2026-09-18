@@ -3,6 +3,12 @@
 use serde_json::Value;
 
 pub trait StreamSink: Send + Sync {
+    /// Compiler pressure for the request being prepared, including its limit
+    /// and count quality. Surfaces must not recompute a competing budget.
+    fn context_pressure(&self, _pressure: crate::context::ContextPressure) {}
+    /// How the turn is being run, when that differs from what was asked —
+    /// an image described instead of sent, for instance. Not model output.
+    fn notice(&self, _text: &str) {}
     /// A fragment of model text as it streams in.
     fn text(&self, _delta: &str) {}
     /// A fragment of reasoning/thinking content, when the model streams one

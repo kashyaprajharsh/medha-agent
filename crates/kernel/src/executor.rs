@@ -48,6 +48,25 @@ pub trait Executor: Send + Sync {
     /// Execute one validated intent and return its observation.
     async fn execute(&self, intent: &ToolIntent) -> Observation;
 
+    /// Validate requested capabilities and return the subset not already granted.
+    fn missing_access(&self, _intent: &ToolIntent) -> Result<crate::ExecutionAccess, String> {
+        Ok(crate::ExecutionAccess::default())
+    }
+
+    async fn grant_access(
+        &self,
+        _access: &crate::ExecutionAccess,
+        _detail: &str,
+        _escalated: bool,
+    ) -> Result<NetworkDecision, String> {
+        Ok(NetworkDecision::Deny)
+    }
+
+    /// Arbitrary shell commands may have partial side effects and must not replay.
+    fn allows_network_retry(&self, _intent: &ToolIntent) -> bool {
+        true
+    }
+
     /// Prompt to grant the sandbox network access and retry after a command
     /// failed under a net-denying jail. A session or persistent grant flips the
     /// shared network flag (and, for persistent, records it durably) so the retry

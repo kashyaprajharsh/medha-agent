@@ -12,7 +12,7 @@ use kernel::ProviderError;
 use crate::{AuthKind, ProviderProfile};
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
-const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Bound successful non-streaming responses before allocating their full body.
 pub(crate) async fn response_text(response: reqwest::Response) -> Result<String, ProviderError> {
@@ -263,6 +263,9 @@ fn redacted_json(mut value: serde_json::Value) -> serde_json::Value {
             for value in values {
                 *value = redacted_json(std::mem::take(value));
             }
+        }
+        serde_json::Value::String(text) if text.starts_with("data:image/") => {
+            *text = REDACTED.into();
         }
         _ => {}
     }

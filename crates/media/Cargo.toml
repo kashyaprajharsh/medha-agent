@@ -1,0 +1,23 @@
+[package]
+name = "media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# Only for the shared transmission ceiling, so admission and the request path
+# cannot drift to two different limits.
+kernel.workspace = true
+# Pure-Rust codecs only: HEIC/AVIF need a C library and are reported as
+# unsupported rather than linked in.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
+    "ico",
+] }

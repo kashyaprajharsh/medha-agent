@@ -469,9 +469,11 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
             ordered: None,
             tools: Vec::new(),
         };
-        self.run(&ctx, Some(self.output_cap())).await?.ok_or_else(|| {
-            SummarizeError::Unavailable("summary input exceeds its token budget".into())
-        })
+        self.run(&ctx, Some(self.output_cap()))
+            .await?
+            .ok_or_else(|| {
+                SummarizeError::Unavailable("summary input exceeds its token budget".into())
+            })
     }
 
     async fn summarize_replaying(

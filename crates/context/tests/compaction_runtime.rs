@@ -387,7 +387,11 @@ async fn a_replay_uses_the_conversation_allowance_instead_of_falling_back_to_a_f
         .await;
     assert_eq!(summary.unwrap(), "SUMMARY");
     let requests = endpoint.sent.lock().unwrap();
-    assert_eq!(requests.len(), 1, "the replay is sent, never re-sent flattened");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the replay is sent, never re-sent flattened"
+    );
     assert_eq!(
         requests[0].context.messages.len(),
         3,

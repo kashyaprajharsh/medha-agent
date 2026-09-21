@@ -55,6 +55,8 @@ pub struct PipelineEngine {
     last_summary: std::sync::Mutex<Option<String>>,
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
     tool_overhead: AtomicU32,
+    /// The last context sent, replayed by a compaction summary.
+    last_request: std::sync::Mutex<Option<Arc<kernel::CompiledContext>>>,
     /// Frozen startup sheaths refresh only at full compaction.
     full_compaction_refresh: Option<Arc<SystemRefresh>>,
 }
@@ -89,6 +91,7 @@ impl PipelineEngine {
             last_summary: std::sync::Mutex::new(None),
             artifacts: None,
             tool_overhead: AtomicU32::new(0),
+            last_request: std::sync::Mutex::new(None),
             full_compaction_refresh: None,
         }
     }
@@ -203,6 +206,7 @@ impl ContextEngine for PipelineEngine {
             self.ineffective_full.store(false, Ordering::Relaxed);
             self.latched_at.store(0, Ordering::Relaxed);
             *self.last_summary.lock().unwrap() = None;
+            *self.last_request.lock().unwrap() = None;
             *self.pressure.lock().unwrap() = None;
             self.clear_preflight();
         }
@@ -278,6 +282,12 @@ impl ContextEngine for PipelineEngine {
             })
             .sum();
         self.tool_overhead.store(n, Ordering::Relaxed);
+    }
+
+    fn note_request(&self, ctx: &kernel::CompiledContext) {
+        if let Ok(mut slot) = self.last_request.lock() {
+            *slot = Some(Arc::new(ctx.clone()));
+        }
     }
 
     async fn compile(&self, messages: &[Message], max_input_tokens: Option<u32>) -> CompileResult {
@@ -480,7 +490,7 @@ impl PipelineEngine {
                             .and_then(|s| s.put(m.content.as_bytes()).ok())
                         {
                             Some(hash) => format!(
-                                "[tool output pruned to save context — {toks} tokens. Re-read with read_artifact hash=\"{hash}\"]"
+                                "[tool output pruned to save context — {toks} tokens. Re-read with read hash=\"{hash}\"]"
                             ),
                             None => format!(
                                 "[earlier tool output pruned to save context — {toks} tokens]"
@@ -506,10 +516,30 @@ impl PipelineEngine {
                     .map(|tracked| msg_to_item(&tracked.message))
                     .collect();
                 let previous = self.last_summary.lock().ok().and_then(|g| g.clone());
+                let sent = self.last_request.lock().ok().and_then(|slot| slot.clone());
+                let anchor = middle
+                    .iter()
+                    .rev()
+                    .find_map(|tracked| anchor_words(&tracked.message.content));
+                let summary = async {
+                    match sent.as_deref() {
+                        Some(sent) => {
+                            self.summarizer
+                                .summarize_replaying(
+                                    previous.as_deref(),
+                                    &items,
+                                    sent,
+                                    anchor.as_deref(),
+                                )
+                                .await
+                        }
+                        None => self.summarizer.summarize(previous.as_deref(), &items).await,
+                    }
+                };
                 let primary = control
                     .run(tokio::time::timeout(
                         std::time::Duration::from_secs(60),
-                        self.summarizer.summarize(previous.as_deref(), &items),
+                        summary,
                     ))
                     .await?;
                 let text = match primary {
@@ -910,6 +940,13 @@ fn dedupe_tracked_tool_outputs(
     out
 }
 
+/// The opening words of a message, quoted so a replayed summary can be told
+/// where to stop. `None` when the message carries no text to anchor on.
+fn anchor_words(content: &str) -> Option<String> {
+    let words: Vec<&str> = content.split_whitespace().take(12).collect();
+    (!words.is_empty()).then(|| format!("{:?}", words.join(" ")))
+}
+
 fn msg_to_item(m: &Message) -> HistoryItem {
     let kind = if m.role == Role::Tool {
         ItemKind::ToolOutput
@@ -1022,7 +1059,7 @@ mod tests {
             String::new(),
             vec![ToolIntent {
                 id: "1".into(),
-                tool: "fs.write".into(),
+                tool: "edit".into(),
                 args: big_args,
             }],
         ));
@@ -1203,6 +1240,104 @@ mod tests {
         assert!(result.compacted && result.summarized && !result.overflow);
         assert!(result.summary.is_some());
         assert_eq!(summarizer.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Default)]
+    struct ReplayProbe {
+        replayed: std::sync::Mutex<Vec<(usize, Option<String>)>>,
+        plain: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Summarizer for ReplayProbe {
+        async fn summarize(
+            &self,
+            _previous: Option<&str>,
+            _i: &[HistoryItem],
+        ) -> Result<String, crate::compactor::SummarizeError> {
+            self.plain.fetch_add(1, Ordering::SeqCst);
+            Ok("SUMMARY".to_string())
+        }
+        async fn summarize_replaying(
+            &self,
+            _previous: Option<&str>,
+            _i: &[HistoryItem],
+            sent: &kernel::CompiledContext,
+            anchor: Option<&str>,
+        ) -> Result<String, crate::compactor::SummarizeError> {
+            self.replayed
+                .lock()
+                .unwrap()
+                .push((sent.messages.len(), anchor.map(str::to_string)));
+            Ok("SUMMARY".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn full_compaction_replays_the_sent_context_and_anchors_on_the_last_summarized_message() {
+        use kernel::ContextEngine;
+        let probe = Arc::new(ReplayProbe::default());
+        let eng = engine(full_policy()).with_summarizer(probe.clone());
+        let history = full_compaction_history();
+        eng.note_request(&kernel::CompiledContext {
+            model: String::new(),
+            messages: history.clone(),
+            ordered: None,
+            tools: Vec::new(),
+        });
+        let result = eng.compile(&history, Some(local_input_limit(1_300))).await;
+        assert!(result.compacted && result.summarized);
+        let replayed = probe.replayed.lock().unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].0, history.len());
+        let anchor = replayed[0].1.as_deref().expect("an anchor is derived");
+        // The anchor opens a summarized message, never one kept verbatim.
+        assert!(anchor.starts_with('"') && anchor.contains("ask "));
+        assert!(!anchor.contains("FINAL"));
+        assert_eq!(probe.plain.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn anchor_words_quotes_leading_text_and_skips_messages_without_any() {
+        assert_eq!(
+            anchor_words("  read the  config file  ").as_deref(),
+            Some("\"read the config file\"")
+        );
+        assert_eq!(anchor_words("   ").as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn a_scope_change_drops_the_recorded_request_so_another_conversation_is_never_replayed() {
+        use kernel::ContextEngine;
+        let probe = Arc::new(ReplayProbe::default());
+        let eng = engine(full_policy()).with_summarizer(probe.clone());
+        let history = full_compaction_history();
+        eng.begin_request("session-a:route:model:limits");
+        eng.note_request(&kernel::CompiledContext {
+            model: String::new(),
+            messages: vec![Message::system("SYSTEM"), user("another conversation")],
+            ordered: None,
+            tools: Vec::new(),
+        });
+        eng.begin_request("session-b:route:model:limits");
+        let result = eng.compile(&history, Some(local_input_limit(1_300))).await;
+        assert!(result.compacted && result.summarized);
+        assert!(
+            probe.replayed.lock().unwrap().is_empty(),
+            "a context recorded under another scope must never be replayed"
+        );
+        assert_eq!(probe.plain.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn full_compaction_without_a_sent_context_falls_back_to_the_plain_summarizer() {
+        let probe = Arc::new(ReplayProbe::default());
+        let eng = engine(full_policy()).with_summarizer(probe.clone());
+        let result = eng
+            .compile(&full_compaction_history(), Some(local_input_limit(1_300)))
+            .await;
+        assert!(result.compacted && result.summarized);
+        assert_eq!(probe.plain.load(Ordering::SeqCst), 1);
+        assert!(probe.replayed.lock().unwrap().is_empty());
     }
 
     struct RecordingSummarizer(std::sync::Mutex<Vec<Option<String>>>);
@@ -1564,9 +1699,7 @@ mod tests {
             r.summarized
         );
         assert!(
-            r.messages
-                .iter()
-                .any(|m| m.content.contains("read_artifact hash=")),
+            r.messages.iter().any(|m| m.content.contains("read hash=")),
             "pruned tool output must be spilled + re-fetchable"
         );
     }
@@ -1576,7 +1709,7 @@ mod tests {
         let eng = engine(CompactionPolicy::default());
         let call = ToolIntent {
             id: "c1".into(),
-            tool: "fs.read".into(),
+            tool: "read".into(),
             args: serde_json::json!({}),
         };
         let msgs = vec![
@@ -1668,7 +1801,7 @@ mod tests {
             msgs.push(user(&format!("ask {i} {}", "y".repeat(400))));
             let call = ToolIntent {
                 id: format!("c{i}"),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: serde_json::json!({}),
             };
             msgs.push(Message::assistant_calls("", vec![call]));
@@ -1709,7 +1842,7 @@ mod tests {
         let mut msgs = vec![Message::system("SYSTEM"), user("first ask")];
         let head_call = ToolIntent {
             id: "head".into(),
-            tool: "fs.read".into(),
+            tool: "read".into(),
             args: serde_json::json!({}),
         };
         msgs.push(Message::assistant_calls("", vec![head_call]));
@@ -1718,7 +1851,7 @@ mod tests {
             msgs.push(user(&format!("ask {i} {}", "y".repeat(400))));
             let call = ToolIntent {
                 id: format!("c{i}"),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: serde_json::json!({}),
             };
             msgs.push(Message::assistant_calls("", vec![call]));
@@ -1754,7 +1887,7 @@ mod tests {
         let calls = vec![
             ToolIntent {
                 id: "parallel-a".into(),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: serde_json::json!({}),
             },
             ToolIntent {
@@ -1774,7 +1907,7 @@ mod tests {
             msgs.push(user(&format!("ask {i} {}", "y".repeat(400))));
             let call = ToolIntent {
                 id: format!("middle-{i}"),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: serde_json::json!({}),
             };
             msgs.push(Message::assistant_calls("", vec![call]));
@@ -1849,7 +1982,7 @@ mod tests {
                 &[("write foo", "in_progress"), ("write bar", "pending")],
             ),
             vec![user("working on foo")],
-            work_turn("w1", "fs.write", "wrote foo"),
+            work_turn("w1", "edit", "wrote foo"),
             update_plan_turn(
                 "p2",
                 &[("write foo", "completed"), ("write bar", "in_progress")],
@@ -1875,7 +2008,7 @@ mod tests {
     fn microcompact_emits_one_marker_per_step_completed_in_the_same_window() {
         let turns = vec![
             update_plan_turn("p1", &[("a", "in_progress"), ("b", "pending")]),
-            work_turn("w1", "fs.write", "did both"),
+            work_turn("w1", "edit", "did both"),
             update_plan_turn("p2", &[("a", "completed"), ("b", "completed")]),
         ];
         let out = microcompact(&turns);
@@ -1899,12 +2032,12 @@ mod tests {
         let calls = vec![
             ToolIntent {
                 id: "a".into(),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: serde_json::json!({}),
             },
             ToolIntent {
                 id: "b".into(),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: serde_json::json!({}),
             },
         ];
@@ -1936,12 +2069,12 @@ mod tests {
         let calls = vec![
             ToolIntent {
                 id: "a".into(),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: serde_json::json!({}),
             },
             ToolIntent {
                 id: "b".into(),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: serde_json::json!({}),
             },
         ];
@@ -1984,7 +2117,7 @@ mod tests {
         });
         let mut msgs = vec![Message::system("S")];
         msgs.extend(update_plan_turn("p1", &[("big task", "in_progress")]));
-        msgs.extend(work_turn("w0", "fs.read", &"a".repeat(15_000)));
+        msgs.extend(work_turn("w0", "read", &"a".repeat(15_000)));
         msgs.extend(update_plan_turn("p2", &[("big task", "completed")]));
         msgs.push(user("LAST"));
 

@@ -366,3 +366,31 @@ async fn summary_generation_is_bounded_and_oversized_summary_input_never_sends()
     assert!(summarizer.summarize(None, &small).await.is_ok());
     assert_eq!(endpoint.sent.lock().unwrap()[0].body["max_tokens"], 2048);
 }
+
+#[tokio::test]
+async fn a_replay_uses_the_conversation_allowance_instead_of_falling_back_to_a_flattened_copy() {
+    use ::context::{HistoryItem, LlmSummarizer, Summarizer};
+    let endpoint = Endpoint::new(8_000, vec![vec![Block::Text("SUMMARY".into())]]);
+    let summarizer = LlmSummarizer::new(endpoint.clone());
+    // Sized past the summary-only allowance (8_000 - 2_048) but inside the
+    // conversation's own, which is what a replayed body already fit under.
+    let filler = "word ".repeat(5_600);
+    let sent = CompiledContext {
+        model: String::new(),
+        messages: vec![Message::system("SYSTEM"), Message::user(&filler)],
+        ordered: None,
+        tools: Vec::new(),
+    };
+    let items = vec![HistoryItem::text(Role::User, filler.clone())];
+    let summary = summarizer
+        .summarize_replaying(None, &items, &sent, Some("\"word word word\""))
+        .await;
+    assert_eq!(summary.unwrap(), "SUMMARY");
+    let requests = endpoint.sent.lock().unwrap();
+    assert_eq!(requests.len(), 1, "the replay is sent, never re-sent flattened");
+    assert_eq!(
+        requests[0].context.messages.len(),
+        3,
+        "the replay carries the sent messages plus one trailing instruction"
+    );
+}

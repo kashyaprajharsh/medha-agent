@@ -88,6 +88,18 @@ pub trait Summarizer: Send + Sync {
         previous: Option<&str>,
         items: &[HistoryItem],
     ) -> Result<String, SummarizeError>;
+
+    /// Summarize by replaying the last sent context and appending only the
+    /// instruction. `anchor` opens the last message that belongs in the summary.
+    async fn summarize_replaying(
+        &self,
+        previous: Option<&str>,
+        items: &[HistoryItem],
+        _sent: &kernel::CompiledContext,
+        _anchor: Option<&str>,
+    ) -> Result<String, SummarizeError> {
+        self.summarize(previous, items).await
+    }
 }
 
 pub fn total_tokens(items: &[HistoryItem], counter: &dyn TokenCounter) -> u32 {
@@ -280,16 +292,28 @@ fn role_label(role: &Role) -> &'static str {
     }
 }
 
-#[async_trait]
-impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
-    async fn summarize(
-        &self,
-        previous: Option<&str>,
-        items: &[HistoryItem],
-    ) -> Result<String, SummarizeError> {
-        use futures::StreamExt;
-        use kernel::{Block, CompiledContext, Message};
+/// The trailing instruction appended after a replayed prefix. `anchor` opens the
+/// last message to summarize; without one the whole replay is in scope, which
+/// re-covers the verbatim tail rather than risking a short summary.
+fn replay_instruction(previous: Option<&str>, anchor: Option<&str>) -> String {
+    let base = crate::prompts::compaction_summary();
+    let prev = previous.map_or_else(String::new, |prev| {
+        format!("\n\n=== previous summary (update it) ===\n{prev}")
+    });
+    let scope = anchor.map_or_else(
+        || "\n\nSummarize the conversation above.".to_string(),
+        |anchor| {
+            format!(
+                "\n\nSummarize the conversation above, ending with the message that \
+                 begins: {anchor}\nMessages after it are kept verbatim — do not summarize them."
+            )
+        },
+    );
+    format!("{base}{prev}{scope}")
+}
 
+impl<P: kernel::Provider + 'static> LlmSummarizer<P> {
+    fn blob(previous: Option<&str>, items: &[HistoryItem]) -> Result<String, SummarizeError> {
         let mut body = String::new();
         if let Some(prev) = previous {
             if prev.len() > MAX_SUMMARY_INPUT_BYTES {
@@ -317,29 +341,37 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
             body.push_str(&it.content);
             body.push('\n');
         }
+        Ok(body)
+    }
 
-        let ctx = CompiledContext {
-            model: String::new(),
-            messages: vec![
-                Message::system(crate::prompts::compaction_summary()),
-                Message::user(body),
-            ],
-            ordered: None,
-            tools: Vec::new(),
-        };
-        let limits = self.provider.model_limits();
-        let output_cap = self
-            .provider
+    fn output_cap(&self) -> u64 {
+        self.provider
             .requested_output_tokens()
             .map_or(SUMMARY_OUTPUT_TOKENS, |limit| {
                 limit.min(SUMMARY_OUTPUT_TOKENS)
-            });
-        let input_limit = limits.input_allowance(Some(output_cap)).ok_or_else(|| {
+            })
+    }
+
+    /// One request; `Ok(None)` means it did not fit the budget and was not sent.
+    /// `input_reserve` is the output reservation the allowance is derived from —
+    /// a replay passes the conversation's own, since it resends a body that
+    /// already fit under it.
+    async fn run(
+        &self,
+        ctx: &kernel::CompiledContext,
+        input_reserve: Option<u64>,
+    ) -> Result<Option<String>, SummarizeError> {
+        use futures::StreamExt;
+        use kernel::Block;
+
+        let limits = self.provider.model_limits();
+        let output_cap = self.output_cap();
+        let input_limit = limits.input_allowance(input_reserve).ok_or_else(|| {
             SummarizeError::Unavailable("summary model context limit is unknown".into())
         })?;
         let request = self
             .provider
-            .prepare_request(&ctx)
+            .prepare_request(ctx)
             .map_err(|error| SummarizeError::Unavailable(error.to_string()))?;
         let request = self
             .provider
@@ -381,9 +413,7 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
             quality,
         );
         if tokens >= u64::from(budget.usable_input_tokens.unwrap_or(0)) {
-            return Err(SummarizeError::Unavailable(
-                "summary input exceeds its token budget".into(),
-            ));
+            return Ok(None);
         }
         let mut stream = self
             .provider
@@ -417,7 +447,63 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
                 "model returned empty summary".into(),
             ));
         }
-        Ok(text)
+        Ok(Some(text))
+    }
+}
+
+#[async_trait]
+impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
+    async fn summarize(
+        &self,
+        previous: Option<&str>,
+        items: &[HistoryItem],
+    ) -> Result<String, SummarizeError> {
+        use kernel::{CompiledContext, Message};
+
+        let ctx = CompiledContext {
+            model: String::new(),
+            messages: vec![
+                Message::system(crate::prompts::compaction_summary()),
+                Message::user(Self::blob(previous, items)?),
+            ],
+            ordered: None,
+            tools: Vec::new(),
+        };
+        self.run(&ctx, Some(self.output_cap())).await?.ok_or_else(|| {
+            SummarizeError::Unavailable("summary input exceeds its token budget".into())
+        })
+    }
+
+    async fn summarize_replaying(
+        &self,
+        previous: Option<&str>,
+        items: &[HistoryItem],
+        sent: &kernel::CompiledContext,
+        anchor: Option<&str>,
+    ) -> Result<String, SummarizeError> {
+        if previous.is_some_and(|prev| prev.len() > MAX_SUMMARY_INPUT_BYTES) {
+            return Err(SummarizeError::Unavailable(
+                "previous summary exceeds the compactor input limit".into(),
+            ));
+        }
+        let instruction = kernel::Message::user(replay_instruction(previous, anchor));
+        let mut ctx = sent.clone();
+        if let Some(ordered) = ctx.ordered.as_mut() {
+            ordered.push(instruction.ordered());
+        }
+        ctx.messages.push(instruction);
+        let reserve = self.provider.requested_output_tokens();
+        if let Some(text) = self.run(&ctx, reserve).await? {
+            tracing::info!(
+                messages = ctx.messages.len(),
+                tools = ctx.tools.len(),
+                anchored = anchor.is_some(),
+                "compaction replayed the last sent context"
+            );
+            return Ok(text);
+        }
+        tracing::info!("compaction replay exceeded its budget; summarizing a flattened copy");
+        self.summarize(previous, items).await
     }
 }
 

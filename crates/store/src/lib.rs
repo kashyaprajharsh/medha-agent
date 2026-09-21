@@ -19,6 +19,26 @@ use ulid::Ulid;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Connection-local proof that the complete chain was authenticated. External
+/// commits change data_version; local DML (including rolled-back writes) changes
+/// total_changes. Never compare this stamp across different connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerifiedVersion {
+    data_version: i64,
+    total_changes: u64,
+}
+
+impl VerifiedVersion {
+    fn read(conn: &Connection) -> Result<Self, StoreError> {
+        Ok(Self {
+            data_version: conn
+                .query_row("PRAGMA main.data_version", [], |row| row.get(0))
+                .map_err(|error| StoreError::Db(error.to_string()))?,
+            total_changes: conn.total_changes(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SessionSearchHit {
     pub session_id: Ulid,
@@ -443,6 +463,11 @@ pub enum StoreError {
 #[derive(Clone)]
 pub struct SqliteLog {
     conn: Arc<Mutex<Connection>>,
+    /// Always lock conn before this cache. Clones share both the connection and
+    /// its verification stamp; no event payloads are retained in memory.
+    verified_version: Arc<Mutex<Option<VerifiedVersion>>>,
+    #[cfg(test)]
+    verification_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Async callers acquire this permit before entering the blocking pool.
     /// This keeps contention on one SQLite connection from consuming an
     /// unbounded number of blocking workers; callers cancelled while queued
@@ -533,6 +558,9 @@ impl SqliteLog {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            verified_version: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            verification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             runtime_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             mutation_lock,
             global_mutation_lock,
@@ -593,12 +621,45 @@ impl SqliteLog {
     /// Each event must link to the running hash and recompute to its stored hash,
     /// so an edit to any row is detected. Call on open and on session resume.
     pub fn verify(&self) -> Result<(), StoreError> {
-        let conn = self
+        self.with_verified_snapshot(true, |_| Ok(()))
+    }
+
+    /// Reserve the writer before reading the version so an external commit
+    /// cannot race the cache check and snapshot selection. Keep the reservation
+    /// through the query. Warm session reads hold it only for an indexed lookup;
+    /// cold verification still blocks writers while it authenticates the chain.
+    fn with_verified_snapshot<T>(
+        &self,
+        force: bool,
+        read: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut conn = self
             .conn
             .lock()
             .map_err(|_| StoreError::Db("lock poisoned".into()))?;
-        let rows = load_chain_rows(&conn)?;
-        verify_chain_anchor(&conn, &rows)
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        let version = VerifiedVersion::read(&tx)?;
+        let mut cached = self
+            .verified_version
+            .lock()
+            .map_err(|_| StoreError::Db("verification cache poisoned".into()))?;
+        if force || *cached != Some(version) {
+            *cached = None;
+            let rows = load_chain_rows(&tx)?;
+            verify_chain_anchor(&tx, &rows)?;
+            #[cfg(test)]
+            self.verification_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let result = read(&tx)?;
+        tx.commit()
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        // Retain the version sampled *inside* the transaction. Reading a newer
+        // version after COMMIT could bless an external write we never verified.
+        *cached = Some(version);
+        Ok(result)
     }
 
     /// List every session in the log, newest activity first — for the resume
@@ -666,24 +727,25 @@ impl SqliteLog {
 
     /// Read and verify a single SQLite snapshot before trusting serialized events.
     pub fn all_events(&self) -> Result<Vec<Event>, StoreError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        let rows = load_chain_rows(&tx)?;
-        verify_chain_anchor(&tx, &rows)?;
-        let events = rows
-            .into_iter()
-            .map(|(_, row, _)| {
-                row.into_event()
-                    .ok_or_else(|| StoreError::Db("verified event could not be decoded".into()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        tx.commit().map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(events)
+        self.with_verified_snapshot(false, |conn| decode_events(load_chain_rows(conn)?))
+    }
+
+    fn session_events(&self, session: Ulid) -> Result<Vec<Event>, StoreError> {
+        self.with_verified_snapshot(false, |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                            prev_hash, hash, hash_version, ts
+                     FROM events WHERE session_id = ?1 ORDER BY rowid ASC",
+                )
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            let rows = stmt
+                .query_map([session.to_string()], chain_row)
+                .map_err(|error| StoreError::Db(error.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            decode_events(rows)
+        })
     }
 
     /// Search text-bearing events. Interactive sessions rank ahead of
@@ -913,6 +975,28 @@ impl SqliteLog {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|err| KernelError::Log(err.to_string()))?;
 
+        let version =
+            VerifiedVersion::read(&tx).map_err(|error| KernelError::Log(error.to_string()))?;
+        let mut cached = self
+            .verified_version
+            .lock()
+            .map_err(|_| KernelError::Log("verification cache poisoned".into()))?;
+        // Only the known append below can extend our proof. Unexpected SQL
+        // triggers may rewrite older events as a side effect, so never promote
+        // the cache when any trigger is installed (including TEMP triggers).
+        let has_triggers: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                               UNION ALL
+                               SELECT 1 FROM sqlite_temp_schema WHERE type = 'trigger')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| KernelError::Log(error.to_string()))?;
+        let extend_verified = *cached == Some(version) && !has_triggers;
+        // Fail closed on any error or rollback after this point.
+        *cached = None;
+
         let head: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT hash FROM events ORDER BY rowid DESC LIMIT 1",
@@ -985,6 +1069,14 @@ impl SqliteLog {
             .map_err(|error| KernelError::Log(error.to_string()))?;
         tx.commit()
             .map_err(|err| KernelError::Log(err.to_string()))?;
+        if extend_verified {
+            // FTS can perform internal writes during COMMIT. Sample only the
+            // connection-local counter afterward, never the external version.
+            *cached = Some(VerifiedVersion {
+                total_changes: conn.total_changes(),
+                ..version
+            });
+        }
         Ok(e)
     }
 }
@@ -1001,15 +1093,9 @@ impl EventLog for SqliteLog {
     }
 
     async fn checked_events(&self, session: Ulid) -> Result<Vec<Event>, KernelError> {
-        self.run_store_task(move |log| {
-            Ok(log
-                .all_events()?
-                .into_iter()
-                .filter(|e| e.session_id == session)
-                .collect())
-        })
-        .await
-        .map_err(|e| KernelError::Log(e.to_string()))
+        self.run_store_task(move |log| log.session_events(session))
+            .await
+            .map_err(|e| KernelError::Log(e.to_string()))
     }
 
     async fn acquire_mutation_lease(
@@ -1143,27 +1229,38 @@ fn load_chain_rows(conn: &Connection) -> Result<Vec<(i64, Row, Vec<u8>)>, StoreE
              FROM events ORDER BY rowid ASC",
         )
         .map_err(|error| StoreError::Db(error.to_string()))?;
-    stmt.query_map([], |row| {
-        Ok((
-            row.get(0)?,
-            Row {
-                id: row.get(1)?,
-                session_id: row.get(2)?,
-                parent_id: row.get(3)?,
-                kind: row.get(4)?,
-                payload: row.get(5)?,
-                trust: row.get(6)?,
-                provenance: row.get(7)?,
-                prev_hash: row.get(8)?,
-                hash_version: row.get(10)?,
-                ts: row.get(11)?,
-            },
-            row.get(9)?,
-        ))
-    })
-    .map_err(|error| StoreError::Db(error.to_string()))?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|error| StoreError::Db(error.to_string()))
+    stmt.query_map([], chain_row)
+        .map_err(|error| StoreError::Db(error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| StoreError::Db(error.to_string()))
+}
+
+fn chain_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Row, Vec<u8>)> {
+    Ok((
+        row.get(0)?,
+        Row {
+            id: row.get(1)?,
+            session_id: row.get(2)?,
+            parent_id: row.get(3)?,
+            kind: row.get(4)?,
+            payload: row.get(5)?,
+            trust: row.get(6)?,
+            provenance: row.get(7)?,
+            prev_hash: row.get(8)?,
+            hash_version: row.get(10)?,
+            ts: row.get(11)?,
+        },
+        row.get(9)?,
+    ))
+}
+
+fn decode_events(rows: Vec<(i64, Row, Vec<u8>)>) -> Result<Vec<Event>, StoreError> {
+    rows.into_iter()
+        .map(|(_, row, _)| {
+            row.into_event()
+                .ok_or_else(|| StoreError::Db("verified event could not be decoded".into()))
+        })
+        .collect()
 }
 
 fn validated_chain(rows: &[(i64, Row, Vec<u8>)]) -> Result<(u64, [u8; 32]), StoreError> {
@@ -1258,6 +1355,143 @@ fn migrate_event_chain_v2(conn: &mut Connection) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn warm_session_reads_and_local_appends_reuse_verification() {
+        let dir = std::env::temp_dir().join(format!("medha-cache-{}", Ulid::new()));
+        let log = SqliteLog::open(dir.join("events.db")).unwrap();
+        let wanted = kernel::Session::new();
+        let other = kernel::Session::new();
+        log.append(Event::model_text(&other, &"x".repeat(100_000)))
+            .await
+            .unwrap();
+        log.append(Event::model_text(&wanted, "first"))
+            .await
+            .unwrap();
+        log.verify().unwrap();
+        for _ in 0..3 {
+            let events = log.clone().checked_events(wanted.id).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].payload["text"], "first");
+        }
+        log.append(Event::model_text(&wanted, "second"))
+            .await
+            .unwrap();
+        assert_eq!(log.checked_events(wanted.id).await.unwrap().len(), 2);
+        assert_eq!(log.all_events().unwrap().len(), 3);
+        assert_eq!(
+            log.verification_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_cache_reverifies_external_appends_and_rejects_unrelated_tampering() {
+        let dir = std::env::temp_dir().join(format!("medha-cache-external-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let log = SqliteLog::open(&db).unwrap();
+        let writer = SqliteLog::open(&db).unwrap();
+        let session = kernel::Session::new();
+        log.verify().unwrap();
+        writer
+            .append(Event::model_text(&session, "external"))
+            .await
+            .unwrap();
+        assert_eq!(log.checked_events(session.id).await.unwrap().len(), 1);
+        assert_eq!(
+            log.verification_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        let attacker = Connection::open(&db).unwrap();
+        attacker
+            .execute("UPDATE events SET payload = '{}'", [])
+            .unwrap();
+        // The requested session has no rows, but global tampering still fails.
+        assert!(log.checked_events(Ulid::new()).await.is_err());
+        assert!(log.all_events().is_err());
+        drop((attacker, writer, log));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_cache_rejects_same_connection_mutations_and_trigger_side_effects() {
+        for trigger in [false, true] {
+            let dir = std::env::temp_dir().join(format!("medha-cache-local-{}", Ulid::new()));
+            let log = SqliteLog::open(dir.join("events.db")).unwrap();
+            let session = kernel::Session::new();
+            log.append(Event::model_text(&session, "original"))
+                .await
+                .unwrap();
+            if trigger {
+                log.conn
+                    .lock()
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER rewrite_history AFTER INSERT ON events BEGIN
+                     UPDATE events SET payload = '{}' WHERE rowid < NEW.rowid; END;",
+                    )
+                    .unwrap();
+            }
+            log.verify().unwrap();
+            if trigger {
+                log.append(Event::model_text(&session, "next"))
+                    .await
+                    .unwrap();
+            } else {
+                log.conn
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE events SET payload = '{}'", [])
+                    .unwrap();
+            }
+            assert!(log.checked_events(session.id).await.is_err());
+            drop(log);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_cache_rejects_external_suffix_deletion_and_anchor_edits() {
+        for sql in [
+            "DELETE FROM events WHERE rowid = (SELECT MAX(rowid) FROM events)",
+            "DELETE FROM store_meta WHERE key LIKE 'event_chain%'",
+        ] {
+            let (dir, db, log) = seeded_chain("warm-corruption").await;
+            let attacker = Connection::open(db).unwrap();
+            let changed = attacker.execute(sql, []).unwrap();
+            assert!(changed > 0);
+            assert!(log.checked_events(Ulid::new()).await.is_err());
+            drop((attacker, log));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn verified_snapshot_blocks_a_writer_until_its_result_is_read() {
+        let dir = std::env::temp_dir().join(format!("medha-cache-race-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let log = SqliteLog::open(&db).unwrap();
+        log.verify().unwrap();
+        let writer = Connection::open(&db).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        log.with_verified_snapshot(false, |_| {
+            let error = writer.execute("DELETE FROM store_meta", []).unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            Ok(())
+        })
+        .unwrap();
+        writer.execute("DELETE FROM store_meta", []).unwrap();
+        assert!(log.session_events(Ulid::new()).is_err());
+        drop((writer, log));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn list_sessions_titles_and_orders_newest_first() {

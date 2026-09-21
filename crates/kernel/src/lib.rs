@@ -57,3 +57,5 @@ pub use types::{
 };
 pub use verify::{NoVerify, Verifier, VerifyReport};
 pub use vision::{NoVision, VisionDescriber, describe_media};
+
+mod usage_reporting;

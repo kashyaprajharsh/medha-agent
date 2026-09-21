@@ -32,8 +32,12 @@ pub trait StreamSink: Send + Sync {
     fn tool_result_with_id(&self, _id: &str, tool: &str, ok: bool, payload: &Value) {
         self.tool_result(tool, ok, payload);
     }
-    /// Real token usage for the turn, reported by the provider (authoritative).
-    fn usage(&self, _prompt_tokens: u32, _total_tokens: u32) {}
+    /// Last provider-reported usage snapshot, once per request attempt.
+    /// Interrupted/failed attempts may have only a partial snapshot; attempts
+    /// without usage emit no callback. Retries are separate attempts.
+    /// Carries the whole record, so a surface can show what the provider served
+    /// from cache rather than only the totals.
+    fn usage(&self, _usage: &crate::types::Usage) {}
     /// Session cost so far, when pricing is known. `indicative` means the
     /// figure comes from a list price (models.dev) rather than the operator's
     /// own configured rate — surfaces show it as "~$0.42 est.".

@@ -18,6 +18,22 @@ fn configured_medha(workspace: &std::path::Path, home: &std::path::Path) -> Comm
 }
 
 #[test]
+fn unknown_tool_presets_fail_instead_of_exposing_the_full_catalogue() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    assert!(lockfile::MedhaLock::parse("[tools]\npreset = 'minmal'\n").is_err());
+    let output = configured_medha(&workspace, &home)
+        .env("MEDHA_TOOLS", "minmal")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown tools preset"));
+}
+
+#[test]
 fn a_headless_provider_failure_exits_nonzero() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");

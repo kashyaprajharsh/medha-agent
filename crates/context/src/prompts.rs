@@ -44,7 +44,37 @@ pub fn compaction_summary() -> String {
 /// Honors the same runtime override chain, so a deployment can swap the agent's
 /// persona by dropping a `system.md` in its prompts dir — no recompile.
 pub fn system_identity() -> String {
-    get(SYSTEM_IDENTITY).expect("system prompt is embedded")
+    render_capabilities(
+        &get(SYSTEM_IDENTITY).expect("system prompt is embedded"),
+        |_| true,
+    )
+}
+
+/// Keep capability-specific guidance beside the base prompt, but only send it
+/// when every required tool is exposed. Overrides can use the same markers.
+pub fn system_identity_for_tools(tools: &std::collections::HashSet<String>) -> String {
+    render_capabilities(
+        &get(SYSTEM_IDENTITY).expect("system prompt is embedded"),
+        |name| tools.contains(name),
+    )
+}
+
+fn render_capabilities(prompt: &str, available: impl Fn(&str) -> bool) -> String {
+    prompt
+        .lines()
+        .filter_map(|line| {
+            if let Some(rest) = line.strip_prefix("<!-- tools:") {
+                let (requirements, body) = rest.split_once(" -->")?;
+                requirements
+                    .split(',')
+                    .all(|name| available(name.trim()))
+                    .then_some(body)
+            } else {
+                Some(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn override_dirs() -> Vec<PathBuf> {
@@ -75,7 +105,10 @@ mod tests {
     fn system_prompt_makes_workspace_audits_an_explicit_delegation_case() {
         let prompt = embedded(SYSTEM_IDENTITY).expect("system prompt is embedded");
         assert!(prompt.contains("whole-workspace review or audit"));
-        assert!(prompt.contains("parallel `agent.spawn` `tasks`"));
+        // The mechanism, not one phrasing of it: an audit is delegated as one
+        // parallel call, not as a sequence of spawns.
+        assert!(prompt.contains("parallel `tasks` call"));
+        assert!(prompt.contains("`agent.spawn`"));
         assert!(!prompt.contains("use `background`"));
     }
 

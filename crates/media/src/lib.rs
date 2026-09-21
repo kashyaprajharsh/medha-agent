@@ -47,6 +47,31 @@ struct Kind {
     universal: bool,
 }
 
+/// Whether a path is *named* like an image. A hint for routing a read, never a
+/// decision about content: admission still identifies the bytes, so a file with
+/// a lying extension gets a clear error rather than a wrong answer.
+pub fn has_image_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "bmp"
+                    | "tif"
+                    | "tiff"
+                    | "ico"
+                    | "heic"
+                    | "heif"
+                    | "avif"
+            )
+        })
+}
+
 pub fn normalize(raw: Vec<u8>) -> Result<Image> {
     within(raw, MAX_BYTES)
 }

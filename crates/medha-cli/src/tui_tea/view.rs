@@ -380,11 +380,11 @@ pub(super) fn short_target(t: &str) -> String {
     }
 }
 
-/// The live activity label, e.g. "writing medha.html", "reading", "thinking".
+/// Distinguish generation of tool arguments from execution of the tool.
 /// A streaming tool call wins so the user sees what's actually happening.
 pub(super) fn activity_label(model: &Model) -> String {
     if let Some((tool, target)) = &model.current_tool {
-        let verb = cat_verb(model.category(tool));
+        let verb = format!("preparing {tool}");
         return match target {
             Some(t) => format!("{verb} {}", short_target(t)),
             None => verb.to_string(),
@@ -698,7 +698,7 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
         Item::Assistant(s) => render_assistant(s, cx.width),
         Item::AgentsDone(rows) => render_agents_done(rows, cx.show_summary),
         Item::ToolCall { tool, .. } if tool == "update_plan" => Vec::new(),
-        Item::ToolCall { tool, args } => {
+        Item::ToolCall { tool, args, .. } => {
             let v = cx.viz.get(tool);
             let icon = v.map(|v| v.icon.as_str()).unwrap_or("•");
             let color = cat_color(v.map(|v| v.category).unwrap_or(ToolCategory::Other));
@@ -718,36 +718,38 @@ pub(super) fn render_item(item: &Item, cx: &RenderCtx<'_>) -> Vec<Line<'static>>
             }
             lines
         }
-        Item::ToolResult { tool, ok, payload } => {
-            if tool == "update_plan" && *ok {
+        Item::ToolResult {
+            tool, ok, payload, ..
+        } => {
+            let failure = crate::result_failure(tool, payload);
+            let ok = *ok && failure.is_none();
+            if tool == "update_plan" && ok {
                 return render_plan(payload);
             }
             if let Some(card) = payload.get("reconciliation") {
                 return render_reconciliation(card);
             }
-            if let (Some(old), Some(new)) = (
-                payload.get("old").and_then(|v| v.as_str()),
-                payload.get("new").and_then(|v| v.as_str()),
-            ) {
+            if ok
+                && let (Some(old), Some(new)) = (
+                    payload.get("old").and_then(|v| v.as_str()),
+                    payload.get("new").and_then(|v| v.as_str()),
+                )
+            {
                 let path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 return render_diff(old, new, path, cx.width);
             }
-            let (mark, color, summary) = if !*ok {
-                // Failures carry {"error": …}; policy denials carry {"reason": …}. Show
-                // whichever is present so the user sees WHY, not a bare "error".
-                let msg = payload
-                    .get("error")
-                    .or_else(|| payload.get("reason"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("error")
-                    .to_string();
+            let (mark, color, summary) = if !ok {
+                let msg = failure.unwrap_or_else(|| "error".to_string());
                 ("╰ ✗", theme::err(), msg)
             } else {
                 ("╰", theme::dim(), crate::result_summary(tool, payload))
             };
             let mut lines = vec![Line::from(vec![
                 Span::styled(format!("  {mark} "), Style::default().fg(theme::faint())),
-                Span::styled(summary, Style::default().fg(color)),
+                Span::styled(
+                    format!("{}: {summary}", tool_label(tool)),
+                    Style::default().fg(color),
+                ),
             ])];
             if cx.full_transparency {
                 lines.extend(json_block(payload, "out"));
@@ -1601,6 +1603,19 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         Some((usd, false)) => format!(" · ${usd:.2}"),
         None => String::new(),
     };
+    // Absent unless the route reported the bucket: a session against an endpoint
+    // that says nothing about caching shows nothing, rather than 0%.
+    let cache = match model.cache {
+        Some((hits, prompt)) if prompt > 0 => {
+            let percent = 100.0 * hits.min(prompt) as f64 / prompt as f64;
+            if hits < prompt && percent >= 99.5 {
+                " · cache >99%".to_string()
+            } else {
+                format!(" · cache {percent:.0}%")
+            }
+        }
+        _ => String::new(),
+    };
     let mode = match model.reasoning.enabled {
         Some(true) => "on",
         Some(false) => "off",
@@ -1634,10 +1649,10 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
     // Drop status details by priority rather than clipping mid-word.
     let available = (area.width as usize).saturating_sub(left_w + 2);
     let right = [
-        format!("{ctx}{cost} · {reasoning}{stream}   {hints}"),
-        format!("{ctx}{cost} · {reasoning}{stream}"),
-        format!("{ctx}{cost} · reasoning {mode}{stream}"),
-        format!("{ctx}{cost}"),
+        format!("{ctx}{cost}{cache} · {reasoning}{stream}   {hints}"),
+        format!("{ctx}{cost}{cache} · {reasoning}{stream}"),
+        format!("{ctx}{cost}{cache} · reasoning {mode}{stream}"),
+        format!("{ctx}{cost}{cache}"),
         ctx.clone(),
     ]
     .into_iter()
@@ -2809,6 +2824,91 @@ mod clarify_view_tests {
 mod agent_view_tests {
     use super::*;
 
+    #[test]
+    fn result_names_its_tool_even_when_plan_call_is_hidden() {
+        // Same-name calls completing out of order still attach to their own row.
+        let mut pane = VecDeque::new();
+        for id in ["first", "second"] {
+            append_pane_item(
+                &mut pane,
+                Item::ToolCall {
+                    id: Some(id.into()),
+                    tool: "edit".into(),
+                    args: serde_json::json!({"path": id}),
+                },
+                100,
+            );
+        }
+        for id in ["second", "first"] {
+            append_pane_item(
+                &mut pane,
+                Item::ToolResult {
+                    id: Some(id.into()),
+                    tool: "edit".into(),
+                    ok: false,
+                    payload: serde_json::json!({"error":"mismatch"}),
+                },
+                100,
+            );
+        }
+        let order: Vec<_> = pane
+            .iter()
+            .map(|entry| match &entry.item {
+                Item::ToolCall { id, .. } => ("call", id.as_deref()),
+                Item::ToolResult { id, .. } => ("result", id.as_deref()),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("call", Some("first")),
+                ("result", Some("first")),
+                ("call", Some("second")),
+                ("result", Some("second"))
+            ]
+        );
+        let viz = HashMap::new();
+        let cx = RenderCtx {
+            width: 120,
+            full_transparency: false,
+            show_thinking: false,
+            show_summary: false,
+            viz: &viz,
+        };
+        let call = Item::ToolCall {
+            id: None,
+            tool: "update_plan".into(),
+            args: serde_json::json!({}),
+        };
+        assert!(render_item(&call, &cx).is_empty());
+        let result = Item::ToolResult {
+            id: None,
+            tool: "update_plan".into(),
+            ok: false,
+            payload: serde_json::json!({"error":"expected array 'steps'"}),
+        };
+        let rendered = text(&render_item(&result, &cx));
+        assert!(rendered.contains("Update plan: expected array 'steps'"));
+        let web = Item::ToolResult {
+            id: None,
+            tool: "web".into(),
+            ok: true,
+            payload: serde_json::json!({}),
+        };
+        assert!(text(&render_item(&web, &cx)).contains("Web:"));
+        // A shell invocation can execute successfully but its command fails.
+        let shell = Item::ToolResult {
+            id: None,
+            tool: "shell.exec".into(),
+            ok: true,
+            payload: serde_json::json!({"exit_code": 1, "stderr": "build failed"}),
+        };
+        let rendered = text(&render_item(&shell, &cx));
+        assert!(rendered.contains("✗"));
+        assert!(rendered.contains("exit 1: build failed"));
+    }
+
     fn row(name: &str, status: orchestrator::AgentStatus, tools: u32, tokens: u64) -> AgentDoneRow {
         AgentDoneRow {
             name: name.into(),
@@ -2835,10 +2935,10 @@ mod agent_view_tests {
     #[test]
     fn a_phase_names_the_tool_and_its_target() {
         let (label, _) = phase_line(&kernel::Phase::InTool {
-            tool: "fs.read".into(),
+            tool: "read".into(),
             target: Some("/long/path/to/app.py".into()),
         });
-        assert_eq!(label, "fs.read  app.py", "the basename, not the whole path");
+        assert_eq!(label, "read  app.py", "the basename, not the whole path");
 
         let (label, _) = phase_line(&kernel::Phase::Generating);
         assert_eq!(label, "thinking…");
@@ -2871,6 +2971,52 @@ mod agent_view_tests {
             write: false,
             tools: None,
         }
+    }
+
+    fn status_bar(cache: Option<(u64, u64)>) -> String {
+        let dir = std::env::temp_dir().join(format!("medha-status-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut model = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            lockfile::UiConfig::default(),
+            HashMap::new(),
+            Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap()),
+        );
+        model.cache = cache;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(140, 3)).unwrap();
+        terminal.draw(|f| draw_status(f, &model, f.area())).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        rendered
+    }
+
+    /// The status bar is where the operator learns whether a long session is
+    /// re-paying for its whole prefix every turn.
+    #[test]
+    fn the_status_bar_shows_the_cache_hit_rate_once_a_route_reports_one() {
+        assert!(status_bar(Some((9_600, 10_000))).contains("cache 96%"));
+        assert!(status_bar(Some((9_999, 10_000))).contains("cache >99%"));
+        assert!(status_bar(Some((10_000, 10_000))).contains("cache 100%"));
+        // A route that reports the bucket and serves nothing is a finding, and
+        // has to be visible as one.
+        assert!(status_bar(Some((0, 10_000))).contains("cache 0%"));
+    }
+
+    /// Nothing reported is not zero: an endpoint that never mentions caching
+    /// must not render as one that caches nothing.
+    #[test]
+    fn the_status_bar_stays_silent_when_no_route_reported_a_cache() {
+        assert!(!status_bar(None).contains("cache"));
+        assert!(!status_bar(Some((0, 0))).contains("cache"));
     }
 
     #[test]

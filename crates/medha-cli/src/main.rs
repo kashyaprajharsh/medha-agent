@@ -1520,7 +1520,7 @@ async fn main() -> Result<()> {
     // been registered. Registering it earlier made valid requirements such as
     // memory.write, sessions.search, and agent.spawn look unavailable.
     registry.register_skills(skill_store.clone());
-    let known_tools = registry.tool_names();
+    let registered_tools = registry.tool_names();
     let agent_parent = registry.agent_parent_handle();
     let agent_session = registry.agent_session_handle();
     let executor = Arc::new(registry);
@@ -1528,6 +1528,22 @@ async fn main() -> Result<()> {
     if let Ok(mut slot) = agent_registry.lock() {
         *slot = Some(Arc::downgrade(&executor));
     }
+    // `[tools] preset = "minimal"`, or MEDHA_TOOLS. Narrowing happens once, at
+    // the boundary: children inherit from the narrowed executor, so a preset
+    // cannot be widened by delegating.
+    let preset = lockfile::ToolsConfig {
+        preset: std::env::var("MEDHA_TOOLS").unwrap_or(lock.tools.preset.clone()),
+    };
+    preset.validate().map_err(anyhow::Error::msg)?;
+    let executor: Arc<dyn kernel::Executor> = match preset.exposed() {
+        Some(exposed) => Arc::new(orchestrator::NarrowedExecutor::new(
+            executor,
+            Some(&exposed),
+        )),
+        None => executor,
+    };
+    let known_tools: std::collections::HashSet<String> =
+        executor.specs().into_iter().map(|spec| spec.name).collect();
 
     let recall_store = memory_store.clone();
     let memory_enabled = lock.memory.enabled;
@@ -1555,6 +1571,15 @@ async fn main() -> Result<()> {
             })),
     );
 
+    let stale = unknown_approvals(&lock.policy.approve, &registered_tools);
+    if !stale.is_empty() {
+        eprintln!(
+            "warning: [policy].approve names {} tool(s) that do not exist: {} — \
+             they gate nothing; update medha.lock",
+            stale.len(),
+            stale.join(", ")
+        );
+    }
     let policy = Arc::new(
         policy::DefaultPolicy::requiring_approval(approve_list(lock.policy.approve.clone()))
             .with_workspace(workspace.root())
@@ -1581,13 +1606,17 @@ async fn main() -> Result<()> {
         (Some(i), Some(o)) => Some(kernel::Pricing {
             input_per_mtok: i,
             output_per_mtok: o,
+            // Configured rates are the operator's own; nothing is inferred for
+            // cached reads, so they bill at the input rate unless stated.
+            cached_input_per_mtok: lock.pricing.cached_input_per_mtok,
             indicative: false,
         }),
         _ => providers::models_dev::pricing(&model_name)
             .await
-            .map(|(i, o)| kernel::Pricing {
-                input_per_mtok: i,
-                output_per_mtok: o,
+            .map(|(input, output, cached)| kernel::Pricing {
+                input_per_mtok: input,
+                output_per_mtok: output,
+                cached_input_per_mtok: cached,
                 indicative: true,
             }),
     };
@@ -1652,7 +1681,7 @@ async fn main() -> Result<()> {
     if let Some(file) = persona_file.as_ref().filter(|file| file.blocked()) {
         eprintln!("{}", file.content);
     }
-    let mut system = context::identity::system_prompt(persona);
+    let mut system = context::identity::system_prompt_for_tools(persona, &known_tools);
     // Give time-sensitive requests an explicit clock and workspace.
     let today = chrono::Local::now().format("%A, %-d %B %Y").to_string();
     system.push_str(&format!(
@@ -1916,6 +1945,7 @@ async fn main() -> Result<()> {
         )),
         Ok((_t, kernel::StopReason::Finished)) => {
             println!();
+            sink.report_cache();
             Ok(())
         }
         Err(error) => Err(anyhow::anyhow!("headless run failed: {error}")),
@@ -2334,21 +2364,40 @@ fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
     }
 
     // Delegation is gated for irreversible token spend, not filesystem radius.
+    // One name covers both starting a child and giving one more work.
     let mut out = base;
-    out.push("shell.exec".into());
-    out.extend(["agent.spawn", "agent.followup"].map(String::from));
+    out.extend(["shell.exec", "agent.spawn"].map(String::from));
     for part in parts {
         match part {
-            "all" => out.extend(["fs.write", "fs.edit", "shell.exec"].map(String::from)),
-            "writes" => out.extend(["fs.write", "fs.edit"].map(String::from)),
+            "all" => out.extend(["edit", "shell.exec"].map(String::from)),
+            "writes" => out.extend(["edit"].map(String::from)),
             "shell" => out.push("shell.exec".into()),
-            "agents" => out.extend(["agent.spawn", "agent.followup"].map(String::from)),
+            "agents" => out.push("agent.spawn".into()),
             other => out.push(other.to_string()),
         }
     }
     out.sort();
     out.dedup();
     out
+}
+
+/// Names in `[policy].approve` that match no registered tool, in the order the
+/// lock file lists them.
+///
+/// The approve list is matched against a tool's name, so a name that is not a
+/// tool gates nothing — and says so nowhere. A tool that was renamed or folded
+/// into another leaves exactly that behind: `approve = ["fs.write"]` reads as a
+/// configured gate and behaves as no gate at all. Report it rather than resolve
+/// it, so the lock file gets corrected once instead of translated forever.
+fn unknown_approvals(
+    approve: &[String],
+    registered: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    approve
+        .iter()
+        .filter(|name| !registered.contains(*name))
+        .cloned()
+        .collect()
 }
 
 /// Keep the verifier's diagnostic tail bounded.
@@ -2515,14 +2564,38 @@ impl kernel::HumanGate for TerminalGate {
 struct PrintSink {
     /// Compiler budget for the REPL pressure meter.
     usage: Option<Arc<std::sync::Mutex<Option<kernel::ContextPressure>>>>,
+    /// Prompt tokens this run and how many the provider served from cache.
+    /// Accumulated rather than printed on arrival: usage lands mid-stream, and
+    /// writing it there cuts the model's own sentence in half.
+    cache: std::sync::Mutex<(u64, u64)>,
 }
 
 impl PrintSink {
     fn plain() -> Self {
-        Self { usage: None }
+        Self {
+            usage: None,
+            cache: std::sync::Mutex::new((0, 0)),
+        }
     }
     fn tracking(cell: Arc<std::sync::Mutex<Option<kernel::ContextPressure>>>) -> Self {
-        Self { usage: Some(cell) }
+        Self {
+            usage: Some(cell),
+            cache: std::sync::Mutex::new((0, 0)),
+        }
+    }
+
+    /// One line after the turn, and only when a route reported the bucket —
+    /// silence about caching is not evidence of none.
+    fn report_cache(&self) {
+        let Ok((hits, prompt)) = self.cache.lock().map(|cell| *cell) else {
+            return;
+        };
+        if prompt > 0 {
+            eprintln!(
+                "· {hits} of {prompt} prompt tokens served from cache ({:.0}%)",
+                100.0 * hits as f64 / prompt as f64
+            );
+        }
     }
 }
 
@@ -2545,8 +2618,20 @@ impl kernel::StreamSink for PrintSink {
     fn tool_call(&self, tool: &str, args: &serde_json::Value) {
         println!("\n⏺ {tool}{}", salient_arg(tool, args));
     }
+    /// Counted only when the route reports the bucket — a run must be able to
+    /// tell "this endpoint does not cache" from "it was never asked".
+    fn usage(&self, usage: &kernel::Usage) {
+        if let (Some(cached), Ok(mut cell)) = (usage.cached_prompt_tokens, self.cache.lock()) {
+            cell.0 += u64::from(cached);
+            cell.1 += u64::from(usage.prompt_tokens);
+        }
+    }
     fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) {
-        if let Some(diff) = payload.get("diff").and_then(|v| v.as_str()) {
+        let failure = result_failure(tool, payload);
+        if !ok || failure.is_some() {
+            let err = failure.unwrap_or_else(|| "error".into());
+            println!("  ⎿ \x1b[31m✗ {tool}: {err}\x1b[0m");
+        } else if let Some(diff) = payload.get("diff").and_then(|v| v.as_str()) {
             for line in diff.lines() {
                 if line.starts_with('+') && !line.starts_with("+++") {
                     println!("\x1b[32m{line}\x1b[0m");
@@ -2556,16 +2641,8 @@ impl kernel::StreamSink for PrintSink {
                     println!("{line}");
                 }
             }
-        } else if !ok {
-            // Failures carry {"error": …}; policy denials carry {"reason": …}.
-            let err = payload
-                .get("error")
-                .or_else(|| payload.get("reason"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("error");
-            println!("  ⎿ \x1b[31m✗ {err}\x1b[0m");
         } else {
-            println!("  ⎿ {}", result_summary(tool, payload));
+            println!("  ⎿ {tool}: {}", result_summary(tool, payload));
         }
     }
     fn compaction(&self, before: u32, after: u32, summarized: bool, _summary: Option<&str>) {
@@ -2588,22 +2665,26 @@ impl kernel::StreamSink for PrintSink {
 
 /// Pick one useful input value for a compact tool label.
 fn salient_arg(tool: &str, args: &serde_json::Value) -> String {
-    let key = match tool {
-        t if t.starts_with("fs.") => "path",
-        "shell.exec" => "command",
-        "web.search" => "query",
-        "web.fetch" => "url",
-        "read_artifact" => "hash",
-        "grep" => "pattern",
-        t if t.starts_with("skill.") => "name",
-        "agent.spawn" => "objective",
-        "agent.cancel" | "agent.transcript" => "agent",
-        _ => "",
+    // First key present wins, so one tool covering several verbs still labels
+    // each of them with the argument that identifies the call.
+    let keys: &[&str] = match tool {
+        "read" | "edit" | "ls" | "code" => &["path", "symbol"],
+        "shell.exec" => &["command"],
+        "web" => &["query", "url"],
+        "grep" | "glob" => &["pattern"],
+        "skill" | "skill.save" => &["name"],
+        "agent.spawn" => &["objective", "agent"],
+        "agent" => &["agent"],
+        "memory" => &["name", "query"],
+        _ => &[],
     };
-    let val = args.get(key).and_then(|v| v.as_str()).or_else(|| {
-        args.as_object()
-            .and_then(|o| o.values().find_map(|v| v.as_str()))
-    });
+    let val = keys
+        .iter()
+        .find_map(|key| args.get(key).and_then(|v| v.as_str()))
+        .or_else(|| {
+            args.as_object()
+                .and_then(|o| o.values().find_map(|v| v.as_str()))
+        });
     match val {
         Some(v) => {
             let short: String = v.chars().take(60).collect();
@@ -2612,6 +2693,41 @@ fn salient_arg(tool: &str, args: &serde_json::Value) -> String {
         }
         None => String::new(),
     }
+}
+
+/// Surface failures consistently in live, resumed and non-interactive output.
+fn result_failure(tool: &str, p: &serde_json::Value) -> Option<String> {
+    if let Some(error) = p.get("error").and_then(|v| v.as_str()) {
+        return Some(error.to_string());
+    }
+    // Kernel policy denials use this exact envelope. A reason embedded in an
+    // otherwise successful structured result is not automatically an error.
+    if p.as_object().is_some_and(|o| o.len() == 1)
+        && let Some(reason) = p.get("reason").and_then(|v| v.as_str())
+    {
+        return Some(reason.to_string());
+    }
+    if tool == "shell.exec"
+        && let Some(code) = p.get("exit_code").and_then(|v| v.as_i64())
+        && code != 0
+    {
+        let detail = ["stderr", "stdout"]
+            .iter()
+            .find_map(|key| {
+                p.get(key)?
+                    .as_str()?
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+            })
+            .unwrap_or("");
+        let detail: String = detail.chars().take(240).collect();
+        return Some(if detail.is_empty() {
+            format!("exit {code}")
+        } else {
+            format!("exit {code}: {detail}")
+        });
+    }
+    None
 }
 
 fn result_summary(tool: &str, p: &serde_json::Value) -> String {
@@ -2630,7 +2746,6 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
             .unwrap_or(0)
     };
     match tool {
-        "web.search" => format!("{} results", u("count")),
         "grep" => {
             let t = p
                 .get("truncated")
@@ -2642,16 +2757,18 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
                 if t { " (truncated)" } else { "" }
             )
         }
-        "fs.read" => format!("{} chars", chars("content")),
-        "fs.list" => format!("{} entries", arr("entries")),
-        "fs.write" => format!("wrote {}", s("path")),
-        "web.fetch" => {
+        "read" => format!("{} chars", chars("content")),
+        "ls" => format!("{} entries", arr("entries")),
+        "edit" => format!("wrote {}", s("path")),
+        // One tool, three shapes: a search answers with a count, a fetch with a
+        // page, a crawl with pages.
+        "web" => {
             let title = s("title");
             let len = chars("content");
-            if title.is_empty() {
-                format!("{len} chars")
-            } else {
-                format!("{title} ({len} chars)")
+            match (p.get("count"), title.is_empty(), len) {
+                (Some(_), true, 0) => format!("{} results", u("count")),
+                (_, true, _) => format!("{len} chars"),
+                _ => format!("{title} ({len} chars)"),
             }
         }
         "shell.exec" => {
@@ -2666,7 +2783,7 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
                 None => "ran".into(),
             }
         }
-        "read_artifact" => format!("{} of {} bytes", u("length"), u("total_size")),
+
         _ => "ok".into(),
     }
 }
@@ -3141,14 +3258,15 @@ mod approve_list_tests {
     fn delegation_is_gated_out_of_the_box() {
         let approved = approved("");
         assert!(approved.contains(&"agent.spawn".to_string()));
-        assert!(approved.contains(&"agent.followup".to_string()));
         assert!(approved.contains(&"shell.exec".to_string()));
     }
 
+    /// Looking at a child, steering it or messaging it spends nothing, so the
+    /// tool holding those verbs must never be in the approve list.
     #[test]
-    fn messaging_and_listing_are_never_gated() {
+    fn addressing_a_running_agent_is_never_gated() {
         let approved = approved("");
-        for free in ["agent.list", "agent.message", "agent.steer", "agent.wait"] {
+        for free in ["agent", "agent.apply", "read"] {
             assert!(!approved.contains(&free.to_string()), "{free} was gated");
         }
     }
@@ -3156,6 +3274,24 @@ mod approve_list_tests {
     #[test]
     fn the_autonomous_escape_hatch_still_clears_everything() {
         assert!(approved("none").is_empty());
+    }
+
+    /// A lock file naming a tool that no longer exists reads as a configured
+    /// gate and behaves as no gate at all, so it has to be reported.
+    #[test]
+    fn an_approve_entry_matching_no_tool_is_reported() {
+        let registered: std::collections::HashSet<String> =
+            ["edit", "skill.save"].map(String::from).into();
+        let approve = ["fs.write".to_string(), "edit".to_string()];
+        assert_eq!(
+            super::unknown_approvals(&approve, &registered),
+            ["fs.write"],
+            "a name nothing answers to must not pass silently"
+        );
+        assert!(
+            super::unknown_approvals(&["edit".into()], &registered).is_empty(),
+            "a live name is not a warning"
+        );
     }
 }
 

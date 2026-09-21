@@ -118,6 +118,7 @@ fn intent(id: &str, tool: &str, args: Value) -> Block {
 
 fn memory_write_args() -> Value {
     json!({
+        "op": "write",
         "name": "gateway-turbo",
         "claim": "The gateway supports /v2/turbo.",
         "description": "gateway endpoint note",
@@ -160,7 +161,7 @@ fn harness(
 async fn web_tainted_window_cannot_write_trusted_memory() {
     let (k, log, store) = harness(vec![
         vec![intent("c1", "web.fake_fetch", json!({}))],
-        vec![intent("c2", "memory.write", memory_write_args())],
+        vec![intent("c2", "memory", memory_write_args())],
         vec![Block::Text("done".into())],
     ]);
     let session = Session::new();
@@ -204,7 +205,7 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
 
     let logged = events
         .iter()
-        .find(|e| e.kind == EventKind::ModelIntent && e.payload["tool"] == "memory.write")
+        .find(|e| e.kind == EventKind::ModelIntent && e.payload["tool"] == "memory")
         .expect("memory.write intent logged");
     assert!(
         logged.payload["args"].get("trust").is_none(),
@@ -241,8 +242,9 @@ async fn clean_user_window_writes_user_stated_memory() {
     let (k, _log, store) = harness(vec![
         vec![intent(
             "c1",
-            "memory.write",
+            "memory",
             json!({
+                "op": "write",
                 "name": "prefers-pytest",
                 "claim": "The user prefers pytest over unittest.",
                 "description": "test framework preference",

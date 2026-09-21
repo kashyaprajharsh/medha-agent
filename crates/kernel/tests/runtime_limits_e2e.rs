@@ -402,8 +402,11 @@ struct PlanExecutor {
 
 #[async_trait]
 impl Executor for PlanExecutor {
+    fn mutation_key(&self, intent: &ToolIntent) -> Option<String> {
+        (intent.args["op"] == "write").then(|| "memory:project:fixture".to_owned())
+    }
     fn specs(&self) -> Vec<ToolSpec> {
-        ["fs.read", "fs.write", "shell.exec", "agent.spawn"]
+        ["fs.read", "edit", "shell.exec", "agent.spawn"]
             .into_iter()
             .map(|name| ToolSpec {
                 name: name.into(),
@@ -420,7 +423,7 @@ impl Executor for PlanExecutor {
     fn blast_radius(&self, name: &str) -> Option<BlastRadius> {
         match name {
             "fs.read" => Some(BlastRadius::Read),
-            "fs.write" => Some(BlastRadius::ReversibleLocal),
+            "edit" => Some(BlastRadius::ReversibleLocal),
             "shell.exec" => Some(BlastRadius::IrreversibleLocal),
             "agent.spawn" => Some(BlastRadius::External),
             _ => None,
@@ -433,14 +436,55 @@ impl Executor for PlanExecutor {
 }
 
 #[tokio::test]
+async fn plan_rejects_a_mutating_operation_on_a_read_radius_tool() {
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![
+        Block::ToolIntent(ToolIntent {
+            id: "write".into(),
+            tool: "fs.read".into(),
+            args: json!({"op": "write"}),
+        }),
+        Block::ToolIntent(ToolIntent {
+            id: "search".into(),
+            tool: "fs.read".into(),
+            args: json!({"op": "search"}),
+        }),
+    ])]));
+    let executor = Arc::new(PlanExecutor::default());
+    let log = Arc::new(InMemoryLog::new());
+    let kernel = Kernel::new(
+        provider,
+        log.clone(),
+        executor.clone(),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    );
+    let mut session = Session::new();
+    session.autonomy = kernel::AutonomyLevel::Plan;
+    kernel
+        .run_session(
+            &session,
+            vec![Message::user("inspect")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(*executor.executed.lock().unwrap(), ["fs.read"]);
+    assert!(
+        !log.events(session.id)
+            .await
+            .iter()
+            .any(|event| event.kind == EventKind::ToolEffectPrepared)
+    );
+}
+
+#[tokio::test]
 async fn plan_blocks_writes_shell_delegation_and_unknown_tools_even_with_allow_all() {
-    let attempted = [
-        "fs.read",
-        "fs.write",
-        "shell.exec",
-        "agent.spawn",
-        "unknown",
-    ];
+    let attempted = ["fs.read", "edit", "shell.exec", "agent.spawn", "unknown"];
     let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(
         attempted
             .into_iter()
@@ -749,4 +793,47 @@ async fn completion_check_obeys_the_task_wall_deadline() {
     .expect("completion must not hang on verification")
     .unwrap();
     assert_eq!(stop, StopReason::Budget(BudgetStop::Wall));
+}
+
+#[tokio::test]
+async fn cumulative_usage_blocks_settle_once_at_the_end_of_an_attempt() {
+    #[derive(Default)]
+    struct UsageSink(Mutex<Vec<kernel::Usage>>);
+    impl kernel::StreamSink for UsageSink {
+        fn usage(&self, usage: &kernel::Usage) {
+            self.0.lock().unwrap().push(*usage);
+        }
+    }
+    let partial = kernel::Usage {
+        prompt_tokens: 100,
+        cached_prompt_tokens: Some(75),
+        ..kernel::Usage::default()
+    };
+    let final_usage = kernel::Usage {
+        completion_tokens: 5,
+        total_tokens: 105,
+        ..partial
+    };
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![
+        Block::Usage(partial),
+        Block::Text("done".into()),
+        Block::Usage(final_usage),
+        Block::Usage(final_usage),
+    ])]));
+    let kernel = kernel_with(provider, Arc::new(CountingExecutor::default()));
+    let sink = UsageSink::default();
+    kernel
+        .run_session(
+            &Session::new(),
+            vec![Message::user("go")],
+            Budget::default(),
+            &sink,
+            None,
+        )
+        .await
+        .unwrap();
+    let recorded = sink.0.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].completion_tokens, 5);
+    assert_eq!(recorded[0].cached_prompt_tokens, Some(75));
 }

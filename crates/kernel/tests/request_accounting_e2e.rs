@@ -390,7 +390,7 @@ async fn tool_result_is_prepared_and_recounted_before_the_following_model_call()
         })
         .expect("the live ordered request includes the tool result");
     assert!(live_result.len() < 8_000);
-    assert!(live_result.contains("read_artifact"));
+    assert!(live_result.contains("call read with hash="));
 }
 
 #[tokio::test]
@@ -772,7 +772,7 @@ async fn resumed_ordered_tool_results_are_spilled_without_losing_identity_or_opa
     assert_eq!(result.tool_call_id, call.id);
     assert_eq!(result.provider_state, vec![provider_state]);
     assert!(result.content.len() < 8_000);
-    assert!(result.content.contains("read_artifact"));
+    assert!(result.content.contains("call read with hash="));
 }
 
 #[tokio::test]

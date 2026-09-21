@@ -40,29 +40,32 @@ impl Delegate {
         let Some(control) = self.control.upgrade() else {
             return Vec::new();
         };
+        let verb = |action| AgentControlTool {
+            control: Arc::clone(&control),
+            action,
+            caller: caller.clone(),
+            executor: Arc::clone(&self.executor),
+            max_turns: self.max_turns,
+        };
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(AgentSpawn {
             control: Arc::clone(&control),
             executor: Arc::clone(&self.executor),
             max_turns: self.max_turns,
             caller: caller.clone(),
+            followup: verb(AgentAction::Followup),
         })];
-        for action in [
-            AgentAction::List,
-            AgentAction::Cancel,
-            AgentAction::Transcript,
-            AgentAction::Steer,
-            AgentAction::Message,
-            AgentAction::Followup,
-            AgentAction::Wait,
-        ] {
-            tools.push(Arc::new(AgentControlTool {
-                control: Arc::clone(&control),
-                action,
-                caller: caller.clone(),
-                executor: Arc::clone(&self.executor),
-                max_turns: self.max_turns,
-            }));
-        }
+        tools.push(Arc::new(AgentControls {
+            verbs: [
+                AgentAction::List,
+                AgentAction::Cancel,
+                AgentAction::Transcript,
+                AgentAction::Steer,
+                AgentAction::Message,
+                AgentAction::Wait,
+            ]
+            .map(verb)
+            .into(),
+        }));
         if control.can_write() {
             tools.push(Arc::new(AgentApply { control }));
         }
@@ -201,6 +204,10 @@ struct AgentSpawn {
     /// addressed back to this session, so a nested agent nests under itself
     /// rather than under whoever happens to be at the root.
     caller: CallerSlot,
+    /// Naming an existing agent gives it more work instead of starting a new
+    /// one. It is admitted exactly as a spawn is — same radius, same absence of
+    /// a turn cap — so it belongs behind the same name rather than beside it.
+    followup: AgentControlTool,
 }
 
 #[async_trait]
@@ -211,6 +218,12 @@ impl Tool for AgentSpawn {
     fn icon(&self) -> &'static str {
         "⚇"
     }
+    /// What the model needs *before* it calls this: when delegation is the right
+    /// move, and how to write an objective a cold child can act on. What to do
+    /// afterwards — do not poll, a writer's patch is not on disk, a report is a
+    /// claim not a fact — is delivered with the call's own result and with the
+    /// report, so a session that never delegates does not pay for it on every
+    /// turn. This description is re-sent on every request; those notes are not.
     fn description(&self) -> &str {
         "Delegate a self-contained task to a child agent and get back a summary. \
          The child works in its own context, so none of its searching lands in this conversation.\n\
@@ -225,53 +238,26 @@ impl Tool for AgentSpawn {
          · you want background gathered while you keep working — every child runs in the \
          background and reports back on its own.\n\
          \n\
-         Do NOT delegate these — the direct tool is faster and cheaper every time:\n\
-         · reading a file you can already name → `fs.read`;\n\
-         · finding a definition or a usage → `grep`, `glob`, `references`, `code_outline`;\n\
-         · anything spanning two or three known files → read them;\n\
-         · work you already have the context for — a child starts cold and pays to rediscover \
-         what you know;\n\
-         · your entire task handed to one child — that is pass-through, and it doubles the cost \
+         Do NOT delegate what a direct tool answers faster and cheaper: a file you can name, a \
+         definition or usage (`grep`, `glob`, `code`), two or three known files, or work you \
+         already have the context for — a child starts cold and pays to rediscover what you \
+         know. Never hand over your whole task: that is pass-through, and it doubles the cost \
          for nothing. Split off a *part*, or do it yourself.\n\
          \n\
          To run several at once, pass `tasks` — one call, N children, all concurrent. That is \
          strictly better than spawning them one at a time and waiting for each.\n\
          \n\
-         Once you have sent something to a background child, leave it alone. Its report reaches \
-         you on its own the moment it is ready — you do not need to check, and there is nothing to \
-         poll. Use `agent.wait` only when its answer blocks your next step; otherwise keep working. \
-         Specifically: do not call agent.list repeatedly to watch it, do not read its \
-         transcript to see whether it is progressing, do not cancel it for being quiet, and do not \
-         start doing its task yourself in the meantime. A child that looks idle is almost always \
-         composing its answer; killing it there throws away work that was nearly finished and \
-         charges you twice for it. Cancel only when you no longer want the result at all.\n\
-         \n\
-         Children are read-only by default. Set `write` for a child that must change code: it gets \
-         its own private checkout of the repository, and hands back a patch plus the result of \
-         building it. Two writing children can safely run at once; they cannot see each other's \
-         changes.\n\
-         \n\
-         A writer's changes are NOT on disk when it finishes. It edited its own copy, and you get \
-         the diff — so the real file still reads exactly as it did before, and checking it proves \
-         nothing about whether the agent worked. That is the design, not a failure: review the \
-         diff, then call `agent.apply` to land it, which asks the user first. If a writer says it \
-         made changes and the file looks untouched, you are looking at the wrong place — apply \
-         the patch rather than redoing the work.\n\
+         Children are read-only by default. Set `write` for a child that must change code: it \
+         gets its own private checkout and hands back a patch plus the result of building it. \
+         Two writing children can safely run at once; they cannot see each other\'s changes.\n\
          \n\
          State the objective in full: the child cannot see this conversation and cannot ask you \
-         anything — put every path, error message and constraint it needs in the objective itself. \
-         If the user asked for a particular language, tone or format, say so there too, or the \
-         child's summary will come back in the wrong one and contaminate your reply. Give \
-         `contract` when the answer must have a particular shape. A child can never use a tool you \
-         do not already have. It can message you and any other running agent, but it can only stop \
-         or steer the agents it started itself. A read-only child cannot delegate further; a \
-         writing one can.\n\
-         \n\
-         A child's report is its own account of what it did, not an established fact. For anything \
-         with an effect outside its own reasoning — a file written, a request sent, a test claimed \
-         to pass — get the verifiable handle (path, URL, status, command output) and check it \
-         yourself before you tell the user it happened. Its report comes back to you, not to the \
-         user — relay what matters."
+         anything — put every path, error message and constraint it needs in the objective \
+         itself, including any language, tone or format the user asked for, or its summary comes \
+         back in the wrong one and contaminates your reply. Give `contract` when the answer must \
+         have a particular shape. A child can never use a tool you do not already have; it can \
+         message any running agent but only steer or stop the ones it started; a read-only child \
+         cannot delegate further."
     }
     fn blast_radius(&self) -> BlastRadius {
         // Read-only children: no mutation, but real model spend, so it stays
@@ -296,7 +282,7 @@ impl Tool for AgentSpawn {
     fn mutation_key(&self, _args: &Value) -> Option<String> {
         None
     }
-    fn timeout(&self) -> Option<std::time::Duration> {
+    fn timeout(&self, _args: &Value) -> Option<std::time::Duration> {
         // No tool-level cap. A child is a whole session — it runs to its own
         // turn budget, which is the bound that means anything here. The default
         // 60s killed any child that did real work, and killed it *silently* from
@@ -316,6 +302,14 @@ impl Tool for AgentSpawn {
                     "type": "string",
                     "description": "The complete task. The child sees only this — not this conversation."
                 },
+                "agent": {
+                    "type": "string",
+                    "description": "Continue one of your own agents instead of starting a new one, by name or session id. Give `text` with it."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "With `agent`: the further work. Stands alone — it cannot see this conversation."
+                },
                 "name": { "type": "string", "description": "Short label for the agent (optional)" },
                 "contract": {
                     "type": "string",
@@ -324,7 +318,7 @@ impl Tool for AgentSpawn {
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Narrow the child to these tools. Omit this — inheriting your set is almost always right, and a child missing something it turns out to need cannot ask for it. Use canonical dotted names such as web.search, web.fetch, shell.exec, and fs.read; provider-facing aliases such as web_search are accepted but canonical names are persisted. Use this only to take a capability away deliberately. Cannot exceed yours, and reading files is always kept."
+                    "description": "Narrow the child to these tools. Omit this — inheriting your set is almost always right, and a child missing something it turns out to need cannot ask for it. Name tools exactly as they are registered, such as web, shell.exec, and read. Use this only to take a capability away deliberately. Cannot exceed yours, and reading files is always kept."
                 },
                 "max_turns": { "type": "integer", "description": "Turn ceiling, clamped to what remains" },
                 "wait": {
@@ -339,19 +333,23 @@ impl Tool for AgentSpawn {
                     "type": "string",
                     "description": "How much of this conversation the child inherits: 'none' (default — it works from the objective alone), 'all', or a number of recent turns. Raise it only when the task genuinely depends on what was said earlier and you cannot restate it in the objective; the child pays for that history in its own context."
                 },
+                // One entry per child, each taking the same fields as above. The
+                // meanings are not restated here: every one of them would be
+                // re-sent on every request for the sake of a form most calls
+                // never use.
                 "tasks": {
                     "type": "array",
-                    "description": "Run several independent investigations at once, each its own agent, and get every report back together. Use this instead of one call per question — they run concurrently rather than in sequence. Give `tasks` OR `objective`, not both.",
+                    "description": "Run several independent investigations at once, each its own agent, and get every report back together. Use this instead of one call per question — they run concurrently rather than in sequence. Give `tasks` OR `objective`, not both. Each entry takes the same fields as a single spawn.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "objective": { "type": "string" },
                             "name": { "type": "string" },
                             "contract": { "type": "string" },
-                            "tools": { "type": "array", "items": { "type": "string" }, "description": "Optional capability narrowing using canonical dotted names such as web.search; omit to inherit the parent's tools." },
-                            "max_turns": { "type": "integer", "description": "Turn ceiling for this task, clamped to the caller and operator ceilings." },
-                            "write": { "type": "boolean", "description": "REQUIRED if this task changes anything; without it the child is read-only and cannot edit." },
-                            "fork": { "type": "string", "description": "How much of this conversation this child inherits: 'none' (default), 'all', or a number of turns." }
+                            "tools": { "type": "array", "items": { "type": "string" } },
+                            "max_turns": { "type": "integer" },
+                            "write": { "type": "boolean" },
+                            "fork": { "type": "string" }
                         },
                         "required": ["objective"]
                     }
@@ -370,6 +368,10 @@ impl Tool for AgentSpawn {
         ))
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        // Naming an agent means continuing that one, not starting another.
+        if args.get("agent").is_some() {
+            return self.followup.execute(args).await;
+        }
         // Batch: independent questions run at once rather than one call after
         // another. Capacity is already bounded per tree, so an over-large batch
         // is refused by the runtime rather than flooding it.
@@ -429,10 +431,11 @@ impl Tool for AgentSpawn {
                 "agents": started,
                 "count": started.len(),
                 "note": "All started. Their reports arrive on their own — do not poll or wait \
-                         unless you cannot continue without them, in which case call agent.wait.",
+                         unless you cannot continue without them, in which case wait on one.",
             }));
         }
         let spec = parse_agent_spec(args)?;
+        let writing = spec.write;
         let Some(parent) = parent_executor(&self.executor) else {
             return Err(ToolError::Failed(
                 "the agent runtime is not available in this session".into(),
@@ -471,13 +474,21 @@ impl Tool for AgentSpawn {
             )
             .await;
         }
+        let mut note = "Started. Its report arrives on its own when ready — do not poll, do not \
+                        read its transcript to check progress, and do not start doing its work. \
+                        If you need the result before continuing, wait on it."
+            .to_string();
+        if writing {
+            note.push_str(
+                " It is writing in its own private checkout, so nothing it changes appears in \
+                 your files: it hands back a patch to review and apply.",
+            );
+        }
         Ok(json!({
             "agent": agent.path,
             "session": agent.session,
             "status": "running",
-            "note": "Started. Its report arrives on its own when ready — do not poll, do not read \
-                     its transcript to check progress, and do not start doing its work. If you \
-                     need the result before continuing, call agent.wait.",
+            "note": note,
         }))
     }
 }
@@ -707,6 +718,143 @@ enum AgentAction {
     Wait,
 }
 
+impl AgentAction {
+    fn verb(&self) -> &'static str {
+        match self {
+            AgentAction::List => "list",
+            AgentAction::Cancel => "cancel",
+            AgentAction::Transcript => "transcript",
+            AgentAction::Steer => "steer",
+            AgentAction::Message => "message",
+            AgentAction::Followup => "followup",
+            AgentAction::Wait => "wait",
+        }
+    }
+}
+
+/// Addressing agents that already exist: see them, read them, tell them
+/// something, wait for one, stop one. Every verb here only reads or redirects,
+/// so they share one name and one Read radius.
+///
+/// Starting work stays outside it: a spawn or a follow-up is `ReversibleLocal`
+/// because it spends real money and a writer resumes as a writer, and folding
+/// that in would have put an approval card in front of every verb that merely
+/// looks.
+struct AgentControls {
+    verbs: Vec<AgentControlTool>,
+}
+
+impl AgentControls {
+    fn of(&self, args: &Value) -> Result<&AgentControlTool, ToolError> {
+        let asked = args
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Args("expected string 'action'".into()))?;
+        self.verbs
+            .iter()
+            .find(|verb| verb.action.verb() == asked)
+            .ok_or_else(|| {
+                ToolError::Args(format!(
+                    "unknown action '{asked}'; expected one of {}",
+                    self.verbs
+                        .iter()
+                        .map(|verb| verb.action.verb())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+    }
+}
+
+#[async_trait]
+impl Tool for AgentControls {
+    fn name(&self) -> &str {
+        "agent"
+    }
+    fn icon(&self) -> &'static str {
+        "⚇"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Diagnostic
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn description(&self) -> &str {
+        "Address the agents already running under you.\n\
+         \n\
+         `list` — what each one is doing right now: its objective, `doing` (current \
+         phase), and the running counters `tool_calls` and `tokens`. `quiet_ms` \
+         appears only in phases where silence can mean a stall, and is null while an \
+         agent waits on the operator. Do not poll, and do not cancel an agent merely \
+         because it is quiet.\n\
+         `transcript` — what an agent actually did, by session id. A report is a \
+         summary; when one looks thin, wrong, or cut short, read the work behind it \
+         instead of guessing or re-running the search yourself. `tail` limits it to \
+         the last N steps.\n\
+         `steer` — send `text` to one of your own agents that is still running: a \
+         correction, a constraint you forgot, a narrowing of scope. It arrives at the \
+         agent's next step and does not restart it or discard what it has found. Use \
+         it the moment you realise an agent is working from something wrong — the \
+         only alternative is cancelling and paying for the whole run again, and an \
+         agent cannot ask you a question when it gets stuck.\n\
+         `message` — send `text` to any live agent in this session, including the one \
+         that started you. For passing along what the other agent needs and cannot \
+         find on its own: a finding from your work, an answer its objective left \
+         open, a constraint that arrived after it started. Unlike `steer`, the target \
+         need not be your own child.\n\
+         `cancel` — stop one agent by name or session id. Its siblings keep running, \
+         and whatever it had found is still reported.\n\
+         `wait` — pause until a running agent finishes, and only when you genuinely \
+         cannot continue without its answer. Returns as soon as one settles, or empty \
+         if `timeout_seconds` passes first, so it is bounded and a timeout is not a \
+         failure. Prefer not to: agents report on their own, and waiting spends the \
+         turn doing nothing."
+    }
+    /// Per verb: a wait is bounded by its own `timeout_seconds`, checked against
+    /// the operator's ceiling before it starts. A tool-level cap on top of that
+    /// turns a legitimate long wait into an error that reads as a failed agent.
+    fn timeout(&self, args: &Value) -> Option<std::time::Duration> {
+        match self.of(args) {
+            Ok(verb) => verb.timeout(args),
+            Err(_) => Some(crate::TOOL_TIMEOUT),
+        }
+    }
+    fn schema(&self) -> Value {
+        let bounds = self
+            .verbs
+            .first()
+            .map(|verb| verb.control.wait_bounds())
+            .unwrap_or_default();
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "transcript", "steer", "message", "cancel", "wait"],
+                    "description": "Which verb to apply"
+                },
+                "agent": { "type": "string", "description": "Agent name, path, or session id — required by transcript, steer, message and cancel" },
+                "text": { "type": "string", "description": "steer/message: what to tell it. Stands alone — the agent cannot see this conversation." },
+                "tail": { "type": "integer", "description": "transcript: only the last N steps (default: all)" },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": bounds.min.as_secs(),
+                    "maximum": bounds.max.as_secs(),
+                    "description": format!(
+                        "wait: how long before giving up, in seconds ({}–{}, default {}).",
+                        bounds.min.as_secs(), bounds.max.as_secs(), bounds.default.as_secs(),
+                    ),
+                }
+            },
+            "required": ["action"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        self.of(args)?.execute(args).await
+    }
+}
+
 struct AgentControlTool {
     control: Arc<orchestrator::AgentControl>,
     action: AgentAction,
@@ -721,13 +869,9 @@ struct AgentControlTool {
 impl Tool for AgentControlTool {
     fn name(&self) -> &str {
         match self.action {
-            AgentAction::List => "agent.list",
-            AgentAction::Cancel => "agent.cancel",
-            AgentAction::Transcript => "agent.transcript",
-            AgentAction::Steer => "agent.steer",
-            AgentAction::Message => "agent.message",
             AgentAction::Followup => "agent.followup",
             AgentAction::Wait => "agent.wait",
+            _ => "agent",
         }
     }
     fn icon(&self) -> &'static str {
@@ -808,7 +952,7 @@ impl Tool for AgentControlTool {
     fn mutation_key(&self, _args: &Value) -> Option<String> {
         None
     }
-    fn timeout(&self) -> Option<std::time::Duration> {
+    fn timeout(&self, _args: &Value) -> Option<std::time::Duration> {
         match self.action {
             // The wait *is* the bound, and it is checked against the operator's
             // ceiling before it starts. A tool-level cap on top of it turns a

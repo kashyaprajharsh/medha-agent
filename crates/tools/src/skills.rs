@@ -24,6 +24,44 @@ const MAX_BUNDLED_LINES_PER_READ: usize = 1_000;
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVENANCE_FILE: &str = ".medha-source.json";
 
+/// Compatibility is limited to skill metadata/instructions. Do not install
+/// executable aliases: dispatch and permission narrowing still use real tools.
+fn legacy_tool(name: &str) -> Option<(&'static str, Value)> {
+    let (tool, extra) = match name {
+        "fs.read" | "image.view" | "read_artifact" => ("read", json!({})),
+        "word_count" => ("read", json!({"count": true})),
+        "fs.write" | "fs.edit" | "multi_edit" => ("edit", json!({})),
+        "fs.list" => ("ls", json!({})),
+        "code_outline" | "references" => ("code", json!({})),
+        "skill.load" | "skill.list" => ("skill", json!({})),
+        "agent.followup" => ("agent.spawn", json!({})),
+        _ => {
+            let (namespace, op) = name.split_once('.')?;
+            match (namespace, op) {
+                ("web", "search" | "fetch" | "crawl") => ("web", json!({"op": op})),
+                ("memory", "write" | "update" | "forget" | "search") => {
+                    ("memory", json!({"op": op}))
+                }
+                (
+                    "lsp",
+                    "status" | "diagnostics" | "definition" | "references" | "hover" | "symbols"
+                    | "implementation" | "document_symbols" | "call_hierarchy",
+                ) => ("lsp", json!({"op": op})),
+                ("agent", "list" | "transcript" | "steer" | "message" | "cancel" | "wait") => {
+                    ("agent", json!({"action": op}))
+                }
+                ("task", "kill" | "remove") => ("task.control", json!({"op": op})),
+                _ => return None,
+            }
+        }
+    };
+    Some((tool, extra))
+}
+
+fn requirement_available(name: &str, known: &HashSet<String>) -> bool {
+    known.contains(name) || legacy_tool(name).is_some_and(|(tool, _)| known.contains(tool))
+}
+
 /// Where a skill was found. Project (workspace-committed) shadows user (personal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillScope {
@@ -201,7 +239,7 @@ impl SkillStore {
                         let missing_tools = skill
                             .required_tools
                             .iter()
-                            .filter(|t| !known_tools.contains(*t))
+                            .filter(|t| !requirement_available(t, known_tools))
                             .cloned()
                             .collect();
                         out.listings.push(SkillListing {
@@ -255,9 +293,28 @@ impl SkillStore {
             "dir": dir.display().to_string(),
             "procedure": s.body,
         });
+        let migrations: Vec<Value> = s
+            .required_tools
+            .iter()
+            .filter_map(|old| {
+                if known_tools.contains(old) {
+                    return None;
+                }
+                let (tool, add_arguments) = legacy_tool(old)?;
+                Some(json!({"old_tool": old, "tool": tool, "add_arguments": add_arguments}))
+            })
+            .collect();
+        if !migrations.is_empty() {
+            out["tool_migrations"] = json!(migrations);
+            out["tool_migration_note"] = json!(
+                "This procedure predates tool consolidation. Use the mapped tool names, retaining \
+                 the original arguments and adding the listed arguments. Follow the current tool \
+                 schemas; do not call the retired names. The procedure on disk is unchanged."
+            );
+        }
         if !files.is_empty() {
-            // Give each bundled file BOTH its relative name (pass to skill.load
-            // `file=` to READ text) and its absolute `abs_path` (use with
+            // Give each bundled file BOTH its relative name (pass to `skill`
+            // as `file` to READ text) and its absolute `abs_path` (use with
             // shell.exec to RUN) — so the agent never has to reconstruct a path.
             let entries: Vec<Value> = files
                 .iter()
@@ -268,7 +325,7 @@ impl SkillStore {
                 "These files live in `{dir}` (ABSOLUTE, OUTSIDE your workspace) — NOT your working \
                  directory, so never conclude one is missing by listing/globbing the workspace. \
                  Each entry gives `abs_path` (the full path). To READ a text reference, call \
-                 skill.load with `name`+`file`; to RUN a script, pass its `abs_path` to shell.exec \
+                 skill with `name`+`file`; to RUN a script, pass its `abs_path` to shell.exec \
                  (a relative `scripts/foo.py` in the procedure is that entry's `abs_path`).",
                 dir = dir.display()
             ));
@@ -364,6 +421,9 @@ impl SkillStore {
 
     /// Large catalogs retain prompt matches and an omitted count.
     pub fn manifest(&self, known_tools: &HashSet<String>, prompt: Option<&str>) -> String {
+        if !known_tools.contains("skill") {
+            return String::new();
+        }
         const TRIM_ABOVE: usize = 30;
         let disc = self.discover(known_tools);
         let all: Vec<&SkillListing> = disc.effective().collect();
@@ -392,7 +452,7 @@ impl SkillStore {
 
         let mut lines = String::from(
             "## Skills available — CHECK THIS BEFORE STARTING A TASK. If any description below \
-             matches the request, skill.load it and follow it before doing the task your own way.\n",
+             matches the request, call skill with its name and follow it before doing the task your own way.\n",
         );
         for (i, l) in shown.iter().enumerate() {
             let s = &l.skill;
@@ -415,7 +475,7 @@ impl SkillStore {
         }
         if hidden > 0 {
             lines.push_str(&format!(
-                "- … and {hidden} more — call skill.list to browse them\n"
+                "- … and {hidden} more — call skill without a name to browse them\n"
             ));
         }
         lines
@@ -468,10 +528,12 @@ impl SkillStore {
                 spec.procedure.len()
             ));
         }
+        // A skill installed before a tool merge names the verb it was written
+        // against; resolve it rather than declaring the skill unusable.
         let unknown: Vec<&String> = spec
             .required_tools
             .iter()
-            .filter(|t| !known_tools.contains(*t))
+            .filter(|t| !requirement_available(t, known_tools))
             .collect();
         if !unknown.is_empty() {
             return Err(format!(
@@ -1482,14 +1544,70 @@ fn build_skill(fm_body: ParsedMd, scope: SkillScope, path: PathBuf) -> Skill {
     }
 }
 
-/// `skill.load` — read radius. The model pulls a full procedure by name.
+/// Reading the skill catalogue: the index, or one procedure in full. Read
+/// radius either way, and the index exists to find a name for the load — so
+/// they are one tool, told apart by whether a `name` was given.
+pub struct SkillTool {
+    load: SkillLoad,
+    list: SkillList,
+}
+
+impl SkillTool {
+    pub(crate) fn new(store: Arc<SkillStore>, catalog: Arc<SkillToolCatalog>) -> Self {
+        Self {
+            load: SkillLoad {
+                store: Arc::clone(&store),
+                catalog: Arc::clone(&catalog),
+            },
+            list: SkillList { store, catalog },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SkillTool {
+    fn name(&self) -> &str {
+        "skill"
+    }
+    fn description(&self) -> &str {
+        "Installed procedures. With a `name`, load that skill's procedure in full; \
+         to inspect a bundled reference or script it returned, call again with the \
+         relative `file` path and an optional line range. With no `name`, list every \
+         installed skill with its description, scope, and availability — use that \
+         when the skills manifest says more are hidden."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "The skill to load (kebab-case). Omit to list what is installed." },
+                "file": { "type": "string", "description": "Bundled file path returned by the initial load" },
+                "line_start": { "type": "integer", "minimum": 1, "description": "First line to return; default 1" },
+                "line_limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum lines; default 400" }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        match args.get("name") {
+            Some(_) => self.load.execute(args).await,
+            None => self.list.execute(args).await,
+        }
+    }
+}
+
+/// Loading one procedure by name — the `name` form of `skill`.
 pub struct SkillLoad {
     pub store: Arc<SkillStore>,
     pub(crate) catalog: Arc<SkillToolCatalog>,
 }
 
-/// `skill.list` — compact index for large catalogs, separate from `skill.load`
-/// so a model can discover names before loading a full procedure.
+/// The compact index for large catalogues — the no-argument form of `skill`.
 pub struct SkillList {
     pub store: Arc<SkillStore>,
     pub(crate) catalog: Arc<SkillToolCatalog>,
@@ -1537,7 +1655,7 @@ impl SkillToolCatalog {
 #[async_trait]
 impl Tool for SkillList {
     fn name(&self) -> &str {
-        "skill.list"
+        "skill"
     }
     fn description(&self) -> &str {
         "List installed skills with names, descriptions, scope, and availability. \
@@ -1560,7 +1678,7 @@ impl Tool for SkillList {
 #[async_trait]
 impl Tool for SkillLoad {
     fn name(&self) -> &str {
-        "skill.load"
+        "skill"
     }
     fn description(&self) -> &str {
         "Load an installed skill's procedure by name. To progressively inspect \
@@ -1687,8 +1805,25 @@ impl SkillSave {
         let mut spec = Self::spec_from(args)?;
         let mut available: Vec<String> = known_tools.iter().cloned().collect();
         available.sort();
-        spec.required_tools = kernel::canonical_tool_names(&spec.required_tools, &available)
-            .map_err(|error| ToolError::Args(format!("invalid required_tools: {error}")))?;
+        // Preserve legacy names in metadata so loading can explain the merged
+        // operation arguments without silently rewriting the user's procedure.
+        spec.required_tools = spec
+            .required_tools
+            .iter()
+            .map(|name| {
+                if !known_tools.contains(name) && requirement_available(name, known_tools) {
+                    Ok(name.clone())
+                } else {
+                    kernel::canonical_tool_names(std::slice::from_ref(name), &available)
+                        .map(|names| names[0].clone())
+                        .map_err(|error| {
+                            ToolError::Args(format!("invalid required_tools: {error}"))
+                        })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut seen = HashSet::new();
+        spec.required_tools.retain(|name| seen.insert(name.clone()));
         Ok(spec)
     }
 }
@@ -1723,7 +1858,7 @@ impl Tool for SkillSave {
                 "procedure": { "type": "string", "description": "the skill body: steps, decision points, known failure modes (markdown)" },
                 "triggers": { "type": "array", "items": { "type": "string" }, "description": "match hints (keywords)" },
                 "domains": { "type": "array", "items": { "type": "string" } },
-                "required_tools": { "type": "array", "items": { "type": "string" }, "description": "canonical dotted tool names the procedure needs, such as shell.exec or web.search; provider-facing underscore aliases are accepted and normalized" },
+                "required_tools": { "type": "array", "items": { "type": "string" }, "description": "registered tool names the procedure needs, such as shell.exec or web; provider-facing underscore aliases are accepted and normalized" },
                 "scope": { "type": "string", "enum": ["user", "project"], "description": "user (personal, default) or project (committed with the repo)" }
             },
             "required": ["name", "description", "procedure"]
@@ -1777,7 +1912,7 @@ impl Tool for SkillSave {
             "name": spec.name,
             "scope": spec.scope.as_str(),
             "path": path.display().to_string(),
-            "note": "Available to load with skill.load; appears in the skills list next session."
+            "note": "Available to load with skill; appears in the skills list next session."
         }))
     }
 }
@@ -1924,7 +2059,7 @@ mod tests {
         let proj = root.join("proj");
         write_skill(&proj, "deploy-fly", DEPLOY);
         let store = SkillStore::new(proj, Some(root.join("user")));
-        let known = tools(&["fs.read"]); // shell.exec missing
+        let known = tools(&["read", "skill"]); // shell.exec missing
         let disc = store.discover(&known);
         let l = disc.effective().next().unwrap();
         assert!(!l.available());
@@ -2222,6 +2357,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_skill_requirements_explain_new_names_and_operation_arguments() {
+        let root = tmp();
+        let proj = root.join("proj");
+        write_skill(
+            &proj,
+            "legacy",
+            "---\nname: legacy\ndescription: old procedure\nrequired_tools: [fs.read, memory.write, agent.transcript, word_count]\n---\nUse the original procedure.\n",
+        );
+        let store = SkillStore::new(proj, None);
+        let available = tools(&["read", "memory", "agent", "skill"]);
+        let loaded = store.load("legacy", &available).unwrap();
+        let migrations = loaded["tool_migrations"].as_array().unwrap();
+        assert_eq!(migrations[0]["tool"], "read");
+        assert_eq!(migrations[1]["add_arguments"]["op"], "write");
+        assert_eq!(migrations[2]["add_arguments"]["action"], "transcript");
+        assert_eq!(migrations[3]["add_arguments"]["count"], true);
+        assert!(
+            loaded["procedure"]
+                .as_str()
+                .unwrap()
+                .contains("original procedure")
+        );
+        assert!(store.load("legacy", &tools(&["read", "skill"])).is_err());
+        assert!(store.manifest(&tools(&["read"]), None).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn manifest_trims_above_threshold_by_prompt_match() {
         let root = tmp();
         let proj = root.join("proj");
@@ -2232,9 +2395,9 @@ mod tests {
             write_skill(&proj, &format!("skill-{i}"), &body);
         }
         let store = SkillStore::new(proj, Some(root.join("user")));
-        let m = store.manifest(&tools(&[]), Some("please do kw7 now"));
+        let m = store.manifest(&tools(&["skill"]), Some("please do kw7 now"));
         assert!(m.contains("skill-7"));
-        assert!(m.contains("and 34 more — call skill.list"));
+        assert!(m.contains("and 34 more — call skill without a name"));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2263,11 +2426,11 @@ mod tests {
             description: "Does a thing".into(),
             triggers: vec!["thing".into()],
             domains: vec![],
-            required_tools: vec!["fs.read".into()],
+            required_tools: vec!["read".into()],
             procedure: "## Steps\n1. do it".into(),
             scope: SkillScope::Project,
         };
-        let known = tools(&["fs.read"]);
+        let known = tools(&["read"]);
         let (path, version) = store.save(&spec, &known).unwrap();
         assert!(path.ends_with("my-skill/SKILL.md"));
         assert_eq!(version, 1);
@@ -2427,7 +2590,7 @@ mod tests {
             Arc::new(move || live.lock().unwrap().clone()) as Arc<LiveToolNames>
         };
         let catalog = Arc::new(SkillToolCatalog {
-            static_tools: Arc::new(tools(&["fs.read"])),
+            static_tools: Arc::new(tools(&["read"])),
             live_tools: Some(live_tools),
         });
         let list = SkillList {
@@ -2480,7 +2643,7 @@ mod tests {
         let proj = root.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
         let store = Arc::new(SkillStore::new(proj, Some(root.join("user"))));
-        let known = Arc::new(tools(&["fs.read"]));
+        let known = Arc::new(tools(&["read"]));
         let tool = SkillSave {
             store: store.clone(),
             catalog: catalog_from(known.clone()),
@@ -2489,7 +2652,7 @@ mod tests {
             "name": "note-taker",
             "description": "Capture a decision as a note",
             "procedure": "## Steps\n1. write it down",
-            "required_tools": ["fs.read"],
+            "required_tools": ["read"],
             "scope": "project"
         });
         // preview renders the full SKILL.md that would be written
@@ -2520,7 +2683,7 @@ mod tests {
         let proj = root.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
         let store = SkillStore::new(proj, Some(root.join("user")));
-        let known = tools(&["fs.read"]);
+        let known = tools(&["read"]);
         let base = SaveSpec {
             name: "ok-name".into(),
             description: "d".into(),

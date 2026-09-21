@@ -545,6 +545,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tiktoken-rs",
  "tokio",
+ "tracing",
  "ulid",
 ]
 
@@ -1944,6 +1945,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
  "ulid",
 ]
 
@@ -4585,6 +4587,7 @@ dependencies = [
  "htmd",
  "ignore",
  "kernel",
+ "lockfile",
  "lsp",
  "mcp",
  "media",

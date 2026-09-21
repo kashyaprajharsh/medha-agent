@@ -10,7 +10,7 @@ const API_URL: &str = "https://models.dev/api.json";
 /// Re-fetch if the cache is older than this; models.dev updates periodically,
 /// not every second, so a cached copy is fine to reuse for a while.
 const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 static PROCESS_ENTRIES: tokio::sync::OnceCell<BTreeMap<String, ModelMeta>> =
     tokio::sync::OnceCell::const_new();
@@ -20,11 +20,12 @@ static PROCESS_ENTRIES: tokio::sync::OnceCell<BTreeMap<String, ModelMeta>> =
 /// Capability discovery must keep "not listed" separate from an explicit
 /// negative. A custom endpoint may support an input even when the catalog has
 /// no entry for it, so callers must not turn an unknown value into `false`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityState {
     Supported,
     Unsupported,
+    #[default]
     Unknown,
 }
 
@@ -35,12 +36,6 @@ impl CapabilityState {
             Self::Unsupported => "unsupported",
             Self::Unknown => "unknown",
         }
-    }
-}
-
-impl Default for CapabilityState {
-    fn default() -> Self {
-        Self::Unknown
     }
 }
 
@@ -93,17 +88,12 @@ pub struct ModelCapabilities {
     pub reasoning: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CapabilitySource {
     ProfileOverride,
     ModelsDev,
+    #[default]
     Unknown,
-}
-
-impl Default for CapabilitySource {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl CapabilitySource {
@@ -182,6 +172,9 @@ pub struct ModelMeta {
     pub input_per_mtok: Option<f64>,
     /// USD per million output tokens (models.dev list price).
     pub output_per_mtok: Option<f64>,
+    /// USD per million prompt tokens served from the provider's cache.
+    #[serde(default)]
+    pub cached_input_per_mtok: Option<f64>,
     #[serde(default)]
     pub capabilities: Option<ModelCapabilities>,
 }
@@ -249,6 +242,11 @@ struct Cost {
     input: Option<f64>,
     #[serde(default)]
     output: Option<f64>,
+    /// Rate for prompt tokens the provider serves from its own cache. Published
+    /// for roughly two thirds of the catalogue; absent means the route does not
+    /// price cache reads separately, not that they are free.
+    #[serde(default)]
+    cache_read: Option<f64>,
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -308,6 +306,7 @@ async fn fetch_and_flatten(
                 context: model.limit.and_then(|l| l.context),
                 input_per_mtok: model.cost.as_ref().and_then(|c| c.input),
                 output_per_mtok: model.cost.as_ref().and_then(|c| c.output),
+                cached_input_per_mtok: model.cost.as_ref().and_then(|c| c.cache_read),
                 capabilities: capability_values
                     .has_known_value()
                     .then_some(capability_values),
@@ -380,10 +379,16 @@ pub async fn context_window(model_id: &str) -> Option<u32> {
 /// Look up `model_id`'s list price (USD per MTok input, output). This is the
 /// vendor's list price — for a self-hosted route it's an *indicative* figure
 /// only; callers must label it as such. `None` = not listed, never a guess.
-pub async fn pricing(model_id: &str) -> Option<(f64, f64)> {
+/// List price for a route: input, output, and the cache-read rate when the
+/// catalogue publishes one.
+pub async fn pricing(model_id: &str) -> Option<(f64, f64, Option<f64>)> {
     let entries = entries().await?;
     let meta = lookup(model_id, &entries)?;
-    Some((meta.input_per_mtok?, meta.output_per_mtok?))
+    Some((
+        meta.input_per_mtok?,
+        meta.output_per_mtok?,
+        meta.cached_input_per_mtok,
+    ))
 }
 
 /// Look up capability metadata using only an exact model id. A provider prefix
@@ -480,6 +485,7 @@ mod tests {
                 context: Some(131_072),
                 input_per_mtok: None,
                 output_per_mtok: None,
+                cached_input_per_mtok: None,
                 capabilities: None,
             },
         );
@@ -489,6 +495,7 @@ mod tests {
                 context: Some(200_000),
                 input_per_mtok: Some(15.0),
                 output_per_mtok: Some(75.0),
+                cached_input_per_mtok: None,
                 capabilities: None,
             },
         );
@@ -514,12 +521,14 @@ mod tests {
             context: Some(8_192),
             input_per_mtok: Some(1.0),
             output_per_mtok: Some(2.0),
+            cached_input_per_mtok: None,
             capabilities: None,
         };
         let specific = ModelMeta {
             context: Some(131_072),
             input_per_mtok: Some(3.0),
             output_per_mtok: Some(4.0),
+            cached_input_per_mtok: None,
             capabilities: None,
         };
         let entries = BTreeMap::from([

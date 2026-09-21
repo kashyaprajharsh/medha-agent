@@ -118,8 +118,12 @@ pub trait Tool: Send + Sync {
 
     /// Hard wall-clock ceiling for one call, default 60s. `None` means the tool
     /// bounds itself — `shell.exec` owns a stricter deadline with process-tree
-    /// teardown; `diagnostics`/`web.crawl` legitimately run longer.
-    fn timeout(&self) -> Option<std::time::Duration> {
+    /// teardown; `diagnostics` and a crawl legitimately run longer.
+    ///
+    /// Per call, not per tool: a tool that covers several operations gives each
+    /// the ceiling it needs, so merging a slow one in never loosens the bound on
+    /// the quick ones beside it.
+    fn timeout(&self, _args: &Value) -> Option<std::time::Duration> {
         Some(TOOL_TIMEOUT)
     }
 }
@@ -141,7 +145,7 @@ fn cap_preview(s: &str) -> String {
 /// the whole process group, so nothing is orphaned.
 pub(crate) async fn run_tool(tool: &dyn Tool, intent: &ToolIntent) -> Observation {
     let run = tool.execute(&intent.args);
-    let result = match tool.timeout() {
+    let result = match tool.timeout(&intent.args) {
         Some(limit) => match tokio::time::timeout(limit, run).await {
             Ok(result) => result,
             Err(_) => {
@@ -359,8 +363,14 @@ async fn lsp_diagnostic_value(
     Ok(value)
 }
 
-struct LspStatus {
+/// Every read-only language-server query behind one `op`. They differ only in
+/// which request is sent, and all carry the same blast radius, so nine tools
+/// bought nothing and cost the model nine descriptions to choose between.
+/// Starting a server stays separate: that spawns a process.
+struct Lsp {
     manager: Arc<lsp::LspManager>,
+    sbx: Arc<WorkspaceSandbox>,
+    artifacts: Arc<dyn kernel::ArtifactStore>,
 }
 
 struct LspStart {
@@ -465,13 +475,21 @@ impl Tool for LspStart {
 }
 
 #[async_trait]
-impl Tool for LspStatus {
+impl Tool for Lsp {
     fn name(&self) -> &str {
-        "lsp.status"
+        "lsp"
     }
 
     fn description(&self) -> &str {
-        "Show language-server sessions and whether each project-root server is starting, ready, or broken."
+        "Compiler-accurate code intelligence from the language server, selected by `op`: \
+         `definition` and `implementation` resolve a symbol at a position; `references` \
+         finds its use sites; `hover` returns its type and docs; `document_symbols` \
+         outlines one file and `symbols` searches the project by name; `call_hierarchy` \
+         walks callers or callees; `diagnostics` returns one file's fresh errors; \
+         `status` reports which servers are running. Position ops take `path` + `line` \
+         (1-based) and optional `character`. Prefer `code` or `diagnostics` when you \
+         have a name rather than a position — they work without a server; this is the \
+         precise layer once one is running."
     }
 
     fn blast_radius(&self) -> BlastRadius {
@@ -483,62 +501,121 @@ impl Tool for LspStatus {
     }
 
     fn schema(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
-    }
-
-    async fn execute(&self, _args: &Value) -> Result<Value, ToolError> {
-        // Sessions alone cannot answer "why was that a text match" — servers
-        // start lazily, so an empty list means either "nothing asked yet" or
-        // "nothing installed". The inventory separates the two.
-        Ok(json!({
-            "servers": self.manager.status().await,
-            "available": self.manager.inventory(),
-        }))
-    }
-}
-
-struct LspDiagnostics {
-    manager: Arc<lsp::LspManager>,
-    sbx: Arc<WorkspaceSandbox>,
-    artifacts: Arc<dyn kernel::ArtifactStore>,
-}
-
-#[async_trait]
-impl Tool for LspDiagnostics {
-    fn name(&self) -> &str {
-        "lsp.diagnostics"
-    }
-
-    fn description(&self) -> &str {
-        "Synchronize a supported source file with its language server and return only a fresh diagnostic result. A timeout is no_fresh_data, never clean."
-    }
-
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
-    }
-
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Diagnostic
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Workspace-relative supported source file" }
-            },
-            "required": ["path"]
-        })
+        let mut properties = lsp_position_schema();
+        properties["op"] = json!({
+            "type": "string",
+            "enum": ["definition", "references", "implementation", "hover",
+                     "document_symbols", "symbols", "call_hierarchy", "diagnostics", "status"],
+        });
+        properties["query"] = json!({
+            "type": "string",
+            "description": "symbols: the symbol name to search for"
+        });
+        properties["include_declaration"] = json!({
+            "type": "boolean",
+            "description": "references: include the declaration (default true)"
+        });
+        properties["direction"] = json!({
+            "type": "string",
+            "enum": ["incoming", "outgoing"],
+            "description": "call_hierarchy: incoming = callers (default), outgoing = callees"
+        });
+        json!({ "type": "object", "properties": properties, "required": ["op"] })
     }
 
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let path = arg_str(args, "path")?;
+        let op = arg_str(args, "op")?;
+        if op == "status" {
+            // Sessions alone cannot answer "why was that a text match" — servers
+            // start lazily, so an empty list means either "nothing asked yet" or
+            // "nothing installed". The inventory separates the two.
+            return Ok(json!({
+                "servers": self.manager.status().await,
+                "available": self.manager.inventory(),
+            }));
+        }
+        let path = arg_str(args, "path")
+            .map_err(|_| ToolError::Args(format!("lsp op '{op}' requires 'path'")))?;
         let absolute = self
             .sbx
             .resolve(&path)
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?;
-        lsp_diagnostic_value(self.manager.diagnostics(absolute).await, &self.artifacts).await
+        if op == "diagnostics" {
+            return lsp_diagnostic_value(self.manager.diagnostics(absolute).await, &self.artifacts)
+                .await;
+        }
+        // Each request returns its own report type, so the shared serializer is
+        // applied per arm rather than to one merged value.
+        match op.as_str() {
+            "document_symbols" => {
+                lsp_query_value(
+                    self.manager.document_symbols(absolute).await,
+                    &self.artifacts,
+                )
+                .await
+            }
+            "symbols" => {
+                let name = arg_str(args, "query")
+                    .map_err(|_| ToolError::Args("lsp op 'symbols' requires 'query'".into()))?;
+                lsp_query_value(
+                    self.manager.workspace_symbols(absolute, &name).await,
+                    &self.artifacts,
+                )
+                .await
+            }
+            "definition" => {
+                lsp_query_value(
+                    self.manager.definition(absolute, lsp_position(args)?).await,
+                    &self.artifacts,
+                )
+                .await
+            }
+            "implementation" => {
+                lsp_query_value(
+                    self.manager
+                        .implementations(absolute, lsp_position(args)?)
+                        .await,
+                    &self.artifacts,
+                )
+                .await
+            }
+            "hover" => {
+                lsp_query_value(
+                    self.manager.hover(absolute, lsp_position(args)?).await,
+                    &self.artifacts,
+                )
+                .await
+            }
+            "references" => {
+                let include = args
+                    .get("include_declaration")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                lsp_query_value(
+                    self.manager
+                        .references(absolute, lsp_position(args)?, include)
+                        .await,
+                    &self.artifacts,
+                )
+                .await
+            }
+            "call_hierarchy" => {
+                let outgoing = args.get("direction").and_then(Value::as_str) == Some("outgoing");
+                lsp_query_value(
+                    self.manager
+                        .call_hierarchy(absolute, lsp_position(args)?, outgoing)
+                        .await,
+                    &self.artifacts,
+                )
+                .await
+            }
+            other => Err(ToolError::Args(format!(
+                "unknown lsp op '{other}'; expected one of definition, references, \
+                 implementation, hover, document_symbols, symbols, call_hierarchy, \
+                 diagnostics, status"
+            ))),
+        }
     }
 }
 
@@ -565,328 +642,6 @@ fn lsp_position_schema() -> Value {
         "line": { "type": "integer", "minimum": 1, "description": "1-based source line" },
         "character": { "type": "integer", "minimum": 0, "description": "0-based UTF-16 character offset (default 0)" }
     })
-}
-
-struct LspDefinition {
-    manager: Arc<lsp::LspManager>,
-    sbx: Arc<WorkspaceSandbox>,
-    artifacts: Arc<dyn kernel::ArtifactStore>,
-}
-
-#[async_trait]
-impl Tool for LspDefinition {
-    fn name(&self) -> &str {
-        "lsp.definition"
-    }
-    fn description(&self) -> &str {
-        "Resolve the semantic definition at a source position using its long-lived language server."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Diagnostic
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": lsp_position_schema(),
-            "required": ["path", "line"]
-        })
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let path = arg_str(args, "path")?;
-        let absolute = self
-            .sbx
-            .resolve(&path)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        lsp_query_value(
-            self.manager.definition(absolute, lsp_position(args)?).await,
-            &self.artifacts,
-        )
-        .await
-    }
-}
-
-struct LspReferences {
-    manager: Arc<lsp::LspManager>,
-    sbx: Arc<WorkspaceSandbox>,
-    artifacts: Arc<dyn kernel::ArtifactStore>,
-}
-
-#[async_trait]
-impl Tool for LspReferences {
-    fn name(&self) -> &str {
-        "lsp.references"
-    }
-    fn description(&self) -> &str {
-        "Find semantic references at a source position, including declaration by default."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Diagnostic
-    }
-    fn schema(&self) -> Value {
-        let mut properties = lsp_position_schema();
-        properties["include_declaration"] = json!({
-            "type": "boolean",
-            "description": "Include the declaration (default true)"
-        });
-        json!({
-            "type": "object",
-            "properties": properties,
-            "required": ["path", "line"]
-        })
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let path = arg_str(args, "path")?;
-        let absolute = self
-            .sbx
-            .resolve(&path)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        let include = args
-            .get("include_declaration")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        lsp_query_value(
-            self.manager
-                .references(absolute, lsp_position(args)?, include)
-                .await,
-            &self.artifacts,
-        )
-        .await
-    }
-}
-
-struct LspHover {
-    manager: Arc<lsp::LspManager>,
-    sbx: Arc<WorkspaceSandbox>,
-    artifacts: Arc<dyn kernel::ArtifactStore>,
-}
-
-#[async_trait]
-impl Tool for LspHover {
-    fn name(&self) -> &str {
-        "lsp.hover"
-    }
-    fn description(&self) -> &str {
-        "Return bounded semantic type/documentation hover text at a source position."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Diagnostic
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": lsp_position_schema(),
-            "required": ["path", "line"]
-        })
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let path = arg_str(args, "path")?;
-        let absolute = self
-            .sbx
-            .resolve(&path)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        lsp_query_value(
-            self.manager.hover(absolute, lsp_position(args)?).await,
-            &self.artifacts,
-        )
-        .await
-    }
-}
-
-struct LspSymbols {
-    manager: Arc<lsp::LspManager>,
-    sbx: Arc<WorkspaceSandbox>,
-    artifacts: Arc<dyn kernel::ArtifactStore>,
-}
-
-#[async_trait]
-impl Tool for LspSymbols {
-    fn name(&self) -> &str {
-        "lsp.symbols"
-    }
-    fn description(&self) -> &str {
-        "Search semantic workspace symbols in the project containing path; results are sorted, deduplicated, and bounded."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Search
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Symbol-name query" },
-                "path": { "type": "string", "description": "Source file selecting the language server and project root" }
-            },
-            "required": ["query", "path"]
-        })
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let query = arg_str(args, "query")?;
-        let path = arg_str(args, "path")?;
-        let absolute = self
-            .sbx
-            .resolve(&path)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        lsp_query_value(
-            self.manager.workspace_symbols(absolute, &query).await,
-            &self.artifacts,
-        )
-        .await
-    }
-}
-
-struct LspImplementation {
-    manager: Arc<lsp::LspManager>,
-    sbx: Arc<WorkspaceSandbox>,
-    artifacts: Arc<dyn kernel::ArtifactStore>,
-}
-
-#[async_trait]
-impl Tool for LspImplementation {
-    fn name(&self) -> &str {
-        "lsp.implementation"
-    }
-    fn description(&self) -> &str {
-        "Resolve implementations of the symbol at a source position (trait/interface methods, abstract definitions)."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Diagnostic
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": lsp_position_schema(),
-            "required": ["path", "line"]
-        })
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let path = arg_str(args, "path")?;
-        let absolute = self
-            .sbx
-            .resolve(&path)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        lsp_query_value(
-            self.manager
-                .implementations(absolute, lsp_position(args)?)
-                .await,
-            &self.artifacts,
-        )
-        .await
-    }
-}
-
-struct LspDocumentSymbols {
-    manager: Arc<lsp::LspManager>,
-    sbx: Arc<WorkspaceSandbox>,
-    artifacts: Arc<dyn kernel::ArtifactStore>,
-}
-
-#[async_trait]
-impl Tool for LspDocumentSymbols {
-    fn name(&self) -> &str {
-        "lsp.document_symbols"
-    }
-    fn description(&self) -> &str {
-        "List the semantic symbol outline of a single source file, sorted, deduplicated, and bounded."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Search
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Workspace-relative supported source file" }
-            },
-            "required": ["path"]
-        })
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let path = arg_str(args, "path")?;
-        let absolute = self
-            .sbx
-            .resolve(&path)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        lsp_query_value(
-            self.manager.document_symbols(absolute).await,
-            &self.artifacts,
-        )
-        .await
-    }
-}
-
-struct LspCallHierarchy {
-    manager: Arc<lsp::LspManager>,
-    sbx: Arc<WorkspaceSandbox>,
-    artifacts: Arc<dyn kernel::ArtifactStore>,
-}
-
-#[async_trait]
-impl Tool for LspCallHierarchy {
-    fn name(&self) -> &str {
-        "lsp.call_hierarchy"
-    }
-    fn description(&self) -> &str {
-        "List callers (direction=incoming, default) or callees (direction=outgoing) of the symbol at a source position."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::Read
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Search
-    }
-    fn schema(&self) -> Value {
-        let mut properties = lsp_position_schema();
-        properties["direction"] = json!({
-            "type": "string",
-            "enum": ["incoming", "outgoing"],
-            "description": "incoming = callers (default), outgoing = callees"
-        });
-        json!({
-            "type": "object",
-            "properties": properties,
-            "required": ["path", "line"]
-        })
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let path = arg_str(args, "path")?;
-        let absolute = self
-            .sbx
-            .resolve(&path)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        let outgoing = args.get("direction").and_then(Value::as_str) == Some("outgoing");
-        lsp_query_value(
-            self.manager
-                .call_hierarchy(absolute, lsp_position(args)?, outgoing)
-                .await,
-            &self.artifacts,
-        )
-        .await
-    }
 }
 
 struct McpStatus {
@@ -1037,9 +792,6 @@ impl ToolRegistry {
     /// post-edit diagnostic reports through the shared handle.
     pub fn register_lsp(&mut self, manager: Arc<lsp::LspManager>) -> &mut Self {
         *self.lsp.lock().expect("LSP handle lock poisoned") = Some(manager.clone());
-        self.register(Arc::new(LspStatus {
-            manager: manager.clone(),
-        }));
         if let Some(sbx) = self.sandbox.clone() {
             let Some(artifacts) = self.artifacts.clone() else {
                 return self;
@@ -1048,42 +800,7 @@ impl ToolRegistry {
                 manager: manager.clone(),
                 sbx: sbx.clone(),
             }));
-            self.register(Arc::new(LspDiagnostics {
-                manager: manager.clone(),
-                sbx: sbx.clone(),
-                artifacts: artifacts.clone(),
-            }));
-            self.register(Arc::new(LspDefinition {
-                manager: manager.clone(),
-                sbx: sbx.clone(),
-                artifacts: artifacts.clone(),
-            }));
-            self.register(Arc::new(LspReferences {
-                manager: manager.clone(),
-                sbx: sbx.clone(),
-                artifacts: artifacts.clone(),
-            }));
-            self.register(Arc::new(LspHover {
-                manager: manager.clone(),
-                sbx: sbx.clone(),
-                artifacts: artifacts.clone(),
-            }));
-            self.register(Arc::new(LspImplementation {
-                manager: manager.clone(),
-                sbx: sbx.clone(),
-                artifacts: artifacts.clone(),
-            }));
-            self.register(Arc::new(LspDocumentSymbols {
-                manager: manager.clone(),
-                sbx: sbx.clone(),
-                artifacts: artifacts.clone(),
-            }));
-            self.register(Arc::new(LspCallHierarchy {
-                manager: manager.clone(),
-                sbx: sbx.clone(),
-                artifacts: artifacts.clone(),
-            }));
-            self.register(Arc::new(LspSymbols {
+            self.register(Arc::new(Lsp {
                 manager,
                 sbx,
                 artifacts,
@@ -1150,17 +867,13 @@ impl ToolRegistry {
     /// live catalogue for availability on every skill call.
     pub fn register_skills(&mut self, store: Arc<SkillStore>) -> &mut Self {
         let mut names = self.tool_names();
-        names.extend(["skill.load", "skill.save", "skill.list"].map(String::from));
+        names.extend(["skill", "skill.save"].map(String::from));
         let known = Arc::new(names);
         let catalog = Arc::new(skills::SkillToolCatalog::new(known, self.mcp.clone()));
-        self.register(Arc::new(skills::SkillLoad {
-            store: store.clone(),
-            catalog: catalog.clone(),
-        }));
-        self.register(Arc::new(skills::SkillList {
-            store: store.clone(),
-            catalog: catalog.clone(),
-        }));
+        self.register(Arc::new(skills::SkillTool::new(
+            store.clone(),
+            catalog.clone(),
+        )));
         self.register(Arc::new(skills::SkillSave { store, catalog }));
         self
     }
@@ -1180,18 +893,11 @@ impl ToolRegistry {
         budget_tokens: u32,
         stale_after_days: u32,
     ) -> &mut Self {
-        self.register(Arc::new(memory_tools::MemoryWrite::new_configured(
-            store.clone(),
+        self.register(Arc::new(memory_tools::Memory::new(
+            store,
             budget_tokens,
             stale_after_days,
         )));
-        self.register(Arc::new(memory_tools::MemoryUpdate {
-            store: store.clone(),
-        }));
-        self.register(Arc::new(memory_tools::MemoryForget {
-            store: store.clone(),
-        }));
-        self.register(Arc::new(memory_tools::MemorySearch { store }));
         self
     }
 
@@ -1213,30 +919,48 @@ impl ToolRegistry {
         let mut r = Self::new();
         r.sandbox = Some(sandbox.clone());
         r.artifacts = Some(artifacts.clone());
-        r.register(Arc::new(FsRead {
-            sbx: sandbox.clone(),
+        r.register(Arc::new(Read {
+            text: FsRead {
+                sbx: sandbox.clone(),
+            },
+            image: ImageView {
+                sbx: sandbox.clone(),
+                artifacts: artifacts.clone(),
+            },
+            artifact: ReadArtifact {
+                store: artifacts.clone(),
+            },
+            count: WordCount {
+                sbx: sandbox.clone(),
+            },
         }));
-        r.register(Arc::new(ImageView {
-            sbx: sandbox.clone(),
-            artifacts: artifacts.clone(),
+        r.register(Arc::new(Edit {
+            write: FsWrite {
+                sbx: sandbox.clone(),
+                pins: Default::default(),
+                lsp: r.lsp.clone(),
+                artifacts: artifacts.clone(),
+            },
+            replace: FsEdit {
+                sbx: sandbox.clone(),
+                pins: Default::default(),
+                lsp: r.lsp.clone(),
+                artifacts: artifacts.clone(),
+            },
+            many: MultiEdit {
+                sbx: sandbox.clone(),
+                pins: Default::default(),
+                lsp: r.lsp.clone(),
+                artifacts: artifacts.clone(),
+            },
         }));
-        r.register(Arc::new(FsWrite {
-            sbx: sandbox.clone(),
-            pins: Default::default(),
-            lsp: r.lsp.clone(),
-            artifacts: artifacts.clone(),
-        }));
-        r.register(Arc::new(FsList {
-            sbx: sandbox.clone(),
-        }));
-        r.register(Arc::new(FsEdit {
-            sbx: sandbox.clone(),
-            pins: Default::default(),
-            lsp: r.lsp.clone(),
-            artifacts: artifacts.clone(),
-        }));
-        r.register(Arc::new(WordCount {
-            sbx: sandbox.clone(),
+        r.register(Arc::new(Ls {
+            flat: FsList {
+                sbx: sandbox.clone(),
+            },
+            tree: Tree {
+                sbx: sandbox.clone(),
+            },
         }));
         r.register(Arc::new(Grep {
             sbx: sandbox.clone(),
@@ -1244,23 +968,7 @@ impl ToolRegistry {
         r.register(Arc::new(Glob {
             sbx: sandbox.clone(),
         }));
-        r.register(Arc::new(CodeOutline {
-            sbx: sandbox.clone(),
-            lsp: Arc::clone(&r.lsp),
-        }));
-        r.register(Arc::new(References {
-            sbx: sandbox.clone(),
-            lsp: Arc::clone(&r.lsp),
-        }));
-        r.register(Arc::new(Tree {
-            sbx: sandbox.clone(),
-        }));
-        r.register(Arc::new(MultiEdit {
-            sbx: sandbox.clone(),
-            pins: Default::default(),
-            lsp: r.lsp.clone(),
-            artifacts: artifacts.clone(),
-        }));
+        r.register(Arc::new(Code::new(sandbox.clone(), Arc::clone(&r.lsp))));
         r.register(Arc::new(Git {
             sbx: sandbox.clone(),
         }));
@@ -1276,26 +984,13 @@ impl ToolRegistry {
             sbx: sandbox,
             tasks: tasks.clone(),
         }));
+        // `task.list` is not registered: `task.output` with no `task_id` runs
+        // the identical expression, so it was two names for one answer.
         r.register(Arc::new(TaskOutput {
             tasks: tasks.clone(),
         }));
-        r.register(Arc::new(TaskKill {
-            tasks: tasks.clone(),
-        }));
-        r.register(Arc::new(TaskRemove {
-            tasks: tasks.clone(),
-        }));
-        r.register(Arc::new(TaskList { tasks }));
-        r.register(Arc::new(ReadArtifact { store: artifacts }));
-        r.register(Arc::new(WebSearch {
-            search: r.search.clone(),
-        }));
-        r.register(Arc::new(WebFetch {
-            search: r.search.clone(),
-        }));
-        r.register(Arc::new(WebCrawl {
-            search: r.search.clone(),
-        }));
+        r.register(Arc::new(TaskControl { tasks }));
+        r.register(Arc::new(Web::new(r.search.clone())));
         r.register(Arc::new(Clarify {
             asker: r.clarify.clone(),
         }));
@@ -1501,6 +1196,71 @@ impl Executor for ToolRegistry {
     }
 }
 
+/// Reading something in: a text file, an image, a stored artifact page, or
+/// just a file's size. All read-only, all the same timeout — the difference is
+/// only what is being addressed, and `path` and `hash` never appear together.
+struct Read {
+    text: FsRead,
+    image: ImageView,
+    artifact: ReadArtifact,
+    count: WordCount,
+}
+
+#[async_trait]
+impl Tool for Read {
+    fn name(&self) -> &str {
+        "read"
+    }
+    fn description(&self) -> &str {
+        "Read a file by `path`, or a stored artifact by `hash`. For text, use \
+         `offset` (1-based line) and `limit` to read part of a large \
+         file instead of all of it. An image path returns the picture itself, so use \
+         this rather than a shell command to look at a screenshot or diagram — \
+         oversized images are scaled and rotated photos made upright first. Pass \
+         `count: true` for words, lines and characters instead of contents. With \
+         `hash`, `offset` and `length` are byte positions into a spilled tool result. \
+         Supports paths outside the workspace with permission."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Read
+    }
+    fn icon(&self) -> &'static str {
+        "◇"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to read; omit when reading an artifact" },
+                "hash": { "type": "string", "description": "Artifact content hash, from a spilled tool result" },
+                "offset": { "type": "integer", "minimum": 0, "description": "With `path`: 1-based first line. With `hash`: start byte." },
+                "limit": { "type": "integer", "minimum": 1, "description": "With `path`: how many lines to return" },
+                "length": { "type": "integer", "minimum": 1, "description": "With `hash`: how many bytes to return" },
+                "count": { "type": "boolean", "description": "Return word/line/character counts instead of contents" }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        if args.get("hash").is_some() {
+            return self.artifact.execute(args).await;
+        }
+        let path = arg_str(args, "path")
+            .map_err(|_| ToolError::Args("read needs `path` or `hash`".into()))?;
+        if args.get("count").and_then(Value::as_bool) == Some(true) {
+            return self.count.execute(args).await;
+        }
+        // The extension only routes the call; `image.view` identifies the bytes
+        // and reports a mislabelled file rather than guessing.
+        if media::has_image_extension(std::path::Path::new(&path)) {
+            return self.image.execute(args).await;
+        }
+        self.text.execute(args).await
+    }
+}
+
 struct FsRead {
     sbx: Arc<WorkspaceSandbox>,
 }
@@ -1516,12 +1276,12 @@ struct ImageView {
 #[async_trait]
 impl Tool for ImageView {
     fn name(&self) -> &str {
-        "image.view"
+        "read"
     }
     fn description(&self) -> &str {
         "Look at an image file: screenshots, diagrams, photos, rendered output. \
          Accepts PNG, JPEG, WebP, GIF, BMP, TIFF and ICO, and returns the picture \
-         itself, not a text extract — use it instead of `fs.read`, which only reads \
+         itself, not a text extract — use it instead of `read`, which only reads \
          text. Oversized images are scaled down and rotated photos are made upright \
          before you see them. An image already marked `[attached image: …]` in the \
          conversation is one you can see: do not call this for it, and do not go \
@@ -1600,7 +1360,7 @@ const FS_READ_MAX_RANGE_OUTPUT_BYTES: usize = 2_000_000;
 #[async_trait]
 impl Tool for FsRead {
     fn name(&self) -> &str {
-        "fs.read"
+        "read"
     }
     fn description(&self) -> &str {
         "Read a UTF-8 text file (workspace, or outside with permission). Reads the \
@@ -1652,8 +1412,8 @@ impl Tool for FsRead {
         // question actually being asked.
         if resolved.is_dir() {
             return Err(ToolError::Args(format!(
-                "{path} is a directory — use `fs.list` for its entries, `tree` for a nested view, \
-                 or `glob`/`grep` to find files inside it"
+                "{path} is a directory — use `ls` for its entries, `ls` with `depth` for a \
+                 nested view, or `glob`/`grep` to find files inside it"
             )));
         }
         // Reject oversized whole-file reads before allocation.
@@ -1710,6 +1470,112 @@ impl Tool for FsRead {
     }
 }
 
+/// Changing a file: replace it whole, replace one substring, or apply several
+/// substitutions atomically. One blast radius and one mutation lane between
+/// them, and the argument shapes are disjoint, so the verb needs no `op`.
+struct Edit {
+    write: FsWrite,
+    replace: FsEdit,
+    many: MultiEdit,
+}
+
+#[async_trait]
+impl Tool for Edit {
+    fn name(&self) -> &str {
+        "edit"
+    }
+    fn description(&self) -> &str {
+        "Change a file. Give `content` to create it or replace it whole. Give \
+         `old_string` and `new_string` to replace one exact substring — it must match \
+         uniquely unless `replace_all` is true. Give `edits` to apply several \
+         substitutions to the same file atomically, in order, each seeing the previous \
+         one's result: all of them land or none do, which is cheaper and safer than \
+         repeating this tool. Returns a unified diff. Supports paths outside the \
+         workspace with permission."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::ReversibleLocal
+    }
+    fn icon(&self) -> &'static str {
+        "✎"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative or absolute path" },
+                "content": { "type": "string", "description": "Whole new contents; creates or replaces the file" },
+                "old_string": { "type": "string", "description": "Exact text to replace" },
+                "new_string": { "type": "string", "description": "Replacement text" },
+                "replace_all": { "type": "boolean", "description": "Replace every match instead of requiring a unique one" },
+                "edits": {
+                    "type": "array",
+                    "description": "Several substitutions applied in order to one file, all-or-nothing",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": { "type": "string" },
+                            "new_string": { "type": "string" },
+                            "replace_all": { "type": "boolean" }
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
+                }
+            },
+            "required": ["path"]
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        match self.shape(args) {
+            Some(Shape::Many) => self.many.execute(args).await,
+            Some(Shape::Write) => self.write.execute(args).await,
+            Some(Shape::Replace) => self.replace.execute(args).await,
+            None => Err(ToolError::Args(
+                "edit takes exactly one of: `content` (replace the file), \
+                 `old_string`+`new_string` (replace a substring), or `edits` (several \
+                 substitutions at once)"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Delegated, not defaulted: the approval card renders this diff, and a
+    /// merged tool that forgot it would have the operator approving a write
+    /// they cannot see.
+    async fn preview(&self, args: &Value) -> Option<String> {
+        match self.shape(args)? {
+            Shape::Many => self.many.preview(args).await,
+            Shape::Write => self.write.preview(args).await,
+            Shape::Replace => self.replace.preview(args).await,
+        }
+    }
+}
+
+enum Shape {
+    Write,
+    Replace,
+    Many,
+}
+
+impl Edit {
+    /// Which of the three edits this call is, or `None` when the arguments name
+    /// more than one shape or none at all.
+    fn shape(&self, args: &Value) -> Option<Shape> {
+        match (
+            args.get("edits").is_some(),
+            args.get("content").is_some(),
+            args.get("old_string").is_some(),
+            args.get("new_string").is_some(),
+            args.get("replace_all").is_some(),
+        ) {
+            (true, false, false, false, false) => Some(Shape::Many),
+            (false, true, false, false, false) => Some(Shape::Write),
+            (false, false, true, true, _) => Some(Shape::Replace),
+            _ => None,
+        }
+    }
+}
+
 struct FsWrite {
     sbx: Arc<WorkspaceSandbox>,
     pins: PreviewPins,
@@ -1719,12 +1585,12 @@ struct FsWrite {
 #[async_trait]
 impl Tool for FsWrite {
     fn name(&self) -> &str {
-        "fs.write"
+        "edit"
     }
     fn description(&self) -> &str {
         "Write a whole UTF-8 text file (creates parent dirs; snapshots any prior \
          version; returns a diff). Use this for NEW files or full rewrites; prefer \
-         `fs.edit` to change part of an existing file (smaller, reviewable diff). \
+         `edit` to change part of an existing file (smaller, reviewable diff). \
          Supports paths outside workspace with permission."
     }
     fn blast_radius(&self) -> BlastRadius {
@@ -1863,13 +1729,60 @@ async fn read_or_flag_unreadable(
     }
 }
 
+/// Listing a directory: one level by default, or a depth-limited tree. Same
+/// blast radius, same timeout, same question — "what is in here".
+struct Ls {
+    flat: FsList,
+    tree: Tree,
+}
+
+#[async_trait]
+impl Tool for Ls {
+    fn name(&self) -> &str {
+        "ls"
+    }
+    fn description(&self) -> &str {
+        "List what is in a directory. By default the immediate entries, with directories \
+         suffixed '/'. Pass `depth` for an indented, gitignore-aware tree that skips \
+         .git/target/node_modules — the fastest way to orient in an unfamiliar project. \
+         Use `glob` to match files by pattern anywhere in the tree, `grep` to search \
+         file contents. Supports paths outside the workspace with permission."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
+    fn icon(&self) -> &'static str {
+        "▸"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory to list (default '.')" },
+                "depth": { "type": "integer", "minimum": 1, "description": "Levels deep; omit for one level" },
+                "max_entries": { "type": "integer", "description": "Cap on entries in a tree (default 300)" }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        if args.get("depth").is_some() {
+            self.tree.execute(args).await
+        } else {
+            self.flat.execute(args).await
+        }
+    }
+}
+
 struct FsList {
     sbx: Arc<WorkspaceSandbox>,
 }
 #[async_trait]
 impl Tool for FsList {
     fn name(&self) -> &str {
-        "fs.list"
+        "ls"
     }
     fn icon(&self) -> &'static str {
         "▸"
@@ -1949,7 +1862,7 @@ struct FsEdit {
 #[async_trait]
 impl Tool for FsEdit {
     fn name(&self) -> &str {
-        "fs.edit"
+        "edit"
     }
     fn description(&self) -> &str {
         "Edit a file by replacing an exact substring. `old_string` must match uniquely unless `replace_all` is true. Returns a unified diff. Supports paths outside workspace with permission."
@@ -2001,7 +1914,7 @@ impl Tool for FsEdit {
         self.pins.check(args, &path, &inspection.state)?;
         // CRLF-tolerant byte-exact match (see `resolve_edit`).
         let (old_s, new_s) = resolve_edit(&content, &old_s, &new_s)
-            .ok_or_else(|| ToolError::Failed(format!("old_string not found in {path}")))?;
+            .ok_or_else(|| ToolError::Failed(format!("old_string not found in {path}. No changes applied. Re-read the current file and copy an exact substring, including whitespace and punctuation; do not retry the same unmatched text.")))?;
         let count = content.matches(&old_s).count();
         if count > 1 && !replace_all {
             return Err(ToolError::Failed(format!(
@@ -2090,7 +2003,7 @@ struct WordCount {
 #[async_trait]
 impl Tool for WordCount {
     fn name(&self) -> &str {
-        "word_count"
+        "read"
     }
     fn icon(&self) -> &'static str {
         "#"
@@ -2586,7 +2499,7 @@ fn outline_rules(path: &str) -> Vec<(&'static str, Regex)> {
 #[async_trait]
 impl Tool for CodeOutline {
     fn name(&self) -> &str {
-        "code_outline"
+        "code"
     }
     fn icon(&self) -> &'static str {
         "⌗"
@@ -2597,7 +2510,7 @@ impl Tool for CodeOutline {
     fn description(&self) -> &str {
         "Extract a symbol map — functions, classes, structs, traits, methods, etc., \
          each with its line number — from a source file. A fast table of contents so \
-         you can jump straight to a symbol with `fs.read` (offset/limit) instead of \
+         you can jump straight to a symbol with `read` (offset/limit) instead of \
          reading the whole file. When a language server can serve the file you get the \
          file's real structure and `backend` names the server; otherwise it falls back \
          to line-based patterns (Rust, Python, JS/TS, Go, Ruby, Java/Kotlin, C/C++) and \
@@ -2734,7 +2647,7 @@ async fn lsp_upgrade(
 #[async_trait]
 impl Tool for References {
     fn name(&self) -> &str {
-        "references"
+        "code"
     }
     fn icon(&self) -> &'static str {
         "↗"
@@ -2854,6 +2767,72 @@ impl Tool for References {
     }
 }
 
+/// Asking the code about itself: what a file declares, and where a symbol is
+/// used. Both answer from a language server when one can serve the file and
+/// fall back to a text scan otherwise, so they share one name and differ only
+/// in what is addressed — a `path` or a `symbol`.
+struct Code {
+    outline: CodeOutline,
+    references: References,
+}
+
+impl Code {
+    fn new(sbx: Arc<WorkspaceSandbox>, lsp: LspHandle) -> Self {
+        Self {
+            outline: CodeOutline {
+                sbx: Arc::clone(&sbx),
+                lsp: Arc::clone(&lsp),
+            },
+            references: References { sbx, lsp },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Code {
+    fn name(&self) -> &str {
+        "code"
+    }
+    fn icon(&self) -> &'static str {
+        "⌗"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Search
+    }
+    fn description(&self) -> &str {
+        "Ask the code about itself. Both forms use a language server when one can \
+         serve the file — so you get the real structure, not a pattern guess — and \
+         `backend` names it, or says \"text\" when it fell back to a scan.\n\
+         \n\
+         `symbol` — every place that symbol is used, compiler-resolved: the actual \
+         symbol, not same-named ones elsewhere or mentions in comments. This is the \
+         tool for 'where is X used' and for finding call sites before renaming \
+         something. Scope it with `path`. Use `grep` for free-form regex or prose.\n\
+         `path` alone — that file's symbol map (functions, classes, structs, traits, \
+         methods), each with its line, so you can jump straight to one with `read` \
+         (offset/limit) instead of reading the whole file."
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "symbol": { "type": "string", "description": "Identifier to locate (matched as a whole word)" },
+                "path": { "type": "string", "description": "With `symbol`: directory to scope the search (default '.'). Alone: the source file to outline." },
+                "max_results": { "type": "integer", "description": "With `symbol`: cap on references returned (default 200)" }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        match args.get("symbol") {
+            Some(_) => self.references.execute(args).await,
+            None => self.outline.execute(args).await,
+        }
+    }
+}
+
 struct Tree {
     sbx: Arc<WorkspaceSandbox>,
 }
@@ -2872,7 +2851,7 @@ impl Tool for Tree {
     fn description(&self) -> &str {
         "Show a directory as an indented, depth-limited tree (gitignore-aware, skips \
          .git/target/node_modules) — the fastest way to orient in an unfamiliar \
-         project. Use `glob` to match files by pattern, `fs.list` for one directory."
+         project. Use `glob` to match files by pattern, `ls` for one directory."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -2983,7 +2962,7 @@ struct ReadArtifact {
 #[async_trait]
 impl Tool for ReadArtifact {
     fn name(&self) -> &str {
-        "read_artifact"
+        "read"
     }
     fn icon(&self) -> &'static str {
         "⎘"
@@ -3040,7 +3019,7 @@ impl Tool for ReadArtifact {
                 ToolError::Failed(format!(
                     "no artifact stored under hash {hash} ({err}). Artifact hashes are only \
                      valid if a tool result printed one — they cannot be guessed or \
-                     constructed. To read a file from disk use `fs.read`; to search it use \
+                     constructed. To read a file from disk use `read`; to search it use \
                      `grep`."
                 ))
             })?;
@@ -3339,7 +3318,7 @@ pub(crate) fn validate_connected_peer(
     Ok(())
 }
 
-/// Which backend `web.search` uses. `DuckDuckGo` needs no key and is always the
+/// Which backend a web search uses. `DuckDuckGo` needs no key and is always the
 /// fallback; the others need a key (Tavily/Brave) or an instance URL (SearXNG)
 /// supplied via `/search` in the TUI (or the matching env var).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3438,7 +3417,7 @@ struct WebSearch {
 #[async_trait]
 impl Tool for WebSearch {
     fn name(&self) -> &str {
-        "web.search"
+        "web"
     }
     fn category(&self) -> ToolCategory {
         ToolCategory::Web
@@ -3446,8 +3425,7 @@ impl Tool for WebSearch {
     fn description(&self) -> &str {
         "Search the web. Returns {title, url, snippet}. Uses the provider the \
          user configured via /search (Tavily, Brave, or SearXNG), falling back \
-         to DuckDuckGo when none is set or the chosen one fails. Follow up with \
-         web.fetch on a result url."
+         to DuckDuckGo when none is set or the chosen one fails. Follow up by fetching a result url."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -3731,7 +3709,7 @@ async fn tavily_crawl(
     if pages.is_empty() {
         return Err(ToolError::Failed(
             "no pages returned — the site is likely JavaScript-rendered or has few \
-             crawlable links; use web.fetch on specific page URLs instead"
+             crawlable links; fetch specific page URLs instead"
                 .into(),
         ));
     }
@@ -3924,7 +3902,7 @@ struct WebFetch {
 #[async_trait]
 impl Tool for WebFetch {
     fn name(&self) -> &str {
-        "web.fetch"
+        "web"
     }
     fn icon(&self) -> &'static str {
         "↓"
@@ -3935,7 +3913,7 @@ impl Tool for WebFetch {
     fn description(&self) -> &str {
         "Fetch a web page and return its readable content as Markdown (free plain \
          fetch; falls back to Tavily Extract if TAVILY_API_KEY is set and the page \
-         blocks scrapers or errors). For crawling a whole site, use web.crawl."
+         blocks scrapers or errors). For crawling a whole site, crawl it."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -4032,7 +4010,7 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
         // extractor panic degrades to a message, it never takes down the run.
         let text = tokio::task::spawn_blocking(move || extract_pdf_text(&bytes))
             .await
-            .unwrap_or_else(|_| "[web.fetch: PDF extraction failed]".to_string());
+            .unwrap_or_else(|_| "[web fetch: PDF extraction failed]".to_string());
         return Ok(json!({ "url": url, "status": code, "title": "", "content": text }));
     }
 
@@ -4062,7 +4040,7 @@ async fn fetch_plain(url: &str) -> Result<Value, ToolError> {
         return Ok(json!({
             "url": url, "status": code, "title": title,
             "content": format!(
-                "[web.fetch: {kind} ({} bytes) is not an HTML/text page — cannot convert to Markdown]",
+                "[web fetch: {kind} ({} bytes) is not an HTML/text page — cannot convert to Markdown]",
                 body.len()
             )
         }));
@@ -4082,7 +4060,7 @@ struct WebCrawl {
 #[async_trait]
 impl Tool for WebCrawl {
     fn name(&self) -> &str {
-        "web.crawl"
+        "web"
     }
     fn icon(&self) -> &'static str {
         "⇊"
@@ -4093,17 +4071,15 @@ impl Tool for WebCrawl {
     fn description(&self) -> &str {
         "Fetch content from MANY pages under ONE site/root in a single call (Tavily; \
          requires a Tavily key configured via /search or TAVILY_API_KEY). Use this — \
-         instead of calling web.fetch page by \
-         page — when the task needs multiple pages of the SAME site, e.g. 'read all \
+         instead of fetching page by page — when the task needs multiple pages of the SAME site, e.g. 'read all \
          the docs under this URL', 'every posting on this careers page', 'summarize \
          this whole section'. Give natural-language `instructions` to focus it (e.g. \
-         'pages about pricing'). NOT for: a single known page (use web.fetch) or \
-         finding pages across different sites (use web.search)."
+         'pages about pricing'). NOT for: a single known page, or finding pages across different sites."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
     }
-    fn timeout(&self) -> Option<std::time::Duration> {
+    fn timeout(&self, _args: &Value) -> Option<std::time::Duration> {
         // A multi-page crawl (`limit` up to 100) is one long request and can't
         // finish inside 60s; give it a wider ceiling.
         Some(std::time::Duration::from_secs(300)) // 5 min
@@ -4127,12 +4103,102 @@ impl Tool for WebCrawl {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
         let key = read_search(&self.search).tavily_key().ok_or_else(|| {
             ToolError::Failed(
-                "web.crawl needs a Tavily API key — set one with /search (choose Tavily) \
+                "a web crawl needs a Tavily API key — set one with /search (choose Tavily) \
                  or TAVILY_API_KEY"
                     .into(),
             )
         })?;
         tavily_crawl(&http_client()?, &url, instructions, max_depth, limit, &key).await
+    }
+}
+
+/// Everything that reaches out to the open web: finding pages, reading one, and
+/// reading many under one root. Three verbs behind `op` because they are always
+/// used in sequence — search, then fetch what it returned — and because each
+/// needs the other two named to be chosen correctly.
+struct Web {
+    search: WebSearch,
+    fetch: WebFetch,
+    crawl: WebCrawl,
+}
+
+impl Web {
+    fn new(search: SearchHandle) -> Self {
+        Self {
+            search: WebSearch {
+                search: Arc::clone(&search),
+            },
+            fetch: WebFetch {
+                search: Arc::clone(&search),
+            },
+            crawl: WebCrawl { search },
+        }
+    }
+
+    fn op<'a>(&'a self, args: &Value) -> Result<&'a dyn Tool, ToolError> {
+        match args.get("op").and_then(Value::as_str) {
+            Some("search") => Ok(&self.search),
+            Some("fetch") => Ok(&self.fetch),
+            Some("crawl") => Ok(&self.crawl),
+            // Nothing to guess from: a missing `op` with a `url` is a fetch and
+            // with a `query` a search, which is what the model meant either way.
+            None if args.get("url").is_some() => Ok(&self.fetch),
+            None if args.get("query").is_some() => Ok(&self.search),
+            other => Err(ToolError::Args(format!(
+                "web needs op: \"search\", \"fetch\", or \"crawl\" (got {})",
+                other.unwrap_or("nothing")
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Web {
+    fn name(&self) -> &str {
+        "web"
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Web
+    }
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn description(&self) -> &str {
+        "Reach the open web.\n\
+         \n\
+         `op: \"search\"` — find pages by `query`. Returns {title, url, snippet}; \
+         uses the provider configured via /search (Tavily, Brave, or SearXNG) and \
+         falls back to DuckDuckGo. Follow up by fetching a result's url.\n\
+         `op: \"fetch\"` — read ONE known `url` as Markdown (plain fetch, falling \
+         back to Tavily Extract when a key is set and the page blocks scrapers).\n\
+         `op: \"crawl\"` — read MANY pages under one root `url` in a single call \
+         (Tavily key required). Use it instead of fetching page by page when the \
+         task spans one site: 'read all the docs under this URL', 'every posting \
+         on this careers page'. Narrow it with natural-language `instructions`. \
+         Not for a single page, and not for finding pages across different sites."
+    }
+    fn timeout(&self, args: &Value) -> Option<std::time::Duration> {
+        match self.op(args) {
+            Ok(tool) => tool.timeout(args),
+            Err(_) => Some(TOOL_TIMEOUT),
+        }
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": ["search", "fetch", "crawl"], "description": "Which verb; defaults to search with a query, fetch with a url" },
+                "query": { "type": "string", "description": "search: what to look for" },
+                "max_results": { "type": "integer", "description": "search: max results (default 8)" },
+                "url": { "type": "string", "description": "fetch: the page; crawl: the root to start from" },
+                "instructions": { "type": "string", "description": "crawl: what to look for, in natural language" },
+                "max_depth": { "type": "integer", "description": "crawl: how far from the root to follow links (1-5, default 1)" },
+                "limit": { "type": "integer", "description": "crawl: max pages to process (default 20)" }
+            }
+        })
+    }
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        self.op(args)?.execute(args).await
     }
 }
 
@@ -4251,7 +4317,7 @@ impl Tool for Clarify {
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
     }
-    fn timeout(&self) -> Option<std::time::Duration> {
+    fn timeout(&self, _args: &Value) -> Option<std::time::Duration> {
         // A human question has NO deadline — the agent must wait for the user, not
         // give up after 60s and proceed on its own. The user can always Esc to
         // dismiss the form (→ skipped) or cancel the turn.
@@ -4363,10 +4429,10 @@ fn html_to_markdown(html: &str) -> String {
         .ok()
         .and_then(|h| h.join().ok())
         .filter(|markdown| !markdown.trim().is_empty())
-        .unwrap_or_else(|| "[web.fetch: page too complex to convert to Markdown]".to_string())
+        .unwrap_or_else(|| "[web fetch: page too complex to convert to Markdown]".to_string())
 }
 
-/// Extract the text of a PDF (e.g. an arXiv paper) so `web.fetch` returns
+/// Extract the text of a PDF (e.g. an arXiv paper) so a web fetch returns
 /// something useful instead of refusing binary. Size-capped; empty output means
 /// a scanned/image PDF with no embedded text layer (we don't OCR).
 fn extract_pdf_text(bytes: &[u8]) -> String {
@@ -4374,7 +4440,7 @@ fn extract_pdf_text(bytes: &[u8]) -> String {
     const MAX_OUT: usize = 400 * 1024;
     if bytes.len() > MAX_PDF {
         return format!(
-            "[web.fetch: PDF too large to extract ({} bytes)]",
+            "[web fetch: PDF too large to extract ({} bytes)]",
             bytes.len()
         );
     }
@@ -4382,7 +4448,7 @@ fn extract_pdf_text(bytes: &[u8]) -> String {
         Ok(text) => {
             let text = text.trim();
             if text.is_empty() {
-                "[web.fetch: PDF has no extractable text layer (likely scanned images)]".to_string()
+                "[web fetch: PDF has no extractable text layer (likely scanned images)]".to_string()
             } else if text.len() > MAX_OUT {
                 let mut end = MAX_OUT;
                 while !text.is_char_boundary(end) {
@@ -4397,7 +4463,7 @@ fn extract_pdf_text(bytes: &[u8]) -> String {
                 text.to_string()
             }
         }
-        Err(e) => format!("[web.fetch: could not extract PDF text: {e}]"),
+        Err(e) => format!("[web fetch: could not extract PDF text: {e}]"),
     }
 }
 
@@ -4756,7 +4822,7 @@ impl TaskTable {
         if active >= self.limits.max_active {
             return Err(format!(
                 "shell task limit reached ({}/{} active); wait for a running command or stop it \
-                 with task.kill",
+                 with task.control op=kill",
                 active, self.limits.max_active
             ));
         }
@@ -5147,7 +5213,7 @@ impl Tool for ShellExec {
          code — sed, awk, cat, diff, git, curl, build/test commands, pipelines, \
          anything the shell provides. Commands run only in the foreground; on \
          timeout or cancellation MEDHA kills and settles the whole process tree \
-         before reporting the result. Prefer fs.edit for exact string-replace edits \
+         before reporting the result. Prefer edit for exact string-replace edits \
          (it produces a reviewable diff) and glob/grep for finding files — use this \
          for everything else, including multi-step shell pipelines. Set network=true \
          for dependency installs, downloads, or other commands needing the network: \
@@ -5159,7 +5225,7 @@ impl Tool for ShellExec {
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::IrreversibleLocal
     }
-    fn timeout(&self) -> Option<std::time::Duration> {
+    fn timeout(&self, _args: &Value) -> Option<std::time::Duration> {
         // Self-managed: `execute` owns a bounded foreground wait and does not
         // return from its timeout path until the killed process has settled.
         None
@@ -5382,7 +5448,7 @@ impl Tool for TaskOutput {
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "task_id": { "type": "string", "description": "Task id from task.list (omit to list all tasks)" } }
+            "properties": { "task_id": { "type": "string", "description": "Task id from shell.exec or task.output (omit to list all tasks)" } }
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
@@ -5396,24 +5462,27 @@ impl Tool for TaskOutput {
     }
 }
 
-struct TaskKill {
+/// Stopping and forgetting a task: one blast radius, one mutation rule, two
+/// verbs that only differ in which table entry they touch.
+struct TaskControl {
     tasks: Arc<TaskTable>,
 }
 
 #[async_trait]
-impl Tool for TaskKill {
+impl Tool for TaskControl {
     fn name(&self) -> &str {
-        "task.kill"
+        "task.control"
     }
     fn category(&self) -> ToolCategory {
         ToolCategory::Shell
     }
     fn description(&self) -> &str {
-        "Stop a running shell task by id — SIGKILLs its whole process group. \
-         Shell commands hold the mutation lane while they run, so a task started \
-         by this agent has already finished by the time you could call this; use \
-         `task.list` to find one still running and `task.output` to read a \
-         finished one."
+        "`op: \"kill\"` stops a running shell task by id, SIGKILLing its whole process \
+         group. Shell commands hold the mutation lane while they run, so a task this \
+         agent started has already finished by the time you could kill it; use \
+         `task.output` to find one still running, and to read a finished one. \
+         `op: \"remove\"` forgets a completed task and its retained output from the \
+         bounded recent-result cache; a running task must be killed first."
     }
     fn blast_radius(&self) -> BlastRadius {
         // A local, expected action on a task this agent started — no approval nag.
@@ -5421,70 +5490,50 @@ impl Tool for TaskKill {
     }
     fn mutation_key(&self, _args: &Value) -> Option<String> {
         // A shell task holds the mutation lane until it settles. Requiring that
-        // same lane before task.kill could run would make the only escape path
+        // same lane before a kill could run would make the only escape path
         // wait behind the process it is supposed to stop.
         None
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "task_id": { "type": "string", "description": "Task id to kill" } },
-            "required": ["task_id"]
+            "properties": {
+                "op": { "type": "string", "enum": ["kill", "remove"] },
+                "task_id": { "type": "string", "description": "Task id, from task.output" }
+            },
+            "required": ["op", "task_id"]
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let id = arg_str(args, "task_id")?;
-        if self.tasks.kill(&id) {
-            Ok(json!({ "task_id": id, "killed": true }))
-        } else {
-            Err(ToolError::Failed(format!("no such task '{id}'")))
+        match args.get("op").and_then(Value::as_str) {
+            Some("kill") => {
+                if self.tasks.kill(&id) {
+                    Ok(json!({ "task_id": id, "killed": true }))
+                } else {
+                    Err(ToolError::Failed(format!("no such task '{id}'")))
+                }
+            }
+            Some("remove") => {
+                if self.tasks.remove_recent(&id) {
+                    Ok(json!({ "task_id": id, "removed": true }))
+                } else if self.tasks.is_active(&id) {
+                    Err(ToolError::Failed(format!(
+                        "task '{id}' is still running; stop it with op=kill before removing it"
+                    )))
+                } else {
+                    Err(ToolError::Failed(format!("no such completed task '{id}'")))
+                }
+            }
+            other => Err(ToolError::Args(format!(
+                "task.control needs op = kill or remove; got {}",
+                other.unwrap_or("nothing")
+            ))),
         }
     }
 }
 
-struct TaskRemove {
-    tasks: Arc<TaskTable>,
-}
-
-#[async_trait]
-impl Tool for TaskRemove {
-    fn name(&self) -> &str {
-        "task.remove"
-    }
-    fn category(&self) -> ToolCategory {
-        ToolCategory::Shell
-    }
-    fn description(&self) -> &str {
-        "Remove a completed shell task and its retained output from MEDHA's bounded \
-         recent-result cache. A running task must be stopped with task.kill first."
-    }
-    fn blast_radius(&self) -> BlastRadius {
-        BlastRadius::ReversibleLocal
-    }
-    fn mutation_key(&self, _args: &Value) -> Option<String> {
-        None
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "task_id": { "type": "string", "description": "Completed task id to forget" } },
-            "required": ["task_id"]
-        })
-    }
-    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
-        let id = arg_str(args, "task_id")?;
-        if self.tasks.remove_recent(&id) {
-            Ok(json!({ "task_id": id, "removed": true }))
-        } else if self.tasks.is_active(&id) {
-            Err(ToolError::Failed(format!(
-                "task '{id}' is still running; stop it with task.kill before removing it"
-            )))
-        } else {
-            Err(ToolError::Failed(format!("no such completed task '{id}'")))
-        }
-    }
-}
-
+#[allow(dead_code)]
 struct TaskList {
     tasks: Arc<TaskTable>,
 }
@@ -5568,6 +5617,12 @@ fn resolve_edit(content: &str, old: &str, new: &str) -> Option<(String, String)>
 }
 
 fn apply_edits(content: &str, edits: &[Value]) -> Result<String, ToolError> {
+    apply_edits_inner(content, edits).map_err(|err| ToolError::Failed(format!(
+        "{err}. Entire batch aborted; no edits applied. Re-read the current file, correct the failing edit, and resubmit all intended edits."
+    )))
+}
+
+fn apply_edits_inner(content: &str, edits: &[Value]) -> Result<String, ToolError> {
     let mut cur = content.to_string();
     for (i, e) in edits.iter().enumerate() {
         let n = i + 1;
@@ -5604,7 +5659,7 @@ fn apply_edits(content: &str, edits: &[Value]) -> Result<String, ToolError> {
 #[async_trait]
 impl Tool for MultiEdit {
     fn name(&self) -> &str {
-        "multi_edit"
+        "edit"
     }
     fn icon(&self) -> &'static str {
         "❏"
@@ -5613,7 +5668,7 @@ impl Tool for MultiEdit {
         "Apply several exact-substring edits to ONE file atomically, in order — one \
          snapshot, one write, one combined diff. All-or-nothing: if any edit's \
          `old_string` isn't found (or is ambiguous without `replace_all`), NOTHING is \
-         written. Prefer this over multiple `fs.edit` calls when changing several places \
+         written. Prefer this over multiple `edit` calls when changing several places \
          in the same file — it's cheaper and can't leave the file half-edited. Each edit \
          sees the result of the previous one."
     }
@@ -5705,13 +5760,13 @@ impl Tool for MultiEdit {
     async fn preview(&self, args: &Value) -> Option<String> {
         let path = args.get("path")?.as_str()?;
         let edits = args.get("edits")?.as_array()?;
-        // Never prompts — see `fs.edit`'s preview.
+        // Never prompts — see `edit`'s preview.
         let inspection = self.sbx.inspect_if_permitted(path).await.ok()??;
         self.pins.pin(args, &inspection.state);
         let content = String::from_utf8(inspection.bytes.unwrap_or_default()).ok()?;
         match apply_edits(&content, edits) {
             Ok(updated) => Some(cap_preview(&make_diff(path, &content, &updated))),
-            Err(e) => Some(format!("({e} — this multi_edit would fail)")),
+            Err(e) => Some(format!("({e} — this edit batch would fail)")),
         }
     }
 }
@@ -6300,7 +6355,7 @@ impl Tool for Diagnostics {
          \n\
          This is the whole-project, authoritative check — use it to verify work before \
          calling it done. For 'what did my edit just break in this file', prefer \
-         `lsp.diagnostics`: it is per-file, instant, needs no approval, and already \
+         `lsp` with `op: diagnostics`: it is per-file, instant, needs no approval, and already \
          runs automatically after every edit."
     }
     fn blast_radius(&self) -> BlastRadius {
@@ -6309,7 +6364,7 @@ impl Tool for Diagnostics {
         // human gate and let an untrusted checkout exfiltrate secrets.
         BlastRadius::IrreversibleLocal
     }
-    fn timeout(&self) -> Option<std::time::Duration> {
+    fn timeout(&self, _args: &Value) -> Option<std::time::Duration> {
         // A cold `cargo check`/`tsc`/`mvn` on a large workspace easily exceeds 60s.
         Some(std::time::Duration::from_secs(600)) // 10 min
     }
@@ -6507,7 +6562,7 @@ impl Tool for UpdatePlan {
         let steps = args
             .get("steps")
             .and_then(Value::as_array)
-            .ok_or_else(|| ToolError::Args("expected array 'steps'".into()))?;
+            .ok_or_else(|| ToolError::Args(r#"expected array 'steps', not a JSON-encoded string. Example: {"steps":[{"title":"Inspect current files","status":"in_progress"}]}. No plan update applied"#.into()))?;
         let mut out = Vec::with_capacity(steps.len());
         // Enforce the invariant the model is asked to keep: at most ONE step
         // `in_progress`. If it slips and marks several, keep the first and demote the
@@ -6782,11 +6837,11 @@ mod tests {
 
         // specs are exposed and sorted
         let names: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
-        assert!(names.contains(&"fs.write".to_string()));
+        assert!(names.contains(&"edit".to_string()));
 
         let write = ToolIntent {
             id: "1".into(),
-            tool: "fs.write".into(),
+            tool: "edit".into(),
             args: json!({ "path": "x.txt", "content": "hi" }),
         };
         let obs = reg.execute(&write).await;
@@ -6794,7 +6849,7 @@ mod tests {
 
         let read = ToolIntent {
             id: "2".into(),
-            tool: "fs.read".into(),
+            tool: "read".into(),
             args: json!({ "path": "x.txt" }),
         };
         let obs = reg.execute(&read).await;
@@ -6815,19 +6870,44 @@ mod tests {
             },
         )));
 
+        // Two tools, not nine: every read-only query shares `lsp`, and only
+        // starting a server — which spawns a process — is addressed separately.
         let names: Vec<String> = reg.specs().into_iter().map(|spec| spec.name).collect();
-        assert!(names.contains(&"lsp.status".to_string()));
+        assert!(names.contains(&"lsp".to_string()));
         assert!(names.contains(&"lsp.start".to_string()));
-        assert!(names.contains(&"lsp.diagnostics".to_string()));
-        assert!(names.contains(&"lsp.definition".to_string()));
-        assert!(names.contains(&"lsp.references".to_string()));
-        assert!(names.contains(&"lsp.hover".to_string()));
-        assert!(names.contains(&"lsp.symbols".to_string()));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("lsp.") && name != "lsp.start"),
+            "{names:?}"
+        );
+        let ops = reg
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "lsp")
+            .map(|spec| spec.schema["properties"]["op"]["enum"].clone())
+            .unwrap();
+        for op in [
+            "definition",
+            "references",
+            "implementation",
+            "hover",
+            "document_symbols",
+            "symbols",
+            "call_hierarchy",
+            "diagnostics",
+            "status",
+        ] {
+            assert!(
+                ops.as_array().unwrap().iter().any(|value| value == op),
+                "op {op} must remain reachable: {ops}"
+            );
+        }
 
         let observation = reg
             .execute(&ToolIntent {
                 id: "lsp-write".into(),
-                tool: "fs.write".into(),
+                tool: "edit".into(),
                 args: json!({ "path": "main.rs", "content": "fn main() {}" }),
             })
             .await;
@@ -6956,7 +7036,7 @@ mod tests {
         let out = extract_pdf_text(&bytes);
         assert!(!out.is_empty());
         assert!(
-            !out.starts_with("[web.fetch: could not"),
+            !out.starts_with("[web fetch: could not"),
             "extraction errored: {out}"
         );
         eprintln!(
@@ -7024,7 +7104,7 @@ mod tests {
         let page1 = reg
             .execute(&ToolIntent {
                 id: "1".into(),
-                tool: "read_artifact".into(),
+                tool: "read".into(),
                 args: json!({ "hash": hash, "offset": 0, "length": 2 }),
             })
             .await;
@@ -7040,7 +7120,7 @@ mod tests {
         let page2 = reg
             .execute(&ToolIntent {
                 id: "2".into(),
-                tool: "read_artifact".into(),
+                tool: "read".into(),
                 args: json!({ "hash": hash, "offset": next, "length": 4 }),
             })
             .await;
@@ -7144,7 +7224,7 @@ mod tests {
         let whole = reg
             .execute(&ToolIntent {
                 id: "1".into(),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: json!({ "path": "big.txt" }),
             })
             .await;
@@ -7161,7 +7241,7 @@ mod tests {
         let ranged = reg
             .execute(&ToolIntent {
                 id: "2".into(),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: json!({ "path": "big.txt", "offset": 1, "limit": 3 }),
             })
             .await;
@@ -7187,7 +7267,7 @@ mod tests {
         sbx.write("p.txt", "alpha\nbeta\n").await.unwrap();
         let intent = ToolIntent {
             id: "1".into(),
-            tool: "fs.edit".into(),
+            tool: "edit".into(),
             args: json!({ "path": "p.txt", "old_string": "beta", "new_string": "BETA" }),
         };
         // Gate flow: preview pins the content, then the file changes underneath.
@@ -7219,7 +7299,7 @@ mod tests {
         // multi_edit gets the same guard.
         let mintent = ToolIntent {
             id: "3".into(),
-            tool: "multi_edit".into(),
+            tool: "edit".into(),
             args: json!({ "path": "p.txt", "edits": [{ "old_string": "alpha", "new_string": "ALPHA" }] }),
         };
         assert!(reg.preview(&mintent).await.is_some());
@@ -7276,7 +7356,7 @@ mod tests {
 
         reg.execute(&ToolIntent {
             id: "1".into(),
-            tool: "fs.write".into(),
+            tool: "edit".into(),
             args: json!({ "path": "f.txt", "content": "alpha\nbeta\ngamma\n" }),
         })
         .await;
@@ -7285,7 +7365,7 @@ mod tests {
         let edit = reg
             .execute(&ToolIntent {
                 id: "2".into(),
-                tool: "fs.edit".into(),
+                tool: "edit".into(),
                 args: json!({ "path": "f.txt", "old_string": "beta", "new_string": "BETA" }),
             })
             .await;
@@ -7309,7 +7389,7 @@ mod tests {
         let bad = reg
             .execute(&ToolIntent {
                 id: "4".into(),
-                tool: "fs.edit".into(),
+                tool: "edit".into(),
                 args: json!({ "path": "f.txt", "old_string": "a", "new_string": "x" }),
             })
             .await;
@@ -7466,15 +7546,29 @@ mod tests {
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
         reg.execute(&ToolIntent {
             id: "1".into(),
-            tool: "fs.write".into(),
+            tool: "edit".into(),
             args: json!({ "path": "f.txt", "content": "alpha\nbeta\n" }),
         })
         .await;
+        // Ambiguous merged-tool arguments must not silently become a whole-file write.
+        for args in [
+            json!({"path":"f.txt", "content":"overwrite", "new_string":"replacement"}),
+            json!({"path":"f.txt", "content":"overwrite", "replace_all":true}),
+        ] {
+            let result = reg
+                .execute(&ToolIntent {
+                    id: "mixed".into(),
+                    tool: "edit".into(),
+                    args,
+                })
+                .await;
+            assert_eq!(result.status, kernel::ObsStatus::Error);
+        }
         // A batch where the second edit can't match must leave the file untouched.
         let bad = reg
             .execute(&ToolIntent {
                 id: "2".into(),
-                tool: "multi_edit".into(),
+                tool: "edit".into(),
                 args: json!({ "path": "f.txt", "edits": [
                     { "old_string": "alpha", "new_string": "ALPHA" },
                     { "old_string": "nonexistent", "new_string": "x" }
@@ -7485,7 +7579,7 @@ mod tests {
         let after = reg
             .execute(&ToolIntent {
                 id: "3".into(),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: json!({ "path": "f.txt" }),
             })
             .await;
@@ -7504,7 +7598,7 @@ mod tests {
 
         reg.execute(&ToolIntent {
             id: "1".into(),
-            tool: "fs.write".into(),
+            tool: "edit".into(),
             args: json!({ "path": "f.txt", "content": "alpha\nbeta\ngamma\n" }),
         })
         .await;
@@ -7513,7 +7607,7 @@ mod tests {
         let prev = reg
             .preview(&ToolIntent {
                 id: "2".into(),
-                tool: "fs.edit".into(),
+                tool: "edit".into(),
                 args: json!({ "path": "f.txt", "old_string": "beta", "new_string": "BETA" }),
             })
             .await
@@ -7526,7 +7620,7 @@ mod tests {
         let after = reg
             .execute(&ToolIntent {
                 id: "3".into(),
-                tool: "fs.read".into(),
+                tool: "read".into(),
                 args: json!({ "path": "f.txt" }),
             })
             .await;
@@ -7536,7 +7630,7 @@ mod tests {
         let np = reg
             .preview(&ToolIntent {
                 id: "4".into(),
-                tool: "fs.write".into(),
+                tool: "edit".into(),
                 args: json!({ "path": "new.txt", "content": "hello\n" }),
             })
             .await
@@ -7550,7 +7644,7 @@ mod tests {
         let miss = reg
             .preview(&ToolIntent {
                 id: "5".into(),
-                tool: "fs.edit".into(),
+                tool: "edit".into(),
                 args: json!({ "path": "f.txt", "old_string": "nope", "new_string": "x" }),
             })
             .await
@@ -7567,7 +7661,7 @@ mod tests {
 
         let attempt = |id: &str, path: &str, content: &str| ToolIntent {
             id: id.into(),
-            tool: "fs.write".into(),
+            tool: "edit".into(),
             args: json!({ "path": path, "content": content }),
         };
 
@@ -7626,7 +7720,7 @@ mod tests {
         // Write a test file
         reg.execute(&ToolIntent {
             id: "1".into(),
-            tool: "fs.write".into(),
+            tool: "edit".into(),
             args: json!({ "path": "test.txt", "content": "hello world\nthis is a test\nthree lines here" }),
         })
         .await;
@@ -7635,8 +7729,8 @@ mod tests {
         let wc = reg
             .execute(&ToolIntent {
                 id: "2".into(),
-                tool: "word_count".into(),
-                args: json!({ "path": "test.txt" }),
+                tool: "read".into(),
+                args: json!({ "path": "test.txt", "count": true }),
             })
             .await;
         assert_eq!(wc.status, kernel::ObsStatus::Ok);
@@ -7739,14 +7833,14 @@ mod tests {
         let reg = reg_in(&dir);
         run(
             &reg,
-            "fs.write",
+            "edit",
             json!({ "path": "f.txt", "content": "one\r\ntwo\r\nthree\r\n" }),
         )
         .await;
 
         let r = run(
             &reg,
-            "fs.read",
+            "read",
             json!({ "path": "f.txt", "offset": 2, "limit": 1 }),
         )
         .await;
@@ -7758,7 +7852,7 @@ mod tests {
 
         let e = run(
             &reg,
-            "fs.edit",
+            "edit",
             json!({
                 "path": "f.txt", "old_string": "two\r\n", "new_string": "TWO\r\n"
             }),
@@ -7771,9 +7865,7 @@ mod tests {
             e.payload
         );
         assert_eq!(
-            run(&reg, "fs.read", json!({ "path": "f.txt" }))
-                .await
-                .payload["content"],
+            run(&reg, "read", json!({ "path": "f.txt" })).await.payload["content"],
             "one\r\nTWO\r\nthree\r\n"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -7785,22 +7877,20 @@ mod tests {
         let reg = reg_in(&dir);
         run(
             &reg,
-            "fs.write",
+            "edit",
             json!({ "path": "f.txt", "content": "a\r\nb\r\nc\r\n" }),
         )
         .await;
         let e = run(
             &reg,
-            "fs.edit",
+            "edit",
             json!({
                 "path": "f.txt", "old_string": "b\r\n", "new_string": "X\nY\n"
             }),
         )
         .await;
         assert_eq!(e.status, kernel::ObsStatus::Ok, "{:?}", e.payload);
-        let out = run(&reg, "fs.read", json!({ "path": "f.txt" }))
-            .await
-            .payload["content"]
+        let out = run(&reg, "read", json!({ "path": "f.txt" })).await.payload["content"]
             .as_str()
             .unwrap()
             .to_string();
@@ -7818,13 +7908,13 @@ mod tests {
         let reg = reg_in(&dir);
         run(
             &reg,
-            "fs.write",
+            "edit",
             json!({ "path": "f.txt", "content": "one\r\ntwo\r\n" }),
         )
         .await;
         let e = run(
             &reg,
-            "fs.edit",
+            "edit",
             json!({
                 "path": "f.txt", "old_string": "one\ntwo", "new_string": "1\n2"
             }),
@@ -7837,9 +7927,7 @@ mod tests {
             e.payload
         );
         assert_eq!(
-            run(&reg, "fs.read", json!({ "path": "f.txt" }))
-                .await
-                .payload["content"],
+            run(&reg, "read", json!({ "path": "f.txt" })).await.payload["content"],
             "1\r\n2\r\n"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -7851,13 +7939,13 @@ mod tests {
         let reg = reg_in(&dir);
         run(
             &reg,
-            "fs.write",
+            "edit",
             json!({ "path": "f.txt", "content": "one\r\ntwo\r\n" }),
         )
         .await;
         let intent = ToolIntent {
             id: "crlf-preview".into(),
-            tool: "fs.edit".into(),
+            tool: "edit".into(),
             args: json!({
                 "path": "f.txt", "old_string": "one\ntwo", "new_string": "1\n2"
             }),
@@ -7872,9 +7960,7 @@ mod tests {
         let observation = reg.execute(&intent).await;
         assert_eq!(observation.status, kernel::ObsStatus::Ok, "{observation:?}");
         assert_eq!(
-            run(&reg, "fs.read", json!({ "path": "f.txt" }))
-                .await
-                .payload["content"],
+            run(&reg, "read", json!({ "path": "f.txt" })).await.payload["content"],
             "1\r\n2\r\n"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -7886,13 +7972,13 @@ mod tests {
         let reg = reg_in(&dir);
         run(
             &reg,
-            "fs.write",
+            "edit",
             json!({ "path": "f.txt", "content": "a\nb\nc\n" }),
         )
         .await;
         let r = run(
             &reg,
-            "fs.read",
+            "read",
             json!({ "path": "f.txt", "offset": 2, "limit": u64::MAX }),
         )
         .await;
@@ -7902,7 +7988,7 @@ mod tests {
         );
         let past = run(
             &reg,
-            "fs.read",
+            "read",
             json!({ "path": "f.txt", "offset": 99, "limit": 1 }),
         )
         .await;
@@ -7920,16 +8006,11 @@ mod tests {
     async fn edit_rejects_empty_and_noop_old_string() {
         let dir = std::env::temp_dir().join(format!("medha-empty-{}", ulid_like()));
         let reg = reg_in(&dir);
-        run(
-            &reg,
-            "fs.write",
-            json!({ "path": "f.txt", "content": "abc" }),
-        )
-        .await;
+        run(&reg, "edit", json!({ "path": "f.txt", "content": "abc" })).await;
 
         let empty = run(
             &reg,
-            "fs.edit",
+            "edit",
             json!({
                 "path": "f.txt", "old_string": "", "new_string": "X", "replace_all": true
             }),
@@ -7941,15 +8022,13 @@ mod tests {
             "empty old_string must be rejected"
         );
         assert_eq!(
-            run(&reg, "fs.read", json!({ "path": "f.txt" }))
-                .await
-                .payload["content"],
+            run(&reg, "read", json!({ "path": "f.txt" })).await.payload["content"],
             "abc"
         );
 
         let noop = run(
             &reg,
-            "fs.edit",
+            "edit",
             json!({
                 "path": "f.txt", "old_string": "abc", "new_string": "abc"
             }),
@@ -7963,7 +8042,7 @@ mod tests {
 
         let me = run(
             &reg,
-            "multi_edit",
+            "edit",
             json!({
                 "path": "f.txt", "edits": [{ "old_string": "", "new_string": "Y" }]
             }),
@@ -8039,7 +8118,7 @@ mod tests {
         let obs = run(&reg, "shell.exec", json!({ "command": "printf recent" })).await;
         assert_eq!(obs.status, kernel::ObsStatus::Ok);
 
-        let list = run(&reg, "task.list", json!({})).await;
+        let list = run(&reg, "task.output", json!({})).await;
         let tasks = list.payload["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 1, "{:?}", list.payload);
         assert_eq!(tasks[0]["status"], "exited");
@@ -8049,13 +8128,18 @@ mod tests {
         assert_eq!(output.status, kernel::ObsStatus::Ok);
         assert_eq!(output.payload["stdout"], "recent");
 
-        let removed = run(&reg, "task.remove", json!({ "task_id": id })).await;
+        let removed = run(
+            &reg,
+            "task.control",
+            json!({ "op": "remove", "task_id": id }),
+        )
+        .await;
         assert_eq!(removed.status, kernel::ObsStatus::Ok);
         assert_eq!(removed.payload["removed"], true);
         let missing = run(&reg, "task.output", json!({ "task_id": id })).await;
         assert_eq!(missing.status, kernel::ObsStatus::Error);
         assert!(
-            run(&reg, "task.list", json!({})).await.payload["tasks"]
+            run(&reg, "task.output", json!({})).await.payload["tasks"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -8203,7 +8287,7 @@ mod tests {
             shell_spec.schema["properties"]["timeout_s"]["maximum"],
             SHELL_TIMEOUT_MAX_SECS
         );
-        let list = run(&reg, "task.list", json!({})).await;
+        let list = run(&reg, "task.output", json!({})).await;
         assert!(list.payload["tasks"].as_array().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -8424,7 +8508,7 @@ mod tests {
         // Timeout drops the tool future exactly as the kernel does after its
         // cancellation settle window.
         let _ = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
-        let list = run(&reg, "task.list", json!({})).await;
+        let list = run(&reg, "task.output", json!({})).await;
         let tasks = list.payload["tasks"].as_array().unwrap();
         assert_eq!(
             tasks.len(),
@@ -8448,11 +8532,11 @@ mod tests {
         assert_eq!(
             reg.mutation_key(&ToolIntent {
                 id: "kill".into(),
-                tool: "task.kill".into(),
-                args: json!({ "task_id": "t1" }),
+                tool: "task.control".into(),
+                args: json!({ "op": "kill", "task_id": "t1" }),
             }),
             None,
-            "task.kill must remain callable while shell.exec owns the mutation lease"
+            "a kill must remain callable while shell.exec owns the mutation lease"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -8460,18 +8544,21 @@ mod tests {
     #[test]
     fn per_tool_timeouts_exceed_the_default_for_long_runners() {
         let default = TOOL_TIMEOUT;
-        assert_eq!(WordCount { sbx: mk_sbx() }.timeout(), Some(default));
+        assert_eq!(
+            WordCount { sbx: mk_sbx() }.timeout(&json!({})),
+            Some(default)
+        );
         // shell.exec self-manages a bounded kill-and-settle deadline → no outer cap.
         assert_eq!(
             ShellExec {
                 sbx: mk_sbx(),
                 tasks: Arc::new(TaskTable::default())
             }
-            .timeout(),
+            .timeout(&json!({})),
             None
         );
         assert!(
-            Diagnostics { sbx: mk_sbx() }.timeout().unwrap() > default,
+            Diagnostics { sbx: mk_sbx() }.timeout(&json!({})).unwrap() > default,
             "diagnostics must exceed 60s"
         );
         assert_eq!(
@@ -8493,7 +8580,7 @@ mod tests {
         let reg = Arc::new(reg_in(&dir));
         run(
             &reg,
-            "fs.write",
+            "edit",
             json!({ "path": "f.txt", "content": "alpha beta" }),
         )
         .await;
@@ -8502,7 +8589,7 @@ mod tests {
         let e1 = tokio::spawn(async move {
             run(
                 &a,
-                "fs.edit",
+                "edit",
                 json!({ "path": "f.txt", "old_string": "alpha", "new_string": "A" }),
             )
             .await
@@ -8511,7 +8598,7 @@ mod tests {
         let e2 = tokio::spawn(async move {
             run(
                 &b,
-                "fs.edit",
+                "edit",
                 json!({ "path": absolute_alias, "old_string": "beta", "new_string": "B" }),
             )
             .await
@@ -8520,9 +8607,7 @@ mod tests {
         assert_eq!(r1.status, kernel::ObsStatus::Ok);
         assert_eq!(r2.status, kernel::ObsStatus::Ok);
 
-        let out = run(&reg, "fs.read", json!({ "path": "f.txt" }))
-            .await
-            .payload["content"]
+        let out = run(&reg, "read", json!({ "path": "f.txt" })).await.payload["content"]
             .as_str()
             .unwrap()
             .to_string();
@@ -8534,10 +8619,10 @@ mod tests {
     async fn glob_star_does_not_cross_slash() {
         let dir = std::env::temp_dir().join(format!("medha-glob-{}", ulid_like()));
         let reg = reg_in(&dir);
-        run(&reg, "fs.write", json!({ "path": "top.rs", "content": "" })).await;
+        run(&reg, "edit", json!({ "path": "top.rs", "content": "" })).await;
         run(
             &reg,
-            "fs.write",
+            "edit",
             json!({ "path": "src/main.rs", "content": "" }),
         )
         .await;
@@ -8565,7 +8650,7 @@ mod tests {
         std::fs::create_dir_all(project.join("nested-loader")).unwrap();
         std::fs::write(
             project.join("nested-loader").join("SKILL.md"),
-            "---\nname = \"nested-loader\"\ndescription = \"Loads another skill\"\nrequired_tools = [\"skill.load\"]\n---\nbody",
+            "---\nname = \"nested-loader\"\ndescription = \"Loads another skill\"\nrequired_tools = [\"skill\"]\n---\nbody",
         )
         .unwrap();
 
@@ -8573,16 +8658,12 @@ mod tests {
         let mut reg = ToolRegistry::new();
         reg.register_skills(store);
         let names = reg.tool_names();
-        assert!(
-            names.contains("skill.load")
-                && names.contains("skill.save")
-                && names.contains("skill.list")
-        );
+        assert!(names.contains("skill") && names.contains("skill.save"));
 
         let obs = reg
             .execute(&ToolIntent {
                 id: "load".into(),
-                tool: "skill.load".into(),
+                tool: "skill".into(),
                 args: json!({ "name": "nested-loader" }),
             })
             .await;
@@ -8634,7 +8715,7 @@ mod tests {
             asker: Arc::new(Mutex::new(None)),
         };
         assert!(
-            tool.timeout().is_none(),
+            tool.timeout(&json!({})).is_none(),
             "clarify must wait indefinitely for the user"
         );
     }
@@ -8867,7 +8948,12 @@ mod tests {
         )
         .await;
 
-        let waited = call(&registry, "agent.wait", json!({ "timeout_seconds": 5 })).await;
+        let waited = call(
+            &registry,
+            "agent",
+            json!({ "action": "wait", "timeout_seconds": 5 }),
+        )
+        .await;
         assert_eq!(
             waited.get("timed_out").and_then(Value::as_bool),
             Some(false)
@@ -8904,7 +8990,12 @@ mod tests {
             .expect("session id")
             .to_string();
 
-        let shown = call(&registry, "agent.transcript", json!({ "agent": session })).await;
+        let shown = call(
+            &registry,
+            "agent",
+            json!({ "action": "transcript", "agent": session }),
+        )
+        .await;
         assert_eq!(shown.get("total").and_then(Value::as_u64), Some(500));
         assert_eq!(
             shown.get("showing").and_then(Value::as_u64),
@@ -8993,12 +9084,29 @@ mod tests {
         let tools = saw.lock().unwrap().clone();
         assert!(!tools.is_empty(), "the child never ran");
         assert!(
-            !tools.iter().any(|tool| tool == "fs.write"),
+            !tools.iter().any(|tool| tool == "edit"),
             "child got a write tool: {tools:?}"
         );
     }
 
     /// A child is a whole session and routinely outlives any per-tool cap. The
+    /// Delegation costs two names in a read-only tree and three where a child
+    /// can write. The six verbs that only look at an agent share `agent`;
+    /// starting work — a spawn or a follow-up, which are admitted identically —
+    /// shares `agent.spawn`; landing a child's patch stays alone, because it is
+    /// the one that touches the tree.
+    #[test]
+    fn delegation_exposes_two_names_plus_apply_where_children_can_write() {
+        let (registry, _saw) = registry_with_agents();
+        let mut names: Vec<String> = registry
+            .tool_names()
+            .into_iter()
+            .filter(|name| name.starts_with("agent"))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["agent", "agent.spawn"]);
+    }
+
     /// default 60s killed every agent that did real work — and killed it from
     /// the parent's side, so the report was lost even though the child had been
     /// making progress.
@@ -9010,7 +9118,7 @@ mod tests {
             .get("agent.spawn")
             .expect("agent.spawn is registered");
         assert_eq!(
-            spawn.timeout(),
+            spawn.timeout(&json!({})),
             None,
             "a sub-agent must be bounded by its turn budget, not a tool timeout"
         );
@@ -9028,8 +9136,8 @@ mod tests {
             .await
             .expect_err("a directory is not readable as a file");
         let message = error.to_string();
-        assert!(message.contains("fs.list"), "unhelpful: {message}");
-        assert!(message.contains("tree"), "unhelpful: {message}");
+        assert!(message.contains("`ls`"), "unhelpful: {message}");
+        assert!(message.contains("depth"), "unhelpful: {message}");
     }
 
     #[tokio::test]

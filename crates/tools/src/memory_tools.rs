@@ -161,6 +161,111 @@ fn saved_response(op: MemoryOp, note: &str) -> Value {
     })
 }
 
+/// The four memory verbs behind one `op`. They share a blast radius and a
+/// timeout — memory lives outside the workspace, so even a write is a Read as
+/// far as the human gate is concerned — which is what makes one tool safe here.
+/// Each op delegates to the implementation that already owned it, unchanged.
+pub struct Memory {
+    write: MemoryWrite,
+    update: MemoryUpdate,
+    forget: MemoryForget,
+    search: MemorySearch,
+}
+
+impl Memory {
+    pub fn new(store: Arc<MemoryProjection>, budget_tokens: u32, stale_after_days: u32) -> Self {
+        Self {
+            write: MemoryWrite::new_configured(store.clone(), budget_tokens, stale_after_days),
+            update: MemoryUpdate {
+                store: store.clone(),
+            },
+            forget: MemoryForget {
+                store: store.clone(),
+            },
+            search: MemorySearch { store },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Memory {
+    fn name(&self) -> &str {
+        "memory"
+    }
+
+    fn description(&self) -> &str {
+        "Persistent memory across sessions, selected by `op`. `write` saves a NEW typed \
+         memory — a user preference, a project fact, feedback on how to work, a reference, \
+         or a decision; one memory = one fact, worth knowing next session, and never what \
+         the repo already records. `update` revises an existing one: corroborating from a \
+         fresh session promotes confidence, a contradicting claim replaces it, and the old \
+         version stays in the audit log. `forget` stops one being recalled. `search` looks \
+         through everything stored, beyond the frozen recall index, returning exact claims \
+         with scope, trust, age and provenance."
+    }
+
+    fn blast_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+
+    /// Only the three mutating ops hold the lane. A search is not a mutation,
+    /// and giving it a key would serialize reads behind every write.
+    fn mutation_key(&self, args: &Value) -> Option<String> {
+        match args.get("op").and_then(Value::as_str) {
+            Some("write") => self.write.mutation_key(args),
+            Some("update") => self.update.mutation_key(args),
+            Some("forget") => self.forget.mutation_key(args),
+            _ => None,
+        }
+    }
+
+    fn category(&self) -> ToolCategory {
+        self.write.category()
+    }
+
+    fn icon(&self) -> &'static str {
+        self.write.icon()
+    }
+
+    fn schema(&self) -> Value {
+        let merge = |target: &mut Value, source: Value| {
+            if let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) {
+                for (key, value) in source {
+                    target.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        };
+        let mut properties = json!({
+            "op": {
+                "type": "string",
+                "enum": ["write", "update", "forget", "search"],
+            }
+        });
+        for tool in [
+            self.write.schema(),
+            self.update.schema(),
+            self.forget.schema(),
+            self.search.schema(),
+        ] {
+            merge(&mut properties, tool["properties"].clone());
+        }
+        json!({ "type": "object", "properties": properties, "required": ["op"] })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        match args.get("op").and_then(Value::as_str) {
+            Some("write") => self.write.execute(args).await,
+            Some("update") => self.update.execute(args).await,
+            Some("forget") => self.forget.execute(args).await,
+            Some("search") => self.search.execute(args).await,
+            other => Err(ToolError::Args(format!(
+                "memory needs op = write, update, forget or search; got {}",
+                other.unwrap_or("nothing")
+            ))),
+        }
+    }
+}
+
 pub struct MemoryWrite {
     pub store: Arc<MemoryProjection>,
     budget_tokens: u32,
@@ -280,7 +385,7 @@ impl Tool for MemoryWrite {
             .is_some()
         {
             return Err(ToolError::Failed(format!(
-                "memory '{name}' already exists in {} scope — use memory.update",
+                "memory '{name}' already exists in {} scope — use memory with op=update",
                 scope.as_str()
             )));
         }
@@ -367,7 +472,7 @@ impl Tool for MemoryUpdate {
         "Revise an EXISTING memory: correct its claim, refine the description, or \
          re-confirm it. Corroborating a memory from a fresh session promotes its \
          confidence; a contradicting claim replaces the old version (the old one \
-         stays in the audit log). Fails if the name doesn't exist — use memory.write for new facts."
+         stays in the audit log). Fails if the name doesn't exist — use memory with op=write for new facts."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -397,7 +502,7 @@ impl Tool for MemoryUpdate {
         let scope = parse_scope(args)?;
         let Some(existing) = self.store.get_async(scope, name).await.map_err(store_err)? else {
             return Err(ToolError::Failed(format!(
-                "no memory '{name}' in {} scope — use memory.write for a new fact",
+                "no memory '{name}' in {} scope — use memory with op=write for a new fact",
                 scope.as_str()
             )));
         };
@@ -565,9 +670,9 @@ impl SessionsSearch {
                 .put_async(text.into_bytes())
                 .await
             {
-                Ok(hash) => format!(
-                    "[oversized event stored as an artifact — read_artifact hash=\"{hash}\"]"
-                ),
+                Ok(hash) => {
+                    format!("[oversized event stored as an artifact — read hash=\"{hash}\"]")
+                }
                 Err(_) => "[oversized event; open it by event id from the session log]".into(),
             }
         } else {
@@ -834,32 +939,21 @@ mod tests {
             })
         };
 
+        // One tool, but the lane is still held per operation: merging the verbs
+        // must not let a write run unserialized, nor serialize a read.
+        for op in ["write", "update", "forget"] {
+            assert_eq!(
+                key(
+                    "memory",
+                    json!({ "op": op, "scope": "project", "name": "shared" })
+                )
+                .as_deref(),
+                Some("memory:project:shared"),
+                "{op} must hold the mutation lane"
+            );
+        }
         assert_eq!(
-            key(
-                "memory.write",
-                json!({ "scope": "project", "name": "shared" })
-            )
-            .as_deref(),
-            Some("memory:project:shared")
-        );
-        assert_eq!(
-            key(
-                "memory.update",
-                json!({ "scope": "project", "name": "shared" })
-            )
-            .as_deref(),
-            Some("memory:project:shared")
-        );
-        assert_eq!(
-            key(
-                "memory.forget",
-                json!({ "scope": "project", "name": "shared" })
-            )
-            .as_deref(),
-            Some("memory:project:shared")
-        );
-        assert_eq!(
-            key("memory.search", json!({ "query": "shared" })),
+            key("memory", json!({ "op": "search", "query": "shared" })),
             None,
             "read-only recall remains parallelizable"
         );
@@ -916,7 +1010,7 @@ mod tests {
             .execute(&enriched(write_args("a"), "user", sid, true))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("memory.update"), "{err}");
+        assert!(err.to_string().contains("op=update"), "{err}");
 
         let mut dup = write_args("b");
         dup["claim"] = json!("claim a");
@@ -1022,7 +1116,7 @@ mod tests {
             .execute(&enriched(json!({ "name": "ghost" }), "user", sid, true))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("memory.write"), "{err}");
+        assert!(err.to_string().contains("op=write"), "{err}");
         let err = f
             .execute(&enriched(json!({ "name": "ghost" }), "user", sid, true))
             .await
@@ -1223,12 +1317,20 @@ mod tests {
                 .iter()
                 .any(|spec| spec.name == "sessions.search")
         );
-        assert!(
-            registry
-                .specs()
-                .iter()
-                .any(|spec| spec.name == "memory.write")
-        );
+        // Memory is one tool now; every verb it used to expose stays reachable
+        // through `op`, so registering it must still advertise all four.
+        let memory = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "memory")
+            .expect("memory is registered");
+        let ops = memory.schema["properties"]["op"]["enum"].clone();
+        for op in ["write", "update", "forget", "search"] {
+            assert!(
+                ops.as_array().unwrap().iter().any(|value| value == op),
+                "op {op} must remain reachable: {ops}"
+            );
+        }
         assert!(tool.execute(&json!({ "query": "" })).await.is_err());
         assert!(
             tool.execute(&json!({ "session_id": session.id }))
@@ -1253,7 +1355,7 @@ mod tests {
             .await
             .unwrap();
         let text = result["sessions"][0]["window"][0]["text"].as_str().unwrap();
-        assert!(text.contains("read_artifact hash="), "{text}");
+        assert!(text.contains("read hash="), "{text}");
         assert!(!text.contains(&"x".repeat(1_000)));
         let hash = text.split('"').nth(1).unwrap();
         assert!(artifacts.size(hash).unwrap() > 20_000);

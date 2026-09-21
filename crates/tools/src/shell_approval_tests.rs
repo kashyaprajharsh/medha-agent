@@ -234,13 +234,14 @@ async fn network_and_folder_are_approved_together_before_the_only_execution() {
         0,
         "command review must use the combined card"
     );
-    let cards = f.gate.cards.lock().unwrap();
-    assert_eq!(cards.len(), 1);
-    assert!(cards[0].contains("Network access"));
-    assert!(cards[0].contains("Read/write"));
-    assert!(cards[0].contains(&format!("Working directory: {}", f.outside.display())));
-    assert!(!cards[0].contains("- Read "), "write already includes read");
-    drop(cards);
+    {
+        let cards = f.gate.cards.lock().unwrap();
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].contains("Network access"));
+        assert!(cards[0].contains("Read/write"));
+        assert!(cards[0].contains(&format!("Working directory: {}", f.outside.display())));
+        assert!(!cards[0].contains("- Read "), "write already includes read");
+    }
     assert!(!f.network.granted());
     assert!(f.roots.write_roots().is_empty());
     assert!(!kernel::network_once_active());

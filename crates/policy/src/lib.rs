@@ -85,12 +85,7 @@ impl DefaultPolicy {
         match autonomy {
             AutonomyLevel::Plan => false,
             AutonomyLevel::Careful => self.approve.contains(tool),
-            AutonomyLevel::Normal => {
-                tool != "fs.write"
-                    && tool != "fs.edit"
-                    && tool != "multi_edit"
-                    && self.approve.contains(tool)
-            }
+            AutonomyLevel::Normal => tool != "edit" && self.approve.contains(tool),
             AutonomyLevel::Yolo => false,
         }
     }
@@ -115,9 +110,10 @@ impl Policy for DefaultPolicy {
             "skill.save" => Decision::Human,
             // Applying an unseen sub-agent patch always requires review.
             "agent.apply" => Decision::Human,
-            "memory.write" | "memory.update" | "memory.forget" if self.gates_memory(intent) => {
-                Decision::Human
-            }
+            // The verb lives behind `op`, so the gate reads the argument rather
+            // than the name — matching on the name alone would let every write
+            // past it.
+            _ if mutates_memory(intent) && self.gates_memory(intent) => Decision::Human,
 
             // Missing blast-radius metadata fails closed.
             _ => match blast_radius {
@@ -141,6 +137,16 @@ impl Policy for DefaultPolicy {
         }
         verdict
     }
+}
+
+/// Whether a call writes to persistent memory. The verb is an argument, so a
+/// name-only match would miss every one of them.
+fn mutates_memory(intent: &ToolIntent) -> bool {
+    intent.tool == "memory"
+        && matches!(
+            intent.args.get("op").and_then(|value| value.as_str()),
+            Some("write" | "update" | "forget")
+        )
 }
 
 /// Allows Git reads, gates `add`/`commit`, and denies other subcommands.
@@ -937,6 +943,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The memory verbs live behind `op`. A gate that matched the tool name
+    /// alone would pass every user-scope write straight through, which is the
+    /// one thing `memory.write_approval` exists to stop.
+    #[test]
+    fn a_user_scope_memory_write_is_gated_under_every_mutating_op() {
+        let policy = DefaultPolicy::new().with_memory_write_approval("user-scope");
+        for op in ["write", "update", "forget"] {
+            let call = intent("memory", json!({ "op": op, "scope": "user", "name": "n" }));
+            assert!(
+                matches!(
+                    policy.authorize(AutonomyLevel::Normal, &call, Some(BlastRadius::Read)),
+                    Decision::Human
+                ),
+                "memory op '{op}' must reach the human gate"
+            );
+        }
+        // A search is not a mutation and must stay ungated.
+        assert!(matches!(
+            policy.authorize(
+                AutonomyLevel::Normal,
+                &intent("memory", json!({ "op": "search", "query": "x" })),
+                Some(BlastRadius::Read)
+            ),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn an_approve_list_gates_only_what_it_names() {
+        let policy = DefaultPolicy::requiring_approval(["memory"]);
+        assert!(policy.escalates(AutonomyLevel::Careful, "memory"));
+        assert!(!policy.escalates(AutonomyLevel::Careful, "shell.exec"));
+        assert!(!policy.escalates(AutonomyLevel::Careful, "read"));
+    }
+
     fn intent(tool: &str, args: serde_json::Value) -> ToolIntent {
         ToolIntent {
             id: "t".into(),
@@ -951,9 +992,7 @@ mod tests {
     /// declared radii. Unknown tools return `None` (unregistered → deny).
     fn radius_of(tool: &str) -> Option<BlastRadius> {
         Some(match tool {
-            "fs.write" | "fs.edit" | "multi_edit" | "git" | "agent.apply" => {
-                BlastRadius::ReversibleLocal
-            }
+            "edit" | "git" | "agent.apply" => BlastRadius::ReversibleLocal,
             "shell.exec" | "diagnostics" => BlastRadius::IrreversibleLocal,
             "deploy" => BlastRadius::External, // registered but externally-consequential
             "email.send" | "payment.charge" => return None, // unregistered
@@ -984,16 +1023,16 @@ mod tests {
     #[test]
     fn user_scope_memory_writes_gate_project_scope_rides_read_radius() {
         let p = DefaultPolicy::default();
-        for tool in ["memory.write", "memory.update", "memory.forget"] {
-            let user = auth(&p, &intent(tool, json!({ "name": "n", "scope": "user" })));
-            assert!(
-                matches!(user, Decision::Human),
-                "{tool} user scope must gate"
+        for op in ["write", "update", "forget"] {
+            let user = auth(
+                &p,
+                &intent("memory", json!({ "op": op, "name": "n", "scope": "user" })),
             );
-            let project = auth(&p, &intent(tool, json!({ "name": "n" })));
+            assert!(matches!(user, Decision::Human), "{op} user scope must gate");
+            let project = auth(&p, &intent("memory", json!({ "op": op, "name": "n" })));
             assert!(
                 matches!(project, Decision::Allow),
-                "{tool} project scope rides Read radius"
+                "{op} project scope rides Read radius"
             );
         }
     }
@@ -1001,12 +1040,12 @@ mod tests {
     #[test]
     fn memory_write_approval_mode_supports_none_and_all() {
         let project = intent(
-            "memory.write",
-            json!({ "name": "quoted-name", "scope": "project" }),
+            "memory",
+            json!({ "op": "write", "name": "quoted-name", "scope": "project" }),
         );
         let user = intent(
-            "memory.write",
-            json!({ "name": "quoted-name", "scope": "user" }),
+            "memory",
+            json!({ "op": "write", "name": "quoted-name", "scope": "user" }),
         );
         let none = DefaultPolicy::default().with_memory_write_approval("none");
         assert!(matches!(auth(&none, &project), Decision::Allow));
@@ -1379,10 +1418,10 @@ mod tests {
 
     #[test]
     fn approval_set_escalates_to_human() {
-        let p = DefaultPolicy::requiring_approval(["fs.edit", "shell.exec"]);
+        let p = DefaultPolicy::requiring_approval(["edit", "shell.exec"]);
         // configured tools that would be allowed → human gate
         assert!(matches!(
-            auth(&p, &intent("fs.edit", json!({}))),
+            auth(&p, &intent("edit", json!({}))),
             Decision::Human
         ));
         assert!(matches!(auth(&p, &shell("cargo build")), Decision::Human));
@@ -1409,9 +1448,9 @@ mod tests {
 
     #[test]
     fn dial_relaxes_edits_then_shell_as_it_loosens() {
-        let p = DefaultPolicy::requiring_approval(["fs.edit", "shell.exec"]);
+        let p = DefaultPolicy::requiring_approval(["edit", "shell.exec"]);
         assert!(matches!(
-            auth_at(&p, AutonomyLevel::Careful, &intent("fs.edit", json!({}))),
+            auth_at(&p, AutonomyLevel::Careful, &intent("edit", json!({}))),
             Decision::Human
         ));
         assert!(matches!(
@@ -1419,7 +1458,7 @@ mod tests {
             Decision::Human
         ));
         assert!(matches!(
-            auth_at(&p, AutonomyLevel::Normal, &intent("fs.edit", json!({}))),
+            auth_at(&p, AutonomyLevel::Normal, &intent("edit", json!({}))),
             Decision::Allow
         ));
         assert!(matches!(
@@ -1427,7 +1466,7 @@ mod tests {
             Decision::Human
         ));
         assert!(matches!(
-            auth_at(&p, AutonomyLevel::Yolo, &intent("fs.edit", json!({}))),
+            auth_at(&p, AutonomyLevel::Yolo, &intent("edit", json!({}))),
             Decision::Allow
         ));
         assert!(matches!(
@@ -1439,7 +1478,7 @@ mod tests {
     #[test]
     fn floor_is_invariant_across_every_level_including_yolo() {
         // The seatbelt cannot be unbuckled: no dial level loosens the base floor.
-        let p = DefaultPolicy::requiring_approval(["fs.edit", "shell.exec"]);
+        let p = DefaultPolicy::requiring_approval(["edit", "shell.exec"]);
         for level in [
             AutonomyLevel::Careful,
             AutonomyLevel::Normal,

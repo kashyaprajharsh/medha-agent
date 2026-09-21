@@ -319,8 +319,8 @@ pub(crate) enum TuiEvent {
     Text(String),
     Reasoning(String),
     ToolStarted(String, Option<String>),
-    ToolCall(String, serde_json::Value),
-    ToolResult(String, bool, serde_json::Value),
+    ToolCall(Option<String>, String, serde_json::Value),
+    ToolResult(Option<String>, String, bool, serde_json::Value),
     Compaction(u32, u32, bool, Option<String>),
     /// Compaction is running (true) / finished (false) — drives the live indicator.
     Compacting(bool),
@@ -336,6 +336,8 @@ pub(crate) enum TuiEvent {
         step: AgentStep,
     },
     ContextPressure(kernel::ContextPressure),
+    /// Provider-reported token accounting for one request.
+    Usage(kernel::Usage),
     /// Session cost so far in USD; `true` = indicative list price (shown "est.").
     Cost(f64, bool),
     Verify(bool, String),
@@ -534,10 +536,12 @@ enum Item {
     User(String),
     Assistant(String),
     ToolCall {
+        id: Option<String>,
         tool: String,
         args: serde_json::Value,
     },
     ToolResult {
+        id: Option<String>,
         tool: String,
         ok: bool,
         payload: serde_json::Value,
@@ -578,10 +582,12 @@ pub(crate) enum AgentStep {
     Text(String),
     Reasoning(String),
     ToolCall {
+        id: Option<String>,
         tool: String,
         args: serde_json::Value,
     },
     ToolResult {
+        id: Option<String>,
         tool: String,
         ok: bool,
         payload: serde_json::Value,
@@ -1877,6 +1883,16 @@ struct Model {
     /// are on screen and selection input is safe to accept (blocks blind-Enter).
     approval_ready: bool,
     context_pressure: Option<kernel::ContextPressure>,
+    /// Live prompt tokens observed since opening this session (not restored
+    /// from history), and how many of them the provider served
+    /// from its prefix cache. Accumulated rather than per-turn: one request's
+    /// ratio swings with what the turn happened to add, and the question worth
+    /// answering is what the session as a whole is re-paying for. Stays `None`
+    /// until a route reports the bucket at least once, so "not measured" never
+    /// renders as "no cache".
+    cache: Option<(u64, u64)>,
+    cache_last_usage: Option<kernel::Usage>,
+    cache_unreported_attempts: u64,
     /// Session cost so far (USD, `true` = indicative "est." figure), when known.
     cost_usd: Option<(f64, bool)>,
     model: String,
@@ -2049,7 +2065,22 @@ const MAX_AGENT_PANE_ITEMS: usize = 200;
 /// Append one rendered item while keeping the pane's physical history bounded.
 /// Returns whether an old entry was evicted.
 fn append_pane_item(pane: &mut VecDeque<Entry>, item: Item, limit: usize) -> bool {
-    pane.push_back(Entry::new(item));
+    // Completion order can differ from dispatch order. Attach a result to its
+    // exact call, including in parked child panes and reconstructed history.
+    let call_index = match &item {
+        Item::ToolResult {
+            id: Some(id), tool, ..
+        } => pane.iter().rposition(|entry| {
+            matches!(&entry.item, Item::ToolCall { id: Some(call_id), tool: call_tool, .. }
+                if call_id == id && call_tool == tool)
+        }),
+        _ => None,
+    };
+    if let Some(index) = call_index {
+        pane.insert(index + 1, Entry::new(item));
+    } else {
+        pane.push_back(Entry::new(item));
+    }
     let mut dropped = false;
     while pane.len() > limit {
         pane.pop_front();
@@ -2114,8 +2145,18 @@ fn append_agent_step(pane: &mut VecDeque<Entry>, step: AgentStep) {
             true => return,
             false => Item::Thinking(delta),
         },
-        AgentStep::ToolCall { tool, args } => Item::ToolCall { tool, args },
-        AgentStep::ToolResult { tool, ok, payload } => Item::ToolResult { tool, ok, payload },
+        AgentStep::ToolCall { id, tool, args } => Item::ToolCall { id, tool, args },
+        AgentStep::ToolResult {
+            id,
+            tool,
+            ok,
+            payload,
+        } => Item::ToolResult {
+            id,
+            tool,
+            ok,
+            payload,
+        },
         AgentStep::Restarted => {
             // A queued steer notice can arrive after the partial text. Work
             // backwards to the last durable task/user/tool boundary, removing
@@ -2203,6 +2244,9 @@ impl Model {
             clipboard_status: None,
             approval_ready: false,
             context_pressure: None,
+            cache: None,
+            cache_last_usage: None,
+            cache_unreported_attempts: 0,
             cost_usd: None,
             model,
             protocol: kernel::Protocol::OpenAiChat,
@@ -2658,6 +2702,10 @@ impl Model {
     }
 
     fn push_item(&mut self, item: Item) {
+        // Correlated results can insert above a selection, changing its rows.
+        if matches!(&item, Item::ToolResult { id: Some(_), .. }) {
+            self.text_selection = None;
+        }
         let dropped = append_pane_item(&mut self.items, item, MAX_SCROLLBACK_LINES);
         if dropped {
             self.text_selection = None;
@@ -2726,6 +2774,9 @@ impl Model {
             _ => None,
         };
         let showing = self.focus.as_ref() == Some(&path);
+        if showing && matches!(&step, AgentStep::ToolResult { id: Some(_), .. }) {
+            self.text_selection = None;
+        }
         let pane = match showing {
             true => &mut self.items,
             false => self.agent_panes.entry(path).or_default(),
@@ -2790,6 +2841,9 @@ impl Model {
     /// discarding them so the previous conversation cannot be resurrected from
     /// `parked_main` under the new session id.
     fn clear_session_panes(&mut self) {
+        self.cache = None;
+        self.cache_last_usage = None;
+        self.cache_unreported_attempts = 0;
         self.context_pressure = None;
         self.attachments.reset();
         self.submit_deferred = None;
@@ -3480,7 +3534,7 @@ mod tests {
 
         let (visible_tx, visible_rx) = oneshot::channel();
         model.pending_approvals.push_back(PendingApproval {
-            action: "fs.write".into(),
+            action: "edit".into(),
             detail: None,
             escalated: false,
             cancel: None,
@@ -3565,7 +3619,8 @@ mod tests {
         .unwrap();
         let store = Arc::new(tools::SkillStore::new(proj, None));
         let mut known = std::collections::HashSet::new();
-        known.insert("fs.write".to_string());
+        known.insert("edit".to_string());
+        known.insert("skill".to_string());
         let model = Model::new(
             "m".into(),
             None,
@@ -3962,22 +4017,30 @@ mod tests {
                 "checking",
                 vec![kernel::ToolIntent {
                     id: "call-1".into(),
-                    tool: "fs.list".into(),
+                    tool: "ls".into(),
                     args: serde_json::json!({"path": "."}),
                 }],
             ),
             Message::tool_result("call-1", r#"{"entries": 3}"#),
             Message::tool_result("call-1", r#"{"error": "denied"}"#),
+            Message::tool_result("call-1", r#"{"reason": "not permitted"}"#),
         ];
         update::repaint_history(&mut m, &msgs);
+        assert_eq!(
+            m.items
+                .iter()
+                .filter(|e| matches!(&e.item, Item::ToolResult { ok: false, .. }))
+                .count(),
+            2
+        );
         assert!(
             m.items
                 .iter()
-                .any(|e| matches!(&e.item, Item::ToolCall { tool, .. } if tool == "fs.list"))
+                .any(|e| matches!(&e.item, Item::ToolCall { tool, .. } if tool == "ls"))
         );
         assert!(
             m.items.iter().any(
-                |e| matches!(&e.item, Item::ToolResult { tool, ok: true, .. } if tool == "fs.list")
+                |e| matches!(&e.item, Item::ToolResult { tool, ok: true, .. } if tool == "ls")
             ),
             "successful result replays with its tool name"
         );
@@ -4107,8 +4170,8 @@ mod tests {
             category: c,
         };
         let cats = HashMap::from([
-            ("fs.write".to_string(), viz("✎", ToolCategory::Write)),
-            ("fs.read".to_string(), viz("◇", ToolCategory::Read)),
+            ("edit".to_string(), viz("✎", ToolCategory::Write)),
+            ("read".to_string(), viz("◇", ToolCategory::Read)),
             ("shell.exec".to_string(), viz("❯", ToolCategory::Shell)),
         ]);
         let mut m = Model::new(
@@ -4119,14 +4182,14 @@ mod tests {
             cats,
             test_sbx(),
         );
-        // A streaming write shows the file basename — "writing medha.html", not "thinking".
-        m.current_tool = Some(("fs.write".into(), Some("/Users/x/medha/medha.html".into())));
-        assert_eq!(activity_label(&m), "writing medha.html");
+        // A streamed argument is being prepared; the file has not been written yet.
+        m.current_tool = Some(("edit".into(), Some("/Users/x/medha/medha.html".into())));
+        assert_eq!(activity_label(&m), "preparing edit medha.html");
         // Name-only (target not sniffed yet) still shows the verb.
-        m.current_tool = Some(("fs.read".into(), None));
-        assert_eq!(activity_label(&m), "reading");
+        m.current_tool = Some(("read".into(), None));
+        assert_eq!(activity_label(&m), "preparing read");
         m.current_tool = Some(("shell.exec".into(), Some("cargo build".into())));
-        assert_eq!(activity_label(&m), "running command cargo build");
+        assert_eq!(activity_label(&m), "preparing shell.exec cargo build");
     }
 
     #[test]

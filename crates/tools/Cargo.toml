@@ -40,6 +40,7 @@ fd-lock = "4"
 
 [dev-dependencies]
 tokio-util = { version = "0.7" }
+lockfile = { version = "0.1.8", path = "../lockfile" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [

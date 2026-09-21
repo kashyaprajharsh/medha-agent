@@ -95,6 +95,53 @@ pub struct MedhaLock {
     pub pricing: PricingConfig,
     #[serde(default)]
     pub gate: GateConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
+}
+
+/// Which tools a session exposes.
+///
+/// Every tool's name, description and schema is re-sent on every request of
+/// every turn, so the catalogue is a fixed tax whether or not a session uses
+/// it. `minimal` drops it to the five tools that can still reach everything —
+/// a shell is a general-purpose escape hatch — for cheap models, short runs,
+/// and anything where the tax outweighs the convenience. `full` is the default
+/// because the specialised tools are faster, safer and cheaper *per use*.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub preset: String,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            preset: "full".into(),
+        }
+    }
+}
+
+/// The smallest set that can still do the work: read a file, change one, run a
+/// command, and find things by content or by name.
+pub const MINIMAL_TOOLS: [&str; 5] = ["read", "edit", "shell.exec", "grep", "glob"];
+
+impl ToolsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.preset.as_str() {
+            "full" | "minimal" => Ok(()),
+            _ => Err(format!(
+                "unknown tools preset {:?}; expected full or minimal",
+                self.preset
+            )),
+        }
+    }
+    /// The names to expose, or `None` for everything registered.
+    pub fn exposed(&self) -> Option<Vec<String>> {
+        match self.preset.as_str() {
+            "minimal" => Some(MINIMAL_TOOLS.map(String::from).into()),
+            _ => None,
+        }
+    }
 }
 
 /// Language-server code intelligence. Built-in adapters start automatically
@@ -334,6 +381,10 @@ impl Default for GateConfig {
 pub struct PricingConfig {
     pub input_per_mtok: Option<f64>,
     pub output_per_mtok: Option<f64>,
+    /// Rate for prompt tokens the provider serves from its cache. Left unset,
+    /// cached tokens bill at `input_per_mtok`, which overstates every turn after
+    /// the first rather than understating it.
+    pub cached_input_per_mtok: Option<f64>,
 }
 
 /// Execution sandbox for shell, build, and VCS commands.
@@ -579,12 +630,7 @@ impl ContextConfig {
 /// Default human-gated tools. Shell commands use deterministic scanning unless
 /// `shell.exec` is explicitly added.
 fn default_approve() -> Vec<String> {
-    vec![
-        "fs.write".into(),
-        "fs.edit".into(),
-        "multi_edit".into(),
-        "skill.save".into(),
-    ]
+    vec!["edit".into(), "skill.save".into()]
 }
 
 fn default_autonomy() -> String {
@@ -678,6 +724,7 @@ impl MedhaLock {
     pub fn parse(text: &str) -> Result<Self, String> {
         let lock: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         lock.sandbox.validate()?;
+        lock.tools.validate()?;
         lock.reasoning.to_config()?;
         kernel::AutonomyLevel::parse(&lock.policy.autonomy)?;
         if lock.verify.timeout_s == Some(0) {
@@ -822,10 +869,7 @@ mod tests {
             lock.context.to_policy().trigger_ratio,
             context::CompactionPolicy::default().trigger_ratio
         );
-        assert_eq!(
-            lock.policy.approve,
-            vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]
-        );
+        assert_eq!(lock.policy.approve, vec!["edit", "skill.save"]);
         assert!(lock.verify.command.is_none());
         assert!(lock.memory.enabled);
         assert_eq!(lock.memory.k3_budget_tokens, 3_000);
@@ -862,7 +906,7 @@ mod tests {
             max_turns = 50
 
             [policy]
-            approve = ["fs.write", "shell.exec"]
+            approve = ["edit", "shell.exec"]
 
             [verify]
             command = "cargo check"
@@ -877,7 +921,7 @@ mod tests {
         let lock = MedhaLock::parse(toml).unwrap();
         assert_eq!(lock.budget.max_turns, Some(50));
         assert_eq!(lock.budget.max_tokens, None);
-        assert_eq!(lock.policy.approve, vec!["fs.write", "shell.exec"]);
+        assert_eq!(lock.policy.approve, vec!["edit", "shell.exec"]);
         assert_eq!(lock.verify.command, Some("cargo check".to_string()));
         assert_eq!(lock.memory.k3_budget_tokens, 900);
         assert_eq!(lock.memory.write_approval, "all");
@@ -896,12 +940,12 @@ mod tests {
         let path = dir.path().join("medha.lock");
         let mut lock = MedhaLock::default();
         lock.budget.max_turns = Some(999);
-        lock.policy.approve = vec!["fs.edit".to_string()]; // explicit opt-down from the default set
+        lock.policy.approve = vec!["edit".to_string()]; // explicit opt-down from the default set
         lock.save(&path).unwrap();
 
         let loaded = MedhaLock::load(&path).unwrap().unwrap();
         assert_eq!(loaded.budget.max_turns, Some(999));
-        assert_eq!(loaded.policy.approve, vec!["fs.edit"]);
+        assert_eq!(loaded.policy.approve, vec!["edit"]);
     }
 
     #[test]
@@ -911,10 +955,7 @@ mod tests {
         let default_used = MedhaLock::load("/nonexistent/path/medha.lock")
             .unwrap()
             .unwrap_or_default();
-        assert_eq!(
-            default_used.policy.approve,
-            vec!["fs.write", "fs.edit", "multi_edit", "skill.save"]
-        );
+        assert_eq!(default_used.policy.approve, vec!["edit", "skill.save"]);
     }
 
     #[test]

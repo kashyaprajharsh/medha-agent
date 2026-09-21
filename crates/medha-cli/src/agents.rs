@@ -74,6 +74,7 @@ impl kernel::StreamSink for AgentSink {
 
     fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) {
         self.show(crate::tui_tea::AgentStep::ToolResult {
+            id: None,
             tool: tool.to_string(),
             ok,
             payload: payload.clone(),
@@ -83,13 +84,35 @@ impl kernel::StreamSink for AgentSink {
     fn tool_call(&self, tool: &str, args: &serde_json::Value) {
         self.progress.tool_dispatched();
         self.show(crate::tui_tea::AgentStep::ToolCall {
+            id: None,
             tool: tool.to_string(),
             args: args.clone(),
         });
     }
 
-    fn usage(&self, _prompt_tokens: u32, total_tokens: u32) {
-        self.progress.metered(u64::from(total_tokens));
+    fn tool_call_with_id(&self, id: &str, tool: &str, args: &serde_json::Value) {
+        self.progress.tool_dispatched();
+        self.show(crate::tui_tea::AgentStep::ToolCall {
+            id: Some(id.into()),
+            tool: tool.into(),
+            args: args.clone(),
+        });
+    }
+    fn tool_result_with_id(&self, id: &str, tool: &str, ok: bool, payload: &serde_json::Value) {
+        self.show(crate::tui_tea::AgentStep::ToolResult {
+            id: Some(id.into()),
+            tool: tool.into(),
+            ok,
+            payload: payload.clone(),
+        });
+    }
+    fn usage(&self, usage: &kernel::Usage) {
+        self.progress.metered(u64::from(usage.total_tokens));
+        // A child's prompt is billed like any other, so it belongs in the same
+        // cache accounting; reporting only the parent measures a fraction of it.
+        if let Some(tx) = &self.route {
+            let _ = tx.send(crate::tui_tea::TuiEvent::Usage(*usage));
+        }
     }
 
     fn cost(&self, total_usd: f64, _indicative: bool) {
@@ -147,7 +170,7 @@ fn child_prompt(run: &ChildRun) -> String {
         }
         false => "\nYou cannot delegate: do this work yourself.\n",
     });
-    if holds("agent.message") {
+    if holds("agent") {
         prompt.push_str(
             "\nYou can send a message to the agent that sent you here, or to another \
              running agent, when you find something it needs and cannot see. That is \
@@ -816,7 +839,7 @@ impl<L: EventLog + 'static> orchestrator::Outbox for LogOutbox<L> {
                     "[outcome unknown — Medha exited while this agent was running, so it never \
                      recorded a result. It may have finished its work, or none of it. Its \
                      objective was: {objective}]\n\nRead what it actually did with \
-                     agent.transcript('{child}'), or re-run it."
+                     agent with action=transcript and agent='{child}', or re-run it."
                 ),
                 artifact: None,
                 turns: 0,
@@ -1406,6 +1429,30 @@ mod child_prompt_tests {
     use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
     use orchestrator::AgentSpec;
 
+    #[test]
+    fn a_child_reports_its_usage_so_cache_accounting_covers_delegated_requests() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = AgentSink {
+            path: orchestrator::AgentPath::root().child("survey").unwrap(),
+            surface_session: Some(ulid::Ulid::new()),
+            progress: kernel::ProgressHandle::new().0,
+            route: Some(tx),
+        };
+        let usage = kernel::Usage {
+            prompt_tokens: 10_000,
+            cached_prompt_tokens: Some(9_600),
+            ..Default::default()
+        };
+        kernel::StreamSink::usage(&sink, &usage);
+        match rx.try_recv().expect("a child's usage reaches the surface") {
+            crate::tui_tea::TuiEvent::Usage(seen) => {
+                assert_eq!(seen.prompt_tokens, 10_000);
+                assert_eq!(seen.cached_prompt_tokens, Some(9_600));
+            }
+            _ => panic!("expected a usage event"),
+        }
+    }
+
     struct Holding(Vec<&'static str>);
 
     #[async_trait::async_trait]
@@ -1449,29 +1496,26 @@ mod child_prompt_tests {
 
     #[test]
     fn a_child_is_told_it_can_delegate_only_when_it_actually_can() {
-        let reader = prompt_for(vec!["fs.read"], None);
+        let reader = prompt_for(vec!["read"], None);
         assert!(reader.contains("You cannot delegate"));
 
-        let writer = prompt_for(
-            vec!["fs.read", "agent.spawn"],
-            Some(PathBuf::from("/tmp/wt")),
-        );
+        let writer = prompt_for(vec!["read", "agent.spawn"], Some(PathBuf::from("/tmp/wt")));
         assert!(writer.contains("You may delegate"));
         assert!(!writer.contains("You cannot delegate"));
     }
 
     #[test]
     fn a_child_is_told_about_messaging_only_when_it_holds_the_tool() {
-        assert!(!prompt_for(vec!["fs.read"], None).contains("send a message"));
+        assert!(!prompt_for(vec!["read"], None).contains("send a message"));
         assert!(
-            prompt_for(vec!["fs.read", "agent.message"], None).contains("send a message"),
+            prompt_for(vec!["read", "agent"], None).contains("send a message"),
             "a child that can reach its parent and is not told so will not"
         );
     }
 
     #[test]
     fn every_child_is_told_it_cannot_ask_but_may_be_stopped_for_approval() {
-        let prompt = prompt_for(vec!["fs.read"], None);
+        let prompt = prompt_for(vec!["read"], None);
         assert!(prompt.contains("cannot ask a question"));
         assert!(prompt.contains("approval"));
     }

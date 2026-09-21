@@ -15,13 +15,13 @@ struct Tools;
 #[async_trait]
 impl Executor for Tools {
     fn specs(&self) -> Vec<ToolSpec> {
-        ["fs.read", "fs.write"]
+        ["read", "edit"]
             .iter()
             .map(|name| ToolSpec {
                 name: (*name).to_string(),
                 description: String::new(),
                 schema: json!({}),
-                blast_radius: if name.ends_with("write") {
+                blast_radius: if *name == "edit" {
                     BlastRadius::ReversibleLocal
                 } else {
                     BlastRadius::Read
@@ -140,7 +140,7 @@ async fn a_child_runs_read_only_within_the_parents_budget() {
     assert_eq!(result.agent, "summarise-the-crate");
 
     let seen = recorder.seen.lock().unwrap();
-    assert_eq!(seen[0].0, vec!["fs.read"]);
+    assert_eq!(seen[0].0, vec!["read"]);
     assert_eq!(seen[0].1, 5);
 }
 
@@ -1799,7 +1799,7 @@ async fn parked(phase: kernel::Phase) -> (AgentControl, AgentPath) {
 #[tokio::test]
 async fn a_running_child_reports_what_it_is_doing_not_merely_that_it_exists() {
     let (control, path) = parked(kernel::Phase::InTool {
-        tool: "fs.read".into(),
+        tool: "read".into(),
         target: Some("app.py".into()),
     })
     .await;
@@ -1809,7 +1809,7 @@ async fn a_running_child_reports_what_it_is_doing_not_merely_that_it_exists() {
     assert_eq!(
         seen.phase,
         kernel::Phase::InTool {
-            tool: "fs.read".into(),
+            tool: "read".into(),
             target: Some("app.py".into())
         },
         "the roster must be able to name the tool, not just say 'running'"
@@ -1988,12 +1988,12 @@ async fn a_narrowed_child_can_still_read_a_file() {
     // needed and left out reading, so the child had no way to open a file and
     // started guessing at tool names instead.
     let mut spec = spec("inventory the backend");
-    spec.tools = Some(vec!["fs.write".into()]);
+    spec.tools = Some(vec!["edit".into()]);
     run(&control, spec, 5).await.expect("report");
 
     let held = &recorder.seen.lock().unwrap()[0].0;
     assert!(
-        held.contains(&"fs.read".to_string()),
+        held.contains(&"read".to_string()),
         "narrowing removes capability, not the ability to read: {held:?}"
     );
 }
@@ -2009,23 +2009,23 @@ async fn the_floor_still_cannot_widen_past_the_parent() {
 
     let held = &recorder.seen.lock().unwrap()[0].0;
     assert!(
-        !held.contains(&"fs.list".to_string()),
+        !held.contains(&"ls".to_string()),
         "a floor is not a way in: {held:?}"
     );
-    assert!(held.contains(&"fs.read".to_string()), "{held:?}");
+    assert!(held.contains(&"read".to_string()), "{held:?}");
 }
 
 #[test]
 fn child_tool_lists_canonicalize_provider_wire_aliases() {
     let available = vec![
-        "fs.list".to_string(),
-        "fs.read".to_string(),
+        "ls".to_string(),
+        "read".to_string(),
         "shell.exec".to_string(),
         "web.fetch".to_string(),
         "web.search".to_string(),
     ];
     let asked = vec![
-        "fs_read".to_string(),
+        "read".to_string(),
         "web_search".to_string(),
         "web_fetch".to_string(),
         "shell_exec".to_string(),
@@ -2034,11 +2034,11 @@ fn child_tool_lists_canonicalize_provider_wire_aliases() {
     assert_eq!(
         child_tools(Some(&asked), &available).unwrap(),
         Some(vec![
-            "fs.read".to_string(),
+            "read".to_string(),
             "web.search".to_string(),
             "web.fetch".to_string(),
             "shell.exec".to_string(),
-            "fs.list".to_string(),
+            "ls".to_string(),
         ])
     );
 }

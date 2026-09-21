@@ -58,7 +58,7 @@ fn dropping_the_approval_list_is_itself_a_relaxation() {
     assert_eq!(risky.len(), 1, "{risky:?}");
     assert_eq!(risky[0].key, "policy.approve");
     let restored = lock.without_risky_settings().policy.approve;
-    for tool in ["fs.write", "fs.edit", "multi_edit", "skill.save"] {
+    for tool in ["edit", "edit", "edit", "skill.save"] {
         assert!(
             restored.contains(&tool.to_string()),
             "{tool} must be regated"

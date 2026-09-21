@@ -663,6 +663,66 @@ pub fn canonical_tool_names(
 }
 
 #[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    fn usage(prompt: u32, cached: Option<u32>) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: 100,
+            total_tokens: prompt + 100,
+            cached_prompt_tokens: cached,
+        }
+    }
+
+    /// A route that says nothing about caching must not read as one that cached
+    /// nothing: the first would be a gap in measurement, the second a finding.
+    #[test]
+    fn an_unreported_cache_is_not_a_miss() {
+        assert_eq!(usage(1_000, None).cache_hit_ratio(), None);
+        assert_eq!(usage(1_000, Some(0)).cache_hit_ratio(), Some(0.0));
+    }
+
+    #[test]
+    fn the_uncached_share_is_what_the_request_actually_computed() {
+        assert_eq!(usage(1_000, Some(900)).uncached_prompt_tokens(), 100);
+        // Nothing reported means nothing may be assumed free.
+        assert_eq!(usage(1_000, None).uncached_prompt_tokens(), 1_000);
+    }
+
+    /// The reason this exists: an agent loop re-sends a growing prefix, so a
+    /// priced cache hit is the difference between paying for the conversation
+    /// once and paying for it every turn.
+    #[test]
+    fn cached_tokens_bill_at_the_cached_rate_when_the_route_publishes_one() {
+        let priced = Pricing {
+            input_per_mtok: 10.0,
+            output_per_mtok: 40.0,
+            cached_input_per_mtok: Some(1.0),
+            indicative: false,
+        };
+        // 100 uncached × $10 + 900 cached × $1 + 100 out × $40 per million.
+        let cost = priced.cost(&usage(1_000, Some(900)));
+        assert!((cost - (1_000.0 + 900.0 + 4_000.0) / 1_000_000.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn without_a_cached_rate_a_hit_bills_as_ordinary_input() {
+        let unpriced = Pricing {
+            input_per_mtok: 10.0,
+            output_per_mtok: 40.0,
+            cached_input_per_mtok: None,
+            indicative: false,
+        };
+        assert_eq!(
+            unpriced.cost(&usage(1_000, Some(900))),
+            unpriced.cost(&usage(1_000, None)),
+            "an unknown cached rate must not quietly discount the turn"
+        );
+    }
+}
+
+#[cfg(test)]
 mod attachment_tests {
     use super::*;
 
@@ -812,9 +872,37 @@ pub struct ToolIntent {
 /// Real token usage reported by the provider (authoritative — never estimated).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// Every prompt token the request was billed for, cached ones included —
+    /// what the context meter and the turn budget measure.
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// The part of `prompt_tokens` the provider served from its prefix cache,
+    /// typically at a fraction of the input rate.
+    ///
+    /// `None` means the route never reported the bucket — which is not the same
+    /// as a miss, and must not be shown as one. An agent loop re-sends a growing
+    /// prefix every turn, so this is the difference between paying for the whole
+    /// conversation each time and paying for what was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_prompt_tokens: Option<u32>,
+}
+
+impl Usage {
+    /// Prompt tokens actually computed this request. Falls back to the whole
+    /// prompt when nothing was reported, so an unknown cache never reads as a
+    /// free one.
+    pub fn uncached_prompt_tokens(&self) -> u32 {
+        self.prompt_tokens
+            .saturating_sub(self.cached_prompt_tokens.unwrap_or(0))
+    }
+
+    /// Share of the prompt served from cache, or `None` when the route does not
+    /// report it or sent no prompt at all.
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        let cached = self.cached_prompt_tokens?;
+        (self.prompt_tokens > 0).then(|| f64::from(cached) / f64::from(self.prompt_tokens))
+    }
 }
 
 /// Model pricing in USD per million tokens. `indicative` marks a list price
@@ -823,13 +911,22 @@ pub struct Usage {
 pub struct Pricing {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
+    /// Rate for prompt tokens served from the provider's cache, where the route
+    /// publishes one. Without it a cache hit bills at the full input rate, which
+    /// overstates the cost of every turn after the first.
+    pub cached_input_per_mtok: Option<f64>,
     pub indicative: bool,
 }
 
 impl Pricing {
-    pub fn cost(&self, prompt_tokens: u32, completion_tokens: u32) -> f64 {
-        (prompt_tokens as f64 * self.input_per_mtok
-            + completion_tokens as f64 * self.output_per_mtok)
+    pub fn cost(&self, usage: &Usage) -> f64 {
+        // Cached tokens are billed at their own rate when one is known, and at
+        // the full input rate otherwise — never silently as free.
+        let cached = f64::from(usage.cached_prompt_tokens.unwrap_or(0));
+        let cached_rate = self.cached_input_per_mtok.unwrap_or(self.input_per_mtok);
+        (f64::from(usage.uncached_prompt_tokens()) * self.input_per_mtok
+            + cached * cached_rate
+            + f64::from(usage.completion_tokens) * self.output_per_mtok)
             / 1_000_000.0
     }
 }

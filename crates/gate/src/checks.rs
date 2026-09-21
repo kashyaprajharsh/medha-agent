@@ -1165,9 +1165,9 @@ mod tests {
     #[tokio::test]
     async fn tool_used_and_not_used_scan_intents() {
         let runner = test_runner(Duration::from_secs(1), 1024);
-        let events = vec![intent_event("fs.edit"), intent_event("shell.exec")];
+        let events = vec![intent_event("edit"), intent_event("shell.exec")];
         let used = eval_one(
-            &Check::ToolUsed("fs.edit".into()),
+            &Check::ToolUsed("edit".into()),
             &art(".".into(), ".".into(), events.clone()),
             &runner,
         )
@@ -1193,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn event_absent_catches_dangerous_pattern() {
         let runner = test_runner(Duration::from_secs(1), 1024);
-        let clean = vec![intent_event("fs.read")];
+        let clean = vec![intent_event("read")];
         let ok = eval_one(
             &Check::EventAbsent {
                 kind: "policy".into(),

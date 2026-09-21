@@ -2,7 +2,7 @@
 //! provider view, not the event log.
 
 use crate::provider::{InputTokenCount, TokenCountQuality};
-use crate::types::{Message, ToolSpec, TrustLabel};
+use crate::types::{CompiledContext, Message, ToolSpec, TrustLabel};
 use async_trait::async_trait;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -170,6 +170,9 @@ pub trait ContextEngine: Send + Sync {
 
     /// Note the session's tool set so tool-definition overhead is sized once.
     fn note_tools(&self, _tools: &[ToolSpec]) {}
+
+    /// Note the context being sent, so a compaction summary can replay it.
+    fn note_request(&self, _ctx: &CompiledContext) {}
 
     /// Compile outbound context from the working history. `max_input_tokens`
     /// is the resolved input-only allowance for this request. `None` means the

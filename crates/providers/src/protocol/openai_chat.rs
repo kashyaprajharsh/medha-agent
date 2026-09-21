@@ -445,12 +445,40 @@ struct ResponseError {
 
 #[derive(Default, Clone, Copy, Deserialize)]
 struct UsageRaw {
+    /// Inclusive of anything served from cache: on every endpoint that reports
+    /// the split, this equals hit + miss.
     #[serde(default)]
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
     #[serde(default)]
     total_tokens: u32,
+    /// The OpenAI-compatible spelling of the cache-hit count.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    /// DeepSeek's own spelling of the same number.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+}
+
+#[derive(Default, Clone, Copy, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+impl UsageRaw {
+    /// Absent unless the route actually reported it. A zero would read as a
+    /// measured miss, so every endpoint that does not report the bucket would
+    /// look like one that never caches.
+    fn cached_prompt_tokens(&self) -> Option<u32> {
+        self.prompt_tokens_details
+            .and_then(|details| details.cached_tokens)
+            .or(self.prompt_cache_hit_tokens)
+            // A gateway reporting more hits than prompt tokens is reporting
+            // something else; keep the count inside the prompt it belongs to.
+            .map(|cached| cached.min(self.prompt_tokens))
+    }
 }
 
 #[derive(Deserialize)]
@@ -669,6 +697,7 @@ fn usage_block(usage: UsageRaw) -> Block {
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens,
+        cached_prompt_tokens: usage.cached_prompt_tokens(),
     })
 }
 
@@ -964,6 +993,64 @@ impl ThinkTagFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage_of(body: serde_json::Value) -> kernel::Usage {
+        let raw: UsageRaw = serde_json::from_value(body).expect("usage parses");
+        match usage_block(raw) {
+            Block::Usage(usage) => usage,
+            other => panic!("expected a usage block, got {other:?}"),
+        }
+    }
+
+    /// Both spellings of the same number. Endpoints differ on which they send,
+    /// and a harness that reads only one reports no caching on the other.
+    #[test]
+    fn a_cache_hit_is_read_under_either_spelling() {
+        let openai = usage_of(serde_json::json!({
+            "prompt_tokens": 10_000,
+            "completion_tokens": 200,
+            "total_tokens": 10_200,
+            "prompt_tokens_details": { "cached_tokens": 9_600 },
+        }));
+        assert_eq!(openai.cached_prompt_tokens, Some(9_600));
+        assert_eq!(openai.uncached_prompt_tokens(), 400);
+
+        let deepseek = usage_of(serde_json::json!({
+            "prompt_tokens": 10_000,
+            "completion_tokens": 200,
+            "total_tokens": 10_200,
+            "prompt_cache_hit_tokens": 9_600,
+            "prompt_cache_miss_tokens": 400,
+        }));
+        assert_eq!(deepseek.cached_prompt_tokens, Some(9_600));
+    }
+
+    /// Silence is not a miss. Every endpoint that reports no bucket would
+    /// otherwise show a 0% hit rate and look like caching had stopped working.
+    #[test]
+    fn an_endpoint_that_reports_no_bucket_reports_nothing() {
+        let usage = usage_of(serde_json::json!({
+            "prompt_tokens": 10_000,
+            "completion_tokens": 200,
+            "total_tokens": 10_200,
+        }));
+        assert_eq!(usage.cached_prompt_tokens, None);
+        assert_eq!(usage.cache_hit_ratio(), None);
+    }
+
+    /// A gateway reporting more hits than prompt tokens is reporting something
+    /// else; the count stays inside the prompt it is a share of.
+    #[test]
+    fn a_cache_count_larger_than_the_prompt_is_clamped() {
+        let usage = usage_of(serde_json::json!({
+            "prompt_tokens": 1_000,
+            "completion_tokens": 10,
+            "total_tokens": 1_010,
+            "prompt_tokens_details": { "cached_tokens": 5_000 },
+        }));
+        assert_eq!(usage.cached_prompt_tokens, Some(1_000));
+        assert_eq!(usage.cache_hit_ratio(), Some(1.0));
+    }
 
     #[test]
     fn incomplete_tool_json_is_rejected_in_both_response_modes() {

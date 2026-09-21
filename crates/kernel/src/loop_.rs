@@ -23,12 +23,20 @@ fn approval_detail(intent: &ToolIntent) -> String {
     let s = |k: &str| intent.args.get(k).and_then(|v| v.as_str()).unwrap_or("");
     match intent.tool.as_str() {
         "shell.exec" => format!("$ {}", s("command")),
-        "fs.edit" => {
+        // One tool, three shapes: show the operator what this call actually does.
+        "edit" if intent.args.get("content").is_some() => {
+            format!("write {} ({} bytes)", s("path"), s("content").len())
+        }
+        "edit" if intent.args.get("edits").is_some() => format!(
+            "edit {} ({} changes)",
+            s("path"),
+            intent.args["edits"].as_array().map_or(0, Vec::len)
+        ),
+        "edit" => {
             let old: String = s("old_string").chars().take(120).collect();
             let new: String = s("new_string").chars().take(120).collect();
             format!("edit {}\n- {}\n+ {}", s("path"), old, new)
         }
-        "fs.write" => format!("write {} ({} bytes)", s("path"), s("content").len()),
         _ => {
             let a: String = intent.args.to_string().chars().take(200).collect();
             format!("{} {}", intent.tool, a)
@@ -539,9 +547,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 let head: String = content.chars().take(2_000).collect();
                 format!(
                     "{head}\n\n[SHOWING FIRST 2000 CHARS of {} total bytes — the rest is NOT \
-                     lost. Continue reading it: call read_artifact with hash=\"{hash}\" \
+                     lost. Continue reading it: call read with hash=\"{hash}\" \
                      (offset, length) to page through the remainder, or re-read a specific \
-                     line range with fs.read offset+limit. Do NOT report to the user that the \
+                     line range with read offset+limit. Do NOT report to the user that the \
                      output was truncated or that you can't see it — page through it and \
                      finish the task.]",
                     content.len()
@@ -769,14 +777,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             attach_discovered_context(&mut obs, &discovered);
         }
         // Persist applied memory before its observation so replay cannot miss it.
-        let applied =
-            if matches!(obs.status, crate::types::ObsStatus::Ok) && tool.starts_with("memory.") {
-                obs.payload
-                    .as_object_mut()
-                    .and_then(|payload| payload.remove("applied"))
-            } else {
-                None
-            };
+        let applied = if matches!(obs.status, crate::types::ObsStatus::Ok) && is_memory_tool(&tool)
+        {
+            obs.payload
+                .as_object_mut()
+                .and_then(|payload| payload.remove("applied"))
+        } else {
+            None
+        };
         if let Some(op) = applied.filter(|op| op.is_object()) {
             self.log.append(Event::memory_write(session, op)).await?;
         }
@@ -874,6 +882,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
     /// Run a session to completion: stream, execute tool calls, feed results back
     /// until the model finishes or `max_turns` is hit. Context is recompiled each turn.
+    #[tracing::instrument(level = "info", skip_all, fields(session = %session.id))]
     pub async fn run_session(
         &self,
         session: &Session,
@@ -904,6 +913,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut window_taint = TrustLabel::User;
         // Skip what the log already ends with: a retry would append the run
         // twice, and the projection only collapses adjacent identical turns.
+        let history_started = std::time::Instant::now();
         let prior_events = self.log.checked_events(session.id).await?;
         let already = logged_tail(&prior_events);
         // Retried input is already durable but still belongs to this evidence
@@ -942,6 +952,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut ordered_messages: Vec<ModelMessage> =
             messages.iter().map(Message::ordered).collect();
         let logged_events = self.log.checked_events(session.id).await?;
+        tracing::info!(
+            elapsed_ms = history_started.elapsed().as_millis() as u64,
+            "session history prepared"
+        );
         let has_checkpoint = logged_events.iter().any(|event| {
             event.kind == EventKind::Compaction
                 && crate::events::has_valid_compaction_snapshot(&event.payload)
@@ -1164,6 +1178,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         ));
                     }
                     if !compiled.compacted {
+                        self.context.note_request(&candidate);
                         let input_tokens = preflight.as_ref().map(|count| count.tokens);
                         let output_tokens = self
                             .provider
@@ -1340,7 +1355,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // with taint-window values, which stop at this turn's dispatch.
             let mut intents = intents;
             for it in &mut intents {
-                if it.tool.starts_with("memory.") {
+                if is_memory_tool(&it.tool) {
                     enrich_memory_intent(&mut it.args, window_taint, &window_events, session.id);
                 }
             }
@@ -1832,6 +1847,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     > {
         // Connection and prompt processing must remain cancellable before the
         // first stream byte arrives.
+        let request_started = std::time::Instant::now();
+        let mut usage_report = crate::usage_reporting::AttemptUsage::new(sink, prepared);
         let mut stream = tokio::select! {
             s = self.provider.stream_prepared(prepared) => s.map_err(|e| (e, false))?,
             _ = cancel.cancelled() => {
@@ -1901,6 +1918,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             }
             match block {
                 Ok(Block::Text(t)) => {
+                    if text.is_empty() && !t.is_empty() {
+                        tracing::info!(
+                            elapsed_ms = request_started.elapsed().as_millis() as u64,
+                            "model first text delta"
+                        );
+                    }
                     charge_stream_bytes(&mut stream_bytes, t.len())
                         .map_err(|error| (error, emitted))?;
                     emitted = true;
@@ -1915,6 +1938,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                 }
                 Ok(Block::Reasoning(r)) => {
+                    if reasoning.is_empty() && !r.is_empty() {
+                        tracing::info!(
+                            elapsed_ms = request_started.elapsed().as_millis() as u64,
+                            "model first reasoning delta"
+                        );
+                    }
                     charge_stream_bytes(&mut stream_bytes, r.len())
                         .map_err(|error| (error, emitted))?;
                     emitted = true;
@@ -1964,7 +1993,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     intents.push(it);
                 }
                 Ok(Block::Usage(u)) => {
-                    sink.usage(u.prompt_tokens, u.total_tokens);
+                    usage_report.observe(u);
                     usage = Some(u);
                 }
                 Ok(Block::CompletedMessage(message)) => {
@@ -2081,7 +2110,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // Enforce before policy/human approval so custom AllowAll policies and
         // remembered approvals cannot turn Plan into an editing session.
         let raw = if session.autonomy == crate::types::AutonomyLevel::Plan
-            && radius != Some(BlastRadius::Read)
+            && (radius != Some(BlastRadius::Read) || self.executor.mutation_key(intent).is_some())
         {
             crate::types::Decision::Deny {
                 reason: "plan mode permits read-only tools; switch mode to implement".into(),
@@ -2311,6 +2340,14 @@ fn net_grant_detail(intent: &ToolIntent, web_tainted: bool, obs: &Observation) -
         );
     }
     detail
+}
+
+/// Whether a call targets the memory store, and so needs kernel-computed trust
+/// on the way in and its applied operation persisted on the way out. The dotted
+/// names are the per-verb tools these were split across before they merged;
+/// replaying a session logged then must take the same path it did originally.
+fn is_memory_tool(tool: &str) -> bool {
+    tool == "memory" || tool.starts_with("memory.")
 }
 
 /// Replace model-supplied trust metadata with kernel-computed values.
@@ -2659,8 +2696,8 @@ mod approval_key_tests {
         assert_eq!(a, "shell.exec: cargo build");
         assert_ne!(a, b, "distinct commands must not share an auto-approve key");
         assert_eq!(
-            approval_key(&intent("fs.write", json!({ "path": "x.rs" }))),
-            "fs.write: x.rs"
+            approval_key(&intent("edit", json!({ "path": "x.rs" }))),
+            "edit: x.rs"
         );
         assert_eq!(
             approval_key(&intent("update_plan", json!({}))),

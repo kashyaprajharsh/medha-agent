@@ -400,6 +400,10 @@ fn usage_block(usage: UsageRaw) -> Block {
         prompt_tokens: usage.input,
         completion_tokens: usage.output,
         total_tokens: usage.total,
+        // The Interactions usage object reports no cache bucket here. Left
+        // unreported rather than guessed at: a zero would be read as a measured
+        // miss and make the route look like one that never caches.
+        cached_prompt_tokens: None,
     })
 }
 

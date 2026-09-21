@@ -2277,12 +2277,13 @@ pub(super) fn handle_agent_event(
             TuiEvent::Text(_)
             | TuiEvent::Reasoning(_)
             | TuiEvent::ToolStarted(_, _)
-            | TuiEvent::ToolCall(_, _)
-            | TuiEvent::ToolResult(_, _, _)
+            | TuiEvent::ToolCall(_, _, _)
+            | TuiEvent::ToolResult(_, _, _, _)
             | TuiEvent::Compaction(_, _, _, _)
             | TuiEvent::Compacting(_)
             | TuiEvent::Restarted
             | TuiEvent::ContextPressure(_)
+            | TuiEvent::Usage(_)
             | TuiEvent::Cost(_, _)
             | TuiEvent::Verify(_, _) => return,
             other => other,
@@ -2314,13 +2315,18 @@ pub(super) fn handle_agent_event(
             model.push_text_delta(&delta);
         }
         TuiEvent::Reasoning(delta) => model.push_thinking_delta(&delta),
-        TuiEvent::ToolCall(tool, args) => {
+        TuiEvent::ToolCall(id, tool, args) => {
             model.current_tool = None;
-            model.push_main_item(Item::ToolCall { tool, args });
+            model.push_main_item(Item::ToolCall { id, tool, args });
         }
-        TuiEvent::ToolResult(tool, ok, payload) => {
+        TuiEvent::ToolResult(id, tool, ok, payload) => {
             model.current_tool = None;
-            model.push_main_item(Item::ToolResult { tool, ok, payload });
+            model.push_main_item(Item::ToolResult {
+                id,
+                tool,
+                ok,
+                payload,
+            });
         }
         TuiEvent::Compaction(before, after, summarized, summary) => {
             model.compacting = false;
@@ -2349,6 +2355,22 @@ pub(super) fn handle_agent_event(
         TuiEvent::AgentStep { .. } => {}
         TuiEvent::ContextPressure(pressure) => {
             model.context_pressure = Some(pressure);
+        }
+        TuiEvent::Usage(usage) => {
+            model.cache_last_usage = Some(usage);
+            if usage.cached_prompt_tokens.is_none() {
+                model.cache_unreported_attempts = model.cache_unreported_attempts.saturating_add(1);
+            }
+            // Only a route that reports the bucket contributes; mixing in a
+            // request that never reported it would dilute the ratio toward zero
+            // and read as a cache that stopped working.
+            if let Some(cached) = usage.cached_prompt_tokens {
+                let (hits, prompt) = model.cache.unwrap_or((0, 0));
+                model.cache = Some((
+                    hits.saturating_add(u64::from(cached.min(usage.prompt_tokens))),
+                    prompt.saturating_add(u64::from(usage.prompt_tokens)),
+                ));
+            }
         }
         TuiEvent::Cost(usd, indicative) => model.cost_usd = Some((usd, indicative)),
         TuiEvent::Verify(ok, summary) => model.push_main_item(Item::Verify { ok, summary }),
@@ -2924,6 +2946,7 @@ pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
                 for tc in &m.tool_calls {
                     call_tools.insert(tc.id.clone(), tc.tool.clone());
                     model.push_item(Item::ToolCall {
+                        id: Some(tc.id.clone()),
                         tool: tc.tool.clone(),
                         args: tc.args.clone(),
                     });
@@ -2932,16 +2955,19 @@ pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
             kernel::Role::Tool => {
                 let payload: serde_json::Value = serde_json::from_str(&m.content)
                     .unwrap_or_else(|_| serde_json::Value::String(m.content.clone()));
-                // Status isn't projected into the message; a top-level "error"
-                // key is how every failing observation payload reports itself.
-                let ok = payload.get("error").is_none();
                 let tool = m
                     .tool_call_id
                     .as_deref()
                     .and_then(|id| call_tools.get(id))
                     .cloned()
                     .unwrap_or_else(|| "tool".to_string());
-                model.push_item(Item::ToolResult { tool, ok, payload });
+                let ok = crate::result_failure(&tool, &payload).is_none();
+                model.push_item(Item::ToolResult {
+                    id: m.tool_call_id.clone(),
+                    tool,
+                    ok,
+                    payload,
+                });
             }
             // system messages are not shown as transcript rows.
             _ => {}
@@ -3269,8 +3295,8 @@ fn show_lsp_status(
         let observation = executor
             .execute(&kernel::ToolIntent {
                 id: "tui-lsp-status".into(),
-                tool: "lsp.status".into(),
-                args: serde_json::json!({}),
+                tool: "lsp".into(),
+                args: serde_json::json!({ "op": "status" }),
             })
             .await;
         let result = if observation.status == kernel::ObsStatus::Ok {
@@ -4651,7 +4677,9 @@ pub(super) fn spawn_turn<P, L>(
     model.running = true;
     model.reasoning_received_this_turn = false;
     model.streamed_this_turn = 0;
-    model.turn_started = Some(Instant::now());
+    let submitted_at = Instant::now();
+    model.turn_started = Some(submitted_at);
+    tracing::info!(session = %session.id, "tui turn submitted");
     // Pick up any skill saved/edited since startup so the model's manifest is
     // current this turn (not just next session).
     model.refresh_skill_manifest(transcript);
@@ -4724,7 +4752,7 @@ pub(super) fn spawn_turn<P, L>(
                     summary.truncate(cut);
                     summary.push_str(&match spilled {
                         Some(hash) => {
-                            format!("\n… truncated; read the rest with `read_artifact` {hash}")
+                            format!("\n… truncated; read the rest with `read` hash={hash}")
                         }
                         None => "\n… report truncated".to_string(),
                     });
@@ -4756,6 +4784,9 @@ pub(super) fn spawn_turn<P, L>(
             return;
         }
         let sink = TuiSink { tx: tx.clone() };
+        tracing::info!(session = %session.id,
+            elapsed_ms = submitted_at.elapsed().as_millis() as u64,
+            "tui preparation finished");
         let outcome = FOREGROUND_TURN_CANCEL
             .scope(
                 approval_cancel,
@@ -4857,13 +4888,25 @@ impl kernel::StreamSink for TuiSink {
     fn tool_call(&self, tool: &str, args: &serde_json::Value) {
         self.emit(
             "tool_call",
-            TuiEvent::ToolCall(tool.to_string(), args.clone()),
+            TuiEvent::ToolCall(None, tool.to_string(), args.clone()),
         );
     }
     fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) {
         self.emit(
             "tool_result",
-            TuiEvent::ToolResult(tool.to_string(), ok, payload.clone()),
+            TuiEvent::ToolResult(None, tool.to_string(), ok, payload.clone()),
+        );
+    }
+    fn tool_call_with_id(&self, id: &str, tool: &str, args: &serde_json::Value) {
+        self.emit(
+            "tool_call",
+            TuiEvent::ToolCall(Some(id.into()), tool.into(), args.clone()),
+        );
+    }
+    fn tool_result_with_id(&self, id: &str, tool: &str, ok: bool, payload: &serde_json::Value) {
+        self.emit(
+            "tool_result",
+            TuiEvent::ToolResult(Some(id.into()), tool.into(), ok, payload.clone()),
         );
     }
     fn compacting(&self, active: bool) {
@@ -4886,6 +4929,9 @@ impl kernel::StreamSink for TuiSink {
     }
     fn context_pressure(&self, pressure: kernel::ContextPressure) {
         self.emit("context_pressure", TuiEvent::ContextPressure(pressure));
+    }
+    fn usage(&self, usage: &kernel::Usage) {
+        self.emit("usage", TuiEvent::Usage(*usage));
     }
     fn cost(&self, total_usd: f64, indicative: bool) {
         self.emit("cost", TuiEvent::Cost(total_usd, indicative));
@@ -5866,7 +5912,7 @@ pub(super) fn run_slash<P: kernel::Provider>(
                     let state = if t.running { "running" } else { "done" };
                     lines.push_str(&format!("\n  {} [{state}]  {}", t.id, t.command));
                 }
-                lines.push_str("\n\n(inspect with task.output; stop with task.kill)");
+                lines.push_str("\n\n(inspect with task.output; stop with task.control op=kill)");
                 lines
             };
             // Live status: refresh the previous /tasks block instead of
@@ -5907,6 +5953,21 @@ pub(super) fn run_slash<P: kernel::Provider>(
                     None => "unknown window; proactive compaction unavailable".to_string(),
                 },
             };
+            let cache = match model.cache {
+                Some((hits, prompt)) => format!("{hits}/{prompt} reported prompt tokens cached"),
+                None => "not reported".to_string(),
+            };
+            let last = match model.cache_last_usage {
+                Some(u) => format!(
+                    "cached {:?} / {} prompt tokens",
+                    u.cached_prompt_tokens, u.prompt_tokens
+                ),
+                None => "no usage received".to_string(),
+            };
+            model.push_notice(format!(
+                "cache (live since session opened, across models): {cache}\nlast attempt: {last}\nusage reports without cache information: {} (excluded); attempts without usage are unknown",
+                model.cache_unreported_attempts
+            ));
             model.push_notice(format!(
                 "model: {} ({})  |  {ctx}\n\n{}",
                 model.model,
@@ -6110,6 +6171,43 @@ mod fix_tests {
             HashMap::new(),
             sbx,
         )
+    }
+
+    #[test]
+    fn cache_usage_is_weighted_unknown_is_excluded_and_session_boundary_resets() {
+        let mut m = model();
+        let mut session = Session::new();
+        let mut transcript = Vec::new();
+        for (prompt, cached) in [(100, Some(75)), (900, Some(900)), (500, None)] {
+            handle_agent_event(
+                &mut m,
+                TuiEvent::Usage(kernel::Usage {
+                    prompt_tokens: prompt,
+                    cached_prompt_tokens: cached,
+                    ..kernel::Usage::default()
+                }),
+                &mut session,
+                &mut transcript,
+            );
+        }
+        assert_eq!(m.cache, Some((975, 1000)));
+        assert_eq!(m.cache_unreported_attempts, 1);
+        assert_eq!(m.cache_last_usage.unwrap().prompt_tokens, 500);
+        m.clear_session_panes();
+        assert_eq!(m.cache, None);
+        assert!(m.cache_last_usage.is_none());
+        assert_eq!(m.cache_unreported_attempts, 0);
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Usage(kernel::Usage {
+                prompt_tokens: 100,
+                cached_prompt_tokens: Some(200),
+                ..kernel::Usage::default()
+            }),
+            &mut session,
+            &mut transcript,
+        );
+        assert_eq!(m.cache, Some((100, 100)));
     }
 
     #[test]
@@ -7944,7 +8042,7 @@ mod agent_pane_tests {
         );
         handle_agent_event(
             &mut m,
-            TuiEvent::ToolCall("parent.tool".into(), serde_json::json!({})),
+            TuiEvent::ToolCall(None, "parent.tool".into(), serde_json::json!({})),
             &mut session,
             &mut transcript,
         );
@@ -8117,6 +8215,7 @@ mod agent_pane_tests {
             m.push_agent_step(
                 worker.clone(),
                 AgentStep::ToolCall {
+                    id: None,
                     tool: format!("tool-{n}"),
                     args: serde_json::json!({}),
                 },

@@ -9,6 +9,17 @@ max_turns = 200
 # max_wall_s = 7200
 # max_parallel_tools = 10000   # concurrent tool calls per turn
 
+[pricing]
+# Your real rates, in USD per million tokens. Left unset, Medha uses the
+# models.dev list price and marks the cost meter "est.".
+# input_per_mtok = 0.27
+# output_per_mtok = 1.10
+# Rate for prompt tokens the provider serves from its own cache — usually a
+# fraction of the input rate. An agent re-sends a growing prefix every turn, so
+# on a long session this is most of what you pay for. Unset, cached tokens bill
+# at input_per_mtok, which overstates the cost rather than understating it.
+# cached_input_per_mtok = 0.027
+
 [context]
 # Compaction thresholds and protected transcript regions.
 trigger_ratio = 0.99
@@ -56,7 +67,20 @@ allow_network = false # local servers are network-denied unless explicitly enabl
 [policy]
 # Otherwise-allowed tool classes that still require human approval.
 # Add "shell.exec" to require approval for every shell command.
-approve = ["fs.write", "fs.edit", "multi_edit", "skill.save"]
+# Names must match registered tools — Medha warns at startup about any that
+# do not, because a name nothing answers to gates nothing.
+approve = ["edit", "skill.save"]
+
+[tools]
+# Which tools the model is shown. Every tool's name, description and schema is
+# re-sent on every request of every turn, so the catalogue is a fixed tax on the
+# whole session whether or not it gets used.
+#   preset = "full"     (default) → everything registered
+#           = "minimal"           → read, edit, shell.exec, grep, glob
+# Minimal suits small models and short runs: anything the specialised tools do
+# is still reachable through the shell, at the cost of more model work. Override
+# for one run with MEDHA_TOOLS=minimal.
+preset = "full"
 
 [sandbox]
 # Execution isolation for shell, build, and VCS commands.

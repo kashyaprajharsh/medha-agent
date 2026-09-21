@@ -519,11 +519,11 @@ struct AcpSink {
 /// Map a Medha tool to the closest ACP `ToolKind`, so an editor can pick an icon.
 fn acp_tool_kind(tool: &str) -> &'static str {
     match tool {
-        "fs.read" | "read_artifact" | "fs.list" | "tree" | "code_outline" => "read",
-        "fs.write" | "fs.edit" | "multi_edit" => "edit",
-        "grep" | "glob" | "references" | "sessions.search" => "search",
-        "shell.exec" | "git" => "execute",
-        "web.fetch" | "web.search" | "web.crawl" => "fetch",
+        "read" | "ls" | "skill" => "read",
+        "edit" => "edit",
+        "grep" | "glob" | "code" | "sessions.search" => "search",
+        "shell.exec" | "git" | "diagnostics" => "execute",
+        "web" => "fetch",
         "update_plan" | "clarify" => "think",
         _ => "other",
     }
@@ -637,10 +637,16 @@ impl kernel::StreamSink for AcpSink {
             json!({ "id": id, "tool": tool, "ok": ok, "payload": payload }),
         );
     }
-    fn usage(&self, prompt_tokens: u32, total_tokens: u32) {
+    fn usage(&self, usage: &kernel::Usage) {
         self.writer.event(
             "usage",
-            json!({ "prompt_tokens": prompt_tokens, "total_tokens": total_tokens }),
+            json!({
+                "prompt_tokens": usage.prompt_tokens,
+                "total_tokens": usage.total_tokens,
+                // Omitted rather than zeroed when the route does not report it:
+                // an editor must be able to tell "no cache" from "not measured".
+                "cached_prompt_tokens": usage.cached_prompt_tokens,
+            }),
         );
     }
     fn context_pressure(&self, pressure: kernel::ContextPressure) {
@@ -1689,7 +1695,7 @@ mod tests {
         ));
         let waiting = {
             let gate = Arc::clone(&gate);
-            tokio::spawn(async move { gate.confirm("fs.edit", Some("a.rs"), false).await })
+            tokio::spawn(async move { gate.confirm("edit", Some("a.rs"), false).await })
         };
         let frame = rx.recv().await.expect("permission request");
         let request: Value = match frame {
@@ -1708,7 +1714,7 @@ mod tests {
         );
         assert_eq!(waiting.await.unwrap(), Approval::Always);
         assert_eq!(
-            gate.confirm("fs.edit", Some("b.rs"), false).await,
+            gate.confirm("edit", Some("b.rs"), false).await,
             Approval::Always
         );
         assert!(rx.try_recv().is_err(), "remembered approval prompted again");
@@ -1722,8 +1728,8 @@ mod tests {
             .unwrap();
         let (writer, mut rx) = capture_writer(8);
         let sink = AcpSink { writer, peer };
-        sink.tool_call_with_id("call-17", "fs.read", &json!({"path": "a.rs"}));
-        sink.tool_result_with_id("call-17", "fs.read", true, &json!({"content": "x"}));
+        sink.tool_call_with_id("call-17", "read", &json!({"path": "a.rs"}));
+        sink.tool_result_with_id("call-17", "read", true, &json!({"content": "x"}));
         let updates = captured_values(&mut rx);
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0]["params"]["update"]["toolCallId"], "call-17");
@@ -2140,8 +2146,7 @@ mod tests {
         ));
 
         let dropped_gate = Arc::clone(&gate);
-        let dropped =
-            tokio::spawn(async move { dropped_gate.confirm("fs.edit", None, false).await });
+        let dropped = tokio::spawn(async move { dropped_gate.confirm("edit", None, false).await });
         let _approval_frame = rx.recv().await.expect("approval notification");
         assert_eq!(lock_pending(&pending).len(), 1);
         dropped.abort();

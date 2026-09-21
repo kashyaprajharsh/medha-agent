@@ -51,7 +51,7 @@ pub const REPORT_ACKS_FIELD: &str = kernel::AGENT_REPORT_ACKS_FIELD;
 ///
 /// Still intersected with the parent's own set afterwards, so this is a floor
 /// under narrowing and never a way to widen.
-const ESSENTIAL_CHILD_TOOLS: &[&str] = &["fs.read", "fs.list"];
+const ESSENTIAL_CHILD_TOOLS: &[&str] = &["read", "ls"];
 
 /// Resolve a requested child capability list to canonical registry names, then
 /// add the readability floor. `None` inherits the parent unchanged.
@@ -1811,8 +1811,21 @@ fn report(sender: &AgentPath, result: &AgentResult) -> String {
         AgentStatus::Failed => "FAILED",
         AgentStatus::Cancelled => "CANCELLED",
     };
-    let next = match result.status {
-        AgentStatus::Completed => "",
+    // What to do with a report, delivered with the report rather than carried in
+    // the spawn tool's description — where every turn would pay for it whether
+    // or not anything was ever delegated.
+    let next = match (result.status, result.patch.is_some()) {
+        (AgentStatus::Completed, true) => {
+            "\n\nIts changes are NOT on disk. It edited a private checkout and handed back a \
+              patch, so the real files still read exactly as they did before — checking them \
+              proves nothing. Review the diff, then apply it, which asks the user first."
+        }
+        (AgentStatus::Completed, false) => {
+            "\n\nThis is its own account of what it did, not an established fact. For anything \
+              with an effect outside its reasoning — a file written, a request sent, a test \
+              claimed to pass — get the verifiable handle and check it before telling the user \
+              it happened. Relay what matters; the user did not see this."
+        }
         // A failure with no next step reads as a dead end, and the agent either
         // abandons the work or silently redoes it itself.
         _ => {

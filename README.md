@@ -197,7 +197,10 @@ Drop a `medha.lock` in your repo to version the harness itself. No file means bu
 ```toml
 [policy]
 autonomy = "careful"          # careful · normal · yolo
-approve  = ["fs.write", "fs.edit", "multi_edit", "skill.save"]
+approve  = ["edit", "skill.save"]
+
+[tools]
+preset = "full"               # full · minimal (read, edit, shell.exec, grep, glob)
 
 [sandbox]
 backend = "native"            # native · container · ssh · host
@@ -231,7 +234,7 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
   └──┬────────┬──────────┬──────────┬──────────┬───────────────┘
      │        │          │          │          │
  providers  context   policy    executor   event log
- OpenAI ·   compact   deny-     53 tools   SQLite WAL +
+ OpenAI ·   compact   deny-     25 tools   SQLite WAL +
  Gemini     + spill   first     sandboxed  SHA-256 chain
 ```
 
@@ -241,7 +244,7 @@ Fifteen crates. `kernel` is the only code that calls a model, writes an event, o
 
 Pre-1.0 (`0.1.8`) — interfaces may still change.
 
-**Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 53 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation that you can open, watch and steer while they run,
+**Working today:** the kernel loop, OpenAI-compatible and native Gemini providers, 25 tools, four sandbox backends, deny-first policy, two-phase compaction, typed memory with kernel-computed provenance, the hash-chained event log, rewind and undo, skills with a two-tier guard, LSP and MCP hosts, sub-agents with worktree isolation that you can open, watch and steer while they run,
 graceful interrupts, the ACP editor bridge, and the Eval Gate.
 
 **Next:** native Anthropic Messages and OpenAI Responses protocols, cross-vendor adversarial verification, span-level trust taint, and trace→skill distillation.

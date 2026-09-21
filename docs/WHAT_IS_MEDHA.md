@@ -246,7 +246,7 @@ The gate activates when:
 ### How It Works
 
 ```
-AI proposes: fs.edit("config.toml", ...)
+AI proposes: edit("config.toml", ...)
      │
      ▼
 Policy check → Decision::Human (requires approval)
@@ -400,7 +400,7 @@ verdict is returned untouched, so no level, `yolo` included, can loosen the floo
 | Mode | What the dial escalates |
 |------|-------------------------|
 | `careful` (default) | Every tool in the approve set |
-| `normal` | The approve set **minus** `fs.write`, `fs.edit`, `multi_edit` — so edits run freely |
+| `normal` | The approve set **minus** `edit` — so edits run freely |
 | `yolo` | Nothing from the approve set |
 
 > **`yolo` is not "no approval prompts."** It switches off the approve-set
@@ -416,7 +416,7 @@ verdict is returned untouched, so no level, `yolo` included, can loosen the floo
 > - `skill.save` — always `Human`, unconditionally
 > - `agent.apply` — always `Human`; reviewing a sub-agent's diff *is* the feature
 > - `git add` / `git commit` — gated per subcommand, while reads stay free
-> - `memory.write` / `update` / `forget` in **user** scope — these follow the person
+> - `memory` with `op` `write` / `update` / `forget` in **user** scope — these follow the person
 >   into every future session, so they earn a gate; project scope rides its `Read`
 >   radius
 > - Any web-tainted consequential action — trust-flow escalation is applied *after*
@@ -503,10 +503,10 @@ MEDHA tracks two separate attributes for every tool call:
 
 | Attribute | What It Tracks | Example |
 |-----------|----------------|---------|
-| **Tool Category** | What the tool **does** | `web.fetch` = Web, `fs.write` = Write |
+| **Tool Category** | What the tool **does** | `web` = Web, `edit` = Write |
 | **Trust Window** | What **influenced** the session | Web content seen since last user message |
 
-**Key Insight:** A tool's own category (e.g., `fs.write`) is separate from the trust window (e.g., "user read a website 3 turns ago"). Any tool can be escalated if the trust window is tainted, regardless of its own category.
+**Key Insight:** A tool's own category (e.g., `edit`) is separate from the trust window (e.g., "user read a website 3 turns ago"). Any tool can be escalated if the trust window is tainted, regardless of its own category.
 
 ### Trust Labels
 
@@ -528,14 +528,14 @@ User message: "Find a fix online"
 Trust Window RESETS: window_taint = User
      │
      ▼
-Turn 1: AI calls web.fetch("https://blog.com/fix")
+Turn 1: AI calls web(op: "fetch", url: "https://blog.com/fix")
      │
      ├─ Tool Category: Web
      ├─ Trust Label: Web
      └─ window_taint = User.min(Web) = Web ← TAINTED!
      │
      ▼
-Turn 2: AI calls fs.write("fix.py") ← Different tool!
+Turn 2: AI calls edit("fix.py") ← Different tool!
      │
      ├─ Blast Radius: ReversibleLocal
      ├─ web_tainted: true ← from Turn 1
@@ -567,7 +567,7 @@ web_tainted STAYS true — it is a one-way latch for the whole
 run_session. Only a new session starts clean.
      │
      ▼
-Turn 5: AI calls fs.write("final.py")
+Turn 5: AI calls edit("final.py")
      │
      ├─ window_taint: User (fresh memory-evidence window)
      ├─ web_tainted: true (session latch)
@@ -625,8 +625,8 @@ A tool call is escalated to human approval ONLY if ALL four conditions are met:
 |----------|-----------|-----|
 | Read web → `shell.exec` | ✅ YES | Web + IrreversibleLocal |
 | Read web → call an MCP tool | ✅ YES | Web + External |
-| Read web → `fs.write` | ❌ NO | ReversibleLocal is **not** consequential here — a snapshot makes it undoable. It may still gate via `[policy] approve`. |
-| Read web → `fs.read` | ❌ NO | Read is not consequential |
+| Read web → `edit` | ❌ NO | ReversibleLocal is **not** consequential here — a snapshot makes it undoable. It may still gate via `[policy] approve`. |
+| Read web → `read` | ❌ NO | Read is not consequential |
 | Read workspace → `shell.exec` | ❌ NO | Not web-tainted |
 | Read web → `shell.exec` (network denied) | ❌ NO | Network confined, so nothing can be exfiltrated |
 
@@ -677,7 +677,7 @@ When escalation triggers, the user sees a warning:
 │                                                             │
 │ Approve this action?                                        │
 │                                                             │
-│ Action: fs.write: fix.py                                    │
+│ Action: edit: fix.py                                    │
 │ Details: write fix.py (1250 bytes)                          │
 │                                                             │
 │ [Y] Yes, this once                                          │
@@ -712,12 +712,12 @@ Blast radius categorizes tools by **potential damage** if they malfunction or ar
 
 | Level | Tools | Undo Possible? | Policy Default |
 |-------|-------|----------------|----------------|
-| 🟢 **Read** | `fs.read`, `grep`, `glob`, `tree`, `references`, `code_outline`, `lsp.*` queries, `web.search`, `web.fetch`, `web.crawl`, `memory.*`, `read_artifact`, `clarify`, `update_plan`, and the non-starting agent controls (`agent.list`, `agent.wait`, `agent.message`, `agent.steer`, `agent.transcript`, `agent.cancel`) | N/A (nothing changes) | Allow |
-| 🟡 **ReversibleLocal** | `fs.edit`, `fs.write`, `multi_edit`, `git` (add/commit), `task.kill`, `task.remove`, `agent.spawn`, `agent.followup`, `agent.apply` | Yes (snapshot, git, or bounded agent state) | Ask (careful) / Allow (yolo) |
+| 🟢 **Read** | `read`, `grep`, `glob`, `ls`, `code`, `lsp` queries, `web`, `memory`, `sessions.search`, `skill`, `task.output`, `clarify`, `update_plan`, `mcp.status`, and `agent` — the verbs that only look at a child (`list`, `wait`, `message`, `steer`, `transcript`, `cancel`) | N/A (nothing changes) | Allow |
+| 🟡 **ReversibleLocal** | `edit`, `git` (add/commit), `task.control`, `skill.save`, `agent.spawn` (a spawn or a follow-up), `agent.apply` | Yes (snapshot, git, or bounded agent state) | Ask (careful) / Allow (yolo) |
 | 🟠 **IrreversibleLocal** | `shell.exec`, `diagnostics` | No | `diagnostics`: Ask Human. `shell.exec`: scanner decides Deny/Human/Allow, then the autonomy dial may tighten `Allow`. |
 | 🔴 **External** | `mcp__*` (every MCP tool), `lsp.start`, `mcp.start` | No + affects outside | Ask Human |
 
-> **The web tools are `Read`, not `External`.** Fetching a page changes nothing, so
+> **The `web` tool is `Read`, not `External`.** Fetching a page changes nothing, so
 > it is not gated on blast radius. What protects you there is a different mechanism:
 > the SSRF guard on the request itself, and **trust-flow escalation** — once
 > web-labelled content enters a turn, later consequential actions derived from it are
@@ -735,9 +735,9 @@ Blast radius categorizes tools by **potential damage** if they malfunction or ar
 
 #### 🟢 Read
 - **What:** Changes nothing on disk or off-machine
-- **Examples:** `fs.read`, `grep`, `glob`, `tree`, `references`, `code_outline`, the
-  `lsp.*` queries, `memory.*`, `read_artifact`, `clarify`, `update_plan`, and the
-  **web tools** — `web.search`, `web.fetch`, `web.crawl`
+- **Examples:** `read`, `grep`, `glob`, `ls`, `code`, the `lsp` queries, `memory`,
+  `sessions.search`, `skill`, `clarify`, `update_plan`, and `web` — search, fetch
+  and crawl alike
 - **Base verdict:** `Allow`
 - **Risk is not zero.** Blast radius measures *what an action changes*, not whether
   its output is trustworthy. The web tools sit here because fetching a page mutates
@@ -747,17 +747,18 @@ Blast radius categorizes tools by **potential damage** if they malfunction or ar
 
 #### 🟡 ReversibleLocal
 - **What:** Modifies workspace or bounded local agent state in a recoverable way
-- **Examples:** `fs.write`, `fs.edit`, `multi_edit`, `git add`/`commit`, `task.kill`,
-  `task.remove`, `agent.spawn`, `agent.followup`, `agent.apply`
+- **Examples:** `edit`, `git add`/`commit`, `task.control`, `skill.save`,
+  `agent.spawn`, `agent.apply`
 - **Base verdict:** `Allow` — the snapshot is what makes `medha undo` possible
 - **Then the dial:** `careful` gates whatever is in `[policy] approve`; `normal` drops
-  the three edit tools from that set; `yolo` gates none of it. Some tools here carry
+  `edit` from that set; `yolo` gates none of it. Some tools here carry
   their own rule regardless — `agent.apply` is always `Human`, because reviewing a
   sub-agent's diff *is* the feature.
 
-`agent.followup` is not a read: it admits and runs another child session, spends
-budget, and can resume a writing agent in a fresh private checkout. It therefore has
-the same `ReversibleLocal` classification as `agent.spawn`.
+A follow-up — `agent.spawn` given an existing `agent` rather than an `objective` —
+is not a read: it admits and runs another child session, spends budget, and can
+resume a writing agent in a fresh private checkout. It is admitted exactly as a
+spawn is, which is why the two share one name.
 
 #### 🟠 IrreversibleLocal
 - **What:** Runs code whose effects the snapshot system cannot capture
@@ -948,7 +949,7 @@ therefore re-taints the receiving session rather than entering as trusted user
 instruction.
 
 **A wait can be interrupted.** Because the queue publishes an activity signal, a long
-`agent.wait` ends the moment its own operator says something, instead of holding the
+A wait ends the moment its own operator says something, instead of holding the
 turn against instructions that are already obsolete.
 
 ---
@@ -975,7 +976,7 @@ Twenty-one kinds, from `crates/kernel/src/events.rs`:
 | `model.message` | The complete ordered canonical assistant message, including opaque provider replay state |
 | `policy.decision` | Policy authorizes, denies, or escalates |
 | `tool.observation` | Tool completes (success, error, or denial) |
-| `memory.write` | Memory entry created / updated / forgotten / pinned |
+| `memory` | Memory entry created / updated / forgotten / pinned |
 | `interrupt` | A cancel or steer was processed |
 | `context.compaction` | History was pruned or summarized |
 | `context.file_loaded` | A context file entered the prompt |
@@ -1043,7 +1044,7 @@ The Memory System provides **persistent, trust-aware fact storage** across sessi
 ### How It Works
 
 ```
-1. Model calls memory.write / memory.update / memory.forget
+1. Model calls memory with op write / update / forget
      │
 2. Kernel strips model-supplied trust fields
      │
@@ -1143,7 +1144,7 @@ marker, so the model can weigh a fact without fetching it:
 **What gets into the index at all:** an entry is eligible if it is pinned, **or** its
 confidence is above `Candidate`, **or** it is younger than the staleness window. So an
 old, never-corroborated candidate falls out of the index on its own — it still exists
-and `memory.search` still finds it, it just stops occupying prompt budget.
+and a memory search still finds it, it just stops occupying prompt budget.
 
 **Pinned entries are clipped, never dropped.** If a pinned entry does not fit the
 remaining budget, its *description* is trimmed to fit. Pinning is a promise that the
@@ -1172,18 +1173,18 @@ Tools are the **capabilities** the AI can use to interact with the world. Each t
 
 | Category | Tools | Purpose |
 |----------|-------|---------|
-| **Filesystem** | `fs.read`, `fs.write`, `fs.edit`, `fs.list`, `multi_edit`, `word_count` | File operations |
-| **Search** | `grep`, `glob`, `tree`, `code_outline`, `references` | Find files, content and symbols |
-| **Shell** | `shell.exec`, `task.list`, `task.output`, `task.kill`, `task.remove` | Run bounded foreground commands; inspect/stop live tasks and forget retained results |
-| **Web** | `web.fetch`, `web.search`, `web.crawl` | Internet access (SSRF-guarded) |
+| **Filesystem** | `read`, `edit`, `ls` | Read a file, an image or a stored artifact; write, patch or replace; list a directory |
+| **Search** | `grep`, `glob`, `code` | Find files by name, content by regex, and symbols or their uses |
+| **Shell** | `shell.exec`, `task.output`, `task.control` | Run bounded foreground commands; inspect live tasks; stop one or forget its result |
+| **Web** | `web` (`op`: search · fetch · crawl) | Internet access (SSRF-guarded) |
 | **Git** | `git` (status, diff, log, blame, show, add, commit) | Version control |
 | **Diagnostics** | `diagnostics` | Structured compiler/linter output across 8 toolchains |
-| **Code Intelligence** | `lsp.*` (10 tools) | Semantic diagnostics, definitions, references, symbols (see [Code Intelligence](#code-intelligence-lsp)) |
+| **Code Intelligence** | `lsp` (`op`: nine queries), `lsp.start` | Semantic diagnostics, definitions, references, symbols (see [Code Intelligence](#code-intelligence-lsp)) |
 | **MCP** | `mcp.status`, `mcp.start`, `mcp__<server>__<tool>` | External Model Context Protocol servers (see [MCP Host](#mcp-host)) |
-| **Sub-agents** | `agent.spawn`, `agent.wait`, `agent.list`, `agent.message`, `agent.steer`, `agent.followup`, `agent.transcript`, `agent.cancel`, `agent.apply` | Delegation (see [Sub-Agents](#sub-agents)) |
-| **Memory** | `memory.write`, `update`, `forget`, `search`, `sessions.search` | Manage persistent facts and recall past sessions |
-| **Skills** | `skill.list`, `skill.load`, `skill.save` | Load/save procedures |
-| **Artifacts** | `read_artifact` | Page through spilled output (see [Artifacts](#artifacts)) |
+| **Sub-agents** | `agent.spawn` (start or continue one), `agent` (`action`: list · transcript · steer · message · cancel · wait), `agent.apply` | Delegation (see [Sub-Agents](#sub-agents)) |
+| **Memory** | `memory` (`op`: write · update · forget · search), `sessions.search` | Manage persistent facts and recall past sessions |
+| **Skills** | `skill` (a `name` loads one, none lists them), `skill.save` | Load/save procedures |
+| **Artifacts** | `read` (by `hash`) | Page through spilled output (see [Artifacts](#artifacts)) |
 | **Meta** | `clarify`, `update_plan` | Ask the user; maintain the live progress checklist |
 
 ### Tool Registry
@@ -1205,12 +1206,12 @@ wrong for them:
 | Tool | Ceiling | Why |
 |------|---------|-----|
 | *(default)* | 60s | Protects against a stuck tool |
-| `web.crawl` | 300s | One call can walk up to 100 pages |
+| `web` with `op: "crawl"` | 300s | One call can walk up to 100 pages; the other web verbs keep the default |
 | `diagnostics` | 600s | A cold `cargo check` / `tsc` / `mvn` on a large workspace |
 | `shell.exec` | **none** | Self-managed hard deadline: 50s by default, configurable from 1–600s; timeout kills and settles the whole process tree before returning an error |
 | `clarify` | **none** | A question to a human has no deadline — the agent must wait, not give up and guess |
 | `agent.spawn` | **none** | A child is a whole session; its turn budget is the bound that means anything |
-| `agent.wait` | **none** | The requested wait *is* the bound, already checked against the operator's ceiling |
+| `agent` with `action: "wait"` | **none** | The requested wait *is* the bound, already checked against the operator's ceiling |
 
 The `shell.exec` case is intentionally strict: it never detaches or returns while
 its process can still mutate the workspace. `background: true` is rejected. A
@@ -1218,8 +1219,8 @@ timeout or cancelled execution kills the registered process tree before the
 kernel releases the mutation lease; the timeout path also awaits settlement.
 Admission is reserved before spawn and capped at 32 concurrent processes. Completed
 processes are reaped immediately; at most 64 recent results and 8 MiB of their
-combined output remain inspectable for ten minutes through `task.list` /
-`task.output`. LRU/TTL eviction is automatic, and `task.remove` forgets one result
+combined output remain inspectable for ten minutes through `task.output`. LRU/TTL
+eviction is automatic, and `task.control` with `op: "remove"` forgets one result
 immediately.
 
 ### Observation Format
@@ -1243,7 +1244,7 @@ All tools return structured observations:
 
 MEDHA embeds a **native Language Server Protocol client** so the agent understands code the way a compiler does — real diagnostics, definitions, and references — instead of guessing from text. It is **automatic and opt-out**: the agent does not pick a language, and nothing starts until a supported file is touched.
 
-The headline win is **automatic post-edit diagnostics**: every successful `fs.write` / `fs.edit` / `multi_edit` returns a compact "errors this edit introduced/resolved" delta, so the agent catches its own mistakes on the same turn instead of shipping a broken build.
+The headline win is **automatic post-edit diagnostics**: every successful `edit` returns a compact "errors this edit introduced/resolved" delta, so the agent catches its own mistakes on the same turn instead of shipping a broken build.
 
 ### Languages (built-in)
 
@@ -1255,24 +1256,29 @@ The headline win is **automatic post-edit diagnostics**: every successful `fs.wr
 | Go | `gopls` |
 | C / C++ | `clangd` |
 
-Servers are **not bundled** — MEDHA only ships the thin JSON-RPC client and uses whatever servers are installed. A missing server produces an actionable status and falls back to the text-based `code_outline` / `references` / `diagnostics` tools. The fallback is **not silent**: those tools return a `backend` field naming the language server that answered, or the string `"text"` when the heuristic did, so a caller always knows which it got. `lsp.status` reports both live sessions and the inventory of what is installed, because an empty session list otherwise cannot distinguish "nothing asked yet" from "nothing installed".
+Servers are **not bundled** — MEDHA only ships the thin JSON-RPC client and uses whatever servers are installed. A missing server produces an actionable status and falls back to the text-based `code` and `diagnostics` tools. The fallback is **not silent**: those tools return a `backend` field naming the language server that answered, or the string `"text"` when the heuristic did, so a caller always knows which it got. `lsp` with `op: "status"` reports both live sessions and the inventory of what is installed, because an empty session list otherwise cannot distinguish "nothing asked yet" from "nothing installed".
 
 `lsp.start` can also **fetch a missing server binary** when MEDHA knows how, installing it into MEDHA's own directory — the approval card shows the exact command and destination first. Project-defined servers are approval-gated. Extra languages are added via `[[lsp.servers]]` in `medha.lock`.
 
 ### Tools
 
-| Tool | Purpose |
+Every query is `lsp` with an `op`; only starting a server — which spawns a process —
+is addressed separately.
+
+| `op` | Purpose |
 |------|---------|
-| `lsp.diagnostics` | Fresh diagnostics for a file (a timeout is `no_fresh_data`, never "clean") |
-| `lsp.definition` | Semantic definition at a position |
-| `lsp.references` | All references (incl. declaration) |
-| `lsp.implementation` | Implementations of a symbol |
-| `lsp.hover` | Type / documentation at a position |
-| `lsp.symbols` | Workspace symbol search |
-| `lsp.document_symbols` | Symbol outline of one file |
-| `lsp.call_hierarchy` | Callers (incoming) or callees (outgoing) |
-| `lsp.status` | Live server sessions and health |
-| `lsp.start` | Approve + start an approval-gated server |
+| `diagnostics` | Fresh diagnostics for a file (a timeout is `no_fresh_data`, never "clean") |
+| `definition` | Semantic definition at a position |
+| `references` | All references (incl. declaration) |
+| `implementation` | Implementations of a symbol |
+| `hover` | Type / documentation at a position |
+| `symbols` | Workspace symbol search |
+| `document_symbols` | Symbol outline of one file |
+| `call_hierarchy` | Callers (incoming) or callees (outgoing) |
+| `status` | Live server sessions and health |
+
+`lsp.start` approves and starts an approval-gated server. It is `External`, so it
+keeps its own name rather than riding the read-only queries' radius.
 
 ### Lifecycle & Safety
 
@@ -1356,7 +1362,7 @@ paints an explicit canvas when the terminal underneath is *light*, or it would b
 near-white text on white. Every other palette paints its own.
 
 **Private tty.** Some dependencies print to stdout unconditionally — a PDF text
-extractor emits a warning on ligatures, which any `web.fetch` of an academic PDF
+extractor emits a warning on ligatures, which any web fetch of an academic PDF
 triggers. On an alternate screen that spray corrupts the display. So the terminal is
 built on a *duplicated* tty handle and the real fd 1/2 are redirected to
 `$MEDHA_HOME/projects/<workspace-id>/logs/stray-stdout.log`. Stray output from
@@ -1512,12 +1518,11 @@ addressable transcript. The parent receives only a bounded structured result.
 ### Capability Narrowing
 
 Omitting `tools` inherits the parent's capabilities. A supplied narrowing list uses
-canonical registry names — often dotted, such as `web.search`, but also wire-safe
-names such as `mcp__server__tool`. An unambiguous provider-visible alias
-(`web_search`) is also accepted and normalized to the canonical name. Unknown or
-ambiguous names refuse admission instead of being silently dropped and launching a
-crippled child. `fs.read` and `fs.list` are retained as essential legibility tools
-when the parent has them.
+canonical registry names — sometimes dotted, such as `shell.exec`, and also wire-safe
+names such as `mcp__server__tool`. An unambiguous provider-visible alias is accepted
+and normalized to the canonical name. Unknown or ambiguous names refuse admission
+instead of being silently dropped and launching a crippled child. `read` and `ls` are
+retained as essential legibility tools when the parent has them.
 
 The normalized set is still intersected with the parent's executor and enforced **a
 second time on dispatch**. Both halves are load-bearing: `specs()` decides what the
@@ -1548,26 +1553,28 @@ A patch **never applies itself**:
 
 ### Control Verbs
 
+Starting work costs money and can change code, so it is named apart from the verbs
+that only look.
+
 | Tool | Purpose |
 |---|---|
-| `agent.spawn` | Delegate; `tasks` starts several at once, concurrently; children always start asynchronously |
-| `agent.wait` | Block until one settles — bounded, and a timeout is an outcome, not a failure |
-| `agent.list` | What is running: `doing`, `tool_calls`, `tokens`, and phase-aware nullable `quiet_ms` |
-| `agent.steer` | Correct one of your own children mid-run without restarting it |
-| `agent.message` | Note to any live agent, including your parent |
-| `agent.followup` | Add work to your child: queue it while live, or resume its prior session after it finishes |
-| `agent.transcript` | Read what an agent actually did (tail-bounded) |
-| `agent.cancel` | Stop one; siblings keep running |
+| `agent.spawn` | Delegate with an `objective`; `tasks` starts several at once, concurrently; children always start asynchronously. Given an existing `agent` and `text` instead, it adds work to that child — queued while it is live, or resuming its prior session after it finishes |
+| `agent` `action: "wait"` | Block until one settles — bounded, and a timeout is an outcome, not a failure |
+| `agent` `action: "list"` | What is running: `doing`, `tool_calls`, `tokens`, and phase-aware nullable `quiet_ms` |
+| `agent` `action: "steer"` | Correct one of your own children mid-run without restarting it |
+| `agent` `action: "message"` | Note to any live agent, including your parent |
+| `agent` `action: "transcript"` | Read what an agent actually did (tail-bounded) |
+| `agent` `action: "cancel"` | Stop one; siblings keep running |
 | `agent.apply` | Merge a writer's patch, behind the human gate |
 
 `agent.spawn` returns immediately by default and each durable report arrives on its
 own. Set its optional `wait: true` only when the caller cannot proceed without the
 new child or batch: the same tool call then waits for those children and returns their
 reports. Operator input interrupts that wait and detaches it without cancelling the
-children. The separate `agent.wait` waits for any owned child and returns as soon as
+children. The separate `wait` action waits for any owned child and returns as soon as
 one settles or its validated timeout expires.
 
-`agent.list` reports the current phase in `doing` plus running tool-call and token
+A `list` reports the current phase in `doing` plus running tool-call and token
 counters. `quiet_ms` is populated only in phases where silence can indicate a stall;
 it is `null` while a child is waiting on the operator or in another exempt phase, so
 null must not be interpreted as a hung agent.
@@ -1580,7 +1587,7 @@ wait cannot decay into a poll.
 
 A child's report carries the **weakest trust label the child touched**. A finding
 derived from a fetched web page returns web-trusted, so anything the parent does
-with it still escalates. `agent.transcript` is stricter still — it hands back
+with it still escalates. A `transcript` is stricter still — it hands back
 another agent's raw tool output, so it relays as web trust unconditionally.
 
 ---
@@ -1747,8 +1754,8 @@ Result: All history preserved as-is
 Before Prune (80K tokens):
 ├─ Turn 1: User message (50 tokens)
 ├─ Turn 1: Model response (100 tokens)
-├─ Turn 1: fs.read output (15,000 tokens) ← LARGE!
-├─ Turn 2: web.fetch output (25,000 tokens) ← LARGE!
+├─ Turn 1: read output (15,000 tokens) ← LARGE!
+├─ Turn 2: web fetch output (25,000 tokens) ← LARGE!
 └─ ... (more turns)
 
 After Prune (35K tokens):
@@ -1763,7 +1770,7 @@ Tokens saved: 80K → 35K (56% reduction)
 
 **Key Property: Lossless**
 - Full outputs still stored in artifact store (content-addressed by hash)
-- Model can re-fetch with `read_artifact(hash="abc123")` if needed
+- Model can re-fetch with `read(hash="abc123")` if needed
 - Nothing is deleted — only removed from live context
 
 #### Stage 3: Full Compaction (> 99% usage)
@@ -2148,14 +2155,14 @@ my-skill/
 name: pptx
 description: Work with PowerPoint files
 triggers: ["pptx", "presentation", "slides"]
-required_tools: ["shell.exec", "fs.read"]
+required_tools: ["shell.exec", "read"]
 domains: ["file-format", "automation"]
 version: 1
 ---
 
 ## Procedure
 
-1. Check if file exists using fs.read
+1. Check if file exists using read
 2. If extracting text:
    - Use python with python-pptx library
    - Run: python -c "from pptx import Presentation..."
@@ -2181,7 +2188,7 @@ skipped on write, so a skill MEDHA saves stays portable back out.
 **Scope.** Project skills (committed to the workspace) **shadow** personal ones of the
 same name, so a repo can override a user's version of a procedure.
 
-The model-facing `skill.list`, `skill.load` and `skill.save` calls use a live catalogue:
+The model-facing `skill` and `skill.save` calls use a live catalogue:
 each combines the session's frozen built-in/static tools with the MCP tools available
 at that call. `skill.save` accepts unambiguous provider-facing aliases such as
 `shell_exec`, normalizes them to `shell.exec`, and rejects unknown or ambiguous
@@ -2215,12 +2222,12 @@ disk has already been screened.
    └─ One line per skill into the system prompt
 
 3. Load
-   └─ Model calls skill.load → full procedure +
+   └─ Model calls skill { name } → full procedure +
       bundled file list (with absolute paths)
 
 4. Execute
    └─ Model follows the procedure, paging bundled
-      references with skill.load { name, file }
+      references with skill { name, file }
 
 5. Save (optional)
    ├─ User says "save this as a skill", or the agent offers
@@ -2243,7 +2250,7 @@ upstream changes. `/skill lock` and `/skill sync` pin a team's set.
 ### Progressive Disclosure
 
 - System prompt shows **one line per skill** (manifest)
-- Model calls `skill.load` for full procedure when relevant
+- Model calls `skill` with a `name` for the full procedure when relevant
 - Keeps initial prompt small
 
 ### Skill Commands
@@ -2408,10 +2415,10 @@ max_active = 3                  # children alive at once, across the whole tree
 max_depth = 1                   # 1 keeps delegation flat (a child cannot spawn)
 write = true                    # allow writing children (worktree + patch)
 max_turns = 100                 # operator ceiling on ONE child's turns
-min_wait_secs = 1               # floor stops `agent.wait` becoming a poll
+min_wait_secs = 1               # floor stops a wait becoming a poll
 default_wait_secs = 120
 max_wait_secs = 600
-transcript_tail = 40            # steps `agent.transcript` returns by default
+transcript_tail = 40            # steps a transcript returns by default
 verify_timeout_secs = 900       # ceiling on verifying one patch
 cancel_grace_secs = 5           # settle window for a cancelled child
 max_patch_bytes = 16777216      # 16 MiB
@@ -2421,7 +2428,7 @@ max_patch_bytes = 16777216      # 16 MiB
 # ───────────────────────────────────────────────────────────
 [policy]
 # Tools requiring human approval
-approve = ["fs.write", "fs.edit", "multi_edit", "skill.save"]   # the built-in default
+approve = ["edit", "skill.save"]   # the built-in default
 # Autonomy mode: careful | normal | yolo
 autonomy = "careful"
 
@@ -2524,7 +2531,7 @@ max_turns = 100
 max_cost_usd = 10.0
 
 [policy]
-approve = ["fs.write", "skill.save"]
+approve = ["edit", "skill.save"]
 autonomy = "normal"  # Less nagging
 
 [sandbox]
@@ -2550,7 +2557,7 @@ max_turns = 50
 max_cost_usd = 2.0
 
 [policy]
-approve = ["fs.write", "fs.edit", "shell.exec", "skill.save"]
+approve = ["edit", "shell.exec", "skill.save"]
 autonomy = "careful"
 
 [sandbox]
@@ -2672,8 +2679,7 @@ Runs configured command (e.g., cargo check)
 
 The trigger comes from the **declared blast radius**, not a hardcoded tool list — any
 `ReversibleLocal` or `IrreversibleLocal` call in the turn arms it. That is why an edit
-made through `multi_edit`, or through `shell.exec` running `sed -i`, is covered just
-as an `fs.edit` is.
+made through `shell.exec` running `sed -i` is covered just as an `edit` is.
 
 > **Verifier output is labelled `Tool`, not `User`.** The report is fed back as a
 > message on the user channel, but it carries tool trust — build scripts and test
@@ -2830,7 +2836,7 @@ Check: Exceeds threshold (16KB)?
           ▼
           Return preview + reference:
           "[SHOWING FIRST 2000 CHARS of 500000 total bytes
-            Continue reading: read_artifact(hash=..., offset, length)]"
+            Continue reading: read(hash=..., offset, length)]"
 ```
 
 ### Content-Addressed Storage
@@ -2853,7 +2859,7 @@ Files are named by their **SHA-256 hash**:
 
 Artifacts support ranged reads:
 ```
-read_artifact(hash="abc123", offset=2000, length=5000)
+read(hash="abc123", offset=2000, length=5000)
      │
      ▼
 Returns bytes 2000-7000 of the artifact
@@ -2899,7 +2905,7 @@ contract:
 checks:
   - command: { run: "sh test.sh", expect_exit: 0 }
   - unchanged: { pattern: "test.sh", allow_zero_matches: false }
-  - tool_not_used: "web.fetch"
+  - tool_not_used: "web"
   - event_absent: { kind: policy, contains: "dangerous_pattern" }
 
 labels: [coding, golden]
@@ -2920,7 +2926,7 @@ Checks are evaluated **in order, and all must pass** for the run to pass.
 | `unchanged` | `{ pattern, allow_zero_matches }` | Every matching file is **byte-identical to the pristine fixture** — the anti-cheat guard for "fixed the bug without editing the tests" |
 | `changed` | `{ pattern, allow_zero_matches }` | At least one matching file differs from the fixture |
 | `exists` / `absent` | path | The path does / does not exist afterwards (a plain path, not a glob) |
-| `tool_used` / `tool_not_used` | tool name | Counts `model.tool_intent` events for that exact tool — a *trajectory* guard, e.g. "no `web.fetch` on a purely local bug" |
+| `tool_used` / `tool_not_used` | tool name | Counts `model.tool_intent` events for that exact tool — a *trajectory* guard, e.g. "no `web` on a purely local bug" |
 | `event_present` / `event_absent` | `{ kind, contains }` | At least one / no event of that kind whose **serialized payload** contains the substring |
 
 Three semantics that are easy to get wrong:
@@ -3031,7 +3037,7 @@ USER: "Fix the failing test in tests/calc.rs"
 ┌─────────────────────────────────────────────────────────┐
 │ PROVIDER: Stream response from model                    │
 │ "I'll start by reading the test file"                   │
-│ Tool call: fs.read(path="tests/calc.rs")                │
+│ Tool call: read(path="tests/calc.rs")                   │
 └─────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -3052,13 +3058,13 @@ USER: "Fix the failing test in tests/calc.rs"
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │ MODEL: "I see the bug! Can I edit tests/calc.rs?"       │
-│ Tool call: fs.edit(path="tests/calc.rs", ...)           │
+│ Tool call: edit(path="tests/calc.rs", ...)              │
 └─────────────────────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │ POLICY: base verdict Allow (ReversibleLocal), but        │
-│ fs.edit is in [policy] approve and the dial is careful   │
+│ edit is in [policy] approve and the dial is careful      │
 │ → escalated to HUMAN                                     │
 └─────────────────────────────────────────────────────────┘
                          │

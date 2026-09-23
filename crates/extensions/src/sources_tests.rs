@@ -148,17 +148,16 @@ fn default_catalogs_are_added_once_and_a_removed_one_stays_removed() {
     assert!(markets.list().unwrap().is_empty());
 }
 
+/// Windows git checks links out as plain files unless `core.symlinks` is set.
+#[cfg(unix)]
 #[test]
 fn fetched_links_inside_the_repository_become_copies_and_others_are_dropped() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     fs::create_dir_all(repo.join(".github")).unwrap();
     fs::write(temp.path().join("secret.txt"), "outside").unwrap();
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink("../skills/tidy", repo.join(".github/tidy")).unwrap();
-        std::os::unix::fs::symlink(temp.path().join("secret.txt"), repo.join("leak.txt")).unwrap();
-    }
+    std::os::unix::fs::symlink("../skills/tidy", repo.join(".github/tidy")).unwrap();
+    std::os::unix::fs::symlink(temp.path().join("secret.txt"), repo.join("leak.txt")).unwrap();
     let source = committed_repo(&repo);
     let checkout = fetch(&source).unwrap();
     let copied = checkout.dir().join(".github/tidy");

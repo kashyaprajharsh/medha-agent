@@ -34,7 +34,7 @@ impl PendingImages {
         }
         if self.staged.len() >= MAX_PER_MESSAGE {
             return Err(format!(
-                "{MAX_PER_MESSAGE} images are already attached — /detach one first"
+                "{MAX_PER_MESSAGE} images are already attached — /attach remove one first"
             ));
         }
         self.loading = true;
@@ -72,11 +72,11 @@ impl PendingImages {
             .join("\n");
         self.staged.extend(images);
         Some(format!(
-            "{notice}\ntype your message and press Enter, or /detach"
+            "{notice}\ntype your message and press Enter, or /attach remove"
         ))
     }
 
-    /// `/detach [number|all]`; the number is the one shown on the composer.
+    /// `/attach remove [number|all]`; the number is shown on the composer.
     pub(super) fn detach(&mut self, arg: &str) -> String {
         let arg = arg.trim();
         if arg.is_empty() || arg == "all" {
@@ -89,7 +89,7 @@ impl PendingImages {
                 format!("detached {} ({} staged)", removed.label, self.staged.len())
             }
             Ok(_) => "no attachment at that number".into(),
-            Err(_) => "usage: /detach [number|all]".into(),
+            Err(_) => "usage: /attach remove [number|all]".into(),
         }
     }
 
@@ -109,7 +109,7 @@ impl PendingImages {
             .collect()
     }
 
-    /// Composer title, numbered so `/detach N` addresses what is on screen.
+    /// Composer title, numbered so `/attach remove N` addresses the image.
     pub(super) fn title(&self) -> Option<String> {
         if self.staged.is_empty() {
             return self.loading.then(|| " attaching image… ".to_string());
@@ -122,7 +122,7 @@ impl PendingImages {
             .collect::<Vec<_>>()
             .join("  ");
         let tail = if self.loading { " · attaching…" } else { "" };
-        Some(format!(" {list} · /detach [number|all]{tail} "))
+        Some(format!(" {list} · /attach remove [number|all]{tail} "))
     }
 
     /// Transcript label for a submitted message, so the scrollback records that

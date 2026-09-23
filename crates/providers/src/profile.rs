@@ -4,7 +4,7 @@
 //! never contains the credential itself: callers resolve that separately from
 //! the secret store and hand it to [`ProviderClient`](crate::ProviderClient).
 
-use kernel::{Protocol, ReasoningEffort, ReasoningSupport, TokenAccountingMode};
+use kernel::{ImageInputMode, Protocol, ReasoningEffort, ReasoningSupport, TokenAccountingMode};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -93,6 +93,10 @@ pub struct ProviderProfile {
     /// capability set than the public model listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<ModelCapabilities>,
+    /// Select native pixels, auxiliary text descriptions, or automatic
+    /// capability discovery for this exact deployment.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub image_input: ImageInputMode,
     #[serde(default, skip_serializing_if = "is_default")]
     pub chat_token_limit: ChatTokenLimit,
 }
@@ -120,6 +124,7 @@ impl ProviderProfile {
             reasoning: ReasoningSupport::Unknown,
             reasoning_efforts: None,
             capabilities: None,
+            image_input: ImageInputMode::Auto,
             chat_token_limit: ChatTokenLimit::Auto,
         }
     }
@@ -241,6 +246,8 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             #[serde(default)]
             capabilities: Option<ModelCapabilities>,
             #[serde(default)]
+            image_input: ImageInputMode,
+            #[serde(default)]
             chat_token_limit: ChatTokenLimit,
         }
 
@@ -262,6 +269,7 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             reasoning: raw.reasoning,
             reasoning_efforts: raw.reasoning_efforts,
             capabilities: raw.capabilities,
+            image_input: raw.image_input,
             chat_token_limit: raw.chat_token_limit,
         })
     }
@@ -343,13 +351,16 @@ mod tests {
             tool_calls: Some(true),
             reasoning: Some(false),
         });
+        profile.image_input = ImageInputMode::Native;
 
         let encoded = serde_json::to_value(&profile).unwrap();
         assert_eq!(encoded["capabilities"]["attachment"], true);
+        assert_eq!(encoded["image_input"], "native");
         assert!(encoded.to_string().contains("vision-model"));
         assert!(!encoded.to_string().contains("Bearer"));
 
         let decoded: ProviderProfile = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.capabilities, profile.capabilities);
+        assert_eq!(decoded.image_input, ImageInputMode::Native);
     }
 }

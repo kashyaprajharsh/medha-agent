@@ -211,7 +211,10 @@ fn identify(raw: &[u8]) -> Result<Kind> {
         _ if raw.starts_with(b"\x89PNG\r\n\x1a\n") => ("image/png", ImageFormat::Png, true),
         _ if raw.starts_with(b"\xff\xd8\xff") => ("image/jpeg", ImageFormat::Jpeg, true),
         _ if raw.starts_with(b"GIF87a") || raw.starts_with(b"GIF89a") => {
-            ("image/gif", ImageFormat::Gif, true)
+            // Gemini Interactions does not accept GIF. Decode the first frame
+            // and normalize it to PNG so every implemented protocol receives
+            // a MIME type its adapter can lower.
+            ("image/gif", ImageFormat::Gif, false)
         }
         _ if raw.starts_with(b"RIFF") && raw.get(8..12) == Some(b"WEBP") => {
             ("image/webp", ImageFormat::WebP, true)

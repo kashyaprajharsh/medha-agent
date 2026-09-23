@@ -43,8 +43,8 @@ pub use kernel_loop::{DEFAULT_MAX_PARALLEL_TOOLS, Kernel, SPILL_THRESHOLD, StopR
 pub use policy::{AllowAll, Policy};
 pub use progress::{Phase, Progress, ProgressHandle, ProgressWatch};
 pub use provider::{
-    ImageSupport, InputTokenCount, ModelLimits, PreparedModelRequest, Protocol, Provider,
-    ProviderCaps, ProviderError, ProviderFailure, ReasoningConfig, ReasoningEffort,
+    ImageInputMode, ImageSupport, InputTokenCount, ModelLimits, PreparedModelRequest, Protocol,
+    Provider, ProviderCaps, ProviderError, ProviderFailure, ReasoningConfig, ReasoningEffort,
     ReasoningSupport, TokenAccountingMode, TokenCountError, TokenCountQuality, ToolCallStrategy,
 };
 pub use sink::{NullSink, StreamSink};

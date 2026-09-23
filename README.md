@@ -160,6 +160,7 @@ authenticate event history, artifacts, logs, or permission grants.
 export MEDHA_BASE_URL="http://localhost:11434/v1"   # any OpenAI-compatible server
 export MEDHA_MODEL="qwen3-coder"
 export MEDHA_API_KEY="…"                            # only if the endpoint needs one
+export MEDHA_IMAGE_INPUT="auto"                     # auto | native | text
 ```
 
 Resolution order is **CLI flag > `MEDHA_*` env > `~/.medha/config.toml` > first-run setup**.

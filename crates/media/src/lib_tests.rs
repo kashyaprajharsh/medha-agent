@@ -24,6 +24,7 @@ fn an_acceptable_image_is_sent_byte_for_byte() {
 #[test]
 fn formats_no_endpoint_accepts_are_converted_and_reported() {
     for (format, mime) in [
+        (ImageFormat::Gif, "image/gif"),
         (ImageFormat::Bmp, "image/bmp"),
         (ImageFormat::Tiff, "image/tiff"),
     ] {

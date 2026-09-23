@@ -239,6 +239,10 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
             "MEDHA_REASONING_SUPPORT".to_string(),
             resolved.provider.reasoning.as_str().to_string(),
         ),
+        (
+            "MEDHA_IMAGE_INPUT".to_string(),
+            resolved.provider.image_input.as_str().to_string(),
+        ),
     ];
     if !resolved.provider.headers.is_empty() {
         provider_env.push((
@@ -922,26 +926,27 @@ async fn main() -> Result<()> {
     }
 
     if !cli.attach.is_empty() {
-        anyhow::ensure!(
-            resolved.provider.protocol.carries_images(),
-            "the {} protocol cannot carry images yet",
-            resolved.provider.protocol.as_str()
-        );
-        let state = resolved
-            .provider
-            .capabilities
-            .as_ref()
-            .map_or(providers::CapabilityState::Unknown, |caps| {
-                caps.input_state("image")
-            });
-        anyhow::ensure!(
-            state != providers::CapabilityState::Unsupported,
-            "selected model declares image input unsupported; select a vision-capable profile"
-        );
-        if state == providers::CapabilityState::Unknown {
-            eprintln!(
-                "image support is unknown for this custom route; attempting native image input on the configured endpoint"
-            );
+        match resolved.provider.image_input {
+            kernel::ImageInputMode::Text => {
+                eprintln!("image input mode is text; routing attachments through auxiliary vision")
+            }
+            kernel::ImageInputMode::Native => {
+                eprintln!("image input mode is native; sending attachments to the selected model")
+            }
+            kernel::ImageInputMode::Auto => {
+                let state = resolved
+                    .provider
+                    .capabilities
+                    .as_ref()
+                    .map_or(providers::CapabilityState::Unknown, |caps| {
+                        caps.input_state("image")
+                    });
+                if state == providers::CapabilityState::Unknown {
+                    eprintln!(
+                        "image support is unknown; trying native input once, with auxiliary-vision fallback"
+                    );
+                }
+            }
         }
     }
     let prompt = if cli.prompt.is_empty() && !cli.attach.is_empty() {

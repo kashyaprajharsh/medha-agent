@@ -2,11 +2,11 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use kernel::{
     AllowAll, AutoDeny, BlastRadius, Block, Budget, CompileResult, CompiledContext, ContentPart,
-    ContextEngine, EventLog, InMemoryLog, InputTokenCount, Kernel, Message, ModelMessage, NoVerify,
-    Observation, PreparedModelRequest, Protocol, Provider, ProviderCaps, ProviderError,
-    ProviderState, ReasoningPart, Role, Session, StopReason, TokenAccountingMode, TokenCountError,
-    TokenCountQuality, ToolCallPart, ToolCallStrategy, ToolCategory, ToolIntent, ToolResultPart,
-    ToolSpec,
+    ContextEngine, EventLog, ImageSupport, InMemoryLog, InputTokenCount, Kernel, MediaPart,
+    MediaSource, Message, ModelMessage, NoVerify, Observation, PreparedModelRequest, Protocol,
+    Provider, ProviderCaps, ProviderError, ProviderState, ReasoningPart, Role, Session, StopReason,
+    TokenAccountingMode, TokenCountError, TokenCountQuality, ToolCallPart, ToolCallStrategy,
+    ToolCategory, ToolIntent, ToolResultPart, ToolSpec, VisionDescriber,
 };
 use serde_json::json;
 use std::collections::VecDeque;
@@ -1041,4 +1041,163 @@ async fn in_band_input_overflow_forces_compaction_without_halving_the_known_wind
         serde_json::to_vec(sent[1].context.ordered.as_ref().unwrap()).unwrap(),
         "ordered request replay diverged from the live compacted input"
     );
+}
+
+struct AutoImageProvider {
+    caps: ProviderCaps,
+    observed: Mutex<ImageSupport>,
+    sent: Mutex<Vec<PreparedModelRequest>>,
+}
+
+impl AutoImageProvider {
+    fn new() -> Self {
+        Self {
+            caps: ProviderCaps {
+                images: ImageSupport::Unknown,
+                caching: false,
+                max_ctx: Some(32_000),
+                tool_calls: ToolCallStrategy::Native,
+            },
+            observed: Mutex::new(ImageSupport::Unknown),
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for AutoImageProvider {
+    fn capabilities(&self) -> &ProviderCaps {
+        &self.caps
+    }
+
+    fn image_support(&self) -> ImageSupport {
+        *self.observed.lock().unwrap()
+    }
+
+    fn observe_image_support(&self, support: ImageSupport) {
+        *self.observed.lock().unwrap() = support;
+    }
+
+    async fn stream(
+        &self,
+        _ctx: &CompiledContext,
+    ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+        Err(ProviderError::Decode(
+            "kernel bypassed the prepared-request path".into(),
+        ))
+    }
+
+    async fn stream_prepared(
+        &self,
+        request: &PreparedModelRequest,
+    ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+        let mut sent = self.sent.lock().unwrap();
+        sent.push(request.clone());
+        if sent.len() == 1 {
+            return Err(ProviderError::Status(
+                400,
+                "this model does not support image input".into(),
+            ));
+        }
+        Ok(stream::iter([Ok(Block::Text("described answer".into()))]).boxed())
+    }
+}
+
+struct TestVision;
+
+#[async_trait]
+impl VisionDescriber for TestVision {
+    async fn describe(&self, _: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
+        Ok(format!(
+            "auxiliary description of {mime}, {} bytes",
+            bytes.len()
+        ))
+    }
+
+    fn model(&self) -> &str {
+        "test-vision"
+    }
+}
+
+struct ImageArtifacts;
+
+impl kernel::ArtifactStore for ImageArtifacts {
+    fn put(&self, _: &[u8]) -> Result<String, String> {
+        Ok("hash".into())
+    }
+
+    fn get(&self, hash: &str, offset: usize, len: Option<usize>) -> Result<Vec<u8>, String> {
+        if hash != "hash" {
+            return Err("missing artifact".into());
+        }
+        let bytes = b"pixels";
+        let end = len.map_or(bytes.len(), |length| (offset + length).min(bytes.len()));
+        Ok(bytes[offset.min(bytes.len())..end].to_vec())
+    }
+
+    fn size(&self, hash: &str) -> Result<usize, String> {
+        (hash == "hash")
+            .then_some(6)
+            .ok_or_else(|| "missing artifact".into())
+    }
+}
+
+#[tokio::test]
+async fn unknown_native_image_rejection_retries_once_as_auxiliary_text() {
+    let provider = Arc::new(AutoImageProvider::new());
+    let kernel = Kernel::new(
+        provider.clone(),
+        Arc::new(InMemoryLog::new()),
+        Arc::new(ToolExecutor),
+        Arc::new(Passthrough),
+        Arc::new(ImageArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    )
+    .with_vision(Arc::new(TestVision));
+    let mut input = Message::user("what is shown?");
+    input.attachments.push(MediaPart {
+        mime_type: "image/png".into(),
+        source: MediaSource::Artifact("hash".into()),
+        label: Some("screen.png".into()),
+        provider_state: Vec::new(),
+    });
+
+    let (_, stop) = kernel
+        .run_session(
+            &Session::new(),
+            vec![input],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(stop, StopReason::Finished);
+    assert_eq!(
+        *provider.observed.lock().unwrap(),
+        ImageSupport::Unsupported
+    );
+    let sent = provider.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2, "exactly one fallback retry is allowed");
+    assert!(sent[0].context.ordered_messages().iter().any(|message| {
+        message
+            .parts
+            .iter()
+            .any(|part| matches!(part, ContentPart::Media(_)))
+    }));
+    let retried = sent[1].context.ordered_messages();
+    assert!(!retried.iter().any(|message| {
+        message
+            .parts
+            .iter()
+            .any(|part| matches!(part, ContentPart::Media(_)))
+    }));
+    assert!(retried.iter().any(|message| {
+        message.parts.iter().any(|part| {
+        matches!(part, ContentPart::Text(text) if text.text.contains("auxiliary description"))
+    })
+    }));
 }

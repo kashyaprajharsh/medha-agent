@@ -53,9 +53,10 @@ tokio::task_local! {
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
-    ("/attach", "attach an image file: /attach PATH"),
-    ("/paste", "attach an image from the clipboard (Ctrl-V)"),
-    ("/detach", "remove pending images: /detach [number|all]"),
+    (
+        "/attach",
+        "images: /attach PATH · /attach paste · /attach remove [number|all]",
+    ),
     ("/status", "model, context window, current pressure"),
     (
         "/pulse",
@@ -81,10 +82,6 @@ const COMMANDS: &[(&str, &str)] = &[
         "/mode",
         "execution: read-only plan · careful · normal · yolo",
     ),
-    (
-        "/plan",
-        "investigate and propose a plan; /mode careful to implement",
-    ),
     ("/detail", "expand/collapse full tool input & output"),
     ("/theme", "light · dark · auto (bare /theme toggles)"),
     ("/resume", "switch to a past session"),
@@ -100,19 +97,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/agents",
-        "patches waiting and agents finished  ·  a apply  ·  running agents: tab",
-    ),
-    (
-        "/steer",
-        "correct a running agent without killing it — /steer <message>, or /steer <agent> <message>",
-    ),
-    (
-        "/followup",
-        "give a finished agent more work — it resumes with what it already found  ·  /followup <agent> <message>",
-    ),
-    (
-        "/tree",
-        "the whole agent tree, finished ones included — addresses for /followup and agent.apply",
+        "manage agents · /agents tree · /agents steer … · /agents followup …",
     ),
     (
         "/memory",
@@ -139,7 +124,18 @@ impl ProfileProvider for providers::OpenAiCompat {
 }
 
 /// Compatibility commands intentionally omitted from autocomplete and help.
-const HIDDEN_COMMANDS: &[&str] = &["/think", "/thinking", "/effort", "/skills"];
+const HIDDEN_COMMANDS: &[&str] = &[
+    "/paste",
+    "/detach",
+    "/plan",
+    "/steer",
+    "/followup",
+    "/tree",
+    "/think",
+    "/thinking",
+    "/effort",
+    "/skills",
+];
 
 /// `(label, action id)` rows shown before installed skills in the skill hub.
 pub(super) const SKILL_HUB_ACTIONS: &[(&str, &str)] = &[

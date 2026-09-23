@@ -860,6 +860,11 @@ fn resolve_inner(
         .transpose()?
         .or_else(|| configured.map(|profile| profile.reasoning))
         .unwrap_or_default();
+    let image_input = first_env(&["MEDHA_IMAGE_INPUT"])
+        .map(|value| parse_image_input(&value))
+        .transpose()?
+        .or_else(|| configured.map(|profile| profile.image_input))
+        .unwrap_or_default();
 
     let provider = providers::ProviderProfile {
         protocol,
@@ -874,6 +879,7 @@ fn resolve_inner(
         reasoning,
         reasoning_efforts: configured.and_then(|p| p.reasoning_efforts.clone()),
         capabilities: configured.and_then(|p| p.capabilities.clone()),
+        image_input,
         chat_token_limit: configured.map(|p| p.chat_token_limit).unwrap_or_default(),
     };
     provider.validate().map_err(anyhow::Error::msg)?;
@@ -1046,6 +1052,23 @@ fn diagnose_checks(
                     auto_fixable: false,
                 });
             }
+
+            checks.push(Check {
+                health: Health::Ok,
+                title: "Image input routing".into(),
+                detail: match r.provider.image_input {
+                    kernel::ImageInputMode::Auto => {
+                        "auto: use exact capability evidence; unknown routes try native once and may fall back to auxiliary vision".into()
+                    }
+                    kernel::ImageInputMode::Native => {
+                        "native: always send pixels and surface unsupported-image errors".into()
+                    }
+                    kernel::ImageInputMode::Text => {
+                        "text: always route attachments through auxiliary vision".into()
+                    }
+                },
+                auto_fixable: false,
+            });
 
             let url = r.provider.base_url.to_ascii_lowercase();
             let proto = r.provider.protocol.as_str();
@@ -1367,6 +1390,17 @@ fn parse_reasoning_support(value: &str) -> Result<kernel::ReasoningSupport> {
         "effort" => Ok(kernel::ReasoningSupport::Effort),
         other => anyhow::bail!(
             "invalid MEDHA_REASONING_SUPPORT '{other}'; expected 'unknown', 'unsupported', or 'effort'"
+        ),
+    }
+}
+
+fn parse_image_input(value: &str) -> Result<kernel::ImageInputMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(kernel::ImageInputMode::Auto),
+        "native" => Ok(kernel::ImageInputMode::Native),
+        "text" => Ok(kernel::ImageInputMode::Text),
+        other => anyhow::bail!(
+            "invalid MEDHA_IMAGE_INPUT '{other}'; expected 'auto', 'native', or 'text'"
         ),
     }
 }
@@ -1962,8 +1996,26 @@ mod tests {
             reasoning: kernel::ReasoningSupport::Unknown,
             reasoning_efforts: None,
             capabilities: None,
+            image_input: kernel::ImageInputMode::Auto,
             chat_token_limit: Default::default(),
         }
+    }
+
+    #[test]
+    fn image_input_mode_is_explicit_and_strict() {
+        assert_eq!(
+            parse_image_input("auto").unwrap(),
+            kernel::ImageInputMode::Auto
+        );
+        assert_eq!(
+            parse_image_input("NATIVE").unwrap(),
+            kernel::ImageInputMode::Native
+        );
+        assert_eq!(
+            parse_image_input("text").unwrap(),
+            kernel::ImageInputMode::Text
+        );
+        assert!(parse_image_input("maybe").is_err());
     }
 
     #[test]

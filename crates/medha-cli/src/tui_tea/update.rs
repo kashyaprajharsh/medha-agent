@@ -883,6 +883,7 @@ fn finish_model_setup<P: ProfileProvider>(model: &mut Model, provider: &P) {
         reasoning: kernel::ReasoningSupport::Unknown,
         reasoning_efforts: None,
         capabilities: None,
+        image_input: kernel::ImageInputMode::Auto,
         chat_token_limit: Default::default(),
     };
     if !completed.api_key.is_empty()
@@ -2987,19 +2988,19 @@ enum SlashAction {
     Clear,
     /// `/attach <path>` — stage a local image on the composer.
     Attach(String),
-    /// `/paste` — stage an image from the system clipboard (also Ctrl-V).
+    /// `/attach paste` — stage an image from the clipboard (also Ctrl-V).
     Paste,
-    /// `/detach [number|all]` — unstage images before sending.
+    /// `/attach remove [number|all]` — unstage images before sending.
     Detach(String),
     Lsp,
     /// `/mcp` — open the MCP management picker.
     Mcp,
     Agents,
-    /// `/steer <agent> <text>` — send further instruction to a running agent.
+    /// `/agents steer <agent> <text>` — instruct a running agent.
     Steer(String),
-    /// `/followup <agent> <text>` — more work for an agent, finished or not.
+    /// `/agents followup <agent> <text>` — resume an agent with more work.
     Followup(String),
-    /// `/tree` — the whole agent tree, settled ones included.
+    /// `/agents tree` — the whole agent tree, settled ones included.
     Tree,
     /// `/mcp start <id>` — approve and connect a configured MCP server.
     McpStart(String),
@@ -3047,6 +3048,14 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "rewind" => SlashAction::Rewind,
         "clear" => SlashAction::Clear,
         "paste" => SlashAction::Paste,
+        "attach paste" => SlashAction::Paste,
+        "attach clear" => SlashAction::Detach("all".into()),
+        c if c.strip_prefix("attach remove").is_some_and(is_cmd_boundary) => SlashAction::Detach(
+            c.strip_prefix("attach remove")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        ),
         c if c.strip_prefix("attach").is_some_and(is_cmd_boundary) => {
             SlashAction::Attach(c.strip_prefix("attach").unwrap_or("").trim().to_string())
         }
@@ -3056,6 +3065,24 @@ fn classify_slash(cmd: &str) -> SlashAction {
         "lsp" => SlashAction::Lsp,
         "mcp" => SlashAction::Mcp,
         "agents" => SlashAction::Agents,
+        "agents tree" => SlashAction::Tree,
+        c if c
+            .strip_prefix("agents followup")
+            .is_some_and(is_cmd_boundary) =>
+        {
+            SlashAction::Followup(
+                c.strip_prefix("agents followup")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            )
+        }
+        c if c.strip_prefix("agents steer").is_some_and(is_cmd_boundary) => SlashAction::Steer(
+            c.strip_prefix("agents steer")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        ),
         "tree" => SlashAction::Tree,
         c if c.strip_prefix("followup").is_some_and(is_cmd_boundary) => {
             SlashAction::Followup(c.strip_prefix("followup").unwrap_or("").trim().to_string())
@@ -3164,13 +3191,6 @@ fn stage_images<P: Provider + 'static, L: EventLog + 'static>(
     tx: &mpsc::UnboundedSender<TuiEvent>,
     source: ImageSource,
 ) {
-    if !model.protocol.carries_images() {
-        model.push_notice(format!(
-            "the {} protocol cannot carry images yet",
-            model.protocol.as_str()
-        ));
-        return;
-    }
     if model.session_op.is_some() {
         model.push_notice("a session change is in flight — attach once it settles");
         return;
@@ -3179,6 +3199,11 @@ fn stage_images<P: Provider + 'static, L: EventLog + 'static>(
         Ok(generation) => generation,
         Err(notice) => return model.push_notice(notice),
     };
+    // Clipboard paste and file-drop paths do not pass through dispatch_slash.
+    // Make the loading title visible immediately even when attachment is the
+    // first action on the welcome screen.
+    model.welcome = false;
+    model.dirty = true;
     let session = session.id;
     let store = kernel.artifacts.clone();
     let tx = tx.clone();
@@ -3239,7 +3264,7 @@ fn dispatch_slash<P, L>(
         SlashAction::Rewind => start_rewind(model, kernel, session, tx),
         SlashAction::Clear => do_clear(model, session, transcript),
         SlashAction::Attach(path) if path.is_empty() => {
-            model.push_notice("usage: /attach PATH (PNG, JPEG, WebP, GIF, BMP, TIFF, or ICO)")
+            model.push_notice("usage: /attach PATH | /attach paste | /attach remove [number|all]")
         }
         SlashAction::Attach(path) => {
             let path = crate::attachments::refs::expand(model.restore.root(), &path);
@@ -3657,7 +3682,7 @@ fn show_agent_tree(model: &mut Model) {
         })
         .collect();
     model.push_notice(format!(
-        "agents in this session — pass a path to /followup or agent.apply\n\n{}",
+        "agents in this session — pass a path to /agents followup or agent.apply\n\n{}",
         lines.join("\n")
     ));
 }
@@ -3678,12 +3703,12 @@ fn agents_followup<P, L>(
         return;
     };
     let Some((id, text)) = rest.trim().split_once(char::is_whitespace) else {
-        model.push_notice("/followup <agent> <message> — /tree lists the addresses");
+        model.push_notice("/agents followup <agent> <message> — /agents tree lists the addresses");
         return;
     };
     let (id, text) = (id.to_string(), text.trim().to_string());
     if text.is_empty() {
-        model.push_notice("nothing to send — /followup <agent> <message>");
+        model.push_notice("nothing to send — /agents followup <agent> <message>");
         return;
     }
     let executor = Arc::clone(&kernel.executor);
@@ -3720,7 +3745,7 @@ fn followup_budget(control: &orchestrator::AgentControl) -> kernel::Budget {
 
 /// Resolves a steer target; omission is allowed only when exactly one is running.
 fn steer_target(rest: &str, running: &[(String, String)]) -> Result<(String, String), String> {
-    let missing = || "nothing to send — /steer <agent> <message>".to_string();
+    let missing = || "nothing to send — /agents steer <agent> <message>".to_string();
     let addressed = |word: &str| running.iter().any(|(name, id)| name == word || id == word);
 
     let (id, text) = match rest.split_once(char::is_whitespace) {
@@ -3735,7 +3760,7 @@ fn steer_target(rest: &str, running: &[(String, String)]) -> Result<(String, Str
         _ => {
             let names: Vec<&str> = running.iter().map(|(name, _)| name.as_str()).collect();
             return Err(format!(
-                "several agents are running — say which: /steer <agent> <message>  ({})",
+                "several agents are running — say which: /agents steer <agent> <message>  ({})",
                 names.join(", ")
             ));
         }
@@ -5969,9 +5994,11 @@ pub(super) fn run_slash<P: kernel::Provider>(
                 model.cache_unreported_attempts
             ));
             model.push_notice(format!(
-                "model: {} ({})  |  {ctx}\n\n{}",
+                "model: {} ({})  |  {ctx}\nimage input: {} ({:?})\n\n{}",
                 model.model,
                 model.active_profile,
+                provider.image_input_mode().as_str(),
+                provider.image_support(),
                 model.reasoning_status_block()
             ));
         }
@@ -6282,6 +6309,14 @@ mod fix_tests {
             &tx,
         );
         assert!(
+            !m.welcome,
+            "attachment loading must replace the welcome splash"
+        );
+        assert!(
+            m.dirty,
+            "attachment loading must schedule an immediate redraw"
+        );
+        assert!(
             m.input.is_empty(),
             "the path must not be typed into the composer"
         );
@@ -6398,6 +6433,33 @@ mod fix_tests {
         assert_ne!(
             classify_slash("steering"),
             SlashAction::Steer(String::new())
+        );
+        assert_eq!(
+            classify_slash("agents steer parser only fix this"),
+            SlashAction::Steer("parser only fix this".into())
+        );
+        assert_eq!(classify_slash("agents tree"), SlashAction::Tree);
+        assert_eq!(
+            classify_slash("agents followup parser add tests"),
+            SlashAction::Followup("parser add tests".into())
+        );
+    }
+
+    #[test]
+    fn attach_is_one_command_with_compatible_hidden_aliases() {
+        assert_eq!(classify_slash("attach paste"), SlashAction::Paste);
+        assert_eq!(
+            classify_slash("attach remove 2"),
+            SlashAction::Detach("2".into())
+        );
+        assert_eq!(
+            classify_slash("attach clear"),
+            SlashAction::Detach("all".into())
+        );
+        assert_eq!(classify_slash("paste"), SlashAction::Paste);
+        assert_eq!(
+            classify_slash("detach all"),
+            SlashAction::Detach("all".into())
         );
     }
 

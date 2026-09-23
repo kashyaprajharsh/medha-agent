@@ -14,6 +14,15 @@ use crate::types::{
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 
+fn context_has_media(context: &CompiledContext) -> bool {
+    context.ordered_messages().iter().any(|message| {
+        message
+            .parts
+            .iter()
+            .any(|part| matches!(part, ContentPart::Media(_)))
+    })
+}
+
 /// Default cap on tool calls executed concurrently within one turn.
 /// Overridable via `[budget] max_parallel_tools` in `medha.lock` or
 /// `MEDHA_MAX_PARALLEL_TOOLS`, or per session via [`Kernel::with_max_parallel_tools`].
@@ -466,9 +475,25 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
     /// Whether this route can carry images itself: the wire contract must
     /// support them and the model must not declare that it cannot see.
-    fn route_reads_images(&self) -> bool {
-        self.provider.protocol().carries_images()
-            && self.provider.image_support() != crate::ImageSupport::Unsupported
+    fn route_reads_images(&self, force_text: bool) -> Result<bool, KernelError> {
+        if force_text {
+            return Ok(false);
+        }
+        match self.provider.image_input_mode() {
+            crate::ImageInputMode::Text => Ok(false),
+            crate::ImageInputMode::Native => {
+                if self.provider.protocol().carries_images() {
+                    Ok(true)
+                } else {
+                    Err(KernelError::Provider(format!(
+                        "image_input=native cannot be used with the {} protocol",
+                        self.provider.protocol().as_str()
+                    )))
+                }
+            }
+            crate::ImageInputMode::Auto => Ok(self.provider.protocol().carries_images()
+                && self.provider.image_support() != crate::ImageSupport::Unsupported),
+        }
     }
 
     /// Auxiliary model that reads images for a route that cannot.
@@ -1032,6 +1057,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // full prepare → count → compile loop. If compaction changes the
             // candidate, the request is rebuilt and re-counted before sending.
             let mut overflow_retried = false;
+            let mut image_fallback_retried = false;
+            let mut force_text_images = false;
             let mut compaction_passes = 0u32;
             let (assistant, canonical, intents, usage, turn_interrupted) = 'model_call: loop {
                 let (prepared, prepared_input_tokens, reserved_output_tokens) = loop {
@@ -1061,7 +1088,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // Images either go to the model as pixels or reach it as a
                     // described, clearly-labelled substitute. They are never
                     // dropped on the way to a model that cannot see.
-                    if self.route_reads_images() {
+                    if self.route_reads_images(force_text_images)? {
                         crate::artifacts::resolve_media(
                             &mut candidate,
                             Arc::clone(&self.artifacts),
@@ -1261,7 +1288,29 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     )
                     .await
                 {
-                    Ok(t) => break t,
+                    Ok(t) => {
+                        if self.provider.image_input_mode() == crate::ImageInputMode::Auto
+                            && context_has_media(&prepared.context)
+                        {
+                            self.provider
+                                .observe_image_support(crate::ImageSupport::Supported);
+                        }
+                        break t;
+                    }
+                    Err(KernelError::UnsupportedImage)
+                        if !image_fallback_retried
+                            && self.provider.image_input_mode() == crate::ImageInputMode::Auto
+                            && self.provider.image_support() == crate::ImageSupport::Unknown =>
+                    {
+                        image_fallback_retried = true;
+                        force_text_images = true;
+                        self.provider
+                            .observe_image_support(crate::ImageSupport::Unsupported);
+                        sink.notice(
+                            "native image input was rejected; retrying once through auxiliary vision",
+                        );
+                        continue 'model_call;
+                    }
                     Err(KernelError::ContextOverflow { reported_limit }) if !overflow_retried => {
                         overflow_retried = true;
                         if let Some(limit) = reported_limit {
@@ -1748,6 +1797,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                     .into(),
                             ));
                         }
+                        crate::provider::ProviderFailure::UnsupportedImage
+                            if !emitted
+                                && self.provider.image_input_mode()
+                                    == crate::ImageInputMode::Auto
+                                && self.provider.image_support()
+                                    == crate::ImageSupport::Unknown
+                                && context_has_media(&request.context) =>
+                        {
+                            return Err(KernelError::UnsupportedImage);
+                        }
+                        crate::provider::ProviderFailure::UnsupportedImage => {}
                         crate::provider::ProviderFailure::Transient
                         | crate::provider::ProviderFailure::Fatal => {}
                     }

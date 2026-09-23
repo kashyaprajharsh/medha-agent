@@ -238,6 +238,30 @@ pub enum ImageSupport {
     Unknown,
 }
 
+/// Operator-selected policy for image input on one model profile.
+///
+/// `Auto` uses exact/observed capabilities, tries an unknown route natively,
+/// and may fall back to auxiliary vision only when the provider rejects the
+/// image before producing output. `Native` and `Text` never change strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageInputMode {
+    #[default]
+    Auto,
+    Native,
+    Text,
+}
+
+impl ImageInputMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Native => "native",
+            Self::Text => "text",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("transport error: {0}")]
@@ -267,9 +291,15 @@ pub enum ProviderError {
 /// raw HTTP-body-size error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderFailure {
-    InputContextOverflow { reported_limit: Option<u64> },
-    OutputLimit { available_output: Option<u64> },
+    InputContextOverflow {
+        reported_limit: Option<u64>,
+    },
+    OutputLimit {
+        available_output: Option<u64>,
+    },
     PayloadTooLarge,
+    /// This model/endpoint cannot accept the image modality.
+    UnsupportedImage,
     Transient,
     Fatal,
 }
@@ -387,6 +417,23 @@ fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
         }
         return ProviderFailure::OutputLimit { available_output };
     }
+    // Deliberately narrow: ordinary "unsupported" request errors must not
+    // reroute pixels through another model. Require both image/vision evidence
+    // and an explicit capability rejection from a client-error response.
+    let image_shaped = lower.contains("image") || lower.contains("vision");
+    let unsupported_shaped = lower.contains("unsupported modality")
+        || lower.contains("unsupported content type")
+        || lower.contains("does not support")
+        || lower.contains("doesn't support")
+        || lower.contains("not support image")
+        || lower.contains("image input is not supported")
+        || lower.contains("image input not supported")
+        || lower.contains("images are not supported")
+        || lower.contains("vision is not supported");
+    if code.is_none_or(|code| matches!(code, 400 | 415 | 422)) && image_shaped && unsupported_shaped
+    {
+        return ProviderFailure::UnsupportedImage;
+    }
     // Retry HTTP-200 error objects only for explicit transient declarations.
     let transient_shaped = structured_google_rpc_transient_status(message)
         || lower.contains("rate_limit")
@@ -491,6 +538,28 @@ mod error_class_tests {
         assert!(!ProviderError::Status(401, "unauthorized".into()).is_retryable());
         assert!(!ProviderError::Status(404, "not found".into()).is_retryable());
         assert!(!ProviderError::Decode("bad json".into()).is_retryable());
+    }
+
+    #[test]
+    fn only_explicit_pre_output_image_rejections_enable_fallback() {
+        for error in [
+            ProviderError::Status(400, "this model does not support image input".into()),
+            ProviderError::Status(415, "unsupported content type: image/gif".into()),
+            ProviderError::Response("vision is not supported by this model".into()),
+        ] {
+            assert_eq!(error.classify(), ProviderFailure::UnsupportedImage);
+            assert!(!error.is_retryable());
+        }
+
+        assert_eq!(
+            ProviderError::Status(400, "unsupported tool choice".into()).classify(),
+            ProviderFailure::Fatal
+        );
+        assert_eq!(
+            ProviderError::Status(500, "server does not support image input".into()).classify(),
+            ProviderFailure::Transient,
+            "server errors remain ordinary transient failures"
+        );
     }
 
     #[test]
@@ -774,6 +843,15 @@ pub trait Provider: Send + Sync {
     fn image_support(&self) -> ImageSupport {
         self.capabilities().images
     }
+
+    /// Saved routing policy for the active model profile.
+    fn image_input_mode(&self) -> ImageInputMode {
+        ImageInputMode::Auto
+    }
+
+    /// Remember exact runtime evidence for this endpoint/protocol/model.
+    /// Providers without a switchable capability cache may ignore it.
+    fn observe_image_support(&self, _support: ImageSupport) {}
 
     /// Scope for usage calibration. Adapters include their endpoint so counts
     /// from one deployment are not carried into another serving the same model.

@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use kernel::{
-    Block, CompiledContext, InputTokenCount, ModelLimits, PreparedModelRequest, Protocol, Provider,
-    ProviderCaps, ProviderError, ReasoningConfig, ReasoningEffort, ReasoningSupport,
-    TokenAccountingMode, TokenCountError, TokenCountQuality, ToolCallStrategy,
+    Block, CompiledContext, ImageInputMode, ImageSupport, InputTokenCount, ModelLimits,
+    PreparedModelRequest, Protocol, Provider, ProviderCaps, ProviderError, ReasoningConfig,
+    ReasoningEffort, ReasoningSupport, TokenAccountingMode, TokenCountError, TokenCountQuality,
+    ToolCallStrategy,
 };
 #[cfg(test)]
 use kernel::{Message, Role};
@@ -29,7 +30,12 @@ pub struct ProviderClient {
     caps: ProviderCaps,
     reasoning: Mutex<ReasoningConfig>,
     streaming: std::sync::atomic::AtomicBool,
+    /// Runtime evidence is deliberately scoped to the exact
+    /// protocol/endpoint/model tuple and expires within this process.
+    observed_images: Mutex<std::collections::HashMap<String, (ImageSupport, std::time::Instant)>>,
 }
+
+const IMAGE_OBSERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Compatibility name retained while callers migrate to the protocol/profile
 /// client introduced by the provider refactor.
@@ -172,7 +178,7 @@ impl ProviderClient {
 
     fn with_connection(connection: Connection) -> Self {
         let max_ctx = connection.profile.max_ctx;
-        let images = Self::image_support(&connection.profile);
+        let images = Self::profile_image_support(&connection.profile);
         Self {
             connection: Mutex::new(connection),
             http: http::client(),
@@ -188,24 +194,39 @@ impl ProviderClient {
             },
             reasoning: Mutex::new(ReasoningConfig::default()),
             streaming: std::sync::atomic::AtomicBool::new(true),
+            observed_images: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn image_identity(profile: &ProviderProfile) -> String {
+        format!(
+            "{}:{}:{}",
+            profile.protocol.as_str(),
+            profile.base_url,
+            profile.model
+        )
     }
 
     /// What the profile's resolved metadata says about image input. Missing
     /// metadata stays `Unknown` so a custom endpoint is attempted rather than
     /// diverted to a described substitute it never needed.
-    fn image_support(profile: &ProviderProfile) -> kernel::ImageSupport {
+    fn profile_image_support(profile: &ProviderProfile) -> ImageSupport {
         if !profile.protocol.carries_images() {
-            return kernel::ImageSupport::Unsupported;
+            return ImageSupport::Unsupported;
+        }
+        match profile.image_input {
+            ImageInputMode::Native => return ImageSupport::Supported,
+            ImageInputMode::Text => return ImageSupport::Unsupported,
+            ImageInputMode::Auto => {}
         }
         match profile
             .capabilities
             .as_ref()
             .map(|capabilities| capabilities.input_state("image"))
         {
-            Some(crate::CapabilityState::Supported) => kernel::ImageSupport::Supported,
-            Some(crate::CapabilityState::Unsupported) => kernel::ImageSupport::Unsupported,
-            _ => kernel::ImageSupport::Unknown,
+            Some(crate::CapabilityState::Supported) => ImageSupport::Supported,
+            Some(crate::CapabilityState::Unsupported) => ImageSupport::Unsupported,
+            _ => ImageSupport::Unknown,
         }
     }
 
@@ -846,7 +867,37 @@ impl Provider for ProviderClient {
     }
 
     fn image_support(&self) -> kernel::ImageSupport {
-        Self::image_support(&self.connection.lock().unwrap().profile)
+        let profile = self.connection.lock().unwrap().profile.clone();
+        let declared = Self::profile_image_support(&profile);
+        if profile.image_input != ImageInputMode::Auto || declared != ImageSupport::Unknown {
+            return declared;
+        }
+        let identity = Self::image_identity(&profile);
+        let now = std::time::Instant::now();
+        let mut observations = self.observed_images.lock().unwrap();
+        match observations.get(&identity).copied() {
+            Some((support, expires)) if expires > now => support,
+            Some(_) => {
+                observations.remove(&identity);
+                ImageSupport::Unknown
+            }
+            None => ImageSupport::Unknown,
+        }
+    }
+
+    fn image_input_mode(&self) -> ImageInputMode {
+        self.connection.lock().unwrap().profile.image_input
+    }
+
+    fn observe_image_support(&self, support: ImageSupport) {
+        let profile = self.connection.lock().unwrap().profile.clone();
+        if profile.image_input != ImageInputMode::Auto {
+            return;
+        }
+        self.observed_images.lock().unwrap().insert(
+            Self::image_identity(&profile),
+            (support, std::time::Instant::now() + IMAGE_OBSERVATION_TTL),
+        );
     }
 
     fn context_identity(&self) -> String {
@@ -931,6 +982,7 @@ impl Provider for ProviderClient {
                 .iter()
                 .any(|part| matches!(part, kernel::ContentPart::Media(_)))
         }) && model == connection.profile.model
+            && connection.profile.image_input != ImageInputMode::Native
             && connection
                 .profile
                 .capabilities
@@ -2542,6 +2594,43 @@ mod reasoning_request_tests {
         let connection = provider.connection.lock().unwrap();
         assert!(connection.profile.base_url.is_empty());
         assert!(connection.profile.model.is_empty());
+    }
+
+    #[test]
+    fn observed_image_support_is_scoped_to_the_exact_profile() {
+        let first = ProviderProfile::openai_chat("http://one/v1", "model-a", AuthKind::None);
+        let provider = ProviderClient::from_profile(first.clone(), "").unwrap();
+        assert_eq!(provider.image_support(), ImageSupport::Unknown);
+        provider.observe_image_support(ImageSupport::Unsupported);
+        assert_eq!(provider.image_support(), ImageSupport::Unsupported);
+
+        let second = ProviderProfile::openai_chat("http://one/v1", "model-b", AuthKind::None);
+        provider.switch_provider_profile(second, "").unwrap();
+        assert_eq!(provider.image_support(), ImageSupport::Unknown);
+
+        provider.switch_provider_profile(first, "").unwrap();
+        assert_eq!(provider.image_support(), ImageSupport::Unsupported);
+    }
+
+    #[test]
+    fn explicit_image_mode_overrides_catalog_metadata() {
+        let mut profile = ProviderProfile::openai_chat("http://one/v1", "model", AuthKind::None);
+        profile.capabilities = Some(crate::ModelCapabilities {
+            modalities: Some(crate::ModalitySet {
+                input: Some(["text".into()].into_iter().collect()),
+                output: Some(["text".into()].into_iter().collect()),
+            }),
+            attachment: Some(false),
+            tool_calls: None,
+            reasoning: None,
+        });
+        profile.image_input = ImageInputMode::Native;
+        let provider = ProviderClient::from_profile(profile.clone(), "").unwrap();
+        assert_eq!(provider.image_support(), ImageSupport::Supported);
+
+        profile.image_input = ImageInputMode::Text;
+        provider.switch_provider_profile(profile, "").unwrap();
+        assert_eq!(provider.image_support(), ImageSupport::Unsupported);
     }
 
     #[test]

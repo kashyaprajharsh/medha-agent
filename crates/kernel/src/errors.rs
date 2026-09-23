@@ -17,4 +17,9 @@ pub enum KernelError {
     /// harder instead of surfacing a fatal error.
     #[error("provider context-length exceeded")]
     ContextOverflow { reported_limit: Option<u64> },
+
+    /// An automatic native image attempt was rejected before any output. The
+    /// caller can rebuild the canonical request through auxiliary vision once.
+    #[error("provider does not support image input")]
+    UnsupportedImage,
 }

@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 mod attach;
 mod markdown;
+mod plugins;
 mod spin;
 mod tty;
 mod update;
@@ -107,6 +108,14 @@ const COMMANDS: &[(&str, &str)] = &[
         "/skill",
         "skill hub — use a skill, or add one (search / paste a link)  ·  /skill <name> to load",
     ),
+    (
+        "/plugins",
+        "plugins — install from GitHub or a marketplace · discover · on/off · update",
+    ),
+    (
+        "/hooks",
+        "add a hook: pick when it runs and which tools, then a command or script",
+    ),
     ("/clear", "reset the conversation"),
     ("/exit", "quit (also Ctrl-D)"),
 ];
@@ -158,11 +167,18 @@ pub(super) const SKILL_MANAGE_ACTIONS: &[(&str, &str)] = &[
     ("← Back", "back"),
 ];
 
-fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
+fn command_matches(model: &Model) -> Vec<(String, String)> {
+    let input = model.input.as_str();
     COMMANDS
         .iter()
-        .filter(|(c, _)| c.starts_with(input))
-        .copied()
+        .map(|(name, about)| (name.to_string(), about.to_string()))
+        .chain(
+            model
+                .plugin_commands
+                .iter()
+                .map(|command| (command.name.clone(), command.description.clone())),
+        )
+        .filter(|(name, _)| name.starts_with(input))
         .collect()
 }
 
@@ -412,6 +428,8 @@ pub(crate) enum TuiEvent {
     SessionsLoaded(Vec<kernel::SessionMeta>),
     /// `/skill install <src>` finished with a complete package report.
     SkillInstalled(Result<tools::InstallReport, String>),
+    /// A background plugin install, update, or marketplace fetch finished.
+    PluginJob(plugins::JobDone),
     /// `/skill search <query>` finished querying the registered sources.
     SkillSearchResults(Result<tools::SearchResults, String>),
     /// `/skill update` finished checking (and possibly applying) updates; the
@@ -1146,6 +1164,8 @@ enum PickerKind {
     /// `(repo, path, removable)`; built-ins are shown but not removable. Rows are
     /// an "Add a source…" row, one per source, then "Back".
     SkillSources(Vec<(String, String, bool)>),
+    /// `/plugins`: every plugin screen; its rows and keys live in `plugins`.
+    Plugins(plugins::Screen),
     /// `/theme`: pick the colour theme. Rows are [`theme::modes`]; choosing one
     /// re-colours the UI live for the session.
     Theme,
@@ -1327,6 +1347,7 @@ impl PickerKind {
             PickerKind::SkillSearch(_) => " add a skill — ↑↓ select · Enter · Esc back ".into(),
             PickerKind::SkillManage => " manage skills — ↑↓ select · Enter · Esc back ".into(),
             PickerKind::SkillSources(_) => " skill sources — ↑↓ · Enter · Esc back ".into(),
+            PickerKind::Plugins(screen) => screen.title(),
             PickerKind::Theme => " theme — ↑↓ select · Enter apply · Esc done ".into(),
             PickerKind::Mcp(_) => {
                 " MCP — Enter connect · space on/off · t tools · d remove · Esc close ".into()
@@ -1653,6 +1674,7 @@ impl PickerKind {
                 .iter()
                 .map(|(label, _)| (*label).to_string())
                 .collect(),
+            PickerKind::Plugins(screen) => screen.labels(),
             PickerKind::SkillSources(sources) => {
                 let mut rows = vec!["➕ Add a source…".to_string()];
                 for (repo, path, removable) in sources {
@@ -2010,6 +2032,17 @@ struct Model {
     /// MCP host handle, so `/mcp` can list/connect/remove/add live. `None` when
     /// MCP is disabled or unwired (tests).
     mcp: Option<Arc<mcp::McpManager>>,
+    /// The same plugin store `medha plugins` manages. `None` in tests.
+    plugins: Option<extensions::Store>,
+    plugin_markets: Option<extensions::sources::Marketplaces>,
+    /// Enabled plugin actions offered as `/` commands.
+    plugin_commands: Vec<plugins::commands::PluginCommand>,
+    /// Shown in the chat instead of the prompt a plugin command expands to.
+    typed_command: Option<String>,
+    /// Applies plugin changes to the running session; returns warnings.
+    apply_plugins: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+    /// Set after `apply_plugins` so the skill list in the prompt is rebuilt.
+    plugins_changed: bool,
     /// Sub-agent control plane, so the user can see that Medha delegated and to
     /// what. `None` when sub-agents are disabled.
     agents: Option<Arc<orchestrator::AgentControl>>,
@@ -2297,6 +2330,12 @@ impl Model {
             memory_budget_tokens: memory::recall::DEFAULT_K3_BUDGET_TOKENS,
             memory_stale_after_days: memory::recall::DEFAULT_STALE_AFTER_DAYS,
             mcp: None,
+            plugins: None,
+            plugin_markets: None,
+            plugin_commands: Vec::new(),
+            typed_command: None,
+            apply_plugins: None,
+            plugins_changed: false,
             agents: None,
             agent_runs: Vec::new(),
             agent_progress: HashMap::new(),
@@ -3150,6 +3189,9 @@ pub async fn run_tea<P, L>(
     known_tools: std::collections::HashSet<String>,
     search_handle: tools::SearchHandle,
     mcp: Option<Arc<mcp::McpManager>>,
+    plugins: extensions::Store,
+    plugin_markets: extensions::sources::Marketplaces,
+    live_plugins: crate::plugin_session::LivePlugins,
     agents: Option<Arc<orchestrator::AgentControl>>,
     tx: mpsc::UnboundedSender<TuiEvent>,
     mut rx: mpsc::UnboundedReceiver<TuiEvent>,
@@ -3209,6 +3251,10 @@ where
     .with_model_profiles(model_profiles, active_profile)
     .with_search(search_handle);
     model.mcp = mcp;
+    model.plugins = Some(plugins);
+    model.plugin_markets = Some(plugin_markets);
+    plugins::refresh_commands(&mut model);
+    model.apply_plugins = Some(Arc::new(move || live_plugins.apply()));
     model.agents = agents;
     model.autonomy = session.autonomy;
     model.streaming = kernel.provider.streaming();
@@ -3217,6 +3263,8 @@ where
     // quiet variant keeps the welcome identity screen visible behind the form.
     if open_setup {
         update::open_model_setup_quiet(&mut model);
+    } else {
+        plugins::review_hooks(&mut model);
     }
     let mut transcript = crate::session_transcript(system, resumed);
     let mut events = EventStream::new();

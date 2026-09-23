@@ -63,10 +63,12 @@ fn requirement_available(name: &str, known: &HashSet<String>) -> bool {
 }
 
 /// Where a skill was found. Project (workspace-committed) shadows user (personal).
+/// Plugin skills are namespaced by their plugin id, so they never shadow either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillScope {
     Project,
     User,
+    Plugin,
 }
 
 impl SkillScope {
@@ -74,6 +76,7 @@ impl SkillScope {
         match self {
             SkillScope::Project => "project",
             SkillScope::User => "user",
+            SkillScope::Plugin => "plugin",
         }
     }
 }
@@ -201,6 +204,10 @@ pub struct SkillStore {
     /// Optional LLM escalation for the guard's ambiguous (Caution) verdicts.
     /// Attached by the surface that owns a model; `None` = regex-only.
     judge: Option<Arc<dyn crate::judge::SkillJudge>>,
+    /// Parsed once from a hash-verified plugin package and served from memory,
+    /// so editing the package after approval cannot change what the model loads.
+    /// Replaced wholesale when plugins are enabled or disabled mid-session.
+    plugin_skills: std::sync::RwLock<Vec<Skill>>,
 }
 
 impl SkillStore {
@@ -209,7 +216,37 @@ impl SkillStore {
             project_dir,
             user_dir,
             judge: None,
+            plugin_skills: std::sync::RwLock::new(Vec::new()),
         }
+    }
+
+    /// Replaces every plugin skill; each `(plugin_id, dir)` is served as
+    /// `<plugin_id>:<name>`. Returns one message per skill that could not load.
+    pub fn set_plugin_skills(&self, sources: &[(String, PathBuf)]) -> Vec<String> {
+        let mut skills: Vec<Skill> = Vec::new();
+        let mut problems = Vec::new();
+        for (plugin_id, dir) in sources {
+            match plugin_skill(plugin_id, dir) {
+                Ok(skill) if skills.iter().any(|s| s.name == skill.name) => {
+                    problems.push(format!("plugin skill '{}' is declared twice", skill.name));
+                }
+                Ok(skill) => skills.push(skill),
+                Err(problem) => {
+                    problems.push(format!("{plugin_id}: skill was not loaded: {problem}"))
+                }
+            }
+        }
+        if let Ok(mut current) = self.plugin_skills.write() {
+            *current = skills;
+        }
+        problems
+    }
+
+    fn plugin_skill_list(&self) -> Vec<Skill> {
+        self.plugin_skills
+            .read()
+            .map(|skills| skills.clone())
+            .unwrap_or_default()
     }
 
     /// Adds LLM review for ambiguous guard verdicts; otherwise review is regex-only.
@@ -251,6 +288,19 @@ impl SkillStore {
                     Err(reason) => out.errors.push((path, reason)),
                 }
             }
+        }
+        for skill in &self.plugin_skill_list() {
+            let missing_tools = skill
+                .required_tools
+                .iter()
+                .filter(|t| !requirement_available(t, known_tools))
+                .cloned()
+                .collect();
+            out.listings.push(SkillListing {
+                skill: skill.clone(),
+                shadowed: false,
+                missing_tools,
+            });
         }
         out
     }
@@ -345,7 +395,7 @@ impl SkillStore {
         line_start: usize,
         line_limit: usize,
     ) -> Result<Value, String> {
-        validate_name(name)?;
+        validate_reference(name)?;
         let relative = Path::new(file);
         if file.is_empty()
             || relative.components().any(|component| {
@@ -551,6 +601,7 @@ impl SkillStore {
                 .user_dir
                 .as_ref()
                 .ok_or("no user home directory available; save to project scope instead")?,
+            SkillScope::Plugin => return Err("plugin skills are read-only".into()),
         };
         let target = dir.join(&spec.name).join("SKILL.md");
         let version = next_version(&target);
@@ -568,6 +619,7 @@ impl SkillStore {
         let dir = match spec.scope {
             SkillScope::Project => &self.project_dir,
             SkillScope::User => self.user_dir.as_ref()?,
+            SkillScope::Plugin => return None,
         };
         let target = dir.join(&spec.name).join("SKILL.md");
         let text = std::fs::read_to_string(&target).ok()?;
@@ -578,7 +630,7 @@ impl SkillStore {
     /// context. Unlike `load`, this also works for skills whose required tools
     /// are unavailable, making it suitable for `/skill info` diagnostics.
     pub fn inspect(&self, name: &str, known_tools: &HashSet<String>) -> Result<Value, String> {
-        validate_name(name)?;
+        validate_reference(name)?;
         let disc = self.discover(known_tools);
         let Some(listing) = disc.effective().find(|l| l.skill.name == name) else {
             let names = disc
@@ -1389,6 +1441,31 @@ impl SaveSpec {
 }
 
 /// kebab-case: lowercase alphanumerics separated by single hyphens.
+fn plugin_skill(plugin_id: &str, dir: &Path) -> Result<Skill, String> {
+    let path = dir.join("SKILL.md");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let parsed = parse_skill_md(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut skill = build_skill(parsed, SkillScope::Plugin, path);
+    skill.name = format!("{plugin_id}:{}", skill.name);
+    Ok(skill)
+}
+
+/// A lookup name: a local skill, or `<plugin-id>:<skill>` for a plugin skill.
+fn validate_reference(name: &str) -> Result<(), String> {
+    match name.split_once(':') {
+        Some((plugin, skill))
+            if !plugin.is_empty()
+                && plugin
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-._".contains(c)) =>
+        {
+            validate_name(skill)
+        }
+        Some(_) => Err(format!("'{name}' is not a valid plugin skill name")),
+        None => validate_name(name),
+    }
+}
+
 fn validate_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -1870,6 +1947,7 @@ impl Tool for SkillSave {
         let dir = match spec.scope {
             SkillScope::Project => "<workspace>/.medha/skills",
             SkillScope::User => "~/.medha/skills",
+            SkillScope::Plugin => return None,
         };
         // Updating an existing skill previews as a diff (what actually
         // changes), not a full re-dump of the file.
@@ -1952,6 +2030,41 @@ mod tests {
     }
 
     const DEPLOY: &str = "---\nname = \"deploy-fly\"\ndescription = \"Deploy a FastAPI app to Fly.io\"\ntriggers = [\"deploy\", \"fly.io\"]\nrequired_tools = [\"shell.exec\"]\nversion = 1\n---\n\n## Steps\n1. flyctl launch\n";
+
+    #[test]
+    fn plugin_skills_are_namespaced_read_only_and_served_as_approved() {
+        let root = tmp();
+        write_skill(&root, "pkg", DEPLOY);
+        let store = SkillStore::new(root.join("project"), Some(root.join("user")));
+        let source = ("dev.me.kit".to_string(), root.join("pkg"));
+        let problems = store.set_plugin_skills(&[source.clone(), source.clone()]);
+        assert_eq!(
+            problems.len(),
+            1,
+            "a duplicate is reported, not loaded twice"
+        );
+        let known = tools(&["shell.exec"]);
+        let listing = store.discover(&known);
+        let skill = &listing.effective().next().unwrap().skill;
+        assert_eq!(skill.name, "dev.me.kit:deploy-fly");
+        assert_eq!(skill.scope, SkillScope::Plugin);
+
+        std::fs::write(
+            root.join("pkg/SKILL.md"),
+            DEPLOY.replace("flyctl", "curl evil"),
+        )
+        .unwrap();
+        let loaded = store.load("dev.me.kit:deploy-fly", &known).unwrap();
+        assert!(loaded["procedure"].as_str().unwrap().contains("flyctl"));
+        assert!(store.inspect("dev.me.kit:deploy-fly", &known).is_ok());
+        assert!(store.inspect("dev.me.kit:Bad", &known).is_err());
+
+        assert!(store.set_plugin_skills(&[]).is_empty());
+        assert!(
+            store.discover(&known).effective().next().is_none(),
+            "disabling a plugin removes its skills from the running session"
+        );
+    }
 
     #[test]
     fn parses_valid_frontmatter_and_body() {

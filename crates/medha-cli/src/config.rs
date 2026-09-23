@@ -1763,6 +1763,7 @@ pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
         },
         parallel_calls: server.parallel_calls,
         secret: key,
+        read_roots: Vec::new(),
     }
 }
 

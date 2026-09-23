@@ -74,6 +74,8 @@ pub enum EventKind {
     ModelMessage,
     ToolObs,
     PolicyDecision,
+    /// Sanitized result of one host-supervised extension hook invocation.
+    HookDecision,
     /// Write-ahead marker emitted between authorization and a state-changing call,
     /// so a crash still leaves replay knowing the effect may have committed.
     ToolEffectPrepared,
@@ -111,6 +113,7 @@ impl EventKind {
             EventKind::ModelMessage => "model.message",
             EventKind::ToolObs => "tool.observation",
             EventKind::PolicyDecision => "policy.decision",
+            EventKind::HookDecision => "hook.decision",
             EventKind::ToolEffectPrepared => "tool.effect_prepared",
             EventKind::Compaction => "context.compaction",
             EventKind::Session => "session",
@@ -137,6 +140,7 @@ impl EventKind {
             "model.message" => EventKind::ModelMessage,
             "tool.observation" => EventKind::ToolObs,
             "policy.decision" => EventKind::PolicyDecision,
+            "hook.decision" => EventKind::HookDecision,
             "tool.effect_prepared" => EventKind::ToolEffectPrepared,
             "context.compaction" => EventKind::Compaction,
             "session" => EventKind::Session,
@@ -441,6 +445,24 @@ impl Event {
             s,
             EventKind::PolicyDecision,
             json!({ "tool": intent.tool, "intent_id": intent.id, "decision": verdict, "reason": reason }),
+            TrustLabel::System,
+        )
+    }
+
+    pub fn hook(s: &Session, audit: &crate::hooks::HookAudit) -> Self {
+        Self::new(
+            s,
+            EventKind::HookDecision,
+            json!({
+                "event_id": audit.event_id,
+                "plugin_id": audit.plugin_id,
+                "component_id": audit.component_id,
+                "point": audit.point.as_str(),
+                "status": audit.status.as_str(),
+                "decision": audit.decision.map(|decision| decision.as_str()),
+                "reason": audit.reason,
+                "duration_ms": audit.duration_ms,
+            }),
             TrustLabel::System,
         )
     }

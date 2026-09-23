@@ -1864,7 +1864,7 @@ fn fill_panel(f: &mut Frame, area: Rect) {
 }
 
 pub(super) fn draw_autocomplete(f: &mut Frame, model: &Model, input_area: Rect) {
-    let matches = command_matches(&model.input);
+    let matches = command_matches(model);
     if matches.is_empty() {
         return;
     }

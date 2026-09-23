@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use kernel::{
     AllowAll, AutoDeny, BlastRadius, Block, Budget, BudgetStop, CompileResult, CompiledContext,
-    ContextEngine, EventKind, EventLog, Executor, InMemoryLog, InputTokenCount, InterruptQueue,
-    Kernel, KernelError, Message, NoVerify, Observation, PreparedModelRequest, Provider,
-    ProviderCaps, ProviderError, Session, StopReason, TokenCountError, TokenCountQuality,
+    ContextEngine, EventKind, EventLog, Executor, HookAudit, HookBatch, HookDecision,
+    HookDirective, HookPoint, HookRequest, HookRunner, HookStatus, InMemoryLog, InputTokenCount,
+    InterruptQueue, Kernel, KernelError, Message, NoVerify, Observation, PreparedModelRequest,
+    Provider, ProviderCaps, ProviderError, Session, StopReason, TokenCountError, TokenCountQuality,
     ToolCallStrategy, ToolIntent, ToolSpec, Verifier,
 };
 use serde_json::json;
@@ -127,6 +128,66 @@ impl Executor for CountingExecutor {
             std::future::pending::<()>().await;
         }
         Observation::ok(intent.id.clone(), json!({"ok": true}))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HookMode {
+    Continue,
+    Deny,
+    RequestApproval,
+}
+
+struct ScriptedHooks {
+    mode: HookMode,
+    requests: Mutex<Vec<HookRequest>>,
+}
+
+impl ScriptedHooks {
+    fn new(mode: HookMode) -> Self {
+        Self {
+            mode,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl HookRunner for ScriptedHooks {
+    async fn invoke(
+        &self,
+        request: &HookRequest,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> HookBatch {
+        self.requests.lock().unwrap().push(request.clone());
+        let (decision, directive, reason) = match (request.point, self.mode) {
+            (HookPoint::PreTool, HookMode::Deny) => (
+                HookDecision::Deny,
+                HookDirective::Deny("blocked by test hook".into()),
+                Some("blocked by test hook".into()),
+            ),
+            (HookPoint::PreTool, HookMode::RequestApproval) => (
+                HookDecision::RequestApproval,
+                HookDirective::RequestApproval("review required".into()),
+                Some("review required".into()),
+            ),
+            _ => (HookDecision::Continue, HookDirective::Continue, None),
+        };
+        HookBatch {
+            directive,
+            audits: vec![HookAudit {
+                event_id: request.event_id.clone(),
+                plugin_id: "dev.medha.test".into(),
+                component_id: "guard".into(),
+                point: request.point,
+                status: HookStatus::Completed,
+                decision: Some(decision),
+                reason,
+                duration_ms: 1,
+            }],
+            contexts: Vec::new(),
+            notices: Vec::new(),
+        }
     }
 }
 
@@ -836,4 +897,134 @@ async fn cumulative_usage_blocks_settle_once_at_the_end_of_an_attempt() {
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].completion_tokens, 5);
     assert_eq!(recorded[0].cached_prompt_tokens, Some(75));
+}
+
+#[tokio::test]
+async fn pre_tool_hooks_can_only_narrow_or_escalate_execution() {
+    for mode in [HookMode::Deny, HookMode::RequestApproval] {
+        let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![intent(0)])]));
+        let executor = Arc::new(CountingExecutor::default());
+        let log = Arc::new(InMemoryLog::new());
+        let hooks = Arc::new(ScriptedHooks::new(mode));
+        let kernel = Kernel::new(
+            provider,
+            log.clone(),
+            executor.clone(),
+            Arc::new(Passthrough),
+            Arc::new(MemArtifacts),
+            Arc::new(AllowAll),
+            Arc::new(AutoDeny),
+            Arc::new(NoVerify),
+        )
+        .with_hooks(hooks);
+        let session = Session::new();
+        kernel
+            .run_session(
+                &session,
+                vec![Message::user("go")],
+                Budget::default(),
+                &kernel::NullSink,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 0);
+        let events = log.events(session.id).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::HookDecision)
+        );
+        let policy = events
+            .iter()
+            .find(|event| event.kind == EventKind::PolicyDecision)
+            .unwrap();
+        let expected = match mode {
+            HookMode::Deny => "deny",
+            HookMode::RequestApproval => "human",
+            HookMode::Continue => unreachable!(),
+        };
+        assert_eq!(policy.payload["decision"], expected);
+    }
+}
+
+#[tokio::test]
+async fn hook_payloads_are_redacted_and_audited_around_real_execution() {
+    let call = Block::ToolIntent(ToolIntent {
+        id: "call-secret".into(),
+        tool: "test.read".into(),
+        args: json!({"path": "visible.txt", "api_key": "must-not-leak"}),
+    });
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![call])]));
+    let executor = Arc::new(CountingExecutor::default());
+    let log = Arc::new(InMemoryLog::new());
+    let hooks = Arc::new(ScriptedHooks::new(HookMode::Continue));
+    let kernel = Kernel::new(
+        provider,
+        log.clone(),
+        executor.clone(),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    )
+    .with_hooks(hooks.clone());
+    let session = Session::new();
+    kernel
+        .run_session(
+            &session,
+            vec![Message::user("go")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+    {
+        let requests = hooks.requests.lock().unwrap();
+        let points: Vec<HookPoint> = requests.iter().map(|request| request.point).collect();
+        assert_eq!(
+            points,
+            [
+                HookPoint::SessionStart,
+                HookPoint::PromptSubmit,
+                HookPoint::PreTool,
+                HookPoint::PostTool,
+                HookPoint::TaskCompletion,
+            ]
+        );
+        assert_eq!(requests[2].payload["args"]["path"], "visible.txt");
+        assert_eq!(requests[2].payload["args"]["api_key"], "<redacted>");
+    }
+
+    let events = log.events(session.id).await;
+    let tool_point = |event: &kernel::Event| {
+        event.kind != EventKind::HookDecision
+            || matches!(
+                event.payload["point"].as_str(),
+                Some("pre_tool" | "post_tool")
+            )
+    };
+    let positions = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (matches!(
+                &event.kind,
+                EventKind::HookDecision | EventKind::PolicyDecision | EventKind::ToolObs
+            ) && tool_point(event))
+            .then_some((index, event.kind.as_str()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        positions.iter().map(|(_, kind)| *kind).collect::<Vec<_>>(),
+        vec![
+            "hook.decision",
+            "policy.decision",
+            "hook.decision",
+            "tool.observation"
+        ]
+    );
 }

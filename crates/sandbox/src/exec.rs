@@ -40,6 +40,26 @@ pub struct ExecOutput {
     pub stderr_truncated: bool,
 }
 
+/// Separate-stream result for a bounded argv process that receives fixed input.
+/// Unlike [`ShellOutcome`], stdout is not merged with stderr because protocol
+/// callers must be able to parse stdout without diagnostic text corrupting it.
+#[derive(Debug, Clone)]
+pub struct BoundedCommandOutput {
+    pub status: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub timed_out: bool,
+    pub cancelled: bool,
+}
+
+impl BoundedCommandOutput {
+    pub fn passed(&self) -> bool {
+        !self.timed_out && !self.cancelled && self.status == Some(0)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
     #[error("failed to spawn process: {0}")]
@@ -433,7 +453,7 @@ fn kill_process_tree(pid: u32) {
 
 /// Put a command in its own process group (unix) and pipe stdout/stderr so it
 /// can be supervised and group-killed. Background tasks clear `kill_on_drop`.
-fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool) {
+fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool, pipe_stdin: bool) {
     #[cfg(unix)]
     cmd.process_group(0);
     #[cfg(windows)]
@@ -447,10 +467,14 @@ fn configure_for_spawn(cmd: &mut tokio::process::Command, kill_on_drop: bool) {
     }
     // These are noninteractive tool processes. Inheriting stdin lets a command
     // consume TUI/REPL input, or stop on SIGTTIN in its separate process group.
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(kill_on_drop);
+    cmd.stdin(if pipe_stdin {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    })
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(kill_on_drop);
 }
 
 /// What a bounded shell run produced.
@@ -672,25 +696,9 @@ pub async fn run_command_bounded(
     // `max_output` is both the independent per-stream cap and the aggregate cap
     // for this combined-output API. Capture happens under the cap while the
     // process runs; it is never an after-the-fact truncation.
-    let process = spawn_background_with_limits(cmd, max_output, max_output, max_output, false)?;
-    let ended = match cancel {
-        Some(token) => {
-            let done = process.done_receiver();
-            tokio::select! {
-                finished = wait_done(done, limit) => {
-                    if finished { Ok(()) } else { Err(false) }
-                }
-                _ = token.cancelled() => Err(true),
-            }
-        }
-        None => {
-            if process.wait_until(limit).await {
-                Ok(())
-            } else {
-                Err(false)
-            }
-        }
-    };
+    let process =
+        spawn_background_with_limits(cmd, max_output, max_output, max_output, false, None)?;
+    let ended = wait_bounded(&process, limit, cancel).await;
 
     if ended.is_err() {
         process.kill();
@@ -726,6 +734,66 @@ pub async fn run_command_bounded(
             cancelled,
         },
     })
+}
+
+/// Run an argv process with fixed bytes on stdin, independent stdout/stderr
+/// ceilings, deadline/cancellation, and whole-process-tree cleanup.
+pub async fn run_command_bounded_with_input(
+    cmd: tokio::process::Command,
+    input: Vec<u8>,
+    limit: std::time::Duration,
+    max_stdout: usize,
+    max_stderr: usize,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<BoundedCommandOutput, ExecError> {
+    let process = spawn_background_with_limits(
+        cmd,
+        max_stdout,
+        max_stderr,
+        max_stdout.saturating_add(max_stderr).max(1),
+        false,
+        Some(input),
+    )?;
+    let ended = wait_bounded(&process, limit, cancel).await;
+    if ended.is_err() {
+        process.kill();
+        process.wait().await;
+    }
+    let (stdout, stderr, stdout_truncated, stderr_truncated) = process.raw_snapshot();
+    Ok(BoundedCommandOutput {
+        status: process.exit_code(),
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        timed_out: matches!(ended, Err(false)),
+        cancelled: matches!(ended, Err(true)),
+    })
+}
+
+async fn wait_bounded(
+    process: &BgProc,
+    limit: std::time::Duration,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<(), bool> {
+    match cancel {
+        Some(token) => {
+            let done = process.done_receiver();
+            tokio::select! {
+                finished = wait_done(done, limit) => {
+                    if finished { Ok(()) } else { Err(false) }
+                }
+                _ = token.cancelled() => Err(true),
+            }
+        }
+        None => {
+            if process.wait_until(limit).await {
+                Ok(())
+            } else {
+                Err(false)
+            }
+        }
+    }
 }
 
 /// The last `cap` bytes seen, remembering that earlier output was dropped. The
@@ -1239,9 +1307,10 @@ fn spawn_background_with_limits(
     stderr_cap: usize,
     aggregate_cap: usize,
     watch_network: bool,
+    input: Option<Vec<u8>>,
 ) -> Result<BgProc, ExecError> {
     use std::sync::{Arc, Mutex};
-    configure_for_spawn(&mut cmd, false);
+    configure_for_spawn(&mut cmd, false, input.is_some());
     // Arm kernel-level detection before the fork. Armed here rather than by the
     // caller so the filter and the handle that reads it cannot be wired up
     // separately and drift.
@@ -1265,6 +1334,7 @@ fn spawn_background_with_limits(
         crate::netnotify::watch(pending, finished.clone());
     }
     let pid = child.id();
+    let input_pipe = child.stdin.take();
     let out_pipe = child.stdout.take();
     let err_pipe = child.stderr.take();
     let capture: SharedCapture = Arc::new(Mutex::new(CapturePair::new(
@@ -1277,6 +1347,15 @@ fn spawn_background_with_limits(
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
     let stop_pumps = Arc::new(AtomicBool::new(false));
     let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+
+    let input_handle = input.map(|input| {
+        let mut pipe = input_pipe.expect("piped stdin is present when input is configured");
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let _ = pipe.write_all(&input);
+            let _ = pipe.flush();
+        })
+    });
 
     fn pump<R: PumpPipe>(
         mut pipe: R,
@@ -1391,6 +1470,9 @@ fn spawn_background_with_limits(
         // holder does not, ask the nonblocking pumps to close their descriptors
         // and then explicitly join them before publishing `done`.
         let joins = async {
+            if let Some(handle) = input_handle {
+                let _ = handle.await;
+            }
             if let Some(handle) = out_handle {
                 let _ = handle.await;
             }
@@ -1437,6 +1519,7 @@ pub fn spawn_background(
         EXEC_STDERR_CAP,
         EXEC_AGGREGATE_CAP,
         watch_network,
+        None,
     )
 }
 
@@ -3025,6 +3108,30 @@ mod tests {
             output.output.len()
         );
         assert!(output.output.contains("earlier output dropped"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_argv_input_keeps_protocol_stdout_separate_from_diagnostics() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("IFS= read -r line; printf '{\"echo\":\"%s\"}' \"$line\"; printf diagnostic >&2");
+        let output = run_command_bounded_with_input(
+            command,
+            b"hello\n".to_vec(),
+            std::time::Duration::from_secs(2),
+            1024,
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.passed());
+        assert_eq!(output.stdout, br#"{"echo":"hello"}"#);
+        assert_eq!(output.stderr, b"diagnostic");
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
     }
 
     #[cfg(unix)]

@@ -1029,8 +1029,26 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             objective: run.spec.objective.clone(),
             contract: run.spec.contract.clone(),
         });
+        child
+            .agent_start_hooks(
+                &session,
+                serde_json::json!({"agent": run.spec.name, "objective": run.spec.objective}),
+                &mut messages,
+            )
+            .await;
         let outcome = child
             .run_session(&session, messages, budget, &sink, Some(run.interrupts))
+            .await;
+        let stopped = match &outcome {
+            Ok((_, stop)) => format!("{stop:?}"),
+            Err(error) => format!("error: {error}"),
+        };
+        child
+            .observe_hook(
+                &session,
+                kernel::HookPoint::AgentStop,
+                serde_json::json!({"agent": run.spec.name, "stopped": stopped}),
+            )
             .await;
         let (transcript, stop) = match outcome {
             Ok(result) => result,
@@ -1085,7 +1103,7 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
                 .map(|event| event.trust),
         );
         let status = match stop {
-            StopReason::VerificationFailed => AgentStatus::Failed,
+            StopReason::VerificationFailed | StopReason::Blocked => AgentStatus::Failed,
             StopReason::Finished => AgentStatus::Completed,
             StopReason::Budget(_) => AgentStatus::Exhausted,
             StopReason::Interrupted => AgentStatus::Cancelled,

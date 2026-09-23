@@ -259,6 +259,9 @@ pub struct ServerConfig {
     /// Held apart from the transport so the secret never reaches an approval
     /// card, status line, log or persisted command.
     pub secret: Option<String>,
+    /// Extra read-only roots for this server's jail, e.g. the package that
+    /// ships its code. Never widened by approvals.
+    pub read_roots: Vec<PathBuf>,
 }
 
 impl ServerConfig {
@@ -1539,7 +1542,7 @@ impl McpManager {
             cwd: self.inner.workspace.clone(),
             env: environment,
             clear_env: true,
-            read_roots: Vec::new(),
+            read_roots: server.read_roots.clone(),
             write_roots: Vec::new(),
         };
         let mut command = backend

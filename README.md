@@ -124,6 +124,7 @@ medha memory list              # what the agent has learned
 medha undo                     # restore the last file write
 medha gate scenarios/          # run eval scenarios — CI for agent behavior
 medha mcp                      # add, connect, authorize MCP servers
+medha plugins                  # discover, install, enable, update, roll back plugins
 medha lsp                      # language-server sessions and health
 ```
 
@@ -184,6 +185,15 @@ Shell commands declare whether they need network access using `network: true` or
 **Semantic code intelligence.** Language servers for Rust, TypeScript/JavaScript, Python, Go and C/C++, plus structured diagnostics across eight toolchains — real definitions and references, not grep guesses.
 
 **An MCP host** for external tools, where every call routes through the human gate and results stay untrusted.
+
+**Plugins and hooks without tool-schema bloat.** `/plugins` discovers and installs
+plugins from GitHub or a marketplace (the official plugin directory is built in),
+pinned to a commit and content hash, with update, access diff, and rollback.
+Plugins bring skills, MCP servers, hooks, and `/` commands; changes apply to the
+running session. Requested access is shown once before a plugin turns on, and its
+processes run in the sandbox with only that access. Hooks are a script in
+`.medha/hooks/<event>/` or `/hooks`; existing `.claude` hooks run unchanged. Hook
+decisions are audited and may deny, ask, or add context, but never grant access.
 
 **Time travel.** Rewind to any past turn and branch a new session; undo a file write from three turns ago. Memory is events too, so forking before a bad write means the branch never learned it.
 

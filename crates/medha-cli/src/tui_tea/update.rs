@@ -156,6 +156,9 @@ pub(super) fn update<P, L>(
             }
         }
     }
+    if std::mem::take(&mut model.plugins_changed) {
+        model.refresh_skill_manifest(transcript);
+    }
 }
 
 fn handle_mouse(model: &mut Model, event: MouseEvent) {
@@ -1033,6 +1036,9 @@ pub(super) fn handle_key<P, L>(
     }
 
     // Picker handling
+    if super::plugins::handle_key(model, key.code, tx) {
+        return;
+    }
     if let Some(picker) = model.picker.as_mut() {
         let labels = picker.kind.labels();
         match key.code {
@@ -1656,7 +1662,11 @@ pub(super) fn handle_key<P, L>(
 
     // Autocomplete handling
     if model.input.starts_with('/') {
-        let matches = command_matches(&model.input);
+        let matches = command_matches(model);
+        let chosen_plugin_command = matches
+            .get(model.ac_sel.min(matches.len().saturating_sub(1)))
+            .filter(|(name, _)| model.plugin_commands.iter().any(|c| &c.name == name))
+            .map(|(name, _)| name.clone());
         if !matches.is_empty() {
             model.ac_sel = model.ac_sel.min(matches.len() - 1);
             match key.code {
@@ -1672,6 +1682,19 @@ pub(super) fn handle_key<P, L>(
                     model.input = format!("{} ", matches[model.ac_sel].0);
                     model.cursor = model.input.len();
                     return;
+                }
+                // A plugin command sends its prompt through the normal Enter path.
+                KeyCode::Enter
+                    if chosen_plugin_command.is_some()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    let name = chosen_plugin_command.unwrap_or_default();
+                    if !model.input.trim_start().starts_with(&name) {
+                        model.input = name;
+                        model.cursor = model.input.len();
+                    }
                 }
                 KeyCode::Enter
                     if !key
@@ -1734,6 +1757,15 @@ pub(super) fn handle_key<P, L>(
                 model.input.remove(model.cursor - 1);
                 model.input.insert(model.cursor - 1, '\n');
                 return;
+            }
+            model.typed_command = None;
+            if let Some(prompt) =
+                super::plugins::commands::expand(&model.plugin_commands, &model.input)
+            {
+                let typed = std::mem::replace(&mut model.input, prompt);
+                if !model.running && model.focus.is_none() {
+                    model.typed_command = Some(typed.trim().to_string());
+                }
             }
             // Slash commands — only when the first token IS a known command;
             // a pasted path ("/Users/… do X") goes to the model as chat.
@@ -2491,7 +2523,7 @@ pub(super) fn handle_agent_event(
                 StopReason::VerificationFailed => {
                     model.push_main_notice("✗ completion blocked — required verification failed; review the check output and continue to fix it");
                 }
-                StopReason::Finished => {}
+                StopReason::Finished | StopReason::Blocked => {}
             }
         }
         TuiEvent::Error(e) => {
@@ -2720,6 +2752,7 @@ pub(super) fn handle_agent_event(
             model.push_notice(format!("(resumed session {id})"));
         }
         // `/skill install` finished (async when fetching a URL).
+        TuiEvent::PluginJob(done) => super::plugins::job_done(model, done),
         TuiEvent::SkillInstalled(result) => match result {
             Ok(report) => {
                 model.refresh_skill_manifest(transcript);
@@ -2993,6 +3026,10 @@ enum SlashAction {
     /// `/attach remove [number|all]` — unstage images before sending.
     Detach(String),
     Lsp,
+    /// `/plugins [install|enable|disable|remove …]`.
+    Plugins(String),
+    /// `/hooks [add …]` — add a project hook without writing a file by hand.
+    Hooks(String),
     /// `/mcp` — open the MCP management picker.
     Mcp,
     Agents,
@@ -3063,6 +3100,12 @@ fn classify_slash(cmd: &str) -> SlashAction {
             SlashAction::Detach(c.strip_prefix("detach").unwrap_or("").trim().to_string())
         }
         "lsp" => SlashAction::Lsp,
+        c if c.strip_prefix("hooks").is_some_and(is_cmd_boundary) => {
+            SlashAction::Hooks(c.strip_prefix("hooks").unwrap_or("").trim().to_string())
+        }
+        c if c.strip_prefix("plugins").is_some_and(is_cmd_boundary) => {
+            SlashAction::Plugins(c.strip_prefix("plugins").unwrap_or("").trim().to_string())
+        }
         "mcp" => SlashAction::Mcp,
         "agents" => SlashAction::Agents,
         "agents tree" => SlashAction::Tree,
@@ -3285,6 +3328,8 @@ fn dispatch_slash<P, L>(
         SlashAction::McpAdd(args) => mcp_add(model, &args, tx),
         SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
         SlashAction::SkillPicker => open_skill_picker(model),
+        SlashAction::Plugins(args) => super::plugins::run_command(model, &args, tx),
+        SlashAction::Hooks(args) => super::plugins::hooks_command(model, &args),
         SlashAction::LoadSkill(name) => load_skill_by_name(model, &name, transcript),
         SlashAction::SkillInfo(name) => show_skill_info(model, &name),
         SlashAction::RemoveSkill(name) => begin_remove_skill(model, &name),
@@ -4685,7 +4730,10 @@ pub(super) fn spawn_turn<P, L>(
     model.welcome = false;
     let unprompted = line.is_none();
     if let Some(line) = &line {
-        let label = model.attachments.submission_label(line);
+        let label = model
+            .typed_command
+            .take()
+            .unwrap_or_else(|| model.attachments.submission_label(line));
         model.push_main_item(Item::User(label));
     }
     if model.focus.is_none() {

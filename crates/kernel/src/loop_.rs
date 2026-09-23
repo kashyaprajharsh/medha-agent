@@ -73,6 +73,96 @@ fn salient_arg(intent: &ToolIntent) -> Option<&str> {
         .find_map(|key| intent.args.get(*key).and_then(|value| value.as_str()))
 }
 
+const MAX_HOOK_PAYLOAD_BYTES: usize = 32 * 1024;
+const MAX_HOOK_AUDIT_REASON_BYTES: usize = 1024;
+
+fn sensitive_hook_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "authorization",
+        "api_key",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+        "cookie",
+        "credential",
+        "provider_state",
+        "signature",
+    ]
+    .iter()
+    .any(|part| key.contains(part))
+}
+
+/// Clone untrusted event data into a bounded, recursively redacted hook view.
+/// This is deliberately done by the kernel rather than trusting an extension
+/// transport to remember which provider/tool fields can contain credentials.
+fn hook_safe_value(value: &serde_json::Value) -> serde_json::Value {
+    fn walk(value: &serde_json::Value, remaining: &mut usize, depth: usize) -> serde_json::Value {
+        if *remaining == 0 || depth > 16 {
+            return serde_json::Value::String("<truncated>".into());
+        }
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                *remaining = remaining.saturating_sub(value.to_string().len());
+                value.clone()
+            }
+            serde_json::Value::String(text) => {
+                let limit = (*remaining).min(text.len());
+                let mut end = limit;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                *remaining = remaining.saturating_sub(end);
+                if end == text.len() {
+                    serde_json::Value::String(text.clone())
+                } else {
+                    serde_json::Value::String(format!("{}<truncated>", &text[..end]))
+                }
+            }
+            serde_json::Value::Array(values) => serde_json::Value::Array(
+                values
+                    .iter()
+                    .take(128)
+                    .map(|value| walk(value, remaining, depth + 1))
+                    .collect(),
+            ),
+            serde_json::Value::Object(values) => {
+                let mut safe = serde_json::Map::new();
+                for (key, value) in values.iter().take(128) {
+                    if *remaining == 0 {
+                        break;
+                    }
+                    *remaining = remaining.saturating_sub(key.len());
+                    safe.insert(
+                        key.clone(),
+                        if sensitive_hook_key(key) {
+                            serde_json::Value::String("<redacted>".into())
+                        } else {
+                            walk(value, remaining, depth + 1)
+                        },
+                    );
+                }
+                serde_json::Value::Object(safe)
+            }
+        }
+    }
+
+    let mut remaining = MAX_HOOK_PAYLOAD_BYTES;
+    walk(value, &mut remaining, 0)
+}
+
+fn bounded_hook_reason(reason: &str) -> String {
+    if reason.len() <= MAX_HOOK_AUDIT_REASON_BYTES {
+        return reason.to_string();
+    }
+    let mut end = MAX_HOOK_AUDIT_REASON_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}<truncated>", &reason[..end])
+}
+
 fn attach_discovered_context(
     observation: &mut Observation,
     discovered: &crate::context::DiscoveredContext,
@@ -317,7 +407,13 @@ pub enum StopReason {
     /// The surface cancelled the turn; in-flight work settled gracefully and
     /// the returned history is consistent (every intent has an observation).
     Interrupted,
+    /// A prompt-submit hook refused the new input before any model call. The
+    /// reason reaches the surface through `StreamSink::notice` and the log.
+    Blocked,
 }
+
+#[path = "hook_points.rs"]
+mod hook_points;
 
 pub struct Kernel<P: Provider, L: EventLog> {
     pub provider: Arc<P>,
@@ -328,6 +424,7 @@ pub struct Kernel<P: Provider, L: EventLog> {
     pub policy: Arc<dyn crate::policy::Policy>,
     pub gate: Arc<dyn crate::gate::HumanGate>,
     pub verifier: Arc<dyn crate::verify::Verifier>,
+    hooks: Arc<dyn crate::hooks::HookRunner>,
     /// Reads images for a route whose own model cannot. `None` means an image
     /// reaching such a route fails the turn instead of being dropped.
     vision: Option<Arc<dyn crate::vision::VisionDescriber>>,
@@ -347,6 +444,12 @@ pub struct Kernel<P: Provider, L: EventLog> {
     /// mutation cannot commit in the gap before replay learns about this one.
     mutation_serial: Arc<tokio::sync::Mutex<()>>,
     settle_grace: std::time::Duration,
+    /// Sessions whose start hooks already ran in this process, shared with
+    /// derived kernels so a resumed tree fires them once.
+    started_sessions: Arc<std::sync::Mutex<std::collections::HashSet<ulid::Ulid>>>,
+    /// Derived for a sub-agent: agent start/stop hooks describe it instead of
+    /// session and prompt hooks.
+    sub_agent: bool,
 }
 
 /// Tool-result payloads larger than this spill to the artifact store and are
@@ -433,6 +536,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             policy,
             gate,
             verifier,
+            hooks: Arc::new(crate::hooks::NoHooks),
             vision: None,
             progressive_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
@@ -440,6 +544,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             gate_serial: Arc::new(futures::lock::Mutex::new(())),
             mutation_serial: Arc::new(tokio::sync::Mutex::new(())),
             settle_grace: TOOL_SETTLE_GRACE,
+            started_sessions: Arc::default(),
+            sub_agent: false,
         }
     }
 
@@ -461,6 +567,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             policy: Arc::clone(&self.policy),
             gate,
             verifier: Arc::clone(&self.verifier),
+            hooks: Arc::clone(&self.hooks),
             vision: self.vision.clone(),
             progressive_context: self.progressive_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
@@ -470,6 +577,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             gate_serial: Arc::clone(&self.gate_serial),
             mutation_serial: Arc::clone(&self.mutation_serial),
             settle_grace: self.settle_grace,
+            started_sessions: Arc::clone(&self.started_sessions),
+            sub_agent: true,
         }
     }
 
@@ -520,6 +629,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         progressive_context: Arc<dyn crate::context::ProgressiveContext>,
     ) -> Self {
         self.progressive_context = Some(progressive_context);
+        self
+    }
+
+    /// Install the host-side hook runner. Hooks can narrow or escalate a tool
+    /// decision, but this boundary exposes no way to register a model tool.
+    /// Applies hook enable/disable decisions to this running process.
+    pub fn reload_hooks(&self) -> Vec<String> {
+        self.hooks.reload()
+    }
+
+    pub fn with_hooks(mut self, hooks: Arc<dyn crate::hooks::HookRunner>) -> Self {
+        self.hooks = hooks;
         self
     }
 
@@ -659,7 +780,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // tool gets TOOL_SETTLE_GRACE to finish and keep its real
             // observation. Only after the grace is it dropped and replaced by
             // a synthetic result, preserving intent → observation.
-            let fut = self.dispatch_one(session, &intent, web_tainted, sink);
+            let fut = self.dispatch_one(session, &intent, web_tainted, &cancel, sink);
             tokio::pin!(fut);
             tokio::select! {
                 biased;
@@ -974,6 +1095,36 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 window_taint = window_taint.min(trust);
             }
         }
+        let prompt = messages[fresh..]
+            .iter()
+            .filter(|message| {
+                message.role == crate::types::Role::User
+                    && message.trust.is_none_or(|trust| trust == TrustLabel::User)
+            })
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut hook_events = self
+            .session_start_hooks(session, !prior_events.is_empty(), &cancel, &mut messages)
+            .await?;
+        match self
+            .prompt_submit_hooks(session, &prompt, &cancel, &mut messages)
+            .await?
+        {
+            hook_points::PromptGate::Proceed(events) => hook_events.extend(events),
+            hook_points::PromptGate::Blocked(reason) => {
+                if let Some(q) = interrupts.as_mut() {
+                    Self::return_unapplied_steers(q, sink);
+                }
+                sink.notice(&format!("prompt blocked by a plugin hook: {reason}"));
+                return Ok((messages, StopReason::Blocked));
+            }
+        }
+        if !hook_events.is_empty() {
+            window_events.extend(hook_events);
+            window_taint = window_taint.min(TrustLabel::Tool);
+        }
+        let mut hook_continuations = 0u8;
         let mut ordered_messages: Vec<ModelMessage> =
             messages.iter().map(Message::ordered).collect();
         let logged_events = self.log.checked_events(session.id).await?;
@@ -1255,6 +1406,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             &compacted_ordered,
                         ))
                         .await?;
+                    self.post_compaction_hooks(
+                        session,
+                        compiled.before_tokens,
+                        compiled.after_tokens,
+                        compiled.summarized,
+                        &cancel,
+                    )
+                    .await;
                     // The durable log keeps both originals and this canonical
                     // checkpoint; the active view is now the only candidate
                     // that may be prepared and sent.
@@ -1685,6 +1844,22 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     ordered_messages.push(message.ordered());
                     messages.push(message);
                 }
+            }
+            if finishing
+                && self
+                    .task_completion_hooks(
+                        session,
+                        completion_verified,
+                        hook_continuations,
+                        &cancel,
+                        &mut messages,
+                        &mut ordered_messages,
+                    )
+                    .await?
+            {
+                hook_continuations += 1;
+                window_taint = window_taint.min(TrustLabel::Tool);
+                continue;
             }
             if finishing {
                 if let Some(q) = interrupts.as_mut() {
@@ -2159,11 +2334,103 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         self.executor.execute(intent).await
     }
 
+    async fn invoke_hook(
+        &self,
+        session: &Session,
+        point: medha_extension_api::HookPoint,
+        trust: TrustLabel,
+        payload: serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::hooks::HookBatch, String> {
+        let request = crate::hooks::HookRequest::new(session.id.to_string(), point, trust, payload);
+        let mut batch = self.hooks.invoke(&request, cancel).await;
+        if !matches!(batch.directive, crate::hooks::HookDirective::Continue)
+            && batch.audits.is_empty()
+        {
+            return Err("hook runner returned an unaudited decision".into());
+        }
+        for audit in &mut batch.audits {
+            audit.event_id.clone_from(&request.event_id);
+            audit.point = point;
+            audit.reason = audit.reason.as_deref().map(bounded_hook_reason);
+            self.log
+                .append(Event::hook(session, audit))
+                .await
+                .map_err(|error| format!("hook decision could not be recorded: {error}"))?;
+        }
+        Ok(batch)
+    }
+
+    async fn apply_post_tool_hook(
+        &self,
+        session: &Session,
+        intent: &ToolIntent,
+        mut observation: Observation,
+        web_tainted: bool,
+        cancel: &tokio_util::sync::CancellationToken,
+        sink: &dyn StreamSink,
+    ) -> Observation {
+        let payload = serde_json::json!({
+            "intent_id": intent.id,
+            "tool": intent.tool,
+            "status": observation.status,
+            "result": hook_safe_value(&observation.payload),
+        });
+        let trust = if web_tainted {
+            TrustLabel::Web
+        } else {
+            TrustLabel::Tool
+        };
+        let failed = observation.status == crate::types::ObsStatus::Error;
+        let mut points = vec![medha_extension_api::HookPoint::PostTool];
+        if failed {
+            points.push(medha_extension_api::HookPoint::ToolFailure);
+        }
+        let mut contexts = Vec::new();
+        let mut problem = None;
+        for point in points {
+            match self
+                .invoke_hook(session, point, trust, payload.clone(), cancel)
+                .await
+            {
+                Ok(batch) => {
+                    for notice in &batch.notices {
+                        sink.notice(notice);
+                    }
+                    contexts.extend(batch.contexts);
+                    if let crate::hooks::HookDirective::Deny(reason)
+                    | crate::hooks::HookDirective::RequestApproval(reason) = batch.directive
+                    {
+                        problem.get_or_insert(reason);
+                    }
+                }
+                Err(error) => {
+                    problem.get_or_insert(error);
+                }
+            }
+        }
+        Self::attach_hook_contexts(&mut observation, &contexts);
+        if let Some(problem) = problem {
+            let prior_status = observation.status.clone();
+            let prior_payload = std::mem::take(&mut observation.payload);
+            observation.status = crate::types::ObsStatus::Error;
+            observation.payload = serde_json::json!({
+                "error": format!(
+                    "tool completed, but its required post-tool hook did not settle safely: {problem}"
+                ),
+                "tool_status": prior_status,
+                "tool_result": prior_payload,
+            });
+        }
+        observation
+    }
+
     async fn dispatch_one(
         &self,
         session: &Session,
         intent: &ToolIntent,
         web_tainted: bool,
+        cancel: &tokio_util::sync::CancellationToken,
         sink: &dyn StreamSink,
     ) -> Observation {
         let radius = self.executor.blast_radius(&intent.tool);
@@ -2180,9 +2447,63 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         };
         // Trust-flow escalations must never be auto-approved.
         let raw_permissive = matches!(raw, crate::types::Decision::Allow);
-        let decision =
+        let mut decision =
             escalate_for_trust_flow(raw, radius, web_tainted, self.executor.containment());
-        let escalated = raw_permissive && matches!(decision, crate::types::Decision::Human);
+        let trust_escalated = raw_permissive && matches!(decision, crate::types::Decision::Human);
+        let mut hook_approval_reason = None;
+        if !matches!(decision, crate::types::Decision::Deny { .. }) {
+            let trust = if web_tainted {
+                TrustLabel::Web
+            } else {
+                TrustLabel::System
+            };
+            let payload = serde_json::json!({
+                "intent_id": intent.id,
+                "tool": intent.tool,
+                "blast_radius": radius,
+                "args": hook_safe_value(&intent.args),
+            });
+            let hooks = match self
+                .invoke_hook(
+                    session,
+                    medha_extension_api::HookPoint::PreTool,
+                    trust,
+                    payload,
+                    cancel,
+                )
+                .await
+            {
+                Ok(hooks) => hooks,
+                Err(error) => {
+                    return Observation::error(
+                        &intent.id,
+                        format!(
+                            "tool execution was denied because its pre-tool hook was not auditable: {error}"
+                        ),
+                    );
+                }
+            };
+            for notice in &hooks.notices {
+                sink.notice(notice);
+            }
+            match hooks.directive {
+                crate::hooks::HookDirective::Continue => {}
+                crate::hooks::HookDirective::Deny(reason) => {
+                    decision = crate::types::Decision::Deny { reason };
+                }
+                crate::hooks::HookDirective::RequestApproval(reason) => {
+                    hook_approval_reason = Some(reason);
+                    decision = crate::types::Decision::Human;
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            return Observation::error(
+                &intent.id,
+                "[interrupted] cancelled while running pre-tool hooks",
+            );
+        }
+        let escalated = trust_escalated || hook_approval_reason.is_some();
         if let Err(error) = self
             .log
             .append(Event::policy(session, intent, &decision))
@@ -2245,6 +2566,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     if access_escalated {
                         detail.push_str("\nThis command handled untrusted content; approve this invocation only.");
                     }
+                    if let Some(reason) = &hook_approval_reason {
+                        detail.push_str("\nA pre-tool hook requires approval: ");
+                        detail.push_str(reason);
+                    }
                     self.executor
                         .grant_access(&access, &detail, access_escalated)
                         .await
@@ -2259,11 +2584,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                     Ok(_) => {
                         self.running_tool(intent, sink);
-                        return crate::execution_access_scope(
+                        let observation = crate::execution_access_scope(
                             access,
                             self.execute_with_effect_outbox(session, intent),
                         )
                         .await;
+                        return self
+                            .apply_post_tool_hook(
+                                session,
+                                intent,
+                                observation,
+                                web_tainted,
+                                cancel,
+                                sink,
+                            )
+                            .await;
                     }
                 }
             }
@@ -2281,11 +2616,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 // approved slow tool doesn't block the next card.
                 let approved = {
                     let _one_gate = self.gate_serial.lock().await;
-                    let detail = self
+                    let mut detail = self
                         .executor
                         .preview(intent)
                         .await
                         .unwrap_or_else(|| approval_detail(intent));
+                    if let Some(reason) = &hook_approval_reason {
+                        detail.push_str("\n\nA pre-tool hook requires approval: ");
+                        detail.push_str(reason);
+                    }
                     let action = approval_key(intent);
                     self.gate
                         .confirm(&action, Some(&detail), escalated)
@@ -2294,15 +2633,28 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 };
                 if approved {
                     self.running_tool(intent, sink);
-                    self.execute_with_net_retry(session, intent, web_tainted, radius)
-                        .await
+                    let observation = self
+                        .execute_with_net_retry(session, intent, web_tainted, radius)
+                        .await;
+                    self.apply_post_tool_hook(
+                        session,
+                        intent,
+                        observation,
+                        web_tainted,
+                        cancel,
+                        sink,
+                    )
+                    .await
                 } else {
                     Observation::denial(&intent.id, self.gate.denial_reason().to_string())
                 }
             }
             crate::types::Decision::Allow => {
                 self.running_tool(intent, sink);
-                self.execute_with_net_retry(session, intent, web_tainted, radius)
+                let observation = self
+                    .execute_with_net_retry(session, intent, web_tainted, radius)
+                    .await;
+                self.apply_post_tool_hook(session, intent, observation, web_tainted, cancel, sink)
                     .await
             }
         }

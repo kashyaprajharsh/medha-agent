@@ -20,6 +20,7 @@ tokio-util = "0.7"
 sha2 = "0.10"
 base64 = "0.22"
 tracing = "0.1"
+medha-extension-api = { version = "0.1.8", path = "../extension-api" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

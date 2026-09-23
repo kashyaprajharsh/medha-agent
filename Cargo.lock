@@ -1007,6 +1007,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "extensions"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "fd-lock",
+ "kernel",
+ "medha-extension-api",
+ "sandbox",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "ulid",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1939,6 +1960,7 @@ dependencies = [
  "async-trait",
  "base64",
  "futures",
+ "medha-extension-api",
  "serde",
  "serde_json",
  "sha2",
@@ -2259,6 +2281,7 @@ dependencies = [
  "context",
  "crossterm",
  "dirs",
+ "extensions",
  "fd-lock",
  "flate2",
  "futures",
@@ -2296,6 +2319,17 @@ dependencies = [
  "ulid",
  "unicode-width 0.2.0",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "medha-extension-api"
+version = "0.1.8"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]

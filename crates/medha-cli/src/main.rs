@@ -5,6 +5,8 @@ mod acp;
 mod agents;
 mod attachments;
 mod config;
+mod plugin_session;
+mod plugins_cmd;
 mod skill_judge;
 mod tui_tea;
 mod vision;
@@ -780,6 +782,9 @@ async fn main() -> Result<()> {
     if raw.get(1).map(|s| s == "pulse").unwrap_or(false) {
         return run_pulse_command(&raw[2..]);
     }
+    if raw.get(1).map(|s| s == "plugins").unwrap_or(false) {
+        return plugins_cmd::run(raw[2..].to_vec());
+    }
     if raw.get(1).map(|s| s == "mcp").unwrap_or(false) {
         return run_mcp_command(raw[2..].to_vec()).await;
     }
@@ -1325,13 +1330,17 @@ async fn main() -> Result<()> {
                     .with_authorizer(workspace.clone()),
             )
         });
-    let skill_store = Arc::new(
-        tools::SkillStore::new(
+    let mut session_plugins =
+        plugin_session::SessionPlugins::discover(plugins_cmd::store(&medha_home, &cwd, &state));
+    let skill_store = {
+        let skills = tools::SkillStore::new(
             workspace.root().join(".medha").join("skills"),
             Some(config::user_skills_dir()?),
         )
-        .with_judge(security_judge),
-    );
+        .with_judge(security_judge);
+        session_plugins.add_skills(&skills);
+        Arc::new(skills)
+    };
     let mut registry = ToolRegistry::with_workspace(workspace.clone(), artifacts.clone());
     let lsp_manager = if lock.lsp.enabled {
         let mut lsp_config = lsp::Config {
@@ -1399,7 +1408,7 @@ async fn main() -> Result<()> {
         None
     };
     // MCP definitions are portable; credentials remain in the user store.
-    let mcp_servers: Vec<mcp::ServerConfig> = model_profiles
+    let mut mcp_servers: Vec<mcp::ServerConfig> = model_profiles
         .lock()
         .ok()
         .map(|cfg| {
@@ -1414,6 +1423,11 @@ async fn main() -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
+    let configured_mcp: std::collections::HashSet<String> =
+        mcp_servers.iter().map(|server| server.id.clone()).collect();
+    let plugin_mcp = session_plugins.mcp_servers(&configured_mcp);
+    let plugin_mcp_ids = plugin_mcp.iter().map(|server| server.id.clone()).collect();
+    mcp_servers.extend(plugin_mcp);
     // An idle manager allows live additions without a restart.
     let mcp_manager = {
         let had_servers = !mcp_servers.is_empty();
@@ -1646,6 +1660,14 @@ async fn main() -> Result<()> {
     let max_parallel_tools = parallel_override
         .or(lock.budget.max_parallel_tools)
         .unwrap_or(kernel::DEFAULT_MAX_PARALLEL_TOOLS);
+    let hook_runner = session_plugins.hook_runner(&cwd);
+    for diagnostic in session_plugins
+        .warnings()
+        .iter()
+        .chain(hook_runner.diagnostics())
+    {
+        eprintln!("warning: plugin: {diagnostic}");
+    }
     let mut kernel = Kernel::new(
         provider,
         log.clone(),
@@ -1657,7 +1679,8 @@ async fn main() -> Result<()> {
         verifier,
     )
     .with_pricing(pricing)
-    .with_max_parallel_tools(max_parallel_tools);
+    .with_max_parallel_tools(max_parallel_tools)
+    .with_hooks(Arc::new(hook_runner));
     if let Some(auxiliary) = auxiliary_vision {
         kernel = kernel.with_vision(auxiliary);
     }
@@ -1866,6 +1889,19 @@ async fn main() -> Result<()> {
                 known_tools.clone(),
                 search_handle.clone(),
                 mcp_manager.clone(),
+                plugins_cmd::store(&medha_home, &cwd, &state),
+                plugins_cmd::marketplaces(&medha_home),
+                plugin_session::LivePlugins::new(
+                    plugins_cmd::store(&medha_home, &cwd, &state),
+                    skill_store.clone(),
+                    mcp_manager.clone(),
+                    Box::new({
+                        let kernel = kernel.clone();
+                        move || kernel.reload_hooks()
+                    }),
+                    configured_mcp.clone(),
+                    plugin_mcp_ids,
+                ),
                 agent_control.clone(),
                 tx,
                 rx,
@@ -1952,6 +1988,9 @@ async fn main() -> Result<()> {
             println!();
             sink.report_cache();
             Ok(())
+        }
+        Ok((_t, kernel::StopReason::Blocked)) => {
+            Err(anyhow::anyhow!("the prompt was blocked by a plugin hook"))
         }
         Err(error) => Err(anyhow::anyhow!("headless run failed: {error}")),
     };

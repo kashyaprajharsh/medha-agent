@@ -939,7 +939,7 @@ fn acp_stop_reason(reason: &StopReason) -> &'static str {
     match reason {
         StopReason::Finished => "end_turn",
         StopReason::Interrupted => "cancelled",
-        StopReason::VerificationFailed => "refusal",
+        StopReason::VerificationFailed | StopReason::Blocked => "refusal",
         StopReason::Budget(kernel::BudgetStop::Tokens) => "max_tokens",
         StopReason::Budget(_) => "max_turn_requests",
     }
@@ -1365,6 +1365,7 @@ where
                                 StopReason::Interrupted => writer.event("turn.cancelled", json!({})),
                                 StopReason::Budget(s) => writer.event("turn.done", json!({ "stopped": s.label() })),
                                 StopReason::Finished => writer.event("turn.done", json!({ "stopped": Value::Null })),
+                                StopReason::Blocked => writer.event("turn.done", json!({ "stopped": "blocked_by_hook" })),
                             };
                         }
                     }

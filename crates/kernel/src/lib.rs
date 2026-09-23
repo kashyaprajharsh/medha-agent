@@ -8,6 +8,7 @@ pub mod errors;
 pub mod events;
 pub mod executor;
 pub mod gate;
+pub mod hooks;
 pub mod interrupts;
 pub mod policy;
 pub mod progress;
@@ -38,8 +39,12 @@ pub use gate::{
     Approval, AutoDeny, ExecutionAccess, HumanGate, NetworkDecision, execution_access,
     execution_access_scope, network_once_active, network_once_scope,
 };
+pub use hooks::{
+    HookAudit, HookBatch, HookContext, HookDirective, HookRequest, HookRunner, HookStatus, NoHooks,
+};
 pub use interrupts::{Activity, Interrupt, InterruptHandle, InterruptQueue};
 pub use kernel_loop::{DEFAULT_MAX_PARALLEL_TOOLS, Kernel, SPILL_THRESHOLD, StopReason};
+pub use medha_extension_api::{HookDecision, HookPoint};
 pub use policy::{AllowAll, Policy};
 pub use progress::{Phase, Progress, ProgressHandle, ProgressWatch};
 pub use provider::{

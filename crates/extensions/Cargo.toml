@@ -1,0 +1,29 @@
+[package]
+name = "extensions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+medha-extension-api = { version = "0.1.8", path = "../extension-api" }
+kernel = { version = "0.1.8", path = "../kernel" }
+sandbox = { version = "0.1.8", path = "../sandbox" }
+async-trait.workspace = true
+fd-lock = "4"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "time"] }
+tokio-util = "0.7"
+toml = "0.8"
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Storage_FileSystem",
+] }

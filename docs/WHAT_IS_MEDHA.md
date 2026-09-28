@@ -38,9 +38,9 @@
 ## Overview
 
 MEDHA is an **open-source, verification-first, general-purpose AI agent harness for
-the command line**. It runs against OpenAI-compatible endpoints and Google's native
-Gemini protocol, adding validation, policy enforcement and human oversight around
-the model.
+the command line and desktop**. It runs against OpenAI-compatible endpoints and
+Google's native Gemini protocol, adding validation, policy enforcement and human
+oversight around the model.
 
 **The Core Bet:** The frontier of agent reliability has moved from the model to the harness. The same model behind a stronger harness is a dramatically more reliable agent. MEDHA is that harness.
 
@@ -48,7 +48,7 @@ the model.
 
 - **Validates** every action the AI proposes before it executes
 - **Polices** tool usage with deny-first authorization
-- **Sandboxes** all command execution to prevent system damage
+- **Confines** local commands with the selected execution backend
 - **Records** every action in a tamper-evident event log
 - **Remembers** facts across sessions with kernel-computed trust
 - **Navigates** code semantically through supervised language servers
@@ -61,8 +61,8 @@ the model.
 - MEDHA is **not** an AI model — it speaks the OpenAI-compatible Chat Completions
   protocol and Google's native Gemini Interactions API, and runs against whatever
   endpoint you point it at
-- MEDHA is **not** a GUI editor — it provides TUI, plain REPL, headless, and an ACP
-  bridge for editors
+- MEDHA is **not** a GUI editor — it provides a desktop chat app, TUI, plain REPL,
+  headless mode, and an ACP bridge for editors
 - MEDHA is **not** cloud-dependent — it works fully offline with local models
 
 ---
@@ -71,7 +71,7 @@ the model.
 
 ### Verification-First
 
-Nothing the AI says causes an effect directly. Only validated, policy-approved, sandbox-confined tool actions do. Every intent, decision, and result is logged and can be replayed, audited, or undone.
+Nothing the AI says causes an effect directly. Only validated, policy-approved tool actions do; local command confinement depends on the selected backend. Every intent, decision, and result is logged and can be replayed, audited, or undone.
 
 ### Deny-First Security
 
@@ -99,7 +99,67 @@ Humans approve consequential actions. The system asks before executing potential
 
 ## Architecture at a Glance
 
-MEDHA consists of **15 Rust crates**, each responsible for a specific concern:
+The main Cargo workspace contains **19 Rust crates**; the Tauri desktop app has
+its own manifest under `apps/desktop/src-tauri`.
+
+### Core Component Map
+
+Arrows show runtime calls or component wiring. The kernel owns the agent loop;
+`medha-cli` constructs its dependencies and adapts each user interface.
+
+```mermaid
+flowchart TB
+    UI["User surfaces<br/>Desktop, TUI, REPL, headless, ACP editors"]
+    BOOT["medha-cli<br/>Config, session setup, prompt and media admission"]
+    K["kernel<br/>Agent loop, budgets, interrupts, trust"]
+
+    UI -->|"Prompt + attachments"| BOOT
+    BOOT -->|"Kernel::run_session"| K
+
+    subgraph reasoning["Context and model calls"]
+        CTX["context<br/>History compilation and compaction"]
+        PROV["providers<br/>OpenAI Chat / Gemini Interactions<br/>Local or hosted model endpoints"]
+    end
+    subgraph execution["Controlled execution"]
+        CONTROL["Policy + HumanGate + Verifier<br/>Authorization, approval, completion checks"]
+        TOOLS["tools / Executor<br/>Registered tool routing"]
+        LOCAL["sandbox + permissions + lsp<br/>Files, commands, access, diagnostics"]
+        MCP["mcp<br/>Supervised external tool servers"]
+        CHILD["orchestrator<br/>Child kernels with narrowed capabilities"]
+    end
+    subgraph persistence["Persistence and extensions"]
+        DATA[("store + memory<br/>Events, checkpoints, artifacts, memory projections")]
+        EXT["extensions + extension-api<br/>Activated skills, hooks and MCP configuration"]
+    end
+
+    K -->|"Compile history"| CTX
+    K -->|"Prepare, count, stream"| PROV
+    CTX -->|"Optional summary call"| PROV
+    K -->|"Check before effects / completion"| CONTROL
+    K -->|"Authorized intents"| TOOLS
+    TOOLS -->|"Local operations"| LOCAL
+    TOOLS -->|"MCP calls"| MCP
+    TOOLS -->|"Agent tools"| CHILD
+    CHILD -.->|"Derived sessions"| K
+    K -->|"Log and restore"| DATA
+    TOOLS -->|"Memory, session search, artifacts"| DATA
+    CTX -->|"Artifacts; memory refresh callback"| DATA
+    EXT -.->|"Register components"| BOOT
+    EXT -.->|"Lifecycle hooks"| CONTROL
+```
+
+The desktop launches the same backend through `medha --acp` for live sessions;
+its `desktop-service` handles session/history and desktop control requests.
+`media` normalizes admitted images, and `transcript-view` formats desktop history
+and live tool steps. The `gate` crate below is the offline Eval Gate, distinct
+from the kernel's interactive `HumanGate`.
+
+Source: [runtime construction](../crates/medha-cli/src/main.rs),
+[desktop live bridge](../apps/desktop/src-tauri/src/live.rs),
+[tool registry](../crates/tools/src/lib.rs), and
+[kernel](../crates/kernel/src/loop_.rs).
+
+### Workspace Crates
 
 | Crate | Responsibility |
 |-------|----------------|
@@ -107,7 +167,7 @@ MEDHA consists of **15 Rust crates**, each responsible for a specific concern:
 | `providers` | OpenAI Chat and Gemini Interactions wire protocols, SSE, models.dev metadata |
 | `context` | Prompt assembly, two-phase compaction, identity, context files, prompt registry |
 | `memory` | Typed memory with projection, ranked recall, consolidation |
-| `tools` | 53 tools: filesystem, shell, web, git, diagnostics, LSP, MCP, sub-agents, skills |
+| `tools` | Tool registry: filesystem, shell, web, git, diagnostics, LSP, MCP, sub-agents, skills |
 | `orchestrator` | Sub-agent sessions, capability narrowing, worktree isolation for writers |
 | `lsp` | Supervised multi-language LSP client: diagnostics + navigation |
 | `mcp` | Supervised MCP host: stdio and Streamable HTTP servers, OAuth |
@@ -117,7 +177,11 @@ MEDHA consists of **15 Rust crates**, each responsible for a specific concern:
 | `lockfile` | Configuration parsing (`medha.lock`) |
 | `permissions` | Ask-then-persist trust for out-of-workspace access |
 | `gate` | Eval Gate: scenario runner with deterministic checks |
-| `medha-cli` | TUI interface, REPL, headless mode, ACP editor bridge |
+| `medha-cli` | Runtime construction, TUI, REPL, headless mode, ACP and desktop adapters |
+| `media` | Shared image validation, normalization and transmission limits |
+| `extension-api` | Plugin manifests, permissions and lifecycle hook types |
+| `extensions` | Plugin discovery, activation, skills/MCP integration and hook supervision |
+| `transcript-view` | Shared desktop transcript and tool-result presentation |
 
 ---
 
@@ -127,53 +191,60 @@ MEDHA consists of **15 Rust crates**, each responsible for a specific concern:
 
 ### What It Does
 
-The kernel is the **central controller** of MEDHA. It is the only code that:
-- Calls AI models
-- Writes to the event log
-- Enforces budgets
-- Manages the main agent loop
-
-Everything else connects to the kernel through traits, making components pluggable.
+The kernel coordinates model turns, budgets, interrupts, durable events and tool
+dispatch through injected traits. Provider adapters handle model transport; the
+context engine can also call an auxiliary model for summarization.
 
 ### The Main Loop
 
-The kernel runs a continuous loop for each session:
+`Kernel::run_session` first admits user input, runs session/prompt hooks and
+restores checked history. A blocked prompt stops before generation. The repeated
+turn follows this flow:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ 1. Turn boundary — honor a pending cancel first, then       │
-│    inject any queued steers as user messages                │
-│ 2. Budget gate — stop gracefully if a ceiling is hit        │
-│ 3. Prepare → count → compile, looping until the request     │
-│    fits (bounded to 3 compaction passes)                    │
-│ 4. Stream the model (transient failures retry with bounded  │
-│    provider-requested/fallback backoff; after output, only  │
-│    when the surface can safely restart)                     │
-│ 5. Log model text, reasoning, and the canonical message     │
-│ 6. No tool calls? → Finished                                │
-│ 7. Inject kernel-computed trust into any memory intents     │
-│ 8. Log every intent — dispatch admission, so a logged       │
-│    intent is guaranteed an observation                      │
-│ 9. Dispatch reads concurrently (order-preserved, bounded);  │
-│    mutations cross a hard serialization barrier. Each call: │
-│    a. Policy authorize — deny-first, by declared radius     │
-│    b. Trust-flow escalation — Allow → Human if tainted      │
-│    c. Human gate, serialized so parallel calls cannot pop   │
-│       several approval cards at once                        │
-│    d. Execute in the sandbox                                │
-│ 10. Log each observation with its trust label; spill any    │
-│     payload over 16 KB to the artifact store                │
-│ 11. If configured and armed by local-effect intent → run    │
-│     the verifier; feed its result as tool-trust input       │
-│ 12. Repeat                                                  │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    B["Turn boundary<br/>Cancel or inject queued steers; check budgets"]
+    C["Prepare → count → compile<br/>Checkpoint and recount changes; bounded passes"]
+    M["run_turn<br/>Stream text, reasoning, calls and usage"]
+    A["Persist assistant; admit tool intents<br/>Kernel assigns memory-write provenance"]
+    T{"Tool calls?"}
+    G{"Policy + trust + pre-tool hooks<br/>Human/access approval when required"}
+    E["Executor dispatch<br/>Concurrent reads; serialized mutations"]
+    O["Post-tool hooks where applicable<br/>Persist outcomes + trust labels; spill large results"]
+    V["Verifier when applicable<br/>Feed results back as tool-trust context"]
+    F{"Completion checks<br/>and completion hooks"}
+    Z["Return stop reason or error<br/>Finish, cancel, budget, or verification failure"]
+
+    B -->|"Continue"| C
+    C -->|"Request fits"| M
+    M -->|"Completed model turn"| A
+    A --> T
+    T -->|"Yes"| G
+    G -->|"Allowed / approved"| E
+    G -->|"Denied"| O
+    E --> O --> V
+    T -->|"No: completion candidate"| V
+    V --> F
+    F -->|"Tool work continues / hook requests continuation"| B
+    F -->|"Complete or verification blocks completion"| Z
+    B -->|"Cancel / budget exhausted"| Z
+    C -->|"Cannot fit / compilation failure"| Z
+    M -->|"Interrupted / unrecoverable failure"| Z
 ```
 
-Two details worth drawing out. Intents are logged at **dispatch admission** — after
-the cancel check, immediately before execution — which is what guarantees the
-`intent → decision → observation` triple is never left dangling, even on a cancel.
-And the human gate is serialized by its own lock, held across preview-and-answer but
-dropped *before* execution, so an approved slow tool doesn't block the next card.
+- Each admitted tool intent gets a durable observation, including denial, error
+  or interrupted execution. Policy decisions are logged before execution.
+- Approval prompts are serialized. Reads can run concurrently; mutations hold
+  ordering guards through durable observation, with a pre-effect record for
+  recovery after a crash.
+- Configured verification runs after applicable local effects; required checks
+  also run before completion, including text-only or resumed completion. Plan
+  mode does not launch verification commands.
+- A denial returns evidence to the model; it does not necessarily end the session.
+  Streaming updates reach the surface through `StreamSink` throughout the turn.
+
+See the [compaction flow](#compaction-flow) for request fitting and the
+[user-request flow](#user-request-flow) for the complete surface-to-result path.
 
 ### Key Components
 
@@ -301,11 +372,12 @@ delegates isolation to the remote host.
 ### What's Blocked
 
 With the default `native` backend, the sandbox blocks:
-- Writes outside the workspace directory
+- Writes outside the workspace, isolated HOME/TMP and explicitly granted write roots
 - Reads outside the workspace and explicit runtime/approved read roots,
   including credential locations such as `~/.ssh`
 - Network access (the default is `network = "deny"`; opt in explicitly)
-- System commands that could damage the host
+
+The command danger scanner is a separate policy check, not an OS sandbox rule.
 
 The `host` and `ssh` backends do not make those filesystem guarantees. They
 remain subject to the command scanner, policy, and human gate, and should be
@@ -331,6 +403,22 @@ Execute in jail:
      ▼
 Return output → Log to event log
 ```
+
+### Plugin Boundaries
+
+Enabled hooks and command snippets use a separate native sandbox scope: their own
+installed package is readable, their private `plugin-data/<id>` directory is
+writable, and workspace access follows the reviewed grant. A workspace working
+directory does not grant write access by itself. Credentials and unrelated Medha
+state remain blocked. On macOS, the profile explicitly carves these package/data
+roots out of the general `~/.medha` deny rule. Hook failure details are surfaced in
+plugin health so a missing runtime, denied path or deadline can be diagnosed.
+
+Hooks and snippets fail closed when the required isolation is unavailable. Linux
+Landlock's network enforcement depends on kernel support; Medha does not claim
+proven network denial for that backend, so network-denied plugin execution may be
+unavailable there. Remote MCP tools run on their server and are not confined by the
+local filesystem sandbox.
 
 ### OS-Native Isolation
 
@@ -390,6 +478,35 @@ Steps 3 and 4 are strictly tightening, so a base `Human` or `Deny` survives ever
 dial setting. Because a new tool is authorized by its *declared* radius, adding one
 needs no policy edit — and forgetting to register one means it is denied, not
 allowed.
+
+### Tool Authorization Flow
+
+The kernel owns this sequence. The command scanner is part of policy; the OS
+sandbox enforces filesystem/network access during execution. Hooks can tighten a
+decision but cannot turn a denial into permission.
+
+```mermaid
+flowchart TD
+    I["Admitted tool intent"] --> P["Plan-mode restriction + policy<br/>Registration, tool rules, command scanner, blast radius"]
+    P --> T["Trust escalation<br/>Untrusted input + consequential action + containment"]
+    T --> D{"Denied?"}
+    D -->|Yes| O["Denied/error observation<br/>No tool execution"]
+    D -->|No| H["Pre-tool hooks<br/>Continue, require approval, or deny"]
+    H --> Q{"Decision and required access"}
+    Q -->|Denied or hook audit failed| O
+    Q -->|Approval or extra access needed| G["Serialized human gate<br/>Show preview and requested access"]
+    G -->|Denied or unavailable| O
+    G -->|Approved| E["Execute registered tool<br/>Local commands use selected sandbox"]
+    Q -->|Allowed with existing access| E
+    E --> R["Post-tool hooks + durable observation<br/>Actual effects are not undone by a hook error"]
+    O --> N["Kernel continues with the observation"]
+    R --> N
+```
+
+A missing command-access grant and a policy approval share one review. The gate
+lock is released before execution. Headless runs deny actions needing a human.
+Mutating tools record effect preparation before execution; completed effects are
+not silently replayed after an interruption.
 
 ### Autonomy Modes
 
@@ -917,6 +1034,35 @@ A visible approval, question or picker owns its own first Esc.
 - Event log remains consistent
 - Session can be resumed from any point
 - Replay produces same results
+
+### Cancel and Restart Recovery
+
+Cancellation settles the active turn. Restart reconstructs a new in-memory view
+from durable events; it does not continue a suspended process or blindly rerun a
+shell command whose effects are unknown.
+
+```mermaid
+flowchart TD
+    C["Cancel current turn"] --> S["Stop provider work and settle admitted tools<br/>Keep actual outcomes or record interruption"]
+    S --> L["Durable event log + artifacts<br/>Messages, intents, observations, compaction checkpoints"]
+    R["Resume session after restart"] --> L
+    L --> V{"Checked event history readable?"}
+    V -->|No| X["Surface the error<br/>Do not invent history"]
+    V -->|Yes| P["Project latest valid checkpoint + subsequent events<br/>Or reconstruct from history when no checkpoint exists"]
+    P --> H["Restore ordered content and summary<br/>Recover original user instructions from the log"]
+    H --> U{"Saved usage matches provider<br/>and entire prepared request prefix?"}
+    U -->|Yes| A["Restore token calibration"]
+    U -->|No| B["Discard stale calibration<br/>Use local estimate"]
+    A --> F["Rebuild request and check context budget<br/>Compact if needed before model dispatch"]
+    B --> F
+    L -. "unreported child dispatch" .-> O["Recover abandoned child as outcome unknown<br/>Keep completed reports and pending patches"]
+```
+
+Checkpoint validation includes canonical content and media references. A saved
+usage count is reused only when the full prepared prefix matches, including tool
+schemas and provider identity. An invalid checkpoint is skipped; an unreadable
+history is an error. A process crash cannot prove whether an external effect
+finished, so recovery must preserve that uncertainty.
 
 ### Message Steering
 
@@ -1515,6 +1661,102 @@ built ad hoc from an objective — there are no preset agent files — and gets 
 session id, so the event log already gives it a durable, resumable, independently
 addressable transcript. The parent receives only a bounded structured result.
 
+### Spawn, Execution and Report Delivery
+
+The main agent sees a tool response containing child IDs immediately after spawn.
+It sees the child's **answer** only when a completed report is delivered into its
+context. A live roster or an open child pane is a UI view, not the answer entering
+the parent's model request.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Main agent / kernel
+    participant O as Orchestrator
+    participant C as Child kernel session
+    participant L as Event log / outbox
+    participant U as TUI / desktop bridge
+    P->>O: agent.spawn(objective, fork, tools, write, contract)
+    O->>O: Validate tools, depth, capacity and owner<br/>Narrow capabilities and share budget pool
+    opt Writer requested
+        O->>O: Create private git worktree<br/>Refuse if isolation is unavailable
+    end
+    O->>L: Persist dispatch before starting child
+    O-->>P: Child session ID and agent path
+    O->>C: Start task with selected history and contract
+    Note over P,C: Parent and child can work concurrently.<br/>Contract guides response format.<br/>It is not a schema validator.
+    C-->>U: Live phase, token and tool progress
+    Note over C,U: Switching panes changes what the user watches.<br/>It does not pause or swap the running kernel.
+    opt Parent sends a correction
+        P->>O: steer / message / follow-up
+        O->>C: Queue input for a safe turn boundary
+    end
+    alt Child completes
+        C-->>O: Final assistant answer + status + weakest trust
+    else Budget, cancel, stall or failure
+        C-->>O: Partial findings or failure + status
+    end
+    opt Writer produced changes
+        O->>O: Extract patch and verification evidence
+    end
+    O->>L: Persist report and patch before marking settled
+    O-->>U: Report-ready notification
+    alt Parent is waiting
+        O-->>P: wait tool observation carries reports
+        P->>L: Persist observation with delivery IDs
+    else Parent is working or idle
+        U->>L: Collect undelivered reports at next parent turn
+        U->>P: Add bounded report with child's trust label
+        P->>L: Persist parent turn, then acknowledge delivery
+    end
+    P->>P: Model reads report and decides next action
+    opt Parent chooses to merge writer patch
+        P->>O: agent.apply → human review → conflict / verification checks
+        O-->>P: Merge outcome
+    end
+```
+
+TUI and desktop/ACP defer automatic report delivery until the current parent turn
+settles. If the parent is idle, a report can start a continuation; an empty inbox
+never starts a model request. Headless startup also collects reports left from a
+previous run. A parent waiting inside `agent` or `agent.spawn(wait: true)` receives
+the report directly in that tool's observation. Nested parents receive labelled
+reports through their steering queue.
+
+Reading an outbox record does not acknowledge it. The wait observation's durable
+append, or successful parent-turn persistence followed by delivery acknowledgement,
+commits receipt. An interruption between persistence and acknowledgement can cause
+redelivery; this is not an exactly-once processing guarantee.
+
+Reports entering the surface's parent context are capped at 16,000 characters;
+longer text is stored as an artifact before truncation when storage succeeds. The
+full child transcript remains addressable separately. A writer's diff is retained
+outside the model's report and requires `agent.apply`; an answer saying “done” does
+not merge any files.
+
+### Waits, Timeouts and Continuation
+
+| Mechanism | Default | What happens when it ends |
+|---|---|---|
+| Active children | 3 across the control tree | A full tree refuses new admission; it does not silently queue another child |
+| Delegation depth | 1 | Deeper delegation is refused unless configured otherwise |
+| `agent` wait | 120 seconds; accepted range 1–600 seconds | First owned descendant settles, new input arrives, shutdown occurs, or wait expires. Timeout leaves children running |
+| Spawn with `wait: true` | Up to the configured wait ceiling, normally 600 seconds | Waits for this spawn's child/batch. New input or the ceiling detaches the wait without cancelling children |
+| Child inactivity | Generating: 300s; in a tool: 900s; idle: 120s | Watchdog requests cooperative cancellation and reports exhausted with partial findings |
+| Human approval | Exempt from inactivity timeout | Waits for the operator. `quiet_ms` is null, not evidence of a stalled child |
+| Child turns | Requested cap, bounded by parent turn ceiling | Child stops when exhausted; tokens, cost and wall-clock ceilings use the parent's shared pool |
+
+Provider and individual tool deadlines can stop work before the child watchdog.
+Inactivity means no phase/progress update, not total lifetime. Kernel-backed children
+settle their own cancellation cleanup; the generic runner's five-second cancellation
+grace is not a blanket five-second kill timer for kernel sessions.
+
+A follow-up to a live child queues more input. A follow-up after settlement revives
+the same session with its prior history; a writer restores its pending patch into a
+fresh worktree. Cancelling one child also cancels its descendants, while siblings
+continue. Changing the root session is refused while child work/reservations remain,
+so reports cannot be reassigned by a pane switch or stale spawn request.
+
 ### Capability Narrowing
 
 Omitting `tools` inherits the parent's capabilities. A supplied narrowing list uses
@@ -1704,199 +1946,127 @@ The Context Engine **assembles the prompt** sent to the AI model, managing token
 
 ### Compaction Strategy
 
-MEDHA uses **graduated, 3-stage compaction** — starting with the cheapest method and escalating only when necessary. This ensures efficient token usage while preserving all data.
+The kernel prepares, counts and compiles context before every model call, including
+calls after tool results. The engine chooses no change, deterministic pruning, or
+full summarization. A changed view is checkpointed and recounted before dispatch;
+the original events remain in the durable log.
 
-#### The Problem: Limited Context Window
+#### Compaction Flow
 
-```
-Context Window: 128K tokens (example)
-├─ Identity      (1K)   ← Always stays
-├─ Capability    (2K)   ← Always stays
-├─ Knowledge     (3K)   ← Budgeted
-├─ History       (100K) ← Grows every turn!
-└─ Immediate     (2K)   ← Always stays
+```mermaid
+flowchart TD
+    A[("Original events + saved checkpoint")]
+    B["Restore session<br/>User quotes + validated usage anchor"]
+    C["Prepare request and count tokens<br/>System, tools, messages, media"]
+    D{"Context pressure<br/>and policy"}
 
-After 50-100 turns: History overflows → Need compaction
-```
+    A --> B --> C --> D
 
-#### Stage 1: No Compaction (< 60% usage)
+    D -->|"Fits; no change needed"| SEND["Call chat model"]
+    D -->|"Prune band: 60% usable"| P["Prune old tool outputs<br/>Artifact references where available; no LLM"]
+    D -->|"Full: 99% usable<br/>or forced / emergency"| S["LLM summarizes older work<br/>Updates previous handoff"]
 
-**When:** Context usage below 60% of window
+    S -->|"Valid summary"| BUILD
+    S -->|"Explicit local unavailability"| F["Bounded extractive fallback"]
+    F --> BUILD
+    S -->|"Error, invalid output or timeout"| STOP["Stop safely<br/>Preserve original history"]
+    D -->|"Cannot fit safely"| STOP
 
-**Action:** Nothing — keep everything verbatim
+    P -->|"Changed history"| BUILD["Build active context"]
+    P -->|"No change; fits"| SEND
 
-**Speed:** Instant (no processing)
+    BUILD --> K[("Save canonical + legacy checkpoint<br/>Original events remain stored")]
+    K -->|"Rebuild and recount"| C
+    SEND -.->|"Next model call / tool results"| C
 
-```
-Usage: 50K/128K (39%) → CompactionAction::None
-Result: All history preserved as-is
-```
-
-#### Stage 2: Prune Only (60-99% usage)
-
-**When:** Context usage between 60-99% of window
-
-**Action:** Remove large tool outputs, replace with artifact hash references
-
-**Speed:** Fast (deterministic, no LLM call)
-
-**What Gets Pruned:**
-- Tool outputs larger than threshold (default: >200 tokens or 1% of window)
-- Replaced with: `[Tool output pruned - hash: abc123]` (30 tokens)
-
-**Protected Regions:**
-- **Head:** First 3 messages (system prompt + first exchange) — never pruned
-- **Tail:** Last 20 messages (recent context) — never pruned
-- **Pinned:** Any explicitly pinned items — never pruned
-
-**Example:**
-```
-Before Prune (80K tokens):
-├─ Turn 1: User message (50 tokens)
-├─ Turn 1: Model response (100 tokens)
-├─ Turn 1: read output (15,000 tokens) ← LARGE!
-├─ Turn 2: web fetch output (25,000 tokens) ← LARGE!
-└─ ... (more turns)
-
-After Prune (35K tokens):
-├─ Turn 1: User message (50 tokens) ← PROTECTED (head)
-├─ Turn 1: Model response (100 tokens)
-├─ Turn 1: [Pruned - hash: abc123] (30 tokens) ← Saved 14,970 tokens!
-├─ Turn 2: [Pruned - hash: def456] (30 tokens) ← Saved 24,970 tokens!
-└─ ... (recent turns protected)
-
-Tokens saved: 80K → 35K (56% reduction)
+    classDef store fill:#e8f0ff,stroke:#4873bf,color:#173052
+    classDef work fill:#e6f4ef,stroke:#388d70,color:#163e30
+    classDef stop fill:#fff0ec,stroke:#bf6951,color:#572b20
+    class A,K store
+    class P,S,F,BUILD work
+    class STOP stop
 ```
 
-**Key Property: Lossless**
-- Full outputs still stored in artifact store (content-addressed by hash)
-- Model can re-fetch with `read(hash="abc123")` if needed
-- Nothing is deleted — only removed from live context
+Session restoration loads a valid checkpoint, restores its previous summary, and
+rebuilds bounded user quotes from original trusted user events. Saved provider
+usage is reused only when the provider identity and entire priced request prefix
+match. A provider preflight count takes precedence; otherwise the engine uses
+usage-anchored or local estimates.
 
-#### Stage 3: Full Compaction (> 99% usage)
+#### What Survives Full Compaction
 
-**When:** Context usage above 99% of window (near limit)
+```mermaid
+flowchart LR
+    H["Protected first messages"]
+    S["Generated summary<br/>+ original-user quotes"]
+    T["Bounded recent messages<br/>Complete tool-call/result pairs"]
+    I["Latest user instruction<br/>Retained images / references"]
+    R["Next model request<br/>+ tool definitions"]
 
-**Action:** Prune tool outputs + LLM summarizes old turns
-
-**Speed:** Slower (requires LLM compressor model call)
-
-**Process:**
-1. **Prune** large tool outputs (Stage 2)
-2. **Preserve** head (first 3 messages) and tail (last 20 messages) verbatim
-3. **Summarize** middle section with LLM
-4. **Update** previous summary (iterative re-summarization)
-
-**Example:**
-```
-Before Compaction (127K tokens, 99% full):
-├─ [HEAD] Turns 1-3: Full conversation (500 tokens)
-├─ [MIDDLE] Turns 4-80: Old conversation (80K tokens) ← To summarize
-└─ [TAIL] Turns 81-100: Recent context (46K tokens)
-
-After Full Compaction (5K tokens, 4% full):
-├─ [HEAD] Turns 1-3: Full conversation (500 tokens) ← Protected
-├─ [SUMMARY] "Turns 4-80: User and model collaborated to fix
-│             an off-by-one error in calc.rs. The model read
-│             the file, identified the bug, proposed an edit,
-│             and the user approved. Tests passed." (500 tokens)
-│             (source_events: [ulid1, ulid2, ... ulid80]) ← Lineage!
-└─ [TAIL] Turns 81-100: Full recent conversation (4K tokens) ← Protected
-
-Tokens saved: 127K → 5K (96% reduction!)
+    H --> R
+    S --> R
+    T --> R
+    I --> R
 ```
 
-**Iterative Re-Summarization:**
-```
-First Summary: "Turns 2-40: Fixed bug in calc.rs"
+These categories can overlap: a latest user instruction already in the protected
+head or recent tail is not added a second time.
 
-Later compaction (includes previous summary):
-"Turns 2-40: Fixed bug in calc.rs. Then user asked to optimize,
- model profiled, found bottleneck at line 42, and refactored..."
+- **Head:** The first three messages, extended when needed to keep a tool group
+  complete. A large initial message can therefore remain expensive.
+- **Recent history:** A target of twenty messages, subject to a token budget of
+  `min(20% of usable input, clamp(2.5% of usable input, 10,000, 25,000))`.
+  Older oversized tool groups move into the summary; the newest complete group
+  can exceed the tail budget.
+- **Handoff:** The generated summary plus original-user quotes together have a
+  hard local token cap of 15% of usable input. The LLM output allowance is also
+  bounded by source size, the summarizer's limits and the receiving context budget.
+  Quotes include event IDs and a `sessions.search` recovery pointer.
+- **Images:** Eligible older tool images become stored artifact references.
+  User images, protected images and images without a recoverable stored source
+  remain. There is no hard three-image limit across the whole request.
 
-Result: Detail accretes coherently across multiple compactions
-```
+There is **no fixed total post-compaction percentage**. Summary size alone does
+not determine retained tokens: protected messages, tool definitions and media
+also contribute. Summaries are lossy; original events and stored artifacts provide
+recovery paths for omitted details.
 
-**Lineage Tracking:**
-- Every summary includes `source_events` array (ULIDs)
-- Can trace summary back to exact original events
-- Enables audit and replay from summary alone
+#### Triggers and Safety
 
-#### Emergency Stage: Force Compact (> 98% after compaction)
+The usable input budget accounts for the model's output reservation and the token
+count's quality. These percentages are not percentages of the raw model window.
 
-**When:** Context still above 98% even after compaction attempt
+| Action | Default condition | Behavior |
+|---|---|---|
+| No change | Below 60% of usable input, unless forced | Retain the current view |
+| Prune | From 60%, below the full trigger | Replace eligible large tool bodies; no LLM |
+| Full | At 99% of usable input, or forced/emergency | Summarize the middle and rebuild the active view |
+| Emergency | At 98% of the resolved input limit | Override backoff; stop if the request cannot fit safely |
 
-**Action:**
-- Force compaction even if anti-thrash backoff says "wait"
-- If still over limit → **Refuse to send** (prevent API error)
-- Return `StopReason::Budget(BudgetStop::ContextOverflow)`
+Pruning starts with tool bodies at least `max(1% of usable input, 200)` tokens,
+unless explicitly configured. Artifact references are used when storage succeeds;
+the durable event log retains the original tool observations.
 
-**Safety:** Hard ceiling independent of soft trigger — last line of defense
+A pass that saves less than 10% is locally considered ineffective. Two consecutive
+ineffective passes activate backoff; enough context growth, a stage change, or a
+forced/emergency pass can release or override it. Provider counts and subsequent
+usage also check whether compaction actually relieved pressure. This is a guard
+against repeated wasteful work, not a promised compression ratio.
 
-#### Anti-Thrash Backoff
+LLM summaries have a **60-second idle deadline and a 300-second total deadline**.
+Provider failures, empty/refused responses and incomplete streams preserve history
+and surface an error. Explicit local unavailability, such as summary input that
+cannot fit the auxiliary model, can use bounded extractive fallback.
 
-Compaction that barely helps is worse than none: it costs a compressor call, breaks
-the prompt cache, and leaves you where you started. So the engine counts
-**ineffective** passes, and after **two in a row** it stops trying.
+The prepare/count/compile loop is bounded to three compaction passes. A provider
+context-length rejection permits one recovery attempt and can update a reported
+limit. Cancellation and restart use the durable checkpoint rather than replaying
+the old uncompacted view.
 
-The latch is not permanent, and the release condition is the interesting part. The
-engine records the context size at the moment it latched; when the context **grows
-past that mark**, the latch clears — new material means there is new cut to find.
-Without that release, a latched session sat above 100% of usable with compaction
-refusing to run until the emergency line caught it.
-
-The emergency ceiling overrides the backoff. Near the hard limit, thrash is the lesser
-problem.
-
-#### Provider-Driven Compaction
-
-The soft trigger is measured against MEDHA's own estimate of the window, which can be
-wrong for an unfamiliar model. So the provider gets a vote: a `400` whose message
-identifies a **context-length rejection** is classified separately from a plain error,
-and it sets a **one-shot latch** that forces exactly one compaction pass before the
-request is retried. If the provider reported a concrete limit, that number is learned
-and used from then on.
-
-This is a latch, not a guessed window — MEDHA never fabricates a context size from a
-rejection. And the whole measure → compact → remeasure cycle is bounded to **3 passes**
-per turn, so a pathological compressor cannot rewrite the same turn indefinitely; past
-that the session stops with `BudgetStop::ContextOverflow`.
-
-#### Offline Fallback
-
-Full compaction routes to a compressor model. When that model is unavailable or
-unreliable — which matters most when running entirely on local weights — a
-deterministic **extractive** summarizer takes over instead of the turn failing.
-Compaction degrades in quality, never in availability.
-
-#### Compaction Policy Defaults
-
-```rust
-trigger_ratio: 0.99,      // Full compact at 99%
-microcompact_ratio: 0.60, // Prune at 60%
-tail_ratio: 0.20,         // Keep 20% as tail
-protect_first_n: 3,       // First 3 messages protected
-protect_last_n: 20,       // Last 20 messages protected
-prune_min_tool_tokens: None,  // Auto-scale (1% of window, min 200)
-emergency_ratio: 0.98,    // Hard ceiling at 98%
-```
-
-#### Summary Table
-
-| Stage | Trigger | Action | LLM Call? | Speed | Token Reduction |
-|-------|---------|--------|-----------|-------|-----------------|
-| **1: None** | < 60% | Nothing | No | N/A | 0% |
-| **2: Prune** | 60-99% | Remove large tool outputs | No | Fast | 30-60% |
-| **3: Full** | > 99% | Prune + LLM summarize | Yes | Slow | 80-95% |
-| **Emergency** | > 98% after | Refuse to send | N/A | N/A | N/A |
-
-#### Key Properties
-
-1. **Lossless:** Pruned data still in artifact store, re-fetchable by hash
-2. **Lineage:** Every summary traces to exact source events (ULIDs)
-3. **Iterative:** Previous summaries updated, not restarted — detail accretes
-4. **Protected:** Head (first N), tail (last N), and pinned items never touched
-5. **Graduated:** Starts cheap, escalates only when needed — efficient
+Implementation: [context engine](../crates/context/src/engine.rs),
+[summarizer](../crates/context/src/compactor.rs),
+[user handoff](../crates/context/src/handoff.rs), and
+[kernel request loop](../crates/kernel/src/loop_.rs).
 
 ### Context Files
 
@@ -3021,145 +3191,86 @@ jobs:
 
 ## How It All Works Together
 
-### Complete Flow Example
+### User Request Flow
 
-```
-═══════════════════════════════════════════════════════════
-USER: "Fix the failing test in tests/calc.rs"
-═══════════════════════════════════════════════════════════
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ KERNEL: Log message, check budgets, compile context     │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ PROVIDER: Stream response from model                    │
-│ "I'll start by reading the test file"                   │
-│ Tool call: read(path="tests/calc.rs")                   │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ POLICY: Check blast radius → Read → ALLOW ✓            │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ SANDBOX: Execute in jail, return contents               │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ EVENT LOG: Log intent, decision, observation            │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ MODEL: "I see the bug! Can I edit tests/calc.rs?"       │
-│ Tool call: edit(path="tests/calc.rs", ...)              │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ POLICY: base verdict Allow (ReversibleLocal), but        │
-│ edit is in [policy] approve and the dial is careful      │
-│ → escalated to HUMAN                                     │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ HUMAN GATE: dry-run the edit, show the REAL diff,        │
-│ and PIN a hash of the file it was rendered from          │
-│ User: "Y" (Yes)                                          │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ SANDBOX: re-read the file, check the pin still matches   │
-│ (refuse if it changed), snapshot, then write             │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ LSP: post-edit diagnostic delta attached to the result   │
-│ (automatic — no extra tool call)                         │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ VERIFY: local-effect turn → run configured command       │
-│ cargo check → PASS ✓  (fed back as TOOL trust)           │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ MODEL: "Fixed! Want me to run tests?"                   │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ ...continues until task complete                        │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ MEMORY: Save fact "tests/calc.rs had off-by-one bug"    │
-│ Trust: TOOL — the evidence came from tool observations, │
-│ and the kernel computes this, not the model.            │
-│ (Workspace trust comes from context files; Web from a   │
-│  fetched page. The floor across the window wins.)       │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│ SESSION ENDS → StopReason::Finished                     │
-│ All events in hash-chained log                          │
-│ Undo available for all edits                            │
-└─────────────────────────────────────────────────────────┘
+The selected surface owns user interaction; the shared runtime assembles the
+session and invokes the kernel. The example below follows a request such as
+“Fix the failing test,” including further model calls after tools return.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as Surface + medha-cli
+    participant K as Kernel
+    participant C as Context engine
+    participant P as Provider adapters
+    participant T as Tool executor
+    participant D as Durable store
+
+    User->>UI: Prompt + optional attachments
+    Note over UI: Config + workspace + session<br/>Identity + context files<br/>Tools + memory recall
+    UI->>K: run_session(messages, budget, sink, interrupts)
+    K->>D: Check history, admit input, restore checkpoint
+    D-->>K: Durable conversation + saved state
+    Note over K: Session / prompt hooks<br/>can block or add context
+
+    loop Model turns until a stop reason
+        K->>K: Handle interrupts and enforce budgets
+        K->>P: Prepare request and request input count
+        P-->>K: Prepared request + count when available
+        K->>C: Compile against input allowance
+        opt Full compaction uses an LLM
+            C->>P: Bounded summary on chat or auxiliary route
+            P-->>C: Summary or failure
+        end
+        C-->>K: Unchanged, pruned or summarized view
+        opt Context changed
+            K->>D: Save canonical + legacy checkpoint
+            K->>P: Rebuild and recount before dispatch
+        end
+        K->>P: Stream model response
+        P-->>K: Text, reasoning, tool calls, usage
+        K-->>UI: StreamSink updates
+        K->>D: Persist assistant and reported usage
+
+        alt Model requested tools
+            K->>D: Log admitted tool intents
+            K->>K: Policy, trust, pre-tool hooks and access checks
+            opt Human approval required
+                K-->>UI: Preview / approval request
+                UI-->>User: Show action and details
+                User->>UI: Approve or deny
+                UI->>K: Approval decision
+            end
+            Note over K,T: Only allowed intents execute.<br/>Denial becomes an observation.
+            K->>T: Dispatch allowed tools
+            T-->>K: Observations and artifacts
+            K->>D: Persist outcomes and provenance
+        else No tool calls
+            K->>K: Mark completion candidate
+        end
+        K->>K: Applicable verification and completion hooks
+    end
+
+    K-->>UI: Transcript + StopReason, or error
+    UI-->>User: Result, verification status, or reason for stopping
 ```
 
-### Component Interaction Map
+During execution, cancellation and steering travel back through the interrupt
+queue. Fatal failures or exhausted budgets exit the loop; required verification
+can block completion. Headless runs deny actions requiring human approval.
+Memory changes occur through memory tools and durable
+projection events, not automatically after every successful task.
 
-```
-                    ┌─────────────┐
-                    │   KERNEL    │
-                    │   (Loop)    │
-                    └──────┬──────┘
-                           │
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-        ▼                  ▼                  ▼
-┌───────────────┐  ┌───────────────┐  ┌───────────────┐
-│   PROVIDER    │  │    POLICY     │  │   BUDGETS     │
-│   (Model)     │  │  (Authorize)  │  │   (Limits)    │
-└───────┬───────┘  └───────┬───────┘  └───────────────┘
-        │                  │
-        ▼                  ▼
-┌───────────────┐  ┌───────────────┐
-│    CONTEXT    │  │  HUMAN GATE   │
-│   (Prompt)    │  │  (Approval)   │
-└───────┬───────┘  └───────┬───────┘
-        │                  │
-        ▼                  ▼
-┌───────────────┐  ┌───────────────┐
-│    MEMORY     │  │   EXECUTOR    │
-│  (Facts)      │  │   (Tools)     │
-└───────┬───────┘  └───────┬───────┘
-                           │
-                           ▼
-                    ┌───────────────┐
-                    │   SANDBOX     │
-                    │   (Jail)      │
-                    └───────┬───────┘
-                           │
-                           ▼
-                    ┌───────────────┐
-                    │  EVENT LOG    │
-                    │  (Storage)    │
-                    └───────────────┘
-```
+### Reading the Architecture
+
+- [Core component map](#core-component-map): which runtime components connect.
+- [Kernel loop](#the-main-loop): how a turn advances, dispatches tools and stops.
+- [Compaction flow](#compaction-flow): how context is reduced and checked again.
+- [Retained context](#what-survives-full-compaction): what reaches the next model call.
+
+The runtime wiring lives in [main.rs](../crates/medha-cli/src/main.rs); the shared
+loop and dispatch logic live in [loop_.rs](../crates/kernel/src/loop_.rs).
 
 ---
 
@@ -3177,8 +3288,8 @@ MEDHA transforms any AI model into a **reliable, auditable, safe agent** through
 | **Interrupts** | Graceful cancellation and message steering |
 | **Event Log** | Tamper-evident history with time travel |
 | **Memory** | Persistent facts with kernel-computed trust |
-| **Tools** | 53 capabilities, sandbox-confined |
-| **Context** | Five-layer prompt assembly with compaction |
+| **Tools** | Registered capabilities behind policy and controlled execution |
+| **Context** | Prompt context, token accounting and history compaction |
 | **Skills** | Reusable procedures loaded on demand |
 | **Verify** | Optional post-dispatch checks for local-effect turns |
 | **Permissions** | Ask-then-persist for out-of-workspace access |

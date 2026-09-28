@@ -1,0 +1,32 @@
+schema_version = 1
+id = "dev.medha.hello"
+name = "Hello Medha"
+version = "0.1.0"
+medha = ">=0.1.8, <0.2.0"
+description = "A small native package with a skill, operator action, MCP server, and hook."
+
+[[components]]
+kind = "skill"
+id = "greeting"
+path = "skills/greeting"
+
+[[components]]
+kind = "action"
+id = "greet"
+title = "Greet"
+description = "Draft a concise greeting"
+prompt = "Write a short, friendly greeting for $ARGUMENTS."
+
+[[components]]
+kind = "mcp"
+id = "greetings"
+command = ["python3", "${PLUGIN_ROOT}/server.py"]
+allow_tools = ["hello"]
+
+[[components]]
+kind = "hook"
+id = "welcome"
+points = ["session_start"]
+entrypoint = { program = "python3 hook.py", args = [], shell = true }
+timeout_ms = 2000
+failure = "warn"

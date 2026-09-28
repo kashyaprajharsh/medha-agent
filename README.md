@@ -28,7 +28,7 @@ workflows, and code, not only coding tasks.*
 
 Most agents ask you to trust the model. MEDHA doesn't.
 
-Every action a model proposes runs **validate → police → approve when required → execute → observe**. When configured, a deterministic verifier follows turns containing local-effect tools. Unregistered tools are denied, shell commands pass a danger scanner, consequential actions stop for your approval, and native OS isolation is used where available. If unavailable, Medha warns and falls back to host execution; the scanner and approval gate still apply. Nothing the model *says* causes an effect — only a policy-approved, sandboxed tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
+Every action a model proposes runs **validate → police → approve when required → execute → observe**. When configured, a deterministic verifier follows turns containing local-effect tools. Unregistered tools are denied, shell commands pass a danger scanner, consequential actions stop for your approval, and native OS isolation is used where available. If unavailable, Medha warns and falls back to host execution; the scanner and approval gate still apply. Nothing the model *says* causes an effect — only an authorized tool intent does, and every intent, decision and result lands in an append-only, hash-chained event log you can rewind, audit or fork.
 
 It runs on whatever model you have — a local Ollama or vLLM server, a hosted gateway, or Gemini natively.
 
@@ -144,7 +144,7 @@ Just run `medha`. The first launch opens model setup right in the TUI: pick an e
 Reasoning controls: `medha --effort xhigh "your task"` or `/reasoning` in the TUI.
 See [reasoning levels and approval review](docs/REASONING_AND_APPROVALS.md).
 
-Context is checked before each model request, including after tool results and on resume. Set the profile's `max_ctx` to the window your endpoint actually serves; `max_output_tokens`, when set, is reserved from that window. Leaving the output cap unset keeps automatic compaction active, with the server's output default remaining unknown. The context meter uses the compiler's input budget (`~` marks an estimate). Compaction checkpoints preserve resumable history; a request that still exceeds the budget stops instead of repeatedly reaching the provider. Summarization has its own token bounds and a 60-second timeout with an extractive fallback. Unknown context limits are reported explicitly; they cannot provide proactive overflow protection.
+Context is checked before each model request, including after tool results and on resume. Set the profile's `max_ctx` to the window your endpoint actually serves; `max_output_tokens`, when set, is reserved from that window. Leaving the output cap unset keeps automatic compaction active, with the server's output default remaining unknown. The context meter uses the compiler's input budget (`~` marks an estimate). Compaction checkpoints preserve resumable history; a request that still exceeds the budget stops instead of repeatedly reaching the provider. LLM summarization has its own token bounds, a 60-second inactivity deadline and a 300-second total deadline. Provider failures preserve history and stop compaction; extractive fallback is reserved for explicit local summarizer unavailability. Unknown context limits are reported explicitly; they cannot provide proactive overflow protection.
 
 Setup suggests Ollama, LM Studio, llama.cpp, vLLM/SGLang, OpenRouter, Together, Groq and OpenAI. **Google Gemini** works through its native Interactions API.
 
@@ -162,6 +162,10 @@ export MEDHA_BASE_URL="http://localhost:11434/v1"   # any OpenAI-compatible serv
 export MEDHA_MODEL="qwen3-coder"
 export MEDHA_API_KEY="…"                            # only if the endpoint needs one
 export MEDHA_IMAGE_INPUT="auto"                     # auto | native | text
+export MEDHA_IMAGE_MAX_WIDTH="16384"                 # pixels; may be lowered
+export MEDHA_IMAGE_MAX_HEIGHT="16384"                # pixels; may be lowered
+export MEDHA_IMAGE_MAX_PIXELS="50000000"             # decoded pixels; may be lowered
+export MEDHA_IMAGE_MAX_BYTES="10485760"              # encoded bytes; may be lowered
 ```
 
 Resolution order is **CLI flag > `MEDHA_*` env > `~/.medha/config.toml` > first-run setup**.
@@ -190,8 +194,12 @@ Shell commands declare whether they need network access using `network: true` or
 plugins from GitHub or a marketplace (the official plugin directory is built in),
 pinned to a commit and content hash, with update, access diff, and rollback.
 Plugins bring skills, MCP servers, hooks, and `/` commands; changes apply to the
-running session. Requested access is shown once before a plugin turns on, and its
-processes run in the sandbox with only that access. Hooks are a script in
+running session. Requested access is shown before a plugin turns on; filesystem
+roots are sandboxed. Stdio plugin network access is currently all or nothing,
+while remote MCP URLs must match a declared host. Secret requests are refused
+until a scoped broker is available. Action prompts may use ``!`cmd` `` snippets;
+each runs without network in the plugin's filesystem sandbox with a five-second
+timeout and bounded output. Hooks are a script in
 `.medha/hooks/<event>/` or `/hooks`; existing `.claude` hooks run unchanged. Hook
 decisions are audited and may deny, ask, or add context, but never grant access.
 
@@ -233,23 +241,32 @@ Project instructions go in `MEDHA.md`, or your existing `AGENTS.md` / `CLAUDE.md
 
 ## Architecture
 
-Fifteen crates. `kernel` is the only code that calls a model, writes an event, or enforces a budget — everything else sits behind a trait, so it can be swapped.
+The CLI, TUI, desktop and editor bridge share one Rust kernel. It prepares each
+model request, authorizes proposed tools, records outcomes and checks configured
+verification. The context engine also calls a model when summarization is needed.
 
-```
-        surfaces        TUI · REPL · headless · ACP editor bridge
-            │
-  ┌─────────▼──────────────────────────────────────────────────┐
-  │  KERNEL                                                    │
-  │  compile context → call model → validate → police →        │
-  │  approve → execute → observe → optionally verify effects   │
-  └──┬────────┬──────────┬──────────┬──────────┬───────────────┘
-     │        │          │          │          │
- providers  context   policy    executor   event log
- OpenAI ·   compact   deny-     25 tools   SQLite WAL +
- Gemini     + spill   first     sandboxed  SHA-256 chain
+```mermaid
+flowchart TB
+    UI["User<br/>TUI · CLI · Desktop · Editor"] --> CLI["medha-cli<br/>Session, configuration, plugins"]
+    CLI --> K["Kernel<br/>Context → model → authorize → execute → observe → verify"]
+    K <--> C["Context engine<br/>Budget, compaction, durable handoff"]
+    K <--> P["Providers<br/>OpenAI-compatible · Gemini"]
+    C -. "optional summary request" .-> P
+    K --> G["Policy + human approval<br/>Trust checks and hooks"]
+    G --> T["Tool registry"]
+    T --> S["Local execution<br/>Sandbox + permissions + LSP"]
+    T --> M["MCP<br/>External tools"]
+    T --> A["Orchestrator<br/>Child kernel sessions + writer worktrees"]
+    K <--> D["Durable state<br/>Event log · artifacts · memory"]
 ```
 
-[`kernel`](crates/kernel/) · [`providers`](crates/providers/) · [`context`](crates/context/) · [`tools`](crates/tools/) · [`orchestrator`](crates/orchestrator/) · [`policy`](crates/policy/) · [`sandbox`](crates/sandbox/) · [`store`](crates/store/) · [`memory`](crates/memory/) · [`lsp`](crates/lsp/) · [`mcp`](crates/mcp/) · [`gate`](crates/gate/) · [`lockfile`](crates/lockfile/) · [`permissions`](crates/permissions/) · [`medha-cli`](crates/medha-cli/)
+Desktop runs `medha --acp` for live sessions. Local command isolation depends on
+the selected sandbox backend; remote MCP services execute outside that local jail.
+The [full architecture](docs/WHAT_IS_MEDHA.md#architecture-at-a-glance) includes the
+[kernel loop](docs/WHAT_IS_MEDHA.md#the-main-loop),
+[authorization](docs/WHAT_IS_MEDHA.md#tool-authorization-flow),
+[recovery](docs/WHAT_IS_MEDHA.md#cancel-and-restart-recovery), and
+[subagent lifecycle](docs/WHAT_IS_MEDHA.md#spawn-execution-and-report-delivery).
 
 ## Status
 

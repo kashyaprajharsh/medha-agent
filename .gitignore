@@ -22,6 +22,9 @@ medha.lock
 # local, per-developer working ledgers (audit + post-release gaps) — kept out of the repo
 /audit/
 
+# local plans, design concepts and working notes — never commit
+/work/
+
 # Local design/audit notes; only the public Medha overview belongs in docs.
 /docs/ENGINEERING_AUDIT.md
 /docs/FEATURE_AUDIT.md

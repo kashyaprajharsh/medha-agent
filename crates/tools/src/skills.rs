@@ -171,12 +171,13 @@ pub struct Skill {
 pub struct SkillListing {
     pub skill: Skill,
     pub shadowed: bool,
+    pub disabled: bool,
     pub missing_tools: Vec<String>,
 }
 
 impl SkillListing {
     pub fn available(&self) -> bool {
-        self.missing_tools.is_empty()
+        !self.disabled && self.missing_tools.is_empty()
     }
 }
 
@@ -192,7 +193,7 @@ pub struct Discovery {
 impl Discovery {
     /// The skills that actually apply this session: not shadowed, sorted by name.
     pub fn effective(&self) -> impl Iterator<Item = &SkillListing> {
-        self.listings.iter().filter(|l| !l.shadowed)
+        self.listings.iter().filter(|l| !l.shadowed && !l.disabled)
     }
 }
 
@@ -217,6 +218,35 @@ impl SkillStore {
             user_dir,
             judge: None,
             plugin_skills: std::sync::RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Operator control shared by every surface. Disabled skills remain
+    /// discoverable for management but are absent from prompts and cannot load.
+    pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<(), String> {
+        validate_reference(name)?;
+        let discovery = self.discover(&HashSet::new());
+        let listing = discovery
+            .listings
+            .iter()
+            .find(|listing| !listing.shadowed && listing.skill.name == name)
+            .ok_or("Skill not found")?;
+        if listing.skill.scope == SkillScope::Plugin {
+            return Err("Manage this skill through its plugin".into());
+        }
+        let marker = listing.skill.path.with_file_name("SKILL.disabled");
+        if enabled {
+            match std::fs::remove_file(marker) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.to_string()),
+            }
+        } else {
+            std::fs::write(
+                marker,
+                "Disabled by the user. Remove this file to enable the skill.\n",
+            )
+            .map_err(|error| error.to_string())
         }
     }
 
@@ -280,6 +310,7 @@ impl SkillStore {
                             .cloned()
                             .collect();
                         out.listings.push(SkillListing {
+                            disabled: skill.path.with_file_name("SKILL.disabled").exists(),
                             skill,
                             shadowed,
                             missing_tools,
@@ -299,6 +330,7 @@ impl SkillStore {
             out.listings.push(SkillListing {
                 skill: skill.clone(),
                 shadowed: false,
+                disabled: false,
                 missing_tools,
             });
         }
@@ -311,6 +343,13 @@ impl SkillStore {
     /// unavailable (names the missing tools).
     pub fn load(&self, name: &str, known_tools: &HashSet<String>) -> Result<Value, String> {
         let disc = self.discover(known_tools);
+        if disc
+            .listings
+            .iter()
+            .any(|listing| !listing.shadowed && listing.skill.name == name && listing.disabled)
+        {
+            return Err(format!("skill '{name}' is disabled"));
+        }
         let Some(listing) = disc.effective().find(|l| l.skill.name == name) else {
             let available: Vec<&str> = disc.effective().map(|l| l.skill.name.as_str()).collect();
             return Err(if available.is_empty() {
@@ -536,7 +575,9 @@ impl SkillStore {
     pub fn list(&self, known_tools: &HashSet<String>) -> Value {
         let disc = self.discover(known_tools);
         let skills: Vec<Value> = disc
-            .effective()
+            .listings
+            .iter()
+            .filter(|listing| !listing.shadowed)
             .map(|l| {
                 let s = &l.skill;
                 json!({
@@ -544,6 +585,7 @@ impl SkillStore {
                     "description": s.description,
                     "scope": s.scope.as_str(),
                     "available": l.available(),
+                    "enabled": !l.disabled,
                     "missing_tools": l.missing_tools,
                     "triggers": s.triggers,
                     "domains": s.domains,
@@ -1054,13 +1096,29 @@ fn gather_flagged_content(stage: &Path, scan: &policy::guard::ScanReport) -> Str
 /// Render guard findings as `"file:line — reason"` (or `"file — reason"` for a
 /// whole-file finding) for the install report and any surface that shows them.
 fn format_findings(findings: &[policy::guard::Finding]) -> Vec<String> {
-    findings
+    const MAX_SHOWN: usize = 12;
+    let mut ordered: Vec<_> = findings.iter().collect();
+    ordered.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+    let mut lines: Vec<_> = ordered
         .iter()
+        .take(MAX_SHOWN)
         .map(|f| match f.line {
             Some(n) => format!("{}:{n} — {}", f.file, f.reason),
             None => format!("{} — {}", f.file, f.reason),
         })
-        .collect()
+        .collect();
+    if ordered.len() > MAX_SHOWN {
+        lines.push(format!(
+            "… and {} more finding(s); review the package before use",
+            ordered.len() - MAX_SHOWN
+        ));
+    }
+    lines
 }
 
 #[derive(Debug, Default)]
@@ -2032,6 +2090,51 @@ mod tests {
     const DEPLOY: &str = "---\nname = \"deploy-fly\"\ndescription = \"Deploy a FastAPI app to Fly.io\"\ntriggers = [\"deploy\", \"fly.io\"]\nrequired_tools = [\"shell.exec\"]\nversion = 1\n---\n\n## Steps\n1. flyctl launch\n";
 
     #[test]
+    fn disabled_skills_are_listed_but_cannot_enter_context_or_be_loaded() {
+        let root = tmp();
+        write_skill(&root, "deploy-fly", DEPLOY);
+        let store = SkillStore::new(root.clone(), None);
+        let known = tools(&["shell.exec", "skill"]);
+        assert!(store.manifest(&known, None).contains("deploy-fly"));
+        store.set_enabled("deploy-fly", false).unwrap();
+        assert!(!store.manifest(&known, None).contains("deploy-fly"));
+        assert!(
+            store
+                .load("deploy-fly", &known)
+                .unwrap_err()
+                .contains("disabled")
+        );
+        assert_eq!(store.list(&known)["skills"][0]["enabled"], false);
+        store.set_enabled("deploy-fly", true).unwrap();
+        assert!(store.load("deploy-fly", &known).is_ok());
+        assert!(store.manifest(&known, None).contains("deploy-fly"));
+        assert!(store.set_enabled("../escape", false).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn large_guard_reports_keep_the_install_result_readable_and_show_danger_first() {
+        let mut findings: Vec<_> = (0..40)
+            .map(|line| policy::guard::Finding {
+                file: "test/example.mjs".into(),
+                line: Some(line),
+                severity: policy::guard::Severity::Caution,
+                reason: "review source".into(),
+            })
+            .collect();
+        findings.push(policy::guard::Finding {
+            file: "SKILL.md".into(),
+            line: Some(4),
+            severity: policy::guard::Severity::Dangerous,
+            reason: "blocked dangerous command".into(),
+        });
+        let shown = format_findings(&findings);
+        assert_eq!(shown.len(), 13);
+        assert!(shown[0].starts_with("SKILL.md:4"));
+        assert!(shown.last().unwrap().contains("29 more finding"));
+    }
+
+    #[test]
     fn plugin_skills_are_namespaced_read_only_and_served_as_approved() {
         let root = tmp();
         write_skill(&root, "pkg", DEPLOY);
@@ -2240,6 +2343,31 @@ mod tests {
         assert_eq!(report.scan_verdict, "caution");
         assert!(!report.scan_findings.is_empty());
         assert!(user.join("caut").join("SKILL.md").exists());
+
+        // A bundled JavaScript module is not shell input. It remains a
+        // reviewable Caution, but ordinary `|| node` syntax cannot block it.
+        let source = root.join("source-src");
+        std::fs::create_dir_all(source.join("renderers")).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: source-skill\ndescription: d\n---\n\nRun the bundled renderer.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("renderers/layout.mjs"),
+            "const next = current || node.value;\n",
+        )
+        .unwrap();
+        let report =
+            futures::executor::block_on(store.install_from(source.to_str().unwrap())).unwrap();
+        assert_eq!(report.scan_verdict, "caution");
+        assert!(
+            report
+                .scan_findings
+                .iter()
+                .any(|f| f.contains("non-shell source"))
+        );
+        assert!(user.join("source-skill/renderers/layout.mjs").is_file());
 
         std::fs::remove_dir_all(&root).ok();
     }

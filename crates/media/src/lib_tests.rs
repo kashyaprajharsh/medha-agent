@@ -107,7 +107,27 @@ fn a_header_claiming_an_impossible_size_is_refused_before_allocating() {
     header[18..22].copy_from_slice(&40_000i32.to_le_bytes());
     header[22..26].copy_from_slice(&40_000i32.to_le_bytes());
     let error = normalize(header).unwrap_err().to_string();
-    assert!(error.contains("refuses to decode"), "{error}");
+    assert!(error.contains("dimension limit"), "{error}");
+}
+
+#[test]
+fn configured_width_and_encoded_size_ceilings_are_enforced() {
+    let raw = encoded(&canvas(600, 300), ImageFormat::Png);
+    let limits = ImageLimits {
+        max_width: 256,
+        ..ImageLimits::default()
+    };
+    let error = within_limits(raw.clone(), MAX_BYTES, limits)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dimension limit"), "{error}");
+
+    let limits = ImageLimits {
+        max_encoded_bytes: raw.len() - 1,
+        ..ImageLimits::default()
+    };
+    let admitted = within_limits(raw, limits.max_encoded_bytes, limits).unwrap();
+    assert!(admitted.bytes.len() <= limits.max_encoded_bytes);
 }
 
 /// Splice a minimal Exif APP1 segment carrying one orientation tag, the way a
@@ -130,4 +150,13 @@ fn with_exif_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
     out.extend_from_slice(&app1);
     out.extend_from_slice(&jpeg[2..]);
     out
+}
+
+#[test]
+fn transport_normalization_obeys_the_smaller_budget_and_rejects_zero() {
+    let raw = encoded(&canvas(256, 256), ImageFormat::Png);
+    let image = normalize_for_transport(raw.clone(), 4096).unwrap();
+    assert!(image.bytes.len() <= 4096);
+    assert!(image.width <= 256 && image.height <= 256);
+    assert!(normalize_for_transport(raw, 0).is_err());
 }

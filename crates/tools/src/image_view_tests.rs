@@ -67,11 +67,30 @@ async fn the_model_gets_the_picture_not_a_text_extract() {
     let kernel::MediaSource::Artifact(hash) = &media[0].source else {
         panic!("images must be stored, never inlined into the payload")
     };
+    assert_eq!(media[0].width, Some(3));
+    assert_eq!(media[0].height, Some(2));
+    assert_eq!(media[0].byte_size, Some(bytes.len()));
     assert_eq!(f.artifacts.get(hash, 0, None).unwrap(), bytes);
     assert!(
         !payload.to_string().contains("base64"),
         "pixels must not enter the payload the model reads"
     );
+}
+
+#[tokio::test]
+async fn a_large_image_path_is_rejected_before_reading_it() {
+    let f = fixture();
+    std::fs::File::create(f.dir.join("huge.png"))
+        .unwrap()
+        .set_len(media::MAX_SOURCE_BYTES as u64 + 1)
+        .unwrap();
+    let error = f
+        .tool
+        .execute(&json!({ "path": "huge.png" }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("larger"), "{error}");
 }
 
 #[tokio::test]
@@ -118,4 +137,34 @@ async fn a_missing_file_says_so_rather_than_returning_nothing() {
         .await
         .expect_err("a missing file cannot be viewed");
     assert!(error.to_string().contains("nope.png"), "{error}");
+}
+
+#[tokio::test]
+async fn a_compacted_screenshot_can_be_reopened_from_its_hash_after_the_file_is_deleted() {
+    let f = fixture();
+    write_png(&f.dir, "shot.png");
+    let payload = f.tool.execute(&json!({"path":"shot.png"})).await.unwrap();
+    let media: Vec<kernel::MediaPart> = serde_json::from_value(payload[MEDIA].clone()).unwrap();
+    let kernel::MediaSource::Artifact(hash) = &media[0].source else {
+        panic!("stored source")
+    };
+    std::fs::remove_file(f.dir.join("shot.png")).unwrap();
+    let recovered = ReadArtifact {
+        store: f.artifacts.clone(),
+    }
+    .execute(&json!({"hash":hash}))
+    .await
+    .unwrap();
+    assert_eq!(recovered["width"], 3);
+    assert_eq!(recovered["height"], 2);
+    assert!(!recovered.to_string().contains("base64"));
+    let reopened: Vec<kernel::MediaPart> =
+        serde_json::from_value(recovered[MEDIA].clone()).unwrap();
+    let kernel::MediaSource::Artifact(reopened_hash) = &reopened[0].source else {
+        panic!("stored pixels")
+    };
+    assert_eq!(
+        f.artifacts.get(reopened_hash, 0, None).unwrap(),
+        f.artifacts.get(hash, 0, None).unwrap()
+    );
 }

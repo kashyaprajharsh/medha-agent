@@ -4,13 +4,45 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, metadata::Orientation};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 pub const MAX_BYTES: usize = kernel::artifacts::MAX_IMAGE_BYTES;
+pub const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+
+/// A shared bounded reader for user paths and model-callable image tools.
+pub fn read_source(path: &std::path::Path) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open attachment {}", path.display()))?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "attachment must be a regular file: {}",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= MAX_SOURCE_BYTES as u64,
+        "attachment is larger than {MAX_SOURCE_BYTES} bytes"
+    );
+    let mut raw = Vec::new();
+    file.take(MAX_SOURCE_BYTES as u64 + 1)
+        .read_to_end(&mut raw)?;
+    ensure!(
+        raw.len() <= MAX_SOURCE_BYTES,
+        "attachment is larger than {MAX_SOURCE_BYTES} bytes"
+    );
+    Ok(raw)
+}
+
+/// Recognize an image header without allocating a decoded pixel buffer.
+/// Full validation and size guards still belong to `normalize`.
+pub fn has_image_header(bytes: &[u8]) -> bool {
+    image::guess_format(bytes).is_ok()
+}
 
 /// Decode guard: a header claiming more pixels than this is refused before any
 /// buffer is allocated for it.
 const MAX_PIXELS: u64 = 50_000_000;
+const MAX_DIMENSION: u32 = 16_384;
 
 /// First long-edge target when an image has to shrink to fit the budget. Well
 /// above what vision models sample at, so screenshot text stays readable.
@@ -25,6 +57,58 @@ pub struct Image {
     pub height: u32,
     /// What admission changed, for the surface to show. `None` = sent verbatim.
     pub note: Option<String>,
+}
+
+/// Local admission ceilings. Operators can lower them with environment
+/// variables; the artifact and request path still enforce the 10 MiB hard cap.
+#[derive(Debug, Clone, Copy)]
+pub struct ImageLimits {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_pixels: u64,
+    pub max_encoded_bytes: usize,
+}
+
+impl Default for ImageLimits {
+    fn default() -> Self {
+        Self {
+            max_width: MAX_DIMENSION,
+            max_height: MAX_DIMENSION,
+            max_pixels: MAX_PIXELS,
+            max_encoded_bytes: MAX_BYTES,
+        }
+    }
+}
+
+impl ImageLimits {
+    pub fn from_env() -> Result<Self> {
+        fn ceiling<T: std::str::FromStr + PartialOrd + Copy + Default>(
+            name: &str,
+            default: T,
+            hard_max: T,
+        ) -> Result<T> {
+            let Some(value) = std::env::var_os(name) else {
+                return Ok(default);
+            };
+            let text = value.to_str().context(format!("{name} must be UTF-8"))?;
+            let parsed = text
+                .parse::<T>()
+                .map_err(|_| anyhow::anyhow!("invalid {name}"))?;
+            ensure!(
+                parsed > T::default() && parsed <= hard_max,
+                "{name} exceeds its allowed range"
+            );
+            Ok(parsed)
+        }
+        // Parse as integers here instead of accepting strings with units, so
+        // the exact byte and pixel ceiling is clear in diagnostics.
+        Ok(Self {
+            max_width: ceiling("MEDHA_IMAGE_MAX_WIDTH", MAX_DIMENSION, MAX_DIMENSION)?,
+            max_height: ceiling("MEDHA_IMAGE_MAX_HEIGHT", MAX_DIMENSION, MAX_DIMENSION)?,
+            max_pixels: ceiling("MEDHA_IMAGE_MAX_PIXELS", MAX_PIXELS, MAX_PIXELS)?,
+            max_encoded_bytes: ceiling("MEDHA_IMAGE_MAX_BYTES", MAX_BYTES, MAX_BYTES)?,
+        })
+    }
 }
 
 impl std::fmt::Debug for Image {
@@ -73,12 +157,27 @@ pub fn has_image_extension(path: &std::path::Path) -> bool {
 }
 
 pub fn normalize(raw: Vec<u8>) -> Result<Image> {
-    within(raw, MAX_BYTES)
+    let limits = ImageLimits::from_env()?;
+    within_limits(raw, limits.max_encoded_bytes, limits)
 }
 
+/// Normalize through the same admission path while respecting a surface's
+/// smaller transport budget. It can only lower configured safety ceilings.
+pub fn normalize_for_transport(raw: Vec<u8>, budget: usize) -> Result<Image> {
+    ensure!(raw.len() <= MAX_SOURCE_BYTES, "image source exceeds 64 MiB");
+    ensure!(budget > 0, "image transport budget must be positive");
+    let limits = ImageLimits::from_env()?;
+    within_limits(raw, budget.min(limits.max_encoded_bytes), limits)
+}
+
+#[cfg(test)]
 fn within(raw: Vec<u8>, budget: usize) -> Result<Image> {
+    within_limits(raw, budget, ImageLimits::default())
+}
+
+fn within_limits(raw: Vec<u8>, budget: usize, limits: ImageLimits) -> Result<Image> {
     let kind = identify(&raw)?;
-    let (width, height, orientation) = probe(&raw, kind.format)?;
+    let (width, height, orientation) = probe(&raw, kind.format, limits)?;
     // Decode even when the bytes will be forwarded untouched: a truncated file
     // has to fail here, with the path in the message, rather than as a provider
     // rejection halfway through a turn.
@@ -155,6 +254,15 @@ fn fit_budget(image: DynamicImage, prefer_jpeg: bool, budget: usize) -> Result<I
 
 /// The clipboard hands over raw pixels rather than an encoded file.
 pub fn from_rgba(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>> {
+    let limits = ImageLimits::from_env()?;
+    ensure!(
+        width <= limits.max_width && height <= limits.max_height,
+        "clipboard image dimensions exceed the configured limit"
+    );
+    ensure!(
+        u64::from(width) * u64::from(height) <= limits.max_pixels,
+        "clipboard image pixel count exceeds the configured limit"
+    );
     let buffer = image::RgbaImage::from_raw(width, height, pixels.to_vec())
         .context("clipboard pixel buffer does not match its reported size")?;
     encode(&DynamicImage::ImageRgba8(buffer), ImageFormat::Png)
@@ -181,13 +289,20 @@ fn encode(image: &DynamicImage, format: ImageFormat) -> Result<Vec<u8>> {
 }
 
 /// Dimensions and orientation come from the header, before anything is decoded.
-fn probe(raw: &[u8], format: ImageFormat) -> Result<(u32, u32, Orientation)> {
+fn probe(raw: &[u8], format: ImageFormat, limits: ImageLimits) -> Result<(u32, u32, Orientation)> {
     let mut decoder = reader(raw, format).into_decoder()?;
     let (width, height) = decoder.dimensions();
     ensure!(width > 0 && height > 0, "image has no pixels");
     ensure!(
-        u64::from(width) * u64::from(height) <= MAX_PIXELS,
-        "image is {width}×{height}; Medha refuses to decode more than {MAX_PIXELS} pixels"
+        width <= limits.max_width && height <= limits.max_height,
+        "image is {width}×{height}; configured dimension limit is {}×{}",
+        limits.max_width,
+        limits.max_height
+    );
+    ensure!(
+        u64::from(width) * u64::from(height) <= limits.max_pixels,
+        "image is {width}×{height}; Medha refuses to decode more than {} pixels",
+        limits.max_pixels
     );
     Ok((
         width,

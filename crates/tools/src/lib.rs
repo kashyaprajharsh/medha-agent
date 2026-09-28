@@ -1214,7 +1214,7 @@ impl Tool for Read {
     fn description(&self) -> &str {
         "Read a file by `path`, or a stored artifact by `hash`. For text, use \
          `offset` (1-based line) and `limit` to read part of a large \
-         file instead of all of it. An image path returns the picture itself, so use \
+         file instead of all of it. An image path or stored image hash returns the picture itself, so use \
          this rather than a shell command to look at a screenshot or diagram — \
          oversized images are scaled and rotated photos made upright first. Pass \
          `count: true` for words, lines and characters instead of contents. With \
@@ -1318,15 +1318,17 @@ impl Tool for ImageView {
                 )
             })
         })?;
-        let raw = tokio::fs::read(&resolved)
-            .await
-            .map_err(|error| ToolError::Failed(format!("cannot read {path}: {error}")))?;
+        let image_path = resolved.clone();
         let artifacts = self.artifacts.clone();
-        let image = tokio::task::spawn_blocking(move || media::normalize(raw))
-            .await
-            .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
-            .map_err(|error| ToolError::Args(format!("{path}: {error}")))?;
+        let image = tokio::task::spawn_blocking(move || {
+            let raw = media::read_source(&image_path)?;
+            media::normalize(raw)
+        })
+        .await
+        .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
+        .map_err(|error| ToolError::Args(format!("{path}: {error}")))?;
         let (width, height, mime, note) = (image.width, image.height, image.mime, image.note);
+        let byte_size = image.bytes.len();
         let hash = artifacts
             .put_async(image.bytes)
             .await
@@ -1337,6 +1339,9 @@ impl Tool for ImageView {
             label: resolved
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned()),
+            width: Some(width),
+            height: Some(height),
+            byte_size: Some(byte_size),
             provider_state: Vec::new(),
         };
         Ok(json!({
@@ -2972,7 +2977,8 @@ impl Tool for ReadArtifact {
          whenever a tool result shows a hash and says only the first N chars are \
          shown, use this to read the rest. Page through with `offset`/`length` \
          until you have what you need. Never tell the user an output was truncated \
-         or that you can't see it: the full content is here, so fetch it."
+         or that you can't see it: the full content is here, so fetch it. \
+         A stored image hash returns pixels again when read from offset 0 with no length."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -3027,6 +3033,39 @@ impl Tool for ReadArtifact {
             .get_async(hash.clone(), offset, Some(length))
             .await
             .map_err(ToolError::Failed)?;
+        if offset == 0 && args.get("length").is_none() && media::has_image_header(&bytes) {
+            if total > media::MAX_SOURCE_BYTES {
+                return Err(ToolError::Args(
+                    "stored image exceeds the 64 MiB source limit".into(),
+                ));
+            }
+            let raw = Arc::clone(&self.store)
+                .get_async(hash.clone(), 0, Some(media::MAX_SOURCE_BYTES + 1))
+                .await
+                .map_err(ToolError::Failed)?;
+            let image = tokio::task::spawn_blocking(move || media::normalize(raw))
+                .await
+                .map_err(|error| ToolError::Failed(format!("image decode task failed: {error}")))?
+                .map_err(|error| ToolError::Args(error.to_string()))?;
+            let byte_size = image.bytes.len();
+            let stored = Arc::clone(&self.store)
+                .put_async(image.bytes)
+                .await
+                .map_err(ToolError::Failed)?;
+            let part = kernel::MediaPart {
+                mime_type: image.mime.to_owned(),
+                source: kernel::MediaSource::Artifact(stored),
+                label: Some(format!("stored image {hash}")),
+                width: Some(image.width),
+                height: Some(image.height),
+                byte_size: Some(byte_size),
+                provider_state: Vec::new(),
+            };
+            return Ok(
+                json!({"hash":hash,"width":image.width,"height":image.height,"mime":image.mime,
+                "note":image.note, MEDIA:[part]}),
+            );
+        }
         let lead = if offset > 0 {
             bytes.iter().take_while(|b| (**b & 0xC0) == 0x80).count()
         } else {

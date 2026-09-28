@@ -148,6 +148,19 @@ pub trait ExecBackend: Send + Sync {
     /// is applied in one place for both foreground and background runs.
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError>;
 
+    /// Run an enabled plugin with host-validated package/data paths. Unlike a
+    /// shell command, its working directory does not imply write permission.
+    fn build_plugin_command(
+        &self,
+        _req: &ExecRequest,
+        _package: &Path,
+        _data: &Path,
+    ) -> Result<tokio::process::Command, ExecError> {
+        Err(ExecError::Unavailable(
+            "plugin isolation is unavailable".into(),
+        ))
+    }
+
     /// Run a command to completion (foreground). Default: build + supervise, so a
     /// timeout/cancel tears down the whole process group (see [`GroupReaper`]).
     async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError> {
@@ -1777,6 +1790,46 @@ fn safe_request_readable(paths: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// These roots come from the enabled package registry, never tool arguments.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone)]
+struct PluginScope {
+    package: PathBuf,
+    data: PathBuf,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl PluginScope {
+    fn new(package: &Path, data: &Path) -> Result<Self, ExecError> {
+        let resolve = |path: &Path, directory: &str| {
+            let root = path
+                .canonicalize()
+                .map_err(|error| ExecError::Unavailable(error.to_string()))?;
+            let allowed = native_sensitive_paths().iter().all(|secret| {
+                let secret = resolve_native_policy_path(secret).unwrap_or_else(|| secret.clone());
+                if !root.starts_with(&secret) && !secret.starts_with(&root) {
+                    return true;
+                }
+                // Only one installed package or its private data, never the
+                // whole state directory, credentials, or another package.
+                secret.file_name().is_some_and(|name| name == ".medha")
+                    && root.parent() == Some(secret.join(directory).as_path())
+            });
+            if !root.is_dir() || !allowed {
+                return Err(ExecError::Unavailable(format!(
+                    "invalid plugin {directory} root: {}",
+                    root.display()
+                )));
+            }
+            Ok(root)
+        };
+        Ok(Self {
+            package: resolve(package, "plugins")?,
+            data: resolve(data, "plugin-data")?,
+        })
+    }
+}
+
 /// Skill assets are deliberately shared with file tools by the harness. Allow
 /// those same read roots beneath ~/.medha/skills in the exec jail, while keeping
 /// the rest of ~/.medha private. Resolve each root before comparing so a skill
@@ -1802,14 +1855,14 @@ fn skill_read_exceptions(secret: &Path, approved: &ApprovedRoots) -> Vec<PathBuf
 }
 
 #[cfg(target_os = "macos")]
-fn sensitive_read_deny(secret: &Path, exceptions: &[PathBuf]) -> String {
+fn sensitive_deny(access: &str, secret: &Path, exceptions: &[PathBuf]) -> String {
     let secret = sbpl_escape(&secret.to_string_lossy());
     let mut filter = format!("(require-any (literal \"{secret}\") (subpath \"{secret}\"))");
     for root in exceptions {
         let root = sbpl_escape(&root.to_string_lossy());
         filter = format!("(require-all {filter} (require-not (subpath \"{root}\")))");
     }
-    format!("(deny file-read* {filter})\n")
+    format!("(deny {access} {filter})\n")
 }
 
 /// Absolute-path tokens in a line of tool output or an argv entry. Utilities
@@ -2046,12 +2099,14 @@ fn sbpl_escape(s: &str) -> String {
 /// and writes are deny-by-default, reopened only for the workspace, an isolated
 /// HOME/TMP, system runtimes, and selected toolchain roots.
 #[cfg(target_os = "macos")]
+#[derive(Clone)]
 pub struct SeatbeltBackend {
     net: NetPolicy,
     extra_writable: Vec<PathBuf>,
     approved: ApprovedRoots,
     net_grant: NetworkGrant,
     home: std::sync::Arc<IsolatedHome>,
+    plugin: Option<PluginScope>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2063,6 +2118,7 @@ impl SeatbeltBackend {
             approved,
             net_grant: NetworkGrant::default(),
             home: IsolatedHome::shared(),
+            plugin: None,
         }
     }
 
@@ -2074,7 +2130,7 @@ impl SeatbeltBackend {
     /// Network policy for this run: a one-shot task-local grant or a live
     /// session/persistent grant opens it; otherwise the configured default.
     fn effective_net(&self, _req: &ExecRequest) -> NetPolicy {
-        if kernel::network_once_active() || self.net_grant.granted() {
+        if self.plugin.is_none() && (kernel::network_once_active() || self.net_grant.granted()) {
             NetPolicy::Allow
         } else {
             self.net
@@ -2084,7 +2140,6 @@ impl SeatbeltBackend {
     fn readable_paths(&self, req: &ExecRequest) -> Vec<PathBuf> {
         let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
         let mut readable = vec![
-            ws,
             self.home.path.clone(),
             PathBuf::from("/System"),
             PathBuf::from("/usr"),
@@ -2106,6 +2161,10 @@ impl SeatbeltBackend {
             PathBuf::from("/Library/Developer"),
             PathBuf::from("/Applications/Xcode.app"),
         ];
+        match &self.plugin {
+            Some(plugin) => readable.extend([plugin.package.clone(), plugin.data.clone()]),
+            None => readable.push(ws),
+        }
         readable.extend(native_toolchain_read_roots());
         readable.extend(self.extra_writable.iter().cloned());
         // Live user approvals: a write grant implies read, or editing under it
@@ -2127,7 +2186,11 @@ impl SeatbeltBackend {
     fn profile(&self, req: &ExecRequest) -> String {
         // Canonicalize so the subpath match survives /var → /private/var etc.
         let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
-        let mut writable: Vec<PathBuf> = vec![ws, self.home.path.clone()];
+        let mut writable = vec![self.home.path.clone()];
+        match &self.plugin {
+            Some(plugin) => writable.push(plugin.data.clone()),
+            None => writable.push(ws),
+        }
         writable.extend(self.extra_writable.iter().cloned());
         writable.extend(safe_extra_writable(&self.approved.write_roots()));
         writable.extend(safe_extra_writable(&req.write_roots));
@@ -2176,13 +2239,21 @@ impl SeatbeltBackend {
         // A workspace that is nested near HOME cannot accidentally broaden a
         // more-specific credential path through the workspace subpath rule.
         for secret in native_sensitive_paths() {
-            let exceptions = skill_read_exceptions(&secret, &self.approved);
+            let mut exceptions = skill_read_exceptions(&secret, &self.approved);
+            let writes: Vec<PathBuf> = self
+                .plugin
+                .as_ref()
+                .map(|plugin| {
+                    exceptions.extend([plugin.package.clone(), plugin.data.clone()]);
+                    vec![plugin.data.clone()]
+                })
+                .unwrap_or_default();
             let resolved = resolve_native_policy_path(&secret).unwrap_or(secret);
-            p.push_str(&sensitive_read_deny(&resolved, &exceptions));
-            let secret = sbpl_escape(&resolved.to_string_lossy());
-            p.push_str(&format!(
-                "(deny file-write* (literal \"{secret}\") (subpath \"{secret}\"))\n"
-            ));
+            p.push_str(&sensitive_deny("file-read*", &resolved, &exceptions));
+            p.push_str(&sensitive_deny("file-write*", &resolved, &writes));
+        }
+        if let Some(plugin) = &self.plugin {
+            p.push_str(&sensitive_deny("file-write*", &plugin.package, &[]));
         }
         if self.effective_net(req) == NetPolicy::Deny {
             p.push_str("(deny network*)\n");
@@ -2194,6 +2265,17 @@ impl SeatbeltBackend {
 #[cfg(target_os = "macos")]
 #[async_trait]
 impl ExecBackend for SeatbeltBackend {
+    fn build_plugin_command(
+        &self,
+        req: &ExecRequest,
+        package: &Path,
+        data: &Path,
+    ) -> Result<tokio::process::Command, ExecError> {
+        let mut scoped = self.clone();
+        scoped.plugin = Some(PluginScope::new(package, data)?);
+        scoped.build_command(req)
+    }
+
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
         if workspace_contains_native_credentials(&req.cwd) {
             return Err(ExecError::Unavailable(
@@ -2236,12 +2318,14 @@ impl ExecBackend for SeatbeltBackend {
 /// the child rather than the agent. The ruleset is built in the parent; only the
 /// allocation-free `restrict_self` runs post-fork.
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
 pub struct LandlockBackend {
     net: NetPolicy,
     extra_writable: Vec<PathBuf>,
     approved: ApprovedRoots,
     net_grant: NetworkGrant,
     home: std::sync::Arc<IsolatedHome>,
+    plugin: Option<PluginScope>,
 }
 
 #[cfg(target_os = "linux")]
@@ -2253,6 +2337,7 @@ impl LandlockBackend {
             approved,
             net_grant: NetworkGrant::default(),
             home: IsolatedHome::shared(),
+            plugin: None,
         }
     }
 
@@ -2262,7 +2347,7 @@ impl LandlockBackend {
     }
 
     fn effective_net(&self, _req: &ExecRequest) -> NetPolicy {
-        if kernel::network_once_active() || self.net_grant.granted() {
+        if self.plugin.is_none() && (kernel::network_once_active() || self.net_grant.granted()) {
             NetPolicy::Allow
         } else {
             self.net
@@ -2271,7 +2356,11 @@ impl LandlockBackend {
 
     fn writable_paths(&self, req: &ExecRequest) -> Vec<PathBuf> {
         let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
-        let mut v = vec![ws, self.home.path.clone()];
+        let mut v = vec![self.home.path.clone()];
+        match &self.plugin {
+            Some(plugin) => v.push(plugin.data.clone()),
+            None => v.push(ws),
+        }
         v.extend(self.extra_writable.iter().cloned());
         v.extend(safe_extra_writable(&self.approved.write_roots()));
         v.extend(safe_extra_writable(&req.write_roots));
@@ -2289,7 +2378,6 @@ impl LandlockBackend {
     fn readable_paths(&self, req: &ExecRequest) -> Vec<PathBuf> {
         let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
         let mut paths = vec![
-            ws,
             self.home.path.clone(),
             PathBuf::from("/usr"),
             PathBuf::from("/bin"),
@@ -2325,6 +2413,10 @@ impl LandlockBackend {
             if Path::new(file).exists() {
                 paths.push(PathBuf::from(file));
             }
+        }
+        match &self.plugin {
+            Some(plugin) => paths.extend([plugin.package.clone(), plugin.data.clone()]),
+            None => paths.push(ws),
         }
         paths.extend(native_toolchain_read_roots());
         paths.extend(self.extra_writable.iter().cloned());
@@ -2416,6 +2508,17 @@ fn build_landlock_ruleset(
 #[cfg(target_os = "linux")]
 #[async_trait]
 impl ExecBackend for LandlockBackend {
+    fn build_plugin_command(
+        &self,
+        req: &ExecRequest,
+        package: &Path,
+        data: &Path,
+    ) -> Result<tokio::process::Command, ExecError> {
+        let mut scoped = self.clone();
+        scoped.plugin = Some(PluginScope::new(package, data)?);
+        scoped.build_command(req)
+    }
+
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
         use std::os::unix::process::CommandExt;
 

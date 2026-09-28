@@ -788,7 +788,7 @@ pub(crate) fn hard_dangerous(c: &str, workspace: Option<&str>) -> Option<String>
     static EMBEDDED_PIPE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let embedded_pipe = EMBEDDED_PIPE.get_or_init(|| {
         Regex::new(
-            r"\|[ \t]*(?:(?:env|command|nohup)[ \t]+(?:(?:-[^ \t]+|[a-z_][a-z0-9_]*=[^ \t]+)[ \t]+)*)?(?:/[a-z0-9_./-]+/)?(?:sh|dash|bash|zsh|fish|ksh|python[23]?|perl|ruby|node|php|lua)\b",
+            r"(?:^|[^|])\|[ \t]*(?:(?:env|command|nohup)[ \t]+(?:(?:-[^ \t]+|[a-z_][a-z0-9_]*=[^ \t]+)[ \t]+)*)?(?:/[a-z0-9_./-]+/)?(?:sh|dash|bash|zsh|fish|ksh|python[23]?|perl|ruby|node|php|lua)\b",
         )
         .expect("static pattern")
     });

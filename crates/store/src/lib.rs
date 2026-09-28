@@ -329,6 +329,18 @@ fn open_verified_artifact_for_sync(path: &Path, expected_hash: &str) -> Result<F
 
 struct TemporaryArtifact(PathBuf);
 
+fn private_artifact(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 impl Drop for TemporaryArtifact {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -375,6 +387,12 @@ impl FileArtifactStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::Io(e.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| StoreError::Io(e.to_string()))?;
+        }
         Ok(Self { dir })
     }
 
@@ -394,16 +412,19 @@ impl ArtifactStore for FileArtifactStore {
         let hash = format!("{:x}", h.finalize());
         let path = self.dir.join(&hash);
         if open_verified_artifact(&path, &hash).is_ok() {
+            private_artifact(&path)?;
             return Ok(hash);
         }
 
         let temporary = TemporaryArtifact(self.dir.join(format!(".{hash}.{}.tmp", Ulid::new())));
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&temporary.0)
-            .map_err(|e| e.to_string())?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary.0).map_err(|e| e.to_string())?;
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         if !file_digest(&mut file)?.eq_ignore_ascii_case(&hash) {
@@ -418,6 +439,7 @@ impl ArtifactStore for FileArtifactStore {
         {
             return Err(format!("could not atomically publish artifact: {error}"));
         }
+        private_artifact(&path)?;
         let final_file = open_verified_artifact_for_sync(&path, &hash)?;
         final_file.sync_all().map_err(|e| e.to_string())?;
         #[cfg(unix)]
@@ -624,10 +646,11 @@ impl SqliteLog {
         self.with_verified_snapshot(true, |_| Ok(()))
     }
 
-    /// Reserve the writer before reading the version so an external commit
-    /// cannot race the cache check and snapshot selection. Keep the reservation
-    /// through the query. Warm session reads hold it only for an indexed lookup;
-    /// cold verification still blocks writers while it authenticates the chain.
+    /// Pin one WAL read snapshot before reading the version, so the version,
+    /// the verified chain and the query all describe the same commit. An
+    /// external commit after the pin is invisible here and changes the version
+    /// the next read sees, which verifies again. Readers never hold the write
+    /// lock, so a long verification cannot make a live turn's append time out.
     fn with_verified_snapshot<T>(
         &self,
         force: bool,
@@ -638,7 +661,9 @@ impl SqliteLog {
             .lock()
             .map_err(|_| StoreError::Db("lock poisoned".into()))?;
         let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        tx.query_row("SELECT 1 FROM sqlite_schema LIMIT 1", [], |_| Ok(()))
             .map_err(|error| StoreError::Db(error.to_string()))?;
         let version = VerifiedVersion::read(&tx)?;
         let mut cached = self
@@ -675,6 +700,7 @@ impl SqliteLog {
                 "SELECT e1.session_id, MIN(e1.ts), MAX(e1.ts), COUNT(*),
                     (SELECT e2.payload FROM events e2
                      WHERE e2.session_id = e1.session_id AND e2.kind = 'user.message'
+                       AND e2.trust = 'user' AND json_extract(e2.payload, '$.hook') IS NULL
                      ORDER BY e2.rowid ASC LIMIT 1)
                  FROM events e1
                  GROUP BY e1.session_id
@@ -1471,23 +1497,24 @@ mod tests {
     }
 
     #[test]
-    fn verified_snapshot_blocks_a_writer_until_its_result_is_read() {
+    fn a_verified_read_never_blocks_a_writer_nor_blesses_its_commit() {
         let dir = std::env::temp_dir().join(format!("medha-cache-race-{}", Ulid::new()));
         let db = dir.join("events.db");
         let log = SqliteLog::open(&db).unwrap();
         log.verify().unwrap();
         let writer = Connection::open(&db).unwrap();
         writer.busy_timeout(Duration::ZERO).unwrap();
-        log.with_verified_snapshot(false, |_| {
-            let error = writer.execute("DELETE FROM store_meta", []).unwrap_err();
-            assert_eq!(
-                error.sqlite_error_code(),
-                Some(rusqlite::ErrorCode::DatabaseBusy)
-            );
+        let count = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM store_meta", [], |row| row.get(0))
+                .unwrap()
+        };
+        log.with_verified_snapshot(false, |conn| {
+            let before = count(conn);
+            writer.execute("DELETE FROM store_meta", []).unwrap();
+            assert_eq!(count(conn), before);
             Ok(())
         })
         .unwrap();
-        writer.execute("DELETE FROM store_meta", []).unwrap();
         assert!(log.session_events(Ulid::new()).is_err());
         drop((writer, log));
         std::fs::remove_dir_all(dir).unwrap();
@@ -1525,6 +1552,25 @@ mod tests {
         assert_eq!(sessions[1].id, s1.id);
         assert_eq!(sessions[1].title, "first task here");
         assert_eq!(sessions[1].events, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_session_is_titled_by_the_person_not_by_hook_context() {
+        let dir = std::env::temp_dir().join(format!("medha-sess-hook-{}", Ulid::new()));
+        let log = SqliteLog::open(dir.join("events.db")).unwrap();
+        let session = kernel::Session::new();
+        let mut hook = Event::user_input(
+            &session,
+            "[session_start hook p/c] be terse",
+            TrustLabel::Tool,
+        );
+        hook.payload["hook"] = serde_json::json!({"point": "session_start"});
+        log.append(hook).await.unwrap();
+        log.append(Event::user_message(&session, "fix the login bug"))
+            .await
+            .unwrap();
+        assert_eq!(log.list_sessions().unwrap()[0].title, "fix the login bug");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1783,6 +1829,28 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn artifact_files_and_directory_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("medha-art-private-{}", Ulid::new()));
+        let store = FileArtifactStore::open(&dir).unwrap();
+        let hash = store.put(b"private image").unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join(hash))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn locked_event_database_does_not_block_timers_streams_or_queued_cancellation() {
         let dir = std::env::temp_dir().join(format!("medha-store-async-lock-{}", Ulid::new()));
@@ -1884,6 +1952,62 @@ mod tests {
         assert_eq!(log.events(s.id).await.len(), 3);
         log.verify().unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn image_references_survive_sqlite_reopen_and_fork_without_embedded_bytes() {
+        use kernel::{MediaPart, MediaSource};
+        let dir = std::env::temp_dir().join(format!("medha-image-fork-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let artifacts = FileArtifactStore::open(dir.join("artifacts")).unwrap();
+        let bytes = b"private image bytes";
+        let hash = artifacts.put(bytes).unwrap();
+        let session = kernel::Session::new();
+        let mut prompt = kernel::Message::user("inspect this");
+        prompt.attachments.push(MediaPart {
+            mime_type: "image/png".into(),
+            source: MediaSource::Artifact(hash.clone()),
+            label: Some("shot.png".into()),
+            width: Some(1),
+            height: Some(1),
+            byte_size: Some(bytes.len()),
+            provider_state: Vec::new(),
+        });
+        let log = SqliteLog::open(&db).unwrap();
+        log.append(Event::user_input_message(&session, &prompt))
+            .await
+            .unwrap();
+        let cut = log
+            .append(Event::user_message(&session, "next"))
+            .await
+            .unwrap();
+        drop(log);
+
+        let reopened = SqliteLog::open(&db).unwrap();
+        let events = reopened.events(session.id).await;
+        assert_eq!(
+            kernel::project_messages(&events)[0].attachments,
+            prompt.attachments
+        );
+        assert_eq!(events[0].payload["attachments"][0]["width"], 1);
+        assert_eq!(
+            events[0].payload["attachments"][0]["byte_size"],
+            bytes.len()
+        );
+        assert!(
+            !events[0]
+                .payload
+                .to_string()
+                .contains("private image bytes")
+        );
+        let branch = reopened.fork(session.id, cut.id).await.unwrap();
+        let branch_events = reopened.events(branch).await;
+        assert_eq!(
+            kernel::project_messages(&branch_events)[0].attachments,
+            prompt.attachments
+        );
+        assert_eq!(artifacts.get(&hash, 0, None).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

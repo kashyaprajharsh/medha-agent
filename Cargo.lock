@@ -2300,6 +2300,7 @@ dependencies = [
  "providers",
  "pulldown-cmark",
  "ratatui",
+ "reqwest 0.12.28",
  "rustyline",
  "sandbox",
  "serde",
@@ -2316,8 +2317,10 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "transcript-view",
  "ulid",
  "unicode-width 0.2.0",
+ "url",
  "windows-sys 0.60.2",
 ]
 
@@ -3087,6 +3090,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4765,6 +4769,15 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "transcript-view"
+version = "0.1.8"
+dependencies = [
+ "pulldown-cmark",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

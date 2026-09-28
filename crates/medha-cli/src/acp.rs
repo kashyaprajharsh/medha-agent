@@ -2,7 +2,7 @@
 //! stdio. It accepts messages, approvals, and cancellation while streaming
 //! event and approval notifications.
 
-use kernel::{Budget, EventLog, Kernel, Message, Provider, Session, StopReason};
+use kernel::{Budget, EventLog, Kernel, Message, Session, StopReason};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -16,11 +16,12 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 const OUTBOUND_FRAMES: usize = 256;
-const MAX_OUTBOUND_FRAME: usize = 2 * 1024 * 1024;
-const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OUTBOUND_FRAME: usize = 16 * 1024 * 1024;
+const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const TURN_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const TURN_ABORT_GRACE: Duration = Duration::from_secs(2);
+const ROSTER_INTERVAL: Duration = Duration::from_millis(500);
 
 enum Outbound {
     Frame(Vec<u8>),
@@ -311,6 +312,7 @@ pub(crate) struct Bridge {
     pub(crate) writer: Arc<Writer>,
     pub(crate) pending: Pending,
     pub(crate) peer: Peer,
+    pub(crate) questions: crate::acp_questions::Questions,
     writer_task: WriterTask,
 }
 
@@ -348,6 +350,7 @@ where
         }),
         pending: Arc::new(Mutex::new(HashMap::new())),
         peer: Peer::for_workspace(workspace),
+        questions: Default::default(),
         writer_task: WriterTask {
             handle: Some(handle),
             cancelled,
@@ -530,6 +533,16 @@ fn acp_tool_kind(tool: &str) -> &'static str {
 }
 
 impl kernel::StreamSink for AcpSink {
+    fn phase(&self, phase: kernel::progress::Phase) {
+        if !self.peer.is_acp() && phase == kernel::progress::Phase::Generating {
+            self.writer.event("model.waiting", json!({}));
+        }
+    }
+    fn notice(&self, text: &str) {
+        if !self.peer.is_acp() {
+            self.writer.event("notice", json!({ "text": text }));
+        }
+    }
     fn text(&self, delta: &str) {
         if self.peer.is_acp() {
             self.peer.update(
@@ -730,18 +743,50 @@ enum RpcAction {
         /// sit in the transcript or the log.
         images: Vec<AcpImage>,
         reply_to: Option<Value>,
+        admission_reply_to: Option<Value>,
     },
     Shutdown,
 }
 
 impl RpcAction {
+    #[cfg(test)]
     fn turn(content: String) -> Self {
         Self::StartTurn {
             content,
             images: Vec::new(),
             reply_to: None,
+            admission_reply_to: None,
         }
     }
+}
+
+fn desktop_images(value: Option<&Value>) -> Result<Vec<AcpImage>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .filter(|items| items.len() <= 4)
+        .ok_or("Attach at most four images.")?;
+    items
+        .iter()
+        .map(|image| {
+            let mime = image["mime"]
+                .as_str()
+                .filter(|mime| {
+                    matches!(
+                        *mime,
+                        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                    )
+                })
+                .ok_or("Use PNG, JPEG, WebP, or GIF images.")?;
+            let data = image["data"]
+                .as_str()
+                .filter(|data| !data.is_empty() && data.len() <= 3_000_000)
+                .ok_or("Image data is missing or too large.")?;
+            Ok(AcpImage::Inline(mime.to_owned(), data.to_owned()))
+        })
+        .collect()
 }
 
 /// Decode, normalise and store what the editor attached. Errors name the image
@@ -763,13 +808,20 @@ async fn admit_acp_images(
                 let position = index + 1;
                 let label = image.label(position);
                 let bytes = match &image {
-                    AcpImage::Inline(_, data) => base64::engine::general_purpose::STANDARD
-                        .decode(data.as_bytes())
-                        .map_err(|error| {
-                            format!("image {position} is not valid base64: {error}")
-                        })?,
-                    AcpImage::Linked(path) => std::fs::read(path)
-                        .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+                    AcpImage::Inline(_, data) => {
+                        if data.len() > crate::attachments::MAX_SOURCE_BYTES.div_ceil(3) * 4 {
+                            return Err(format!(
+                                "image {position} exceeds the attachment size limit"
+                            ));
+                        }
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data.as_bytes())
+                            .map_err(|error| {
+                                format!("image {position} is not valid base64: {error}")
+                            })?
+                    }
+                    AcpImage::Linked(path) => crate::attachments::read_source(path)
+                        .map_err(|error| format!("image {position}: {error:#}"))?,
                 };
                 crate::attachments::admit(bytes, label, &artifacts)
                     .map(|attachment| attachment.part)
@@ -1105,6 +1157,7 @@ fn dispatch_rpc(
                 },
                 images: prompt.images,
                 reply_to: id,
+                admission_reply_to: None,
             }
         }
         "session/cancel" => {
@@ -1127,6 +1180,22 @@ fn dispatch_rpc(
             RpcAction::None
         }
         "message.send" => {
+            let images = match desktop_images(params.get("images")) {
+                Ok(images) => images,
+                Err(error) => {
+                    rpc_error(writer, &id, -32602, error);
+                    return RpcAction::None;
+                }
+            };
+            if running && !images.is_empty() {
+                rpc_error(
+                    writer,
+                    &id,
+                    -32000,
+                    "Send images after the current turn finishes.",
+                );
+                return RpcAction::None;
+            }
             let Some(content) = params
                 .get("content")
                 .and_then(Value::as_str)
@@ -1146,8 +1215,18 @@ fn dispatch_rpc(
                 }
                 RpcAction::None
             } else {
-                rpc_result(writer, &id, json!({ "accepted": true, "steered": false }));
-                RpcAction::turn(content)
+                let admission_reply_to = if images.is_empty() {
+                    rpc_result(writer, &id, json!({ "accepted": true, "steered": false }));
+                    None
+                } else {
+                    id
+                };
+                RpcAction::StartTurn {
+                    content,
+                    images,
+                    reply_to: None,
+                    admission_reply_to,
+                }
             }
         }
         "approval.respond" => {
@@ -1260,28 +1339,49 @@ async fn settle_turn(
 #[allow(clippy::too_many_arguments)]
 pub async fn run<P, L>(
     kernel: Arc<Kernel<P, L>>,
-    session: Session,
+    mut session: Session,
     system: String,
-    model: String,
+    mut model: String,
     base_budget: Budget,
     agent_budget: kernel::BudgetHandle,
     resumed: Vec<Message>,
     bridge: Bridge,
+    agents: Option<Arc<orchestrator::AgentControl>>,
+    model_config: Arc<Mutex<crate::config::Config>>,
+    mut active_profile: String,
+    extensions: crate::desktop_extensions::Runtime,
 ) -> anyhow::Result<()>
 where
-    P: Provider + 'static,
+    P: crate::desktop_controls::ProfileProvider + 'static,
     L: EventLog + 'static,
 {
     let Bridge {
         writer,
         pending,
         peer,
+        questions,
         writer_task,
     } = bridge;
+    let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+    if let Some(control) = &agents
+        && let Ok(mut slot) = control.notifier_handle().lock()
+    {
+        *slot = Some(Arc::new(move |owner| {
+            let _ = report_tx.send(owner);
+        }));
+    }
+    let mut roster = agents.clone().map(crate::acp_agents::Roster::new);
+    let mut roster_tick = tokio::time::interval(ROSTER_INTERVAL);
+    roster_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut prompt_reply: Option<Value> = None;
     writer.notify(
         "ready",
-        json!({ "proto": "1.0", "model": model, "caps": { "cards": ["approval", "diff"] } }),
+        json!({
+            "proto": "1.0",
+            "model": model,
+            "session": session.id.to_string(),
+            "caps": { "cards": ["approval", "diff"] },
+        }),
     );
 
     let mut transcript = crate::session_transcript(system, resumed);
@@ -1293,7 +1393,56 @@ where
     let mut running = false;
     let mut interrupt: Option<kernel::InterruptHandle> = None;
 
+    let mut reports_ready = true; // Also collect reports retained across restart.
+    let mut turn_requested = false;
     loop {
+        if !running && (turn_requested || reports_ready) {
+            reports_ready = false;
+            let mut messages = transcript.clone();
+            let taken = match &agents {
+                Some(control) => {
+                    crate::agents::collect_reports(
+                        control,
+                        session.id,
+                        &kernel.artifacts,
+                        &mut messages,
+                    )
+                    .await
+                }
+                None => Vec::new(),
+            };
+            if turn_requested || !taken.is_empty() {
+                turn_requested = false;
+                running = true;
+                let (handle, queue) = kernel::InterruptQueue::pair();
+                if let Some(control) = &agents {
+                    control.attend(handle.clone());
+                }
+                interrupt = Some(handle);
+                let kernel = kernel.clone();
+                let session = session.clone();
+                let budget = crate::task_budget(&base_budget, &agent_budget);
+                let sink = AcpSink {
+                    writer: writer.clone(),
+                    peer: peer.clone(),
+                };
+                let agents = agents.clone();
+                turns.spawn(async move {
+                    match kernel
+                        .run_session(&session, messages, budget, &sink, Some(queue))
+                        .await
+                    {
+                        Ok((updated, reason)) => {
+                            if let Some(control) = &agents {
+                                control.settle(session.id, &taken).await;
+                            }
+                            TurnDone::Ok(updated, reason)
+                        }
+                        Err(error) => TurnDone::Err(error.to_string()),
+                    }
+                });
+            }
+        }
         tokio::select! {
             line = read_frame(&mut stdin, &mut frame_buf) => {
                 let Ok(Some(line)) = line else { break }; // stdin closed / oversized frame → exit
@@ -1301,10 +1450,58 @@ where
                 if trimmed.is_empty() {
                     continue;
                 }
+                if let Ok(request) = serde_json::from_str::<Value>(trimmed)
+                    && request["jsonrpc"] == "2.0"
+                    && let Some(method) = request["method"].as_str()
+                    && !peer.is_acp()
+                {
+                    let params = request.get("params").cloned().unwrap_or(Value::Null);
+                    let result = if method == "question.respond" {
+                        Some(crate::acp_questions::respond(&questions, &params))
+                    } else if method == "session.rewind.points" {
+                        Some(crate::desktop_rewind::points(&kernel, &session, extensions.workspace.root()).await)
+                    } else if method == "session.rewind" {
+                        Some(if running || agents.as_ref().is_some_and(|control| !control.active().is_empty()) || !kernel.executor.background_tasks().is_empty() { Err("Finish or stop active work before rewinding.".into()) } else { crate::desktop_rewind::rewind(&kernel, &mut session, &mut transcript, &extensions, agents.as_ref(), &params).await })
+                    } else if method == "mcp.disconnect" {
+                        Some(if running || agents.as_ref().is_some_and(|control| !control.active().is_empty()) || !kernel.executor.background_tasks().is_empty() { Err("Finish active work before disconnecting a server.".into()) } else { extensions.disconnect(&params).await })
+                    } else if method == "mcp.connect" {
+                        Some(if running || agents.as_ref().is_some_and(|control| !control.active().is_empty()) || !kernel.executor.background_tasks().is_empty() { Err("Finish active work before connecting a server.".into()) } else { extensions.connect(&params, &writer).await })
+                    } else if method == "mcp.signin" {
+                        Some(extensions.sign_in_again(&params, &writer).await)
+                    } else if method == "memory.list" {
+                        Some(crate::desktop_memory::list(extensions.memory.as_ref()).await)
+                    } else if method == "memory.pin" || method == "memory.forget" {
+                        Some(crate::desktop_memory::change(kernel.log.as_ref(), &session, extensions.memory.as_ref(), method, &params).await)
+                    } else if method == "memory.provenance" {
+                        Some(crate::desktop_memory::provenance(kernel.log.as_ref(), extensions.memory.as_ref(), &params).await)
+                    } else if method == "tasks.list" {
+                        Some(Ok(json!({ "tasks": kernel.executor.background_tasks().iter().map(|task| json!({ "id": task.id, "command": task.command, "running": task.running })).collect::<Vec<_>>() })))
+                    } else if method == "extensions.reload" {
+                        Some(if running || agents.as_ref().is_some_and(|control| !control.active().is_empty()) || !kernel.executor.background_tasks().is_empty() { Err("Finish or stop active work before reloading extensions.".into()) } else { extensions.reload().await })
+                    } else if method == "extensions.catalog" {
+                        Some(Ok(extensions.catalog(&kernel).await))
+                    } else {
+                        crate::desktop_controls::handle(method, &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, running, agents.as_ref()).await
+                    };
+                    if let Some(result) = result {
+                        let id = request.get("id").cloned();
+                        match result {
+                            Ok(value) => {
+                                if matches!(method, "session.settings" | "session.configure") { writer.notify("settings", value.clone()); }
+                                if method == "session.rewind" { writer.notify("session.rewound", json!({ "session": value["session"], "code_only": value["code_only"] })); roster = agents.clone().map(crate::acp_agents::Roster::new); }
+                                if method == "question.respond" { writer.notify("question.answered", json!({ "question_id": params["question_id"] })); }
+                                rpc_result(&writer, &id, value);
+                            }
+                            Err(error) => rpc_error(&writer, &id, -32001, error),
+                        }
+                        continue;
+                    }
+                    if matches!(method, "cancel" | "interrupt" | "shutdown" | "exit") { crate::acp_questions::clear(&questions); }
+                }
                 match dispatch_line(trimmed, &model, running, interrupt.as_ref(), &pending, &writer, &peer) {
                     RpcAction::None => {}
                     RpcAction::Shutdown => break,
-                    RpcAction::StartTurn { content, images, reply_to } => {
+                    RpcAction::StartTurn { content, images, reply_to, admission_reply_to } => {
                         prompt_reply = reply_to;
                         let mut prompt = Message::user(content);
                         match admit_acp_images(images, &kernel.artifacts).await {
@@ -1313,34 +1510,17 @@ where
                                 // The editor attached an image Medha cannot
                                 // read. Answering the text alone would look
                                 // like it was seen, so the turn does not start.
-                                if let Some(id) = prompt_reply.take() {
+                                if let Some(id) = admission_reply_to.clone().or_else(|| prompt_reply.take()) {
                                     rpc_error(&writer, &Some(id), -32602, &error);
+                                } else {
+                                    writer.event("turn.error", json!({"message":error}));
                                 }
                                 continue;
                             }
                         }
+                        if let Some(id) = admission_reply_to { rpc_result(&writer, &Some(id), json!({ "accepted": true, "steered": false })); }
                         transcript.push(prompt);
-                        running = true;
-                        let (handle, queue) = kernel::InterruptQueue::pair();
-                        interrupt = Some(handle);
-                        let kernel = kernel.clone();
-                        let session = session.clone();
-                        let messages = transcript.clone();
-                        // Each editor message gets a fresh task budget shared
-                        // with descendants spawned during that turn.
-                        let budget = crate::task_budget(&base_budget, &agent_budget);
-                        let writer = writer.clone();
-                        let peer = peer.clone();
-                        turns.spawn(async move {
-                            let sink = AcpSink { writer, peer };
-                            let result = kernel
-                                .run_session(&session, messages, budget, &sink, Some(queue))
-                                .await;
-                            match result {
-                                Ok((updated, reason)) => TurnDone::Ok(updated, reason),
-                                Err(e) => TurnDone::Err(e.to_string()),
-                            }
-                        });
+                        turn_requested = true;
                     }
                 }
             }
@@ -1351,6 +1531,7 @@ where
                 // also releases a gate whose task ended with an error before
                 // consuming its response.
                 deny_pending(&pending);
+                crate::acp_questions::clear(&questions);
                 // `session/prompt` is answered here, not at dispatch: its result
                 // is the turn's stopReason.
                 let reply = prompt_reply.take();
@@ -1390,12 +1571,28 @@ where
                     }
                 }
             }
+            Some(owner) = report_rx.recv(), if agents.is_some() => {
+                if owner.is_none() || owner == Some(session.id) { reports_ready = true; }
+            }
+            _ = roster_tick.tick(), if roster.is_some() => {
+                if let Some(update) = roster.as_mut().and_then(crate::acp_agents::Roster::changed) {
+                    writer.notify("agents", update);
+                }
+            }
             _ = writer.cancelled() => break,
         }
     }
 
     settle_turn(&mut interrupt, &pending, &mut turns, TURN_SHUTDOWN_GRACE).await;
     deny_pending(&pending);
+    crate::acp_questions::clear(&questions);
+    kernel
+        .observe_hook(
+            &session,
+            kernel::HookPoint::SessionEnd,
+            json!({ "source": "acp" }),
+        )
+        .await;
     writer_task.finish(&writer).await;
     Ok(())
 }
@@ -1519,6 +1716,7 @@ mod tests {
                 content: "fix the test".into(),
                 images: Vec::new(),
                 reply_to: Some(json!(3)),
+                admission_reply_to: None,
             }
         );
         assert!(
@@ -1722,6 +1920,31 @@ mod tests {
     }
 
     #[test]
+    fn desktop_waiting_and_retry_notices_are_emitted_without_extending_standard_acp() {
+        use kernel::StreamSink;
+        let (writer, mut rx) = capture_writer(8);
+        let sink = AcpSink {
+            writer,
+            peer: Peer::new(),
+        };
+        sink.phase(kernel::progress::Phase::Generating);
+        sink.notice("Model request failed. Retrying (1/3)…");
+        let frames = captured_values(&mut rx);
+        assert_eq!(frames[0]["params"]["kind"], "model.waiting");
+        assert_eq!(frames[1]["params"]["kind"], "notice");
+        assert!(
+            frames[1]["params"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Retrying")
+        );
+        sink.peer.select_acp();
+        sink.phase(kernel::progress::Phase::Generating);
+        sink.notice("retry");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn acp_tool_updates_keep_the_provider_call_id() {
         let peer = Peer::new();
         peer.select_acp();
@@ -1810,6 +2033,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn acp_linked_image_uses_the_shared_source_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("huge.png");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(media::MAX_SOURCE_BYTES as u64 + 1)
+            .unwrap();
+        let artifacts: Arc<dyn kernel::ArtifactStore> =
+            Arc::new(store::FileArtifactStore::open(temp.path().join("artifacts")).unwrap());
+        let error = admit_acp_images(vec![AcpImage::Linked(path)], &artifacts)
+            .await
+            .unwrap_err();
+        assert!(error.contains("larger"), "{error}");
+    }
+
     #[test]
     fn an_embedded_blob_resource_is_an_image_and_text_resources_still_are_not() {
         let parsed = acp_prompt(Some(&json!([
@@ -1864,6 +2103,7 @@ mod tests {
                 content: crate::attachments::IMAGE_ONLY_PROMPT.to_string(),
                 images: vec![AcpImage::Inline("image/png".into(), "QUJD".into())],
                 reply_to: Some(json!(4)),
+                admission_reply_to: None,
             }
         );
         let _ = captured_values(&mut rx);
@@ -2271,6 +2511,7 @@ mod tests {
         let Bridge {
             writer: blocked_writer,
             pending: _,
+            questions: _,
             peer: _,
             writer_task: blocked_task,
         } = bridge_with_output(blocked_output, 2);
@@ -2303,6 +2544,7 @@ mod tests {
         let Bridge {
             writer: healthy_writer,
             pending: _,
+            questions: _,
             peer: _,
             writer_task: healthy_task,
         } = bridge_with_output(healthy_output, 2);
@@ -2321,6 +2563,7 @@ mod tests {
         let Bridge {
             writer,
             pending: _,
+            questions: _,
             peer: _,
             writer_task,
         } = bridge_with_output(BrokenOutput, 2);

@@ -2,13 +2,27 @@
 //! saved user settings, and finally first-run TUI setup.
 
 mod acp;
+mod acp_agents;
+mod acp_questions;
 mod agents;
 mod attachments;
 mod config;
+mod desktop_changes;
+mod desktop_controls;
+mod desktop_extensions;
+mod desktop_keys;
+mod desktop_mcp_registry;
+mod desktop_memory;
+mod desktop_preferences;
+mod desktop_rewind;
+mod desktop_service;
+mod hook_files;
+mod lock_edit;
 mod plugin_session;
 mod plugins_cmd;
 mod skill_judge;
 mod tui_tea;
+mod usage_insights;
 mod vision;
 
 use anyhow::{Context, Result};
@@ -794,6 +808,9 @@ async fn main() -> Result<()> {
     if raw.get(1).map(|s| s == "trust").unwrap_or(false) {
         return run_trust_command(&raw[2..]);
     }
+    if raw.get(1).map(|s| s == "desktop-service").unwrap_or(false) {
+        return desktop_service::run(&raw[2..]).await;
+    }
 
     let cli = Cli::parse();
     let effort_override = match cli.reasoning_effort.clone() {
@@ -907,8 +924,9 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|capabilities| {
                 format!(
-                    "image input {}, image output {}, attachments {}, tool calls {}, reasoning {}",
-                    capabilities.input_state("image").as_str(),
+                    "user images {}, tool-result images {}, image output {}, attachments {}, tool calls {}, reasoning {}",
+                    capabilities.user_image_state().as_str(),
+                    capabilities.tool_result_image_state().as_str(),
                     capabilities.output_state("image").as_str(),
                     capabilities.attachment_state().as_str(),
                     capabilities.tool_call_state().as_str(),
@@ -944,7 +962,7 @@ async fn main() -> Result<()> {
                     .capabilities
                     .as_ref()
                     .map_or(providers::CapabilityState::Unknown, |caps| {
-                        caps.input_state("image")
+                        caps.user_image_state()
                     });
                 if state == providers::CapabilityState::Unknown {
                     eprintln!(
@@ -1185,9 +1203,16 @@ async fn main() -> Result<()> {
         Arc::new(kernel::AutoDeny)
     };
 
-    // Only the TUI can render structured questions.
+    // Each interactive surface supplies its question form.
     let asker: Arc<dyn kernel::Asker> = if let Some((tx, _)) = &tui_channel {
         Arc::new(tui_tea::TuiAsker { tx: tx.clone() })
+    } else if let Some(bridge) = &acp_bridge {
+        Arc::new(acp_questions::AcpAsker {
+            writer: Arc::clone(&bridge.writer),
+            pending: Arc::clone(&bridge.questions),
+            peer: bridge.peer.clone(),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        })
     } else {
         Arc::new(kernel::NoAsker)
     };
@@ -1564,11 +1589,38 @@ async fn main() -> Result<()> {
     let known_tools: std::collections::HashSet<String> =
         executor.specs().into_iter().map(|spec| spec.name).collect();
 
+    let configured_compressor = {
+        let configured = model_profiles.lock().unwrap().clone();
+        configured
+            .auxiliary
+            .compression
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| (name, configured))
+    };
+    let (summary_provider, replay_summary) = match configured_compressor {
+        Some((name, configured)) => {
+            let auxiliary = config::resolve_model(&configured, &name).and_then(|resolved| {
+                providers::OpenAiCompat::from_profile(resolved.provider, resolved.credential)
+                    .map_err(anyhow::Error::from)
+            });
+            match auxiliary {
+                Ok(auxiliary) => (Arc::new(auxiliary), false),
+                Err(error) => {
+                    tracing::warn!(%error, "auxiliary compression profile unavailable; using chat route");
+                    (provider.clone(), true)
+                }
+            }
+        }
+        None => (provider.clone(), true),
+    };
     let recall_store = memory_store.clone();
     let memory_enabled = lock.memory.enabled;
     let context_engine = Arc::new(
         context::PipelineEngine::new(lock.context.to_policy())
-            .with_summarizer(Arc::new(context::LlmSummarizer::new(provider.clone())))
+            .with_summarizer(Arc::new(
+                context::LlmSummarizer::new(summary_provider).with_replay(replay_summary),
+            ))
             .with_artifacts(artifacts.clone())
             .with_full_compaction_refresh(Arc::new(move |system| {
                 if !memory_enabled {
@@ -1850,6 +1902,31 @@ async fn main() -> Result<()> {
             Arc::clone(&agent_budget),
             resumed,
             bridge,
+            agent_control.clone(),
+            model_profiles,
+            active_profile,
+            desktop_extensions::Runtime {
+                store: session_plugins.store(),
+                skills: skill_store.clone(),
+                search: search_handle.clone(),
+                workspace: workspace.clone(),
+                memory: lock.memory.enabled.then(|| memory_store.clone()),
+                memory_budget: k3_budget_tokens,
+                memory_stale_days: stale_after_days,
+                mcp: mcp_manager.clone(),
+                configured_mcp: std::sync::Mutex::new(configured_mcp.clone()),
+                plugins: plugin_session::LivePlugins::new(
+                    session_plugins.store(),
+                    skill_store.clone(),
+                    mcp_manager.clone(),
+                    Box::new({
+                        let kernel = kernel.clone();
+                        move || kernel.reload_hooks()
+                    }),
+                    configured_mcp.clone(),
+                    plugin_mcp_ids,
+                ),
+            },
         )
         .await;
         if let Some(control) = &agent_control {
@@ -1889,10 +1966,10 @@ async fn main() -> Result<()> {
                 known_tools.clone(),
                 search_handle.clone(),
                 mcp_manager.clone(),
-                plugins_cmd::store(&medha_home, &cwd, &state),
+                session_plugins.store(),
                 plugins_cmd::marketplaces(&medha_home),
                 plugin_session::LivePlugins::new(
-                    plugins_cmd::store(&medha_home, &cwd, &state),
+                    session_plugins.store(),
                     skill_store.clone(),
                     mcp_manager.clone(),
                     Box::new({
@@ -1940,25 +2017,10 @@ async fn main() -> Result<()> {
     let mut messages = session_transcript(system, resumed);
     let mut taken: Vec<orchestrator::AgentResult> = Vec::new();
     if let Some(control) = &agent_control {
-        taken = control.collect(session.id).await;
-        for result in &taken {
-            // Preserve the child's trust label; a report is not user speech.
-            messages.push(
-                Message::new(
-                    kernel::Role::User,
-                    format!(
-                        "[background agent '{}' finished — {}]\n{}",
-                        result.agent,
-                        serde_json::to_string(&result.status)
-                            .unwrap_or_default()
-                            .trim_matches('"'),
-                        result.summary
-                    ),
-                )
-                .carrying(result.trust),
-            );
-        }
+        taken =
+            agents::collect_reports(control, session.id, &kernel.artifacts, &mut messages).await;
     }
+
     let mut input = Message::user(prompt);
     input.attachments = attached_images;
     messages.push(input);
@@ -2001,6 +2063,13 @@ async fn main() -> Result<()> {
         }
         control.shutdown().await;
     }
+    kernel
+        .observe_hook(
+            &session,
+            kernel::HookPoint::SessionEnd,
+            serde_json::json!({ "source": "headless" }),
+        )
+        .await;
     if let Some(manager) = &lsp_manager {
         manager.shutdown_all().await;
     }
@@ -3040,6 +3109,13 @@ where
             }
         }
     }
+    kernel
+        .observe_hook(
+            &session,
+            kernel::HookPoint::SessionEnd,
+            serde_json::json!({ "source": "repl" }),
+        )
+        .await;
     println!("bye.");
     Ok(())
 }

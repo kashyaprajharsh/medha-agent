@@ -35,6 +35,9 @@ fn native_image() -> Result<Vec<u8>> {
     ensure!(
         width > 0
             && height > 0
+            && width
+                .checked_mul(height)
+                .is_some_and(|pixels| pixels <= 50_000_000)
             && width.checked_mul(height).and_then(|n| n.checked_mul(4)) == Some(image.bytes.len()),
         "the clipboard reported an image whose pixel buffer does not match its size"
     );
@@ -76,7 +79,7 @@ fn windows_clipboard_image() -> Result<Vec<u8>> {
         bail!(NO_IMAGE);
     }
     ensure!(status.success(), "PowerShell could not read the clipboard");
-    std::fs::read(&path).context("PowerShell reported success but wrote no image")
+    super::read_source(&path).context("PowerShell reported success but wrote no image")
 }
 
 struct Remove(std::path::PathBuf);

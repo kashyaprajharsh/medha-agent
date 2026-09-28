@@ -1,10 +1,97 @@
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn bundled_example_mcp_server_handshakes_and_answers() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello-plugin");
+    let store = Store::new(
+        root.join("home/plugins"),
+        root.join("workspace/.medha/plugins"),
+        root.join("home/plugins.toml"),
+        root.join("state/plugins.toml"),
+        env!("CARGO_PKG_VERSION"),
+    );
+    store.install(&source).unwrap();
+    store
+        .enable("dev.medha.hello", None, &extensions::Grant::default())
+        .unwrap();
+    let mut session = SessionPlugins::discover(store);
+    let servers = session.mcp_servers(&HashSet::new());
+    assert_eq!(servers.len(), 1, "{:?}", session.warnings());
+    let manager = mcp::McpManager::new(
+        root.join("workspace"),
+        mcp::Config {
+            enabled: true,
+            servers,
+            ..mcp::Config::default()
+        },
+    );
+    manager.connect_startup().await;
+    let statuses = manager.status().await;
+    assert_eq!(statuses[0].state, mcp::ServerState::Ready, "{statuses:?}");
+    let result = manager
+        .call(
+            "mcp__dev-medha-hello-greetings__hello",
+            &serde_json::json!({"name":"Ada"}),
+        )
+        .await
+        .unwrap();
+    assert!(result.text.contains("Hello, Ada!"), "{}", result.text);
+    manager.shutdown().await;
+}
+
 #[test]
 fn server_ids_are_valid_tool_name_segments() {
     assert_eq!(server_id("dev.me.guard", "gh"), "dev-me-guard-gh");
     assert_eq!(server_id("dev.me_x", "a-b"), "dev-me-x-a-b");
     assert!(!server_id("dev..x", "y").contains("--"));
+}
+
+#[test]
+fn remote_mcp_cannot_connect_to_an_undeclared_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir_all(root.join("source")).unwrap();
+    std::fs::write(
+        root.join("source/plugin.toml"),
+        "schema_version = 1\nid = \"dev.me.remote\"\nname = \"Remote\"\nversion = \"0.1.0\"\n\
+         medha = \">=0.1.0\"\n[permissions]\nnetwork_hosts = [\"allowed.example.com\"]\n\
+         [[components]]\nkind = \"mcp\"\nid = \"server\"\nurl = \"https://denied.example.com/mcp\"\n",
+    )
+    .unwrap();
+    let store = Store::new(
+        root.join("home/plugins"),
+        root.join("workspace/.medha/plugins"),
+        root.join("home/plugins.toml"),
+        root.join("state/plugins.toml"),
+        env!("CARGO_PKG_VERSION"),
+    );
+    store.install(root.join("source")).unwrap();
+    let grant = store
+        .inspect("dev.me.remote", None)
+        .unwrap()
+        .requested_grant()
+        .unwrap();
+    store.enable("dev.me.remote", None, &grant).unwrap();
+    let mut session = SessionPlugins::discover(store);
+    assert!(session.mcp_servers(&HashSet::new()).is_empty());
+    assert!(
+        session
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("not listed in permissions.network_hosts"))
+    );
 }
 
 #[test]

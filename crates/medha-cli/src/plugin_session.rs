@@ -13,6 +13,10 @@ pub struct SessionPlugins {
 }
 
 impl SessionPlugins {
+    pub fn store(&self) -> Store {
+        self.store.clone()
+    }
+
     pub fn discover(store: Store) -> Self {
         let (discovery, warnings) = match store.discover() {
             Ok(discovery) => {
@@ -76,10 +80,35 @@ impl SessionPlugins {
                     ));
                     continue;
                 }
-                Some(url) => mcp::Transport::Remote {
-                    url: url.clone(),
-                    auth: mcp::RemoteAuth::Auto,
-                },
+                Some(url) => {
+                    let host = extensions::url_host(&url).unwrap_or_default();
+                    let declared = plugin
+                        .package
+                        .manifest
+                        .permissions
+                        .network_hosts
+                        .iter()
+                        .any(|pattern| {
+                            if let Some(suffix) = pattern.strip_prefix("*.") {
+                                host.len() > suffix.len()
+                                    && host
+                                        .to_ascii_lowercase()
+                                        .ends_with(&format!(".{suffix}").to_ascii_lowercase())
+                            } else {
+                                pattern.eq_ignore_ascii_case(&host)
+                            }
+                        });
+                    if !declared {
+                        problems.push(format!(
+                            "{plugin_id}/{component_id}: remote MCP host {host} is not listed in permissions.network_hosts"
+                        ));
+                        continue;
+                    }
+                    mcp::Transport::Remote {
+                        url: url.clone(),
+                        auth: mcp::RemoteAuth::Auto,
+                    }
+                }
                 None => {
                     let root = plugin.package.root.to_string_lossy();
                     mcp::Transport::Stdio {
@@ -205,7 +234,7 @@ impl LivePlugins {
 
 /// MCP tool names are `mcp__<server>__<tool>`; provider tool names allow only
 /// ASCII letters, digits, `_`, and `-`, and `__` separates the parts.
-fn server_id(plugin_id: &str, component_id: &str) -> String {
+pub(crate) fn server_id(plugin_id: &str, component_id: &str) -> String {
     let mut id = String::new();
     for c in format!("{plugin_id}-{component_id}").chars() {
         let c = if c.is_ascii_alphanumeric() { c } else { '-' };

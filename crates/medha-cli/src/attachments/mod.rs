@@ -7,7 +7,7 @@ pub use clipboard::clipboard;
 
 use anyhow::{Context, Result, ensure};
 use kernel::{ArtifactStore, MediaPart, MediaSource};
-use std::{io::Read, path::Path, path::PathBuf, sync::Arc};
+use std::{path::Path, path::PathBuf, sync::Arc};
 
 pub const MAX_PER_MESSAGE: usize = 4;
 
@@ -17,7 +17,7 @@ pub const IMAGE_ONLY_PROMPT: &str = "Describe the attached image(s).";
 
 /// Refused before decoding. Anything under this but over the wire budget is
 /// resized rather than rejected.
-const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_SOURCE_BYTES: usize = media::MAX_SOURCE_BYTES;
 
 /// One admitted image: the artifact reference that travels with the message,
 /// plus what the surface needs to show the user what they attached.
@@ -91,6 +91,9 @@ pub(crate) fn admit(
             mime_type: image.mime.into(),
             source: MediaSource::Artifact(hash),
             label: Some(label.clone()),
+            width: Some(image.width),
+            height: Some(image.height),
+            byte_size: Some(image.bytes.len()),
             provider_state: Vec::new(),
         },
         label,
@@ -102,23 +105,57 @@ pub(crate) fn admit(
     })
 }
 
-fn read_source(path: &Path) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("cannot open attachment {}", path.display()))?;
+pub(crate) fn read_source(path: &Path) -> Result<Vec<u8>> {
+    media::read_source(path)
+}
+
+/// Rebuild composer metadata from a durable artifact when a conversation is
+/// rewound to an image-bearing prompt. The original path may no longer exist.
+pub async fn restage(
+    parts: Vec<MediaPart>,
+    store: Arc<dyn ArtifactStore>,
+) -> Result<Vec<Attachment>> {
     ensure!(
-        file.metadata()?.is_file(),
-        "attachment must be a regular file: {}",
-        path.display()
+        parts.len() <= MAX_PER_MESSAGE,
+        "too many images in the saved prompt"
     );
-    let mut raw = Vec::new();
-    file.take(MAX_SOURCE_BYTES as u64 + 1)
-        .read_to_end(&mut raw)?;
-    ensure!(
-        raw.len() <= MAX_SOURCE_BYTES,
-        "attachment is larger than {}",
-        human_size(MAX_SOURCE_BYTES)
-    );
-    Ok(raw)
+    let mut restored = Vec::with_capacity(parts.len());
+    for part in parts {
+        let MediaSource::Artifact(hash) = &part.source else {
+            anyhow::bail!("saved image has no artifact reference");
+        };
+        let bytes = kernel::artifacts::read_all(&store, hash)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let size = bytes.len();
+        let image = tokio::task::spawn_blocking(move || media::normalize(bytes)).await??;
+        ensure!(
+            image.mime == part.mime_type,
+            "saved image MIME type changed"
+        );
+        ensure!(
+            part.width.is_none_or(|width| width == image.width),
+            "saved image width changed"
+        );
+        ensure!(
+            part.height.is_none_or(|height| height == image.height),
+            "saved image height changed"
+        );
+        ensure!(
+            part.byte_size.is_none_or(|bytes| bytes == size),
+            "saved image size changed"
+        );
+        restored.push(Attachment {
+            label: part.label.clone().unwrap_or_else(|| "image".into()),
+            part,
+            source: None,
+            width: image.width,
+            height: image.height,
+            bytes: size,
+            note: None,
+        });
+    }
+    Ok(restored)
 }
 
 pub fn label_for(path: &Path) -> String {

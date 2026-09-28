@@ -70,6 +70,41 @@ async fn identical_images_are_stored_once() {
 }
 
 #[tokio::test]
+async fn a_saved_image_can_be_restaged_after_its_source_file_is_deleted() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("original.png");
+    std::fs::write(&path, pixel_bytes()).unwrap();
+    let store: Arc<dyn ArtifactStore> =
+        Arc::new(store::FileArtifactStore::open(temp.path().join("artifacts")).unwrap());
+    let image = ingest(vec![path.clone()], store.clone())
+        .await
+        .unwrap()
+        .remove(0);
+    std::fs::remove_file(path).unwrap();
+    let restored = restage(vec![image.part.clone()], store).await.unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].part, image.part);
+    assert_eq!(restored[0].summary(), image.summary());
+    assert!(restored[0].source.is_none());
+}
+
+#[test]
+fn source_limit_rejects_large_files_before_reading_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("huge.png");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(MAX_SOURCE_BYTES as u64 + 1)
+        .unwrap();
+    assert!(
+        read_source(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("larger")
+    );
+}
+
+#[tokio::test]
 async fn more_than_the_limit_is_refused_before_any_file_is_read() {
     let temp = tempfile::tempdir().unwrap();
     let store = Arc::new(store::FileArtifactStore::open(temp.path().join("artifacts")).unwrap());

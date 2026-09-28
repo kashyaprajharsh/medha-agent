@@ -240,6 +240,10 @@ pub struct AgentConfig {
 /// Models used beside the main one for work it cannot do itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuxiliaryConfig {
+    /// Optional saved profile used for conversation summaries, independently
+    /// of the active chat model and its reasoning/output settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<String>,
     /// Saved profile that reads images when the main model has no image input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<String>,
@@ -317,7 +321,7 @@ impl Config {
         self.models.get(name)
     }
 
-    fn startup_model(&self) -> Option<&str> {
+    pub(crate) fn startup_model(&self) -> Option<&str> {
         self.default_model
             .as_deref()
             .filter(|n| self.models.contains_key(*n))
@@ -703,6 +707,34 @@ pub fn save(cfg: &Config) -> Result<()> {
     }
     let text = toml::to_string_pretty(cfg).context("serializing config")?;
     with_config_lock(&path, || write_config_file(&path, &text))
+}
+
+/// Read/modify/write under the same config lock; concurrent desktop windows
+/// cannot overwrite a model or server saved by another window.
+pub(crate) fn edit(change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
+    let path = config_path()?;
+    std::fs::create_dir_all(path.parent().expect("config parent"))?;
+    with_config_lock(&path, || {
+        let mut cfg = match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str::<Config>(&text)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Err(error) => return Err(error.into()),
+        };
+        migrate_legacy_provider(&mut cfg);
+        change(&mut cfg)?;
+        write_config_file(&path, &toml::to_string_pretty(&cfg)?)
+    })
+}
+pub(crate) fn key_present(id: &str) -> bool {
+    load_key(id).is_some()
+}
+pub(crate) fn remove_key(id: &str) -> Result<()> {
+    purge_credential(id);
+    anyhow::ensure!(
+        !key_present(id),
+        "The credential store could not remove this key"
+    );
+    Ok(())
 }
 
 fn write_config_file(path: &std::path::Path, text: &str) -> Result<()> {
@@ -1723,6 +1755,29 @@ pub fn mcp_key_present(id: &str, server: &McpServer) -> bool {
     load_key(&mcp_key_id(id, server)).is_some()
 }
 
+pub fn mcp_signed_in(id: &str, server: &McpServer) -> bool {
+    !server.url.is_empty() && load_key(&mcp_oauth_id(id, &server.url)).is_some()
+}
+
+/// Forget a server's stored API key or token; OAuth sign-in stays.
+pub fn remove_mcp_key(id: &str, server: &McpServer) -> Result<()> {
+    remove_key(&mcp_key_id(id, server))
+}
+
+/// Where new keys are kept, in words.
+pub(crate) fn credential_store_label() -> &'static str {
+    if prefer_keychain() {
+        "your system keychain"
+    } else {
+        "~/.medha/credentials.toml (only you can read it)"
+    }
+}
+
+/// Forget a server's OAuth sign-in; its definition and any API key stay.
+pub fn mcp_sign_out(id: &str, server: &McpServer) {
+    purge_credential(&mcp_oauth_id(id, &server.url));
+}
+
 pub fn delete_mcp_key(id: &str, server: &McpServer) {
     purge_credential(&mcp_key_id(id, server));
     purge_credential(&mcp_oauth_id(id, &server.url));
@@ -1780,7 +1835,7 @@ fn normalize_api_key(value: &str) -> String {
 }
 
 /// Load a key from the configured credential layers, migrating legacy keychain data.
-fn load_key(base_url: &str) -> Option<String> {
+pub(crate) fn load_key(base_url: &str) -> Option<String> {
     // Avoid caching secrets that another Medha process may remove.
     with_credentials_lock(|| {
         Ok(if prefer_keychain() {
@@ -1803,6 +1858,22 @@ fn load_key(base_url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn compression_profile_is_optional_and_round_trips_independently_of_vision() {
+        let legacy: Config = toml::from_str("[auxiliary]\nvision = \"eyes\"\n").unwrap();
+        assert_eq!(legacy.auxiliary.compression, None);
+        let configured: Config =
+            toml::from_str("[auxiliary]\nvision = \"eyes\"\ncompression = \"summarizer\"\n")
+                .unwrap();
+        let saved = toml::to_string(&configured).unwrap();
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            reloaded.auxiliary.compression.as_deref(),
+            Some("summarizer")
+        );
+        assert_eq!(reloaded.auxiliary.vision.as_deref(), Some("eyes"));
+    }
 
     #[test]
     fn encodes_workspace_path_with_readable_prefix_and_hash() {

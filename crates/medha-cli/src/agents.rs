@@ -11,6 +11,46 @@ use kernel::{
 };
 use orchestrator::{AgentStatus, ChildOutcome, ChildRun, ChildRunner};
 
+/// Collect without acknowledging: delivery commits only after the parent turn
+/// durably accepts these messages. All surfaces use the same bound and trust.
+pub(crate) async fn collect_reports(
+    control: &orchestrator::AgentControl,
+    session: ulid::Ulid,
+    artifacts: &Arc<dyn kernel::ArtifactStore>,
+    messages: &mut Vec<Message>,
+) -> Vec<orchestrator::AgentResult> {
+    let reports = control.collect(session).await;
+    for result in &reports {
+        let mut summary = result.summary.clone();
+        if let Some((cut, _)) = summary.char_indices().nth(orchestrator::MAX_SUMMARY_CHARS) {
+            let spilled = Arc::clone(artifacts)
+                .put_async(summary.as_bytes().to_vec())
+                .await
+                .ok();
+            summary.truncate(cut);
+            summary.push_str(&match spilled {
+                Some(hash) => format!("\n… truncated; read the rest with `read` hash={hash}"),
+                None => "\n… report truncated".into(),
+            });
+        }
+        messages.push(
+            Message::new(
+                Role::User,
+                format!(
+                    "[background agent '{}' finished — {}]\n{}",
+                    result.agent,
+                    serde_json::to_string(&result.status)
+                        .unwrap_or_default()
+                        .trim_matches('"'),
+                    summary,
+                ),
+            )
+            .carrying(result.trust),
+        );
+    }
+    reports
+}
+
 /// Publishes a child's liveness as it runs.
 ///
 /// Children used to stream into [`kernel::NullSink`], which discarded every

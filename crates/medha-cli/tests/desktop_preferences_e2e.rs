@@ -1,0 +1,241 @@
+//! Exercise the desktop's real stdio forms against isolated Medha state.
+use serde_json::{Value, json};
+use std::{
+    io::{BufRead, BufReader, Write},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc::{Receiver, channel},
+    time::Duration,
+};
+struct Bridge {
+    child: Child,
+    input: ChildStdin,
+    replies: Receiver<Value>,
+    id: u64,
+}
+impl Bridge {
+    fn start(workspace: &std::path::Path, home: &std::path::Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_medha"))
+            .args(["desktop-service", "--workspace"])
+            .arg(workspace)
+            .env("MEDHA_HOME", home)
+            .env_remove("MEDHA_API_KEY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (tx, replies) = channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                let Ok(value) = serde_json::from_str(&line) else {
+                    break;
+                };
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            input,
+            replies,
+            id: 0,
+        }
+    }
+    fn call(&mut self, method: &str, params: Value) -> Value {
+        self.id += 1;
+        writeln!(
+            self.input,
+            "{}",
+            json!({"id": self.id,"method":method,"params":params})
+        )
+        .unwrap();
+        self.input.flush().unwrap();
+        let response = self
+            .replies
+            .recv_timeout(Duration::from_secs(10))
+            .expect("desktop bridge reply");
+        assert_eq!(response["id"], self.id);
+        response
+    }
+    fn ok(&mut self, method: &str, params: Value) -> Value {
+        let reply = self.call(method, params);
+        assert!(reply.get("error").is_none(), "{reply}");
+        reply["result"].clone()
+    }
+}
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+#[test]
+fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("project");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut bridge = Bridge::start(&workspace, &home);
+    let profile = json!({"protocol":"open-ai-chat","base_url":"http://127.0.0.1:11434/v1","model":"local-test","auth":"none","max_ctx":32768,"max_output_tokens":4096,"image_input":"native"});
+    bridge.ok(
+        "settings.model.save",
+        json!({"name":"local-test","profile":profile,"default":true}),
+    );
+    let settings = bridge.ok("settings.list", json!({}));
+    assert_eq!(settings["models"][0]["profile"]["max_ctx"], 32768);
+    assert_eq!(settings["models"][0]["profile"]["max_output_tokens"], 4096);
+    assert_eq!(settings["models"][0]["default"], true);
+    assert!(settings["models"][0].get("key").is_none());
+    assert!(
+        settings["presets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "Ollama (local)")
+    );
+    let protocols = settings["protocols"].as_array().unwrap();
+    for option in protocols {
+        // Picker values must deserialize as the actual shared protocol enum.
+        let _: kernel::Protocol = serde_json::from_value(option["value"].clone()).unwrap();
+    }
+    let chat = protocols
+        .iter()
+        .find(|row| row["value"] == "open-ai-chat")
+        .unwrap();
+    assert_eq!(chat["available"], true);
+    assert_eq!(chat["discovery"], true);
+    assert!(
+        chat["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "Ollama (local)" && row["auth"] == "none")
+    );
+    let gemini = protocols
+        .iter()
+        .find(|row| row["value"] == "gemini-interactions")
+        .unwrap();
+    assert_eq!(gemini["providers"][0]["name"], "Google Gemini");
+    assert_eq!(gemini["providers"][0]["auth"], "x-goog-api-key");
+    assert!(
+        gemini["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| !row["name"].as_str().unwrap().contains("Ollama"))
+    );
+    for value in ["anthropic-messages", "open-ai-responses"] {
+        let option = protocols.iter().find(|row| row["value"] == value).unwrap();
+        assert_eq!(option["available"], false);
+        assert_eq!(option["discovery"], false);
+    }
+
+    // Exercise discovery over the real desktop bridge using its picker value.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "discovery did not reach the server"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("discovery server: {error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut input = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        input.read_line(&mut line).unwrap();
+        assert!(line.starts_with("GET /v1/models "), "{line}");
+        loop {
+            line.clear();
+            assert!(input.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let body = r#"{"data":[{"id":"discovered-local-model"}]}"#;
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    let found = bridge.ok("settings.model.discover", json!({"profile": {
+        "protocol": chat["value"], "base_url": endpoint, "model": "model-discovery", "auth": "none"
+    }}));
+    assert_eq!(found["models"][0]["id"], "discovered-local-model");
+    server.join().unwrap();
+    let defaults = bridge.ok("settings.defaults", json!({}));
+    assert_eq!(defaults["profile"], "local-test");
+    let mut invalid = profile.clone();
+    invalid["max_ctx"] = json!(0);
+    assert!(
+        bridge
+            .call(
+                "settings.model.save",
+                json!({"name":"bad","profile":invalid})
+            )
+            .get("error")
+            .is_some()
+    );
+    bridge.ok(
+        "instructions.save",
+        json!({"kind":"agents","before":"","content":"Use readable tools."}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
+        "Use readable tools."
+    );
+    assert!(
+        bridge
+            .call(
+                "instructions.save",
+                json!({"kind":"agents","before":"","content":"overwrite"})
+            )
+            .get("error")
+            .is_some()
+    );
+    assert!(
+        bridge
+            .call(
+                "instructions.save",
+                json!({"kind":"../../escape","content":"no"})
+            )
+            .get("error")
+            .is_some()
+    );
+    let source = root.path().join("skill");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("SKILL.md"),"---\nname: simple-test\ndescription: Read source before editing\n---\n\nRead the source and explain it.\n").unwrap();
+    bridge.ok("extensions.skill.install", json!({"source":source}));
+    bridge.ok(
+        "extensions.skill.configure",
+        json!({"name":"simple-test","enabled":false}),
+    );
+    let catalog = bridge.ok("extensions.list", json!({}));
+    assert_eq!(catalog["skills"][0]["enabled"], false);
+    assert!(home.join("skills/simple-test/SKILL.disabled").exists());
+    bridge.ok(
+        "extensions.skill.configure",
+        json!({"name":"simple-test","enabled":true}),
+    );
+    assert!(!home.join("skills/simple-test/SKILL.disabled").exists());
+    bridge.ok("settings.model.remove", json!({"name":"local-test"}));
+    assert!(
+        bridge.ok("settings.list", json!({}))["models"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

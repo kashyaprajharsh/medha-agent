@@ -7,11 +7,13 @@ pub struct CompactionPolicy {
     /// At/above this (but below trigger), run a cheap prune-only pass — the
     /// graduated step that defers expensive summarization.
     pub microcompact_ratio: f32,
-    /// Fraction of usable tokens kept verbatim at the tail (most recent turns).
+    /// Maximum fraction of usable tokens retained at the tail; also bounded
+    /// by the scaled recent-history budget.
     pub tail_ratio: f32,
     /// Head messages always preserved (system prompt + first exchange).
     pub protect_first_n: usize,
-    /// Floor on the number of most-recent messages kept verbatim.
+    /// Target number of most-recent messages, subject to the token ceiling.
+    /// The newest item and complete tool/result pairs always survive.
     pub protect_last_n: usize,
     /// Only bother pruning tool outputs if they exceed this many tokens.
     /// `None` (default) scales with the window — see [`Self::prune_floor`]:
@@ -39,6 +41,12 @@ impl Default for CompactionPolicy {
 }
 
 impl CompactionPolicy {
+    /// Token ceiling for recent exchanges; independent of message sizes.
+    pub(crate) fn tail_budget(&self, usable: u32) -> u32 {
+        let ceiling = (usable as f32 * self.tail_ratio) as u32;
+        ceiling.min((usable / 40).clamp(10_000, 25_000))
+    }
+
     /// Effective prune floor for a given usable window. Configured value wins
     /// verbatim; the auto default is 1% of usable, clamped to ≥200 tokens so
     /// tiny windows don't churn outputs barely bigger than the ~30-token

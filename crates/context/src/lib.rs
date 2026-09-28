@@ -4,6 +4,7 @@ pub mod budget;
 pub mod compactor;
 pub mod ctxfiles;
 pub mod engine;
+mod handoff;
 pub mod identity;
 pub mod policy;
 pub mod prompts;

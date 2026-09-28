@@ -53,8 +53,10 @@ pub struct PipelineEngine {
     estimate_at_last_usage: AtomicU32,
     summarizer: Arc<dyn Summarizer>,
     last_summary: std::sync::Mutex<Option<String>>,
+    history_notes: std::sync::Mutex<String>,
     artifacts: Option<Arc<dyn kernel::ArtifactStore>>,
     tool_overhead: AtomicU32,
+    image_recall: AtomicBool,
     /// The last context sent, replayed by a compaction summary.
     last_request: std::sync::Mutex<Option<Arc<kernel::CompiledContext>>>,
     /// Frozen startup sheaths refresh only at full compaction.
@@ -89,8 +91,10 @@ impl PipelineEngine {
             estimate_at_last_usage: AtomicU32::new(0),
             summarizer: Arc::new(ExtractiveSummarizer),
             last_summary: std::sync::Mutex::new(None),
+            history_notes: std::sync::Mutex::new(String::new()),
             artifacts: None,
             tool_overhead: AtomicU32::new(0),
+            image_recall: AtomicBool::new(false),
             last_request: std::sync::Mutex::new(None),
             full_compaction_refresh: None,
         }
@@ -206,14 +210,104 @@ impl ContextEngine for PipelineEngine {
             self.ineffective_full.store(false, Ordering::Relaxed);
             self.latched_at.store(0, Ordering::Relaxed);
             *self.last_summary.lock().unwrap() = None;
+            self.history_notes.lock().unwrap().clear();
             *self.last_request.lock().unwrap() = None;
             *self.pressure.lock().unwrap() = None;
             self.clear_preflight();
         }
     }
 
+    fn restore_summary(&self, summary: &str) {
+        *self.last_summary.lock().unwrap() = Some(crate::handoff::summary_body(summary).to_owned());
+    }
+
+    fn restore_history(&self, events: &[kernel::Event], input_limit: Option<u32>) {
+        let budget = input_limit.map_or(2_048, |limit| {
+            (ContextBudget::from_max_ctx(limit).usable() / 20).min(4_096)
+        });
+        *self.history_notes.lock().unwrap() =
+            crate::handoff::history_notes(events, budget, self.counter.as_ref());
+    }
+
+    fn restore_usage(&self, ctx: &kernel::CompiledContext, prompt_tokens: u32) {
+        self.last_prompt_tokens
+            .store(prompt_tokens, Ordering::Relaxed);
+        self.estimate_at_last_usage.store(
+            if prompt_tokens == 0 {
+                0
+            } else {
+                count_all(&ctx.messages, self.counter.as_ref())
+                    + self.tool_overhead.load(Ordering::Relaxed)
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    fn compaction_policy_version(&self) -> Option<u64> {
+        Some(3)
+    }
+
+    fn checkpoint_needs_refresh(&self, messages: &[Message], input_limit: Option<u32>) -> bool {
+        let Some(limit) = input_limit else {
+            return false;
+        };
+        let budget = ContextBudget::from_max_ctx(limit);
+        let head =
+            complete_head_tool_group(messages, self.policy.protect_first_n.min(messages.len()));
+        let tail = tail_start_index(messages, head, &budget, &self.policy, self.counter.as_ref());
+        let summary_budget = ((budget.usable() as f32 * 0.15) as u32).min(8_192);
+        tail > head
+            && count_all(&messages[head..], self.counter.as_ref())
+                > self
+                    .policy
+                    .tail_budget(budget.usable())
+                    .saturating_add(summary_budget)
+    }
+
     fn pressure(&self) -> Option<kernel::ContextPressure> {
         *self.pressure.lock().unwrap()
+    }
+
+    fn compaction_planned(&self, messages: &[Message], max_input_tokens: Option<u32>) -> bool {
+        let forced = self.force_next.load(Ordering::Acquire);
+        let before = count_all(messages, self.counter.as_ref())
+            .saturating_add(self.tool_overhead.load(Ordering::Relaxed));
+        let mc = match max_input_tokens {
+            Some(limit) => limit,
+            None if forced => before.saturating_mul(3).checked_div(4).unwrap_or(1).max(1),
+            None => return false,
+        };
+        let preflight = self.preflight_tokens.load(Ordering::Acquire);
+        let quality = if preflight > 0 {
+            quality_from_code(self.preflight_quality.load(Ordering::Acquire))
+        } else {
+            TokenCountQuality::LocalEstimate
+        };
+        let usable = ContextBudget::from_input_limit(mc, quality).usable().max(1) as f32;
+        let actual = self.last_prompt_tokens.load(Ordering::Relaxed);
+        let anchor = self.estimate_at_last_usage.load(Ordering::Relaxed);
+        let basis = if preflight > 0 {
+            preflight as f32
+        } else if actual > 0 && anchor > 0 && before >= anchor {
+            (actual.saturating_add(before - anchor)).max(before) as f32
+        } else {
+            (actual as f32).max(before as f32)
+        };
+        let near_hard_ceiling = is_overflow(basis, mc, &self.policy);
+        let full = forced || basis >= usable * self.policy.trigger_ratio || near_hard_ceiling;
+        let prune = basis >= usable * self.policy.microcompact_ratio;
+        if !full && !prune {
+            return false;
+        }
+        if self.ineffective_full.load(Ordering::Relaxed) == full
+            && self.ineffective.load(Ordering::Relaxed) >= 2
+            && !near_hard_ceiling
+            && !forced
+        {
+            let latched = self.latched_at.load(Ordering::Relaxed);
+            return basis as u32 > latched.saturating_add(latched / 10);
+        }
+        true
     }
 
     fn fork(&self) -> Option<Arc<dyn ContextEngine>> {
@@ -272,6 +366,10 @@ impl ContextEngine for PipelineEngine {
     }
 
     fn note_tools(&self, tools: &[kernel::ToolSpec]) {
+        self.image_recall.store(
+            tools.iter().any(|tool| tool.name == "read"),
+            Ordering::Relaxed,
+        );
         let n: u32 = tools
             .iter()
             .map(|t| {
@@ -291,13 +389,22 @@ impl ContextEngine for PipelineEngine {
     }
 
     async fn compile(&self, messages: &[Message], max_input_tokens: Option<u32>) -> CompileResult {
-        self.compile_controlled(
-            messages,
-            max_input_tokens,
-            &kernel::CompileControl::unlimited(),
-        )
-        .await
-        .expect("an unlimited compile control cannot be interrupted")
+        match self
+            .compile_controlled(
+                messages,
+                max_input_tokens,
+                &kernel::CompileControl::unlimited(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => passthrough(
+                messages,
+                count_all(messages, self.counter.as_ref())
+                    + self.tool_overhead.load(Ordering::Relaxed),
+                true,
+            ),
+        }
     }
 
     async fn compile_controlled(
@@ -457,17 +564,16 @@ impl PipelineEngine {
             self.policy.prune_floor(budget.usable()),
             counter,
         );
-        let microcompacted = microcompact_tracked(&group_tracked_into_turns(&deduped));
         let raw_middle_tokens: u32 = raw_middle
             .iter()
             .map(|tracked| count_msg(&tracked.message, counter))
             .sum();
-        let microcompacted_tokens: u32 = microcompacted
+        let deduped_tokens: u32 = deduped
             .iter()
             .map(|tracked| count_msg(&tracked.message, counter))
             .sum();
-        let pre_pass_saved = raw_middle_tokens.saturating_sub(microcompacted_tokens);
-        let middle: &[TrackedMessage] = &microcompacted;
+        let pre_pass_saved = raw_middle_tokens.saturating_sub(deduped_tokens);
+        let middle: &[TrackedMessage] = &deduped;
 
         match action {
             CompactionAction::Prune => {
@@ -511,50 +617,69 @@ impl PipelineEngine {
             CompactionAction::Full => {
                 // A mid-array system message is invalid for strict providers;
                 // the chronological summary is an assistant message.
+                let previous = self.last_summary.lock().ok().and_then(|g| g.clone());
                 let items: Vec<HistoryItem> = middle
                     .iter()
+                    .filter(|tracked| {
+                        tracked.message.role != Role::Assistant
+                            || previous.as_deref()
+                                != Some(crate::handoff::summary_body(&tracked.message.content))
+                    })
                     .map(|tracked| msg_to_item(&tracked.message))
                     .collect();
-                let previous = self.last_summary.lock().ok().and_then(|g| g.clone());
                 let sent = self.last_request.lock().ok().and_then(|slot| slot.clone());
                 let anchor = middle
                     .iter()
                     .rev()
                     .find_map(|tracked| anchor_words(&tracked.message.content));
-                let summary = async {
-                    match sent.as_deref() {
-                        Some(sent) => {
-                            self.summarizer
-                                .summarize_replaying(
-                                    previous.as_deref(),
-                                    &items,
-                                    sent,
-                                    anchor.as_deref(),
-                                )
-                                .await
-                        }
-                        None => self.summarizer.summarize(previous.as_deref(), &items).await,
-                    }
-                };
+                let cap = (usable * 0.15) as u32;
+                let notes = self.history_notes.lock().unwrap().clone();
+                let body_cap = cap.saturating_sub(counter.count(&notes).saturating_add(8));
+                if body_cap == 0 {
+                    return Ok(passthrough(messages, before, true));
+                }
+                let summary = self.summarizer.summarize_bounded(
+                    previous.as_deref(),
+                    &items,
+                    sent.as_deref(),
+                    anchor.as_deref(),
+                    body_cap,
+                );
                 let primary = control
-                    .run(tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
-                        summary,
-                    ))
+                    .run(tokio::time::timeout(self.summarizer.time_limit(), summary))
                     .await?;
                 let text = match primary {
                     Ok(Ok(s)) => s,
-                    Ok(Err(_)) | Err(_) => control
-                        .run(ExtractiveSummarizer.summarize(previous.as_deref(), &items))
-                        .await?
-                        .unwrap_or_else(|_| extractive_stub(&items)),
+                    Ok(Err(crate::compactor::SummarizeError::Unavailable(error))) => {
+                        tracing::warn!(%error, "summary route unavailable; using extractive fallback");
+                        control
+                            .run(ExtractiveSummarizer.summarize(previous.as_deref(), &items))
+                            .await?
+                            .unwrap_or_else(|_| extractive_stub(&items))
+                    }
+                    Ok(Err(error)) => {
+                        return Err(kernel::ContextCompileError::Summary(error.to_string()));
+                    }
+                    Err(_) => {
+                        return Err(kernel::ContextCompileError::Summary(format!(
+                            "summarizer exceeded {} seconds",
+                            self.summarizer.time_limit().as_secs()
+                        )));
+                    }
                 };
+                if text.trim().is_empty() {
+                    return Err(kernel::ContextCompileError::Summary("empty handoff".into()));
+                }
                 // Cap the summary so a runaway one can't itself blow the budget
                 // (~15% of usable). Truncate on a char boundary with a marker.
-                let cap = (usable * 0.15) as u32;
-                let text = cap_summary(text, cap, counter);
-                if let Ok(mut g) = self.last_summary.lock() {
-                    *g = Some(text.clone());
+                let text = cap_summary(
+                    crate::handoff::summary_body(&text).to_owned(),
+                    body_cap,
+                    counter,
+                );
+                let text = cap_summary(format!("{text}{notes}"), cap, counter);
+                if text.is_empty() {
+                    return Ok(passthrough(messages, before, true));
                 }
                 summary_text = Some(text.clone());
                 out.push(TrackedMessage {
@@ -563,10 +688,55 @@ impl PipelineEngine {
                 });
                 // The text summarizer cannot see pixels. Preserve older images
                 // explicitly instead of pretending the text summary covers them.
-                for tracked in middle {
-                    if !tracked.message.attachments.is_empty() {
-                        out.push(tracked.clone());
+                let latest_user = messages.iter().rposition(|message| {
+                    message.role == Role::User
+                        && matches!(message.trust, None | Some(kernel::TrustLabel::User))
+                });
+                let tool_image_count = |message: &Message| {
+                    if message.trust == Some(kernel::TrustLabel::Tool) {
+                        message.attachments.len()
+                    } else {
+                        0
                     }
+                };
+                let protected_images = messages[..head_end]
+                    .iter()
+                    .chain(&messages[tail_start..])
+                    .map(tool_image_count)
+                    .sum::<usize>();
+                let slots = ((budget.usable() / 20).max(4096) / 4096).min(3) as usize;
+                let mut keep_images = slots.saturating_sub(protected_images);
+                let mut keep_sources = std::collections::HashSet::new();
+                for tracked in raw_middle.iter().rev() {
+                    let count = tool_image_count(&tracked.message);
+                    if count > 0 && keep_images > 0 {
+                        keep_sources.insert(tracked.source_index);
+                        keep_images = keep_images.saturating_sub(count);
+                    }
+                }
+                for tracked in &raw_middle {
+                    if tracked.message.attachments.is_empty() && tracked.source_index != latest_user
+                    {
+                        continue;
+                    }
+                    let reference = if self.image_recall.load(Ordering::Relaxed)
+                        && tool_image_count(&tracked.message) > 0
+                        && !keep_sources.contains(&tracked.source_index)
+                    {
+                        match &self.artifacts {
+                            Some(store) => stored_image_reference(&tracked.message, store).await,
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    out.push(match reference {
+                        Some(message) => TrackedMessage {
+                            message,
+                            source_index: None,
+                        },
+                        None => tracked.clone(),
+                    });
                 }
             }
             CompactionAction::None => unreachable!(),
@@ -653,6 +823,10 @@ impl PipelineEngine {
         self.last_prompt_tokens.store(0, Ordering::Relaxed);
         self.estimate_at_last_usage.store(0, Ordering::Relaxed);
 
+        if let Some(summary) = &summary_text {
+            *self.last_summary.lock().unwrap() =
+                Some(crate::handoff::summary_body(summary).to_owned());
+        }
         Ok(CompileResult {
             source_indices: out.iter().map(|tracked| tracked.source_index).collect(),
             messages: out.into_iter().map(|tracked| tracked.message).collect(),
@@ -664,6 +838,35 @@ impl PipelineEngine {
             summary: summary_text,
         })
     }
+}
+
+/// Retire only tool-produced pixels whose immutable artifacts are available.
+/// User attachments and images without a recoverable stored source stay intact.
+async fn stored_image_reference(
+    message: &Message,
+    store: &Arc<dyn kernel::ArtifactStore>,
+) -> Option<Message> {
+    let mut references = Vec::new();
+    for image in &message.attachments {
+        let kernel::MediaSource::Artifact(hash) = &image.source else {
+            return None;
+        };
+        if Arc::clone(store).size_async(hash.clone()).await.ok()? == 0 {
+            return None;
+        }
+        references.push(format!(
+            "{}: read hash=\"{hash}\"",
+            image.label.as_deref().unwrap_or("screenshot")
+        ));
+    }
+    let mut reference = message.clone();
+    reference.attachments.clear();
+    reference.content = format!(
+        "[Earlier tool image stored outside live context. Reopen its pixels with {}.]\n{}",
+        references.join("; "),
+        message.content
+    );
+    Some(reference)
 }
 
 fn complete_head_tool_group(messages: &[Message], head_end: usize) -> usize {
@@ -716,16 +919,28 @@ fn extractive_stub(items: &[HistoryItem]) -> String {
 
 /// Cap a summary to `max_tokens`; truncate on a char boundary + a marker if over.
 fn cap_summary(text: String, max_tokens: u32, counter: &dyn TokenCounter) -> String {
-    if max_tokens == 0 || counter.count(&text) <= max_tokens {
+    if counter.count(&text) <= max_tokens {
         return text;
     }
-    // ~4 chars/token heuristic for the cut point; leave room for the marker.
-    let keep = (max_tokens as usize).saturating_mul(4);
-    let mut cut = keep.min(text.len());
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
+    let marker = "\n…[summary truncated; consult event history]";
+    if counter.count(marker) > max_tokens {
+        return String::new();
     }
-    format!("{}\n…[summary truncated to fit context]", &text[..cut])
+    // Search UTF-8 boundaries and count the complete candidate, including the marker.
+    let boundaries: Vec<_> = text.char_indices().map(|(index, _)| index).collect();
+    let (mut low, mut high) = (0, boundaries.len());
+    let mut result = marker.to_owned();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let candidate = format!("{}{marker}", &text[..boundaries[mid]]);
+        if counter.count(&candidate) <= max_tokens {
+            result = candidate;
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    result
 }
 
 /// A compiled legacy message plus the exact input occurrence it retained.
@@ -738,159 +953,6 @@ fn cap_summary(text: String, max_tokens: u32, counter: &dyn TokenCounter) -> Str
 struct TrackedMessage {
     message: Message,
     source_index: Option<usize>,
-}
-
-fn group_tracked_into_turns(messages: &[TrackedMessage]) -> Vec<Vec<TrackedMessage>> {
-    let mut turns = Vec::new();
-    let mut i = 0;
-    while i < messages.len() {
-        let m = &messages[i].message;
-        let mut end = i + 1;
-        if m.role == Role::Assistant && !m.tool_calls.is_empty() {
-            while end < messages.len()
-                && end - i <= m.tool_calls.len()
-                && messages[end].message.role == Role::Tool
-            {
-                end += 1;
-            }
-        }
-        turns.push(messages[i..end].to_vec());
-        i = end;
-    }
-    turns
-}
-
-/// Split messages into turns — an assistant message plus every tool result
-/// answering it, as one atomic unit; a plain message is its own turn. Every
-/// operation below collapses whole turns, never a partial one, so pairing
-/// can't break.
-#[cfg(test)]
-fn group_into_turns(messages: &[Message]) -> Vec<Vec<Message>> {
-    let tracked = messages
-        .iter()
-        .cloned()
-        .map(|message| TrackedMessage {
-            message,
-            source_index: None,
-        })
-        .collect::<Vec<_>>();
-    group_tracked_into_turns(&tracked)
-        .into_iter()
-        .map(|turn| turn.into_iter().map(|tracked| tracked.message).collect())
-        .collect()
-}
-
-/// The `update_plan` snapshot in this turn, if it called that tool: `(title,
-/// status)` per step, read from the tool's own echoed result.
-fn plan_snapshot(turn: &[Message]) -> Option<Vec<(String, String)>> {
-    let call = turn
-        .first()?
-        .tool_calls
-        .iter()
-        .find(|c| c.tool == "update_plan")?;
-    let result = turn
-        .iter()
-        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(call.id.as_str()))?;
-    let v: serde_json::Value = serde_json::from_str(&result.content).ok()?;
-    let steps = v.get("steps")?.as_array()?;
-    Some(
-        steps
-            .iter()
-            .filter_map(|s| {
-                Some((
-                    s.get("title")?.as_str()?.to_string(),
-                    s.get("status")?.as_str()?.to_string(),
-                ))
-            })
-            .collect(),
-    )
-}
-
-#[cfg(test)]
-fn microcompact(turns: &[Vec<Message>]) -> Vec<Message> {
-    let tracked = turns
-        .iter()
-        .map(|turn| {
-            turn.iter()
-                .cloned()
-                .map(|message| TrackedMessage {
-                    message,
-                    source_index: None,
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    microcompact_tracked(&tracked)
-        .into_iter()
-        .map(|tracked| tracked.message)
-        .collect()
-}
-
-fn microcompact_tracked(turns: &[Vec<TrackedMessage>]) -> Vec<TrackedMessage> {
-    let plans: Vec<(usize, Vec<(String, String)>)> = turns
-        .iter()
-        .enumerate()
-        .filter_map(|(i, turn)| {
-            let messages = turn
-                .iter()
-                .map(|tracked| tracked.message.clone())
-                .collect::<Vec<_>>();
-            plan_snapshot(&messages).map(|snapshot| (i, snapshot))
-        })
-        .collect();
-
-    let mut spans: Vec<(usize, usize, Vec<String>)> = Vec::new();
-    for pair in plans.windows(2) {
-        let (i0, before) = &pair[0];
-        let (i1, after) = &pair[1];
-        if i1.saturating_sub(*i0) <= 1 {
-            continue;
-        }
-        let titles: Vec<String> = after
-            .iter()
-            .filter(|(title, status)| {
-                status == "completed" && before.iter().any(|(t, s)| t == title && s != "completed")
-            })
-            .map(|(title, _)| title.clone())
-            .collect();
-        if !titles.is_empty() {
-            spans.push((*i0 + 1, *i1, titles));
-        }
-    }
-    let mut out = Vec::new();
-    let mut i = 0;
-    let mut next_span = 0;
-    while i < turns.len() {
-        if next_span < spans.len() && spans[next_span].0 == i {
-            let (start, end, titles) = &spans[next_span];
-            for turn in &turns[*start..*end] {
-                for tracked in turn {
-                    // User words are never synthesized away: a mid-task steer
-                    // may still bind the model ("use tabs not spaces").
-                    if tracked.message.role == Role::User {
-                        out.push(tracked.clone());
-                    }
-                }
-            }
-            let marker = titles
-                .iter()
-                .map(|title| format!("✓ {title}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out.push(TrackedMessage {
-                // An assistant checkpoint, not system: it sits chronologically
-                // mid-conversation and is generated rather than retained.
-                message: Message::new(Role::Assistant, marker),
-                source_index: None,
-            });
-            i = *end;
-            next_span += 1;
-        } else {
-            out.extend(turns[i].iter().cloned());
-            i += 1;
-        }
-    }
-    out
 }
 
 /// A tool result byte-identical to an earlier one in `middle` is elided to a
@@ -953,9 +1015,19 @@ fn msg_to_item(m: &Message) -> HistoryItem {
     } else {
         ItemKind::Text
     };
+    let mut content = m.content.clone();
+    for call in &m.tool_calls {
+        use std::fmt::Write;
+        let _ = write!(
+            content,
+            "\nTOOL CALL {} (id={}): {}",
+            call.tool, call.id, call.args
+        );
+    }
     HistoryItem {
         role: m.role.clone(),
-        content: m.content.clone(),
+        trust: m.trust,
+        content,
         kind,
         source_events: Vec::new(),
         artifact: None,
@@ -973,9 +1045,32 @@ fn tail_start_index(
     policy: &CompactionPolicy,
     counter: &dyn TokenCounter,
 ) -> usize {
-    crate::compactor::tail_start_index_by(messages.len(), head_end, budget, policy, |index| {
-        count_msg(&messages[index], counter)
-    })
+    let start =
+        crate::compactor::tail_start_index_by(messages.len(), head_end, budget, policy, |index| {
+            count_msg(&messages[index], counter)
+        });
+    if start >= messages.len() || messages[start].role != Role::Tool {
+        return start;
+    }
+    let mut owner = start;
+    while owner > head_end && messages[owner].role == Role::Tool {
+        owner -= 1;
+    }
+    let mut end = start;
+    while end < messages.len() && messages[end].role == Role::Tool {
+        end += 1;
+    }
+    let expanded = messages[owner..].iter().fold(0u32, |sum, message| {
+        sum.saturating_add(count_msg(message, counter))
+    });
+    if end == messages.len() || expanded <= policy.tail_budget(budget.usable()) {
+        // The newest group is mandatory even when it alone exceeds the ceiling.
+        owner
+    } else {
+        // An older oversized group belongs entirely in the summary. Backing up
+        // unconditionally would retain a huge old write despite the token cap.
+        end
+    }
 }
 
 #[cfg(test)]
@@ -983,6 +1078,15 @@ mod tests {
     use super::*;
     use crate::tokens::HeuristicCounter;
     use kernel::ToolIntent;
+
+    #[test]
+    fn pre_compaction_preview_respects_unknown_and_known_limits() {
+        let engine =
+            PipelineEngine::with_counter(CompactionPolicy::default(), Arc::new(HeuristicCounter));
+        let messages = vec![Message::user("large ".repeat(2000))];
+        assert!(!engine.compaction_planned(&messages, None));
+        assert!(engine.compaction_planned(&messages, Some(200)));
+    }
 
     fn user(s: &str) -> Message {
         Message::user(s.to_string())
@@ -1045,6 +1149,23 @@ mod tests {
     }
 
     #[test]
+    fn summary_input_contains_the_actions_arguments_and_provenance() {
+        let message = Message::assistant_calls(
+            "working",
+            vec![ToolIntent {
+                id: "plan".into(),
+                tool: "update_plan".into(),
+                args: serde_json::json!({"steps": [{"title":"Build deck", "status":"in_progress"}]}),
+            }],
+        );
+        let item = msg_to_item(&message);
+        assert!(item.content.contains("TOOL CALL update_plan (id=plan)"));
+        assert!(item.content.contains("in_progress"));
+        let relayed = Message::user("tool report").carrying(kernel::TrustLabel::Tool);
+        assert_eq!(msg_to_item(&relayed).trust, Some(kernel::TrustLabel::Tool));
+    }
+
+    #[test]
     fn tail_walk_counts_tool_call_args_not_just_text() {
         let counter = HeuristicCounter;
         let budget = ContextBudget::from_max_ctx(10_000);
@@ -1068,6 +1189,206 @@ mod tests {
             start,
             msgs.len() - 1,
             "the args-heavy final message alone exceeds the tail budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_tail_folds_old_large_writes_but_retains_latest_user_and_tool_pair() {
+        let eng =
+            engine(CompactionPolicy::default()).with_summarizer(Arc::new(OkSummarizer("HANDOFF")));
+        let mut messages = vec![
+            Message::system("SYSTEM"),
+            user("INITIAL TASK"),
+            user("constraints"),
+        ];
+        messages.push(Message::assistant_calls(
+            "",
+            vec![ToolIntent {
+                id: "old-write".into(),
+                tool: "write".into(),
+                args: serde_json::json!({"content": "x".repeat(400_000)}),
+            }],
+        ));
+        messages.push(Message::tool_result("old-write", "written"));
+        messages.push(user("LATEST USER INSTRUCTION: preserve this exact text"));
+        for i in 0..12 {
+            messages.push(Message::new(
+                Role::Assistant,
+                format!("intermediate {i} {}", "y".repeat(8_000)),
+            ));
+        }
+        messages.push(Message::assistant_calls(
+            "",
+            vec![ToolIntent {
+                id: "recent-read".into(),
+                tool: "read".into(),
+                args: serde_json::json!({"path":"src/main.rs"}),
+            }],
+        ));
+        messages.push(Message::tool_result("recent-read", "recent result"));
+        let result = eng.compile(&messages, Some(128_000)).await;
+        assert!(result.summarized);
+        assert!(
+            result.after_tokens < 20_000,
+            "old large write must not dominate the recent tail"
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.content == "LATEST USER INSTRUCTION: preserve this exact text")
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .all(|m| m.tool_calls.iter().all(|t| t.id != "old-write"))
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.tool_calls.iter().any(|t| t.id == "recent-read"))
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("recent-read"))
+        );
+    }
+
+    #[test]
+    fn an_old_oversized_tool_group_is_folded_atomically_instead_of_expanding_the_tail() {
+        let counter = HeuristicCounter;
+        let policy = CompactionPolicy::default();
+        let budget = ContextBudget::from_max_ctx(128_000);
+        let messages = vec![
+            Message::system("SYSTEM"),
+            Message::assistant_calls(
+                "",
+                vec![ToolIntent {
+                    id: "large".into(),
+                    tool: "write".into(),
+                    args: serde_json::json!({"content":"x".repeat(80_000)}),
+                }],
+            ),
+            Message::tool_result("large", "written"),
+            user("new direction"),
+            Message::assistant_calls(
+                "",
+                vec![ToolIntent {
+                    id: "recent".into(),
+                    tool: "read".into(),
+                    args: serde_json::json!({"path":"main.rs"}),
+                }],
+            ),
+            Message::tool_result("recent", "contents"),
+        ];
+        assert_eq!(
+            tail_start_index(&messages, 1, &budget, &policy, &counter),
+            3
+        );
+        assert_eq!(
+            tail_start_index(&messages[..3], 1, &budget, &policy, &counter),
+            1,
+            "the newest tool group must survive even when oversized"
+        );
+    }
+
+    struct AvailableImages;
+    impl kernel::ArtifactStore for AvailableImages {
+        fn put(&self, _: &[u8]) -> Result<String, String> {
+            Err("read only".into())
+        }
+        fn get(&self, _: &str, _: usize, _: Option<usize>) -> Result<Vec<u8>, String> {
+            Err("not needed".into())
+        }
+        fn size(&self, hash: &str) -> Result<usize, String> {
+            if hash == "missing" {
+                Err("missing".into())
+            } else {
+                Ok(100)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn old_tool_screenshots_are_bounded_and_recoverable_while_user_images_are_preserved() {
+        let eng = engine(CompactionPolicy::default())
+            .with_summarizer(Arc::new(OkSummarizer("HANDOFF")))
+            .with_artifacts(Arc::new(AvailableImages));
+        eng.image_recall.store(true, Ordering::Relaxed);
+        let mut messages = vec![
+            Message::system("SYSTEM"),
+            user("TASK"),
+            Message::new(Role::Assistant, "ack"),
+        ];
+        let make_image = |hash: &str, trust| {
+            let mut message = user("screenshot");
+            message.trust = Some(trust);
+            message.attachments.push(kernel::MediaPart {
+                mime_type: "image/png".into(),
+                source: kernel::MediaSource::Artifact(hash.into()),
+                label: Some(format!("{hash}.png")),
+                width: None,
+                height: None,
+                byte_size: None,
+                provider_state: Vec::new(),
+            });
+            message
+        };
+        for i in 0..20 {
+            messages.push(make_image(&format!("shot-{i}"), kernel::TrustLabel::Tool));
+        }
+        messages.push(make_image("user-image", kernel::TrustLabel::User));
+        messages.push(make_image("missing", kernel::TrustLabel::Tool));
+        // Force a recent tail without images, so earlier screenshots are folded.
+        for i in 0..8 {
+            messages.push(Message::new(
+                Role::Assistant,
+                format!("step {i} {}", "x".repeat(8_000)),
+            ));
+        }
+        eng.force_next_compaction();
+        let result = eng.compile(&messages, Some(128_000)).await;
+        assert!(result.summarized);
+        let pixels = result
+            .messages
+            .iter()
+            .flat_map(|m| &m.attachments)
+            .collect::<Vec<_>>();
+        assert!(
+            pixels
+                .iter()
+                .any(|image| image.source == kernel::MediaSource::Artifact("user-image".into()))
+        );
+        assert!(
+            pixels
+                .iter()
+                .any(|image| image.source == kernel::MediaSource::Artifact("missing".into()))
+        );
+        assert!(
+            pixels.len() <= 4,
+            "older tool images must not accumulate indefinitely"
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.content.contains("read hash=\"shot-0\""))
+        );
+        // Without a recall tool, do not discard pixels on the promise of an unavailable action.
+        eng.image_recall.store(false, Ordering::Relaxed);
+        eng.force_next_compaction();
+        let no_recall = eng.compile(&messages, Some(128_000)).await;
+        assert_eq!(
+            no_recall
+                .messages
+                .iter()
+                .map(|m| m.attachments.len())
+                .sum::<usize>(),
+            22
         );
     }
 
@@ -1228,18 +1549,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stalled_summarizer_times_out_and_uses_extractive_fallback() {
+    async fn stalled_summarizer_preserves_history_and_can_be_retried() {
         let summarizer = Arc::new(CancellableSummarizer {
             calls: std::sync::atomic::AtomicUsize::new(0),
             started: tokio::sync::Notify::new(),
         });
         let eng = engine(full_policy()).with_summarizer(summarizer.clone());
         let result = eng
+            .compile_controlled(
+                &full_compaction_history(),
+                Some(local_input_limit(1_300)),
+                &kernel::CompileControl::unlimited(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(kernel::ContextCompileError::Summary(_))
+        ));
+        assert!(eng.last_summary.lock().unwrap().is_none());
+        let recovered = eng
             .compile(&full_compaction_history(), Some(local_input_limit(1_300)))
             .await;
-        assert!(result.compacted && result.summarized && !result.overflow);
-        assert!(result.summary.is_some());
-        assert_eq!(summarizer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(recovered.summary.as_deref(), Some("RECOVERED SUMMARY"));
+        assert_eq!(summarizer.calls.load(Ordering::SeqCst), 2);
     }
 
     #[derive(Default)]
@@ -1396,6 +1728,25 @@ mod tests {
             withtools.compile(&history, Some(8_000)).await.compacted,
             "tool-def overhead pushes it over"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_summary_restores_continuity_after_restart_and_does_not_leak_to_a_new_session()
+    {
+        let rec = Arc::new(RecordingSummarizer(std::sync::Mutex::new(Vec::new())));
+        let eng = engine(full_policy()).with_summarizer(rec.clone());
+        eng.begin_request("resumed-session:model:limits");
+        eng.restore_summary("DURABLE TASK AND CONSTRAINTS");
+        eng.compile(&full_compaction_history(), Some(local_input_limit(1_300)))
+            .await;
+        assert_eq!(
+            rec.0.lock().unwrap()[0].as_deref(),
+            Some("DURABLE TASK AND CONSTRAINTS")
+        );
+        eng.begin_request("new-session:model:limits");
+        eng.compile(&full_compaction_history(), Some(local_input_limit(1_300)))
+            .await;
+        assert!(rec.0.lock().unwrap()[1].is_none());
     }
 
     #[tokio::test]
@@ -1974,174 +2325,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn microcompact_collapses_turns_between_a_step_becoming_completed() {
-        let turns = vec![
-            update_plan_turn(
-                "p1",
-                &[("write foo", "in_progress"), ("write bar", "pending")],
-            ),
-            vec![user("working on foo")],
-            work_turn("w1", "edit", "wrote foo"),
-            update_plan_turn(
-                "p2",
-                &[("write foo", "completed"), ("write bar", "in_progress")],
-            ),
-            vec![user("now bar")],
-        ];
-        let out = microcompact(&turns);
-        assert!(out.iter().any(|m| m.content == "✓ write foo"));
-        assert!(!out.iter().any(|m| m.content.contains("wrote foo")));
-        // The plan turns themselves are untouched, only the work between them collapses.
-        assert!(out.iter().any(|m| m.content.contains("write bar")));
-        assert!(out.iter().any(|m| m.content == "now bar"));
-        // User words inside the collapsed window survive verbatim — a mid-task
-        // steer may still bind the model.
-        assert!(
-            out.iter()
-                .any(|m| m.role == Role::User && m.content == "working on foo"),
-            "user message in the collapsed span must be preserved"
-        );
-    }
-
-    #[test]
-    fn microcompact_emits_one_marker_per_step_completed_in_the_same_window() {
-        let turns = vec![
-            update_plan_turn("p1", &[("a", "in_progress"), ("b", "pending")]),
-            work_turn("w1", "edit", "did both"),
-            update_plan_turn("p2", &[("a", "completed"), ("b", "completed")]),
-        ];
-        let out = microcompact(&turns);
-        let marker = out
-            .iter()
-            .find(|m| m.content.contains('✓'))
-            .expect("checkpoint marker");
-        assert!(
-            marker.content.contains("✓ a") && marker.content.contains("✓ b"),
-            "{}",
-            marker.content
-        );
-        assert!(!out.iter().any(|m| m.content.contains("did both")));
-    }
-
-    #[test]
-    fn group_into_turns_does_not_swallow_a_user_steer_after_an_interrupted_turn() {
-        // Assistant fired two calls but only one result landed (interrupt);
-        // the user's steer must start its own turn, not be glued into the
-        // tool-call group where a collapse could delete it.
-        let calls = vec![
-            ToolIntent {
-                id: "a".into(),
-                tool: "read".into(),
-                args: serde_json::json!({}),
-            },
-            ToolIntent {
-                id: "b".into(),
-                tool: "read".into(),
-                args: serde_json::json!({}),
-            },
-        ];
-        let msgs = vec![
-            Message::assistant_calls(String::new(), calls),
-            Message::tool_result("a", "partial"),
-            user("stop — do it differently"),
-        ];
-        let turns = group_into_turns(&msgs);
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].len(), 2, "assistant + its one landed result");
-        assert_eq!(turns[1][0].role, Role::User);
-    }
-
-    #[test]
-    fn microcompact_is_a_noop_without_a_completed_transition() {
-        let turns = vec![
-            update_plan_turn("p1", &[("a", "pending")]),
-            vec![user("x")],
-            update_plan_turn("p2", &[("a", "in_progress")]),
-        ];
-        let out = microcompact(&turns);
-        let flat: Vec<Message> = turns.into_iter().flatten().collect();
-        assert_eq!(out.len(), flat.len());
-    }
-
-    #[test]
-    fn microcompact_collapses_a_multi_tool_call_turn_atomically() {
-        let calls = vec![
-            ToolIntent {
-                id: "a".into(),
-                tool: "read".into(),
-                args: serde_json::json!({}),
-            },
-            ToolIntent {
-                id: "b".into(),
-                tool: "read".into(),
-                args: serde_json::json!({}),
-            },
-        ];
-        let work = vec![
-            Message::assistant_calls(String::new(), calls),
-            Message::tool_result("a", "content a"),
-            Message::tool_result("b", "content b"),
-        ];
-        let turns = vec![
-            update_plan_turn("p1", &[("read files", "in_progress")]),
-            work,
-            update_plan_turn("p2", &[("read files", "completed")]),
-        ];
-        let out = microcompact(&turns);
-        assert!(out.iter().any(|m| m.content == "✓ read files"));
-        assert!(
-            !out.iter()
-                .any(|m| m.content.contains("content a") || m.content.contains("content b"))
-        );
-        for m in &out {
-            for c in &m.tool_calls {
+    #[tokio::test]
+    async fn completed_plan_steps_do_not_erase_evidence_before_summarization() {
+        struct EvidenceSummary;
+        #[async_trait]
+        impl Summarizer for EvidenceSummary {
+            async fn summarize(
+                &self,
+                _: Option<&str>,
+                items: &[HistoryItem],
+            ) -> Result<String, crate::compactor::SummarizeError> {
                 assert!(
-                    out.iter().any(|r| r.role == Role::Tool
-                        && r.tool_call_id.as_deref() == Some(c.id.as_str())),
-                    "dangling call {}",
-                    c.id
+                    items
+                        .iter()
+                        .any(|item| item.content.contains("deployment blocked: missing key"))
                 );
+                assert!(
+                    items
+                        .iter()
+                        .any(|item| item.content.contains("verified parser output"))
+                );
+                Ok("Parser verified; deployment blocked: missing key".into())
             }
         }
-    }
-
-    #[tokio::test]
-    async fn compile_microcompacts_a_completed_plan_step_before_pruning() {
         let eng = engine(CompactionPolicy {
             protect_first_n: 1,
             protect_last_n: 1,
-            tail_ratio: 0.0,
-            prune_min_tool_tokens: Some(100),
             ..Default::default()
-        });
-        let mut msgs = vec![Message::system("S")];
-        msgs.extend(update_plan_turn("p1", &[("big task", "in_progress")]));
-        msgs.extend(work_turn("w0", "read", &"a".repeat(15_000)));
-        msgs.extend(update_plan_turn("p2", &[("big task", "completed")]));
-        msgs.push(user("LAST"));
-
-        let r = eng.compile(&msgs, Some(local_input_limit(5_200))).await;
-        assert!(
-            r.compacted,
-            "expected compaction to fire (before={})",
-            r.before_tokens
-        );
-        assert!(r.messages.iter().any(|m| m.content == "✓ big task"));
-        assert!(
-            !r.messages.iter().any(|m| m.content.len() > 1_000),
-            "the big output must be gone, not just pruned"
-        );
-        assert_no_mid_array_system(&r.messages);
+        })
+        .with_summarizer(Arc::new(EvidenceSummary));
+        let mut messages = vec![Message::system("SYSTEM")];
+        messages.extend(update_plan_turn("p1", &[("fix parser", "in_progress")]));
+        messages.extend(work_turn("read", "read", "verified parser output"));
+        messages.push(Message::new(
+            Role::Assistant,
+            "deployment blocked: missing key",
+        ));
+        messages.extend(update_plan_turn("p2", &[("fix parser", "completed")]));
+        messages.push(user("continue"));
+        eng.force_next_compaction();
+        let result = eng.compile(&messages, Some(128_000)).await;
+        assert!(result.summarized);
+        assert!(result.summary.unwrap().contains("deployment blocked"));
     }
 
-    fn assert_no_mid_array_system(messages: &[Message]) {
-        for (i, m) in messages.iter().enumerate() {
-            assert!(
-                i == 0 || m.role != Role::System,
-                "mid-array system message at index {i}: {:?}",
-                m.content
-            );
+    #[test]
+    fn summary_cap_counts_the_marker_and_multibyte_text() {
+        let counter = BpeCounter::o200k();
+        for text in ["🧬".repeat(4000), "fix src/parser.rs ".repeat(4000)] {
+            for limit in [0, 1, 20, 1080] {
+                let capped = cap_summary(text.clone(), limit, &counter);
+                assert!(counter.count(&capped) <= limit);
+            }
         }
     }
 }

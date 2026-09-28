@@ -6,6 +6,9 @@ fn image(label: &str) -> Attachment {
             mime_type: "image/png".into(),
             source: kernel::MediaSource::Artifact(label.into()),
             label: None,
+            width: Some(800),
+            height: Some(600),
+            byte_size: Some(2_048),
             provider_state: Vec::new(),
         },
         label: label.into(),
@@ -101,8 +104,7 @@ fn the_composer_shows_what_admission_changed() {
     converted.note = Some("image/tiff → image/png".into());
     let notice = pending.accept(generation, Ok(vec![converted])).unwrap();
     assert!(notice.contains("image/tiff → image/png"), "{notice}");
-    let title = pending.title().unwrap();
-    assert!(title.contains("1. scan.tiff  800×600 · 2 KB"), "{title}");
+    assert!(pending.chips()[0].contains("scan.tiff  800×600 · 2 KB"));
 }
 
 #[test]
@@ -112,17 +114,14 @@ fn detach_addresses_the_numbers_shown_on_the_composer() {
         let generation = pending.begin().unwrap();
         pending.accept(generation, Ok(vec![image(name)]));
     }
-    let title = pending.title().unwrap();
-    assert!(
-        title.contains("1. one.png") && title.contains("2. two.png"),
-        "{title}"
-    );
+    assert!(pending.chips()[0].contains("[1 ×] one.png"));
+    assert!(pending.chips()[1].contains("[2 ×] two.png"));
     pending.detach("1");
-    assert!(pending.title().unwrap().contains("1. two.png"));
+    assert!(pending.chips()[0].contains("[1 ×] two.png"));
     assert!(pending.detach("9").contains("no attachment"));
     assert!(pending.detach("first").contains("usage"));
     pending.detach("all");
-    assert!(pending.is_empty() && pending.title().is_none());
+    assert!(pending.is_empty() && pending.chips().is_empty());
 }
 
 #[test]

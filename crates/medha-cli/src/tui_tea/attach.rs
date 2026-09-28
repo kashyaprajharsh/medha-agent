@@ -101,6 +101,13 @@ impl PendingImages {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// Stage the images of a rewound prompt after its artifact references have
+    /// been verified. No old in-flight load may land in this new session.
+    pub(super) fn restore(&mut self, images: Vec<Attachment>) {
+        self.reset();
+        self.staged = images;
+    }
+
     pub(super) fn take(&mut self) -> Vec<kernel::MediaPart> {
         self.generation = self.generation.wrapping_add(1);
         std::mem::take(&mut self.staged)
@@ -109,20 +116,19 @@ impl PendingImages {
             .collect()
     }
 
-    /// Composer title, numbered so `/attach remove N` addresses the image.
-    pub(super) fn title(&self) -> Option<String> {
-        if self.staged.is_empty() {
-            return self.loading.then(|| " attaching image… ".to_string());
-        }
-        let list = self
+    /// Separate composer rows, one per attachment, with the keyboard remove
+    /// target visible beside its size and dimensions.
+    pub(super) fn chips(&self) -> Vec<String> {
+        let mut chips: Vec<String> = self
             .staged
             .iter()
             .enumerate()
-            .map(|(index, image)| format!("{}. {}", index + 1, image.summary()))
-            .collect::<Vec<_>>()
-            .join("  ");
-        let tail = if self.loading { " · attaching…" } else { "" };
-        Some(format!(" {list} · /attach remove [number|all]{tail} "))
+            .map(|(index, image)| format!("[{} ×] {}", index + 1, image.summary()))
+            .collect();
+        if self.loading {
+            chips.push("[⋯] attaching image…".into());
+        }
+        chips
     }
 
     /// Transcript label for a submitted message, so the scrollback records that

@@ -2,6 +2,8 @@
 //! user's message; the model never sees the list.
 
 use extensions::Store;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 const ARGUMENTS: &str = "$ARGUMENTS";
 
@@ -9,35 +11,81 @@ const ARGUMENTS: &str = "$ARGUMENTS";
 pub(crate) struct PluginCommand {
     pub(crate) name: String,
     pub(crate) description: String,
+    action_id: String,
     prompt: String,
 }
 
-/// `/<title>` unless a built-in or another plugin already uses it; then
-/// `/<plugin>:<title>`, where `<plugin>` is the last part of the plugin id.
+/// Keep short names when unique; qualify collisions with the full plugin id.
 pub(crate) fn load(store: &Store, builtin: &[&str]) -> Vec<PluginCommand> {
     let actions = store.actions().unwrap_or_default();
-    let short = |title: &str| format!("/{}", slug(title));
-    let clashes = |name: &str| {
-        builtin.contains(&name) || actions.iter().filter(|a| short(&a.title) == name).count() > 1
-    };
+    let mut counts = HashMap::new();
+    for action in &actions {
+        *counts.entry(slug(&action.title)).or_insert(0usize) += 1;
+    }
+    let mut used = HashSet::new();
     actions
         .iter()
         .filter(|action| !slug(&action.title).is_empty())
         .map(|action| {
-            let plain = short(&action.title);
-            let name = if clashes(&plain) {
-                let plugin = action.plugin_id.rsplit('.').next().unwrap_or_default();
-                format!("/{}:{}", slug(plugin), slug(&action.title))
+            let title = slug(&action.title);
+            let short = format!("/{title}");
+            let base = if counts[&title] > 1 || builtin.contains(&short.as_str()) {
+                format!("/{}:{title}", slug(&action.plugin_id))
             } else {
-                plain
+                short
             };
+            let mut name = base.clone();
+            let mut suffix = 2;
+            while builtin.contains(&name.as_str()) || !used.insert(name.clone()) {
+                name = format!("{base}-{suffix}");
+                suffix += 1;
+            }
             PluginCommand {
                 name,
                 description: format!("{} · {}", action.description, action.plugin_id),
+                action_id: action.id.clone(),
                 prompt: action.prompt.clone(),
             }
         })
         .collect()
+}
+
+pub(crate) fn has_snippets(commands: &[PluginCommand], line: &str) -> bool {
+    let name = line.split_whitespace().next().unwrap_or_default();
+    commands
+        .iter()
+        .find(|command| command.name == name)
+        .is_some_and(|command| command.prompt.contains("!`"))
+}
+
+pub(crate) fn name_for_action<'a>(commands: &'a [PluginCommand], id: &str) -> Option<&'a str> {
+    commands
+        .iter()
+        .find(|command| command.action_id == id)
+        .map(|command| command.name.as_str())
+}
+
+/// Resolve a typed action through the extension host, which checks its current
+/// approval and runs the plugin-authored snippets in the plugin sandbox.
+pub(crate) async fn expand_with_snippets(
+    commands: &[PluginCommand],
+    line: &str,
+    store: &Store,
+    workspace: &Path,
+) -> Result<Option<String>, String> {
+    let line = line.trim();
+    let (name, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let Some(command) = commands.iter().find(|command| command.name == name) else {
+        return Ok(None);
+    };
+    if !command.prompt.contains("!`") {
+        return Ok(expand(commands, line));
+    }
+    store
+        .expand_action_snippets(&command.action_id, &command.prompt, args.trim(), workspace)
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 /// The message a typed line sends, when its first word is a plugin command.

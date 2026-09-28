@@ -1745,10 +1745,6 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
         // Horizontal breathing room only. Vertical padding cost two rows of
         // transcript and made an empty composer five rows tall.
         .padding(ratatui::widgets::Padding::new(1, 1, 0, 0));
-    let block = match model.attachments.title() {
-        Some(title) => block.title(title),
-        None => block,
-    };
     let inner = block.inner(area);
     f.render_widget(block, area);
     if model.input.is_empty() && !model.running {
@@ -1852,6 +1848,19 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
             inner.y + crow as u16,
         ));
     }
+}
+
+fn draw_attachment_chips(f: &mut Frame, model: &Model, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let lines: Vec<Line> = model
+        .attachments
+        .chips()
+        .into_iter()
+        .map(|chip| Line::from(Span::styled(chip, Style::default().fg(theme::accent()))))
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Repaint a themed panel bg after `Clear` — else an overlay shows the bare
@@ -2245,6 +2254,7 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     // Border and horizontal padding consume four cells of composer width.
     let text_rows = input_rows(model, content_w.saturating_sub(4)) as u16;
     let box_h = text_rows.clamp(1, 8) + 2;
+    let chip_h = model.attachments.chips().len().min(5) as u16;
     // The fleet takes the gap above the composer, and gives it back the moment
     // nothing is running, so it costs no screen when there are no children.
     let tree_h = agent_tree_height(model);
@@ -2254,6 +2264,7 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
         .constraints([
             Constraint::Min(3),
             Constraint::Length(1 + tree_h),
+            Constraint::Length(chip_h),
             Constraint::Length(box_h),
             // The switcher takes the status row's place while it is open, so it
             // never pushes the composer around as agents come and go.
@@ -2283,10 +2294,11 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
             }),
         );
     }
-    draw_input(f, model, pad_h(chunks[2]));
+    draw_attachment_chips(f, model, pad_h(chunks[2]));
+    draw_input(f, model, pad_h(chunks[3]));
     match switch_h {
-        0 => draw_status(f, model, pad_h(chunks[3])),
-        _ => draw_switcher(f, model, pad_h(chunks[3])),
+        0 => draw_status(f, model, pad_h(chunks[4])),
+        _ => draw_switcher(f, model, pad_h(chunks[4])),
     }
     // Last, over the transcript's final row, so it reads as a tab on the divider.
     draw_breadcrumb(
@@ -2306,14 +2318,14 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
         && model.search_setup.is_none()
         && model.input.starts_with('/')
     {
-        draw_autocomplete(f, model, pad_h(chunks[2]));
+        draw_autocomplete(f, model, pad_h(chunks[3]));
     }
     if !gate_open && let Some(picker) = &model.picker {
-        draw_picker(f, picker, pad_h(chunks[2]));
+        draw_picker(f, picker, pad_h(chunks[3]));
     }
     // The clarify form owns the overlay space while it's up (like the approval card).
     if let Some(state) = &model.clarify {
-        draw_clarify(f, state, pad_h(chunks[2]));
+        draw_clarify(f, state, pad_h(chunks[3]));
     }
 }
 

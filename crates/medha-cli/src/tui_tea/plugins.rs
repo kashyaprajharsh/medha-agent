@@ -53,11 +53,14 @@ pub(super) struct Row {
     version: String,
     scope: Scope,
     activation: Activation,
+    hash: String,
     components: Vec<(&'static str, String)>,
-    actions: Vec<(String, String)>,
+    actions: Vec<(String, String, String)>,
     /// Installed from a repository, so it can be updated.
     updatable: bool,
     can_rollback: bool,
+    health: Option<&'static str>,
+    last_failure: Option<String>,
 }
 
 impl Row {
@@ -70,8 +73,10 @@ impl Row {
                 ExtensionComponent::Skill { .. } => "skill",
                 ExtensionComponent::Mcp { .. } => "MCP server",
                 ExtensionComponent::Hook { .. } => "hook",
-                ExtensionComponent::Action { title, prompt, .. } => {
-                    actions.push((title.clone(), prompt.clone()));
+                ExtensionComponent::Action {
+                    id, title, prompt, ..
+                } => {
+                    actions.push((id.clone(), title.clone(), prompt.clone()));
                     "action"
                 }
             };
@@ -82,10 +87,13 @@ impl Row {
             version: manifest.version.clone(),
             scope: plugin.scope,
             activation: plugin.activation,
+            hash: plugin.package.content_hash.clone(),
             components,
             actions,
             updatable: false,
             can_rollback: false,
+            health: None,
+            last_failure: None,
         }
     }
 
@@ -109,10 +117,68 @@ impl Row {
         }
     }
 
+    fn with_health(
+        mut self,
+        states: &std::collections::HashMap<String, mcp::ServerState>,
+        store: &Store,
+    ) -> Self {
+        if self.activation != Activation::Enabled {
+            return self;
+        }
+        let mut worst = None;
+        self.last_failure = None;
+        for (_, id) in self
+            .components
+            .iter()
+            .filter(|(kind, _)| *kind == "MCP server")
+        {
+            let state = states.get(&crate::plugin_session::server_id(&self.id, id));
+            let rank = match state {
+                Some(
+                    mcp::ServerState::Failed
+                    | mcp::ServerState::NeedsAuth
+                    | mcp::ServerState::NeedsToken,
+                ) => 3,
+                Some(
+                    mcp::ServerState::Reconnecting
+                    | mcp::ServerState::Degraded
+                    | mcp::ServerState::Parked,
+                ) => 2,
+                Some(mcp::ServerState::Ready) => 0,
+                _ => 1,
+            };
+            worst = Some(worst.unwrap_or(0).max(rank));
+        }
+        for component in store.component_health(&self.id, &self.hash) {
+            let rank = match component.state {
+                extensions::ComponentState::Ready => 0,
+                extensions::ComponentState::Starting => 1,
+                extensions::ComponentState::Restarting => 2,
+                extensions::ComponentState::Failed => 3,
+            };
+            worst = Some(worst.unwrap_or(0).max(rank));
+            if let Some(reason) = component.last_failure {
+                self.last_failure = Some(format!("{}: {reason}", component.component_id));
+            }
+        }
+        self.health = worst.map(|rank| match rank {
+            0 => "ready",
+            1 => "starting",
+            2 => "restarting",
+            _ => "failed",
+        });
+        self
+    }
+
     fn summary(&self) -> String {
         let mut kinds: Vec<&str> = self.components.iter().map(|(kind, _)| *kind).collect();
         kinds.dedup();
-        kinds.join(" · ")
+        let mut summary = kinds.join(" · ");
+        if let Some(reason) = &self.last_failure {
+            summary.push_str(" · ");
+            summary.push_str(reason);
+        }
+        summary
     }
 }
 
@@ -159,7 +225,7 @@ impl Screen {
                         row.id,
                         row.version,
                         row.scope.as_str(),
-                        row.activation.as_str(),
+                        row.health.unwrap_or_else(|| row.activation.as_str()),
                         row.summary()
                     )
                 }));
@@ -198,7 +264,7 @@ impl Screen {
 enum DetailAction {
     Enable,
     Disable,
-    Run(String),
+    Run(String, String),
     Update,
     Rollback,
     Remove,
@@ -217,10 +283,10 @@ fn detail_actions(row: &Row) -> Vec<(String, DetailAction)> {
         Activation::Collision | Activation::Shadowed => {}
     }
     if row.activation == Activation::Enabled {
-        for (title, prompt) in &row.actions {
+        for (id, title, prompt) in &row.actions {
             actions.push((
                 format!("▶ Run action: {title}"),
-                DetailAction::Run(prompt.clone()),
+                DetailAction::Run(id.clone(), prompt.clone()),
             ));
         }
     }
@@ -247,6 +313,29 @@ pub(super) fn open(model: &mut Model) {
     reopen(model, None);
 }
 
+pub(super) fn refresh_health(model: &mut Model) {
+    let Some(store) = model.plugins.as_ref() else {
+        return;
+    };
+    let Some(Picker {
+        kind: PickerKind::Plugins(screen),
+        ..
+    }) = &mut model.picker
+    else {
+        return;
+    };
+    match screen {
+        Screen::List { plugins, .. } => {
+            for row in plugins {
+                *row = row.clone().with_health(&model.plugin_health, store);
+            }
+        }
+        Screen::Detail(row) => *row = row.clone().with_health(&model.plugin_health, store),
+        _ => {}
+    }
+    model.dirty = true;
+}
+
 /// Rebuilds the list from disk, keeping the cursor on `focus` when it is listed.
 fn reopen(model: &mut Model, focus: Option<(&str, Scope)>) {
     let Some(store) = model.plugins.clone() else {
@@ -258,7 +347,11 @@ fn reopen(model: &mut Model, focus: Option<(&str, Scope)>) {
             let plugins: Vec<Row> = discovery
                 .plugins
                 .iter()
-                .map(|plugin| Row::from_listing(plugin).with_history(&store))
+                .map(|plugin| {
+                    Row::from_listing(plugin)
+                        .with_history(&store)
+                        .with_health(&model.plugin_health, &store)
+                })
                 .collect();
             let selected = focus
                 .and_then(|(id, scope)| {
@@ -374,11 +467,14 @@ fn enter(model: &mut Model, screen: Screen, selected: usize, tx: &UnboundedSende
         Screen::Detail(row) => match detail_actions(&row).into_iter().nth(selected) {
             Some((_, DetailAction::Enable)) => begin_enable(model, &row),
             Some((_, DetailAction::Disable)) => disable(model, &row),
-            Some((_, DetailAction::Run(prompt))) => {
-                model.input = prompt;
+            Some((_, DetailAction::Run(id, prompt))) => {
+                model.input =
+                    commands::name_for_action(&model.plugin_commands, &format!("{}/{id}", row.id))
+                        .map(str::to_string)
+                        .unwrap_or(prompt);
                 model.cursor = model.input.len();
                 model.push_notice(format!(
-                    "{}: action placed in the composer — edit it or press Enter to send",
+                    "{}: action placed in the composer — add arguments or press Enter to send",
                     row.id
                 ));
             }
@@ -432,7 +528,15 @@ pub(super) fn run_command(model: &mut Model, args: &str, tx: &UnboundedSender<Tu
     let (verb, rest) = args.split_once(' ').unwrap_or((args, ""));
     let rest = rest.trim();
     match (verb, rest) {
-        ("", _) => open(model),
+        ("", _) => {
+            open(model);
+            if let Some(mcp) = model.mcp.clone() {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(TuiEvent::PluginHealth(mcp.status().await));
+                });
+            }
+        }
         ("install", spec) if !spec.is_empty() => jobs::install(model, spec, tx),
         ("update", id) if !id.is_empty() => jobs::update(model, id, tx),
         ("rollback", id) if !id.is_empty() => jobs::rollback(model, id),
@@ -589,6 +693,9 @@ fn show_details(model: &mut Model, row: &Row) {
         row.scope.as_str(),
         row.activation.as_str()
     );
+    if let Some(health) = row.health {
+        text.push_str(&format!("\n  health: {health}"));
+    }
     for (kind, id) in &row.components {
         text.push_str(&format!("\n  {kind:<10} {id}"));
     }

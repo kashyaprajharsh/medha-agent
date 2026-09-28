@@ -25,9 +25,68 @@ pub(super) fn update<P, L>(
             model.auto_scroll = model.scroll_offset >= model.max_scroll();
             model.text_selection = None;
         }
+        Msg::AgentEvent(TuiEvent::PluginCommandExpanded {
+            session: owner,
+            typed,
+            result,
+        }) => {
+            if owner != session.id {
+                return;
+            }
+            model.plugin_command_busy = false;
+            match result {
+                Ok(prompt)
+                    if model.input.is_empty()
+                        && !model.running
+                        && !model.force_aborting
+                        && model.focus.is_none()
+                        && model.picker.is_none() =>
+                {
+                    model.input = prompt;
+                    model.cursor = model.input.len();
+                    model.queued_plugin_label = Some(typed);
+                    handle_key(
+                        model,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        kernel,
+                        session,
+                        transcript,
+                        budget,
+                        tx,
+                    );
+                }
+                Ok(prompt) => {
+                    model.pending_plugin_prompt = Some((typed, prompt));
+                    model.push_notice(
+                        "plugin command is ready — clear the input and press Enter to send it",
+                    );
+                }
+                Err(error) => {
+                    if model.input.is_empty() {
+                        model.input = typed;
+                        model.cursor = model.input.len();
+                    }
+                    model.push_notice(format!("plugin command: {error}"));
+                }
+            }
+        }
         Msg::AgentEvent(ev) => handle_agent_event(model, ev, session, transcript),
         Msg::Tick => {
             model.anim_frame = model.anim_frame.wrapping_add(1);
+            if model.anim_frame.is_multiple_of(80)
+                && model
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| matches!(&picker.kind, PickerKind::Plugins(_)))
+            {
+                super::plugins::refresh_health(model);
+                if let Some(mcp) = model.mcp.clone() {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(TuiEvent::PluginHealth(mcp.status().await));
+                    });
+                }
+            }
             // Clear before spawning so one durable report triggers one turn.
             if model.agent_report_deferred
                 && !model.running
@@ -1387,6 +1446,18 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
+                if let PickerKind::McpCatalog(picks) = &picker.kind {
+                    let choice = picks.get(picker.selected).cloned();
+                    model.picker = None;
+                    if let Some(pick) = choice {
+                        model.input = pick.line;
+                        model.cursor = pick.cursor.min(model.input.len());
+                        model.push_notice(
+                            "fill in what's missing, then Enter to add it — registry listings aren't reviewed by Medha, so check the source first",
+                        );
+                    }
+                    return;
+                }
                 // Action rows precede installed skills; keep indexing in one place.
                 if let PickerKind::Skill(skills) = &picker.kind {
                     let sel = picker.selected;
@@ -1758,9 +1829,57 @@ pub(super) fn handle_key<P, L>(
                 model.input.insert(model.cursor - 1, '\n');
                 return;
             }
-            model.typed_command = None;
-            if let Some(prompt) =
-                super::plugins::commands::expand(&model.plugin_commands, &model.input)
+            if model.plugin_command_busy {
+                model.push_notice("plugin command snippet is still running");
+                return;
+            }
+            if model.input.is_empty()
+                && let Some((typed, prompt)) = model.pending_plugin_prompt.take()
+            {
+                model.input = prompt;
+                model.cursor = model.input.len();
+                model.queued_plugin_label = Some(typed);
+            }
+            if model.queued_plugin_label.is_none()
+                && super::plugins::commands::has_snippets(&model.plugin_commands, &model.input)
+            {
+                if model.running || model.focus.is_some() || model.session_op.is_some() {
+                    model.push_notice("plugin command snippets need a fresh main-chat turn");
+                    return;
+                }
+                let Some(store) = model.plugins.clone() else {
+                    model.push_notice("plugins are unavailable in this session");
+                    return;
+                };
+                let Ok(workspace) = std::env::current_dir() else {
+                    model.push_notice("cannot find the workspace for this plugin command");
+                    return;
+                };
+                let typed = std::mem::take(&mut model.input);
+                model.cursor = 0;
+                model.plugin_command_busy = true;
+                model.push_notice("running plugin command snippet in the sandbox…");
+                let commands = model.plugin_commands.clone();
+                let tx = tx.clone();
+                let owner = session.id;
+                tokio::spawn(async move {
+                    let result = super::plugins::commands::expand_with_snippets(
+                        &commands, &typed, &store, &workspace,
+                    )
+                    .await
+                    .map(|expanded| expanded.unwrap_or_default());
+                    let _ = tx.send(TuiEvent::PluginCommandExpanded {
+                        session: owner,
+                        typed,
+                        result,
+                    });
+                });
+                return;
+            }
+            model.typed_command = model.queued_plugin_label.take();
+            if model.typed_command.is_none()
+                && let Some(prompt) =
+                    super::plugins::commands::expand(&model.plugin_commands, &model.input)
             {
                 let typed = std::mem::replace(&mut model.input, prompt);
                 if !model.running && model.focus.is_none() {
@@ -1769,7 +1888,7 @@ pub(super) fn handle_key<P, L>(
             }
             // Slash commands — only when the first token IS a known command;
             // a pasted path ("/Users/… do X") goes to the model as chat.
-            if is_slash_command(&model.input) {
+            if model.typed_command.is_none() && is_slash_command(&model.input) {
                 let line = std::mem::take(&mut model.input);
                 model.cursor = 0;
                 model.ac_sel = 0;
@@ -2753,6 +2872,14 @@ pub(super) fn handle_agent_event(
         }
         // `/skill install` finished (async when fetching a URL).
         TuiEvent::PluginJob(done) => super::plugins::job_done(model, done),
+        TuiEvent::PluginHealth(statuses) => {
+            model.plugin_health = statuses
+                .into_iter()
+                .map(|status| (status.server, status.state))
+                .collect();
+            super::plugins::refresh_health(model);
+        }
+        TuiEvent::PluginCommandExpanded { .. } => {}
         TuiEvent::SkillInstalled(result) => match result {
             Ok(report) => {
                 model.refresh_skill_manifest(transcript);
@@ -2828,6 +2955,14 @@ pub(super) fn handle_agent_event(
         TuiEvent::ModelsDiscovered { base_url, result } => {
             on_models_discovered(model, base_url, result)
         }
+        TuiEvent::UsageReport(text) => model.upsert_notice("usage", text),
+        TuiEvent::McpCatalog(result) => match result {
+            Ok(picks) if picks.is_empty() => {
+                model.push_notice("MCP catalog: no servers Medha can set up match that search")
+            }
+            Ok(picks) => model.picker = Some(Picker::new(PickerKind::McpCatalog(picks))),
+            Err(error) => model.push_notice(format!("MCP catalog: {error}")),
+        },
         // `/rewind` cut points arrived from the log — open the rewind picker.
         TuiEvent::RewindPointsLoaded(points) => {
             if model.foreground_owned() || model.has_active_agents() {
@@ -2928,9 +3063,10 @@ pub(super) fn handle_agent_event(
                 transcript.extend(msgs.clone());
                 repaint_history(model, &msgs);
                 // Prefill the prompt so the user can tweak it and re-send.
-                if let Some(text) = prefill {
+                if let Some((text, images)) = prefill {
                     model.input = text;
                     model.cursor = model.input.len();
+                    model.attachments.restore(images);
                 }
             }
             let note = match scope {
@@ -2972,6 +3108,10 @@ pub(super) fn repaint_history(model: &mut Model, msgs: &[Message]) {
         std::collections::HashMap::new();
     for m in msgs {
         match m.role {
+            // Hook context, agent reports and verifier feedback are for the model.
+            kernel::Role::User
+                if m.trust
+                    .is_some_and(|trust| trust != kernel::TrustLabel::User) => {}
             kernel::Role::User => model.push_item(Item::User(m.content.clone())),
             kernel::Role::Assistant => {
                 if !m.content.trim().is_empty() {
@@ -3043,6 +3183,10 @@ enum SlashAction {
     McpStart(String),
     /// `/mcp add <id> [--trust trusted] [--env K=V] -- <command>` — add + connect.
     McpAdd(String),
+    /// `/mcp catalog [search]` — browse the public MCP Registry.
+    McpCatalog(String),
+    /// `/usage` — tokens and cost for this session and the last week.
+    Usage,
     Memory(String),
     SkillPicker,
     LoadSkill(String),
@@ -3139,6 +3283,13 @@ fn classify_slash(cmd: &str) -> SlashAction {
         c if c.strip_prefix("mcp add").is_some_and(is_cmd_boundary) => {
             SlashAction::McpAdd(c.strip_prefix("mcp add").unwrap_or("").trim().to_string())
         }
+        "usage" => SlashAction::Usage,
+        c if c.strip_prefix("mcp catalog").is_some_and(is_cmd_boundary) => SlashAction::McpCatalog(
+            c.strip_prefix("mcp catalog")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        ),
         c if c.strip_prefix("memory").is_some_and(is_cmd_boundary) => {
             SlashAction::Memory(c.strip_prefix("memory").unwrap_or("").trim().to_string())
         }
@@ -3326,6 +3477,8 @@ fn dispatch_slash<P, L>(
         SlashAction::Tree => show_agent_tree(model),
         SlashAction::McpStart(id) => start_mcp_server(kernel, &id, tx),
         SlashAction::McpAdd(args) => mcp_add(model, &args, tx),
+        SlashAction::McpCatalog(query) => search_mcp_catalog(model, &query, tx),
+        SlashAction::Usage => show_usage(model, kernel, session.id, tx),
         SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
         SlashAction::SkillPicker => open_skill_picker(model),
         SlashAction::Plugins(args) => super::plugins::run_command(model, &args, tx),
@@ -3533,6 +3686,87 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
         ));
     }
     open_mcp_picker(model);
+}
+
+/// `/usage`: this session with its sub-agents, then the last seven days by
+/// model, read from the log in the background.
+fn show_usage<P, L>(
+    model: &mut Model,
+    kernel: &Arc<Kernel<P, L>>,
+    session: ulid::Ulid,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) where
+    P: Provider + 'static,
+    L: EventLog + 'static,
+{
+    let (log, tx) = (kernel.log.clone(), tx.clone());
+    model.push_notice("(reading usage …)");
+    tokio::spawn(async move {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs_f64())
+            .unwrap_or_default();
+        let (calls, sessions) = crate::usage_insights::collect(log.as_ref(), 7, now).await;
+        let window = crate::usage_insights::summarize(&calls, &sessions, 7);
+        let mine: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call.session == session
+                    || sessions.get(&call.session).and_then(|(_, parent)| *parent) == Some(session)
+            })
+            .cloned()
+            .collect();
+        let current = crate::usage_insights::summarize(&mine, &sessions, 7);
+        let _ = tx.send(TuiEvent::UsageReport(crate::usage_insights::render(
+            &current, &window,
+        )));
+    });
+}
+
+/// `/mcp catalog [search]`: the public MCP Registry, fetched in the background.
+/// Choosing an entry only pre-fills `/mcp add`, so nothing is saved unseen.
+fn search_mcp_catalog(model: &mut Model, query: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let (query, tx) = (query.to_string(), tx.clone());
+    model.push_notice("(searching the MCP Registry …)");
+    tokio::spawn(async move {
+        let result = crate::desktop_mcp_registry::search(&query, None)
+            .await
+            .map(|listing| catalog_picks(&listing))
+            .map_err(|error| error.to_string());
+        let _ = tx.send(TuiEvent::McpCatalog(result));
+    });
+}
+
+fn catalog_picks(listing: &serde_json::Value) -> Vec<super::CatalogPick> {
+    let mut picks = Vec::new();
+    for server in listing["servers"].as_array().into_iter().flatten() {
+        let name = server["name"].as_str().unwrap_or_default();
+        let title = server["title"]
+            .as_str()
+            .filter(|title| !title.is_empty())
+            .unwrap_or(name);
+        let description: String = server["description"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(70)
+            .collect();
+        for setup in server["setups"].as_array().into_iter().flatten() {
+            if let Some((line, cursor)) = crate::desktop_mcp_registry::add_command(name, setup) {
+                let kind = if setup["kind"] == "remote" {
+                    "remote"
+                } else {
+                    "local"
+                };
+                picks.push(super::CatalogPick {
+                    label: format!("{title} · {kind} — {description}"),
+                    line,
+                    cursor,
+                });
+            }
+        }
+    }
+    picks
 }
 
 /// Opens cached delegated work immediately, then refreshes durable patches.
@@ -4568,7 +4802,7 @@ fn start_rewind<L: EventLog + 'static>(
         // my last") is a valid point.
         let points: Vec<RewindPoint> = events
             .iter()
-            .filter(|e| e.kind == kernel::EventKind::UserMessage)
+            .filter(|e| e.is_from_person())
             .map(|e| {
                 let text = e
                     .payload
@@ -4606,6 +4840,7 @@ fn spawn_rewind<L: EventLog + 'static>(
     tx: &mpsc::UnboundedSender<TuiEvent>,
 ) {
     let log = kernel.log.clone();
+    let artifacts = kernel.artifacts.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
         // Keep planning, file restoration, and any conversation fork inside
@@ -4648,6 +4883,39 @@ fn spawn_rewind<L: EventLog + 'static>(
         // Conversation rewind: fork before the prompt (non-destructive), replay
         // the kept history, and prefill the prompt for editing/re-sending.
         let (new_id, msgs, memory_events, prefill) = if scope.touches_conversation() {
+            let selected = &events[idx];
+            let text = selected
+                .payload
+                .get("text")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let media: Vec<kernel::MediaPart> = match serde_json::from_value(
+                selected
+                    .payload
+                    .get("attachments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            ) {
+                Ok(media) => media,
+                Err(error) => {
+                    let _ = tx.send(TuiEvent::RewindFailed {
+                        source: session_id,
+                        error: format!("saved attachment metadata is invalid: {error}"),
+                    });
+                    return;
+                }
+            };
+            let images = match crate::attachments::restage(media, artifacts.clone()).await {
+                Ok(images) => images,
+                Err(error) => {
+                    let _ = tx.send(TuiEvent::RewindFailed {
+                        source: session_id,
+                        error: format!("cannot restore images on the selected prompt: {error:#}"),
+                    });
+                    return;
+                }
+            };
             let new_id = match log.fork(session_id, at_event).await {
                 Ok(id) => id,
                 Err(error) => {
@@ -4658,11 +4926,7 @@ fn spawn_rewind<L: EventLog + 'static>(
                     return;
                 }
             };
-            let prefill = events
-                .get(idx)
-                .and_then(|e| e.payload.get("text"))
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
+            let prefill = Some((text, images));
             let memory_events = log.events(new_id).await;
             (
                 Some(new_id),
@@ -4802,53 +5066,19 @@ pub(super) fn spawn_turn<P, L>(
         // Reports from background agents, delivered at the head of the turn.
         // Collecting here rather than on completion is what makes delivery
         // survive a restart: the outbox holds them until their owner next runs.
-        let mut taken: Vec<orchestrator::AgentResult> = Vec::new();
-        if let Some(control) = &agents {
-            for result in control.collect(session.id).await {
-                collected += 1;
-                taken.push(result.clone());
-                // Bound it: a background report reaches context directly, without
-                // the tool layer's cap, so a long one would otherwise arrive
-                // whole and crowd out the conversation it was meant to serve.
-                let mut summary = result.summary;
-                if let Some(cut) = summary
-                    .char_indices()
-                    .nth(orchestrator::MAX_SUMMARY_CHARS)
-                    .map(|(index, _)| index)
-                {
-                    // Spill before trimming: the tail is the part worth keeping,
-                    // and truncating first would discard it unrecoverably.
-                    let spilled = Arc::clone(&kernel.artifacts)
-                        .put_async(summary.as_bytes().to_vec())
-                        .await
-                        .ok();
-                    summary.truncate(cut);
-                    summary.push_str(&match spilled {
-                        Some(hash) => {
-                            format!("\n… truncated; read the rest with `read` hash={hash}")
-                        }
-                        None => "\n… report truncated".to_string(),
-                    });
-                }
-                // Carrying the child's label: this is not the user speaking, and
-                // a report built from web content must escalate what the parent
-                // does next exactly as a direct fetch would.
-                messages.push(
-                    Message::new(
-                        kernel::Role::User,
-                        format!(
-                            "[background agent '{}' finished — {}]\n{}",
-                            result.agent,
-                            serde_json::to_string(&result.status)
-                                .unwrap_or_default()
-                                .trim_matches('"'),
-                            summary
-                        ),
-                    )
-                    .carrying(result.trust),
-                );
+        let taken = match &agents {
+            Some(control) => {
+                crate::agents::collect_reports(
+                    control,
+                    session.id,
+                    &kernel.artifacts,
+                    &mut messages,
+                )
+                .await
             }
-        }
+            None => Vec::new(),
+        };
+        collected += taken.len();
         if needs_a_report && collected == 0 {
             // Nothing to deliver and nothing was asked: end the turn without
             // spending a request. `Done` restores the input and clears
@@ -6373,8 +6603,7 @@ mod fix_tests {
         let event = rx.recv().await.unwrap();
         handle_agent_event(&mut m, event, &mut session, &mut transcript);
         assert!(m.attachments.holds(&path));
-        let title = m.attachments.title().unwrap();
-        assert!(title.contains("1. Screen Shot 1.png  1×1"), "{title}");
+        assert!(m.attachments.chips()[0].contains("Screen Shot 1.png  1×1"));
     }
 
     /// The reported failure: a screenshot dropped into the composer arrived as
@@ -6526,6 +6755,15 @@ mod fix_tests {
             classify_slash("memory quoted-fact"),
             SlashAction::Memory("quoted-fact".into())
         );
+        assert_eq!(
+            classify_slash("mcp catalog postgres"),
+            SlashAction::McpCatalog("postgres".into())
+        );
+        assert_eq!(
+            classify_slash("mcp catalog"),
+            SlashAction::McpCatalog(String::new())
+        );
+        assert_eq!(classify_slash("usage"), SlashAction::Usage);
         assert_eq!(
             classify_slash("model fast-local"),
             SlashAction::SwitchModel("fast-local".into())
@@ -8527,6 +8765,24 @@ mod agent_pane_tests {
         assert_eq!(shown(&m), vec!["assistant:child survives"]);
         m.focus_pane(None);
         assert!(shown(&m).is_empty());
+    }
+
+    #[test]
+    fn catalog_rows_are_the_setups_medha_can_run_as_add_lines() {
+        let listing = serde_json::json!({"servers": [{
+            "name": "io.github.acme/notes-mcp", "title": "Notes", "description": "Your notes",
+            "setups": [
+                {"kind": "remote", "url": "https://notes.example/mcp", "sign_in": "detect"},
+                {"kind": "remote", "unsupported": "needs custom request headers"}
+            ]
+        }]});
+        let picks = catalog_picks(&listing);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].label, "Notes · remote — Your notes");
+        assert_eq!(
+            picks[0].line,
+            "/mcp add notes --url https://notes.example/mcp"
+        );
     }
 
     #[test]

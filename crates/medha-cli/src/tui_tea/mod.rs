@@ -60,6 +60,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/status", "model, context window, current pressure"),
     (
+        "/usage",
+        "tokens and cost — this session and the last 7 days by model",
+    ),
+    (
         "/pulse",
         "config health: which model/key resolves & from where; /pulse fix auto-repairs",
     ),
@@ -94,7 +98,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/lsp", "language-server sessions and health"),
     (
         "/mcp",
-        "MCP servers — manage · connect · remove · add  ·  /mcp start <id> to connect",
+        "MCP servers — manage · connect · remove · add  ·  /mcp catalog <search> to browse the registry",
     ),
     (
         "/agents",
@@ -120,17 +124,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/exit", "quit (also Ctrl-D)"),
 ];
 
-/// Applies an explicitly selected profile atomically between turns.
-pub(crate) trait ProfileProvider: Provider {
-    fn switch_profile(&self, profile: &config::Resolved) -> Result<(), String>;
-}
-
-impl ProfileProvider for providers::OpenAiCompat {
-    fn switch_profile(&self, profile: &config::Resolved) -> Result<(), String> {
-        self.switch_provider_profile(profile.provider.clone(), profile.credential.clone())
-            .map_err(|error| error.to_string())
-    }
-}
+pub(crate) use crate::desktop_controls::ProfileProvider;
 
 /// Compatibility commands intentionally omitted from autocomplete and help.
 const HIDDEN_COMMANDS: &[&str] = &[
@@ -403,6 +397,12 @@ pub(crate) enum TuiEvent {
     /// guard before its success/failure notice is shown.
     AgentFollowupFinished(Result<String, String>),
     McpStatus(Result<serde_json::Value, String>),
+    PluginHealth(Vec<mcp::ServerStatus>),
+    PluginCommandExpanded {
+        session: ulid::Ulid,
+        typed: String,
+        result: Result<String, String>,
+    },
     /// A remote MCP server's browser sign-in is waiting on this URL.
     McpAuthUrl {
         server: String,
@@ -443,6 +443,10 @@ pub(crate) enum TuiEvent {
         base_url: String,
         result: Result<Vec<providers::openai_compat::ModelInfo>, String>,
     },
+    /// `/mcp catalog` search results, as ready-to-edit `/mcp add` lines.
+    McpCatalog(Result<Vec<CatalogPick>, String>),
+    /// `/usage` finished reading the log.
+    UsageReport(String),
     /// A past session's events were replayed into a transcript; swap to it.
     Resumed(ulid::Ulid, Vec<Message>, Vec<kernel::Event>),
     /// `/rewind` completed loading this session's rewind points from the log.
@@ -465,7 +469,7 @@ pub(crate) enum TuiEvent {
         memory_events: Vec<kernel::Event>,
         rolled: usize,
         scope: RewindScope,
-        prefill: Option<String>,
+        prefill: Option<(String, Vec<crate::attachments::Attachment>)>,
     },
     RewindFailed {
         source: ulid::Ulid,
@@ -1105,9 +1109,20 @@ impl ReasoningPanelState {
     }
 }
 
+/// One MCP Registry setup: its row, the `/mcp add` line it fills in, and
+/// where the cursor goes for the value still needed.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogPick {
+    pub label: String,
+    pub line: String,
+    pub cursor: usize,
+}
+
 /// Reasoning control / session picker kind. Not `Copy` — some variants own data.
 #[derive(Clone)]
 enum PickerKind {
+    /// `/mcp catalog`: registry servers Medha can set up.
+    McpCatalog(Vec<CatalogPick>),
     Reasoning(ReasoningPanelState),
     /// Browse past sessions to resume. Holds the list from `log.sessions()`.
     Session(Vec<kernel::SessionMeta>),
@@ -1314,6 +1329,9 @@ impl PickerKind {
                     .into()
             }
             PickerKind::Skill(_) => " skill hub — ↑↓ select · Enter · Esc cancel ".into(),
+            PickerKind::McpCatalog(_) => {
+                " MCP catalog — ↑↓ select · Enter fills in /mcp add · Esc close ".into()
+            }
             PickerKind::RemoveSkill(name) => {
                 format!(" remove user skill '{name}'? — ↑↓ move · Enter confirm · Esc back ")
             }
@@ -1460,6 +1478,7 @@ impl PickerKind {
                     })
                     .collect()
             }
+            PickerKind::McpCatalog(picks) => picks.iter().map(|pick| pick.label.clone()).collect(),
             PickerKind::Skill(skills) => SKILL_HUB_ACTIONS
                 .iter()
                 .map(|(label, _)| (*label).to_string())
@@ -2032,6 +2051,7 @@ struct Model {
     /// MCP host handle, so `/mcp` can list/connect/remove/add live. `None` when
     /// MCP is disabled or unwired (tests).
     mcp: Option<Arc<mcp::McpManager>>,
+    plugin_health: HashMap<String, mcp::ServerState>,
     /// The same plugin store `medha plugins` manages. `None` in tests.
     plugins: Option<extensions::Store>,
     plugin_markets: Option<extensions::sources::Marketplaces>,
@@ -2039,6 +2059,9 @@ struct Model {
     plugin_commands: Vec<plugins::commands::PluginCommand>,
     /// Shown in the chat instead of the prompt a plugin command expands to.
     typed_command: Option<String>,
+    queued_plugin_label: Option<String>,
+    pending_plugin_prompt: Option<(String, String)>,
+    plugin_command_busy: bool,
     /// Applies plugin changes to the running session; returns warnings.
     apply_plugins: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
     /// Set after `apply_plugins` so the skill list in the prompt is rebuilt.
@@ -2330,10 +2353,14 @@ impl Model {
             memory_budget_tokens: memory::recall::DEFAULT_K3_BUDGET_TOKENS,
             memory_stale_after_days: memory::recall::DEFAULT_STALE_AFTER_DAYS,
             mcp: None,
+            plugin_health: HashMap::new(),
             plugins: None,
             plugin_markets: None,
             plugin_commands: Vec::new(),
             typed_command: None,
+            queued_plugin_label: None,
+            pending_plugin_prompt: None,
+            plugin_command_busy: false,
             apply_plugins: None,
             plugins_changed: false,
             agents: None,
@@ -2882,6 +2909,10 @@ impl Model {
         self.context_pressure = None;
         self.attachments.reset();
         self.submit_deferred = None;
+        self.typed_command = None;
+        self.queued_plugin_label = None;
+        self.pending_plugin_prompt = None;
+        self.plugin_command_busy = false;
         if self.focus.is_some() {
             self.focus_pane(None);
         }
@@ -3363,8 +3394,16 @@ where
 
     shutdown_foreground_turn(&mut model, &mut rx, TURN_SHUTDOWN_GRACE).await;
 
-    // Leave the alternate screen before undoing output redirection.
+    // Restore the terminal before a closing hook can take its bounded timeout.
     tty::restore(&mut terminal, &mut redirect);
+
+    kernel
+        .observe_hook(
+            &session,
+            kernel::HookPoint::SessionEnd,
+            serde_json::json!({ "source": "tui" }),
+        )
+        .await;
     Ok(())
 }
 
@@ -4094,6 +4133,32 @@ mod tests {
                 .any(|e| matches!(&e.item, Item::ToolResult { ok: false, .. })),
             "error payloads replay as failures"
         );
+    }
+
+    #[test]
+    fn resumed_history_shows_only_what_the_person_typed() {
+        let mut m = Model::new(
+            "m".into(),
+            None,
+            kernel::ReasoningConfig::default(),
+            lockfile::UiConfig::default(),
+            HashMap::new(),
+            test_sbx(),
+        );
+        let msgs = vec![
+            Message::user("hii"),
+            Message::user("[session_start hook p/c] be terse").carrying(kernel::TrustLabel::Tool),
+        ];
+        update::repaint_history(&mut m, &msgs);
+        let users: Vec<_> = m
+            .items
+            .iter()
+            .filter_map(|e| match &e.item {
+                Item::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["hii"]);
     }
 
     #[test]

@@ -158,7 +158,7 @@ fn details_run_an_action_by_placing_it_in_the_composer() {
         .unwrap();
     select(&mut f.model, run);
     handle_key(&mut f.model, KeyCode::Enter, &f.tx);
-    assert_eq!(f.model.input, "Review the current diff.");
+    assert_eq!(f.model.input, "/review");
     assert!(f.model.picker.is_none());
 }
 
@@ -259,8 +259,12 @@ fn enabled_plugin_actions_become_slash_commands() {
         .collect();
     assert_eq!(
         names,
-        ["/kit:review", "/kit:review"],
-        "a clash gets a prefix"
+        ["/dev-me-kit:review", "/dev-other-kit:review"],
+        "every command name must remain unique"
+    );
+    assert_eq!(
+        commands::name_for_action(&f.model.plugin_commands, "dev.other.kit/review"),
+        Some("/dev-other-kit:review")
     );
     let _ = f
         .model
@@ -277,6 +281,53 @@ fn enabled_plugin_actions_become_slash_commands() {
         Some("Review the current diff.\n\nthe auth change")
     );
     assert_eq!(commands::expand(only, "/reviewer"), None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn plugin_command_snippet_runs_in_its_sandbox_before_submission() {
+    if !sandbox::native_backend_available() {
+        return;
+    }
+    let f = fixture();
+    let source = f.root.join("snippet-plugin");
+    write_package(&source, "dev.me.snippet", "");
+    let manifest = source.join("plugin.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap().replace(
+        "prompt = \"Review the current diff.\"",
+        "prompt = 'Review !`printf hello` for $ARGUMENTS.'",
+    );
+    std::fs::write(&manifest, text).unwrap();
+    let store = f.model.plugins.as_ref().unwrap();
+    store.install(&source).unwrap();
+    store
+        .enable("dev.me.snippet", None, &Grant::default())
+        .unwrap();
+    let commands = commands::load(store, &[]);
+    assert!(commands::has_snippets(&commands, "/review Ada"));
+    let prompt =
+        commands::expand_with_snippets(&commands, "/review Ada", store, &f.root.join("workspace"))
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(prompt.contains("[plugin command output — untrusted]\nhello\n"));
+    assert!(prompt.ends_with(" for Ada."));
+    let injected = commands::expand_with_snippets(
+        &commands,
+        "/review !`printf injected`",
+        store,
+        &f.root.join("workspace"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        injected
+            .matches("[plugin command output — untrusted]")
+            .count(),
+        1
+    );
+    assert!(injected.contains("!`printf injected`"));
 }
 
 #[test]

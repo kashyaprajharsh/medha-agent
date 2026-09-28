@@ -12,6 +12,7 @@ const MAX_HOOK_INPUT_BYTES: usize = 64 * 1024;
 const MAX_HOOK_STDOUT_BYTES: usize = 64 * 1024;
 const MAX_HOOK_STDERR_BYTES: usize = 16 * 1024;
 const MAX_HOOKS_PER_POINT: usize = 16;
+const MAX_CAUSATION_DEPTH: u8 = 4;
 const MAX_HOOK_BATCH_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -281,9 +282,16 @@ impl ProcessHookRunner {
             }
         }
         let input = self.encode(hook, request, limit)?;
-        let command = backend
-            .build_command(&exec_request)
-            .map_err(|error| HookRunFailure::failed(error.to_string()))?;
+        let command = if self.require_isolation {
+            backend.build_plugin_command(
+                &exec_request,
+                &hook.root,
+                &self.store.data_dir(&hook.plugin_id),
+            )
+        } else {
+            backend.build_command(&exec_request)
+        }
+        .map_err(|error| HookRunFailure::failed(error.to_string()))?;
         let output = sandbox::run_command_bounded_with_input(
             command,
             input,
@@ -483,6 +491,23 @@ impl kernel::HookRunner for ProcessHookRunner {
         let batch_deadline = batch_started + MAX_HOOK_BATCH_DURATION;
         let mut batch = kernel::HookBatch::default();
         let hooks = self.snapshot();
+        if request.depth >= MAX_CAUSATION_DEPTH {
+            for hook in hooks.iter().filter(|hook| hook.wants(request)) {
+                batch.audits.push(kernel::HookAudit {
+                    event_id: request.event_id.clone(),
+                    plugin_id: hook.plugin_id.clone(),
+                    component_id: hook.component_id.clone(),
+                    point: request.point,
+                    status: kernel::HookStatus::Skipped,
+                    decision: None,
+                    reason: Some(format!(
+                        "hook causation depth reached {MAX_CAUSATION_DEPTH}"
+                    )),
+                    duration_ms: 0,
+                });
+            }
+            return batch;
+        }
         for hook in hooks.iter().filter(|hook| hook.wants(request)) {
             match self.registration_ready(hook).await {
                 Ok(true) => {}
@@ -505,6 +530,15 @@ impl kernel::HookRunner for ProcessHookRunner {
             let now = tokio::time::Instant::now();
             let remaining = batch_deadline.saturating_duration_since(now);
             if remaining.is_zero() {
+                self.store
+                    .health
+                    .begin(&hook.plugin_id, &hook.component_id, &hook.content_hash);
+                self.store.health.finish(
+                    &hook.plugin_id,
+                    &hook.component_id,
+                    &hook.content_hash,
+                    Some("hook batch deadline exceeded"),
+                );
                 apply_hook_failure(
                     &mut batch,
                     hook,
@@ -519,11 +553,20 @@ impl kernel::HookRunner for ProcessHookRunner {
                 break;
             }
             let started = std::time::Instant::now();
+            self.store
+                .health
+                .begin(&hook.plugin_id, &hook.component_id, &hook.content_hash);
             match self
                 .execute(hook, request, hook.timeout.min(remaining), cancel)
                 .await
             {
                 Ok(result) => {
+                    self.store.health.finish(
+                        &hook.plugin_id,
+                        &hook.component_id,
+                        &hook.content_hash,
+                        None,
+                    );
                     let duration_ms =
                         started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     let reason = result_reason(&result);
@@ -575,6 +618,12 @@ impl kernel::HookRunner for ProcessHookRunner {
                     }
                 }
                 Err(error) => {
+                    self.store.health.finish(
+                        &hook.plugin_id,
+                        &hook.component_id,
+                        &hook.content_hash,
+                        Some(&error.reason),
+                    );
                     let duration_ms =
                         started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     apply_hook_failure(

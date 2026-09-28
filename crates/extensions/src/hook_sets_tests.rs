@@ -62,7 +62,7 @@ fn a_script_in_an_event_folder_is_a_hook_without_any_config() {
 #[test]
 fn headers_and_folder_names_are_checked_not_ignored() {
     let temp = tempfile::tempdir().unwrap();
-    let dir = hooks(temp.path(), &[("file-change/x.sh", "echo")]);
+    let dir = hooks(temp.path(), &[("job-state-change/x.sh", "echo")]);
     let error = load(&dir, PROJECT_HOOKS_ID, "0.1.8")
         .unwrap_err()
         .to_string();

@@ -130,6 +130,7 @@ pub struct Store {
     project_state: PathBuf,
     medha_version: String,
     hook_sources: Vec<HookSource>,
+    pub(crate) health: crate::health::Health,
 }
 
 /// A folder of hooks that is not a plugin: a `hooks.toml` folder or a settings
@@ -194,6 +195,7 @@ impl Store {
             project_state,
             medha_version: medha_version.into(),
             hook_sources: Vec::new(),
+            health: crate::health::Health::default(),
         }
     }
 
@@ -204,6 +206,12 @@ impl Store {
 
     pub fn medha_version(&self) -> &str {
         &self.medha_version
+    }
+
+    /// Live process health for the exact installed package version. A new
+    /// package hash cannot inherit an old component's failed state.
+    pub fn component_health(&self, plugin: &str, hash: &str) -> Vec<crate::ComponentHealth> {
+        self.health.for_plugin(plugin, hash)
     }
 
     /// A plugin's private writable folder: kept across updates and disable,
@@ -379,7 +387,34 @@ impl Store {
         scope: Option<Scope>,
         approved: &Grant,
     ) -> Result<Package, Error> {
+        self.enable_inner(id, scope, None, approved)
+    }
+
+    /// Enable exactly the package shown in an operator's review form.
+    pub fn enable_reviewed(
+        &self,
+        id: &str,
+        scope: Option<Scope>,
+        hash: &str,
+        approved: &Grant,
+    ) -> Result<Package, Error> {
+        self.enable_inner(id, scope, Some(hash), approved)
+    }
+
+    fn enable_inner(
+        &self,
+        id: &str,
+        scope: Option<Scope>,
+        hash: Option<&str>,
+        approved: &Grant,
+    ) -> Result<Package, Error> {
         let plugin = self.select(id, scope, false)?;
+        if hash.is_some_and(|hash| hash != plugin.package.content_hash) {
+            return Err(Error::GrantRequired(
+                "The package changed after this review. Reload and review its current access."
+                    .into(),
+            ));
+        }
         let required = plugin.requested_grant()?;
         if &required != approved {
             return Err(Error::GrantRequired(format!(

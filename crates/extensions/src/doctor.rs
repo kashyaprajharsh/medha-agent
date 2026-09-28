@@ -2,7 +2,7 @@
 //! and says how to fix it.
 
 use crate::store::{Activation, Store};
-use crate::{ExtensionComponent, PLUGIN_ROOT_PLACEHOLDER};
+use crate::{ComponentState, ExtensionComponent, PLUGIN_ROOT_PLACEHOLDER};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +80,22 @@ pub fn run(store: &Store) -> Vec<Check> {
         let before = checks.len();
         for component in &plugin.package.manifest.components {
             check_component(&plugin.package.root, id, component, &mut checks);
+        }
+        for health in store.component_health(id, &plugin.package.content_hash) {
+            let level = if health.state == ComponentState::Failed {
+                Level::Fail
+            } else {
+                Level::Ok
+            };
+            let message = health.last_failure.map_or_else(
+                || health.state.as_str().to_string(),
+                |reason| format!("{}: {reason}", health.state.as_str()),
+            );
+            checks.push(Check::new(
+                level,
+                format!("{id}/{}", health.component_id),
+                message,
+            ));
         }
         if let Some(note) = plugin
             .package

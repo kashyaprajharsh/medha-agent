@@ -93,7 +93,8 @@ pub struct RequestedPermissions {
     /// belong to the host because a manifest is untrusted input.
     pub read_paths: Vec<String>,
     pub write_paths: Vec<String>,
-    /// Logical secret names. Values are always brokered as opaque handles.
+    /// Logical secret names. Activation is refused until the host can broker
+    /// these as component-scoped handles.
     pub secrets: Vec<String>,
 }
 
@@ -443,15 +444,15 @@ impl HookPoint {
             Self::PromptSubmit => &[Continue, Deny, AddContext],
             Self::PostTool | Self::ToolFailure => &[Continue, Annotate, AddContext],
             Self::SessionStart | Self::TaskCompletion => &[Continue, AddContext],
+            Self::SessionEnd => &[Continue, Annotate],
+            Self::FileChange | Self::ApprovalDecision | Self::PreCompaction => {
+                &[Continue, Annotate]
+            }
             Self::AgentStart => &[Continue, Annotate, AddContext],
-            Self::PostCompaction | Self::AgentStop => &[Continue, Annotate],
-            Self::SessionEnd
-            | Self::PreModel
-            | Self::PostModel
-            | Self::ApprovalDecision
-            | Self::FileChange
-            | Self::PreCompaction
-            | Self::JobStateChange => &[],
+            Self::PreModel | Self::PostModel | Self::PostCompaction | Self::AgentStop => {
+                &[Continue, Annotate]
+            }
+            Self::JobStateChange => &[],
         }
     }
 
@@ -815,7 +816,7 @@ mod tests {
         let mut value = manifest();
         value.components = vec![ExtensionComponent::Hook {
             id: "future".into(),
-            points: vec![HookPoint::FileChange],
+            points: vec![HookPoint::JobStateChange],
             entrypoint: ProcessEntrypoint {
                 program: "bin/hook".into(),
                 args: Vec::new(),

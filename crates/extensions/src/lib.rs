@@ -4,8 +4,10 @@
 //! enabled package is pinned to its exact content hash and scope. Process
 //! supervision and component adapters are separate layers built on this state.
 
+mod actions;
 mod compat;
 pub mod doctor;
+mod health;
 mod hook_sets;
 mod hooks;
 mod package;
@@ -13,11 +15,12 @@ pub mod sources;
 mod state;
 mod store;
 
+pub use health::{ComponentHealth, ComponentState};
 pub use hook_sets::{HOOKS_FILE, PROJECT_HOOKS_ID, USER_HOOKS_ID};
 pub use hooks::ProcessHookRunner;
 pub use medha_extension_api::{
     ExtensionComponent, HookDecision, HookEnvelope, HookFailureMode, HookPoint, HookResult,
-    Manifest, PLUGIN_ROOT_PLACEHOLDER, ProcessEntrypoint, RequestedPermissions,
+    Manifest, PLUGIN_ROOT_PLACEHOLDER, ProcessEntrypoint, RequestedPermissions, url_host,
 };
 pub use package::{Package, PackageSource};
 pub use state::{Grant, Origin};
@@ -36,6 +39,8 @@ pub(crate) fn io_error(action: &str, path: &Path, error: std::io::Error) -> Erro
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("plugin action: {0}")]
+    Action(String),
     #[error("{0}")]
     Io(String),
     #[error("invalid plugin manifest: {0}")]

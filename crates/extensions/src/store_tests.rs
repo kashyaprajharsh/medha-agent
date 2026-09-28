@@ -64,6 +64,27 @@ fn install_copies_safely_but_does_not_enable() {
 }
 
 #[test]
+fn bundled_example_installs_with_all_four_native_component_kinds() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello-plugin");
+    let store = store(temp.path());
+    let package = store.install(&source).unwrap();
+    assert_eq!(package.manifest.id, "dev.medha.hello");
+    assert_eq!(package.manifest.components.len(), 4);
+    assert_eq!(
+        store.discover().unwrap().plugins[0].activation,
+        Activation::Disabled
+    );
+    store.enable("dev.medha.hello", None, &none()).unwrap();
+    assert_eq!(store.actions().unwrap()[0].id, "dev.medha.hello/greet");
+    assert_eq!(store.discover().unwrap().enabled().count(), 1);
+    store.disable("dev.medha.hello", None).unwrap();
+    assert!(store.actions().unwrap().is_empty());
+    store.remove("dev.medha.hello").unwrap();
+    assert!(store.discover().unwrap().plugins.is_empty());
+}
+
+#[test]
 fn a_repository_package_can_never_disable_or_replace_a_user_package() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
@@ -326,5 +347,38 @@ fn file_modes_are_part_of_the_approval_and_install_normalizes_them() {
     assert_eq!(
         store.discover().unwrap().plugins[0].activation,
         Activation::Changed
+    );
+}
+
+#[test]
+fn reviewed_enable_rejects_a_new_package_even_when_its_permissions_are_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = temp.path().join("project/example");
+    write_action_package(&package, "dev.medha.example");
+    let store = store(temp.path());
+    let hash = store.discover().unwrap().plugins[0]
+        .package
+        .content_hash
+        .clone();
+    fs::write(package.join("extra.txt"), "changed after review").unwrap();
+    assert!(
+        store
+            .enable_reviewed("dev.medha.example", Some(Scope::Project), &hash, &none())
+            .is_err()
+    );
+    assert_eq!(
+        store.discover().unwrap().plugins[0].activation,
+        Activation::Disabled
+    );
+    let current = store.discover().unwrap().plugins[0]
+        .package
+        .content_hash
+        .clone();
+    store
+        .enable_reviewed("dev.medha.example", Some(Scope::Project), &current, &none())
+        .unwrap();
+    assert_eq!(
+        store.discover().unwrap().plugins[0].activation,
+        Activation::Enabled
     );
 }

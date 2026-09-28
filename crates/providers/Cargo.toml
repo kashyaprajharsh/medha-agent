@@ -13,6 +13,7 @@ reqwest.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 thiserror.workspace = true
+tracing = "0.1"
 async-stream = "0.3"
 dirs = "5"
 tokio = { workspace = true, features = ["time"] }

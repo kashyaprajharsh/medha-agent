@@ -493,6 +493,8 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    refusal: Option<serde_json::Value>,
     /// Two wire spellings of the same field. Held separately rather than as one
     /// `alias`, because a server that sends *both* makes `alias` report a
     /// duplicate field and reject the response. `reasoning_content` wins when
@@ -544,6 +546,8 @@ struct CompletionChoice {
 struct CompletionMessage {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    refusal: Option<serde_json::Value>,
     /// See [`Delta`] for why these are two fields and not one `alias`.
     #[serde(default)]
     reasoning_content: Option<String>,
@@ -569,6 +573,7 @@ pub(crate) struct ResponseDecoder {
     target_announced: HashSet<u32>,
     think_filter: ThinkTagFilter,
     completed: bool,
+    progressed: bool,
 }
 
 impl ResponseDecoder {
@@ -579,6 +584,7 @@ impl ResponseDecoder {
             target_announced: HashSet::new(),
             think_filter: ThinkTagFilter::default(),
             completed: false,
+            progressed: false,
         }
     }
 
@@ -589,15 +595,35 @@ impl ResponseDecoder {
             &mut self.think_filter,
             &mut self.target_announced,
         )?;
-        if event.data.trim() == "[DONE]"
-            || serde_json::from_str::<StreamChunk>(&event.data)
-                .ok()
-                .and_then(|chunk| chunk.choices.into_iter().next())
-                .is_some_and(|choice| choice.finish_reason.is_some())
-        {
+        self.progressed = false;
+        if event.data.trim() == "[DONE]" {
+            self.progressed = !self.completed;
             self.completed = true;
+        } else if let Ok(chunk) = serde_json::from_str::<StreamChunk>(&event.data)
+            && let Some(choice) = chunk.choices.first()
+        {
+            let delta = &choice.delta;
+            self.progressed = [&delta.content, &delta.reasoning_content, &delta.reasoning]
+                .iter()
+                .any(|text| text.as_ref().is_some_and(|text| !text.is_empty()))
+                || delta.tool_calls.iter().any(|call| {
+                    call.function.as_ref().is_some_and(|function| {
+                        [&function.name, &function.arguments]
+                            .iter()
+                            .any(|text| text.as_ref().is_some_and(|text| !text.is_empty()))
+                    })
+                })
+                || (!self.completed && choice.finish_reason.is_some());
+            self.completed |= choice.finish_reason.is_some();
         }
         Ok(blocks)
+    }
+
+    pub(crate) fn progressed(&self) -> bool {
+        self.progressed
+    }
+    pub(crate) fn completed(&self) -> bool {
+        self.completed
     }
 
     /// Preserve visible text that the inline-thinking filter held while
@@ -612,10 +638,9 @@ impl ResponseDecoder {
             blocks.push(block);
         }
         let intents = finalize_tool_calls(self.accum, &self.names)?;
-        if !intents.is_empty() && !self.completed {
+        if !self.completed {
             return Err(ProviderError::Stream(
-                "stream ended before completing the tool-call response; no tools were executed"
-                    .into(),
+                "stream ended before completing the model response; no tools were executed".into(),
             ));
         }
         blocks.extend(intents.into_iter().map(Block::ToolIntent));
@@ -639,6 +664,7 @@ pub(crate) fn parse_completion(
     if let Some(choice) = parsed.choices.into_iter().next() {
         validate_finish_reason(choice.finish_reason.as_deref())?;
         let message = choice.message;
+        validate_refusal(message.refusal.as_ref())?;
         if let Some(reasoning) = message
             .reasoning_content
             .or(message.reasoning)
@@ -723,6 +749,7 @@ pub(crate) fn process_sse_event(
     }
     if let Some(choice) = chunk.choices.into_iter().next() {
         validate_finish_reason(choice.finish_reason.as_deref())?;
+        validate_refusal(choice.delta.refusal.as_ref())?;
         if let Some(reasoning) = choice
             .delta
             .reasoning_content
@@ -789,6 +816,15 @@ pub(crate) fn finalize_tool_calls(
         });
     }
     Ok(intents)
+}
+
+fn validate_refusal(refusal: Option<&serde_json::Value>) -> Result<(), ProviderError> {
+    if let Some(refusal) = refusal.filter(|value| !value.is_null() && value.as_str() != Some("")) {
+        return Err(ProviderError::Decode(format!(
+            "model refused the request: {refusal}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_finish_reason(reason: Option<&str>) -> Result<(), ProviderError> {
@@ -1099,23 +1135,48 @@ mod tests {
     }
 
     #[test]
-    fn output_truncation_is_a_fatal_diagnostic_not_a_missing_path() {
-        let body = r#"{"choices":[{"finish_reason":"length","message":{"content":"partial"}}]}"#;
-        let error = parse_completion(body, &HashMap::new()).unwrap_err();
-        assert!(error.to_string().contains("truncated at its output limit"));
-        assert!(!error.is_retryable());
-        let mut decoder = ResponseDecoder::new(HashMap::new());
-        let error = decoder
-            .push(&SseEvent {
-                event: None,
-                data: r#"{"choices":[{"finish_reason":"length","delta":{}}]}"#.into(),
-            })
-            .unwrap_err();
-        assert!(error.to_string().contains("truncated at its output limit"));
+    fn truncated_or_refused_responses_are_fatal_in_both_response_modes() {
+        for (finish, message, reason) in [
+            (
+                "length",
+                serde_json::json!({"content":"partial"}),
+                "truncated at its output limit",
+            ),
+            (
+                "stop",
+                serde_json::json!({"content":"filler", "refusal":"cannot summarize"}),
+                "refused",
+            ),
+        ] {
+            let body = serde_json::json!({"choices":[{"finish_reason":finish, "message":message}]})
+                .to_string();
+            let error = parse_completion(&body, &HashMap::new()).unwrap_err();
+            assert!(error.to_string().contains(reason));
+            assert!(!error.is_retryable());
+            let mut decoder = ResponseDecoder::new(HashMap::new());
+            let error = decoder
+                .push(&SseEvent {
+                    event: None,
+                    data:
+                        serde_json::json!({"choices":[{"finish_reason":finish, "delta":message}]})
+                            .to_string(),
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains(reason));
+        }
     }
 
     #[test]
-    fn clean_eof_cannot_authorize_an_unfinished_tool_batch() {
+    fn clean_eof_cannot_complete_an_unfinished_response() {
+        let mut text_only = ResponseDecoder::new(HashMap::new());
+        text_only
+            .push(&SseEvent {
+                event: None,
+                data: r#"{"choices":[{"delta":{"content":"partial handoff"}}]}"#.into(),
+            })
+            .unwrap();
+        assert!(matches!(text_only.finish(), Err(ProviderError::Stream(_))));
+
         let event = SseEvent {
             event: None,
             data: serde_json::json!({"choices":[{"delta":{"tool_calls":[
@@ -1146,6 +1207,39 @@ mod tests {
                     .any(|b| matches!(b, Block::ToolIntent(_)))
             );
         }
+    }
+
+    #[test]
+    fn stream_progress_excludes_keepalives_but_includes_tool_arguments() {
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        for (data, progress) in [
+            (r#"{"choices":[{"delta":{"content":"working"}}]}"#, true),
+            (r#"{"choices":[],"usage":{"prompt_tokens":10}}"#, false),
+            (r#"{"choices":[{"delta":{}}]}"#, false),
+            ("", false),
+            (
+                r#"{"choices":[{"delta":{"reasoning_content":"checking"}}]}"#,
+                true,
+            ),
+            (
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+                true,
+            ),
+            (
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a\"}"}}]}}]}"#,
+                true,
+            ),
+            ("[DONE]", true),
+        ] {
+            decoder
+                .push(&SseEvent {
+                    event: None,
+                    data: data.into(),
+                })
+                .unwrap();
+            assert_eq!(decoder.progressed(), progress, "{data}");
+        }
+        assert!(decoder.finish().is_ok());
     }
 
     #[test]
@@ -1328,22 +1422,41 @@ mod tests {
 
     #[test]
     fn ordered_user_image_is_lowered_to_chat_content() {
-        let messages = vec![ModelMessage {
+        let mut messages = vec![ModelMessage {
             role: Role::User,
-            parts: vec![ContentPart::Media(MediaPart {
-                mime_type: "image/png".into(),
-                source: MediaSource::Url("https://example.test/image.png".into()),
-                label: None,
-                provider_state: Vec::new(),
-            })],
+            parts: vec![
+                ContentPart::Text(TextPart {
+                    text: "what is this?".into(),
+                    provider_state: Vec::new(),
+                }),
+                ContentPart::Media(MediaPart {
+                    mime_type: "image/png".into(),
+                    source: MediaSource::Base64("QUJD".into()),
+                    label: None,
+                    width: None,
+                    height: None,
+                    byte_size: None,
+                    provider_state: Vec::new(),
+                }),
+            ],
             trust: None,
         }];
 
         let lowered = lower_chat_messages(&messages, &HashMap::new()).unwrap();
-        assert_eq!(lowered[0].content[0]["type"], "image_url");
+        assert_eq!(lowered[0].content[0]["text"], "what is this?");
         assert_eq!(
-            lowered[0].content[0]["image_url"]["url"],
-            "https://example.test/image.png"
+            lowered[0].content[1]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
+        if let ContentPart::Media(image) = &mut messages[0].parts[1] {
+            image.source = MediaSource::Artifact("sha256:unresolved".into());
+        }
+        assert!(
+            lower_chat_messages(&messages, &HashMap::new())
+                .err()
+                .expect("unresolved artifact is refused")
+                .to_string()
+                .contains("must be resolved")
         );
     }
 

@@ -77,6 +77,8 @@ pub struct ProviderProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ctx: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Requested output allowance for ordinary chat calls; not a measured
+    /// maximum output capacity. Auxiliary calls may override it per request.
     pub max_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub token_counter: TokenCounter,
@@ -348,13 +350,19 @@ mod tests {
                 output: Some(["text".into()].into_iter().collect()),
             }),
             attachment: Some(true),
+            user_images: Some(true),
+            tool_result_images: Some(false),
+            image_mime_types: Some(["image/png".into()].into_iter().collect()),
+            max_image_bytes: Some(5_000_000),
             tool_calls: Some(true),
             reasoning: Some(false),
+            ..ModelCapabilities::default()
         });
         profile.image_input = ImageInputMode::Native;
 
         let encoded = serde_json::to_value(&profile).unwrap();
         assert_eq!(encoded["capabilities"]["attachment"], true);
+        assert_eq!(encoded["capabilities"]["tool_result_images"], false);
         assert_eq!(encoded["image_input"], "native");
         assert!(encoded.to_string().contains("vision-model"));
         assert!(!encoded.to_string().contains("Bearer"));

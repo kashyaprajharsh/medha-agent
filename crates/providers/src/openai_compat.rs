@@ -222,7 +222,7 @@ impl ProviderClient {
         match profile
             .capabilities
             .as_ref()
-            .map(|capabilities| capabilities.input_state("image"))
+            .map(|capabilities| capabilities.user_image_state())
         {
             Some(crate::CapabilityState::Supported) => ImageSupport::Supported,
             Some(crate::CapabilityState::Unsupported) => ImageSupport::Unsupported,
@@ -439,15 +439,13 @@ impl ProviderClient {
         );
         http::debug_json_request("POST", &url, &request.body);
 
-        let resp = http::with_profile(
+        let outgoing = http::with_profile(
             self.http.post(&url),
             &connection.profile,
             &connection.credential,
         )?
-        .json(&request.body)
-        .send()
-        .await
-        .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        .json(&request.body);
+        let resp = http::send_model_request(outgoing).await?;
         let resp = http::require_success(resp).await?;
 
         if !streaming {
@@ -465,10 +463,11 @@ impl ProviderClient {
             let mut unread = Some(Vec::new());
 
             futures::pin_mut!(byte_stream);
-            loop {
-                let next =
-                    tokio::time::timeout(http::STREAM_IDLE_TIMEOUT, byte_stream.next()).await;
+            let mut progress_deadline = tokio::time::Instant::now() + http::STREAM_IDLE_TIMEOUT;
+            'chunks: loop {
+                let next = tokio::time::timeout_at(progress_deadline, byte_stream.next()).await;
                 let chunk = match next {
+                    Err(_) if decoder.completed() => break,
                     Err(_) => {
                         yield Err(http::stalled_stream());
                         return;
@@ -496,6 +495,9 @@ impl ProviderClient {
                         for event in events {
                             match decoder.push(&event) {
                                 Ok(blocks) => {
+                                    if decoder.progressed() {
+                                        progress_deadline = tokio::time::Instant::now() + http::STREAM_IDLE_TIMEOUT;
+                                    }
                                     for block in blocks {
                                         unread = None;
                                         yield Ok(block);
@@ -506,6 +508,7 @@ impl ProviderClient {
                                     return;
                                 }
                             }
+                            if decoder.completed() { break 'chunks; }
                         }
                     }
                 }
@@ -526,20 +529,15 @@ impl ProviderClient {
                 }
             }
 
-            if let Err(error) = decoder.finish() {
-                yield Err(error);
-                return;
-            }
-
-            // Nothing decoded as a stream: read it as the single interaction
-            // body an endpoint that ignored `stream` would have sent.
-            if let Some(buffer) = unread.filter(|buffer| !buffer.is_empty()) {
-                let body = String::from_utf8_lossy(&buffer).into_owned();
+            if let Some(buffer) = unread.filter(|buffer| read_whole_body(buffer)) {
+                let body = String::from_utf8_lossy(&buffer);
                 match gemini_interactions::parse_interaction(&body, &names) {
                     Ok(blocks) => for block in blocks { yield Ok(block); },
                     Err(error) => yield Err(error),
                 }
+                return;
             }
+            if let Err(error) = decoder.finish() { yield Err(error); }
         };
         Ok(stream.boxed())
     }
@@ -919,7 +917,10 @@ impl Provider for ProviderClient {
         let connection = self.connection.lock().unwrap();
         ModelLimits {
             max_input_tokens: None,
-            max_output_tokens: connection.profile.max_output_tokens,
+            // The profile stores a per-request allowance, not evidence of the
+            // model's physical output ceiling. requested_output_tokens carries
+            // that policy independently, including for chat preflight.
+            max_output_tokens: None,
             max_combined_tokens: connection.profile.max_ctx.map(u64::from),
         }
     }
@@ -1092,6 +1093,47 @@ impl Provider for ProviderClient {
         Ok(Some(request.with_body(body)))
     }
 
+    fn with_request_reasoning(
+        &self,
+        request: &PreparedModelRequest,
+        config: &ReasoningConfig,
+    ) -> Result<Option<PreparedModelRequest>, ProviderError> {
+        let connection = self.connection.lock().unwrap();
+        if request.protocol != connection.profile.protocol {
+            return Ok(None);
+        }
+        validate_reasoning(&connection.profile, config)?;
+        let mut body = request.body.clone();
+        match request.protocol {
+            Protocol::OpenAiChat => {
+                let object = body.as_object_mut().ok_or_else(|| {
+                    ProviderError::Decode("prepared model request is not an object".into())
+                })?;
+                let effort = if config.enabled == Some(false) {
+                    Some(ReasoningEffort::None)
+                } else {
+                    config.effort
+                };
+                match effort {
+                    Some(effort) => {
+                        object.insert(
+                            "reasoning_effort".into(),
+                            serde_json::json!(effort.as_str()),
+                        );
+                    }
+                    None => {
+                        object.remove("reasoning_effort");
+                    }
+                }
+            }
+            Protocol::GeminiInteractions => {
+                gemini_interactions::apply_reasoning(&mut body, config)?
+            }
+            Protocol::OpenAiResponses | Protocol::AnthropicMessages => return Ok(None),
+        }
+        Ok(Some(request.with_body(body)))
+    }
+
     async fn stream(
         &self,
         ctx: &CompiledContext,
@@ -1141,15 +1183,13 @@ impl Provider for ProviderClient {
         // exact prepared JSON for every call.
         http::debug_json_request("POST", &url, &request.body);
 
-        let resp = http::with_profile(
+        let outgoing = http::with_profile(
             self.http.post(&url),
             &connection.profile,
             &connection.credential,
         )?
-        .json(&request.body)
-        .send()
-        .await
-        .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        .json(&request.body);
+        let resp = http::send_model_request(outgoing).await?;
         let resp = http::require_success(resp).await?;
 
         // Non-streaming: one blocking body, parsed and yielded as a single batch
@@ -1173,12 +1213,11 @@ impl Provider for ProviderClient {
             let mut unread = Some(Vec::new());
 
             futures::pin_mut!(byte_stream);
-            loop {
-                let next =
-                    tokio::time::timeout(http::STREAM_IDLE_TIMEOUT, byte_stream.next()).await;
+            let mut progress_deadline = tokio::time::Instant::now() + http::STREAM_IDLE_TIMEOUT;
+            'chunks: loop {
+                let next = tokio::time::timeout_at(progress_deadline, byte_stream.next()).await;
                 let chunk = match next {
-                    // A stall is reported like any transport failure, so the
-                    // tail the filter is holding still reaches the caller.
+                    Err(_) if decoder.completed() => break,
                     Err(_) => {
                         if let Some(b) = decoder.flush_pending() {
                             yield Ok(b);
@@ -1213,9 +1252,15 @@ impl Provider for ProviderClient {
                         };
                         for event in events {
                             match decoder.push(&event) {
-                                Ok(blocks) => for b in blocks { unread = None; yield Ok(b); },
+                                Ok(blocks) => {
+                                    if decoder.progressed() {
+                                        progress_deadline = tokio::time::Instant::now() + http::STREAM_IDLE_TIMEOUT;
+                                    }
+                                    for b in blocks { unread = None; yield Ok(b); }
+                                },
                                 Err(e) => { yield Err(e); return; }
                             }
+                            if event.data.trim() == "[DONE]" { break 'chunks; }
                         }
                     },
                 }
@@ -1230,25 +1275,33 @@ impl Provider for ProviderClient {
                 }
             }
 
-            let mut spoke = false;
-            match decoder.finish() {
-                Ok(blocks) => for block in blocks { spoke = true; yield Ok(block); },
-                Err(error) => { yield Err(error); return; }
-            }
-
-            // Nothing decoded as a stream. Read the body as the completion it
-            // probably is, so a server that ignores `stream` still answers
-            // rather than ending the turn in silence.
-            if !spoke && let Some(buffer) = unread.filter(|buffer| !buffer.is_empty()) {
-                let body = String::from_utf8_lossy(&buffer).into_owned();
+            if let Some(buffer) = unread.filter(|buffer| read_whole_body(buffer)) {
+                let body = String::from_utf8_lossy(&buffer);
                 match openai_chat::parse_completion(&body, &names) {
                     Ok(blocks) => for block in blocks { yield Ok(block); },
                     Err(error) => yield Err(error),
                 }
+                return;
+            }
+            match decoder.finish() {
+                Ok(blocks) => for block in blocks { yield Ok(block); },
+                Err(error) => yield Err(error),
             }
         };
 
         Ok(s.boxed())
+    }
+}
+
+/// Read a non-stream reply whole so its parse error is reported.
+fn read_whole_body(buffer: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(buffer);
+    match text.trim_start().chars().next() {
+        Some('{') => true,
+        Some(_) => !text
+            .lines()
+            .any(|line| line.starts_with("data:") || line.starts_with("event:")),
+        None => false,
     }
 }
 
@@ -2481,7 +2534,8 @@ mod reasoning_request_tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("model_limits deadlocked while reading the connection");
         assert_eq!(limits.max_combined_tokens, Some(32_768));
-        assert_eq!(limits.max_output_tokens, Some(4_096));
+        assert_eq!(limits.max_output_tokens, None);
+        assert_eq!(limits.input_allowance(Some(4_096)), Some(28_672));
     }
 
     #[test]
@@ -2623,6 +2677,7 @@ mod reasoning_request_tests {
             attachment: Some(false),
             tool_calls: None,
             reasoning: None,
+            ..crate::ModelCapabilities::default()
         });
         profile.image_input = ImageInputMode::Native;
         let provider = ProviderClient::from_profile(profile.clone(), "").unwrap();
@@ -2715,6 +2770,49 @@ mod reasoning_request_tests {
         assert!(corrected.body.get("max_tokens").is_none());
         let count = openai_chat::vllm_tokenize_body(&corrected);
         assert!(count.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn auxiliary_reasoning_override_does_not_change_chat_setting_or_original_request() {
+        let p = OpenAiCompat::new("http://x", "", "m")
+            .with_max_ctx(128_000)
+            .with_max_output_tokens(512)
+            .with_reasoning(ReasoningConfig {
+                enabled: Some(true),
+                effort: Some(ReasoningEffort::Medium),
+            })
+            .unwrap();
+        let request = p
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: vec![Message::user("hello")],
+                ordered: None,
+                tools: vec![],
+            })
+            .unwrap();
+        let bounded = p.with_output_limit(&request, 6_400).unwrap().unwrap();
+        let summary = p
+            .with_request_reasoning(
+                &bounded,
+                &ReasoningConfig {
+                    enabled: Some(false),
+                    effort: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.body["reasoning_effort"], "none");
+        assert_eq!(summary.body["max_tokens"], 6_400);
+        assert_eq!(request.body["max_tokens"], 512);
+        assert_eq!(p.requested_output_tokens(), Some(512));
+        assert_eq!(p.model_limits().max_output_tokens, None);
+        assert_eq!(request.body["reasoning_effort"], "medium");
+        assert_eq!(p.reasoning().effort, Some(ReasoningEffort::Medium));
+        assert_ne!(request.request_fingerprint, summary.request_fingerprint);
+        assert_eq!(
+            serde_json::to_value(&request.context.messages).unwrap(),
+            serde_json::to_value(&summary.context.messages).unwrap()
+        );
     }
 
     #[test]

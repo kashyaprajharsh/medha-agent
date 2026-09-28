@@ -122,6 +122,32 @@ fn generation_config(
     }))
 }
 
+pub(crate) fn apply_reasoning(
+    body: &mut serde_json::Value,
+    reasoning: &ReasoningConfig,
+) -> Result<(), ProviderError> {
+    let replacement = generation_config(reasoning, None)?;
+    let config = body
+        .as_object_mut()
+        .ok_or_else(|| ProviderError::Decode("prepared Gemini request is not an object".into()))?
+        .entry("generation_config")
+        .or_insert_with(|| serde_json::json!({}));
+    let config = config.as_object_mut().ok_or_else(|| {
+        ProviderError::Decode("prepared Gemini generation_config is not an object".into())
+    })?;
+    config.remove("thinking_level");
+    config.remove("thinking_summaries");
+    if let Some(replacement) = replacement {
+        if let Some(level) = replacement.thinking_level {
+            config.insert("thinking_level".into(), serde_json::json!(level));
+        }
+        if let Some(summaries) = replacement.thinking_summaries {
+            config.insert("thinking_summaries".into(), serde_json::json!(summaries));
+        }
+    }
+    Ok(())
+}
+
 fn lower_messages(
     messages: &[ModelMessage],
     canonical_to_wire: &HashMap<&str, &str>,
@@ -565,6 +591,7 @@ pub(crate) struct ResponseDecoder {
     finished_parts: BTreeMap<u32, Vec<ContentPart>>,
     usage: Option<UsageRaw>,
     terminal: bool,
+    progressed: bool,
 }
 
 impl ResponseDecoder {
@@ -575,10 +602,12 @@ impl ResponseDecoder {
             finished_parts: BTreeMap::new(),
             usage: None,
             terminal: false,
+            progressed: false,
         }
     }
 
     pub(crate) fn push(&mut self, event: &SseEvent) -> Result<Vec<Block>, ProviderError> {
+        self.progressed = false;
         let data = event.data.trim();
         if data.is_empty() {
             return Ok(Vec::new());
@@ -679,6 +708,8 @@ impl ResponseDecoder {
                 "Gemini emitted duplicate step.start index {index}"
             )));
         }
+        self.progressed = !initial_blocks.is_empty()
+            || step.get("type").and_then(Value::as_str) == Some("function_call");
         Ok(initial_blocks)
     }
 
@@ -700,6 +731,7 @@ impl ResponseDecoder {
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                self.progressed = !chunk.is_empty();
                 text.push_str(chunk);
                 Ok((!chunk.is_empty())
                     .then(|| Block::Text(chunk.to_string()))
@@ -713,6 +745,7 @@ impl ResponseDecoder {
                     .and_then(|content| content.get("text"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                self.progressed = !chunk.is_empty();
                 summary.push_str(chunk);
                 Ok((!chunk.is_empty())
                     .then(|| Block::Reasoning(chunk.to_string()))
@@ -724,6 +757,7 @@ impl ResponseDecoder {
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                self.progressed = !chunk.is_empty();
                 summary.push_str(chunk);
                 Ok((!chunk.is_empty())
                     .then(|| Block::Reasoning(chunk.to_string()))
@@ -758,6 +792,7 @@ impl ResponseDecoder {
                         "Gemini function-call step {index} supplied both complete and streamed arguments"
                     )));
                 }
+                self.progressed = !chunk.is_empty();
                 argument_deltas.push_str(chunk);
                 Ok(Vec::new())
             }
@@ -857,6 +892,13 @@ impl ResponseDecoder {
         Ok(blocks)
     }
 
+    pub(crate) fn progressed(&self) -> bool {
+        self.progressed
+    }
+    pub(crate) fn completed(&self) -> bool {
+        self.terminal
+    }
+
     pub(crate) fn finish(self) -> Result<(), ProviderError> {
         if self.terminal {
             Ok(())
@@ -902,6 +944,9 @@ mod tests {
                         mime_type: mime.into(),
                         source,
                         label: None,
+                        width: None,
+                        height: None,
+                        byte_size: None,
                         provider_state: Vec::new(),
                     }),
                 ],
@@ -920,6 +965,23 @@ mod tests {
             None,
         )
         .map(|(body, _)| body)
+    }
+
+    #[test]
+    fn auxiliary_reasoning_override_preserves_the_independent_output_cap() {
+        let mut body = serde_json::json!({"generation_config": {
+            "max_output_tokens": 4096, "thinking_level": "high", "thinking_summaries": "auto",
+        }});
+        apply_reasoning(
+            &mut body,
+            &ReasoningConfig {
+                enabled: Some(true),
+                effort: Some(ReasoningEffort::Minimal),
+            },
+        )
+        .unwrap();
+        assert_eq!(body["generation_config"]["max_output_tokens"], 4096);
+        assert_eq!(body["generation_config"]["thinking_level"], "minimal");
     }
 
     #[test]

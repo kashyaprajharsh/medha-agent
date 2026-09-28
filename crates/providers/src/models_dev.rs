@@ -82,6 +82,20 @@ pub struct ModelCapabilities {
     pub modalities: Option<ModalitySet>,
     #[serde(default)]
     pub attachment: Option<bool>,
+    /// Model-specific evidence for where images are accepted. Missing remains
+    /// unknown even if another role accepts images.
+    #[serde(default)]
+    pub user_images: Option<bool>,
+    #[serde(default)]
+    pub tool_result_images: Option<bool>,
+    #[serde(default)]
+    pub image_mime_types: Option<BTreeSet<String>>,
+    #[serde(default)]
+    pub max_image_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_image_width: Option<u32>,
+    #[serde(default)]
+    pub max_image_height: Option<u32>,
     #[serde(default, rename = "tool_call")]
     pub tool_calls: Option<bool>,
     #[serde(default)]
@@ -113,6 +127,30 @@ pub struct CapabilityResolution {
 }
 
 impl ModelCapabilities {
+    pub fn user_image_state(&self) -> CapabilityState {
+        self.user_images.map_or_else(
+            || self.input_state("image"),
+            |known| {
+                if known {
+                    CapabilityState::Supported
+                } else {
+                    CapabilityState::Unsupported
+                }
+            },
+        )
+    }
+
+    pub fn tool_result_image_state(&self) -> CapabilityState {
+        self.tool_result_images
+            .map_or(CapabilityState::Unknown, |known| {
+                if known {
+                    CapabilityState::Supported
+                } else {
+                    CapabilityState::Unsupported
+                }
+            })
+    }
+
     pub fn input_state(&self, modality: &str) -> CapabilityState {
         self.modalities
             .as_ref()
@@ -158,6 +196,12 @@ impl ModelCapabilities {
     fn has_known_value(&self) -> bool {
         self.modalities.is_some()
             || self.attachment.is_some()
+            || self.user_images.is_some()
+            || self.tool_result_images.is_some()
+            || self.image_mime_types.is_some()
+            || self.max_image_bytes.is_some()
+            || self.max_image_width.is_some()
+            || self.max_image_height.is_some()
             || self.tool_calls.is_some()
             || self.reasoning.is_some()
     }
@@ -301,6 +345,7 @@ async fn fetch_and_flatten(
                 attachment: model.attachment,
                 tool_calls: model.tool_calls,
                 reasoning: model.reasoning,
+                ..ModelCapabilities::default()
             };
             let meta = ModelMeta {
                 context: model.limit.and_then(|l| l.context),
@@ -558,6 +603,7 @@ mod tests {
             attachment: Some(false),
             tool_calls: Some(true),
             reasoning: None,
+            ..ModelCapabilities::default()
         };
         assert_eq!(known.input_state("image"), CapabilityState::Supported);
         assert_eq!(known.input_state("audio"), CapabilityState::Unsupported);
@@ -565,6 +611,8 @@ mod tests {
         assert_eq!(known.attachment_state(), CapabilityState::Unsupported);
         assert_eq!(known.tool_call_state(), CapabilityState::Supported);
         assert_eq!(known.reasoning_state(), CapabilityState::Unknown);
+        assert_eq!(known.user_image_state(), CapabilityState::Supported);
+        assert_eq!(known.tool_result_image_state(), CapabilityState::Unknown);
     }
 
     #[test]

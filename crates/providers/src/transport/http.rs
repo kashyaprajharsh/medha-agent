@@ -26,8 +26,22 @@ pub(crate) async fn response_text(response: reqwest::Response) -> Result<String,
     }
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ProviderError::Transport(e.to_string()))?;
+    let deadline = tokio::time::Instant::now() + READ_TIMEOUT;
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .map_err(|_| ProviderError::ProgressTimeout {
+            waited_secs: READ_TIMEOUT.as_secs(),
+        })?
+    {
+        let chunk = chunk.map_err(|e| {
+            if e.is_timeout() {
+                ProviderError::ProgressTimeout {
+                    waited_secs: READ_TIMEOUT.as_secs(),
+                }
+            } else {
+                ProviderError::Transport(e.without_url().to_string())
+            }
+        })?;
         if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
             return Err(ProviderError::Decode(
                 "provider response exceeds 32 MiB".into(),
@@ -49,10 +63,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// and cutting that short turns a busy provider into a failure.
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Idle ceiling between body chunks once a stream is flowing. Tighter than
-/// [`READ_TIMEOUT`], because a gap here means the connection died rather than
-/// that the request is still queued. The clock restarts on every chunk, so a
-/// slow stream is never penalised for being long.
+/// Maximum time without text, reasoning, tool arguments or completion.
+/// Network heartbeats do not reset this deadline.
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Ceiling on an honoured `Retry-After`. A provider asking for an hour is
@@ -76,13 +88,46 @@ pub(crate) fn client() -> reqwest::Client {
         .expect("provider HTTP client")
 }
 
-/// How a stalled stream settles. `Stream` classifies as transient, so the turn
-/// retries instead of surfacing a dead connection as a failed request.
+/// Keep a silent header timeout separate from connection failures and broken
+/// streams. The upstream may still be processing this request; the kernel must
+/// not automatically submit the identical expensive prompt five more times.
+pub(crate) async fn send_model_request(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, ProviderError> {
+    let started = std::time::Instant::now();
+    match request.send().await {
+        Ok(response) => {
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                status = response.status().as_u16(),
+                "model HTTP response headers received"
+            );
+            Ok(response)
+        }
+        Err(error) => {
+            let timeout = error.is_timeout();
+            let connection_failure = error.is_connect();
+            tracing::warn!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                timeout,
+                connection_failure,
+                "model HTTP request failed before response headers"
+            );
+            if timeout && !connection_failure {
+                Err(ProviderError::ResponseTimeout {
+                    waited_secs: started.elapsed().as_secs(),
+                })
+            } else {
+                Err(ProviderError::Transport(error.without_url().to_string()))
+            }
+        }
+    }
+}
+
 pub(crate) fn stalled_stream() -> ProviderError {
-    ProviderError::Stream(format!(
-        "stream stalled: no data for {}s",
-        STREAM_IDLE_TIMEOUT.as_secs()
-    ))
+    ProviderError::ProgressTimeout {
+        waited_secs: STREAM_IDLE_TIMEOUT.as_secs(),
+    }
 }
 
 /// Add bearer authentication only when a non-empty credential is present.
@@ -333,17 +378,42 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_stream_retries_rather_than_failing_the_turn() {
+    fn a_stalled_stream_is_not_resubmitted_automatically() {
         let error = stalled_stream();
         assert!(
-            error.is_retryable(),
-            "a dead connection is transient; failing the turn strands the work"
+            !error.is_retryable(),
+            "a live connection without model progress must not repeat expensive work"
         );
         assert!(
             !error.is_context_overflow(),
             "compaction cannot fix a stall"
         );
         assert!(error.to_string().contains("90s"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_header_timeout_is_not_an_automatic_retry() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            std::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .read_timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+        let error = send_model_request(client.post(format!("http://{address}")))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::ResponseTimeout { .. }));
+        assert!(!error.is_retryable());
+        assert!(!error.is_context_overflow());
+        server.abort();
     }
 
     fn headers(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {

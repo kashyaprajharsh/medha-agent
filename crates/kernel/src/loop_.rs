@@ -237,17 +237,15 @@ fn legacy_views(message: &ModelMessage) -> Vec<Message> {
             }
         }
         _ => {
-            let mut text = String::new();
+            let text = crate::types::legacy_text(message);
             let mut calls = Vec::new();
             for part in &message.parts {
-                match part {
-                    ContentPart::Text(part) => text.push_str(&part.text),
-                    ContentPart::ToolCall(part) => calls.push(ToolIntent {
+                if let ContentPart::ToolCall(part) = part {
+                    calls.push(ToolIntent {
                         id: part.id.clone(),
                         tool: part.tool.clone(),
                         args: part.args.clone(),
-                    }),
-                    _ => {}
+                    });
                 }
             }
             let mut legacy = if message.role == Role::Assistant {
@@ -462,7 +460,7 @@ pub const SPILL_THRESHOLD: usize = 16_000;
 /// provider/model limits: a broken or adversarial stream must not be able to
 /// grow the kernel's in-memory transcript forever.
 const MAX_TOOL_INTENTS_PER_TURN: usize = 64;
-const MAX_PROVIDER_STREAM_BLOCKS: usize = 16_384;
+const MAX_PROVIDER_STREAM_BLOCKS: usize = 262_144;
 const MAX_PROVIDER_STREAM_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many times a turn's model stream is retried on a transient provider
@@ -1071,6 +1069,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
         let mut logged_cursor = 0;
         let fresh = unlogged_tail(&messages);
+        let new_image_submission = messages[fresh..]
+            .iter()
+            .any(|message| !message.attachments.is_empty());
+        let mut image_route_reported = false;
         for message in &messages[fresh..] {
             // Match the durable suffix in order and with its trust label.
             // Membership matching reordered duplicate lines, while comparing
@@ -1127,15 +1129,31 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let mut hook_continuations = 0u8;
         let mut ordered_messages: Vec<ModelMessage> =
             messages.iter().map(Message::ordered).collect();
-        let logged_events = self.log.checked_events(session.id).await?;
+        let mut logged_events = self.log.checked_events(session.id).await?;
         tracing::info!(
             elapsed_ms = history_started.elapsed().as_millis() as u64,
             "session history prepared"
         );
-        let has_checkpoint = logged_events.iter().any(|event| {
+        let checkpoint = logged_events.iter().rev().find(|event| {
             event.kind == EventKind::Compaction
                 && crate::events::has_valid_compaction_snapshot(&event.payload)
         });
+        let has_checkpoint = checkpoint.is_some();
+        let mut checkpoint_policy = checkpoint
+            .and_then(|event| event.payload.get("policy_version"))
+            .and_then(serde_json::Value::as_u64);
+        let mut check_checkpoint_policy = has_checkpoint;
+        let mut history_scope = None;
+        let mut restored_usage = false;
+        let usage_anchor = logged_events
+            .iter()
+            .rev()
+            .take_while(|event| event.kind != EventKind::Compaction)
+            .find(|event| event.kind == EventKind::ContextUsage)
+            .and_then(|event| {
+                serde_json::from_value::<crate::usage_reporting::UsageAnchor>(event.payload.clone())
+                    .ok()
+            });
         if has_checkpoint {
             // A compaction event is a full request checkpoint: replace both views
             // wholesale, or the system sheath duplicates and replay is not exact.
@@ -1148,6 +1166,23 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             let projected = crate::events::project_ordered_messages(&logged_events);
             ordered_messages = hydrate_ordered_log(&messages, projected);
         }
+        let mut retained_summary = logged_events.iter().rev().find_map(|event| {
+            if event.kind != EventKind::Compaction
+                || !crate::events::has_valid_compaction_snapshot(&event.payload)
+            {
+                return None;
+            }
+            event
+                .payload
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .filter(|summary| {
+                    messages.iter().any(|message| {
+                        message.role == Role::Assistant && message.content == *summary
+                    })
+                })
+                .map(str::to_owned)
+        });
         // Spill after hydration — checkpoint replay would silently undo an earlier
         // spill. Both views are rewritten independently.
         self.spill_hydrated_tool_results(&mut messages, &mut ordered_messages)
@@ -1173,6 +1208,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // Fresh user input starts a new memory-evidence window.
                     window_events.clear();
                     window_events.push(e.id);
+                    logged_events.push(e);
+                    history_scope = None;
                     // A sub-agent's report arrives on this queue too, and it is
                     // worth what the agent touched, not what the operator says.
                     window_taint = trust;
@@ -1270,12 +1307,31 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .prepare_request(&candidate)
                         .map_err(|error| KernelError::Provider(error.to_string()))?;
 
-                    self.context.begin_request(&format!(
+                    let request_scope = format!(
                         "{}:{}:{}:{limits:?}",
                         session.id,
                         self.provider.context_identity(),
                         prepared.model,
-                    ));
+                    );
+                    self.context.begin_request(&request_scope);
+                    if history_scope.as_ref() != Some(&request_scope) {
+                        self.context.restore_history(&logged_events, input_limit);
+                        history_scope = Some(request_scope);
+                    }
+                    if !restored_usage {
+                        restored_usage = true;
+                        self.context.restore_usage(&candidate, 0);
+                        if let Some(anchor) = &usage_anchor
+                            && let Some(prefix) =
+                                anchor.matching_context(self.provider.as_ref(), &candidate)
+                        {
+                            self.context.restore_usage(&prefix, anchor.prompt_tokens);
+                        }
+                    }
+
+                    if let Some(summary) = &retained_summary {
+                        self.context.restore_summary(summary);
+                    }
 
                     self.context.clear_preflight();
                     let preflight = match self
@@ -1301,12 +1357,42 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         self.context.update_preflight(count);
                     }
 
-                    sink.compacting(true);
+                    if check_checkpoint_policy {
+                        check_checkpoint_policy = false;
+                        if self.context.compaction_policy_version().is_some()
+                            && checkpoint_policy != self.context.compaction_policy_version()
+                            && self
+                                .context
+                                .checkpoint_needs_refresh(&messages, input_limit)
+                        {
+                            self.context.force_next_compaction();
+                        }
+                    }
+
+                    let compaction_planned =
+                        self.context.compaction_planned(&messages, input_limit);
+                    if compaction_planned {
+                        self.observe_hook(
+                            session,
+                            medha_extension_api::HookPoint::PreCompaction,
+                            serde_json::json!({
+                                "message_count": messages.len(),
+                                "input_limit": input_limit,
+                            }),
+                        )
+                        .await;
+                    }
+
+                    if compaction_planned {
+                        sink.compacting(true);
+                    }
                     let compiled = self
                         .context
                         .compile_controlled(&messages, input_limit, &compile_control)
                         .await;
-                    sink.compacting(false);
+                    if compaction_planned {
+                        sink.compacting(false);
+                    }
                     let compiled = match compiled {
                         Ok(compiled) => compiled,
                         Err(crate::context::ContextCompileError::Cancelled) => {
@@ -1323,6 +1409,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 messages,
                                 StopReason::Budget(crate::budgets::BudgetStop::Wall),
                             ));
+                        }
+                        Err(error @ crate::context::ContextCompileError::Summary(_)) => {
+                            if let Some(q) = interrupts.as_mut() {
+                                Self::return_unapplied_steers(q, sink);
+                            }
+                            return Err(KernelError::Provider(error.to_string()));
                         }
                     };
                     let pressure = self.context.pressure().unwrap_or_else(|| {
@@ -1396,16 +1488,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         &ordered_messages,
                         &compiled.source_indices,
                     );
-                    self.log
-                        .append(Event::compaction_snapshot(
-                            session,
-                            compiled.before_tokens,
-                            compiled.after_tokens,
-                            compiled.summary.as_deref(),
-                            &compiled.messages,
-                            &compacted_ordered,
-                        ))
-                        .await?;
+                    if compiled.summarized {
+                        checkpoint_policy = self.context.compaction_policy_version();
+                    }
+                    let mut checkpoint = Event::compaction_snapshot(
+                        session,
+                        compiled.before_tokens,
+                        compiled.after_tokens,
+                        compiled.summary.as_deref(),
+                        &compiled.messages,
+                        &compacted_ordered,
+                    );
+                    if let Some(version) = checkpoint_policy {
+                        checkpoint.payload["policy_version"] = serde_json::json!(version);
+                    }
+                    self.log.append(checkpoint).await?;
                     self.post_compaction_hooks(
                         session,
                         compiled.before_tokens,
@@ -1417,6 +1514,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // The durable log keeps both originals and this canonical
                     // checkpoint; the active view is now the only candidate
                     // that may be prepared and sent.
+                    if let Some(summary) = &compiled.summary {
+                        retained_summary = Some(summary.clone());
+                    }
                     ordered_messages = compacted_ordered;
                     messages = compiled.messages;
                     // With no real limit there is no next preflight ceiling to
@@ -1448,11 +1548,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     .await
                 {
                     Ok(t) => {
-                        if self.provider.image_input_mode() == crate::ImageInputMode::Auto
-                            && context_has_media(&prepared.context)
-                        {
-                            self.provider
-                                .observe_image_support(crate::ImageSupport::Supported);
+                        if context_has_media(&prepared.context) {
+                            if self.provider.image_input_mode() == crate::ImageInputMode::Auto {
+                                self.provider
+                                    .observe_image_support(crate::ImageSupport::Supported);
+                            }
+                            if new_image_submission && !image_route_reported {
+                                sink.notice("attached image sent natively to the selected model");
+                                image_route_reported = true;
+                            }
                         }
                         break t;
                     }
@@ -1837,9 +1941,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // Verifier output is tool-produced, and can contain arbitrary
                     // build-script/test output. Labelling it as User launders that
                     // text into the most-trusted instruction channel.
-                    self.log
-                        .append(Event::user_input(session, &feedback, TrustLabel::Tool))
-                        .await?;
+                    let mut event = Event::user_input(session, &feedback, TrustLabel::Tool);
+                    event.payload["verifier"] = serde_json::json!({
+                        "ok": rep.ok,
+                        "summary": rep.summary,
+                        "output": tail.join("\n"),
+                    });
+                    self.log.append(event).await?;
                     let message = Message::user(feedback).carrying(TrustLabel::Tool);
                     ordered_messages.push(message.ordered());
                     messages.push(message);
@@ -1849,8 +1957,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 && self
                     .task_completion_hooks(
                         session,
-                        completion_verified,
-                        hook_continuations,
+                        hook_points::CompletionHookState {
+                            verified: completion_verified,
+                            continuations: hook_continuations,
+                            origin: window_events.first().copied(),
+                        },
                         &cancel,
                         &mut messages,
                         &mut ordered_messages,
@@ -1908,10 +2019,32 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 .reserve_model(prepared_input_tokens, reserved_output_tokens, self.pricing)
                 .map_err(KernelError::Budget)?;
             sink.phase(crate::progress::Phase::Generating);
-            match self
+            self.observe_hook_with(
+                session,
+                medha_extension_api::HookPoint::PreModel,
+                serde_json::json!({"model": &request.model, "attempt": attempt}),
+                cancel,
+            )
+            .await;
+            let outcome = self
                 .stream_turn(&request, sink, cancel, wall_deadline)
-                .await
-            {
+                .await;
+            self.observe_hook_with(
+                session,
+                medha_extension_api::HookPoint::PostModel,
+                serde_json::json!({
+                    "model": &request.model,
+                    "attempt": attempt,
+                    "outcome": match &outcome {
+                        Ok((_, _, _, _, _, true)) => "interrupted",
+                        Ok(_) => "completed",
+                        Err(_) => "failed",
+                    },
+                }),
+                cancel,
+            )
+            .await;
+            match outcome {
                 Ok(data) => {
                     reservation
                         .reconcile(data.4, self.pricing)
@@ -2008,6 +2141,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         // The provider's own number when it gave one; retrying
                         // sooner than asked just earns another refusal.
                         let wait = e.retry_after().unwrap_or_else(|| retry_backoff(attempt));
+                        sink.notice(&format!(
+                            "Model request failed. Retrying ({attempt}/{MAX_TURN_RETRIES})…"
+                        ));
                         // The backoff nap races the cancel token too — Esc
                         // during a retry wait must stop the turn, not queue
                         // another attempt.
@@ -2050,6 +2186,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             self.log
                 .append(Event::model_reasoning(session, &reasoning))
                 .await?;
+        }
+        if let Some(usage) = usage.filter(|usage| usage.prompt_tokens > 0) {
+            let anchor = crate::usage_reporting::UsageAnchor::capture(
+                self.provider.context_identity(),
+                &request,
+                &usage,
+                self.pricing,
+            );
+            if let Err(error) = self
+                .log
+                .append(Event::context_usage(session, &anchor))
+                .await
+            {
+                tracing::warn!(%error, "could not persist context usage calibration");
+            }
         }
         Ok((
             Message::assistant_calls(text, intents.clone()),
@@ -2342,7 +2493,30 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         payload: serde_json::Value,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::hooks::HookBatch, String> {
-        let request = crate::hooks::HookRequest::new(session.id.to_string(), point, trust, payload);
+        self.invoke_hook_lineage(
+            session,
+            point,
+            trust,
+            payload,
+            crate::hooks::HookCausation::default(),
+            cancel,
+        )
+        .await
+    }
+
+    async fn invoke_hook_lineage(
+        &self,
+        session: &Session,
+        point: medha_extension_api::HookPoint,
+        trust: TrustLabel,
+        payload: serde_json::Value,
+        causation: crate::hooks::HookCausation,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::hooks::HookBatch, String> {
+        let mut request =
+            crate::hooks::HookRequest::new(session.id.to_string(), point, trust, payload);
+        request.causation_id = causation.id;
+        request.depth = causation.depth;
         let mut batch = self.hooks.invoke(&request, cancel).await;
         if !matches!(batch.directive, crate::hooks::HookDirective::Continue)
             && batch.audits.is_empty()
@@ -2409,6 +2583,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 }
             }
         }
+        let file_changed = observation.status == crate::types::ObsStatus::Ok
+            && matches!(
+                intent.tool.as_str(),
+                "fs.write" | "fs.edit" | "fs.multi_edit"
+            );
         Self::attach_hook_contexts(&mut observation, &contexts);
         if let Some(problem) = problem {
             let prior_status = observation.status.clone();
@@ -2421,6 +2600,18 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 "tool_status": prior_status,
                 "tool_result": prior_payload,
             });
+        }
+        if file_changed {
+            self.observe_hook(
+                session,
+                medha_extension_api::HookPoint::FileChange,
+                serde_json::json!({
+                    "intent_id": intent.id,
+                    "tool": intent.tool,
+                    "args": hook_safe_value(&intent.args),
+                }),
+            )
+            .await;
         }
         observation
     }
@@ -2574,6 +2765,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .grant_access(&access, &detail, access_escalated)
                         .await
                 };
+                self.observe_hook(
+                    session,
+                    medha_extension_api::HookPoint::ApprovalDecision,
+                    serde_json::json!({
+                        "intent_id": intent.id,
+                        "tool": intent.tool,
+                        "kind": "command_access",
+                        "decision": answer.as_ref().map_or("error".to_string(), |value| format!("{value:?}").to_lowercase()),
+                    }),
+                )
+                .await;
                 match answer {
                     Err(error) => return Observation::error(&intent.id, error),
                     Ok(crate::NetworkDecision::Deny) => {
@@ -2614,7 +2816,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 });
                 // Hold the lock through the answer, then drop it before execution so an
                 // approved slow tool doesn't block the next card.
-                let approved = {
+                let answer = {
                     let _one_gate = self.gate_serial.lock().await;
                     let mut detail = self
                         .executor
@@ -2626,11 +2828,20 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         detail.push_str(reason);
                     }
                     let action = approval_key(intent);
-                    self.gate
-                        .confirm(&action, Some(&detail), escalated)
-                        .await
-                        .approved()
+                    self.gate.confirm(&action, Some(&detail), escalated).await
                 };
+                self.observe_hook(
+                    session,
+                    medha_extension_api::HookPoint::ApprovalDecision,
+                    serde_json::json!({
+                        "intent_id": intent.id,
+                        "tool": intent.tool,
+                        "kind": "tool",
+                        "decision": format!("{answer:?}").to_lowercase(),
+                    }),
+                )
+                .await;
+                let approved = answer.approved();
                 if approved {
                     self.running_tool(intent, sink);
                     let observation = self
@@ -2705,6 +2916,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             let detail = net_grant_detail(intent, web_tainted, &obs);
             self.executor.grant_network(Some(&detail), escalated).await
         };
+        self.observe_hook(
+            session,
+            medha_extension_api::HookPoint::ApprovalDecision,
+            serde_json::json!({
+                "intent_id": intent.id,
+                "tool": intent.tool,
+                "kind": "network_retry",
+                "decision": format!("{decision:?}").to_lowercase(),
+            }),
+        )
+        .await;
         match decision {
             crate::NetworkDecision::Deny => obs,
             crate::NetworkDecision::Once => {

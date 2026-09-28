@@ -257,6 +257,12 @@ pub struct MediaPart {
     /// in the request — "the second screenshot" then means one thing to both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_state: Vec<ProviderState>,
 }
@@ -345,17 +351,8 @@ impl From<&Message> for ModelMessage {
         // the same thing, and goes looking for the path — which for a dropped
         // screenshot has usually already been deleted. Several images are also
         // numbered, so "the second screenshot" means one thing to both sides.
-        let numbered = message.attachments.len() > 1;
         for (index, media) in message.attachments.iter().enumerate() {
-            let position = if numbered {
-                format!(" {}", index + 1)
-            } else {
-                String::new()
-            };
-            let caption = match &media.label {
-                Some(label) => format!("[attached image{position}: {label}]"),
-                None => format!("[attached image{position}]"),
-            };
+            let caption = media_caption(media, index, message.attachments.len());
             parts.push(ContentPart::Text(TextPart {
                 text: caption,
                 provider_state: Vec::new(),
@@ -368,6 +365,50 @@ impl From<&Message> for ModelMessage {
             trust: message.trust,
         }
     }
+}
+
+fn media_caption(media: &MediaPart, index: usize, count: usize) -> String {
+    let position = if count > 1 {
+        format!(" {}", index + 1)
+    } else {
+        String::new()
+    };
+    match &media.label {
+        Some(label) => format!("[attached image{position}: {label}]"),
+        None => format!("[attached image{position}]"),
+    }
+}
+
+/// Captions inserted by the legacy bridge describe attachments; they are not
+/// part of the original legacy text. Recognize only an exact generated caption
+/// immediately before its matching media part, leaving all other text intact.
+pub(crate) fn legacy_text(message: &ModelMessage) -> String {
+    let count = message
+        .parts
+        .iter()
+        .filter(|part| matches!(part, ContentPart::Media(_)))
+        .count();
+    let mut media_index = 0;
+    let mut text = String::new();
+    for (index, part) in message.parts.iter().enumerate() {
+        match part {
+            ContentPart::Text(part) => {
+                let caption = match message.parts.get(index + 1) {
+                    Some(ContentPart::Media(media)) => {
+                        part.provider_state.is_empty()
+                            && part.text == media_caption(media, media_index, count)
+                    }
+                    _ => false,
+                };
+                if !caption {
+                    text.push_str(&part.text);
+                }
+            }
+            ContentPart::Media(_) => media_index += 1,
+            _ => {}
+        }
+    }
+    text
 }
 
 impl TryFrom<&ModelMessage> for Message {
@@ -731,6 +772,9 @@ mod attachment_tests {
             mime_type: "image/png".into(),
             source: MediaSource::Artifact(label.into()),
             label: Some(label.into()),
+            width: None,
+            height: None,
+            byte_size: None,
             provider_state: Vec::new(),
         }
     }

@@ -80,6 +80,8 @@ pub enum EventKind {
     /// so a crash still leaves replay knowing the effect may have committed.
     ToolEffectPrepared,
     Compaction,
+    /// Provider usage for an exact request prefix, used only for context calibration.
+    ContextUsage,
     Session,
     /// Reasoning retained for audit but excluded from model history.
     ModelReasoning,
@@ -116,6 +118,7 @@ impl EventKind {
             EventKind::HookDecision => "hook.decision",
             EventKind::ToolEffectPrepared => "tool.effect_prepared",
             EventKind::Compaction => "context.compaction",
+            EventKind::ContextUsage => "context.usage",
             EventKind::Session => "session",
             EventKind::ModelReasoning => "model.reasoning",
             EventKind::Interrupt => "interrupt",
@@ -143,6 +146,7 @@ impl EventKind {
             "hook.decision" => EventKind::HookDecision,
             "tool.effect_prepared" => EventKind::ToolEffectPrepared,
             "context.compaction" => EventKind::Compaction,
+            "context.usage" => EventKind::ContextUsage,
             "session" => EventKind::Session,
             "model.reasoning" => EventKind::ModelReasoning,
             "interrupt" => EventKind::Interrupt,
@@ -238,6 +242,15 @@ impl Event {
     /// came from. Recording a sub-agent's report as `User` lost its taint on resume.
     pub fn user_input(s: &Session, text: &str, trust: TrustLabel) -> Self {
         Self::new(s, EventKind::UserMessage, json!({ "text": text }), trust)
+    }
+
+    /// Whether a user-channel event is text the person wrote. Hook context,
+    /// agent reports and verifier feedback share the channel so the model reads
+    /// them, and are never User-trusted.
+    pub fn is_from_person(&self) -> bool {
+        self.kind == EventKind::UserMessage
+            && self.trust == TrustLabel::User
+            && self.payload.get("hook").is_none()
     }
 
     pub fn user_input_message(s: &Session, message: &Message) -> Self {
@@ -501,6 +514,15 @@ impl Event {
             s,
             EventKind::Compaction,
             json!({ "before_tokens": before_tokens, "after_tokens": after_tokens, "summary": summary }),
+            TrustLabel::System,
+        )
+    }
+
+    pub(crate) fn context_usage(s: &Session, anchor: &crate::usage_reporting::UsageAnchor) -> Self {
+        Self::new(
+            s,
+            EventKind::ContextUsage,
+            json!(anchor),
             TrustLabel::System,
         )
     }
@@ -919,17 +941,15 @@ fn snapshot_legacy_views(message: &ModelMessage) -> Vec<Message> {
         };
     }
 
-    let mut text = String::new();
+    let text = crate::types::legacy_text(message);
     let mut calls = Vec::new();
     for part in &message.parts {
-        match part {
-            ContentPart::Text(part) => text.push_str(&part.text),
-            ContentPart::ToolCall(part) => calls.push(ToolIntent {
+        if let ContentPart::ToolCall(part) = part {
+            calls.push(ToolIntent {
                 id: part.id.clone(),
                 tool: part.tool.clone(),
                 args: part.args.clone(),
-            }),
-            _ => {}
+            });
         }
     }
     let mut legacy = if message.role == crate::types::Role::Assistant {
@@ -1595,6 +1615,9 @@ mod tests {
             mime_type: "image/png".into(),
             source: MediaSource::Artifact("hash-7".into()),
             label: None,
+            width: None,
+            height: None,
+            byte_size: None,
             provider_state: Vec::new(),
         }];
         let events = vec![
@@ -2145,6 +2168,69 @@ mod tests {
         assert_eq!(ordered[0].trust, Some(TrustLabel::Tool));
         assert_eq!(ordered[1].trust, Some(TrustLabel::Web));
         assert_eq!(ordered[2].trust, Some(TrustLabel::Tool));
+    }
+
+    #[test]
+    fn image_compaction_checkpoint_survives_cancel_and_resume_without_old_history() {
+        use crate::types::{MediaPart, MediaSource, Role, TextPart};
+        let session = Session::new();
+        let mut image = Message::user("[attached image: authored text]").carrying(TrustLabel::Tool);
+        image.attachments = vec![
+            MediaPart {
+                mime_type: "image/png".into(),
+                source: MediaSource::Artifact("one".into()),
+                label: Some("diagram.png".into()),
+                width: None,
+                height: None,
+                byte_size: None,
+                provider_state: Vec::new(),
+            },
+            MediaPart {
+                mime_type: "image/png".into(),
+                source: MediaSource::Artifact("two".into()),
+                label: None,
+                width: None,
+                height: None,
+                byte_size: None,
+                provider_state: Vec::new(),
+            },
+        ];
+        let live = vec![
+            Message::system("SYSTEM"),
+            Message::new(Role::Assistant, "HANDOFF"),
+            image,
+        ];
+        let ordered = live.iter().map(Message::ordered).collect::<Vec<_>>();
+        let checkpoint =
+            Event::compaction_snapshot(&session, 100_000, 20_000, Some("HANDOFF"), &live, &ordered);
+        assert!(has_valid_compaction_snapshot(&checkpoint.payload));
+        let events = vec![
+            Event::user_message(&session, "OLD LARGE HISTORY"),
+            checkpoint.clone(),
+            Event::interrupt(&session, "cancel", None),
+            Event::user_message(&session, "continue"),
+        ];
+        let replay = project_request_messages(&events);
+        assert_eq!(
+            serde_json::to_value(&replay[..3]).unwrap(),
+            serde_json::to_value(&live).unwrap()
+        );
+        assert_eq!(replay[3].content, "continue");
+        assert!(!replay.iter().any(|m| m.content == "OLD LARGE HISTORY"));
+        assert_eq!(
+            serde_json::to_value(&project_request_ordered_messages(&events)[..3]).unwrap(),
+            serde_json::to_value(&ordered).unwrap()
+        );
+        let mut wrong_caption = ordered.clone();
+        if let ContentPart::Text(TextPart { text, .. }) = &mut wrong_caption[2].parts[1] {
+            *text = "different actual text".into();
+        }
+        let invalid =
+            Event::compaction_snapshot(&session, 100_000, 20_000, None, &live, &wrong_caption);
+        assert!(
+            !has_valid_compaction_snapshot(&invalid.payload),
+            "ordinary text mismatches must still fail validation"
+        );
     }
 
     #[test]

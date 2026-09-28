@@ -46,12 +46,14 @@ impl ContextPressure {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ContextCompileError {
     #[error("context compilation was cancelled")]
     Cancelled,
     #[error("context compilation exceeded the task deadline")]
     Deadline,
+    #[error("context summary failed; conversation history was preserved: {0}")]
+    Summary(String),
 }
 
 /// Cancellation/deadline authority for work done while compiling a request.
@@ -147,8 +149,34 @@ pub trait ContextEngine: Send + Sync {
     /// change. This does not discard the conversation or its checkpoints.
     fn begin_request(&self, _scope: &str) {}
 
+    /// Restore a validated durable handoff after request-scope calibration resets.
+    /// Only the kernel may select a summary from a retained checkpoint.
+    fn restore_summary(&self, _summary: &str) {}
+
+    /// Rebuild bounded continuity notes from checked original events, not generated summaries.
+    fn restore_history(&self, _events: &[crate::Event], _input_limit: Option<u32>) {}
+
+    /// Restore provider usage only after the kernel has matched the priced request prefix.
+    fn restore_usage(&self, _ctx: &CompiledContext, _prompt_tokens: u32) {}
+
+    /// Version of the retention policy used for full compaction checkpoints.
+    fn compaction_policy_version(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether an older checkpoint has enough excess history to warrant migration.
+    fn checkpoint_needs_refresh(&self, _messages: &[Message], _input_limit: Option<u32>) -> bool {
+        false
+    }
+
     fn pressure(&self) -> Option<ContextPressure> {
         None
+    }
+
+    /// Whether the next compile will attempt a prune or summary. The kernel
+    /// uses this preview to run pre-compaction observers before history changes.
+    fn compaction_planned(&self, _messages: &[Message], _max_input_tokens: Option<u32>) -> bool {
+        false
     }
 
     /// Real usage from the last response — authoritative; includes tool defs.

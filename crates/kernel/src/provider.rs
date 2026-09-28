@@ -266,6 +266,16 @@ impl ImageInputMode {
 pub enum ProviderError {
     #[error("transport error: {0}")]
     Transport(String),
+    /// The request may already be executing upstream. Replaying the same large
+    /// prompt automatically can multiply both the wait and the billed work.
+    #[error(
+        "the model did not return response headers within {waited_secs}s; the request was stopped without automatically resending it. Retry manually or check the model server"
+    )]
+    ResponseTimeout { waited_secs: u64 },
+    #[error(
+        "the model made no progress for {waited_secs}s; stopped without automatically resending the request"
+    )]
+    ProgressTimeout { waited_secs: u64 },
     #[error("decode error: {0}")]
     Decode(String),
     #[error("provider returned status {0}: {1}")]
@@ -343,7 +353,9 @@ impl ProviderError {
                     classify_rejection(Some(*status), body)
                 }
             }
-            ProviderError::Decode(_) => ProviderFailure::Fatal,
+            ProviderError::Decode(_)
+            | ProviderError::ResponseTimeout { .. }
+            | ProviderError::ProgressTimeout { .. } => ProviderFailure::Fatal,
             ProviderError::Response(message) => classify_rejection(None, message),
             ProviderError::Status(code, message) => {
                 if *code == 429 || (500..600).contains(code) {
@@ -933,6 +945,17 @@ pub trait Provider: Send + Sync {
 
     fn reasoning_support(&self) -> ReasoningSupport {
         ReasoningSupport::Unsupported
+    }
+
+    /// Override reasoning for this prepared request only. Auxiliary work such
+    /// as summarization must not change the interactive session's setting.
+    /// `None` means the adapter has no safe per-request override.
+    fn with_request_reasoning(
+        &self,
+        _request: &PreparedModelRequest,
+        _config: &ReasoningConfig,
+    ) -> Result<Option<PreparedModelRequest>, ProviderError> {
+        Ok(None)
     }
 
     /// Choices accepted by this adapter/profile. An unverified model may still

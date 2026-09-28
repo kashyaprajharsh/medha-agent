@@ -17,6 +17,12 @@ use tokio_util::sync::CancellationToken;
 /// run; it is the recursion bound for hook-driven continuation.
 pub(super) const MAX_HOOK_CONTINUATIONS: u8 = 3;
 
+pub(super) struct CompletionHookState {
+    pub verified: bool,
+    pub continuations: u8,
+    pub origin: Option<ulid::Ulid>,
+}
+
 pub(super) enum PromptGate {
     Proceed(Vec<ulid::Ulid>),
     Blocked(String),
@@ -90,27 +96,33 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     pub(super) async fn task_completion_hooks(
         &self,
         session: &Session,
-        verified: bool,
-        continuations: u8,
+        state: CompletionHookState,
         cancel: &CancellationToken,
         messages: &mut Vec<Message>,
         ordered: &mut Vec<ModelMessage>,
     ) -> Result<bool, KernelError> {
+        if state.continuations >= MAX_HOOK_CONTINUATIONS {
+            return Ok(false);
+        }
         let batch = self
-            .invoke_hook(
+            .invoke_hook_lineage(
                 session,
                 HookPoint::TaskCompletion,
                 TrustLabel::System,
                 json!({
-                    "verified": verified,
+                    "verified": state.verified,
                     "verification_required": self.verifier.required(),
-                    "continuations": continuations,
+                    "continuations": state.continuations,
                 }),
+                crate::hooks::HookCausation {
+                    id: state.origin.map(|id| id.to_string()),
+                    depth: state.continuations,
+                },
                 cancel,
             )
             .await
             .map_err(KernelError::Log)?;
-        if batch.contexts.is_empty() || continuations >= MAX_HOOK_CONTINUATIONS {
+        if batch.contexts.is_empty() {
             return Ok(false);
         }
         self.deliver_contexts(
@@ -187,7 +199,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .await;
     }
 
-    async fn observe_hook_with(
+    pub(super) async fn observe_hook_with(
         &self,
         session: &Session,
         point: HookPoint,
@@ -244,10 +256,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 context.component_id,
                 context.text
             );
-            let event = self
-                .log
-                .append(Event::user_input(session, &text, TrustLabel::Tool))
-                .await?;
+            // Names its source so no surface shows it as something the person typed.
+            let mut event = Event::user_input(session, &text, TrustLabel::Tool);
+            event.payload["hook"] = json!({
+                "point": point.as_str(),
+                "plugin": context.plugin_id,
+                "component": context.component_id,
+            });
+            let event = self.log.append(event).await?;
             events.push(event.id);
             let message = Message::user(text).carrying(TrustLabel::Tool);
             if let Some(ordered) = ordered.as_mut() {

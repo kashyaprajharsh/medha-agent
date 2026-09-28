@@ -690,9 +690,10 @@ async fn required_checks_block_false_success_and_missing_results() {
         // A post-edit pass is insufficient: changes can occur before completion.
         let verifier = Arc::new(RequiredVerifier::new(vec![Some(true), final_result]));
         let kernel = kernel_with(provider, executor).with_verifier(verifier.clone());
+        let session = Session::new();
         let (history, stop) = kernel
             .run_session(
-                &Session::new(),
+                &session,
                 vec![Message::user("fix it")],
                 Budget::default(),
                 &kernel::NullSink,
@@ -707,6 +708,13 @@ async fn required_checks_block_false_success_and_missing_results() {
             history.last().unwrap().trust,
             Some(kernel::TrustLabel::Tool)
         );
+        let logged = kernel.log.events(session.id).await;
+        let result = logged
+            .iter()
+            .rev()
+            .find_map(|event| event.payload.get("verifier"))
+            .expect("the verifier result is recorded as itself, not only as text");
+        assert_eq!(result["ok"], false);
     }
 }
 
@@ -900,6 +908,49 @@ async fn cumulative_usage_blocks_settle_once_at_the_end_of_an_attempt() {
 }
 
 #[tokio::test]
+async fn each_model_call_records_its_tokens_and_cost_in_the_log() {
+    let usage = kernel::Usage {
+        prompt_tokens: 1_000_000,
+        completion_tokens: 500_000,
+        total_tokens: 1_500_000,
+        cached_prompt_tokens: Some(400_000),
+    };
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![
+        Block::Text("done".into()),
+        Block::Usage(usage),
+    ])]));
+    let pricing = kernel::Pricing {
+        input_per_mtok: 2.0,
+        output_per_mtok: 8.0,
+        cached_input_per_mtok: Some(0.5),
+        indicative: false,
+    };
+    let kernel =
+        kernel_with(provider, Arc::new(CountingExecutor::default())).with_pricing(Some(pricing));
+    let session = Session::new();
+    kernel
+        .run_session(
+            &session,
+            vec![Message::user("go")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    let events = kernel.log.events(session.id).await;
+    let record = events
+        .iter()
+        .find(|event| event.kind == kernel::EventKind::ContextUsage)
+        .expect("the model call is recorded");
+    assert_eq!(record.payload["prompt_tokens"], 1_000_000);
+    assert_eq!(record.payload["completion_tokens"], 500_000);
+    assert_eq!(record.payload["cached_prompt_tokens"], 400_000);
+    // 600k fresh input at $2, 400k cached at $0.50, 500k output at $8.
+    assert_eq!(record.payload["cost_usd"], 5.4);
+}
+
+#[tokio::test]
 async fn pre_tool_hooks_can_only_narrow_or_escalate_execution() {
     for mode in [HookMode::Deny, HookMode::RequestApproval] {
         let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![intent(0)])]));
@@ -984,19 +1035,18 @@ async fn hook_payloads_are_redacted_and_audited_around_real_execution() {
     assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
     {
         let requests = hooks.requests.lock().unwrap();
-        let points: Vec<HookPoint> = requests.iter().map(|request| request.point).collect();
-        assert_eq!(
-            points,
-            [
-                HookPoint::SessionStart,
-                HookPoint::PromptSubmit,
-                HookPoint::PreTool,
-                HookPoint::PostTool,
-                HookPoint::TaskCompletion,
-            ]
-        );
-        assert_eq!(requests[2].payload["args"]["path"], "visible.txt");
-        assert_eq!(requests[2].payload["args"]["api_key"], "<redacted>");
+        let tool_points: Vec<HookPoint> = requests
+            .iter()
+            .filter(|request| request.point.is_tool_point())
+            .map(|request| request.point)
+            .collect();
+        assert_eq!(tool_points, [HookPoint::PreTool, HookPoint::PostTool]);
+        let pre_tool = requests
+            .iter()
+            .find(|request| request.point == HookPoint::PreTool)
+            .unwrap();
+        assert_eq!(pre_tool.payload["args"]["path"], "visible.txt");
+        assert_eq!(pre_tool.payload["args"]["api_key"], "<redacted>");
     }
 
     let events = log.events(session.id).await;

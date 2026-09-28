@@ -920,6 +920,27 @@ async fn strict_accounting_refuses_provider_estimates() {
 }
 
 #[tokio::test]
+async fn silent_response_timeout_does_not_resubmit_the_same_prompt() {
+    let provider = Arc::new(RecordingProvider::new(vec![
+        Err(ProviderError::ResponseTimeout { waited_secs: 300 }),
+        Ok(vec![Block::Text("must not be requested".into())]),
+    ]));
+    let kernel = kernel_with_context(provider.clone(), Arc::new(Passthrough));
+    let error = kernel
+        .run_session(
+            &Session::new(),
+            vec![Message::user("go")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("response headers"));
+    assert_eq!(provider.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn output_cap_error_retries_with_a_lower_cap_without_compacting_history() {
     let provider = Arc::new(RecordingProvider::new(vec![
         Err(ProviderError::Status(
@@ -1161,6 +1182,9 @@ async fn unknown_native_image_rejection_retries_once_as_auxiliary_text() {
         mime_type: "image/png".into(),
         source: MediaSource::Artifact("hash".into()),
         label: Some("screen.png".into()),
+        width: None,
+        height: None,
+        byte_size: None,
         provider_state: Vec::new(),
     });
 

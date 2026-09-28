@@ -21,6 +21,12 @@ pub struct HookRequest {
     pub payload: Value,
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct HookCausation {
+    pub id: Option<String>,
+    pub depth: u8,
+}
+
 impl HookRequest {
     pub fn new(
         session_id: impl Into<String>,

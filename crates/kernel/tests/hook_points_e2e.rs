@@ -75,6 +75,19 @@ impl ContextEngine for Passthrough {
     }
 }
 
+struct PlannedCompactor;
+
+#[async_trait]
+impl ContextEngine for PlannedCompactor {
+    fn compaction_planned(&self, _messages: &[Message], _max_input_tokens: Option<u32>) -> bool {
+        true
+    }
+
+    async fn compile(&self, messages: &[Message], _max_ctx: Option<u32>) -> CompileResult {
+        Passthrough.compile(messages, None).await
+    }
+}
+
 struct ReadTools;
 
 #[async_trait]
@@ -224,6 +237,81 @@ async fn run(
         .1
 }
 
+#[tokio::test]
+async fn a_successful_file_edit_emits_file_change_once() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_call("fs.edit"),
+        vec![Block::Text("done".into())],
+    ]));
+    let hooks = Arc::new(PointHooks::default());
+    let kernel = build(provider, Arc::new(InMemoryLog::new()), hooks.clone());
+    assert_eq!(
+        run(&kernel, &Session::new(), &Notices::default()).await,
+        StopReason::Finished
+    );
+    assert_eq!(hooks.count(HookPoint::FileChange), 1);
+}
+
+struct ReviewAll;
+
+impl kernel::Policy for ReviewAll {
+    fn authorize(
+        &self,
+        _autonomy: kernel::AutonomyLevel,
+        _intent: &ToolIntent,
+        _radius: Option<BlastRadius>,
+    ) -> kernel::Decision {
+        kernel::Decision::Human
+    }
+}
+
+#[tokio::test]
+async fn a_denied_tool_review_emits_approval_decision() {
+    let hooks = Arc::new(PointHooks::default());
+    let kernel = Kernel::new(
+        Arc::new(ScriptedProvider::new(vec![
+            tool_call("read"),
+            vec![Block::Text("done".into())],
+        ])),
+        Arc::new(InMemoryLog::new()),
+        Arc::new(ReadTools),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(ReviewAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    )
+    .with_hooks(hooks.clone());
+    assert_eq!(
+        run(&kernel, &Session::new(), &Notices::default()).await,
+        StopReason::Finished
+    );
+    assert_eq!(hooks.count(HookPoint::ApprovalDecision), 1);
+}
+
+#[tokio::test]
+async fn pre_compaction_observer_runs_when_engine_plans_compaction() {
+    let hooks = Arc::new(PointHooks::default());
+    let kernel = Kernel::new(
+        Arc::new(ScriptedProvider::new(Vec::new())),
+        Arc::new(InMemoryLog::new()),
+        Arc::new(ReadTools),
+        Arc::new(PlannedCompactor),
+        Arc::new(MemArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    )
+    .with_hooks(hooks.clone());
+    assert_eq!(
+        run(&kernel, &Session::new(), &Notices::default()).await,
+        StopReason::Finished
+    );
+    assert_eq!(hooks.count(HookPoint::PreCompaction), 1);
+    assert_eq!(hooks.count(HookPoint::PreModel), 1);
+    assert_eq!(hooks.count(HookPoint::PostModel), 1);
+}
+
 fn tool_call(tool: &str) -> Vec<Block> {
     vec![Block::ToolIntent(ToolIntent {
         id: "call-1".into(),
@@ -271,15 +359,21 @@ async fn added_context_is_logged_as_tool_trust_before_the_model_reads_it() {
             .content
             .starts_with("[prompt_submit hook dev.test/guard]")
     );
-    let logged = log.events(session.id).await.into_iter().any(|event| {
-        event
-            .payload
-            .to_string()
-            .contains("this repository uses pnpm")
-    });
-    assert!(
-        logged,
-        "model-visible hook context must be in the event log"
+    let logged = log
+        .events(session.id)
+        .await
+        .into_iter()
+        .find(|event| {
+            event
+                .payload
+                .to_string()
+                .contains("this repository uses pnpm")
+        })
+        .expect("model-visible hook context must be in the event log");
+    assert_eq!(
+        logged.payload["hook"],
+        serde_json::json!({"point": "prompt_submit", "plugin": "dev.test", "component": "guard"}),
+        "hook context names its source, so no surface shows it as the person's message"
     );
 }
 
@@ -302,7 +396,25 @@ async fn task_completion_can_resume_work_only_a_bounded_number_of_times() {
         4,
         "one answer plus three hook continuations"
     );
-    assert_eq!(hooks.count(HookPoint::TaskCompletion), 4);
+    let requests = hooks.requests.lock().unwrap();
+    let completions: Vec<_> = requests
+        .iter()
+        .filter(|request| request.point == HookPoint::TaskCompletion)
+        .collect();
+    assert_eq!(completions.len(), 3);
+    assert_eq!(
+        completions
+            .iter()
+            .map(|request| request.depth)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(completions[0].causation_id.is_some());
+    assert!(
+        completions
+            .iter()
+            .all(|request| request.causation_id == completions[0].causation_id)
+    );
 }
 
 #[tokio::test]

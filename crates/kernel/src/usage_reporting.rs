@@ -2,6 +2,69 @@
 use crate::{PreparedModelRequest, StreamSink, Usage};
 use sha2::{Digest, Sha256};
 
+/// Hash the entire priced prefix, not just its last message: edits anywhere
+/// inside it, changed tools, routing or provider settings invalidate calibration.
+/// The rest of the call's usage rides along, so the log is also the record of
+/// what each model call cost; older anchors simply lack those fields.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct UsageAnchor {
+    identity: String,
+    fingerprint: String,
+    message_count: usize,
+    ordered_count: Option<usize>,
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached_prompt_tokens: Option<u32>,
+    /// `None` when no price is known for the model, never a guessed zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+}
+
+impl UsageAnchor {
+    pub fn capture(
+        identity: String,
+        request: &PreparedModelRequest,
+        usage: &Usage,
+        pricing: Option<crate::types::Pricing>,
+    ) -> Self {
+        Self {
+            identity,
+            fingerprint: request.request_fingerprint.clone(),
+            message_count: request.context.messages.len(),
+            ordered_count: request.context.ordered.as_ref().map(Vec::len),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cached_prompt_tokens: usage.cached_prompt_tokens,
+            cost_usd: pricing.map(|pricing| pricing.cost(usage)),
+        }
+    }
+
+    pub fn matching_context<P: crate::Provider>(
+        &self,
+        provider: &P,
+        candidate: &crate::CompiledContext,
+    ) -> Option<crate::CompiledContext> {
+        if self.prompt_tokens == 0
+            || self.message_count == 0
+            || self.identity != provider.context_identity()
+            || self.message_count > candidate.messages.len()
+        {
+            return None;
+        }
+        let mut prefix = candidate.clone();
+        prefix.messages.truncate(self.message_count);
+        match (self.ordered_count, &mut prefix.ordered) {
+            (Some(count), Some(messages)) if count <= messages.len() => messages.truncate(count),
+            (None, None) => {}
+            _ => return None,
+        }
+        let prepared = provider.prepare_request(&prefix).ok()?;
+        (prepared.request_fingerprint == self.fingerprint).then_some(prefix)
+    }
+}
+
 pub(crate) struct AttemptUsage<'a> {
     sink: &'a dyn StreamSink,
     latest: Option<Usage>,
@@ -12,8 +75,46 @@ pub(crate) struct AttemptUsage<'a> {
 impl<'a> AttemptUsage<'a> {
     pub(crate) fn new(sink: &'a dyn StreamSink, request: &PreparedModelRequest) -> Self {
         let id = ulid::Ulid::new();
+        let mut images = 0usize;
+        let mut image_pixels = 0u64;
+        // Inspect borrowed canonical parts; never clone or serialize image data
+        // just to report request shape.
+        if let Some(messages) = &request.context.ordered {
+            for media in messages
+                .iter()
+                .flat_map(|message| &message.parts)
+                .filter_map(|part| {
+                    if let crate::ContentPart::Media(media) = part {
+                        Some(media)
+                    } else {
+                        None
+                    }
+                })
+            {
+                images += 1;
+                image_pixels = image_pixels.saturating_add(
+                    u64::from(media.width.unwrap_or(0)) * u64::from(media.height.unwrap_or(0)),
+                );
+            }
+        } else {
+            for media in request
+                .context
+                .messages
+                .iter()
+                .flat_map(|message| &message.attachments)
+            {
+                images += 1;
+                image_pixels = image_pixels.saturating_add(
+                    u64::from(media.width.unwrap_or(0)) * u64::from(media.height.unwrap_or(0)),
+                );
+            }
+        }
         tracing::info!(attempt = %id, model = %request.model, protocol = ?request.protocol,
-            fingerprint = %request.request_fingerprint, "model request dispatched");
+            fingerprint = %request.request_fingerprint,
+            streaming = ?request.body.get("stream").and_then(serde_json::Value::as_bool),
+            output_limit = ?request.body.get("max_tokens").and_then(serde_json::Value::as_u64),
+            messages = request.context.messages.len(), tools = request.context.tools.len(),
+            images, image_pixels, "model request dispatched");
         // Opt-in structural diagnostics. These hashes detect changed serialized
         // fields, not provider tokenization, KV blocks or actual cache hits.
         // Never log prompt contents or credentials.

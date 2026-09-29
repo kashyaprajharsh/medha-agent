@@ -5,6 +5,7 @@ import { PlanCard, Reasoning, StepGroup } from "./Steps";
 import type { Block, SubagentRun } from "./timeline";
 import { clock, doingLine, duration, outcomeLabel } from "./timeline";
 import type { LiveAgent } from "./live";
+import { UserText } from "./UserText";
 
 type Props = {
   blocks: Block[];
@@ -74,7 +75,7 @@ export const Transcript = memo(function Transcript({
             <span className="you-mark" aria-hidden="true">
               ›
             </span>
-            <p>{block.text}</p>
+            <UserText text={block.text} />
             <time>{clock(block.ts)}</time>
             {onRewind && (
               <button
@@ -118,9 +119,13 @@ export const Transcript = memo(function Transcript({
           <div className="prose plain">{block.text}</div>
         );
       case "reasoning":
-        return showReasoning ? (
-          <Reasoning text={block.text} durationMs={block.durationMs} />
-        ) : null;
+        return (
+          <Reasoning
+            text={block.text}
+            durationMs={block.durationMs}
+            expanded={showReasoning}
+          />
+        );
       case "plan":
         return <PlanCard plan={block.plan} />;
       case "verification":

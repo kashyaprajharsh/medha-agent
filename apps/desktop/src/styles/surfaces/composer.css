@@ -1,0 +1,312 @@
+/* The composer: prompt box, controls row, attachments and the slash menu. */
+.composer-wrap {
+  flex: none;
+  padding: 6px 28px var(--s-4);
+}
+.composer {
+  position: relative;
+  max-width: 720px;
+  margin: 0 auto;
+  border-radius: var(--r-xl);
+  background: var(--raised);
+  box-shadow: inset 0 0 0 1px var(--line), var(--e2-shadow);
+  transition: box-shadow var(--t-base) var(--ease-out);
+}
+.composer:focus-within {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--gold) 45%, var(--line)),
+    0 0 0 3px var(--gold-wash),
+    var(--e2-shadow);
+}
+.composer.dragging {
+  outline: 2px dashed color-mix(in srgb, var(--gold) 70%, transparent);
+  outline-offset: 4px;
+}
+.composer code {
+  color: var(--code);
+}
+.composer textarea {
+  display: block;
+  width: 100%;
+  min-height: 56px;
+  resize: none;
+  padding: var(--s-4) 18px var(--s-1);
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: 15px/1.55 var(--font-ui);
+  color: var(--text);
+}
+.composer textarea::placeholder {
+  color: var(--faint);
+}
+.composer-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  padding: 6px 10px 10px;
+}
+.composer .grow {
+  flex: 1;
+}
+.composer .icon-btn {
+  border-radius: var(--r-full);
+}
+.composer .icon-btn:disabled {
+  color: var(--faint);
+  background: none;
+}
+.composer-hint {
+  max-width: 720px;
+  margin: var(--s-2) auto 0;
+  padding: 0 var(--s-2);
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s-3);
+  font-size: var(--text-xs);
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity var(--t-base);
+}
+.composer-wrap:focus-within .composer-hint,
+.composer-hint.running {
+  opacity: 1;
+}
+.composer-error {
+  max-width: 720px;
+  margin: var(--s-2) auto 0;
+  padding: 0 var(--s-2);
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--err);
+  font-size: var(--text-xs);
+  animation: fade-in var(--t-base) var(--ease-out) both;
+}
+.composer-error button {
+  color: var(--dim);
+}
+
+.send,
+.stop {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-full);
+  transition:
+    transform var(--t-fast) var(--ease-out),
+    background var(--t-fast),
+    box-shadow var(--t-fast),
+    opacity var(--t-base);
+}
+.send {
+  background: var(--gold);
+  color: var(--gold-ink);
+}
+.send:not(:disabled):hover {
+  background: var(--gold-hi);
+}
+.send:disabled {
+  opacity: 0.35;
+}
+.stop {
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.stop span {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--text);
+}
+.stop:hover {
+  background: var(--hover);
+}
+.send:not(:disabled):active,
+.stop:active {
+  transform: scale(0.94);
+}
+
+.chip {
+  height: 30px;
+  max-width: 36%;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border-radius: var(--r-full);
+  color: var(--dim);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  transition:
+    background var(--t-fast),
+    color var(--t-fast),
+    box-shadow var(--t-fast),
+    transform var(--t-fast) var(--ease-out);
+}
+.chip:not(:disabled):active {
+  transform: scale(0.96);
+}
+.chip:hover,
+.chip.active {
+  background: var(--hover);
+  color: var(--text);
+}
+.chip.active {
+  background: var(--gold-wash);
+}
+.chip .icon {
+  width: 14px;
+  height: 14px;
+}
+.chip .chip-caret {
+  width: 10px;
+  height: 10px;
+  color: var(--faint);
+}
+.chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ctx {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 6px;
+  font-size: var(--text-xs);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.ctx svg {
+  width: 16px;
+  height: 16px;
+  transform: rotate(-90deg);
+}
+.ctx circle {
+  fill: none;
+  stroke-width: 2.4;
+}
+.ctx-track {
+  stroke: var(--line);
+}
+.ctx-fill {
+  stroke: var(--gold);
+  stroke-linecap: round;
+  transition: stroke-dasharray 400ms var(--ease-out);
+}
+
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: var(--s-3) var(--s-3) 0;
+}
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-1) 6px var(--s-1) var(--s-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--canvas);
+  font-size: var(--text-xs);
+  max-width: 220px;
+  animation: pop-in var(--t-base) var(--ease-out) both;
+}
+.attachment img {
+  width: 30px;
+  height: 30px;
+  object-fit: cover;
+  border-radius: calc(var(--r-md) - 4px);
+}
+.attachment span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment button {
+  padding: 3px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-full);
+  color: var(--faint);
+  transition: color var(--t-fast), background var(--t-fast);
+}
+.attachment button:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.attachment .icon {
+  width: 13px;
+}
+.attachment-note {
+  display: block;
+  font-size: var(--text-xs);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+}
+.drop-hint {
+  display: flex;
+  justify-content: center;
+  gap: var(--s-2);
+  padding: 10px;
+  color: var(--gold);
+}
+
+.slash-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + var(--s-2));
+  z-index: 15;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--overlay);
+  box-shadow: var(--e2-shadow);
+  transform-origin: bottom center;
+  animation: pop-in var(--t-base) var(--ease-out) both;
+}
+.slash-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border-radius: calc(var(--r-lg) - 6px);
+  text-align: left;
+}
+.slash-menu button[aria-selected="true"] {
+  background: var(--press);
+}
+.slash-menu .icon {
+  color: var(--faint);
+}
+.slash-menu b {
+  width: 92px;
+  font-weight: 500;
+}
+.slash-menu span {
+  font-size: var(--text-xs);
+  color: var(--dim);
+}
+
+@media (max-width: 780px) {
+  .composer-wrap {
+    padding: 6px var(--s-3) var(--s-3);
+  }
+  .composer-hint {
+    font-size: 10.5px;
+  }
+  .chip {
+    padding: 0 6px;
+    gap: var(--s-1);
+  }
+  .chip .icon:not(.chip-caret) {
+    display: none;
+  }
+}

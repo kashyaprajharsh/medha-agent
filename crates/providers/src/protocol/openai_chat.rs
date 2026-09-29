@@ -829,9 +829,7 @@ fn validate_refusal(refusal: Option<&serde_json::Value>) -> Result<(), ProviderE
 
 fn validate_finish_reason(reason: Option<&str>) -> Result<(), ProviderError> {
     match reason {
-        Some("length" | "max_tokens") => Err(ProviderError::Decode(
-            "model response was truncated at its output limit; no tools from this response were executed. Retry with smaller writes or adjust the output allowance".into(),
-        )),
+        Some("length" | "max_tokens") => Err(ProviderError::Truncated),
         Some("content_filter") => Err(ProviderError::Decode(
             "provider filtered the response; no tools from this response were executed".into(),
         )),

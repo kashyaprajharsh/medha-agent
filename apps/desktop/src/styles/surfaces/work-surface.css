@@ -1,0 +1,345 @@
+/* The work surface: tabs, patches from sub-agents, activity and context details. */
+.surface-head {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+  padding: 0 var(--s-3) 0 var(--s-5);
+  border-bottom: 1px solid var(--hair);
+}
+.surface-head b {
+  font-size: var(--text-md);
+  font-weight: 500;
+}
+.surface-tabs {
+  display: flex;
+  gap: var(--s-1);
+  margin: var(--s-2) var(--s-3);
+  padding: var(--s-1);
+  border-radius: var(--r-md);
+  background: var(--side);
+  flex: none;
+}
+.surface-tabs button {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 6px var(--s-1);
+  color: var(--dim);
+  font-size: var(--text-sm);
+  border-radius: calc(var(--r-md) - 4px);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.surface-tabs button:hover {
+  color: var(--text);
+}
+.surface-tabs button[aria-selected="true"] {
+  background: var(--raised);
+  color: var(--text);
+  box-shadow: var(--e1-shadow);
+}
+.surface-tabs button span {
+  font-size: var(--text-xs);
+  color: var(--gold);
+}
+.surface-content {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  border-top: 1px solid var(--hair);
+}
+.surface-content > * {
+  animation: fade-in var(--t-base) var(--ease-out) both;
+}
+.surface-content.has-agent {
+  overflow: hidden;
+}
+.surface-body {
+  padding: 18px var(--s-5) 30px;
+}
+.surface-empty {
+  margin: 30px 0;
+  display: grid;
+  justify-items: start;
+  gap: var(--s-2);
+  color: var(--dim);
+}
+.surface-empty > .icon {
+  width: 20px;
+  height: 20px;
+  color: var(--faint);
+  margin-bottom: 5px;
+}
+.surface-empty b {
+  color: var(--text);
+  font-weight: 500;
+}
+.surface-empty p {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  max-width: 32ch;
+}
+.surface-error {
+  color: var(--err);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+.surface-error button {
+  display: block;
+}
+.surface-notice {
+  display: flex;
+  gap: var(--s-2);
+  color: var(--ok);
+  font-size: var(--text-sm);
+}
+
+.patch-selector {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 18px;
+}
+.patch-selector button {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: var(--s-2) 10px;
+  border-radius: var(--r-sm);
+  text-align: left;
+  transition: background var(--t-fast);
+}
+.patch-selector button:hover {
+  background: var(--hover);
+}
+.patch-selector button[aria-pressed="true"] {
+  background: var(--gold-wash);
+}
+.patch-selector small {
+  color: var(--dim);
+}
+.patch-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.patch-title b {
+  font-weight: 500;
+}
+.patch-title > span {
+  flex: 1;
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+.patch-files {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 var(--s-4);
+}
+.patch-files > span {
+  display: flex;
+  align-items: start;
+  gap: var(--s-2);
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+.patch-files code {
+  overflow-wrap: anywhere;
+}
+.patch-files .icon {
+  width: 13px;
+  height: 14px;
+}
+.patch-verification {
+  display: flex;
+  gap: var(--s-2);
+  align-items: start;
+  color: var(--dim);
+  font-size: var(--text-xs);
+  padding: 10px 0;
+}
+.patch-verification .icon {
+  color: var(--ok);
+  width: 14px;
+}
+.patch-verification.failed,
+.patch-verification.failed .icon {
+  color: var(--err);
+}
+.verification-output {
+  margin-bottom: 10px;
+}
+.verification-output summary {
+  cursor: pointer;
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+.verification-output pre {
+  color: var(--dim);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 200px;
+  overflow: auto;
+}
+.patch-diff {
+  margin: var(--s-2) -8px;
+  padding: var(--s-3) 10px;
+  border: 1px solid var(--hair);
+  background: var(--side);
+  border-radius: var(--r-md);
+  overflow: auto;
+  font-size: var(--text-xs);
+  line-height: 1.65;
+  tab-size: 2;
+  max-height: 55vh;
+}
+.patch-diff > span {
+  display: block;
+  min-width: fit-content;
+  white-space: pre;
+}
+.diff-remove {
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 7%, transparent);
+}
+.diff-section {
+  color: var(--gold);
+}
+.patch-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  margin-top: var(--s-4);
+}
+.patch-actions > span {
+  flex: 1;
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+
+.activity-step {
+  border-bottom: 1px solid var(--hair);
+  padding: var(--s-3) 0;
+}
+.activity-step summary {
+  list-style: none;
+  display: flex;
+  align-items: start;
+  gap: var(--s-2);
+  cursor: pointer;
+}
+.activity-step summary > .icon {
+  width: 13px;
+  height: 16px;
+  color: var(--dim);
+}
+.activity-step summary > span {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+.activity-step summary code {
+  font-size: var(--text-xs);
+  color: var(--dim);
+}
+.activity-step summary small {
+  font-size: var(--text-xs);
+  color: var(--faint);
+  max-width: 100px;
+  text-align: right;
+}
+.activity-step pre {
+  background: var(--side);
+  padding: 10px var(--s-3);
+  border-radius: var(--r-md);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 280px;
+  overflow: auto;
+}
+
+.context-heading {
+  display: flex;
+  gap: 10px;
+  align-items: start;
+}
+.context-heading > .icon {
+  color: var(--dim);
+  margin-top: 3px;
+}
+.context-heading b {
+  display: block;
+  font-weight: 500;
+}
+.context-heading span {
+  display: block;
+  margin-top: 5px;
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+.context-meter {
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--line);
+  margin: var(--s-4) 0 22px;
+  overflow: hidden;
+}
+.context-meter > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--gold);
+  transition: width 400ms var(--ease-out);
+}
+.context-details dl {
+  display: grid;
+  grid-template-columns: 1fr 1.1fr;
+  gap: var(--s-3);
+  padding: 18px 0;
+  font-size: var(--text-sm);
+}
+.context-details dt {
+  color: var(--dim);
+}
+.context-details dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.context-compaction,
+.context-plan {
+  border-top: 1px solid var(--hair);
+  padding: var(--s-3) 0;
+}
+.context-details summary {
+  color: var(--dim);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.context-details details p,
+.context-details details li {
+  font-size: var(--text-xs);
+  color: var(--dim);
+}
+.context-plan ol {
+  padding-left: 18px;
+}
+
+@media (max-width: 1100px) {
+  .work-surface {
+    width: min(440px, 80vw);
+    z-index: 10;
+  }
+}
+@media (max-width: 780px) {
+  .work-surface {
+    width: min(440px, 100vw);
+  }
+}

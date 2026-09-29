@@ -23,7 +23,7 @@ pub use exec::{
     run_command_bounded, run_command_bounded_with_input, run_shell_bounded, run_shell_bounded_with,
     select_backend,
 };
-pub use permissions::{ApprovedRoots, NetworkGrant};
+pub use permissions::{ApprovedRoots, NetworkGrant, is_protected, protected_paths};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
@@ -131,6 +131,13 @@ impl WritePathGuard {
     pub fn resolved(&self) -> &Path {
         &self.resolved
     }
+}
+
+fn refuse_protected(path: PathBuf) -> Result<PathBuf, SandboxError> {
+    if is_protected(&path) {
+        return Err(permissions::PermissionError::Protected { path }.into());
+    }
+    Ok(path)
 }
 
 /// Turn an authorised, canonical path into its lock-table identity: a canonical
@@ -1613,6 +1620,8 @@ pub struct ExecInvocation<'a> {
     request: ExecRequest,
     working_dir: Option<PathBuf>,
     prompted: Vec<(PathBuf, permissions::PermissionType)>,
+    /// The user approved this one run outside the jail.
+    outside_sandbox: bool,
 }
 
 impl<'a> ExecInvocation<'a> {
@@ -1625,12 +1634,26 @@ impl<'a> ExecInvocation<'a> {
             request,
             working_dir: None,
             prompted: Vec::new(),
+            outside_sandbox: access.outside_sandbox,
+        }
+    }
+
+    /// Inside the OS jail, a failure may be a policy denial rather than the command's own.
+    pub fn jailed(&self) -> bool {
+        self.backend().label() == "native"
+    }
+
+    fn backend(&self) -> &dyn ExecBackend {
+        if self.outside_sandbox {
+            &HostBackend
+        } else {
+            self.sandbox.exec.as_ref()
         }
     }
 
     pub fn spawn_background(&self) -> Result<crate::exec::BgProc, ExecError> {
-        let watch_network = self.sandbox.exec.denies_network(&self.request);
-        let mut cmd = self.sandbox.exec.build_command(&self.request)?;
+        let watch_network = self.backend().denies_network(&self.request);
+        let mut cmd = self.backend().build_command(&self.request)?;
         if let Some(dir) = &self.working_dir {
             // Build the profile against the original workspace, then set only
             // the child's working directory. A read grant must not imply writes.
@@ -1646,7 +1669,7 @@ impl<'a> ExecInvocation<'a> {
 
     /// Permission evidence only; arbitrary shell commands must not be replayed.
     pub fn denied_paths(&self, output: &ExecOutput) -> Vec<PathBuf> {
-        if self.sandbox.exec.label() != "native" {
+        if !self.jailed() {
             return Vec::new();
         }
         exec::escalation_candidates(
@@ -1661,9 +1684,7 @@ impl<'a> ExecInvocation<'a> {
     /// denial. Host/container failures cannot be repaired by local path grants.
     pub async fn approve_retry(&mut self, output: &ExecOutput) -> bool {
         // Pipelines and trailing commands can mask the failing exit code.
-        if self.sandbox.exec.label() != "native"
-            || self.prompted.len() >= MAX_EXEC_ESCALATION_PROMPTS
-        {
+        if !self.jailed() || self.prompted.len() >= MAX_EXEC_ESCALATION_PROMPTS {
             return false;
         }
         let approved = self.sandbox.permission_manager.approved_roots();
@@ -1932,6 +1953,9 @@ impl WorkspaceSandbox {
     ) -> Result<kernel::ExecutionAccess, String> {
         let mut missing = kernel::ExecutionAccess {
             network: requested.network && self.denies_network(),
+            outside_sandbox: requested.outside_sandbox
+                && self.exec.label() != "host"
+                && !kernel::execution_access().outside_sandbox,
             ..Default::default()
         };
         let approved = self.permission_manager.approved_roots();
@@ -2176,6 +2200,14 @@ impl WorkspaceSandbox {
     }
 
     pub async fn resolve(&self, path: &str) -> Result<PathBuf, SandboxError> {
+        refuse_protected(self.resolve_any(path).await?)
+    }
+
+    pub async fn resolve_for_write(&self, path: &str) -> Result<PathBuf, SandboxError> {
+        refuse_protected(self.resolve_any_for_write(path).await?)
+    }
+
+    async fn resolve_any(&self, path: &str) -> Result<PathBuf, SandboxError> {
         let path = Path::new(path);
 
         let is_simple_relative = path.is_relative()
@@ -2219,7 +2251,7 @@ impl WorkspaceSandbox {
         }
     }
 
-    pub async fn resolve_for_write(&self, path: &str) -> Result<PathBuf, SandboxError> {
+    async fn resolve_any_for_write(&self, path: &str) -> Result<PathBuf, SandboxError> {
         let path = Path::new(path);
 
         let is_simple_relative = path.is_relative()
@@ -3635,10 +3667,42 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// A workspace that contains a credential store still cannot open it by a relative path.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn relative_paths_into_protected_stores_are_refused() {
+        let Some(library) = std::env::var_os("HOME").map(|home| Path::new(&home).join("Library"))
+        else {
+            return;
+        };
+        if !library.join("Cookies").is_dir() {
+            return;
+        }
+        let sbx = WorkspaceSandbox::new_jailed(&library).unwrap();
+        for relative in [
+            "Cookies",
+            "Keychains",
+            "Application Support/Google/Chrome/Default/Cookies",
+        ] {
+            let refused = |result: Result<PathBuf, SandboxError>| {
+                matches!(
+                    result,
+                    Err(SandboxError::Permission(
+                        permissions::PermissionError::Protected { .. }
+                    ))
+                )
+            };
+            assert!(refused(sbx.resolve(relative).await), "read {relative}");
+            assert!(
+                refused(sbx.resolve_for_write(relative).await),
+                "write {relative}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn rejects_escape_jailed() {
-        let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-sbx");
         let sbx = WorkspaceSandbox::new_jailed(&dir).unwrap();
         assert!(sbx.resolve("../etc/passwd").await.is_err());
         assert!(sbx.resolve("/etc/passwd").await.is_err());
@@ -3673,8 +3737,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_then_read_roundtrips_jailed() {
-        let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-sbx");
         let sbx = WorkspaceSandbox::new_jailed(&dir).unwrap();
         // Write a test file
         sbx.write("test.txt", "hello").await.unwrap();
@@ -3685,8 +3748,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_is_atomic_and_leaves_no_temp_files() {
-        let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-sbx");
         let sbx = WorkspaceSandbox::new_jailed(&dir).unwrap();
         sbx.write("a.txt", "v1").await.unwrap();
         sbx.write("a.txt", "v2").await.unwrap();
@@ -3702,13 +3764,11 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn restore_rolls_a_file_back_and_deletes_created_files() {
-        let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-sbx");
         let sbx = WorkspaceSandbox::new_jailed(&dir).unwrap();
 
         // v1 exists, then a second write snapshots v1 and stores v2.
@@ -3735,13 +3795,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn allows_workspace_relative_paths() {
-        let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-sbx");
         let gate = Arc::new(AutoDeny);
         let trust =
             std::env::temp_dir().join(format!("medha-sbx-trust-{}.lock", ulid::Ulid::new()));
@@ -3757,8 +3815,7 @@ mod tests {
 
     #[tokio::test]
     async fn denies_outside_workspace_without_permission() {
-        let dir = std::env::temp_dir().join(format!("medha-sbx-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-sbx");
         let gate = Arc::new(AutoDeny); // AutoDeny always returns false
         let trust =
             std::env::temp_dir().join(format!("medha-sbx-trust-{}.lock", ulid::Ulid::new()));
@@ -3826,7 +3883,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_symlink_escape_simple_relative() {
-        let base = std::env::temp_dir().join(format!("medha-sbx-sym-{}", ulid::Ulid::new()));
+        let base = test_support::scratch("medha-sbx-sym");
         let root = base.join("ws");
         let outside = base.join("outside");
         std::fs::create_dir_all(&root).unwrap();
@@ -3878,8 +3935,7 @@ mod tests {
     /// work (the canonicalization guard must not require the target to exist).
     #[tokio::test]
     async fn allows_new_nested_file_within_jail() {
-        let dir = std::env::temp_dir().join(format!("medha-sbx-nest-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-sbx-nest");
         let sbx = WorkspaceSandbox::new_jailed(&dir).unwrap();
 
         sbx.write("a/b/c/new.txt", "hi").await.unwrap();

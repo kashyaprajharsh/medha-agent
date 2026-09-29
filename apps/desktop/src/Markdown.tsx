@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import hljs from "highlight.js/lib/common";
+import { highlightCode } from "./highlight";
 import { Icon } from "./Icon";
 import { useWorkspace } from "./Workspace";
 import { highlightAsync } from "./syntax";
@@ -20,7 +20,7 @@ export function codeHtml(text: string, language?: string) {
     highlighted.set(key, cached);
     return cached;
   }
-  const html = highlight(text, language);
+  const html = highlightCode(text, language);
   const size = key.length + html.length;
   if (size <= CACHE_LIMIT) {
     while (cacheSize + size > CACHE_LIMIT) {
@@ -32,11 +32,6 @@ export function codeHtml(text: string, language?: string) {
     cacheSize += size;
   }
   return html;
-}
-function highlight(text: string, language?: string) {
-  if (language && hljs.getLanguage(language))
-    return hljs.highlight(text, { language, ignoreIllegals: true }).value;
-  return hljs.highlightAuto(text).value;
 }
 export const Markdown = memo(function Markdown({
   html,

@@ -5,7 +5,8 @@ import "@fontsource/anek-latin/latin-500.css";
 import "@fontsource/anek-latin/latin-600.css";
 import "@fontsource/anek-latin/latin-700.css";
 import "@fontsource/anek-latin/latin-ext-400.css";
-import "./style.css";
+import "@fontsource/fragment-mono/latin-400.css";
+import "./styles/index.css";
 import { WorkspaceHost } from "./Workspace";
 
 createRoot(document.getElementById("root")!).render(

@@ -102,7 +102,17 @@ struct CountingMutation {
 #[async_trait]
 impl Executor for CountingMutation {
     fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        ["memory.update", "state.write"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: String::new(),
+                schema: json!({}),
+                blast_radius: self.blast_radius(name).unwrap_or(kernel::BlastRadius::Read),
+                category: kernel::ToolCategory::Other,
+                icon: String::new(),
+            })
+            .collect()
     }
 
     fn mutation_key(&self, _intent: &ToolIntent) -> Option<String> {

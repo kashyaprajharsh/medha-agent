@@ -1,10 +1,4 @@
-import hljs from "highlight.js/lib/common";
-
-export function highlightCode(text: string, language?: string) {
-  return language && hljs.getLanguage(language)
-    ? hljs.highlight(text, { language, ignoreIllegals: true }).value
-    : hljs.highlightAuto(text).value;
-}
+import { highlightCode } from "./highlight";
 
 self.onmessage = (
   event: MessageEvent<{ id: number; text: string; language?: string }>,

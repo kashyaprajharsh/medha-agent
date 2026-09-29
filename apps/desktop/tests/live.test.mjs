@@ -215,6 +215,50 @@ test("follow-ups enter the timeline at the steering boundary, not above earlier 
   assert.deepEqual(queuedMessages(state), []);
 });
 
+test("a follow-up a stopped turn never read goes back to the composer, not the timeline", () => {
+  const user = (id, text) => ({ kind: "user", id, text, ts: 1 });
+  let state = recordSent(startingLive(), user("initial", "task"));
+  state = reduceLive(state, { method: "ready", params: { session: "s" } });
+  state = reduceLive(state, event("model.text", { delta: "answer" }));
+  state = recordSent(state, user("late", "also do this"));
+  state = recordSent(state, user("twin", "also do this"));
+  state = reduceLive(
+    state,
+    event("message.returned", { contents: ["also do this", "[agent report]"] }),
+  );
+  state = reduceLive(state, event("turn.cancelled", {}));
+  assert.equal(state.status, "idle");
+  assert.deepEqual(state.returned, ["also do this"], "only typed text returns");
+  assert.deepEqual(
+    state.items.filter((item) => item.kind === "user").map((item) => item.id),
+    ["initial", "twin"],
+    "only the returned copy leaves the timeline",
+  );
+});
+
+test("a follow-up carried into the next run joins the timeline and keeps the run going", () => {
+  const user = (id, text) => ({ kind: "user", id, text, ts: 1 });
+  let state = recordSent(startingLive(), user("initial", "task"));
+  state = reduceLive(state, { method: "ready", params: { session: "s" } });
+  state = reduceLive(state, event("model.text", { delta: "answer" }));
+  state = recordSent(state, user("late", "check the rules too"));
+  state = reduceLive(
+    state,
+    event("message.steered", { content: "check the rules too" }),
+  );
+  state = reduceLive(
+    state,
+    event("turn.continued", { stopped: "verification_failed" }),
+  );
+  assert.equal(state.status, "running");
+  assert.match(state.notice, /Verification failed/, "the earlier stop stays visible");
+  assert.deepEqual(
+    state.items.filter((item) => item.kind === "user").map((item) => item.id),
+    ["initial", "late"],
+  );
+  assert.equal(state.returned, undefined);
+});
+
 test("identical follow-up text stays distinct and unread messages survive cancellation", () => {
   let state = reduceLive(
     startingLive(),
@@ -314,4 +358,35 @@ test("context percentage is the recounted input budget, never a fake compaction 
     undefined,
     "unknown limits must clear stale percentage",
   );
+});
+
+test("unavailable tools retain a structured error through live and history views", async () => {
+  const source = await readFile(new URL("../src/timeline.ts", import.meta.url), "utf8");
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  });
+  const { toBlocks, stepVerb, stepStatusLabel } = await import(
+    `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`
+  );
+  const tool = "mcp__mcp-remote__brave_search";
+  let state = reduceLive(startingLive(), event("tool.call", {
+    id: "guess", tool, verb: "Brave search", target: "agents",
+  }));
+  state = reduceLive(state, event("tool.observation", {
+    id: "guess", ok: false, error_code: "tool_unavailable", detail: "Tool is unavailable",
+  }));
+  const history = toBlocks([
+    { id: "call", kind: "tool_call", ts: 1, tool_id: "guess", text: tool, verb: "Brave search" },
+    { id: "obs", kind: "tool_result", ts: 2, tool_id: "guess", status: "error",
+      error_code: "tool_unavailable", detail: "Tool is unavailable" },
+  ]);
+  for (const step of [state.items[0].steps[0], history[0].steps[0]]) {
+    assert.equal(step.status, "failed");
+    assert.equal(stepVerb(step), tool);
+    assert.equal(stepStatusLabel(step), "Unavailable tool");
+    assert.equal(step.detail, "Tool is unavailable");
+  }
+  const denied = { tool, verb: "Brave search", status: "denied" };
+  assert.equal(stepVerb(denied), "Brave search");
+  assert.equal(stepStatusLabel(denied), "Denied");
 });

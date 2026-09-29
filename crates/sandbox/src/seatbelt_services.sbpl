@@ -1,0 +1,27 @@
+; Deny by default; only what an ordinary command needs to start and run.
+(deny default)
+(allow process-exec process-fork)
+(allow signal (target same-sandbox))
+; Implicitly open otherwise, and launchd would list every running service.
+(deny process-info*)
+(allow process-info* (target same-sandbox))
+(allow sysctl-read)
+(allow pseudo-tty)
+(allow file-ioctl)
+(allow ipc-posix-sem)
+; Lookup, logging and folder helpers; xcrun/clang/ld fail without them.
+(allow mach-lookup
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.system.notification_center")
+  (global-name "com.apple.logd")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.diagnosticd")
+  (global-name "com.apple.bsd.dirhelper"))
+(allow ipc-posix-shm-read* (ipc-posix-name "apple.shm.notification_center"))
+; Pseudo-terminals, so tools that drive a terminal (script, expect, REPLs) work.
+(allow file-read* file-write*
+  (literal "/dev/ptmx")
+  (regex #"^/dev/ttys[0-9]+$"))
+; Time-zone data; without it every sandboxed clock silently reads UTC.
+(allow file-read* (subpath "/private/var/db/timezone"))

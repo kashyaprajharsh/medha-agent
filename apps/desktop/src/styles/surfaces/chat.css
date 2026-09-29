@@ -1,0 +1,515 @@
+/* The conversation: messages, handoffs, plan and thinking. */
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.thread {
+  max-width: 760px;
+  min-height: 100%;
+  margin: 0 auto;
+  padding: var(--s-8) 28px 40px;
+}
+.day {
+  margin-bottom: var(--s-6);
+  text-align: center;
+  font-size: var(--text-xs);
+  color: var(--faint);
+}
+.quiet {
+  color: var(--faint);
+  font-size: var(--text-sm);
+}
+.more {
+  display: block;
+  margin: var(--s-6) auto;
+  height: 32px;
+  padding: 0 var(--s-4);
+  border-radius: var(--r-full);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--dim);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.more:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.you {
+  position: relative;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: 10px;
+  margin: 0 0 28px;
+  padding: 11px 16px;
+  border-radius: var(--r-lg);
+  background: var(--raised);
+  box-shadow: inset 0 0 0 1px var(--hair), var(--e1-shadow);
+  font-size: var(--reading-size);
+}
+.you.pending {
+  opacity: 0.85;
+}
+.you-mark {
+  font: 16px/1.5 var(--font-mono);
+  color: var(--gold);
+}
+.you p {
+  margin: 0;
+  font-size: calc(var(--reading-size) - 1px);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.you-text {
+  min-width: 0;
+}
+.you p.folded {
+  max-height: calc(1.6em * 6);
+  overflow: hidden;
+}
+.you p.faded {
+  mask-image: linear-gradient(to bottom, black 55%, transparent);
+}
+.you-toggle {
+  margin-top: var(--s-1);
+  font-size: var(--text-xs);
+  color: var(--dim);
+  transition: color var(--t-fast);
+}
+.you-toggle:hover {
+  color: var(--text);
+}
+
+/* A paste too long to read inline: a card in the thread, the full text in a sheet. */
+.pasted {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "mark title open"
+    "mark size open"
+    "preview preview preview";
+  column-gap: var(--s-3);
+  width: 100%;
+  max-width: 520px;
+  padding: var(--s-3);
+  text-align: left;
+  border-radius: var(--r-md);
+  background: var(--well);
+  box-shadow: inset 0 0 0 1px var(--hair);
+  transition: background var(--t-fast), box-shadow var(--t-fast);
+}
+.pasted:hover {
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.pasted-mark {
+  grid-area: mark;
+  align-self: center;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  background: var(--gold-wash);
+  color: var(--gold);
+}
+.pasted-title {
+  grid-area: title;
+  align-self: end;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+.pasted-size {
+  grid-area: size;
+  font-size: var(--text-xs);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.pasted-open {
+  grid-area: open;
+  align-self: center;
+  color: var(--dim);
+  opacity: 0;
+  transition: opacity var(--t-fast);
+}
+.pasted:hover .pasted-open,
+.pasted:focus-visible .pasted-open {
+  opacity: 1;
+}
+.pasted-preview {
+  grid-area: preview;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  margin-top: var(--s-3);
+  padding-top: var(--s-3);
+  border-top: 1px solid var(--hair);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  color: var(--dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  mask-image: linear-gradient(to bottom, black 45%, transparent);
+}
+.pasted-sheet {
+  width: min(880px, 100%);
+  max-height: min(84vh, 960px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  background: var(--raised);
+  box-shadow: var(--e2-shadow);
+  animation: pop-in var(--t-slow) var(--ease-out) both;
+}
+.pasted-sheet header {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-4) var(--s-4) var(--s-4) var(--s-5);
+  border-bottom: 1px solid var(--hair);
+}
+.pasted-sheet header > div {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+}
+.pasted-sheet .pasted-size {
+  grid-area: auto;
+}
+.pasted-sheet h2 {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+.pasted-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--s-6) var(--s-8);
+  background: var(--well);
+  font-size: calc(var(--reading-size) - 1px);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.you time {
+  font-size: var(--text-xs);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  transition: opacity var(--t-fast), translate var(--t-base) var(--ease-out);
+}
+.you:hover time {
+  opacity: 1;
+}
+.message-rewind {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  translate: 0 -50%;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  color: var(--dim);
+  opacity: 0;
+  transition: opacity var(--t-fast), background var(--t-fast), color var(--t-fast);
+}
+.message-rewind .icon {
+  width: 15px;
+  height: 15px;
+}
+.message-rewind:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.you:hover .message-rewind,
+.message-rewind:focus-visible {
+  opacity: 1;
+}
+.you:has(.message-rewind):hover time,
+.you:has(.message-rewind:focus-visible) time {
+  opacity: 1;
+  translate: -30px 0;
+}
+
+.turn {
+  margin-top: 2px;
+}
+.turn-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-bottom: 10px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--dim);
+}
+.turn-mark {
+  color: var(--gold);
+  font-size: var(--text-xs);
+}
+.turn-head time {
+  font-weight: 400;
+  font-size: var(--text-xs);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  transition: opacity var(--t-fast);
+}
+.turn:hover > .turn-head time {
+  opacity: 1;
+}
+.live-tail {
+  display: contents;
+}
+.live-status {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin: -4px 0 var(--s-5);
+  font-size: var(--text-sm);
+  color: var(--dim);
+  animation: fade-in var(--t-base) var(--ease-out) both;
+}
+.spinner {
+  width: 16px;
+  text-align: center;
+  color: var(--gold);
+  font-size: 15px;
+  line-height: 1;
+}
+.jump {
+  position: absolute;
+  left: 50%;
+  bottom: 150px;
+  translate: -50% 0;
+  height: 32px;
+  padding: 0 var(--s-4);
+  border-radius: var(--r-full);
+  background: var(--overlay);
+  box-shadow: inset 0 0 0 1px var(--line), var(--e2-shadow);
+  font-size: var(--text-sm);
+  color: var(--text);
+  animation: rise-in var(--t-base) var(--ease-out) both;
+}
+
+/* Handoffs between agents. */
+.handoff {
+  margin: 0 0 var(--s-5);
+  font-size: var(--text-sm);
+  color: var(--dim);
+}
+.handoff summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  list-style: none;
+}
+.handoff summary::-webkit-details-marker {
+  display: none;
+}
+.handoff p {
+  white-space: pre-wrap;
+  margin: var(--s-2) 0 0;
+  padding: 10px var(--s-3);
+  border-radius: var(--r-md);
+  background: var(--raised);
+  font-size: var(--text-sm);
+}
+.from-parent {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  row-gap: 6px;
+  margin: 0 0 var(--s-6);
+  padding: var(--s-3) var(--s-4);
+  border-radius: var(--r-lg);
+  box-shadow:
+    inset 2px 0 var(--gold),
+    inset 0 0 0 1px var(--hair);
+}
+.from-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--gold);
+}
+.from-label .icon {
+  width: 13px;
+  height: 13px;
+}
+.from-parent time {
+  font-size: var(--text-xs);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.from-parent p {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: var(--text-md);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Plan. */
+.plan {
+  margin: 0 0 var(--s-4);
+  padding: var(--s-3) var(--s-4) 10px;
+  border-radius: var(--r-lg);
+  background: var(--raised);
+  box-shadow: inset 0 0 0 1px var(--line), var(--e1-shadow);
+}
+.plan-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--text-md);
+}
+.plan-head > .icon {
+  color: var(--gold);
+}
+.plan-head b {
+  font-weight: 600;
+}
+.plan-count {
+  color: var(--dim);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+.plan-bar {
+  margin-left: auto;
+  width: 96px;
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--line);
+  overflow: hidden;
+}
+.plan-bar i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--gold);
+  transition: width 400ms var(--ease-out);
+}
+.plan-why {
+  margin: 6px 0 2px;
+  font-size: var(--text-sm);
+  color: var(--dim);
+}
+.plan-steps {
+  list-style: none;
+  margin: var(--s-2) 0 0;
+  padding: 0;
+  display: grid;
+  gap: var(--s-1);
+}
+.plan-step {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: var(--s-2);
+  align-items: start;
+  font-size: var(--text-md);
+  line-height: 1.45;
+  transition: color var(--t-base);
+}
+.plan-mark {
+  height: 19px;
+  display: grid;
+  place-items: center;
+}
+.plan-mark .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--ok);
+}
+.plan-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--line-strong);
+}
+.plan-step.done {
+  color: var(--dim);
+}
+.plan-step.active {
+  font-weight: 500;
+}
+
+/* Thinking. */
+.thought {
+  margin: -2px 0 var(--s-3);
+}
+.thought-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  margin-left: -8px;
+  padding: 0 10px 0 8px;
+  border-radius: var(--r-full);
+  font-size: var(--text-sm);
+  color: var(--faint);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.thought-head:hover {
+  background: var(--hover);
+  color: var(--dim);
+}
+.thought-label {
+  font-style: italic;
+}
+.thought.thinking .thought-label {
+  background: linear-gradient(
+    90deg,
+    var(--faint) 0%,
+    var(--gold-hi) 45%,
+    var(--faint) 90%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 1.6s linear infinite;
+}
+.thought-time {
+  font-size: var(--text-xs);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.thought-text {
+  margin: 6px 0 var(--s-1);
+  padding: 2px 0 2px var(--s-4);
+  border-left: 2px solid var(--line);
+  font-size: var(--text-md);
+  line-height: 1.65;
+  font-style: italic;
+  color: var(--dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.error.inline {
+  margin: 0 0 var(--s-5);
+}
+
+@media (max-width: 780px) {
+  .thread {
+    padding: var(--s-5) 18px 30px;
+  }
+  .pasted-body {
+    padding: var(--s-4);
+  }
+}

@@ -1964,13 +1964,14 @@ flowchart TD
 
     D -->|"Fits; no change needed"| SEND["Call chat model"]
     D -->|"Prune band: 60% usable"| P["Prune old tool outputs<br/>Artifact references where available; no LLM"]
-    D -->|"Full: 99% usable<br/>or forced / emergency"| S["LLM summarizes older work<br/>Updates previous handoff"]
+    D -->|"Full: 90% usable<br/>or forced / emergency"| S["LLM summarizes older work<br/>Updates previous handoff"]
 
+    S -->|"Network or server error:<br/>retry once"| S
     S -->|"Valid summary"| BUILD
-    S -->|"Explicit local unavailability"| F["Bounded extractive fallback"]
+    S -->|"Failed; request still fits"| SEND
+    S -->|"Failed again, cannot fit<br/>or local unavailability"| F["Bounded extractive fallback"]
     F --> BUILD
-    S -->|"Error, invalid output or timeout"| STOP["Stop safely<br/>Preserve original history"]
-    D -->|"Cannot fit safely"| STOP
+    D -->|"Cannot fit safely"| STOP["Stop safely<br/>Preserve original history"]
 
     P -->|"Changed history"| BUILD["Build active context"]
     P -->|"No change; fits"| SEND
@@ -2019,9 +2020,12 @@ head or recent tail is not added a second time.
   Older oversized tool groups move into the summary; the newest complete group
   can exceed the tail budget.
 - **Handoff:** The generated summary plus original-user quotes together have a
-  hard local token cap of 15% of usable input. The LLM output allowance is also
-  bounded by source size, the summarizer's limits and the receiving context budget.
-  Quotes include event IDs and a `sessions.search` recovery pointer.
+  hard local token cap of 15% of usable input. The summary's length target is
+  bounded by source size, the summarizer's limits and the receiving context budget,
+  and is stated in the request. When reasoning cannot be turned off, the output
+  allowance is the room left in the summary model's window, so thinking does not
+  consume the summary. Quotes include event IDs and a `sessions.search` recovery
+  pointer.
 - **Images:** Eligible older tool images become stored artifact references.
   User images, protected images and images without a recoverable stored source
   remain. There is no hard three-image limit across the whole request.
@@ -2040,7 +2044,7 @@ count's quality. These percentages are not percentages of the raw model window.
 |---|---|---|
 | No change | Below 60% of usable input, unless forced | Retain the current view |
 | Prune | From 60%, below the full trigger | Replace eligible large tool bodies; no LLM |
-| Full | At 99% of usable input, or forced/emergency | Summarize the middle and rebuild the active view |
+| Full | At 90% of usable input, or forced/emergency | Summarize the middle and rebuild the active view |
 | Emergency | At 98% of the resolved input limit | Override backoff; stop if the request cannot fit safely |
 
 Pruning starts with tool bodies at least `max(1% of usable input, 200)` tokens,
@@ -2054,9 +2058,12 @@ usage also check whether compaction actually relieved pressure. This is a guard
 against repeated wasteful work, not a promised compression ratio.
 
 LLM summaries have a **60-second idle deadline and a 300-second total deadline**.
-Provider failures, empty/refused responses and incomplete streams preserve history
-and surface an error. Explicit local unavailability, such as summary input that
-cannot fit the auxiliary model, can use bounded extractive fallback.
+A failed summary never ends the turn. Network and server errors are retried once.
+After any other failure, such as a truncated, empty or refused summary or a timeout,
+a request that still fits is sent unchanged, and the summary is tried again on the
+next pass. A repeated failure, a request that cannot fit, or explicit local
+unavailability uses the bounded extractive fallback. The surface shows a notice
+naming the failure, and a fallback checkpoint carries its label.
 
 The prepare/count/compile loop is bounded to three compaction passes. A provider
 context-length rejection permits one recovery attempt and can update a reported
@@ -2512,7 +2519,7 @@ max_parallel_tools = 16      # Concurrent tool calls per turn
 # 3. CONTEXT — Compaction tuning
 # ───────────────────────────────────────────────────────────
 [context]
-trigger_ratio = 0.99         # Full compact at 99% full
+trigger_ratio = 0.90         # Full compact at 90% full
 microcompact_ratio = 0.60    # Prune-only at 60% full
 tail_ratio = 0.20            # Keep 20% of window as tail
 protect_first_n = 3          # First 3 messages never touched
@@ -2757,7 +2764,7 @@ max_cost_usd = 20.0
 max_wall_s = 14400  # 4 hours
 
 [context]
-trigger_ratio = 0.95  # Compact earlier
+trigger_ratio = 0.80  # Compact earlier
 protect_last_n = 50   # Keep more recent context
 
 [memory]

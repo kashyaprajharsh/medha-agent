@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tools::{Tool, ToolError, ToolRegistry};
-use ulid::Ulid;
 
 struct ScriptedProvider {
     caps: ProviderCaps,
@@ -137,8 +136,9 @@ fn harness(
     Kernel<ScriptedProvider, InMemoryLog>,
     Arc<InMemoryLog>,
     Arc<MemoryProjection>,
+    test_support::Scratch,
 ) {
-    let dir = std::env::temp_dir().join(format!("medha-poison-e2e-{}", Ulid::new()));
+    let dir = test_support::scratch("medha-poison-e2e");
     let store = Arc::new(MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap());
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(FakeWebFetch));
@@ -154,12 +154,12 @@ fn harness(
         Arc::new(AutoDeny),
         Arc::new(NoVerify),
     );
-    (k, log, store)
+    (k, log, store, dir)
 }
 
 #[tokio::test]
 async fn web_tainted_window_cannot_write_trusted_memory() {
-    let (k, log, store) = harness(vec![
+    let (k, log, store, _dir) = harness(vec![
         vec![intent("c1", "web.fake_fetch", json!({}))],
         vec![intent("c2", "memory", memory_write_args())],
         vec![Block::Text("done".into())],
@@ -224,7 +224,7 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
         MemoryOp::Write { entry } => assert_eq!(entry.trust, TrustLabel::Web),
         other => panic!("expected Write, got {other:?}"),
     }
-    let dir = std::env::temp_dir().join(format!("medha-poison-rebuild-{}", Ulid::new()));
+    let dir = test_support::scratch("medha-poison-rebuild");
     let rebuilt = MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap();
     rebuilt.rebuild(events.into_iter()).unwrap();
     assert_eq!(
@@ -239,7 +239,7 @@ async fn web_tainted_window_cannot_write_trusted_memory() {
 
 #[tokio::test]
 async fn clean_user_window_writes_user_stated_memory() {
-    let (k, _log, store) = harness(vec![
+    let (k, _log, store, _dir) = harness(vec![
         vec![intent(
             "c1",
             "memory",

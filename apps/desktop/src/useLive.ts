@@ -152,6 +152,15 @@ export function useLive() {
     [patch, ensureOpen],
   );
 
+  const takeReturned = useCallback(
+    (key: string) => {
+      const returned = latest.current[key]?.returned ?? [];
+      if (returned.length) patch(key, (state) => ({ ...state, returned: [] }));
+      return returned;
+    },
+    [patch],
+  );
+
   const cancel = useCallback(
     (key: string) => {
       void api
@@ -265,6 +274,7 @@ export function useLive() {
     cancel,
     approve,
     clearTail,
+    takeReturned,
     ensureOpen,
     configure,
     answer,

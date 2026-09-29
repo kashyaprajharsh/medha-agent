@@ -308,6 +308,27 @@ fn lock_pending(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Acknowledged mid-turn messages not yet read; the run loop, not the queue, routes them.
+type Unread = Arc<Mutex<Vec<String>>>;
+
+fn take_unread(unread: &Unread) -> Vec<String> {
+    std::mem::take(
+        &mut *unread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
+/// Removes one acknowledged copy of `text`, if the desktop sent it.
+fn settle_unread(unread: &Unread, text: &str) {
+    let mut unread = unread
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(index) = unread.iter().position(|queued| queued == text) {
+        unread.remove(index);
+    }
+}
+
 pub(crate) struct Bridge {
     pub(crate) writer: Arc<Writer>,
     pub(crate) pending: Pending,
@@ -517,6 +538,7 @@ fn deny_pending(pending: &Pending) -> usize {
 struct AcpSink {
     writer: Arc<Writer>,
     peer: Peer,
+    unread: Unread,
 }
 
 /// Map a Medha tool to the closest ACP `ToolKind`, so an editor can pick an icon.
@@ -688,12 +710,23 @@ impl kernel::StreamSink for AcpSink {
         );
     }
     fn steered(&self, text: &str) {
+        settle_unread(&self.unread, text);
         self.writer
             .event("message.steered", json!({ "content": text }));
     }
     fn steers_returned(&self, texts: &[String]) {
-        self.writer
-            .event("message.returned", json!({ "contents": texts }));
+        // Ledgered messages are routed by the run loop once the turn ends.
+        let others: Vec<&String> = {
+            let unread = self
+                .unread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            texts.iter().filter(|text| !unread.contains(text)).collect()
+        };
+        if !others.is_empty() {
+            self.writer
+                .event("message.returned", json!({ "contents": others }));
+        }
     }
     fn restarted(&self) {
         self.writer.event("model.restarted", json!({}));
@@ -745,6 +778,8 @@ enum RpcAction {
         reply_to: Option<Value>,
         admission_reply_to: Option<Value>,
     },
+    /// A desktop message for the running turn, already acknowledged.
+    Steer(String),
     Shutdown,
 }
 
@@ -1206,14 +1241,13 @@ fn dispatch_rpc(
                 return RpcAction::None;
             };
             if running {
-                if let Some(handle) = interrupt {
-                    handle.steer(content);
-                    writer.event("message.queued", json!({}));
-                    rpc_result(writer, &id, json!({ "accepted": true, "steered": true }));
-                } else {
+                if interrupt.is_none() {
                     rpc_error(writer, &id, -32000, "a turn is already running");
+                    return RpcAction::None;
                 }
-                RpcAction::None
+                writer.event("message.queued", json!({}));
+                rpc_result(writer, &id, json!({ "accepted": true, "steered": true }));
+                RpcAction::Steer(content)
             } else {
                 let admission_reply_to = if images.is_empty() {
                     rpc_result(writer, &id, json!({ "accepted": true, "steered": false }));
@@ -1334,6 +1368,16 @@ async fn settle_turn(
     }
 }
 
+/// The desktop's name for why a run stopped; `None` when it simply finished.
+fn stopped_label(reason: &StopReason) -> Option<&'static str> {
+    match reason {
+        StopReason::VerificationFailed => Some("verification_failed"),
+        StopReason::Budget(stop) => Some(stop.label()),
+        StopReason::Blocked => Some("blocked_by_hook"),
+        StopReason::Finished | StopReason::Interrupted => None,
+    }
+}
+
 /// Mid-turn messages steer at the next boundary; cancellation lets in-flight
 /// tools settle through the kernel interrupt handle.
 #[allow(clippy::too_many_arguments)]
@@ -1392,6 +1436,7 @@ where
     let mut turns = JoinSet::new();
     let mut running = false;
     let mut interrupt: Option<kernel::InterruptHandle> = None;
+    let unread = Unread::default();
 
     let mut reports_ready = true; // Also collect reports retained across restart.
     let mut turn_requested = false;
@@ -1425,6 +1470,7 @@ where
                 let sink = AcpSink {
                     writer: writer.clone(),
                     peer: peer.clone(),
+                    unread: unread.clone(),
                 };
                 let agents = agents.clone();
                 turns.spawn(async move {
@@ -1501,6 +1547,13 @@ where
                 match dispatch_line(trimmed, &model, running, interrupt.as_ref(), &pending, &writer, &peer) {
                     RpcAction::None => {}
                     RpcAction::Shutdown => break,
+                    RpcAction::Steer(content) => {
+                        // Ledger first: the kernel may read the steer immediately.
+                        unread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(content.clone());
+                        if let Some(handle) = &interrupt {
+                            handle.steer(content);
+                        }
+                    }
                     RpcAction::StartTurn { content, images, reply_to, admission_reply_to } => {
                         prompt_reply = reply_to;
                         let mut prompt = Message::user(content);
@@ -1535,19 +1588,27 @@ where
                 // `session/prompt` is answered here, not at dispatch: its result
                 // is the turn's stopReason.
                 let reply = prompt_reply.take();
+                // Unread messages run next after a normal finish; after a stop they go back.
+                let left = take_unread(&unread);
+                let completed = matches!(&joined, Some(Ok(TurnDone::Ok(_, reason))) if *reason != StopReason::Interrupted);
+                let carried = if completed { left } else {
+                    if !left.is_empty() { writer.event("message.returned", json!({ "contents": left })); }
+                    Vec::new()
+                };
                 match joined {
                     Some(Ok(TurnDone::Ok(updated, reason))) => {
                         transcript = updated;
                         if let Some(id) = reply {
                             writer.respond(id, json!({ "stopReason": acp_stop_reason(&reason) }));
+                        } else if !carried.is_empty() {
+                            // The run continues, so the peer sees delivery, not a stop.
+                            for content in &carried { writer.event("message.steered", json!({ "content": content })); }
+                            // Why the previous run ended still matters, e.g. a failed check.
+                            if let Some(stopped) = stopped_label(&reason) { writer.event("turn.continued", json!({ "stopped": stopped })); }
+                        } else if reason == StopReason::Interrupted {
+                            writer.event("turn.cancelled", json!({}));
                         } else {
-                            match reason {
-                                StopReason::VerificationFailed => writer.event("turn.done", json!({ "stopped": "verification_failed" })),
-                                StopReason::Interrupted => writer.event("turn.cancelled", json!({})),
-                                StopReason::Budget(s) => writer.event("turn.done", json!({ "stopped": s.label() })),
-                                StopReason::Finished => writer.event("turn.done", json!({ "stopped": Value::Null })),
-                                StopReason::Blocked => writer.event("turn.done", json!({ "stopped": "blocked_by_hook" })),
-                            };
+                            writer.event("turn.done", json!({ "stopped": stopped_label(&reason) }));
                         }
                     }
                     Some(Ok(TurnDone::Err(e))) => {
@@ -1569,6 +1630,10 @@ where
                             None => { writer.event("turn.error", json!({ "message": "turn task disappeared" })); }
                         }
                     }
+                }
+                if !carried.is_empty() {
+                    transcript.extend(carried.into_iter().map(Message::user));
+                    turn_requested = true;
                 }
             }
             Some(owner) = report_rx.recv(), if agents.is_some() => {
@@ -1920,12 +1985,35 @@ mod tests {
     }
 
     #[test]
+    fn read_steers_leave_the_ledger_and_unread_ones_wait_for_the_run_loop() {
+        use kernel::StreamSink;
+        let (writer, mut rx) = capture_writer(8);
+        let unread = Unread::default();
+        unread
+            .lock()
+            .unwrap()
+            .extend(["same".to_string(), "same".into(), "late".into()]);
+        let sink = AcpSink {
+            writer,
+            peer: Peer::new(),
+            unread: unread.clone(),
+        };
+        sink.steered("same");
+        sink.steers_returned(&["late".into(), "agent report".into()]);
+        let frames = captured_values(&mut rx);
+        assert_eq!(frames[0]["params"]["kind"], "message.steered");
+        assert_eq!(frames[1]["params"]["contents"], json!(["agent report"]));
+        assert_eq!(take_unread(&unread), ["same", "late"], "one copy was read");
+    }
+
+    #[test]
     fn desktop_waiting_and_retry_notices_are_emitted_without_extending_standard_acp() {
         use kernel::StreamSink;
         let (writer, mut rx) = capture_writer(8);
         let sink = AcpSink {
             writer,
             peer: Peer::new(),
+            unread: Unread::default(),
         };
         sink.phase(kernel::progress::Phase::Generating);
         sink.notice("Model request failed. Retrying (1/3)…");
@@ -1951,13 +2039,32 @@ mod tests {
         peer.start_session(&peer.workspace.display().to_string(), Some(&json!([])))
             .unwrap();
         let (writer, mut rx) = capture_writer(8);
-        let sink = AcpSink { writer, peer };
+        let sink = AcpSink {
+            writer,
+            peer,
+            unread: Unread::default(),
+        };
         sink.tool_call_with_id("call-17", "read", &json!({"path": "a.rs"}));
         sink.tool_result_with_id("call-17", "read", true, &json!({"content": "x"}));
         let updates = captured_values(&mut rx);
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0]["params"]["update"]["toolCallId"], "call-17");
         assert_eq!(updates[1]["params"]["update"]["toolCallId"], "call-17");
+    }
+
+    #[test]
+    fn only_a_plain_finish_or_a_stop_carries_no_desktop_reason() {
+        assert_eq!(stopped_label(&StopReason::Finished), None);
+        assert_eq!(stopped_label(&StopReason::Interrupted), None);
+        assert_eq!(
+            stopped_label(&StopReason::VerificationFailed),
+            Some("verification_failed")
+        );
+        assert_eq!(stopped_label(&StopReason::Blocked), Some("blocked_by_hook"));
+        assert_eq!(
+            stopped_label(&StopReason::Budget(kernel::BudgetStop::Tokens)),
+            Some(kernel::BudgetStop::Tokens.label())
+        );
     }
 
     #[test]

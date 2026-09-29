@@ -111,7 +111,14 @@ struct RacyMemoryExecutor {
 #[async_trait]
 impl Executor for RacyMemoryExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        vec![ToolSpec {
+            name: "memory.update".into(),
+            description: String::new(),
+            schema: json!({}),
+            blast_radius: BlastRadius::Read,
+            category: kernel::ToolCategory::Other,
+            icon: String::new(),
+        }]
     }
 
     fn blast_radius(&self, tool: &str) -> Option<BlastRadius> {

@@ -43,11 +43,16 @@ pub struct ExecutionAccess {
     pub network: bool,
     pub read_paths: Vec<std::path::PathBuf>,
     pub write_paths: Vec<std::path::PathBuf>,
+    /// Run this one command without the OS jail; never remembered, reviewed in every mode.
+    pub outside_sandbox: bool,
 }
 
 impl ExecutionAccess {
     pub fn is_empty(&self) -> bool {
-        !self.network && self.read_paths.is_empty() && self.write_paths.is_empty()
+        !self.network
+            && !self.outside_sandbox
+            && self.read_paths.is_empty()
+            && self.write_paths.is_empty()
     }
 }
 

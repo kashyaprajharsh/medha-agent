@@ -86,7 +86,7 @@ fn run_memory(workspace: &std::path::Path, home: &std::path::Path, args: &[&str]
 
 #[tokio::test]
 async fn write_recall_show_and_fork_excludes_post_cut_memory() {
-    let root = std::env::temp_dir().join(format!("medha-memory-e2e-{}", Ulid::new()));
+    let root = test_support::scratch("medha-memory-e2e");
     let workspace = root.join("quoted-project");
     let home = root.join("home");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -195,7 +195,7 @@ async fn write_recall_show_and_fork_excludes_post_cut_memory() {
 async fn cli_edit_appends_a_user_trust_update_before_projection() {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = std::env::temp_dir().join(format!("medha-memory-edit-e2e-{}", Ulid::new()));
+    let root = test_support::scratch("medha-memory-edit-e2e");
     let workspace = root.join("workspace");
     let home = root.join("home");
     std::fs::create_dir_all(&workspace).unwrap();

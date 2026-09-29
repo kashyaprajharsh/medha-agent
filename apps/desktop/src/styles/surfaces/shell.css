@@ -1,0 +1,198 @@
+/* The window layout: sidebar, main column, side panel, header and status bar. */
+.shell {
+  --sidebar-width: 288px;
+  --panel-width: min(560px, 44vw);
+  height: 100%;
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0;
+  grid-template-rows: minmax(0, 1fr) 28px;
+  transition: grid-template-columns var(--t-slow) var(--ease-move);
+}
+.shell.with-panel {
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--panel-width);
+}
+.shell.sidebar-hidden {
+  grid-template-columns: 0 minmax(0, 1fr) 0;
+}
+.shell.sidebar-hidden.with-panel {
+  grid-template-columns: 0 minmax(0, 1fr) var(--panel-width);
+}
+.main {
+  position: relative;
+  grid-row: 1;
+  grid-column: 2;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--canvas);
+}
+.head {
+  flex: none;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: 0 28px;
+  border-bottom: 1px solid var(--hair);
+}
+.head-title {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+}
+.head-title h1 {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--faint);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+.crumb .icon,
+.status-branch .icon {
+  width: 13px;
+  height: 13px;
+}
+.crumb .icon {
+  margin-left: 6px;
+}
+.head-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.surface-toggle {
+  margin-left: auto;
+}
+.head-tools .surface-toggle,
+.run-pill + .surface-toggle {
+  margin-left: 0;
+}
+.run-pill {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  height: 28px;
+  padding: 0 var(--s-3);
+  border-radius: var(--r-full);
+  background: var(--gold-wash);
+  font-size: var(--text-sm);
+  animation: fade-in var(--t-base) var(--ease-out) both;
+}
+.run-pill.await {
+  color: var(--gold);
+}
+.need-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 0 0 3px var(--gold-wash);
+}
+
+.status {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 var(--s-4);
+  border-top: 1px solid var(--hair);
+  background: var(--side);
+  color: var(--faint);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.status .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.status .dot.failed {
+  background: var(--err);
+}
+.status .grow {
+  flex: 1;
+}
+.status-path {
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.error {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  margin: var(--s-4) 28px 0;
+  padding: var(--s-3) var(--s-4);
+  border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--err) 22%, transparent);
+  font-size: var(--text-sm);
+  animation: rise-in var(--t-base) var(--ease-out) both;
+}
+.error b {
+  color: var(--err);
+  white-space: nowrap;
+}
+.error span {
+  flex: 1;
+  overflow-wrap: anywhere;
+  color: var(--dim);
+}
+
+@media (max-width: 1100px) {
+  .shell {
+    --sidebar-width: 256px;
+  }
+  .shell.with-panel {
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0;
+  }
+  .shell.sidebar-hidden.with-panel {
+    grid-template-columns: 0 minmax(0, 1fr) 0;
+  }
+}
+@media (max-width: 780px) {
+  .shell {
+    --sidebar-width: min(300px, calc(100vw - 56px));
+  }
+  .shell,
+  .shell.with-panel,
+  .shell.sidebar-hidden.with-panel {
+    grid-template-columns: 0 minmax(0, 1fr) 0;
+  }
+  .head {
+    padding: 0 14px;
+  }
+  .crumb {
+    font-size: var(--text-xs);
+  }
+  .error {
+    flex-wrap: wrap;
+    margin: var(--s-3) 14px 0;
+  }
+  .run-pill {
+    font-size: var(--text-xs);
+  }
+}

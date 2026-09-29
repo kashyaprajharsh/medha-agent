@@ -173,6 +173,11 @@ pub trait ContextEngine: Send + Sync {
         None
     }
 
+    /// Why the last summary failed, once; the turn continued without it.
+    fn take_summary_failure(&self) -> Option<String> {
+        None
+    }
+
     /// Whether the next compile will attempt a prune or summary. The kernel
     /// uses this preview to run pre-compaction observers before history changes.
     fn compaction_planned(&self, _messages: &[Message], _max_input_tokens: Option<u32>) -> bool {

@@ -29,7 +29,7 @@ pub struct CompactionPolicy {
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
-            trigger_ratio: 0.99,
+            trigger_ratio: 0.90,
             microcompact_ratio: 0.60,
             tail_ratio: 0.20,
             protect_first_n: 3,

@@ -523,8 +523,12 @@ async fn run_memory_command(args: Vec<String>) -> Result<()> {
         MemoryCommand::Edit { name, scope } => {
             let mut entry = find_memory(&projection, scope.as_deref(), &name)?
                 .ok_or_else(|| anyhow::anyhow!("memory '{name}' not found"))?;
-            let path =
-                std::env::temp_dir().join(format!("medha-memory-edit-{}.md", ulid::Ulid::new()));
+            // Owner-only, uniquely named, and removed on every exit path.
+            let draft = tempfile::Builder::new()
+                .prefix("medha-memory-edit-")
+                .suffix(".md")
+                .tempfile()?;
+            let path = draft.path().to_path_buf();
             std::fs::write(&path, &entry.claim)?;
             let editor =
                 std::env::var("EDITOR").map_err(|_| anyhow::anyhow!("$EDITOR is not set"))?;
@@ -540,7 +544,7 @@ async fn run_memory_command(args: Vec<String>) -> Result<()> {
                 anyhow::bail!("editor exited with {status}");
             }
             let edited = std::fs::read_to_string(&path)?;
-            std::fs::remove_file(&path).ok();
+            drop(draft);
             if edited.trim().is_empty() {
                 anyhow::bail!("edited memory claim is empty");
             }

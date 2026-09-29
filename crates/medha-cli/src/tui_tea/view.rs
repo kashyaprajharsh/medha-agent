@@ -3033,8 +3033,7 @@ mod agent_view_tests {
 
     #[test]
     fn the_tree_costs_no_rows_when_nothing_is_running() {
-        let dir = std::env::temp_dir().join(format!("medha-view-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-view");
         let mut model = Model::new(
             "m".into(),
             None,

@@ -5,7 +5,7 @@ import type { Plan, Step } from "./live";
 import { Diff } from "./GitChanges";
 import { SourceCode } from "./Markdown";
 import { Spinner } from "./Spinner";
-import { stepVerb } from "./timeline";
+import { stepStatusLabel, stepVerb } from "./timeline";
 
 function stepKind(step: Step): { kind: string; icon: IconName; label: string } {
   const verb = stepVerb(step);
@@ -198,13 +198,7 @@ const StepRow = memo(
               <code className="step-target">{step.target}</code>
             ))}
           <span className={`step-meta ${bad ? "bad" : ""}`}>
-            {step.status === "denied"
-              ? "Denied"
-              : step.status === "failed"
-                ? "Failed"
-                : step.status === "stopped"
-                  ? "Stopped"
-                  : (step.summary ?? "")}
+            {stepStatusLabel(step)}
           </span>
           <span className="step-dur">
             {took !== undefined && step.started !== undefined
@@ -359,14 +353,17 @@ export const Reasoning = memo(function Reasoning({
   started,
   ended,
   durationMs,
+  expanded = false,
 }: {
   text: string;
   started?: number;
   ended?: number;
   durationMs?: number;
+  expanded?: boolean;
 }) {
   const thinking = started !== undefined && ended === undefined;
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(expanded);
+  useEffect(() => setOpen(expanded), [expanded]);
   const now = useNow(thinking);
   const span =
     durationMs !== undefined

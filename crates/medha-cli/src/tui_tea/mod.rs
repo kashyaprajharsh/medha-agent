@@ -3428,12 +3428,9 @@ mod tests {
     fn block(lines: &[Line]) -> String {
         lines.iter().map(text).collect::<Vec<_>>().join("\n")
     }
-    /// A throwaway jailed sandbox for constructing a `Model` in tests (the
-    /// rewind restore handle; unused by the assertions here).
+    /// Never written through here, so it roots at the existing temp folder instead of creating one.
     fn test_sbx() -> Arc<WorkspaceSandbox> {
-        let dir = std::env::temp_dir().join(format!("medha-tui-test-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap())
+        Arc::new(WorkspaceSandbox::new_jailed(std::env::temp_dir()).unwrap())
     }
 
     #[tokio::test]
@@ -3692,8 +3689,11 @@ mod tests {
 
     #[test]
     fn refresh_skill_manifest_injects_saved_skill_same_session() {
-        let dir = std::env::temp_dir().join(format!("medha-skref-{}", ulid::Ulid::new()));
-        let proj = dir.join(".medha").join("skills");
+        let scratch = tempfile::Builder::new()
+            .prefix("medha-skref-")
+            .tempdir()
+            .unwrap();
+        let proj = scratch.path().join(".medha").join("skills");
         std::fs::create_dir_all(proj.join("note-taker")).unwrap();
         std::fs::write(
             proj.join("note-taker").join("SKILL.md"),
@@ -3730,7 +3730,6 @@ mod tests {
         assert!(transcript[0].content.starts_with("BASE PROMPT"));
         assert_eq!(transcript[0].content.matches("## Memory").count(), 1);
         assert!(transcript[0].content.ends_with("── MEMORY (0 entries) ──"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -34,6 +34,7 @@ export type HistoryEvent = {
   html?: string;
   tool_id?: string;
   status?: string;
+  error_code?: string;
   child_id?: string;
   detail?: string;
   duration_ms?: number;

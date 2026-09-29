@@ -337,6 +337,11 @@ fn sanitize(mut frame: Value, steps: &mut Steps) -> Value {
             let output = params.remove("payload").unwrap_or(Value::Null);
             let ok = params.get("ok") == Some(&Value::Bool(true));
             let outcome = steps.result(&id, &tool, ok, &output);
+            put(
+                params,
+                "error_code",
+                outcome.error_code.map(|code| Value::String(code.into())),
+            );
             put(params, "summary", outcome.summary.map(Value::String));
             put(params, "output", outcome.output.map(Value::String));
             put(params, "detail", outcome.detail.map(Value::String));

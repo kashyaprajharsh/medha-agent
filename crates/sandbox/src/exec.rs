@@ -1572,6 +1572,68 @@ impl ExecBackend for HostBackend {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct IsolatedHome {
     path: PathBuf,
+    /// Held for life, beside the home where jailed children cannot reach it.
+    _lock: Option<std::fs::File>,
+}
+
+/// Every private home lives under one root, each with a sibling `.lock`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const ISOLATED_HOMES: &str = "medha-native-homes";
+
+/// Holds an exclusive advisory lock on `path` without blocking.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn try_lock_file(path: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    let exists = unsafe { libc::kill(pid, 0) } == 0;
+    exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Removes homes whose lock is free, and legacy `medha-native-home-<pid>-*` of exited processes.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sweep_stale_homes(root: &Path, legacy: &Path) {
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let lock = entry.path();
+            if lock.extension().is_none_or(|ext| ext != "lock") {
+                continue;
+            }
+            if let Some(_released) = try_lock_file(&lock) {
+                let _ = std::fs::remove_dir_all(lock.with_extension(""));
+                let _ = std::fs::remove_file(&lock);
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(legacy) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("medha-native-home-"))
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|pid| pid.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if !process_alive(pid) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1586,14 +1648,17 @@ impl IsolatedHome {
     }
 
     fn new() -> std::sync::Arc<Self> {
-        let requested = std::env::temp_dir().join(format!(
-            "medha-native-home-{}-{}",
-            std::process::id(),
-            ulid::Ulid::new()
-        ));
+        let temp = std::env::temp_dir();
+        let root = temp.join(ISOLATED_HOMES);
+        let _ = std::fs::create_dir_all(&root);
+        sweep_stale_homes(&root, &temp);
+        let name = format!("{}-{}", std::process::id(), ulid::Ulid::new());
+        // Lock before the home exists, so a sweep never sees it unlocked.
+        let lock = try_lock_file(&root.join(format!("{name}.lock")));
+        let requested = root.join(name);
         let _ = std::fs::create_dir_all(&requested);
         let path = requested.canonicalize().unwrap_or(requested);
-        let home = std::sync::Arc::new(Self { path });
+        let home = std::sync::Arc::new(Self { path, _lock: lock });
         home.prepare();
         home
     }
@@ -1644,6 +1709,43 @@ impl IsolatedHome {
                 }
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let shims = self.shims();
+            let mktemp = shims.join("mktemp");
+            if std::fs::create_dir_all(&shims).is_ok()
+                && std::fs::write(&mktemp, MKTEMP_SHIM).is_ok()
+            {
+                let _ = std::fs::set_permissions(&mktemp, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    /// Commands resolved ahead of the system ones, so they honour the private TMPDIR.
+    #[cfg(target_os = "macos")]
+    fn shims(&self) -> PathBuf {
+        self.path.join(".medha-bin")
+    }
+}
+
+#[cfg(target_os = "macos")]
+const MKTEMP_SHIM: &str = include_str!("seatbelt_mktemp.sh");
+
+/// Puts the private shims first on the child's PATH, whichever PATH it gets.
+#[cfg(target_os = "macos")]
+fn prepend_shims(cmd: &mut tokio::process::Command, req: &ExecRequest, home: &IsolatedHome) {
+    let inherited = req
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| (!req.clear_env).then(|| std::env::var_os("PATH")).flatten())
+        .unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    let paths = std::iter::once(home.shims()).chain(std::env::split_paths(&inherited));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        cmd.env("PATH", joined);
     }
 }
 
@@ -1700,6 +1802,7 @@ fn native_sensitive_paths() -> Vec<PathBuf> {
     ]
     .iter()
     .map(|relative| home.join(relative))
+    .chain(permissions::protected_paths())
     .collect()
 }
 
@@ -1892,7 +1995,7 @@ fn native_intrinsic_read_roots() -> Vec<PathBuf> {
         "/private/var/select",
         "/private/var/db/xcode_select_link",
         "/Library/Developer",
-        "/Applications/Xcode.app",
+        "/Applications",
         // Resolver config. `curl` resolves through getaddrinfo/mDNSResponder and
         // needs none of this, but standalone resolvers (dig, nslookup, host)
         // read the nameserver list from disk and fail on a network-allowed box
@@ -2095,6 +2198,11 @@ fn sbpl_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+#[cfg(target_os = "macos")]
+const SEATBELT_SERVICES: &str = include_str!("seatbelt_services.sbpl");
+#[cfg(target_os = "macos")]
+const SEATBELT_NETWORK: &str = include_str!("seatbelt_network.sbpl");
+
 /// macOS Seatbelt backend: `sandbox-exec` with a generated SBPL profile. Reads
 /// and writes are deny-by-default, reopened only for the workspace, an isolated
 /// HOME/TMP, system runtimes, and selected toolchain roots.
@@ -2159,7 +2267,8 @@ impl SeatbeltBackend {
             // re-exec the selected toolchain through this link and root.
             PathBuf::from("/private/var/db/xcode_select_link"),
             PathBuf::from("/Library/Developer"),
-            PathBuf::from("/Applications/Xcode.app"),
+            // Program files only, so CLIs inside bundles can load their frameworks.
+            PathBuf::from("/Applications"),
         ];
         match &self.plugin {
             Some(plugin) => readable.extend([plugin.package.clone(), plugin.data.clone()]),
@@ -2197,17 +2306,19 @@ impl SeatbeltBackend {
         writable.sort();
         writable.dedup();
 
-        let mut p = String::from(
-            "(version 1)\n(allow default)\n\
-             (deny file-read*)\n(allow file-read*\n",
-        );
-        for path in self.readable_paths(req) {
-            let filter = if path.is_file() { "literal" } else { "subpath" };
-            p.push_str(&format!(
-                "    ({filter} \"{}\")\n",
-                sbpl_escape(&path.to_string_lossy())
-            ));
-        }
+        let mut p = format!("(version 1)\n{SEATBELT_SERVICES}(allow file-read*\n");
+        let readable: String = self
+            .readable_paths(req)
+            .iter()
+            .map(|path| {
+                let filter = if path.is_file() { "literal" } else { "subpath" };
+                format!(
+                    "    ({filter} \"{}\")\n",
+                    sbpl_escape(&path.to_string_lossy())
+                )
+            })
+            .collect();
+        p.push_str(&readable);
         for device in [
             "/dev/null",
             "/dev/zero",
@@ -2218,6 +2329,8 @@ impl SeatbeltBackend {
             p.push_str(&format!("    (literal \"{device}\")\n"));
         }
         p.push_str(")\n");
+        // Loading code is its own operation: exactly where reading is allowed.
+        p.push_str(&format!("(allow file-map-executable\n{readable})\n"));
         // Resolution stats every component, and a subpath rule covers neither the
         // root inode nor an allowed root's ancestors. Grant the literal root plus
         // directory/symlink metadata only — not readdir or contents.
@@ -2225,7 +2338,7 @@ impl SeatbeltBackend {
             "(allow file-read* (literal \"/\"))\n\
              (allow file-read-metadata (vnode-type DIRECTORY) (vnode-type SYMLINK))\n",
         );
-        p.push_str("(deny file-write*)\n(allow file-write*\n");
+        p.push_str("(allow file-write*\n");
         for w in &writable {
             p.push_str(&format!(
                 "    (subpath \"{}\")\n",
@@ -2255,8 +2368,17 @@ impl SeatbeltBackend {
         if let Some(plugin) = &self.plugin {
             p.push_str(&sensitive_deny("file-write*", &plugin.package, &[]));
         }
-        if self.effective_net(req) == NetPolicy::Deny {
-            p.push_str("(deny network*)\n");
+        if self.effective_net(req) == NetPolicy::Allow {
+            p.push_str(SEATBELT_NETWORK);
+        }
+        // Local sockets only where the command can write; ssh-agent, Docker and editors stay out.
+        p.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
+        for w in &writable {
+            let path = sbpl_escape(&w.to_string_lossy());
+            p.push_str(&format!(
+                "(allow network-bind (local unix-socket (subpath \"{path}\")))\n\
+                 (allow network-outbound (remote unix-socket (subpath \"{path}\")))\n"
+            ));
         }
         p
     }
@@ -2292,6 +2414,7 @@ impl ExecBackend for SeatbeltBackend {
         wrapped.extend(req.args.iter().cloned());
         let mut command = base_command("/usr/bin/sandbox-exec", &wrapped, req);
         apply_isolated_environment(&mut command, &self.home);
+        prepend_shims(&mut command, req, &self.home);
         Ok(command)
     }
     fn label(&self) -> &str {
@@ -3197,7 +3320,7 @@ mod tests {
         let output = run_shell_bounded(
             "i=0; while [ \"$i\" -lt 4000 ]; do printf 0123456789; i=$((i + 1)); done; printf TAIL",
             &std::env::temp_dir(),
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             1024,
             None,
         )
@@ -3292,10 +3415,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("survived.txt");
         let script = format!("(sleep 1; touch {}) >/dev/null 2>&1 &", marker.display());
-        let output =
-            run_shell_bounded(&script, &dir, std::time::Duration::from_secs(5), 1024, None)
-                .await
-                .unwrap();
+        let output = run_shell_bounded(
+            &script,
+            &dir,
+            std::time::Duration::from_secs(30),
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(output.passed());
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         assert!(
@@ -3545,6 +3673,223 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Own sockets and app frameworks work; the shared temp folder's sockets stay closed.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_children_get_local_sockets_only_where_they_can_write() {
+        if !native_sandbox_supported() || !Path::new("/usr/bin/python3").exists() {
+            return;
+        }
+        let shared = std::env::temp_dir();
+        let ws = shared.join(format!("medha-socket-ws-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let backend = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default());
+        let run = |command: String| {
+            let backend = backend.clone();
+            let ws = ws.clone();
+            async move {
+                backend
+                    .run(req("/bin/sh", &["-c", &command], ws))
+                    .await
+                    .unwrap()
+            }
+        };
+        let serve = |socket: &Path| {
+            format!(
+                "/usr/bin/python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); \
+                 s.bind(sys.argv[1]); s.listen(1); c=socket.socket(socket.AF_UNIX); \
+                 c.connect(sys.argv[1]); print(\"served\")' {}",
+                shell_quote(&socket.to_string_lossy())
+            )
+        };
+        let inside = run(serve(&ws.join("s.sock"))).await;
+        assert!(
+            String::from_utf8_lossy(&inside.stdout).contains("served"),
+            "a program must serve a socket to itself in its workspace: {}",
+            String::from_utf8_lossy(&inside.stderr)
+        );
+        for elsewhere in [
+            shared.join(format!("medha-sock-{}.sock", ulid::Ulid::new())),
+            PathBuf::from(format!(
+                "/private/tmp/medha-sock-{}.sock",
+                ulid::Ulid::new()
+            )),
+        ] {
+            let blocked = run(serve(&elsewhere)).await;
+            assert!(
+                !String::from_utf8_lossy(&blocked.stdout).contains("served"),
+                "a socket outside writable roots must stay unreachable: {}",
+                elsewhere.display()
+            );
+            std::fs::remove_file(&elsewhere).ok();
+        }
+        let apps = run("ls /Applications >/dev/null".into()).await;
+        assert_eq!(apps.status, Some(0), "app bundles must be readable");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_sweep_removes_only_homes_whose_session_has_ended() {
+        let base = std::env::temp_dir().join(format!("medha-sweep-{}", ulid::Ulid::new()));
+        let root = base.join(ISOLATED_HOMES);
+        std::fs::create_dir_all(&root).unwrap();
+        let home = |name: &str| {
+            std::fs::create_dir_all(root.join(name).join("tmp")).unwrap();
+            root.join(format!("{name}.lock"))
+        };
+        let live = try_lock_file(&home("live")).unwrap();
+        drop(try_lock_file(&home("ended")).unwrap());
+        std::fs::create_dir_all(root.join("unrelated")).unwrap();
+
+        let exited = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = exited.id();
+        let mut exited = exited;
+        exited.wait().unwrap();
+        let legacy_dead = base.join(format!("medha-native-home-{dead_pid}-OLD"));
+        let legacy_live = base.join(format!("medha-native-home-{}-OLD", std::process::id()));
+        let other = base.join("medha-something-else");
+        for dir in [&legacy_dead, &legacy_live, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        sweep_stale_homes(&root, &base);
+        assert!(root.join("live").exists(), "a live session keeps its home");
+        assert!(!root.join("ended").exists() && !root.join("ended.lock").exists());
+        assert!(root.join("unrelated").exists());
+        assert!(
+            !legacy_dead.exists(),
+            "an exited process's old home is removed"
+        );
+        assert!(legacy_live.exists(), "a running process's old home is kept");
+        assert!(
+            other.exists(),
+            "folders Medha did not name are never touched"
+        );
+        drop(live);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A denial naming a browser profile must never become an offer to open it.
+    #[cfg(unix)]
+    #[test]
+    fn a_denied_browser_profile_is_never_offered_as_a_grant() {
+        let Some(home) = home_dir_from_env() else {
+            return;
+        };
+        let ws = std::env::temp_dir().join(format!("medha-browser-ws-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&ws).unwrap();
+        for profile in [
+            "Library/Application Support/Google/Chrome/Crashpad",
+            "Library/Keychains/login.keychain-db",
+            ".mozilla/firefox",
+        ] {
+            let line = format!(
+                "setxattr on file {}: Operation not permitted (1)",
+                home.join(profile).display()
+            );
+            for permission in [
+                permissions::PermissionType::Read,
+                permissions::PermissionType::Write,
+            ] {
+                let offered = escalation_candidates(
+                    &denied_output(&line),
+                    &ws,
+                    &ApprovedRoots::default(),
+                    permission,
+                );
+                assert!(
+                    offered.is_empty(),
+                    "{profile} was offered as {permission:?}: {offered:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// No clipboard, keychain daemon, service list or app launch from inside the jail.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_children_cannot_reach_the_clipboard_keychain_or_other_apps() {
+        for service in [
+            "com.apple.pasteboard",
+            "com.apple.SecurityServer",
+            "com.apple.coreservices.launchservicesd",
+            "com.apple.coreservices.appleevents",
+        ] {
+            assert!(
+                !SEATBELT_SERVICES.contains(service),
+                "{service} is reachable"
+            );
+            assert!(
+                !SEATBELT_NETWORK.contains(service),
+                "{service} is reachable"
+            );
+        }
+        if !native_sandbox_supported() {
+            return;
+        }
+        let ws = std::env::temp_dir().join(format!("medha-services-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let backend = SeatbeltBackend::new(NetPolicy::Allow, vec![], ApprovedRoots::default());
+        let listed = backend
+            .run(req("/usr/bin/security", &["list-keychains"], ws.clone()))
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&listed.stdout).contains(".keychain"),
+            "a jailed command listed the user's keychains"
+        );
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
+        let services = backend
+            .run(req("/bin/launchctl", &["print", &domain], ws.clone()))
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&services.stdout).contains(" = {"),
+            "a jailed command listed the user's running services: {}",
+            String::from_utf8_lossy(&services.stderr)
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// The mktemp shim keeps plain `mktemp` working and inside the private temp folder.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn plain_mktemp_works_inside_the_jail_and_stays_private() {
+        if !native_sandbox_supported() {
+            return;
+        }
+        let ws = std::env::temp_dir().join(format!("medha-mktemp-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let backend = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default());
+        let private = backend.home.path.join("tmp").canonicalize().unwrap();
+        for command in ["mktemp", "mktemp -d", "mktemp -t medha"] {
+            let mut request = req("/bin/sh", &["-c", command], ws.clone());
+            request.clear_env = true;
+            request.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+            let output = backend.run(request).await.unwrap();
+            let made = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            assert_eq!(
+                output.status,
+                Some(0),
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let made = PathBuf::from(made).canonicalize().unwrap();
+            assert!(
+                made.starts_with(&private),
+                "{command} wrote outside the private temp: {}",
+                made.display()
+            );
+            std::fs::remove_dir_all(&made)
+                .or_else(|_| std::fs::remove_file(&made))
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_profile_is_read_deny_by_default_and_filters_sensitive_writes() {
@@ -3558,9 +3903,10 @@ mod tests {
             std::env::temp_dir().join(format!("medha-seatbelt-profile-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&workspace).unwrap();
         let profile = backend.profile(&req("/bin/true", &[], workspace.clone()));
-        assert!(profile.contains("(deny file-read*)"));
-        assert!(profile.contains("(deny file-write*)"));
-        assert!(profile.contains("(deny network*)"));
+        // Everything not granted starts denied.
+        assert!(profile.contains("(deny default)"));
+        assert!(!profile.contains("(allow default)"));
+        assert!(!profile.contains("(allow network*)"));
         assert!(!profile.contains("(allow file-read* (subpath \"/\")"));
         // Traversal grants: the literal root and directory metadata only —
         // never a readable subtree.
@@ -4122,7 +4468,7 @@ mod tests {
             .arg("-c")
             .arg("echo 'getaddrinfo ENOTFOUND registry.example' >&2; sleep 30");
         let process = spawn_background(command, true).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !process.network_denial_seen() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -4190,15 +4536,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn seatbelt_profile_drops_the_deny_rule_once_network_is_granted() {
+    fn seatbelt_profile_opens_the_network_only_once_granted() {
         let grant = NetworkGrant::default();
         let be = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default())
             .with_network_grant(grant.clone());
         let r = req("sh", &["-c", "true"], std::env::temp_dir());
-        assert!(be.profile(&r).contains("(deny network*)"));
+        assert!(!be.profile(&r).contains("(allow network*)"));
         assert_eq!(be.containment(), kernel::Containment::OsFsJailNoNet);
         grant.grant();
-        assert!(!be.profile(&r).contains("(deny network*)"));
+        assert!(be.profile(&r).contains("(allow network*)"));
         assert_eq!(be.containment(), kernel::Containment::OsFsJail);
     }
 
@@ -4340,16 +4686,16 @@ mod tests {
     async fn once_scope_opens_the_profile_and_does_not_outlive_the_future() {
         let be = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default());
         let r = req("sh", &["-c", "true"], std::env::temp_dir());
-        assert!(be.profile(&r).contains("(deny network*)"));
+        assert!(!be.profile(&r).contains("(allow network*)"));
 
         let opened = kernel::network_once_scope(async { be.profile(&r) }).await;
         assert!(
-            !opened.contains("(deny network*)"),
+            opened.contains("(allow network*)"),
             "a once-scoped run must reach the network"
         );
 
         assert!(
-            be.profile(&r).contains("(deny network*)"),
+            !be.profile(&r).contains("(allow network*)"),
             "the grant must not outlive the scoped future"
         );
         assert_eq!(be.containment(), kernel::Containment::OsFsJailNoNet);

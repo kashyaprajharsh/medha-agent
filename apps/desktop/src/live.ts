@@ -25,6 +25,7 @@ export type Step = {
   target?: string;
   filePath?: string;
   status: "running" | "ok" | "failed" | "denied" | "stopped";
+  errorCode?: string;
   detail?: string;
   inputLabel?: string;
   input?: string;
@@ -95,6 +96,8 @@ export type LiveState = {
   notice?: string;
   error?: string;
   settled: number;
+  // Messages a stopped or failed turn never read, waiting for the composer.
+  returned?: string[];
 };
 
 export const startingLive = (): LiveState => ({
@@ -386,6 +389,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
           return {
             ...step,
             status: params.ok === true ? ("ok" as const) : ("failed" as const),
+            errorCode: str(params.error_code),
             detail: str(params.detail),
             summary: str(params.summary),
             output: str(params.output),
@@ -428,12 +432,27 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
         notice: "Your instruction reached Medha.",
       };
     }
-    case "message.returned":
+    case "message.returned": {
+      const contents = Array.isArray(params.contents)
+        ? params.contents.filter((text): text is string => typeof text === "string")
+        : [];
+      const queued = queuedMessages(state);
+      const unread = contents.flatMap((text) => {
+        const index = queued.findIndex((message) => message.text === text);
+        return index < 0 ? [] : queued.splice(index, 1);
+      });
+      if (!unread.length) return state;
+      const ids = new Set(unread.map((message) => message.id));
       return {
         ...state,
-        notice:
-          "The turn stopped before reading your instruction. It remains in the conversation.",
+        sent: state.sent.filter((message) => !ids.has(message.id)),
+        returned: [
+          ...(state.returned ?? []),
+          ...unread.map((message) => message.text),
+        ],
+        notice: "Medha stopped before reading your message. It’s back in the composer.",
       };
+    }
     case "model.restarted": {
       // Retry abandons only the current response segment, preserving completed tools.
       const items = [...state.items];
@@ -479,6 +498,8 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
         ...settle(state, stopNotice(str(params.stopped))),
         stopReason: str(params.stopped),
       };
+    case "turn.continued":
+      return { ...state, notice: stopNotice(str(params.stopped)) };
     case "turn.cancelled":
       return {
         ...settle(state, "Stopped. You can continue when you’re ready."),

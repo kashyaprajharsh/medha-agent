@@ -39,10 +39,16 @@ sha2 = "0.10"
 fd-lock = "4"
 
 [dev-dependencies]
+test-support = { path = "../test-support" }
 tokio-util = { version = "0.7" }
+tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 lockfile = { version = "0.1.8", path = "../lockfile" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
   "Win32_Storage_FileSystem",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

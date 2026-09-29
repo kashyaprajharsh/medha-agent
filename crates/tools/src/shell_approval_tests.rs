@@ -484,6 +484,93 @@ async fn approved_native_npm_install_works_in_an_outside_directory() {
 }
 
 #[tokio::test]
+async fn outside_sandbox_runs_once_on_the_host_and_is_asked_again_every_time() {
+    let f = Fixture::new(vec![
+        kernel::NetworkDecision::Persistent,
+        kernel::NetworkDecision::Once,
+    ]);
+    let args =
+        json!({"command": "printf ran > unjailed.txt", "network": false, "outside_sandbox": true});
+    run(&f, args.clone(), false).await;
+    assert_eq!(
+        std::fs::read_to_string(f.base.join("workspace/unjailed.txt")).unwrap(),
+        "ran"
+    );
+    assert!(
+        f.requests.lock().unwrap().is_empty(),
+        "an approved run must not go through the jail backend"
+    );
+    assert!(f.gate.cards.lock().unwrap()[0].contains("Run outside Medha's sandbox"));
+    let audit = std::fs::read_to_string(f.base.join("audit.log")).unwrap();
+    assert!(audit.contains("OutsideSandbox | decision=allowed (user approved, once)"));
+    run(&f, args, false).await;
+    assert_eq!(
+        f.gate.cards.lock().unwrap().len(),
+        2,
+        "leaving the sandbox is never remembered, even when Always was chosen"
+    );
+    assert!(!f.base.join("trust.lock").exists());
+}
+
+#[tokio::test]
+async fn a_denied_outside_sandbox_run_starts_nothing() {
+    let f = Fixture::new(vec![kernel::NetworkDecision::Deny]);
+    run(
+        &f,
+        json!({"command": "printf ran > unjailed.txt", "network": false, "outside_sandbox": true}),
+        false,
+    )
+    .await;
+    assert!(!f.base.join("workspace/unjailed.txt").exists());
+    assert!(f.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_jailed_failure_gets_one_precise_next_step_instead_of_guesswork() {
+    let f = Fixture::new(Vec::new());
+    let hint = |events: Vec<kernel::Event>| {
+        events
+            .iter()
+            .find(|event| event.kind == kernel::EventKind::ToolObs)
+            .and_then(|event| {
+                event.payload["payload"]["sandbox_blocked"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .unwrap_or_default()
+    };
+    let pathless = run(
+        &f,
+        json!({"command": "echo 'Failed to create socket directory: Operation not permitted' >&2; exit 1", "network": false}),
+        false,
+    )
+    .await;
+    assert!(hint(pathless).contains("outside_sandbox: true"));
+    let named = run(
+        &f,
+        json!({"command": format!("printf '%s: Operation not permitted\\n' '{}' >&2; exit 1", f.outside.display()), "network": false}),
+        false,
+    )
+    .await;
+    let named = hint(named);
+    assert!(named.contains("write_paths"));
+    assert!(
+        !named.contains("outside_sandbox"),
+        "a narrow grant comes first"
+    );
+    let succeeded = run(
+        &f,
+        json!({"command": "echo 'cp: x: Operation not permitted' >&2; true", "network": false}),
+        false,
+    )
+    .await;
+    assert!(
+        hint(succeeded).is_empty(),
+        "a successful command is not treated as blocked"
+    );
+}
+
+#[tokio::test]
 async fn relative_folder_denials_offer_access_guidance_without_claiming_absence() {
     let f = Fixture::new(Vec::new());
     let events = run(

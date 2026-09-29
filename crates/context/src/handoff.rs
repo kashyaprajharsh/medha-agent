@@ -2,6 +2,7 @@ use crate::tokens::TokenCounter;
 use kernel::{Event, EventKind, TrustLabel};
 
 pub(crate) const NOTES_MARKER: &str = "\n\n[MEDHA durable user context]\n";
+pub(crate) const SUMMARY_FRAME: &str = "[Summary of earlier work, for reference. The latest user message decides what to do now; do not finish items from this summary unless asked.]\n\n";
 
 /// Regenerate quotes from original events so repeated summaries cannot paraphrase them.
 pub(crate) fn history_notes(events: &[Event], budget: u32, counter: &dyn TokenCounter) -> String {
@@ -66,6 +67,7 @@ pub(crate) fn history_notes(events: &[Event], budget: u32, counter: &dyn TokenCo
 }
 
 pub(crate) fn summary_body(summary: &str) -> &str {
+    let summary = summary.strip_prefix(SUMMARY_FRAME).unwrap_or(summary);
     summary
         .rsplit_once(NOTES_MARKER)
         .map_or(summary, |(body, _)| body)

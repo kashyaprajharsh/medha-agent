@@ -592,7 +592,7 @@ export function WorkSurface(props: Props) {
                   <dd>
                     {props.state.compaction.summarized === false
                       ? "Tool-output pruning"
-                      : props.state.compaction.summary?.startsWith(
+                      : props.state.compaction.summary?.includes(
                             "[MEDHA extractive summary",
                           )
                         ? "Local fallback summary"

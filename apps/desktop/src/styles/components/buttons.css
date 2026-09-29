@@ -1,0 +1,95 @@
+/* Buttons: icon, outline, gold and link. Press feedback is a small scale, never a bounce. */
+.icon-btn,
+.btn-line,
+.btn-gold {
+  transition:
+    background var(--t-fast),
+    color var(--t-fast),
+    box-shadow var(--t-fast),
+    transform var(--t-fast) var(--ease-out);
+}
+.icon-btn:not(:disabled):active,
+.btn-line:not(:disabled):active,
+.btn-gold:not(:disabled):active {
+  transform: scale(0.97);
+}
+.icon-btn {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  color: var(--dim);
+}
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.icon-btn.active {
+  background: var(--gold-wash);
+  color: var(--gold);
+}
+.icon-btn.sm {
+  width: 28px;
+  height: 28px;
+}
+.icon-btn.sm .icon {
+  width: 14px;
+  height: 14px;
+}
+.btn-line {
+  height: 32px;
+  padding: 0 var(--s-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border-radius: var(--r-md);
+  box-shadow: inset 0 0 0 1px var(--line);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+.btn-line:hover {
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+}
+.btn-line .icon {
+  width: 14px;
+  height: 14px;
+}
+.btn-line.danger {
+  color: var(--err);
+}
+.btn-gold {
+  height: 32px;
+  padding: 0 var(--s-4);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border-radius: var(--r-md);
+  background: var(--gold);
+  color: var(--gold-ink);
+  font-weight: 600;
+}
+.btn-gold:hover {
+  background: var(--gold-hi);
+}
+.btn-gold:disabled,
+.btn-line:disabled,
+.composer button:disabled {
+  opacity: 0.45;
+}
+.link-btn {
+  margin-top: 6px;
+  font-size: var(--text-sm);
+  color: var(--gold);
+  border-radius: var(--r-xs);
+}
+.link-btn:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.link-btn.danger {
+  color: var(--err);
+}

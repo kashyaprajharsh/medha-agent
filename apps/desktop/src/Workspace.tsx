@@ -7,6 +7,7 @@ import {
   useState,
   type MutableRefObject,
 } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { App } from "./App";
 import {
   createApi,
@@ -26,6 +27,9 @@ const Context = createContext<{
   choose: () => Promise<void>;
   theme: string;
   setTheme: (theme: string) => void;
+  mode: string;
+  look: string;
+  setLook: (look: string) => void;
   textSize: string;
   setTextSize: (size: string) => void;
 } | null>(null);
@@ -36,6 +40,17 @@ export function useWorkspace() {
 }
 export function useWorkspaceApi() {
   return useWorkspace().api;
+}
+function useSystemDark() {
+  const query = "(prefers-color-scheme: dark)";
+  const [dark, setDark] = useState(() => matchMedia(query).matches);
+  useEffect(() => {
+    const media = matchMedia(query);
+    const change = () => setDark(media.matches);
+    media.addEventListener("change", change);
+    return () => media.removeEventListener("change", change);
+  }, []);
+  return dark;
 }
 function preference(key: string, fallback: string) {
   try {
@@ -49,20 +64,35 @@ export function WorkspaceHost() {
   const [selected, setSelected] = useState("");
   const [visited, setVisited] = useState<string[]>([]);
   const [error, setError] = useState("");
-  const [theme, setTheme] = useState(() => preference("medha-theme", "dark"));
+  const [mode, setMode] = useState(() => preference("medha-theme", "system"));
+  const [look, setLook] = useState(() => preference("medha-look", "soft"));
   const [textSize, setTextSize] = useState(() =>
     preference("medha-text-size", "default"),
   );
+  const systemDark = useSystemDark();
+  const theme = mode === "system" ? (systemDark ? "dark" : "light") : mode;
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    document.documentElement.dataset.textSize = textSize;
+    const root = document.documentElement;
+    root.dataset.platform = /Mac/.test(navigator.userAgent) ? "mac" : "other";
+    root.dataset.switching = "";
+    root.dataset.theme = theme;
+    root.dataset.look = look;
+    root.dataset.textSize = textSize;
+    void getCurrentWindow()
+      .setTheme(mode === "system" ? null : theme === "light" ? "light" : "dark")
+      .catch(() => {});
+    const settle = requestAnimationFrame(() =>
+      requestAnimationFrame(() => delete root.dataset.switching),
+    );
     try {
-      localStorage.setItem("medha-theme", theme);
+      localStorage.setItem("medha-theme", mode);
+      localStorage.setItem("medha-look", look);
       localStorage.setItem("medha-text-size", textSize);
     } catch {
       /* private storage */
     }
-  }, [theme, textSize]);
+    return () => cancelAnimationFrame(settle);
+  }, [theme, mode, look, textSize]);
   function select(id: string) {
     setSelected(id);
     setVisited((old) => (old.includes(id) ? old : [...old, id]));
@@ -111,7 +141,10 @@ export function WorkspaceHost() {
       select={select}
       choose={choose}
       theme={theme}
-      setTheme={setTheme}
+      setTheme={setMode}
+      mode={mode}
+      look={look}
+      setLook={setLook}
       textSize={textSize}
       setTextSize={setTextSize}
     />

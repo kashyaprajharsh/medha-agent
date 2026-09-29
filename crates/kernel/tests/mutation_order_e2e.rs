@@ -138,7 +138,17 @@ struct FileLikeExecutor {
 #[async_trait]
 impl Executor for FileLikeExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        ["state.write"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: String::new(),
+                schema: json!({}),
+                blast_radius: self.blast_radius(name).unwrap_or(kernel::BlastRadius::Read),
+                category: kernel::ToolCategory::Other,
+                icon: String::new(),
+            })
+            .collect()
     }
 
     fn blast_radius(&self, tool: &str) -> Option<BlastRadius> {
@@ -209,7 +219,17 @@ struct MemoryLikeExecutor {
 #[async_trait]
 impl Executor for MemoryLikeExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        ["memory.update"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: String::new(),
+                schema: json!({}),
+                blast_radius: self.blast_radius(name).unwrap_or(kernel::BlastRadius::Read),
+                category: kernel::ToolCategory::Other,
+                icon: String::new(),
+            })
+            .collect()
     }
 
     fn blast_radius(&self, tool: &str) -> Option<BlastRadius> {
@@ -366,7 +386,17 @@ struct CrossSessionMemoryExecutor {
 #[async_trait]
 impl Executor for CrossSessionMemoryExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        ["memory.update"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: String::new(),
+                schema: json!({}),
+                blast_radius: self.blast_radius(name).unwrap_or(kernel::BlastRadius::Read),
+                category: kernel::ToolCategory::Other,
+                icon: String::new(),
+            })
+            .collect()
     }
 
     fn blast_radius(&self, tool: &str) -> Option<BlastRadius> {
@@ -537,7 +567,17 @@ struct ParentWaitExecutor {
 #[async_trait]
 impl Executor for ParentWaitExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        ["parent.mutate", "child.mutate", "child.wait"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: String::new(),
+                schema: json!({}),
+                blast_radius: self.blast_radius(name).unwrap_or(kernel::BlastRadius::Read),
+                category: kernel::ToolCategory::Other,
+                icon: String::new(),
+            })
+            .collect()
     }
 
     fn blast_radius(&self, tool: &str) -> Option<BlastRadius> {

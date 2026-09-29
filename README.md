@@ -12,7 +12,7 @@
 workflows, and code, not only coding tasks.*
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-macOS%20·%20Linux%20·%20Windows-lightgrey.svg)](#install)
 [![Status](https://img.shields.io/badge/status-pre--1.0-yellow.svg)](#status)
 
@@ -59,7 +59,7 @@ curl -fsSL "https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/$versi
 curl -fsSL https://raw.githubusercontent.com/kashyaprajharsh/medha-agent/main/install.sh \
   | MEDHA_INSTALL_DIR="$HOME/bin" sh                       # choose the destination
 
-git clone https://github.com/kashyaprajharsh/medha-agent   # build it yourself (Rust 1.88+)
+git clone https://github.com/kashyaprajharsh/medha-agent   # build it yourself (Rust 1.89+)
 cd medha-agent && cargo build --release
 ```
 
@@ -142,7 +142,6 @@ than silently proceeding.
 Just run `medha`. The first launch opens model setup right in the TUI: pick an endpoint or type your own, paste a key if the endpoint needs one, and it's saved — you only do this once. `/model` adds or switches models later.
 
 Reasoning controls: `medha --effort xhigh "your task"` or `/reasoning` in the TUI.
-See [reasoning levels and approval review](docs/REASONING_AND_APPROVALS.md).
 
 Context is checked before each model request, including after tool results and on resume. Set the profile's `max_ctx` to the window your endpoint actually serves; `max_output_tokens`, when set, is reserved from that window. Leaving the output cap unset keeps automatic compaction active, with the server's output default remaining unknown. The context meter uses the compiler's input budget (`~` marks an estimate). Compaction checkpoints preserve resumable history; a request that still exceeds the budget stops instead of repeatedly reaching the provider. LLM summarization has its own token bounds, a 60-second inactivity deadline and a 300-second total deadline. Provider failures preserve history and stop compaction; extractive fallback is reserved for explicit local summarizer unavailability. Unknown context limits are reported explicitly; they cannot provide proactive overflow protection.
 
@@ -299,7 +298,5 @@ Apache-2.0.
 
 Use `medha --plan "inspect this project"` for read-only investigation, or
 `medha --require-verify "fix the tests"` with a configured verification command
-to require passing checks before completion. See
-[planning and verification](docs/PLANNING_AND_VERIFICATION.md),
-[reasoning and approval controls](docs/REASONING_AND_APPROVALS.md), and the
-[source-based feature comparison](docs/FEATURE_AUDIT.md).
+to require passing checks before completion. See [docs/WHAT_IS_MEDHA.md](docs/WHAT_IS_MEDHA.md)
+for how verification, approvals and reasoning controls work.

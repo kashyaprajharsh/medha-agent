@@ -95,6 +95,7 @@ export function toBlocks(events: HistoryEvent[]): Block[] {
         const step = event.tool_id ? steps.get(event.tool_id) : undefined;
         if (step) {
           step.status = STATUS[event.status ?? ""] ?? "failed";
+          step.errorCode = event.error_code;
           step.detail = event.detail;
           step.summary = event.summary;
           step.output = event.output;
@@ -176,8 +177,17 @@ const RUNNING: Record<string, string> = {
 };
 
 export function stepVerb(step: Step) {
+  if (step.errorCode === "tool_unavailable") return step.tool;
   const verb = step.verb ?? toolLabel(step.tool);
   return step.status === "running" ? (RUNNING[verb] ?? verb) : verb;
+}
+
+export function stepStatusLabel(step: Step) {
+  if (step.errorCode === "tool_unavailable") return "Unavailable tool";
+  if (step.status === "denied") return "Denied";
+  if (step.status === "failed") return "Failed";
+  if (step.status === "stopped") return "Stopped";
+  return step.summary ?? "";
 }
 
 /** What a running agent is doing now, in the words its step rows use. */

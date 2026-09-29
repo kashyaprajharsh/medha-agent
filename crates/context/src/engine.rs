@@ -43,6 +43,9 @@ pub struct PipelineEngine {
     ineffective_full: AtomicBool,
     /// Context size when anti-thrash latched; sufficient growth releases it.
     latched_at: AtomicU32,
+    /// The previous full compaction's summary failed; the next failure falls back.
+    summary_failed: AtomicBool,
+    summary_failure: std::sync::Mutex<Option<String>>,
     /// Local estimate of the request most recently compiled, and the estimate
     /// of the request whose authoritative usage we last received. Together they
     /// anchor the size basis: growth is measured from a count the provider
@@ -87,6 +90,8 @@ impl PipelineEngine {
             ineffective: AtomicU32::new(0),
             ineffective_full: AtomicBool::new(false),
             latched_at: AtomicU32::new(0),
+            summary_failed: AtomicBool::new(false),
+            summary_failure: std::sync::Mutex::new(None),
             pending_estimate: AtomicU32::new(0),
             estimate_at_last_usage: AtomicU32::new(0),
             summarizer: Arc::new(ExtractiveSummarizer),
@@ -209,6 +214,7 @@ impl ContextEngine for PipelineEngine {
             self.ineffective.store(0, Ordering::Relaxed);
             self.ineffective_full.store(false, Ordering::Relaxed);
             self.latched_at.store(0, Ordering::Relaxed);
+            self.summary_failed.store(false, Ordering::Relaxed);
             *self.last_summary.lock().unwrap() = None;
             self.history_notes.lock().unwrap().clear();
             *self.last_request.lock().unwrap() = None;
@@ -266,6 +272,10 @@ impl ContextEngine for PipelineEngine {
 
     fn pressure(&self) -> Option<kernel::ContextPressure> {
         *self.pressure.lock().unwrap()
+    }
+
+    fn take_summary_failure(&self) -> Option<String> {
+        self.summary_failure.lock().unwrap().take()
     }
 
     fn compaction_planned(&self, messages: &[Message], max_input_tokens: Option<u32>) -> bool {
@@ -634,42 +644,85 @@ impl PipelineEngine {
                     .find_map(|tracked| anchor_words(&tracked.message.content));
                 let cap = (usable * 0.15) as u32;
                 let notes = self.history_notes.lock().unwrap().clone();
-                let body_cap = cap.saturating_sub(counter.count(&notes).saturating_add(8));
+                let body_cap = cap.saturating_sub(
+                    counter
+                        .count(&notes)
+                        .saturating_add(counter.count(crate::handoff::SUMMARY_FRAME))
+                        .saturating_add(8),
+                );
                 if body_cap == 0 {
                     return Ok(passthrough(messages, before, true));
                 }
-                let summary = self.summarizer.summarize_bounded(
-                    previous.as_deref(),
-                    &items,
-                    sent.as_deref(),
-                    anchor.as_deref(),
-                    body_cap,
-                );
-                let primary = control
-                    .run(tokio::time::timeout(self.summarizer.time_limit(), summary))
-                    .await?;
-                let text = match primary {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(crate::compactor::SummarizeError::Unavailable(error))) => {
-                        tracing::warn!(%error, "summary route unavailable; using extractive fallback");
-                        control
-                            .run(ExtractiveSummarizer.summarize(previous.as_deref(), &items))
-                            .await?
-                            .unwrap_or_else(|_| extractive_stub(&items))
-                    }
-                    Ok(Err(error)) => {
-                        return Err(kernel::ContextCompileError::Summary(error.to_string()));
-                    }
-                    Err(_) => {
-                        return Err(kernel::ContextCompileError::Summary(format!(
-                            "summarizer exceeded {} seconds",
-                            self.summarizer.time_limit().as_secs()
-                        )));
+                let mut retried = false;
+                let primary = loop {
+                    let summary = self.summarizer.summarize_bounded(
+                        previous.as_deref(),
+                        &items,
+                        sent.as_deref(),
+                        anchor.as_deref(),
+                        body_cap,
+                    );
+                    let result = control
+                        .run(tokio::time::timeout(self.summarizer.time_limit(), summary))
+                        .await?;
+                    match &result {
+                        Ok(Err(crate::compactor::SummarizeError::Provider(error)))
+                            if !retried && error.is_retryable() =>
+                        {
+                            retried = true;
+                            let wait = error
+                                .retry_after()
+                                .unwrap_or(std::time::Duration::from_secs(1))
+                                .min(std::time::Duration::from_secs(30));
+                            control.run(tokio::time::sleep(wait)).await?;
+                        }
+                        _ => break result,
                     }
                 };
-                if text.trim().is_empty() {
-                    return Err(kernel::ContextCompileError::Summary("empty handoff".into()));
-                }
+                let text = match primary {
+                    Ok(Ok(s)) if !s.trim().is_empty() => {
+                        self.summary_failed.store(false, Ordering::Relaxed);
+                        Some(s)
+                    }
+                    Ok(Err(crate::compactor::SummarizeError::Unavailable(error))) => {
+                        tracing::warn!(%error, "summary route unavailable; using extractive fallback");
+                        None
+                    }
+                    failed => {
+                        let reason = match failed {
+                            Ok(Err(error)) => error.to_string(),
+                            Ok(Ok(_)) => "empty handoff".to_owned(),
+                            Err(_) => format!(
+                                "summarizer exceeded {} seconds",
+                                self.summarizer.time_limit().as_secs()
+                            ),
+                        };
+                        let unchanged = !forced
+                            && !near_hard_ceiling
+                            && !self.summary_failed.swap(true, Ordering::Relaxed);
+                        tracing::warn!(%reason, unchanged, "summary failed");
+                        *self.summary_failure.lock().unwrap() = Some(if unchanged {
+                            format!(
+                                "Couldn't summarise earlier messages ({reason}); continuing with the full history"
+                            )
+                        } else {
+                            format!(
+                                "Couldn't summarise earlier messages ({reason}); continuing with a basic summary"
+                            )
+                        });
+                        if unchanged {
+                            return Ok(passthrough(messages, before, false));
+                        }
+                        None
+                    }
+                };
+                let text = match text {
+                    Some(text) => text,
+                    None => control
+                        .run(ExtractiveSummarizer.summarize(previous.as_deref(), &items))
+                        .await?
+                        .unwrap_or_else(|_| extractive_stub(&items)),
+                };
                 // Cap the summary so a runaway one can't itself blow the budget
                 // (~15% of usable). Truncate on a char boundary with a marker.
                 let text = cap_summary(
@@ -677,10 +730,16 @@ impl PipelineEngine {
                     body_cap,
                     counter,
                 );
-                let text = cap_summary(format!("{text}{notes}"), cap, counter);
+                let frame = crate::handoff::SUMMARY_FRAME;
+                let text = cap_summary(
+                    format!("{text}{notes}"),
+                    cap.saturating_sub(counter.count(frame)),
+                    counter,
+                );
                 if text.is_empty() {
                     return Ok(passthrough(messages, before, true));
                 }
+                let text = format!("{frame}{text}");
                 summary_text = Some(text.clone());
                 out.push(TrackedMessage {
                     message: Message::new(Role::Assistant, text),
@@ -1399,13 +1458,13 @@ mod tests {
             .compile(&full_compaction_history(), Some(local_input_limit(1_300)))
             .await;
         assert!(r.compacted && r.summarized);
-        assert_eq!(
-            r.summary.as_deref(),
-            Some("HANDOFF"),
-            "summary text carried out for K12 persistence"
-        );
+        let summary = r
+            .summary
+            .as_deref()
+            .expect("summary text carried out for K12 persistence");
+        assert_eq!(crate::handoff::summary_body(summary), "HANDOFF");
         assert!(
-            r.messages.iter().any(|m| m.content == "HANDOFF"),
+            r.messages.iter().any(|m| m.content == summary),
             "summary is in the compacted view"
         );
     }
@@ -1438,6 +1497,32 @@ mod tests {
             compiled.source_indices,
             vec![Some(0), Some(1), Some(2), None, Some(7), Some(8)],
             "the protected duplicate pair must identify the tail occurrence, not its equal middle"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_policy_summarizes_while_a_128k_window_still_has_room_to_think() {
+        let eng =
+            engine(CompactionPolicy::default()).with_summarizer(Arc::new(OkSummarizer("HANDOFF")));
+        let mut messages = vec![
+            Message::system("SYSTEM"),
+            user("build the landing page"),
+            Message::new(Role::Assistant, "on it"),
+        ];
+        for _ in 0..50 {
+            messages.push(user(&"x".repeat(8_600)));
+            messages.push(Message::new(Role::Assistant, "done"));
+        }
+        messages.push(user("continue"));
+
+        let compiled = eng.compile(&messages, Some(128_000)).await;
+        assert!(
+            compiled.before_tokens < 110_000,
+            "fixture must sit below the old 99% trigger"
+        );
+        assert!(
+            compiled.summarized,
+            "~94% of a 128k window must summarize, not prune"
         );
     }
 
@@ -1545,7 +1630,13 @@ mod tests {
             )
             .await
             .expect("a cancelled pass must not poison later compaction");
-        assert_eq!(recovered.summary.as_deref(), Some("RECOVERED SUMMARY"));
+        assert_eq!(
+            recovered
+                .summary
+                .as_deref()
+                .map(crate::handoff::summary_body),
+            Some("RECOVERED SUMMARY")
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1555,22 +1646,113 @@ mod tests {
             started: tokio::sync::Notify::new(),
         });
         let eng = engine(full_policy()).with_summarizer(summarizer.clone());
+        let history = full_compaction_history();
         let result = eng
             .compile_controlled(
-                &full_compaction_history(),
+                &history,
                 Some(local_input_limit(1_300)),
                 &kernel::CompileControl::unlimited(),
             )
-            .await;
-        assert!(matches!(
-            result,
-            Err(kernel::ContextCompileError::Summary(_))
-        ));
+            .await
+            .expect("a stalled summary must not end the turn");
+        assert!(!result.compacted);
+        assert_eq!(
+            result.source_indices,
+            (0..history.len()).map(Some).collect::<Vec<_>>()
+        );
         assert!(eng.last_summary.lock().unwrap().is_none());
         let recovered = eng
             .compile(&full_compaction_history(), Some(local_input_limit(1_300)))
             .await;
-        assert_eq!(recovered.summary.as_deref(), Some("RECOVERED SUMMARY"));
+        assert_eq!(
+            recovered
+                .summary
+                .as_deref()
+                .map(crate::handoff::summary_body),
+            Some("RECOVERED SUMMARY")
+        );
+        assert_eq!(summarizer.calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct ScriptedSummarizer {
+        calls: std::sync::atomic::AtomicUsize,
+        transient_first: bool,
+    }
+
+    #[async_trait]
+    impl Summarizer for ScriptedSummarizer {
+        async fn summarize(
+            &self,
+            _previous: Option<&str>,
+            _items: &[HistoryItem],
+        ) -> Result<String, crate::compactor::SummarizeError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            match (self.transient_first, call) {
+                (true, 0) => Err(crate::compactor::SummarizeError::Provider(
+                    kernel::ProviderError::Transport("connection reset".into()),
+                )),
+                (true, _) => Ok("HANDOFF".into()),
+                (false, _) => Err(crate::compactor::SummarizeError::Invalid(
+                    "summary hit its output limit".into(),
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_summary_sends_history_unchanged_then_falls_back() {
+        let summarizer = Arc::new(ScriptedSummarizer {
+            calls: Default::default(),
+            transient_first: false,
+        });
+        let eng = engine(full_policy()).with_summarizer(summarizer.clone());
+        let history = full_compaction_history();
+        let control = kernel::CompileControl::unlimited();
+
+        let first = eng
+            .compile_controlled(&history, Some(local_input_limit(1_300)), &control)
+            .await
+            .expect("a failed summary must not end the turn");
+        assert!(!first.compacted);
+        assert_eq!(
+            eng.take_summary_failure().as_deref(),
+            Some(
+                "Couldn't summarise earlier messages (invalid summary: summary hit its output limit); continuing with the full history"
+            )
+        );
+
+        let second = eng
+            .compile_controlled(&history, Some(local_input_limit(1_300)), &control)
+            .await
+            .expect("a repeated failure must fall back, not end the turn");
+        assert!(second.summarized && second.after_tokens < second.before_tokens);
+        assert!(
+            second
+                .summary
+                .as_deref()
+                .map(crate::handoff::summary_body)
+                .is_some_and(|summary| summary.starts_with("[MEDHA extractive summary"))
+        );
+        assert_eq!(summarizer.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_connection_retries_the_summary_once() {
+        let summarizer = Arc::new(ScriptedSummarizer {
+            calls: Default::default(),
+            transient_first: true,
+        });
+        let eng = engine(full_policy()).with_summarizer(summarizer.clone());
+        let compiled = eng
+            .compile(&full_compaction_history(), Some(local_input_limit(1_300)))
+            .await;
+        assert_eq!(
+            compiled
+                .summary
+                .as_deref()
+                .map(crate::handoff::summary_body),
+            Some("HANDOFF")
+        );
         assert_eq!(summarizer.calls.load(Ordering::SeqCst), 2);
     }
 

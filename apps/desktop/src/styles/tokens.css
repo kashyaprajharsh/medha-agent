@@ -1,0 +1,46 @@
+/* The design language: the same in every theme. Themes set colour and material only. */
+:root {
+  --font-ui: "Anek Latin", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Fragment Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --text-xs: 12px;
+  --text-sm: 13.5px;
+  --text-md: 15px;
+  --text-base: 16px;
+  --text-lg: 19px;
+  --text-xl: 24px;
+  --reading-size: 16px;
+
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-12: 48px;
+
+  --radius-scale: 1;
+  --r-full: 999px;
+
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-move: cubic-bezier(0.77, 0, 0.175, 1);
+  --t-fast: 120ms;
+  --t-base: 200ms;
+  --t-slow: 280ms;
+}
+:root,
+[data-look] {
+  --r-xs: calc(6px * var(--radius-scale));
+  --r-sm: calc(8px * var(--radius-scale));
+  --r-md: calc(12px * var(--radius-scale));
+  --r-lg: calc(16px * var(--radius-scale));
+  --r-xl: calc(22px * var(--radius-scale));
+}
+:root[data-text-size="small"] {
+  --reading-size: 15px;
+}
+:root[data-text-size="large"] {
+  --reading-size: 18px;
+}

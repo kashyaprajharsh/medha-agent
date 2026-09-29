@@ -82,6 +82,8 @@ pub enum EventKind {
     Compaction,
     /// Provider usage for an exact request prefix, used only for context calibration.
     ContextUsage,
+    /// A compaction summary failed and the turn continued; never a checkpoint.
+    SummaryFailed,
     Session,
     /// Reasoning retained for audit but excluded from model history.
     ModelReasoning,
@@ -119,6 +121,7 @@ impl EventKind {
             EventKind::ToolEffectPrepared => "tool.effect_prepared",
             EventKind::Compaction => "context.compaction",
             EventKind::ContextUsage => "context.usage",
+            EventKind::SummaryFailed => "context.summary_failed",
             EventKind::Session => "session",
             EventKind::ModelReasoning => "model.reasoning",
             EventKind::Interrupt => "interrupt",
@@ -147,6 +150,7 @@ impl EventKind {
             "tool.effect_prepared" => EventKind::ToolEffectPrepared,
             "context.compaction" => EventKind::Compaction,
             "context.usage" => EventKind::ContextUsage,
+            "context.summary_failed" => EventKind::SummaryFailed,
             "session" => EventKind::Session,
             "model.reasoning" => EventKind::ModelReasoning,
             "interrupt" => EventKind::Interrupt,
@@ -514,6 +518,15 @@ impl Event {
             s,
             EventKind::Compaction,
             json!({ "before_tokens": before_tokens, "after_tokens": after_tokens, "summary": summary }),
+            TrustLabel::System,
+        )
+    }
+
+    pub(crate) fn summary_failed(s: &Session, reason: &str) -> Self {
+        Self::new(
+            s,
+            EventKind::SummaryFailed,
+            json!({ "reason": reason }),
             TrustLabel::System,
         )
     }

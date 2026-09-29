@@ -1223,9 +1223,8 @@ mod tests {
         ));
     }
 
-    fn log_at(name: &str) -> (Arc<store::SqliteLog>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("medha-{name}-{}", Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn log_at(name: &str) -> (Arc<store::SqliteLog>, test_support::Scratch) {
+        let dir = test_support::scratch(&format!("medha-{name}"));
         let log = store::SqliteLog::open(dir.join("events.db")).unwrap();
         (Arc::new(log), dir)
     }
@@ -1339,9 +1338,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_live_foreign_process_is_never_reaped_and_a_killed_one_is_recovered_once() {
-        let directory =
-            std::env::temp_dir().join(format!("medha-agent-two-process-{}", Ulid::new()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = test_support::scratch("medha-agent-two-process");
         let parent = Ulid::new();
         let dispatch_id = Ulid::new();
         let child_id = Ulid::new();

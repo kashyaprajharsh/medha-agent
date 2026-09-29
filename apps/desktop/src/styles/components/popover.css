@@ -1,0 +1,307 @@
+/* Floating layers: control popovers, menus and dialogs. They scale in from their trigger. */
+.control-popover {
+  position: absolute;
+  z-index: 30;
+  bottom: calc(100% + var(--s-2));
+  left: 0;
+  width: 344px;
+  max-width: calc(100vw - 40px);
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--overlay);
+  box-shadow: var(--e2-shadow);
+  transform-origin: bottom left;
+  animation: pop-in var(--t-base) var(--ease-out) both;
+}
+.control-popover.reasoning {
+  left: 110px;
+}
+.control-popover.mode {
+  left: 180px;
+}
+.popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--s-1) 7px var(--s-2) 10px;
+}
+.popover-head b {
+  font-weight: 500;
+}
+.model-search {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin: 0 var(--s-1) 6px;
+  padding: var(--s-2) 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  color: var(--faint);
+}
+.model-search:focus-within {
+  border-color: color-mix(in srgb, var(--gold) 55%, var(--line));
+}
+.model-search input {
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+}
+.model-options {
+  max-height: 300px;
+  overflow: auto;
+}
+.setting-option {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border-radius: calc(var(--r-lg) - 6px);
+  text-align: left;
+  transition: background var(--t-fast);
+}
+.setting-option:hover:not(:disabled) {
+  background: var(--hover);
+}
+.setting-option[aria-pressed="true"] {
+  background: var(--gold-wash);
+}
+.setting-option > .icon {
+  color: var(--faint);
+}
+.setting-option > span:not(.option-radio) {
+  flex: 1;
+  min-width: 0;
+}
+.setting-option b {
+  display: block;
+  font-size: var(--text-md);
+  font-weight: 500;
+}
+.setting-option small {
+  display: block;
+  font-size: var(--text-xs);
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.setting-option > .icon:last-child {
+  color: var(--gold);
+}
+.setting-section {
+  padding: 10px;
+  display: grid;
+  gap: var(--s-2);
+}
+.setting-section > label {
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+.setting-section .segmented {
+  margin-bottom: 0;
+}
+.setting-section select {
+  width: 100%;
+  padding: var(--s-2) 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--raised);
+  color: var(--text);
+  font: inherit;
+}
+.toggles {
+  border-top: 1px solid var(--hair);
+}
+.toggles > label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--text);
+}
+.popover-note {
+  margin: 6px 10px 10px;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--dim);
+}
+.popover-error {
+  margin: var(--s-2) 10px;
+  font-size: var(--text-xs);
+  color: var(--err);
+  overflow-wrap: anywhere;
+}
+.popover-foot {
+  border-top: 1px solid var(--hair);
+  padding: 9px 10px var(--s-1);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+.manage-models {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-3) var(--s-4);
+  text-align: left;
+  border-top: 1px solid var(--hair);
+  color: var(--gold);
+  font-size: var(--text-sm);
+}
+
+.workspace-control {
+  position: relative;
+  display: inline-flex;
+}
+.workspace-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--faint);
+  border-radius: var(--r-sm);
+  padding: var(--s-1) 6px;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.workspace-trigger:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.workspace-trigger .icon {
+  width: 14px;
+  height: 14px;
+}
+.workspace-popover {
+  position: absolute;
+  top: calc(100% + var(--s-3));
+  left: 0;
+  z-index: 55;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  width: 340px;
+  max-width: 70vw;
+  padding: var(--s-3);
+  color: var(--text);
+  background: var(--overlay);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--e2-shadow);
+  white-space: normal;
+  font-size: var(--text-xs);
+  transform-origin: top left;
+  animation: pop-in var(--t-base) var(--ease-out) both;
+}
+.workspace-path {
+  overflow-wrap: anywhere;
+  color: var(--dim);
+  line-height: 1.5;
+}
+.workspace-popover button {
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2);
+  border-radius: var(--r-sm);
+}
+.workspace-popover button:hover {
+  background: var(--hover);
+}
+
+.row-more {
+  position: relative;
+}
+.row-more summary {
+  cursor: pointer;
+  list-style: none;
+  padding: var(--s-2);
+  border-radius: var(--r-sm);
+  color: var(--dim);
+}
+.row-more summary:hover {
+  background: var(--hover);
+}
+.row-more > div {
+  position: absolute;
+  right: 0;
+  top: 36px;
+  padding: 6px;
+  min-width: 170px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--overlay);
+  box-shadow: var(--e2-shadow);
+  z-index: 70;
+  transform-origin: top right;
+  animation: pop-in var(--t-base) var(--ease-out) both;
+}
+.row-more button {
+  padding: 9px;
+  display: block;
+  width: 100%;
+  text-align: left;
+  border-radius: calc(var(--r-lg) - 6px);
+}
+.row-more button:hover {
+  background: var(--hover);
+}
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--s-6);
+  background: var(--scrim);
+  animation: fade-in var(--t-base) var(--ease-out) both;
+}
+.confirm-dialog {
+  width: 440px;
+  max-width: 100%;
+  padding: 28px;
+  border: 1px solid var(--line);
+  background: var(--raised);
+  border-radius: var(--r-xl);
+  box-shadow: var(--e2-shadow);
+  animation: pop-in var(--t-slow) var(--ease-out) both;
+}
+.confirm-dialog p {
+  color: var(--dim);
+  line-height: 1.65;
+}
+.confirm-dialog .row-actions {
+  margin-top: var(--s-6);
+  justify-content: flex-end;
+}
+.rewind-label {
+  display: grid;
+  gap: 10px;
+  font-size: var(--text-sm);
+  color: var(--dim);
+}
+.rewind-options {
+  display: grid;
+  gap: var(--s-3);
+  margin-top: 22px;
+}
+.rewind-options label {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+@media (max-width: 1100px) {
+  .control-popover.reasoning,
+  .control-popover.mode {
+    left: 0;
+  }
+}
+@media (max-width: 780px) {
+  .control-popover {
+    width: 320px;
+  }
+}

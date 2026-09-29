@@ -112,7 +112,7 @@ impl Workspaces {
             0,
             Workspace {
                 id: "personal".into(),
-                name: "Personal".into(),
+                name: "Chats".into(),
                 path: personal.canonicalize().map_err(|e| e.to_string())?,
                 personal: true,
             },

@@ -79,7 +79,9 @@ export function App() {
   const [workspace, setWorkspace] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [draftKey, setDraftKey] = useState<string | null>(null);
+  const [draftKey, setDraftKey] = useState<string | null>(
+    () => `draft-${crypto.randomUUID()}`,
+  );
   const [events, setEvents] = useState<HistoryEvent[]>([]);
   const [reload, setReload] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -119,7 +121,7 @@ export function App() {
   const [control, setControl] = useState<Control | null>(null);
   const [defaults, setDefaults] = useState<SessionSettings>();
   const [showReasoning, setShowReasoning] = useState(
-    () => stored("medha-show-reasoning") === "true",
+    () => stored("medha-show-thinking") === "true",
   );
   const [attachments, setAttachments] = useState<Record<string, Attachment[]>>(
     {},
@@ -135,6 +137,7 @@ export function App() {
     cancel,
     approve,
     clearTail,
+    takeReturned,
     ensureOpen,
     configure,
     answer,
@@ -144,7 +147,7 @@ export function App() {
     store("medha-sidebar", sidebarOpen ? "open" : "closed");
   }, [sidebarOpen]);
   useEffect(() => {
-    store("medha-show-reasoning", String(showReasoning));
+    store("medha-show-thinking", String(showReasoning));
   }, [showReasoning]);
 
   useEffect(() => {
@@ -186,16 +189,11 @@ export function App() {
       setBranch(head);
       setSessions(rows);
       const ids = new Set(rows.map((session) => session.id));
-      const top = rows.filter(
-        (session) => !session.parent_id || !ids.has(session.parent_id),
-      );
       if (select && ids.has(select)) {
         setDraftKey(null);
         setSelected(select);
       } else if (!quiet) {
-        setSelected((old) =>
-          old && ids.has(old) ? old : (top[0]?.id ?? null),
-        );
+        setSelected((old) => (old && ids.has(old) ? old : null));
       }
     } catch (cause) {
       setError(String(cause));
@@ -335,6 +333,18 @@ export function App() {
       }
     }
   }, [live, keyBySession, draftKey, currentKey, refresh]);
+
+  // A stopped turn hands back what it never read; typed text must not vanish.
+  useEffect(() => {
+    for (const [key, entry] of Object.entries(live)) {
+      if (!entry.returned?.length) continue;
+      const restored = takeReturned(key).join("\n\n");
+      setText((all) => ({
+        ...all,
+        [key]: all[key] ? `${restored}\n\n${all[key]}` : restored,
+      }));
+    }
+  }, [live, takeReturned, setText]);
 
   useEffect(() => {
     const box = scroller.current;
@@ -1032,17 +1042,6 @@ export function App() {
         <span className={`dot ${error ? "failed" : ""}`} />
         {error ? "Backend needs attention" : "Connected to medha"}
 
-        <span className="grow" />
-
-        <span>
-          {roots.length} {roots.length === 1 ? "session" : "sessions"}
-        </span>
-        {branch && (
-          <span className="status-branch">
-            <Icon name="branch" />
-            {branch}
-          </span>
-        )}
       </footer>
     </div>
   );

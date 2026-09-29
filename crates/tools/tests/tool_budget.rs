@@ -40,8 +40,9 @@ impl orchestrator::ChildRunner for NoChildren {
 /// them for the default static catalogue. Includes MCP controls, but not tools
 /// supplied by connected servers or optional writer-worktree agent tools.
 fn catalogue() -> Vec<(String, usize)> {
-    let dir = std::env::temp_dir().join(format!("medha-budget-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // One folder per call: the tests in this file run in parallel.
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = scratch.path().to_path_buf();
     let sandbox = Arc::new(sandbox::WorkspaceSandbox::new_jailed(&dir).unwrap());
     let mut registry = ToolRegistry::with_workspace(sandbox, Arc::new(NoArtifacts));
     registry.register_lsp(Arc::new(lsp::LspManager::new(
@@ -70,16 +71,14 @@ fn catalogue() -> Vec<(String, usize)> {
         8,
     );
     registry.register_skills(Arc::new(tools::SkillStore::new(dir.join("project"), None)));
-    let specs = registry
+    registry
         .specs()
         .into_iter()
         .map(|spec| {
             let size = spec.name.len() + spec.description.len() + spec.schema.to_string().len();
             (spec.name, size)
         })
-        .collect();
-    std::fs::remove_dir_all(&dir).ok();
-    specs
+        .collect()
 }
 
 #[test]

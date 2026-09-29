@@ -522,8 +522,8 @@ mod tests {
     use super::*;
     use kernel::ProgressiveContext;
 
-    fn root(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("medha-ctxfiles-{tag}-{}", ulid::Ulid::new()))
+    fn root(tag: &str) -> test_support::Scratch {
+        test_support::scratch(&format!("medha-ctxfiles-{tag}"))
     }
 
     #[tokio::test]
@@ -672,7 +672,8 @@ mod tests {
         .unwrap();
         std::fs::write(sub.join("file.rs"), "fn first() {}").unwrap();
         std::fs::write(sub.join("other.rs"), "fn other() {}").unwrap();
-        let progressive = ProgressiveContextFiles::new(ContextFileLoader::new(), root.clone());
+        let progressive =
+            ProgressiveContextFiles::new(ContextFileLoader::new(), root.to_path_buf());
         let first = progressive.discover(&sub.join("file.rs")).await.unwrap();
         assert!(first.content.contains("sub-rules"));
         assert!(first.content.chars().count() <= PROGRESSIVE_MAX_CHARS);
@@ -699,7 +700,8 @@ mod tests {
         std::fs::write(external.join("AGENTS.md"), "external-rules").unwrap();
         std::fs::write(external.join("file.rs"), "external").unwrap();
 
-        let progressive = ProgressiveContextFiles::new(ContextFileLoader::new(), workspace.clone());
+        let progressive =
+            ProgressiveContextFiles::new(ContextFileLoader::new(), workspace.to_path_buf());
         assert!(
             progressive
                 .discover(&sub.join("missing.rs"))
@@ -713,7 +715,8 @@ mod tests {
             "a missing attempt must not poison a later authorized discovery"
         );
 
-        let outside = ProgressiveContextFiles::new(ContextFileLoader::new(), workspace.clone());
+        let outside =
+            ProgressiveContextFiles::new(ContextFileLoader::new(), workspace.to_path_buf());
         assert!(
             outside.discover(&external.join("file.rs")).await.is_none(),
             "an absolute path outside the authorized root must be rejected"
@@ -725,7 +728,8 @@ mod tests {
 
             let touched_alias = workspace.join("external-alias.rs");
             symlink(external.join("file.rs"), &touched_alias).unwrap();
-            let escaped = ProgressiveContextFiles::new(ContextFileLoader::new(), workspace.clone());
+            let escaped =
+                ProgressiveContextFiles::new(ContextFileLoader::new(), workspace.to_path_buf());
             assert!(
                 escaped.discover(&touched_alias).await.is_none(),
                 "a workspace symlink must not turn an external target into workspace context"
@@ -736,7 +740,7 @@ mod tests {
             std::fs::write(linked_dir.join("real.rs"), "real").unwrap();
             symlink(external.join("AGENTS.md"), linked_dir.join("AGENTS.md")).unwrap();
             let escaped_context =
-                ProgressiveContextFiles::new(ContextFileLoader::new(), workspace.clone());
+                ProgressiveContextFiles::new(ContextFileLoader::new(), workspace.to_path_buf());
             assert!(
                 escaped_context
                     .discover(&linked_dir.join("real.rs"))

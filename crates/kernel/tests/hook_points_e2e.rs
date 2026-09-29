@@ -93,7 +93,17 @@ struct ReadTools;
 #[async_trait]
 impl Executor for ReadTools {
     fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        ["fs.edit", "read", "fail"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: String::new(),
+                schema: json!({}),
+                blast_radius: self.blast_radius(name).unwrap_or(kernel::BlastRadius::Read),
+                category: kernel::ToolCategory::Other,
+                icon: String::new(),
+            })
+            .collect()
     }
 
     fn blast_radius(&self, _tool: &str) -> Option<BlastRadius> {

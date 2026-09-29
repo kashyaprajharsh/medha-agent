@@ -844,6 +844,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         &self,
         session: &Session,
         intents: Vec<ToolIntent>,
+        unavailable: &mut std::collections::HashMap<String, Observation>,
         web_tainted: bool,
         cancel: &tokio_util::sync::CancellationToken,
         wall_deadline: Option<tokio::time::Instant>,
@@ -857,15 +858,26 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     )> {
         stream::iter(intents)
             .map(|intent| {
-                self.execute_admitted(
-                    session,
-                    intent,
-                    web_tainted,
-                    cancel.clone(),
-                    wall_deadline,
-                    Arc::clone(settle_deadline),
-                    sink,
-                )
+                let settled = unavailable.remove(&intent.id);
+                let cancel = cancel.clone();
+                let settle_deadline = Arc::clone(settle_deadline);
+                async move {
+                    match settled {
+                        Some(obs) => (intent.id, intent.tool, obs, None),
+                        None => {
+                            self.execute_admitted(
+                                session,
+                                intent,
+                                web_tainted,
+                                cancel,
+                                wall_deadline,
+                                settle_deadline,
+                                sink,
+                            )
+                            .await
+                        }
+                    }
+                }
             })
             .buffered(self.max_parallel_tools)
             .collect()
@@ -1248,7 +1260,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             let mut image_fallback_retried = false;
             let mut force_text_images = false;
             let mut compaction_passes = 0u32;
-            let (assistant, canonical, intents, usage, turn_interrupted) = 'model_call: loop {
+            let (turn, request_tools) = 'model_call: loop {
                 let (prepared, prepared_input_tokens, reserved_output_tokens) = loop {
                     let limits = self.provider.model_limits();
                     let input_limit = limits
@@ -1392,6 +1404,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .await;
                     if compaction_planned {
                         sink.compacting(false);
+                    }
+                    if let Some(failure) = self.context.take_summary_failure() {
+                        sink.notice(&failure);
+                        if let Err(error) = self
+                            .log
+                            .append(Event::summary_failed(session, &failure))
+                            .await
+                        {
+                            tracing::warn!(%error, "could not persist the summary failure");
+                        }
                     }
                     let compiled = match compiled {
                         Ok(compiled) => compiled,
@@ -1558,7 +1580,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 image_route_reported = true;
                             }
                         }
-                        break t;
+                        // Validate against the catalogue of the request that produced
+                        // this response, not a fresh (possibly changed) executor list.
+                        let tools: Vec<String> = prepared
+                            .context
+                            .tools
+                            .iter()
+                            .map(|spec| spec.name.clone())
+                            .collect();
+                        break (t, tools);
                     }
                     Err(KernelError::UnsupportedImage)
                         if !image_fallback_retried
@@ -1607,6 +1637,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     Err(e) => return Err(e),
                 }
             };
+            let (assistant, canonical, intents, usage, turn_interrupted) = turn;
             if let Some(u) = usage {
                 self.context.update_usage(u.prompt_tokens, u.total_tokens);
             }
@@ -1675,7 +1706,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // Dispatch admission: intents are logged HERE — after the cancel
             // check, immediately before execution — so a logged intent always
             // gets an observation (real or synthesized). Replay order per id is
-            // intent → policy.decision → observation.
+            // intent → policy.decision → observation (unavailable tools skip policy).
             for it in &intents {
                 self.log.append(Event::model_intent(session, it)).await?;
             }
@@ -1683,12 +1714,38 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             for it in &intents {
                 sink.tool_call_with_id(&it.id, &it.tool, &it.args);
             }
+            // Provider adapters have already mapped wire names to canonical names.
+            // An undeclared call is invalid model output, not a policy denial: it
+            // skips mutation scheduling, hooks, approval and execution, but settles
+            // in its call-order slot — some chat templates pair results by position.
+            let mut unavailable = std::collections::HashMap::new();
+            if intents.iter().any(|i| !request_tools.contains(&i.tool)) {
+                let mut available: Vec<String> = crate::portable_tool_name_map(&request_tools)
+                    .into_keys()
+                    .collect();
+                available.sort();
+                for intent in intents.iter().filter(|i| !request_tools.contains(&i.tool)) {
+                    let mut observation = Observation::error(
+                        &intent.id,
+                        format!(
+                            "Tool '{}' is unavailable in this request. Choose an available tool; \
+                             approval cannot enable this tool. Do not retry this name.",
+                            intent.tool
+                        ),
+                    );
+                    observation.payload["error_code"] = serde_json::json!("tool_unavailable");
+                    observation.payload["requested_tool"] = serde_json::json!(intent.tool);
+                    observation.payload["available_tools"] = serde_json::json!(available);
+                    unavailable.insert(intent.id.clone(), observation);
+                }
+            }
             // Blast radius, not tool name, determines whether verification runs.
             let modified_files = intents.iter().any(|i| {
-                matches!(
-                    self.executor.blast_radius(&i.tool),
-                    Some(BlastRadius::ReversibleLocal | BlastRadius::IrreversibleLocal)
-                )
+                !unavailable.contains_key(&i.id)
+                    && matches!(
+                        self.executor.blast_radius(&i.tool),
+                        Some(BlastRadius::ReversibleLocal | BlastRadius::IrreversibleLocal)
+                    )
             });
 
             // Reads run concurrently; every mutation gets a hard barrier. If two
@@ -1706,12 +1763,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             let dispatch_web_tainted = web_tainted;
             let mut read_batch = Vec::new();
             for intent in intents {
-                if let Some(mutation_key) = self.executor.mutation_key(&intent) {
+                if !unavailable.contains_key(&intent.id)
+                    && let Some(mutation_key) = self.executor.mutation_key(&intent)
+                {
                     if !read_batch.is_empty() {
                         let settled = self
                             .settle_reads(
                                 session,
                                 std::mem::take(&mut read_batch),
+                                &mut unavailable,
                                 dispatch_web_tainted,
                                 &dispatch_cancel,
                                 dispatch_wall_deadline,
@@ -1850,6 +1910,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     .settle_reads(
                         session,
                         read_batch,
+                        &mut unavailable,
                         dispatch_web_tainted,
                         &dispatch_cancel,
                         dispatch_wall_deadline,
@@ -2739,6 +2800,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .await
                         .unwrap_or_else(|| approval_detail(intent));
                     detail.push_str("\n\nAdditional access required before running:");
+                    if access.outside_sandbox {
+                        detail.push_str(
+                            "\n- Run outside Medha's sandbox, this one time: the command can \
+                             read and change anything your user account can",
+                        );
+                    }
                     if access.network {
                         detail.push_str("\n- Network access");
                     }

@@ -542,6 +542,7 @@ dependencies = [
  "policy",
  "serde",
  "serde_json",
+ "test-support",
  "thiserror 2.0.18",
  "tiktoken-rs",
  "tokio",
@@ -2310,6 +2311,7 @@ dependencies = [
  "store",
  "syntect",
  "tempfile",
+ "test-support",
  "tokio",
  "tokio-util",
  "toml",
@@ -2376,6 +2378,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "test-support",
  "thiserror 2.0.18",
  "tokio",
  "ulid",
@@ -2765,6 +2768,7 @@ dependencies = [
  "kernel",
  "serde",
  "serde_json",
+ "test-support",
  "thiserror 2.0.18",
  "tokio",
  "toml",
@@ -3748,6 +3752,7 @@ dependencies = [
  "libc",
  "permissions",
  "sha2",
+ "test-support",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -4098,6 +4103,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "test-support",
  "thiserror 2.0.18",
  "tokio",
  "ulid",
@@ -4377,6 +4383,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-support"
+version = "0.1.8"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4624,7 +4637,9 @@ dependencies = [
  "glob",
  "htmd",
  "ignore",
+ "image",
  "kernel",
+ "libc",
  "lockfile",
  "lsp",
  "mcp",
@@ -4643,6 +4658,8 @@ dependencies = [
  "sha2",
  "similar",
  "store",
+ "tempfile",
+ "test-support",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

@@ -125,8 +125,7 @@ impl kernel::ArtifactStore for MemArtifacts {
 /// is also the cheapest check that the permit is always released.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wide_batch_of_reads_settles_without_being_interrupted() {
-    let dir = std::env::temp_dir().join(format!("medha-parallel-{}", ulid::Ulid::new()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_support::scratch("medha-parallel");
     let log = Arc::new(store::SqliteLog::open(dir.join("events.db")).unwrap());
     let kernel = Kernel::new(
         Arc::new(Batch::new()),

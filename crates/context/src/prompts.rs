@@ -95,10 +95,15 @@ mod tests {
     #[test]
     fn embedded_default_resolves_and_has_sections() {
         let p = compaction_summary();
-        assert!(p.contains("Goal"));
-        assert!(p.contains("Next steps"));
-        assert!(p.contains("User instructions"));
-        assert!(p.contains("verbatim"));
+        for section in [
+            "## Task",
+            "## Instructions to follow",
+            "## Current state",
+            "## Remaining",
+        ] {
+            assert!(p.contains(section), "{section}");
+        }
+        assert!(p.contains("VERBATIM"));
     }
 
     #[test]

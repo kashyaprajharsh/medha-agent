@@ -3,7 +3,7 @@ name = "medha-desktop"
 version = "0.1.8"
 description = "Medha desktop shell"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 build = "build.rs"
 
 # The desktop shell has its own dependency graph and lockfile. Core runtime
@@ -14,7 +14,7 @@ build = "build.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["macos-private-api"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 rfd = "0.17"

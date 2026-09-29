@@ -625,9 +625,11 @@ mod tests {
         }
     }
 
-    fn temp_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("medha-memory-{tag}-{}", Ulid::new()));
-        (dir.join("project.db"), dir.join("user.db"))
+    /// The project path owns the folder; both databases go when it drops.
+    fn temp_paths(tag: &str) -> (test_support::Scratch, std::path::PathBuf) {
+        let dir = test_support::scratch(&format!("medha-memory-{tag}"));
+        let user = dir.join("user.db");
+        (dir.at("project.db"), user)
     }
 
     /// A `memory.write`-shaped event, built directly from `Event`'s public
@@ -688,8 +690,6 @@ mod tests {
             !proj.list().unwrap().iter().any(|e| e.name == "e1"),
             "forget hides from list"
         );
-
-        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -762,7 +762,6 @@ mod tests {
         );
         drop(blocker);
         drop(projection);
-        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]
@@ -787,7 +786,6 @@ mod tests {
         let proj = MemoryProjection::open(&p, &u).unwrap();
         proj.rebuild(events.into_iter()).unwrap();
         assert!(proj.get(Scope::Project, "e1").unwrap().is_none());
-        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]
@@ -844,9 +842,6 @@ mod tests {
         a.sort_by(|x, y| x.name.cmp(&y.name));
         b.sort_by(|x, y| x.name.cmp(&y.name));
         assert_eq!(a, b, "rebuild-from-log must equal incremental apply");
-
-        std::fs::remove_dir_all(p1.parent().unwrap()).ok();
-        std::fs::remove_dir_all(p2.parent().unwrap()).ok();
     }
 
     #[test]
@@ -892,7 +887,6 @@ mod tests {
             .unwrap();
         proj.apply(&MemoryOp::Update { entry: updated }).unwrap();
         assert_eq!(proj.search("replacement", 10).unwrap().len(), 1);
-        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]
@@ -923,7 +917,6 @@ mod tests {
             original
         );
         assert_eq!(proj.search("prior-valid", 10).unwrap().len(), 1);
-        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]
@@ -986,7 +979,6 @@ mod tests {
         assert!(proj.get(Scope::User, "old-user").unwrap().is_none());
         assert!(proj.get(Scope::Project, "new-project").unwrap().is_some());
         assert!(proj.get(Scope::User, "new-user").unwrap().is_some());
-        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]
@@ -1050,8 +1042,6 @@ mod tests {
             proj.get(Scope::Project, "after-fork").unwrap().is_none(),
             "fork must not see post-cut memories"
         );
-
-        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]
@@ -1079,8 +1069,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(proj.search("trailer", 5).unwrap().len(), 0);
-
-        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
     #[test]
@@ -1105,7 +1093,5 @@ mod tests {
         let hit = merged.iter().find(|e| e.name == "shared-name").unwrap();
         assert_eq!(hit.scope, Scope::Project, "project wins on name collision");
         assert_eq!(merged.iter().filter(|e| e.name == "shared-name").count(), 1);
-
-        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 }

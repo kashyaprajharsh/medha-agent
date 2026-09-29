@@ -269,9 +269,10 @@ mod tests {
     use kernel::TrustLabel;
     use ulid::Ulid;
 
-    fn store(tag: &str) -> MemoryProjection {
-        let dir = std::env::temp_dir().join(format!("medha-recall-{tag}-{}", Ulid::new()));
-        MemoryProjection::open(dir.join("project.db"), dir.join("user.db")).unwrap()
+    fn store(tag: &str) -> (MemoryProjection, test_support::Scratch) {
+        let dir = test_support::scratch(&format!("medha-recall-{tag}"));
+        let store = MemoryProjection::open(dir.join("project.db"), dir.join("user.db"));
+        (store.unwrap(), dir)
     }
 
     fn entry(
@@ -301,7 +302,7 @@ mod tests {
 
     #[test]
     fn compiles_ranked_budgeted_index_and_demotes_stale_candidate() {
-        let store = store("rank");
+        let (store, _dir) = store("rank");
         let now = 40.0 * 86_400.0;
         let stale = entry(
             "old-candidate",
@@ -340,7 +341,7 @@ mod tests {
 
     #[test]
     fn frozen_block_is_byte_stable_until_explicit_refresh() {
-        let store = store("frozen");
+        let (store, _dir) = store("frozen");
         let now = 10_000.0;
         store
             .apply(&MemoryOp::Write {
@@ -378,7 +379,7 @@ mod tests {
 
     #[test]
     fn fresh_projection_session_recalls_prior_write() {
-        let dir = std::env::temp_dir().join(format!("medha-recall-cross-session-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-recall-cross-session");
         let project = dir.join("project.db");
         let user = dir.join("user.db");
         let now = 20_000.0;
@@ -411,7 +412,7 @@ mod tests {
 
     #[test]
     fn configured_staleness_changes_candidate_eligibility() {
-        let store = store("configured-stale");
+        let (store, _dir) = store("configured-stale");
         let now = 40.0 * 86_400.0;
         store
             .apply(&MemoryOp::Write {

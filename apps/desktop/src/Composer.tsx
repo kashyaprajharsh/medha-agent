@@ -563,7 +563,7 @@ export function Composer(props: Props) {
                   )}
                   <div className="setting-section toggles">
                     <label>
-                      Show thinking in chat
+                      Expand thinking in chat
                       <button
                         type="button"
                         role="switch"
@@ -595,7 +595,7 @@ export function Composer(props: Props) {
                       ? "This model does not accept reasoning controls."
                       : support === "unverified"
                         ? "Reasoning support is unverified for this profile. The provider validates each choice."
-                        : "Effort affects the model. Showing thinking only changes the display."}
+                        : "Effort affects the model. Expanding thinking only changes the display."}
                   </p>
                 </>
               )}
@@ -674,7 +674,7 @@ export function Composer(props: Props) {
           </button>
         </div>
       )}
-      <div className="composer-hint">
+      <div className={`composer-hint ${props.running ? "running" : ""}`}>
         <span>
           {props.running
             ? "Your instruction arrives at Medha’s next step."

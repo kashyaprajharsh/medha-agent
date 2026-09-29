@@ -278,6 +278,10 @@ pub enum ProviderError {
     ProgressTimeout { waited_secs: u64 },
     #[error("decode error: {0}")]
     Decode(String),
+    #[error(
+        "model response was truncated at its output limit; no tools from this response were executed. Retry with smaller writes or adjust the output allowance"
+    )]
+    Truncated,
     #[error("provider returned status {0}: {1}")]
     Status(u16, String),
     /// A rate limit or server error which stated when to come back. Held apart
@@ -354,6 +358,7 @@ impl ProviderError {
                 }
             }
             ProviderError::Decode(_)
+            | ProviderError::Truncated
             | ProviderError::ResponseTimeout { .. }
             | ProviderError::ProgressTimeout { .. } => ProviderFailure::Fatal,
             ProviderError::Response(message) => classify_rejection(None, message),

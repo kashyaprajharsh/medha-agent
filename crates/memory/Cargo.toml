@@ -17,4 +17,5 @@ tokio.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
+test-support = { path = "../test-support" }
 futures.workspace = true

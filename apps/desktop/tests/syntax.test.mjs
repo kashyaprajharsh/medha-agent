@@ -8,21 +8,31 @@ import hljs from "highlight.js/lib/common";
 
 // Execute the actual worker source off the main thread. The small adapter maps
 // browser postMessage/onmessage to Node's worker-thread transport for this test.
-const source = await readFile(
-  new URL("../src/syntax.worker.ts", import.meta.url),
-  "utf8",
-);
-let { outputText } = ts.transpileModule(source, {
-  compilerOptions: {
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.ESNext,
-  },
+async function moduleUrl(name, imports) {
+  const source = await readFile(new URL(`../src/${name}.ts`, import.meta.url), "utf8");
+  let { outputText } = ts.transpileModule(source, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  });
+  for (const [from, to] of Object.entries(imports))
+    outputText = outputText.replace(`"${from}"`, JSON.stringify(to));
+  return `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`;
+}
+const highlightUrl = await moduleUrl("highlight", {
+  "highlight.js/lib/common": import.meta.resolve("highlight.js/lib/common"),
 });
-outputText = outputText.replace(
-  '"highlight.js/lib/common"',
-  JSON.stringify(import.meta.resolve("highlight.js/lib/common")),
-);
-const url = `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`;
+const { highlightCode } = await import(highlightUrl);
+const url = await moduleUrl("syntax.worker", { "./highlight": highlightUrl });
+
+test("an unnamed block is coloured only on a confident guess; unknown names stay plain", () => {
+  const plain = (html) => !html.includes("hljs-");
+  assert.ok(plain(highlightCode("plain fenced code without a language")), "prose is not CSS");
+  assert.ok(plain(highlightCode("submission.zip\n├── agent.yaml\n└── configs/")), "a tree is not Python");
+  assert.ok(plain(highlightCode("fn main() {}", "output")), "an unknown name is not guessed");
+  assert.equal(highlightCode("a < b && \"c\"", "output"), "a &lt; b &amp;&amp; &quot;c&quot;");
+  assert.ok(highlightCode("fn main() {}", "rust").includes("hljs-keyword"), "a named language is trusted");
+  const js = 'const x = await fetch(url);\nif (!x.ok) throw new Error("bad");\nexport default function f() { return x; }';
+  assert.ok(highlightCode(js).includes("hljs-keyword"), "real code still gets colour");
+});
 
 test("large automatic syntax highlighting runs off-thread and retains escaped coloured output", async (t) => {
   const worker = new Worker(

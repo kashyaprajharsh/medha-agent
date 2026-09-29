@@ -340,11 +340,15 @@ fn role_label(role: &Role) -> &'static str {
     }
 }
 
+fn length_target(output_cap: u64) -> String {
+    format!("\n\nKeep the summary under {output_cap} tokens.")
+}
+
 /// The trailing instruction appended after a replayed prefix. `anchor` opens the
 /// last message to summarize; without one the whole replay is in scope, which
 /// re-covers the verbatim tail rather than risking a short summary.
-fn replay_instruction(previous: Option<&str>, anchor: Option<&str>) -> String {
-    let base = crate::prompts::compaction_summary();
+fn replay_instruction(previous: Option<&str>, anchor: Option<&str>, output_cap: u64) -> String {
+    let base = crate::prompts::compaction_summary() + &length_target(output_cap);
     let prev = previous.map_or_else(String::new, |prev| {
         format!("\n\n=== previous summary (update it) ===\n{prev}")
     });
@@ -514,6 +518,50 @@ impl<P: kernel::Provider + 'static> LlmSummarizer<P> {
         if tokens >= u64::from(budget.usable_input_tokens.unwrap_or(0)) {
             return Ok(None);
         }
+        let left = limits
+            .max_combined_tokens
+            .and_then(|window| {
+                kernel::ContextPressure::new(
+                    tokens,
+                    Some(window.min(u64::from(u32::MAX)) as u32),
+                    quality,
+                )
+                .usable_input_tokens
+            })
+            .map(|usable| u64::from(usable).saturating_sub(tokens));
+        let room = match (left, limits.max_output_tokens) {
+            (Some(left), Some(max)) => Some(left.min(max)),
+            (left, max) => left.or(max),
+        }
+        .filter(|room| effort != Some(kernel::ReasoningEffort::None) && *room > output_cap);
+        let (request, output_cap) = match room {
+            Some(room) => match self
+                .provider
+                .with_output_limit(&request, room)
+                .map_err(SummarizeError::Provider)?
+            {
+                Some(wider)
+                    if self.provider.token_accounting_mode()
+                        != kernel::TokenAccountingMode::Strict
+                        || tokio::time::timeout_at(
+                            progress_deadline,
+                            self.provider.count_input_tokens(&wider),
+                        )
+                        .await
+                        .map_err(summary_stalled)?
+                        .ok()
+                        .flatten()
+                        .is_some_and(|count| {
+                            count.request_fingerprint == wider.request_fingerprint
+                                && count.quality == kernel::TokenCountQuality::Authoritative
+                        }) =>
+                {
+                    (wider, room)
+                }
+                _ => (request, output_cap),
+            },
+            None => (request, output_cap),
+        };
         let mut stream =
             tokio::time::timeout_at(progress_deadline, self.provider.stream_prepared(&request))
                 .await
@@ -546,10 +594,15 @@ impl<P: kernel::Provider + 'static> LlmSummarizer<P> {
                 }
                 Ok(Block::Usage(usage)) if u64::from(usage.completion_tokens) >= output_cap => {
                     return Err(SummarizeError::Invalid(
-                        "summary exhausted its output allowance; refusing a partial handoff".into(),
+                        "summary hit its output limit; refusing a partial handoff".into(),
                     ));
                 }
                 Ok(_) => {} // ignore reasoning/tool/usage blocks
+                Err(kernel::ProviderError::Truncated) => {
+                    return Err(SummarizeError::Invalid(
+                        "summary hit its output limit; refusing a partial handoff".into(),
+                    ));
+                }
                 Err(e) => return Err(SummarizeError::Provider(e)),
             }
         }
@@ -617,16 +670,16 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
     ) -> Result<String, SummarizeError> {
         use kernel::{CompiledContext, Message};
 
+        let output_cap = self.output_cap(previous, items);
         let ctx = CompiledContext {
             model: String::new(),
             messages: vec![
-                Message::system(crate::prompts::compaction_summary()),
+                Message::system(crate::prompts::compaction_summary() + &length_target(output_cap)),
                 Message::user(Self::blob(previous, items)?),
             ],
             ordered: None,
             tools: Vec::new(),
         };
-        let output_cap = self.output_cap(previous, items);
         self.run(&ctx, output_cap).await?.ok_or_else(|| {
             SummarizeError::Unavailable("summary input exceeds its token budget".into())
         })
@@ -662,13 +715,14 @@ impl<P: kernel::Provider + 'static> Summarizer for LlmSummarizer<P> {
                 "previous summary exceeds the compactor input limit".into(),
             ));
         }
-        let instruction = kernel::Message::user(replay_instruction(previous, anchor));
+        let output_cap = self.output_cap(previous, items);
+        let instruction = kernel::Message::user(replay_instruction(previous, anchor, output_cap));
         let mut ctx = sent.clone();
         if let Some(ordered) = ctx.ordered.as_mut() {
             ordered.push(instruction.ordered());
         }
         ctx.messages.push(instruction);
-        if let Some(text) = self.run(&ctx, self.output_cap(previous, items)).await? {
+        if let Some(text) = self.run(&ctx, output_cap).await? {
             tracing::info!(
                 messages = ctx.messages.len(),
                 tools = ctx.tools.len(),
@@ -846,6 +900,7 @@ impl Summarizer for ExtractiveSummarizer {
                 matches!(item.role, Role::Assistant | Role::Tool)
                     && item.kind != ItemKind::Summary
                     && !item.content.starts_with(EXTRACTIVE_PREFIX)
+                    && !item.content.starts_with(crate::handoff::SUMMARY_FRAME)
                     && !item.content.trim().is_empty()
             })
             .take(8)

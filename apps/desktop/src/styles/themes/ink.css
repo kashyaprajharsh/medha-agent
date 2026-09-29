@@ -1,0 +1,40 @@
+/* Ink: the default dark theme. Slate with a whisper of blue; gold is rationed to accents. */
+:root {
+  color-scheme: dark;
+  --side: #121317;
+  --canvas: #16171b;
+  --raised: #1e1f24;
+  --overlay: #25272d;
+  --hover: rgba(230, 232, 240, 0.05);
+  --press: rgba(230, 232, 240, 0.08);
+  --hair: rgba(230, 232, 240, 0.075);
+  --line: rgba(230, 232, 240, 0.13);
+  --line-strong: #5d606b;
+  --text: #e9eaee;
+  --dim: #adb0ba;
+  --faint: #878a95;
+  --gold: #dfb46c;
+  --gold-hi: #efcd90;
+  --gold-ink: #16171b;
+  --gold-wash: rgba(223, 180, 108, 0.12);
+  --code: #dbc090;
+  --link: #e5c184;
+  --ok: #96c480;
+  --err: #e27864;
+  --warn: #e4b262;
+  --comet: #fff6d6;
+  --logo-top: #fff8e0;
+  --logo-mid: #e6b054;
+  --logo-base: #966c38;
+  --logo-tile: #0f1013;
+  --scrim: rgba(8, 9, 12, 0.55);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+  --e1-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+  --e2-shadow: 0 2px 6px rgba(0, 0, 0, 0.22), 0 18px 44px rgba(0, 0, 0, 0.42);
+  --syntax-keyword: #c5a5ed;
+  --syntax-string: #a9ca95;
+  --syntax-number: #e2ba87;
+  --syntax-function: #8fc6e7;
+  --syntax-comment: #9a9fa7;
+  --syntax-attr: #e7a2a2;
+}

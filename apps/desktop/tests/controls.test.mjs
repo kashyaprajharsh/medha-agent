@@ -22,6 +22,10 @@ for (const name of [
 const { createRoot } = await import("react-dom/client");
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 globalThis.matchMedia = () => ({ matches: true });
+globalThis.ResizeObserver = class {
+  observe() {}
+  disconnect() {}
+};
 globalThis.__medhaControlsTest = { active: true, api: {} };
 const modules = new Map([
   [
@@ -709,6 +713,23 @@ test("calendar groups do not put last Sunday's session into this week's Monday",
   );
 });
 
+test("a long compaction says so instead of looking stuck on Working", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive, recordSent } = await import(await moduleUrl("live"));
+  const event = (kind, params = {}) => ({ method: "event", params: { kind, ...params } });
+  let state = recordSent(startingLive(), { kind: "user", id: "u", text: "forget it", ts: 1 });
+  state = reduceLive(state, { method: "ready", params: { session: "s" } });
+  const status = () => document.querySelector(".live-status > span:last-child")?.textContent;
+  const render = () =>
+    root.render(h(LiveTail, { state, showReasoning: false, onAnswer() {}, onApprove() {}, onOpenAgent() {} }));
+  state = reduceLive(state, event("compacting", { active: true }));
+  await act(render);
+  assert.match(status(), /Condensing earlier messages/);
+  state = reduceLive(state, event("compacting", { active: false }));
+  await act(render);
+  assert.equal(status(), "Working");
+});
+
 test("live follow-ups render between agent responses and pending ones stay at the bottom", async () => {
   const { LiveTail } = await import(await moduleUrl("LiveTail"));
   const { reduceLive, startingLive, recordSent } = await import(
@@ -856,6 +877,78 @@ test("closed work groups update completed steps and release their spinners", asy
   );
   assert.equal(document.querySelectorAll(".step.running .spinner").length, 0);
   assert.equal(document.querySelectorAll(".step.running").length, 0);
+});
+
+test("a long message folds behind Show more only when it overflows", async () => {
+  const { UserText } = await import(await moduleUrl("UserText"));
+  const proto = dom.window.HTMLElement.prototype;
+  const tall = (height) =>
+    Object.defineProperty(proto, "scrollHeight", { configurable: true, get: () => height });
+  Object.defineProperty(proto, "clientHeight", { configurable: true, get: () => 150 });
+  try {
+    tall(150);
+    await act(() => root.render(h(UserText, { text: "short" })));
+    assert.equal(document.querySelector(".you-toggle"), null, "nothing hidden, no toggle");
+
+    tall(900);
+    await act(() => root.render(h(UserText, { text: "long\n".repeat(12) })));
+    const toggle = document.querySelector(".you-toggle");
+    assert.equal(toggle.textContent, "Show more");
+    assert.match(document.querySelector(".you-text p").className, /folded faded/);
+    await act(() => toggle.click());
+    assert.equal(toggle.getAttribute("aria-expanded"), "true");
+    assert.equal(toggle.textContent, "Show less");
+    assert.equal(document.querySelector(".you-text p").className, "");
+  } finally {
+    delete proto.scrollHeight;
+    delete proto.clientHeight;
+  }
+});
+
+test("a paste past the limit is a card whose sheet shows all of it and closes on Escape", async () => {
+  const { UserText } = await import(await moduleUrl("UserText"));
+  const text = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join("\n");
+  await act(() => root.render(h(UserText, { text })));
+  const card = document.querySelector(".pasted");
+  assert.equal(document.querySelector(".you-text p"), null, "no inline wall of text");
+  assert.match(card.textContent, /Pasted content/);
+  assert.match(card.querySelector(".pasted-size").textContent, /^40 lines/);
+  assert.equal(card.querySelector(".pasted-preview").textContent, "line 1\nline 2");
+
+  await act(() => card.click());
+  const sheet = document.body.querySelector(".pasted-sheet");
+  assert.equal(sheet.getAttribute("role"), "dialog");
+  assert.equal(sheet.querySelector(".pasted-body").textContent, text);
+  let reachedApp = false;
+  const app = () => (reachedApp = true);
+  window.addEventListener("keydown", app);
+  await act(() =>
+    window.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape" })),
+  );
+  window.removeEventListener("keydown", app);
+  assert.equal(document.body.querySelector(".pasted-sheet"), null);
+  assert.equal(reachedApp, false, "Escape closes the sheet only");
+
+  await act(() => root.render(h(UserText, { text: "a short question" })));
+  assert.equal(document.querySelector(".pasted"), null);
+});
+
+test("thinking stays in the chat as a collapsed row that opens on click", async () => {
+  const { Transcript } = await import(await moduleUrl("Transcript"));
+  const blocks = [
+    { kind: "user", id: "u", text: "hii", ts: 1 },
+    { kind: "reasoning", id: "r", text: "A greeting.", durationMs: 1200, ts: 2 },
+    { kind: "assistant", id: "a", text: "Hey!", ts: 3 },
+  ];
+  const head = () => document.querySelector(".thought-head");
+  await act(() => root.render(h(Transcript, { blocks, showReasoning: false })));
+  assert.equal(head().textContent, "Thought for 1.2s");
+  assert.equal(head().getAttribute("aria-expanded"), "false");
+  await click(head());
+  assert.equal(head().getAttribute("aria-expanded"), "true");
+  await act(() => root.render(h(Transcript, { blocks, showReasoning: true })));
+  assert.equal(head().getAttribute("aria-expanded"), "true");
+  assert.equal(document.querySelectorAll(".turn-head").length, 1);
 });
 
 test("Markdown adds only one copy control under StrictMode effect replay", async () => {

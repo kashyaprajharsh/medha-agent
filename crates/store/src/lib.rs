@@ -1576,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_window_and_bookends_return_verbatim_prior_session_events() {
-        let dir = std::env::temp_dir().join(format!("medha-session-search-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-session-search");
         let log = SqliteLog::open(dir.join("events.db")).unwrap();
         let session = kernel::Session::new();
         let first = log
@@ -1619,7 +1619,7 @@ mod tests {
 
     #[tokio::test]
     async fn automation_hits_are_demoted_not_excluded() {
-        let dir = std::env::temp_dir().join(format!("medha-session-source-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-session-source");
         let log = SqliteLog::open(dir.join("events.db")).unwrap();
         let automated = kernel::Session::new();
         let mut cron = Event::user_message(&automated, "shared retrieval phrase");
@@ -1700,7 +1700,7 @@ mod tests {
 
     #[tokio::test]
     async fn opening_an_old_database_backfills_the_fts_mirror_once() {
-        let dir = std::env::temp_dir().join(format!("medha-session-backfill-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-session-backfill");
         let db = dir.join("events.db");
         let session = kernel::Session::new();
         {
@@ -1727,7 +1727,7 @@ mod tests {
 
     #[test]
     fn artifacts_roundtrip_and_reject_traversal() {
-        let dir = std::env::temp_dir().join(format!("medha-art-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-art");
         let store = FileArtifactStore::open(&dir).unwrap();
         let hash = store.put(b"hello world").unwrap();
         assert_eq!(store.size(&hash).unwrap(), 11);
@@ -2159,7 +2159,7 @@ mod tests {
 
     #[tokio::test]
     async fn persists_and_chains() {
-        let dir = std::env::temp_dir().join(format!("medha-store-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-store");
         let db = dir.join("events.db");
         let session = Ulid::new();
         let s = kernel::Session {
@@ -2285,7 +2285,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_detects_tampering() {
-        let dir = std::env::temp_dir().join(format!("medha-verify-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-verify");
         let db = dir.join("events.db");
         let s = kernel::Session {
             id: Ulid::new(),

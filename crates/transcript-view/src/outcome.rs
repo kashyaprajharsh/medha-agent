@@ -6,12 +6,20 @@ use serde_json::Value;
 /// diff, reports. Never the raw JSON the model was given.
 #[derive(Debug, Default, PartialEq)]
 pub struct Outcome {
+    pub error_code: Option<&'static str>,
     pub summary: Option<String>,
     pub output: Option<String>,
     pub detail: Option<String>,
 }
 
 pub(crate) fn outcome(name: &str, ok: bool, out: &Value) -> Outcome {
+    if !ok && text(out, "error_code") == Some("tool_unavailable") {
+        return Outcome {
+            error_code: Some("tool_unavailable"),
+            detail: failure_detail(out),
+            ..Outcome::default()
+        };
+    }
     let detail = (!ok).then(|| failure_detail(out)).flatten();
     let only_reason = out.as_object().is_some_and(|object| {
         object
@@ -19,6 +27,7 @@ pub(crate) fn outcome(name: &str, ok: bool, out: &Value) -> Outcome {
             .all(|key| key == "error" || key == "reason" || key.starts_with('_'))
     });
     Outcome {
+        error_code: None,
         summary: summary(name, out),
         output: (!only_reason)
             .then(|| body(name, out))

@@ -16,6 +16,7 @@ import { Spinner } from "./Spinner";
 import { PlanCard, Reasoning, StepGroup } from "./Steps";
 import { clock } from "./timeline";
 import { TurnHead } from "./Transcript";
+import { UserText } from "./UserText";
 
 type Props = {
   state: LiveState;
@@ -47,24 +48,25 @@ export const LiveTail = memo(function LiveTail({
     working &&
     state.approvals.length === 0 &&
     state.questions.length === 0 &&
-    (!last ||
+    (state.activity?.kind === "compacting" ||
+      !last ||
       last.kind === "user" ||
       queued.length > 0 ||
       (last.kind === "tools" &&
         !last.steps.some((step) => step.status === "running")) ||
-      (last.kind === "reasoning" &&
-        (last.ended !== undefined || !showReasoning)));
+      (last.kind === "reasoning" && last.ended !== undefined));
   const gapLabel =
     state.status === "starting"
       ? "Starting Medha…"
-      : last && last.kind !== "reasoning"
-        ? "Working"
-        : "Thinking";
+      : state.activity?.kind === "compacting"
+        ? "Condensing earlier messages to fit the model’s context…"
+        : last && last.kind !== "reasoning"
+          ? "Working"
+          : "Thinking";
   return (
     <div className="live-tail" aria-live="polite">
       {state.items.map((item, index) => {
-        const visible = item.kind !== "reasoning" || showReasoning;
-        const first = item.kind !== "user" && !replying && visible;
+        const first = item.kind !== "user" && !replying;
         if (item.kind === "user") replying = false;
         else if (first) replying = true;
         return (
@@ -166,9 +168,14 @@ export const LiveTail = memo(function LiveTail({
   function renderItem(item: LiveItem, index: number) {
     if (item.kind === "user") return <UserMessage message={item} />;
     if (item.kind === "reasoning")
-      return showReasoning ? (
-        <Reasoning text={item.text} started={item.started} ended={item.ended} />
-      ) : null;
+      return (
+        <Reasoning
+          text={item.text}
+          started={item.started}
+          ended={item.ended}
+          expanded={showReasoning}
+        />
+      );
     if (item.kind === "tools") return <StepGroup steps={item.steps} live />;
     if (item.kind === "plan") return <PlanCard plan={item.plan} />;
     const streaming = working && index === state.items.length - 1;
@@ -194,7 +201,7 @@ const UserMessage = memo(function UserMessage({
       <span className="you-mark" aria-hidden="true">
         ›
       </span>
-      <p>{message.text}</p>
+      <UserText text={message.text} />
       <time>{clock(message.ts)}</time>
     </div>
   );

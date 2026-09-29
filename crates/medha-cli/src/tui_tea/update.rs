@@ -6464,23 +6464,27 @@ mod fix_tests {
         );
     }
 
-    fn model() -> Model {
-        let dir = std::env::temp_dir().join(format!("medha-upd-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
-        Model::new(
+    /// The model and its workspace, which is removed when the test drops it.
+    fn model() -> (Model, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix("medha-upd-")
+            .tempdir()
+            .unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(dir.path()).unwrap());
+        let model = Model::new(
             "m".into(),
             None,
             kernel::ReasoningConfig::default(),
             lockfile::UiConfig::default(),
             HashMap::new(),
             sbx,
-        )
+        );
+        (model, dir)
     }
 
     #[test]
     fn cache_usage_is_weighted_unknown_is_excluded_and_session_boundary_resets() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = Vec::new();
         for (prompt, cached) in [(100, Some(75)), (900, Some(900)), (500, None)] {
@@ -6517,7 +6521,7 @@ mod fix_tests {
 
     #[test]
     fn context_meter_and_status_use_the_compiler_budget_and_reset_with_session() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         m.max_ctx = Some(1_000_000); // Deliberately different from the active budget.
         let mut session = Session::new();
         let mut transcript = vec![Message::user("unrelated UI transcript")];
@@ -6540,9 +6544,17 @@ mod fix_tests {
         assert!(m.context_pressure.is_none());
     }
 
-    fn input_kernel() -> Arc<Kernel<providers::OpenAiCompat, kernel::InMemoryLog>> {
-        let dir = std::env::temp_dir().join(format!("medha-input-{}", ulid::Ulid::new()));
-        Arc::new(Kernel::new(
+    /// The kernel and its artifact folder, which is removed when the test drops it.
+    fn input_kernel() -> (
+        Arc<Kernel<providers::OpenAiCompat, kernel::InMemoryLog>>,
+        tempfile::TempDir,
+    ) {
+        let scratch = tempfile::Builder::new()
+            .prefix("medha-input-")
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path();
+        let kernel = Arc::new(Kernel::new(
             Arc::new(providers::OpenAiCompat::new("http://localhost/v1", "", "m")),
             Arc::new(kernel::InMemoryLog::new()),
             Arc::new(tools::ToolRegistry::new()),
@@ -6551,7 +6563,8 @@ mod fix_tests {
             Arc::new(kernel::AllowAll),
             Arc::new(kernel::AutoDeny),
             Arc::new(kernel::NoVerify),
-        ))
+        ));
+        (kernel, scratch)
     }
 
     fn drop_png(root: &std::path::Path, name: &str) -> std::path::PathBuf {
@@ -6572,8 +6585,8 @@ mod fix_tests {
     /// attachment, not a wall of path characters in the composer.
     #[tokio::test]
     async fn a_dropped_image_becomes_an_attachment_instead_of_composer_text() {
-        let mut m = model();
-        let kernel = input_kernel();
+        let (mut m, _workspace) = model();
+        let (kernel, _artifacts) = input_kernel();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -6612,8 +6625,8 @@ mod fix_tests {
     /// attachment; the path is not part of the message.
     #[tokio::test]
     async fn a_dropped_screenshot_path_does_not_travel_as_text() {
-        let mut m = model();
-        let kernel = input_kernel();
+        let (mut m, _workspace) = model();
+        let (kernel, _artifacts) = input_kernel();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         let budget = Budget::default();
@@ -6651,8 +6664,8 @@ mod fix_tests {
 
     #[tokio::test]
     async fn a_path_inside_a_sentence_attaches_and_stays_in_the_sentence() {
-        let mut m = model();
-        let kernel = input_kernel();
+        let (mut m, _workspace) = model();
+        let (kernel, _artifacts) = input_kernel();
         let session = Session::new();
         let (tx, _rx) = mpsc::unbounded_channel();
         drop_png(m.restore.root(), "shot.png");
@@ -6672,8 +6685,8 @@ mod fix_tests {
     /// sending the path as bare text.
     #[tokio::test]
     async fn enter_holds_the_turn_until_a_typed_path_is_admitted() {
-        let mut m = model();
-        let kernel = input_kernel();
+        let (mut m, _workspace) = model();
+        let (kernel, _artifacts) = input_kernel();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         let budget = Budget::default();
@@ -6830,7 +6843,7 @@ mod fix_tests {
 
     #[test]
     fn memory_picker_shows_trust_age_and_provenance_action() {
-        let dir = std::env::temp_dir().join(format!("medha-memory-notice-{}", ulid::Ulid::new()));
+        let dir = test_support::scratch("medha-memory-notice");
         let store = memory::MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6905,7 +6918,7 @@ mod fix_tests {
 
     #[test]
     fn begin_search_setup_opens_provider_picker() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         begin_search_setup(&mut m);
         assert!(m.search_setup.is_some(), "a draft must be started");
         assert!(
@@ -6931,7 +6944,11 @@ mod fix_tests {
 
     #[test]
     fn load_skill_injects_procedure_into_transcript() {
-        let dir = std::env::temp_dir().join(format!("medha-loadskill-{}", ulid::Ulid::new()));
+        let scratch = tempfile::Builder::new()
+            .prefix("medha-loadskill-")
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path();
         let user = dir.join("skills");
         std::fs::create_dir_all(user.join("greet")).unwrap();
         std::fs::write(
@@ -6940,7 +6957,8 @@ mod fix_tests {
         )
         .unwrap();
         let store = Arc::new(tools::SkillStore::new(dir.join("noproj"), Some(user)));
-        let mut m = model().with_skills(store, std::collections::HashSet::new());
+        let (m, _workspace) = model();
+        let mut m = m.with_skills(store, std::collections::HashSet::new());
         let mut transcript = vec![Message::system("S")];
 
         load_skill_by_name(&mut m, "greet", &mut transcript);
@@ -6961,7 +6979,6 @@ mod fix_tests {
 
         load_skill_by_name(&mut m, "", &mut transcript);
         assert!(matches!(&m.picker, Some(p) if matches!(p.kind, PickerKind::Skill(_))));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -6973,7 +6990,7 @@ mod fix_tests {
 
     #[test]
     fn plan_mode_is_discoverable_and_cannot_change_during_owned_work() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         assert!(matches!(classify_slash("plan"), SlashAction::SwitchMode(mode) if mode == "plan"));
         open_mode_picker(&mut m);
         assert!(
@@ -7002,7 +7019,7 @@ mod fix_tests {
     #[test]
     fn reasoning_picker_applies_xhigh_and_resets_to_auto() {
         let provider = providers::OpenAiCompat::new("http://localhost/v1", "", "m");
-        let mut m = model();
+        let (mut m, _workspace) = model();
         open_reasoning_panel(&mut m, &provider);
         m.picker.as_mut().unwrap().selected = 2;
         handle_reasoning_picker_key(
@@ -7043,7 +7060,7 @@ mod fix_tests {
     fn startup_approval_is_visible_and_readable_across_terminal_sizes() {
         use ratatui::{Terminal, backend::TestBackend};
         for (width, height) in [(32, 12), (80, 24), (120, 36)] {
-            let mut m = model();
+            let (mut m, _workspace) = model();
             m.model = "a-provider-model-name-that-is-longer-than-a-small-terminal".into();
             let (responder, _rx) = oneshot::channel();
             m.pending_approvals.push_back(PendingApproval {
@@ -7111,7 +7128,7 @@ mod fix_tests {
     #[test]
     fn approval_review_can_scroll_expand_and_return_without_answering() {
         use ratatui::{Terminal, backend::TestBackend};
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let (responder, mut rx) = oneshot::channel();
         m.pending_approvals.push_back(PendingApproval {
             action: "shell.exec".into(),
@@ -7167,7 +7184,7 @@ mod fix_tests {
     #[test]
     fn unified_reasoning_command_controls_every_setting() {
         let provider = providers::OpenAiCompat::new("http://localhost/v1", "", "m");
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let transcript = vec![Message::system("S")];
 
         run_slash(&mut m, "reasoning on", &transcript, &provider);
@@ -7205,8 +7222,8 @@ mod fix_tests {
 
     #[test]
     fn running_reasoning_panel_consumes_first_esc_then_second_cancels() {
-        let kernel = input_kernel();
-        let mut m = model();
+        let (kernel, _artifacts) = input_kernel();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         let budget = Budget::default();
@@ -7255,8 +7272,8 @@ mod fix_tests {
             }
         }
 
-        let kernel = input_kernel();
-        let mut m = model();
+        let (kernel, _artifacts) = input_kernel();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         let budget = Budget::default();
@@ -7486,7 +7503,7 @@ mod fix_tests {
             }
         }
 
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         let (started_tx, started_rx) = oneshot::channel();
@@ -7533,7 +7550,7 @@ mod fix_tests {
 
     #[test]
     fn stale_cancelled_approval_event_is_denied_before_it_can_reach_a_later_turn() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         let old_cancel = CancellationToken::new();
@@ -7612,8 +7629,8 @@ mod fix_tests {
 
     #[test]
     fn ctrl_d_remains_a_global_exit_while_a_running_picker_is_open() {
-        let kernel = input_kernel();
-        let mut m = model();
+        let (kernel, _artifacts) = input_kernel();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         let budget = Budget::default();
@@ -7640,8 +7657,8 @@ mod fix_tests {
 
     #[test]
     fn hidden_picker_does_not_steal_esc_from_a_visible_approval() {
-        let kernel = input_kernel();
-        let mut m = model();
+        let (kernel, _artifacts) = input_kernel();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         let budget = Budget::default();
@@ -7677,7 +7694,7 @@ mod fix_tests {
 
     #[test]
     fn reasoning_delivery_is_recorded_when_turn_finishes() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
 
@@ -7713,7 +7730,7 @@ mod fix_tests {
 
     #[test]
     fn clear_truncates_transcript_and_starts_fresh_session() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let old_id = session.id;
         let mut transcript = vec![
@@ -7739,7 +7756,7 @@ mod fix_tests {
 
     #[test]
     fn clear_is_refused_mid_turn() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         m.running = true;
         let mut session = Session::new();
         let id = session.id;
@@ -7755,7 +7772,7 @@ mod fix_tests {
 
     #[tokio::test]
     async fn deny_pending_approvals_answers_and_clears_the_queue() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let (tx, rx) = oneshot::channel();
         m.pending_approvals.push_back(PendingApproval {
             action: "shell.exec".into(),
@@ -7781,7 +7798,7 @@ mod fix_tests {
             (KeyCode::Char('4'), kernel::NetworkDecision::Deny),
             (KeyCode::Char('n'), kernel::NetworkDecision::Deny),
         ] {
-            let mut m = model();
+            let (mut m, _workspace) = model();
             let (tx, mut rx) = oneshot::channel();
             m.pending_approvals.push_back(PendingApproval {
                 action: "network access".into(),
@@ -7799,7 +7816,7 @@ mod fix_tests {
 
     #[test]
     fn network_card_arrow_wrap_covers_all_four_options() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let (tx, _rx) = oneshot::channel();
         m.pending_approvals.push_back(PendingApproval {
             action: "network access".into(),
@@ -7864,7 +7881,7 @@ mod fix_tests {
 
     #[test]
     fn clarify_enter_submits_the_recommended_default() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let (tx, mut rx) = oneshot::channel();
         m.clarify = Some(clarify_state(false, Some(0), tx)); // Postgres pre-selected
         handle_clarify_key(&mut m, kc(KeyCode::Enter));
@@ -7875,7 +7892,7 @@ mod fix_tests {
 
     #[test]
     fn clarify_space_toggles_multi_select() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let (tx, mut rx) = oneshot::channel();
         m.clarify = Some(clarify_state(true, None, tx));
         handle_clarify_key(&mut m, kc(KeyCode::Char(' ')));
@@ -7891,7 +7908,7 @@ mod fix_tests {
 
     #[test]
     fn clarify_esc_dismisses_with_none() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let (tx, mut rx) = oneshot::channel();
         m.clarify = Some(clarify_state(false, Some(0), tx));
         handle_clarify_key(&mut m, kc(KeyCode::Esc));
@@ -7904,7 +7921,7 @@ mod fix_tests {
 
     #[test]
     fn clarify_enter_commits_the_focused_radio_option() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let (tx, mut rx) = oneshot::channel();
         let mut state = clarify_state(false, Some(0), tx);
         state.cursor = 1; // move focus away from the recommended Postgres row
@@ -7918,7 +7935,7 @@ mod fix_tests {
 
     #[test]
     fn clarify_rejects_an_unanswered_radio_question() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let (tx, _rx) = oneshot::channel();
         m.clarify = Some(clarify_state(false, None, tx));
 
@@ -7931,7 +7948,7 @@ mod fix_tests {
 
     #[test]
     fn clarify_other_is_unicode_safe_and_preserves_the_composer() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         m.input = "keep this steer".into();
         m.cursor = m.input.len();
         let (tx, _rx) = oneshot::channel();
@@ -8126,18 +8143,21 @@ mod retry_render_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn model() -> Model {
-        let dir = std::env::temp_dir().join(format!("medha-retry-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
-        Model::new(
+    fn model() -> (Model, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix("medha-retry-")
+            .tempdir()
+            .unwrap();
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(dir.path()).unwrap());
+        let model = Model::new(
             "m".into(),
             None,
             kernel::ReasoningConfig::default(),
             lockfile::UiConfig::default(),
             HashMap::new(),
             sbx,
-        )
+        );
+        (model, dir)
     }
 
     /// Only the model's streamed output; notices are the surface talking, not
@@ -8156,7 +8176,7 @@ mod retry_render_tests {
 
     #[test]
     fn a_retry_drops_its_own_partial_reply_and_keeps_the_previous_answer() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
 
@@ -8209,7 +8229,7 @@ mod retry_render_tests {
 
     #[test]
     fn a_retry_that_streamed_nothing_removes_nothing() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         m.running = true;
@@ -8229,7 +8249,7 @@ mod retry_render_tests {
 
     #[test]
     fn a_retry_preserves_a_queued_steer_between_streamed_blocks() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
         m.running = true;
@@ -8268,35 +8288,45 @@ mod agent_pane_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn model() -> Model {
-        let dir = std::env::temp_dir().join(format!("medha-pane-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Model::new(
+    fn model() -> (Model, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix("medha-pane-")
+            .tempdir()
+            .unwrap();
+        let model = Model::new(
             "m".into(),
             None,
             kernel::ReasoningConfig::default(),
             lockfile::UiConfig::default(),
             HashMap::new(),
-            Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap()),
-        )
+            Arc::new(WorkspaceSandbox::new_jailed(dir.path()).unwrap()),
+        );
+        (model, dir)
     }
 
     fn path(name: &str) -> orchestrator::AgentPath {
         orchestrator::AgentPath::root().child(name).unwrap()
     }
 
-    fn input_kernel() -> Arc<Kernel<providers::OpenAiCompat, kernel::InMemoryLog>> {
-        let dir = std::env::temp_dir().join(format!("medha-pane-input-{}", ulid::Ulid::new()));
-        Arc::new(Kernel::new(
+    fn input_kernel() -> (
+        Arc<Kernel<providers::OpenAiCompat, kernel::InMemoryLog>>,
+        tempfile::TempDir,
+    ) {
+        let scratch = tempfile::Builder::new()
+            .prefix("medha-pane-input-")
+            .tempdir()
+            .unwrap();
+        let kernel = Arc::new(Kernel::new(
             Arc::new(providers::OpenAiCompat::new("http://localhost/v1", "", "m")),
             Arc::new(kernel::InMemoryLog::new()),
             Arc::new(tools::ToolRegistry::new()),
             Arc::new(context::PipelineEngine::default()),
-            Arc::new(store::FileArtifactStore::open(dir).unwrap()),
+            Arc::new(store::FileArtifactStore::open(scratch.path()).unwrap()),
             Arc::new(kernel::AllowAll),
             Arc::new(kernel::AutoDeny),
             Arc::new(kernel::NoVerify),
-        ))
+        ));
+        (kernel, scratch)
     }
 
     fn shown(model: &Model) -> Vec<String> {
@@ -8326,7 +8356,7 @@ mod agent_pane_tests {
 
     #[test]
     fn a_childs_stream_stays_out_of_the_conversation_until_it_is_opened() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.push_item(Item::User("the real question".into()));
         m.push_agent_step(worker.clone(), AgentStep::Text("child chatter".into()));
@@ -8343,7 +8373,7 @@ mod agent_pane_tests {
 
     #[test]
     fn returning_from_a_pane_restores_the_conversation_intact() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.push_item(Item::User("keep me".into()));
         m.push_agent_step(worker.clone(), AgentStep::Text("theirs".into()));
@@ -8359,7 +8389,7 @@ mod agent_pane_tests {
 
     #[test]
     fn steps_arriving_while_a_pane_is_open_land_in_it() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.focus_pane(Some(worker.clone()));
         m.push_agent_step(worker.clone(), AgentStep::Reasoning("mine".into()));
@@ -8374,7 +8404,7 @@ mod agent_pane_tests {
 
     #[test]
     fn foreground_events_stay_in_main_while_a_child_pane_is_open() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
@@ -8413,7 +8443,7 @@ mod agent_pane_tests {
 
     #[test]
     fn a_child_retry_rewinds_the_partial_attempt_before_streaming_again() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.push_agent_step(worker.clone(), AgentStep::Text("partial".into()));
         m.push_agent_step(
@@ -8436,7 +8466,7 @@ mod agent_pane_tests {
 
     #[test]
     fn an_unapplied_child_steer_returns_to_the_global_composer() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.input = "new draft".into();
         m.cursor = m.input.len();
@@ -8460,7 +8490,7 @@ mod agent_pane_tests {
 
     #[test]
     fn a_child_steer_keeps_the_session_boundary_owned_until_it_settles() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         m.pending_agent_steers = 1;
         assert!(m.has_active_agents());
 
@@ -8475,8 +8505,8 @@ mod agent_pane_tests {
 
     #[test]
     fn a_refused_child_steer_never_consumes_the_composer() {
-        let kernel = input_kernel();
-        let mut m = model();
+        let (kernel, _artifacts) = input_kernel();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
@@ -8503,7 +8533,7 @@ mod agent_pane_tests {
 
     #[test]
     fn an_applied_child_steer_becomes_a_user_turn_not_assistant_text() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.push_agent_step(
             worker.clone(),
@@ -8521,7 +8551,7 @@ mod agent_pane_tests {
 
     #[test]
     fn streamed_deltas_coalesce_into_one_block() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         for delta in ["a", "b", "c"] {
             m.push_agent_step(worker.clone(), AgentStep::Text(delta.into()));
@@ -8536,7 +8566,7 @@ mod agent_pane_tests {
 
     #[test]
     fn a_pane_opens_with_the_task_the_child_was_given() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.push_agent_step(
             worker.clone(),
@@ -8557,7 +8587,7 @@ mod agent_pane_tests {
 
     #[test]
     fn a_childs_pane_is_bounded_however_much_it_says() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         for n in 0..(MAX_AGENT_PANE_ITEMS + 50) {
             m.push_agent_step(
@@ -8582,7 +8612,7 @@ mod agent_pane_tests {
 
     #[test]
     fn the_switcher_keeps_the_open_pane_addressable_after_it_settles() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.focus_pane(Some(worker.clone()));
         // `agent_runs` is empty: the child has settled and left the roster.
@@ -8596,7 +8626,7 @@ mod agent_pane_tests {
 
     #[test]
     fn a_settled_pane_can_be_reopened_after_returning_to_main() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.push_agent_step(worker.clone(), AgentStep::Text("finished answer".into()));
         assert!(m.agent_runs.is_empty());
@@ -8613,7 +8643,7 @@ mod agent_pane_tests {
 
     #[test]
     fn panes_evicted_from_the_bounded_agent_registry_do_not_accumulate() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let old = path("old");
         let retained = path("retained");
         m.push_agent_step(old.clone(), AgentStep::Text("old answer".into()));
@@ -8629,8 +8659,8 @@ mod agent_pane_tests {
 
     #[test]
     fn tab_returns_from_the_last_settled_agent_to_main() {
-        let kernel = input_kernel();
-        let mut m = model();
+        let (kernel, _artifacts) = input_kernel();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
@@ -8678,8 +8708,8 @@ mod agent_pane_tests {
 
     #[test]
     fn esc_leaves_a_child_pane_without_cancelling_the_running_parent() {
-        let kernel = input_kernel();
-        let mut m = model();
+        let (kernel, _artifacts) = input_kernel();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
@@ -8712,8 +8742,8 @@ mod agent_pane_tests {
 
     #[test]
     fn an_idle_picker_owns_esc_before_the_child_pane() {
-        let kernel = input_kernel();
-        let mut m = model();
+        let (kernel, _artifacts) = input_kernel();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
@@ -8738,7 +8768,7 @@ mod agent_pane_tests {
 
     #[test]
     fn force_abort_keeps_unrelated_child_steps_and_discards_parent_tail() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S")];
@@ -8787,7 +8817,7 @@ mod agent_pane_tests {
 
     #[test]
     fn stale_child_events_cannot_cross_a_session_boundary() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         let old_session = ulid::Ulid::new();
         let mut session = Session::new();
@@ -8829,7 +8859,7 @@ mod agent_pane_tests {
 
     #[test]
     fn a_pending_resume_blocks_clear_until_its_matching_result_arrives() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let mut session = Session::new();
         let source = session.id;
         let target = ulid::Ulid::new();
@@ -8845,7 +8875,7 @@ mod agent_pane_tests {
 
     #[test]
     fn pane_scroll_offset_and_follow_mode_survive_round_trips() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.scroll_offset = 41;
         m.auto_scroll = false;
@@ -8861,7 +8891,7 @@ mod agent_pane_tests {
 
     #[test]
     fn clear_from_a_child_cannot_resurrect_the_old_main_conversation() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         let mut session = Session::new();
         let mut transcript = vec![Message::system("S"), Message::user("old question")];
@@ -8881,7 +8911,7 @@ mod agent_pane_tests {
 
     #[test]
     fn repainting_a_session_drops_panes_from_the_previous_session() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let worker = path("worker");
         m.push_item(Item::User("old main".into()));
         m.push_agent_step(worker.clone(), AgentStep::Text("old child".into()));
@@ -8897,7 +8927,7 @@ mod agent_pane_tests {
 
     #[test]
     fn switcher_selection_follows_the_selected_path_when_rows_change() {
-        let mut m = model();
+        let (mut m, _workspace) = model();
         let a = path("a");
         let b = path("b");
         m.push_agent_step(b.clone(), AgentStep::Text("b".into()));

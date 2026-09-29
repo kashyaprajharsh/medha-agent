@@ -1,0 +1,40 @@
+/* Parchment: the light theme. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --side: #f1ebdf;
+  --canvas: #f9f6ef;
+  --raised: #fffdf8;
+  --overlay: #fffdf8;
+  --hover: rgba(43, 38, 30, 0.045);
+  --press: rgba(43, 38, 30, 0.07);
+  --hair: rgba(43, 38, 30, 0.075);
+  --line: rgba(43, 38, 30, 0.14);
+  --line-strong: #a09583;
+  --text: #2b261e;
+  --dim: #6a6153;
+  --faint: #756d60;
+  --gold: #8c5c0e;
+  --gold-hi: #b8802c;
+  --gold-ink: #fff8e8;
+  --gold-wash: rgba(140, 92, 14, 0.1);
+  --code: #704a0c;
+  --link: #845410;
+  --ok: #2e6c34;
+  --err: #b23224;
+  --warn: #8e5e0c;
+  --comet: #5c380a;
+  --logo-top: #c68e32;
+  --logo-mid: #9e6618;
+  --logo-base: #683e0c;
+  --logo-tile: #16171b;
+  --scrim: rgba(43, 38, 30, 0.28);
+  --shadow: 0 20px 50px rgba(74, 56, 26, 0.18);
+  --e1-shadow: 0 1px 2px rgba(74, 56, 26, 0.06);
+  --e2-shadow: 0 2px 6px rgba(74, 56, 26, 0.06), 0 18px 44px rgba(74, 56, 26, 0.14);
+  --syntax-keyword: #7547a8;
+  --syntax-string: #3b6a30;
+  --syntax-number: #9a5616;
+  --syntax-function: #236983;
+  --syntax-comment: #77756f;
+  --syntax-attr: #a0393c;
+}

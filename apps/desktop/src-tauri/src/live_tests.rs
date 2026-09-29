@@ -67,6 +67,14 @@ fn a_tool_result_carries_readable_output_and_a_reason_when_it_fails() {
         "payload": { "error": "read failed: No such file" } } }),
     );
     assert_eq!(failed["params"]["detail"], "read failed: No such file");
+    let unavailable = clean(json!({ "method": "event", "params": {
+        "kind": "tool.observation", "id": "c3", "tool": "mcp__remote__search", "ok": false,
+        "payload": { "error_code": "tool_unavailable", "error": "Tool is unavailable",
+            "available_tools": ["read"] }
+    } }));
+    assert_eq!(unavailable["params"]["error_code"], "tool_unavailable");
+    assert_eq!(unavailable["params"]["detail"], "Tool is unavailable");
+    assert!(unavailable["params"].get("output").is_none());
 }
 
 #[test]

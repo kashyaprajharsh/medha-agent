@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+mod protected;
+pub use protected::{is_protected, protected_paths};
+
 #[derive(Debug, Error)]
 pub enum PermissionError {
     #[error("I/O error: {0}")]
@@ -22,6 +25,11 @@ pub enum PermissionError {
     Resolution(String),
     #[error("User denied access to {path}")]
     Denied { path: PathBuf },
+    #[error(
+        "{path} holds browser sessions, keychains or passwords; Medha never opens it, \
+         and no approval changes that"
+    )]
+    Protected { path: PathBuf },
     #[error("Human gate unavailable for approval")]
     NoHumanGate,
     #[error("Persistent trust file must be machine-local and outside the workspace: {path}")]
@@ -709,11 +717,21 @@ impl PermissionManager {
         detail: &str,
         escalated: bool,
     ) -> Result<NetworkDecision, PermissionError> {
+        if let Some(path) = access
+            .read_paths
+            .iter()
+            .chain(&access.write_paths)
+            .find(|path| is_protected(path))
+        {
+            return Err(PermissionError::Protected { path: path.clone() });
+        }
         let _guard = self.prompt_mutex.lock().await;
         let gate = self
             .human_gate
             .as_ref()
             .ok_or(PermissionError::NoHumanGate)?;
+        // Leaving the jail is reviewed on every run: never offer to remember it.
+        let escalated = escalated || access.outside_sandbox;
         let mut decision = gate.confirm_access(Some(detail), escalated).await;
         if escalated
             && matches!(
@@ -732,6 +750,9 @@ impl PermissionManager {
         // Record approval before publishing any capability.
         if access.network {
             self.audit_network(audit)?;
+        }
+        if access.outside_sandbox {
+            self.audit_capability("OutsideSandbox", audit)?;
         }
         for (paths, permission) in [
             (&access.read_paths, PermissionType::Read),
@@ -1036,11 +1057,15 @@ impl PermissionManager {
     }
 
     fn audit_network(&self, decision: &str) -> Result<(), PermissionError> {
+        self.audit_capability("Network", decision)
+    }
+
+    fn audit_capability(&self, capability: &str, decision: &str) -> Result<(), PermissionError> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let log_entry = format!("{timestamp} | Network | decision={decision}\n");
+        let log_entry = format!("{timestamp} | {capability} | decision={decision}\n");
         if let Some(parent) = self.audit_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| PermissionError::Io(e.to_string()))?;
         }
@@ -1094,8 +1119,9 @@ impl PermissionManager {
         // canonicalizes existing targets and the parents of prospective ones;
         // the requested permission below still controls admission.
         let resolved = self.resolve_path_for_write(path).ok()?;
-        (self.is_inside_workspace(&resolved) || self.is_trusted(&resolved, permission))
-            .then_some(resolved)
+        (!is_protected(&resolved)
+            && (self.is_inside_workspace(&resolved) || self.is_trusted(&resolved, permission)))
+        .then_some(resolved)
     }
 
     pub async fn request_permission(
@@ -1116,10 +1142,20 @@ impl PermissionManager {
         permission: PermissionType,
         detail: Option<&str>,
     ) -> Result<PathBuf, PermissionError> {
+        // Ahead of the workspace and trust checks, so neither can open a protected store.
+        let requested = self.workspace_path(path)?;
+        if is_protected(&requested) {
+            self.audit_log(path, &requested, permission, "refused (protected)")?;
+            return Err(PermissionError::Protected { path: requested });
+        }
         let resolved = match permission {
             PermissionType::Read => self.resolve_path_for_read(path)?,
             PermissionType::Write => self.resolve_path_for_write(path)?,
         };
+        if is_protected(&resolved) {
+            self.audit_log(path, &resolved, permission, "refused (protected)")?;
+            return Err(PermissionError::Protected { path: resolved });
+        }
 
         if self.is_inside_workspace(&resolved) {
             self.audit_log(path, &resolved, permission, "allowed (workspace)")?;
@@ -1250,16 +1286,14 @@ mod tests {
         }
     }
 
-    fn unique_dir(tag: &str) -> PathBuf {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("medha_perm_{tag}_{}_{n}", std::process::id()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    use test_support::Scratch;
+
+    fn unique_dir(tag: &str) -> Scratch {
+        test_support::scratch(&format!("medha_perm_{tag}"))
     }
 
-    fn machine_trust_file(tag: &str) -> PathBuf {
-        unique_dir(&format!("state_{tag}")).join("trust.lock")
+    fn machine_trust_file(tag: &str) -> Scratch {
+        unique_dir(&format!("state_{tag}")).at("trust.lock")
     }
 
     #[test]
@@ -1381,12 +1415,8 @@ mod tests {
         let target = ws.join("nested").join("file.txt");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, "workspace file").unwrap();
-        let manager = PermissionManager::new(
-            &ws,
-            machine_trust_file("relative_resolution"),
-            ws.join("audit.log"),
-        )
-        .unwrap();
+        let trust = machine_trust_file("relative_resolution");
+        let manager = PermissionManager::new(&ws, &trust, ws.join("audit.log")).unwrap();
 
         assert_eq!(
             manager
@@ -1408,12 +1438,8 @@ mod tests {
     async fn write_resolution_normalizes_parent_after_a_missing_directory() {
         let ws = unique_dir("ws_missing_parent_dir");
         std::fs::create_dir_all(ws.join("dist")).unwrap();
-        let manager = PermissionManager::new(
-            &ws,
-            machine_trust_file("missing_parent_dir"),
-            ws.join("audit.log"),
-        )
-        .unwrap();
+        let trust = machine_trust_file("missing_parent_dir");
+        let manager = PermissionManager::new(&ws, &trust, ws.join("audit.log")).unwrap();
 
         assert_eq!(
             manager
@@ -1547,7 +1573,8 @@ mod tests {
 
     #[test]
     fn concurrent_processes_preserve_every_trust_grant() {
-        let root = unique_dir("concurrent_processes").canonicalize().unwrap();
+        let scratch = unique_dir("concurrent_processes");
+        let root = scratch.canonicalize().unwrap();
         let workspace = root.join("workspace");
         let state = root.join("state");
         let grants = root.join("grants");
@@ -1670,6 +1697,53 @@ mod tests {
             self.actions.lock().unwrap().push(action.to_string());
             self.decision
         }
+    }
+
+    /// Refused before any prompt, even with "Always" and a trusted parent folder.
+    #[tokio::test]
+    async fn protected_credential_stores_are_refused_without_asking() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let ws = unique_dir("ws_protected");
+        let state = unique_dir("state_protected");
+        let asked = Arc::new(AtomicU32::new(0));
+        let mut mgr =
+            PermissionManager::new(&ws, state.join("trust.lock"), state.join("audit.log")).unwrap();
+        mgr.set_human_gate(Arc::new(CountingGate(asked.clone(), Approval::Always)));
+        mgr.trusted.allow_read(home.join(".config"));
+        mgr.trusted.allow_read(home.join("Library"));
+
+        for cookies in [
+            home.join(".config/google-chrome/Default/Cookies"),
+            home.join("Library/Application Support/Google/Chrome/Default/Cookies"),
+            home.join(".config/../.config/chromium/Default/Login Data"),
+        ] {
+            assert!(
+                matches!(
+                    mgr.request_read(&cookies).await,
+                    Err(PermissionError::Protected { .. })
+                ),
+                "{} was not refused",
+                cookies.display()
+            );
+            assert!(
+                mgr.resolve_if_permitted(&cookies, PermissionType::Read)
+                    .is_none()
+            );
+        }
+        let grant = kernel::ExecutionAccess {
+            read_paths: vec![home.join("Library/Application Support/Google")],
+            ..Default::default()
+        };
+        assert!(matches!(
+            mgr.request_execution_access(&grant, "read a profile", false)
+                .await,
+            Err(PermissionError::Protected { .. })
+        ));
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "a refusal must not prompt");
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&state).ok();
     }
 
     /// First run of a clone: even a portable grant for `/` remains inert. The
@@ -1837,9 +1911,8 @@ mod tests {
         let target = outside.join("f.txt");
 
         let asked = Arc::new(AtomicU32::new(0));
-        let mut mgr =
-            PermissionManager::new(&ws, machine_trust_file("session"), ws.join("audit.log"))
-                .unwrap();
+        let trust = machine_trust_file("session");
+        let mut mgr = PermissionManager::new(&ws, &trust, ws.join("audit.log")).unwrap();
         mgr.set_human_gate(Arc::new(CountingGate(asked.clone(), Approval::Always)));
 
         for _ in 0..3 {
@@ -1862,12 +1935,8 @@ mod tests {
         let asked = Arc::new(AtomicU32::new(0));
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let mut manager = PermissionManager::new(
-            &ws,
-            machine_trust_file("concurrent_prompt"),
-            ws.join("audit.log"),
-        )
-        .unwrap();
+        let trust = machine_trust_file("concurrent_prompt");
+        let mut manager = PermissionManager::new(&ws, &trust, ws.join("audit.log")).unwrap();
         manager.set_human_gate(Arc::new(BlockingFirstAlwaysGate {
             asked: asked.clone(),
             entered: entered.clone(),
@@ -1909,8 +1978,8 @@ mod tests {
         std::fs::write(nested.join("deep.txt"), "x").unwrap();
 
         let asked = Arc::new(AtomicU32::new(0));
-        let mut mgr =
-            PermissionManager::new(&ws, machine_trust_file("tree"), ws.join("audit.log")).unwrap();
+        let trust = machine_trust_file("tree");
+        let mut mgr = PermissionManager::new(&ws, &trust, ws.join("audit.log")).unwrap();
         mgr.set_human_gate(Arc::new(CountingGate(asked.clone(), Approval::Always)));
 
         // Trust the root, then read something several levels below it.

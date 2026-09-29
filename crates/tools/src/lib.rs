@@ -8,6 +8,8 @@ use ignore::WalkBuilder;
 use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolSpec};
 
 mod agents;
+mod browser;
+mod shell_hints;
 pub use agents::{ParentHandle, SessionHandle};
 
 pub mod hub;
@@ -933,6 +935,11 @@ impl ToolRegistry {
             count: WordCount {
                 sbx: sandbox.clone(),
             },
+            page: browser::find_browser().map(|browser| browser::BrowserScreenshot {
+                sbx: sandbox.clone(),
+                artifacts: artifacts.clone(),
+                browser,
+            }),
         }));
         r.register(Arc::new(Edit {
             write: FsWrite {
@@ -1115,6 +1122,16 @@ impl Executor for ToolRegistry {
     }
 
     fn missing_access(&self, intent: &ToolIntent) -> Result<kernel::ExecutionAccess, String> {
+        if intent.tool == "read" {
+            let sbx = self
+                .sandbox
+                .as_ref()
+                .ok_or("browser workspace is unavailable")?;
+            return Ok(kernel::ExecutionAccess {
+                network: browser::needs_network(&intent.args) && sbx.denies_network(),
+                ..Default::default()
+            });
+        }
         if intent.tool != "shell.exec" {
             return Ok(Default::default());
         }
@@ -1204,6 +1221,8 @@ struct Read {
     image: ImageView,
     artifact: ReadArtifact,
     count: WordCount,
+    /// `render: true`; absent when no Chromium-family browser is installed.
+    page: Option<browser::BrowserScreenshot>,
 }
 
 #[async_trait]
@@ -1219,6 +1238,8 @@ impl Tool for Read {
          oversized images are scaled and rotated photos made upright first. Pass \
          `count: true` for words, lines and characters instead of contents. With \
          `hash`, `offset` and `length` are byte positions into a spilled tool result. \
+         Pass `render: true` with an HTML file or http(s) URL to see the page as a \
+         screenshot; never launch a browser from the shell. A URL asks for network. \
          Supports paths outside the workspace with permission."
     }
     fn blast_radius(&self) -> BlastRadius {
@@ -1239,7 +1260,8 @@ impl Tool for Read {
                 "offset": { "type": "integer", "minimum": 0, "description": "With `path`: 1-based first line. With `hash`: start byte." },
                 "limit": { "type": "integer", "minimum": 1, "description": "With `path`: how many lines to return" },
                 "length": { "type": "integer", "minimum": 1, "description": "With `hash`: how many bytes to return" },
-                "count": { "type": "boolean", "description": "Return word/line/character counts instead of contents" }
+                "count": { "type": "boolean", "description": "Return word/line/character counts instead of contents" },
+                "render": { "type": "boolean", "description": "Screenshot the page at `path` (HTML file or URL)" }
             }
         })
     }
@@ -1249,6 +1271,16 @@ impl Tool for Read {
         }
         let path = arg_str(args, "path")
             .map_err(|_| ToolError::Args("read needs `path` or `hash`".into()))?;
+        if args.get("render").and_then(Value::as_bool) == Some(true) {
+            return match &self.page {
+                Some(page) => page.render(args).await,
+                None => Err(ToolError::Failed(
+                    "no Chrome, Chromium, Edge or Brave was found to render the page; \
+                     set MEDHA_BROWSER to a Chromium-family browser"
+                        .into(),
+                )),
+            };
+        }
         if args.get("count").and_then(Value::as_bool) == Some(true) {
             return self.count.execute(args).await;
         }
@@ -2295,8 +2327,9 @@ fn clip_marked(line: &str, max: usize) -> String {
 /// Skip build dirs that may not be gitignored (`.git`/hidden/.medha are already
 /// excluded by `standard_filters`).
 fn skip_dir(e: &ignore::DirEntry) -> bool {
-    e.file_type().map(|t| t.is_dir()).unwrap_or(false)
-        && matches!(e.file_name().to_str(), Some("target" | "node_modules"))
+    sandbox::is_protected(e.path())
+        || (e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && matches!(e.file_name().to_str(), Some("target" | "node_modules")))
 }
 
 struct Glob {
@@ -4614,8 +4647,13 @@ impl ShellPlan {
                     })?
             }
         };
+        let outside_sandbox = args
+            .get("outside_sandbox")
+            .map_or(Some(false), Value::as_bool)
+            .ok_or_else(|| ToolError::Args("outside_sandbox must be a boolean".into()))?;
         let mut access = kernel::ExecutionAccess {
             network,
+            outside_sandbox,
             ..Default::default()
         };
         for (key, paths) in [
@@ -5259,7 +5297,8 @@ impl Tool for ShellExec {
          Medha requests access before running if the sandbox denies it. Keep error \
          output visible; tail and curl -s can hide failures and prevent automatic retry. \
          For access outside the workspace, request absolute directory paths with \
-         read_paths or write_paths; approval is scoped to this command unless persisted."
+         read_paths or write_paths; approval is scoped to this command unless persisted. \
+         To see a web page use read with render: true, never a browser from here."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::IrreversibleLocal
@@ -5289,6 +5328,10 @@ impl Tool for ShellExec {
                 "write_paths": {
                     "type": "array", "maxItems": 16, "items": { "type": "string" },
                     "description": "Existing absolute directories outside the workspace that this command needs to write (also permits reads). Requests native sandbox access before running."
+                },
+                "outside_sandbox": {
+                    "type": "boolean",
+                    "description": "Last resort, only after a result reported sandbox_blocked with no narrower fix: rerun this exact command once outside the OS sandbox. The user reviews every such run; never set it speculatively."
                 },
                 "timeout_s": {
                     "type": "integer",
@@ -5387,12 +5430,19 @@ impl Tool for ShellExec {
                 && [&completed.stdout, &completed.stderr].iter().any(|text| {
                     text.contains("Operation not permitted")
                         || text.contains("Permission denied")
+                        || text.contains("blocked by sandbox")
                         || text.contains("uv_cwd")
                 });
             if denied_filesystem {
                 result["filesystem_hint"] = json!(
                     "The command may lack filesystem access. Use workdir for the intended directory and request needed directories in read_paths/write_paths before rerunning. A blocked read does not mean a file or program is missing. The command was not replayed; check for partial side effects first."
                 );
+            }
+            if denied_filesystem && invocation.jailed() && completed.exit_code != Some(0) {
+                let output = format!("{}\n{}", completed.stdout, completed.stderr);
+                if let Some(next) = shell_hints::sandbox_blocked(&command, &output, &denied_paths) {
+                    result["sandbox_blocked"] = json!(next);
+                }
             }
             self.tasks.remember(task_id, completed);
             return Ok(result);
@@ -5435,6 +5485,9 @@ impl Tool for ShellExec {
                 "shell command timed out after {timeout_s}s; process tree was stopped"
             ));
             payload["timed_out"] = Value::Bool(true);
+            if shell_hints::launches_browser(&command) {
+                payload["next_step"] = json!(shell_hints::BROWSER);
+            }
         }
         // A timeout alone says nothing about networking. Only observed
         // failures carry a network hint; the kernel never replays a shell.
@@ -6812,8 +6865,7 @@ mod tests {
 
     #[tokio::test]
     async fn references_whole_word_and_definition_flag() {
-        let dir = std::env::temp_dir().join(format!("medha-refs-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-refs");
         // `helper` is defined once and called once; `helperx` must NOT match.
         std::fs::write(
             dir.join("a.rs"),
@@ -6854,7 +6906,7 @@ mod tests {
 
     #[tokio::test]
     async fn tree_lists_nested_structure() {
-        let dir = std::env::temp_dir().join(format!("medha-tree-{}", ulid_like()));
+        let dir = test_support::scratch("medha-tree");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src").join("main.rs"), "fn main() {}").unwrap();
         std::fs::write(dir.join("README.md"), "# hi").unwrap();
@@ -6869,8 +6921,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_executes_fs_write_then_read() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
 
@@ -6897,12 +6948,11 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_registration_exposes_tools_and_annotates_rust_writes() {
-        let dir = std::env::temp_dir().join(format!("medha-lsp-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-lsp-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let mut reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
         reg.register_lsp(Arc::new(lsp::LspManager::new(
-            dir,
+            dir.to_path_buf(),
             lsp::Config {
                 enabled: false,
                 ..lsp::Config::default()
@@ -7019,8 +7069,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_plan_echoes_steps_and_counts_done() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
         let obs = reg
@@ -7042,8 +7091,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_plan_enforces_single_active_and_keeps_explanation() {
-        let dir = std::env::temp_dir().join(format!("medha-plan-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-plan");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
         let obs = reg
@@ -7097,8 +7145,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_is_denied() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
         let obs = reg
@@ -7131,8 +7178,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_artifact_pages_snap_to_char_boundaries() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let store = mem_artifacts();
         let reg = ToolRegistry::with_workspace(sbx, store.clone());
@@ -7169,7 +7215,6 @@ mod tests {
             "leading continuation bytes snapped: {c2:?}"
         );
         assert_eq!(c2, "éll");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -7244,8 +7289,7 @@ mod tests {
 
     #[tokio::test]
     async fn fs_read_streams_a_tiny_range_from_a_sparse_multigigabyte_file() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
         let path = dir.join("big.txt");
@@ -7293,13 +7337,11 @@ mod tests {
         assert_eq!(ranged.payload["bytes_scanned"], 15);
         assert_eq!(ranged.payload["has_more"], true);
         assert_eq!(ranged.payload["total_lines"], Value::Null);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn edit_refuses_when_file_changed_after_preview() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx.clone(), mem_artifacts());
 
@@ -7349,7 +7391,6 @@ mod tests {
             kernel::ObsStatus::Error,
             "stale multi_edit preview must refuse"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -7388,8 +7429,7 @@ mod tests {
 
     #[tokio::test]
     async fn fs_edit_diffs_and_grep_finds() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
 
@@ -7579,8 +7619,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_edit_writes_once_or_not_at_all() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
         reg.execute(&ToolIntent {
@@ -7630,8 +7669,7 @@ mod tests {
 
     #[tokio::test]
     async fn preview_renders_a_real_diff_without_writing() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
 
@@ -7751,8 +7789,7 @@ mod tests {
 
     #[tokio::test]
     async fn word_count_counts_lines_words_chars() {
-        let dir = std::env::temp_dir().join(format!("medha-tools-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
 
@@ -8566,7 +8603,7 @@ mod tests {
     #[test]
     fn task_kill_does_not_wait_behind_the_task_mutation_lane() {
         use kernel::Executor;
-        let dir = std::env::temp_dir().join(format!("medha-task-kill-lane-{}", ulid_like()));
+        let dir = test_support::scratch("medha-task-kill-lane");
         let reg = reg_in(&dir);
         assert_eq!(
             reg.mutation_key(&ToolIntent {
@@ -8577,7 +8614,6 @@ mod tests {
             None,
             "a kill must remain callable while shell.exec owns the mutation lease"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -8607,10 +8643,9 @@ mod tests {
         );
     }
 
+    /// Never written through, so it roots at the existing temp folder instead of creating one.
     fn mk_sbx() -> Arc<WorkspaceSandbox> {
-        let dir = std::env::temp_dir().join(format!("medha-to-{}", ulid_like()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap())
+        Arc::new(WorkspaceSandbox::new_jailed(std::env::temp_dir()).unwrap())
     }
 
     #[tokio::test]
@@ -9165,7 +9200,7 @@ mod tests {
 
     #[tokio::test]
     async fn reading_a_directory_says_what_to_use_instead() {
-        let dir = std::env::temp_dir().join(format!("medha-dirread-{}", ulid_like()));
+        let dir = test_support::scratch("medha-dirread");
         std::fs::create_dir_all(dir.join("inner")).unwrap();
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
         let tool = FsRead { sbx };

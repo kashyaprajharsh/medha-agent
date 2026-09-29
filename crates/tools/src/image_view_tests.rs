@@ -25,12 +25,11 @@ impl kernel::ArtifactStore for MemArtifacts {
 struct Fixture {
     tool: ImageView,
     artifacts: Arc<dyn kernel::ArtifactStore>,
-    dir: std::path::PathBuf,
+    dir: test_support::Scratch,
 }
 
 fn fixture() -> Fixture {
-    let dir = std::env::temp_dir().join(format!("medha-imgview-{}", ulid::Ulid::new()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_support::scratch("medha-imgview");
     let artifacts: Arc<dyn kernel::ArtifactStore> = Arc::new(MemArtifacts::default());
     Fixture {
         tool: ImageView {

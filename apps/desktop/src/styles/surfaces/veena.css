@@ -1,0 +1,108 @@
+/* The veena: one pluck every few seconds — strings shiver, a note runs up the neck, frets glint. */
+.veena {
+  --pluck: 4.2s;
+  --pluck-start: 0.12s;
+  display: block;
+  width: 300px;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto 22px;
+  overflow: visible;
+}
+.v-bowl {
+  fill: color-mix(in srgb, var(--gold) 7%, transparent);
+  stroke: var(--gold);
+  stroke-width: 1.5;
+  animation: v-bowl var(--pluck) var(--ease-out) infinite;
+}
+.v-rose {
+  fill: none;
+  stroke: color-mix(in srgb, var(--gold) 60%, transparent);
+  stroke-width: 1;
+  stroke-dasharray: 2 2.2;
+}
+.v-rose-in {
+  fill: var(--gold-hi);
+}
+.v-neck {
+  fill: color-mix(in srgb, var(--gold) 5%, transparent);
+  stroke: var(--line-strong);
+  stroke-width: 1.2;
+  stroke-linejoin: round;
+}
+.v-hang {
+  stroke: var(--line-strong);
+  stroke-width: 1.2;
+}
+.v-gourd {
+  fill: color-mix(in srgb, var(--gold) 7%, transparent);
+  stroke: var(--gold);
+  stroke-width: 1.4;
+  animation: v-gourd var(--pluck) linear infinite;
+}
+.v-fret {
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  animation: v-fret var(--pluck) linear infinite;
+}
+.v-yali {
+  fill: none;
+  stroke: var(--gold);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.v-bridge {
+  stroke: var(--gold-hi);
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+.v-string {
+  stroke: var(--gold-hi);
+  stroke-width: 0.6;
+  opacity: 0.7;
+  animation: v-string var(--pluck) linear infinite;
+}
+.v-note {
+  fill: var(--comet);
+  filter: drop-shadow(0 0 3px var(--gold));
+  opacity: 0;
+  animation: v-note var(--pluck) linear infinite;
+}
+
+@keyframes v-string {
+  0% { transform: translateY(0); opacity: 0.7; }
+  1.5% { transform: translateY(1.1px); opacity: 1; }
+  3% { transform: translateY(-0.9px); }
+  4.5% { transform: translateY(0.7px); }
+  6% { transform: translateY(-0.5px); }
+  7.5% { transform: translateY(0.3px); }
+  9% { transform: translateY(-0.15px); }
+  11%, 100% { transform: translateY(0); opacity: 0.7; }
+}
+@keyframes v-note {
+  0%, 2.8% { transform: translateX(0); opacity: 0; }
+  4% { opacity: 1; }
+  38% { opacity: 1; }
+  41.4% { transform: translateX(212px); opacity: 0; }
+  100% { transform: translateX(214px); opacity: 0; }
+}
+@keyframes v-fret {
+  0% { stroke: var(--gold-hi); }
+  5%, 100% { stroke: var(--line-strong); }
+}
+@keyframes v-gourd {
+  0%, 36% { fill: color-mix(in srgb, var(--gold) 7%, transparent); }
+  40% { fill: color-mix(in srgb, var(--gold) 30%, transparent); }
+  56%, 100% { fill: color-mix(in srgb, var(--gold) 7%, transparent); }
+}
+@keyframes v-bowl {
+  0% { fill: color-mix(in srgb, var(--gold) 22%, transparent); }
+  20%, 100% { fill: color-mix(in srgb, var(--gold) 7%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .veena * {
+    animation: none !important;
+  }
+}

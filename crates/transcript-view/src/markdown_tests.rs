@@ -23,6 +23,30 @@ fn raw_html_from_the_model_is_shown_as_text() {
 }
 
 #[test]
+fn only_attribute_free_inline_tags_render() {
+    let html = to_html(
+        "| a |\n|---|\n| one<br>two |\n\nPress <kbd>Cmd</kbd>+<KBD>K</KBD>, H<sub>2</sub>O, x<sup>2</sup>. \
+         <kbd onclick=\"x()\">K</kbd> <br style=\"x\"> <b>bold</b>",
+    );
+    assert!(html.contains("<td>one<br>two</td>"));
+    assert!(html.contains("<kbd>Cmd</kbd>+<kbd>K</kbd>"));
+    assert!(html.contains("H<sub>2</sub>O, x<sup>2</sup>"));
+    assert!(html.contains("&lt;kbd onclick=&quot;x()&quot;&gt;"));
+    assert!(html.contains("&lt;br style=&quot;x&quot;&gt;"));
+    assert!(html.contains("&lt;b&gt;bold&lt;/b&gt;"));
+    assert!(!html.contains("onclick=\""));
+}
+
+#[test]
+fn an_html_block_reads_as_source_unless_it_is_only_line_breaks() {
+    let html = to_html("<details>\n<summary>More</summary>\nHidden\n</details>\n\n<br>\n\nafter");
+    assert!(html.contains(
+        "<pre data-lang=\"html\"><code>&lt;details&gt;\n&lt;summary&gt;More&lt;/summary&gt;\nHidden\n&lt;/details&gt;\n</code></pre>"
+    ));
+    assert!(html.contains("<br><p>after</p>"));
+}
+
+#[test]
 fn only_web_and_mail_links_become_links() {
     let html = to_html(
         "[ok](https://medha.dev) [mail](mailto:a@b.c) [rel](docs/x.md) [bad](javascript:alert(1)) [data](DATA:text/html,x)",

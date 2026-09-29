@@ -119,7 +119,7 @@ export function Extensions({
       .then(() => api.liveCall(sessionKey, "extensions.catalog"))
       .then((catalog) => {
         if (active) {
-          setTools(catalog.tools as Tool[]);
+          setTools((catalog.tools as Tool[]) ?? []);
           setStatuses(
             Object.fromEntries(
               (
@@ -127,7 +127,7 @@ export function Extensions({
               ).map((server) => [server.server, server]),
             ),
           );
-          setSkills(catalog.skills as Skill[]);
+          if (catalog.skills) setSkills(catalog.skills as Skill[]);
           const runtime = catalog.plugins as { plugins: Plugin[] };
           if (runtime?.plugins) setPlugins(runtime.plugins);
         }

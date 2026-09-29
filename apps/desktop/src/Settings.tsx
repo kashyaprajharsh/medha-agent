@@ -38,6 +38,13 @@ type Instruction = {
   content: string;
   exists: boolean;
 };
+const LOOKS = [
+  { id: "soft", name: "Soft", note: "Raised, rounded surfaces. The default." },
+  { id: "flat", name: "Flat", note: "Calm and quiet." },
+  { id: "glass", name: "Glass", note: "Your desktop, blurred, behind the app." },
+  { id: "neo", name: "Neo", note: "Ink outlines and hard shadows." },
+];
+
 export function Settings({
   sessionKey,
   ensureOpen,
@@ -262,12 +269,40 @@ export function Settings({
               <label htmlFor="theme">Theme</label>
               <Select
                 id="theme"
-                value={context.theme}
+                value={context.mode}
                 onChange={(event) => context.setTheme(event.target.value)}
               >
-                <option value="light">Parchment</option>
+                <option value="system">Match system</option>
                 <option value="dark">Ink</option>
+                <option value="light">Parchment</option>
               </Select>
+            </div>
+            <div className="appearance-looks">
+              <span id="look-label">Style</span>
+              <div role="radiogroup" aria-labelledby="look-label">
+                {LOOKS.map((look) => (
+                  <button
+                    key={look.id}
+                    role="radio"
+                    aria-checked={context.look === look.id}
+                    className="look-option"
+                    onClick={() => context.setLook(look.id)}
+                  >
+                    <span className="look-sample" data-look={look.id}>
+                      <i />
+                      <i />
+                      <b />
+                    </span>
+                    <strong>{look.name}</strong>
+                    <small>
+                      {look.id === "glass" &&
+                      document.documentElement.dataset.platform !== "mac"
+                        ? "Frosted menus and cards."
+                        : look.note}
+                    </small>
+                  </button>
+                ))}
+              </div>
             </div>
             <div className="appearance-row">
               <label htmlFor="text-size">Reading size</label>

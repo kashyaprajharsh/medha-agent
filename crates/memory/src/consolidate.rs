@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn assessment_lists_realistic_entries_and_exact_deficit() {
-        let dir = std::env::temp_dir().join(format!("medha-consolidate-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-consolidate");
         let store = MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap();
         let old = entry(
             "quoted-hyphen",
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn stale_candidate_is_not_budget_pressure() {
-        let dir = std::env::temp_dir().join(format!("medha-consolidate-stale-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-consolidate-stale");
         let store = MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap();
         let mut stale = entry("old-candidate", "old hook", 0.0);
         stale.confidence = ConfidenceRung::Candidate;
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn public_assessment_handles_an_empty_hook() {
-        let dir = std::env::temp_dir().join(format!("medha-consolidate-empty-{}", Ulid::new()));
+        let dir = test_support::scratch("medha-consolidate-empty");
         let store = MemoryProjection::open(dir.join("p.db"), dir.join("u.db")).unwrap();
         let incoming = entry("empty-hook", "", 1_000.0);
         let assessment = assess_write(&store, &incoming, 1_200, 1_000.0).unwrap();

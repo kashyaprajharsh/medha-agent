@@ -69,7 +69,17 @@ struct SleepyExecutor {
 #[async_trait]
 impl Executor for SleepyExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        ["slow.tool", "fast.tool", "t1", "t2", "fs.read"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: String::new(),
+                schema: json!({}),
+                blast_radius: self.blast_radius(name).unwrap_or(kernel::BlastRadius::Read),
+                category: kernel::ToolCategory::Other,
+                icon: String::new(),
+            })
+            .collect()
     }
     async fn execute(&self, intent: &ToolIntent) -> Observation {
         tokio::time::sleep(self.delay).await;

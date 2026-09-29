@@ -1,0 +1,172 @@
+/* Usage and Health: totals, the daily chart, tables and checks. */
+.usage-totals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--s-3);
+  margin: 0 0 var(--s-3);
+}
+.usage-totals div {
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+  background: var(--raised);
+}
+.usage-totals dt {
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+.usage-totals dd {
+  margin: var(--s-1) 0 0;
+  font-size: var(--text-lg);
+  font-variant-numeric: tabular-nums;
+}
+.usage-days {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 72px;
+  margin: var(--s-4) 0 var(--s-6);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--hair);
+}
+.usage-days span {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+.usage-days i {
+  display: block;
+  width: 100%;
+  border-radius: 3px 3px 0 0;
+  background: color-mix(in srgb, var(--gold) 55%, transparent);
+  transform-origin: bottom;
+  animation: grow-up var(--t-slow) var(--ease-out) both;
+  transition: background var(--t-fast);
+}
+.usage-days span:hover i {
+  background: var(--gold);
+}
+.usage-block {
+  margin: 0 0 var(--s-6);
+}
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+.usage-table th {
+  text-align: left;
+  color: var(--faint);
+  font-weight: 400;
+  font-size: var(--text-xs);
+  padding: 0 var(--s-2) 6px 0;
+}
+.usage-table td {
+  padding: var(--s-2) var(--s-2) var(--s-2) 0;
+  border-top: 1px solid var(--hair);
+}
+.usage-table code {
+  font-size: var(--text-sm);
+}
+.usage-sessions li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s-4);
+  padding: 9px 0;
+  border-top: 1px solid var(--hair);
+  font-size: var(--text-sm);
+}
+.usage-sessions span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.usage-sessions small {
+  color: var(--faint);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.health-verdict {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 var(--s-4);
+  padding: var(--s-4);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line);
+  background: var(--raised);
+  font-size: var(--text-md);
+  animation: rise-in var(--t-base) var(--ease-out) both;
+}
+.health-verdict .btn-gold {
+  margin-left: auto;
+}
+.health-verdict.ok .icon,
+.health-ok .icon {
+  color: var(--ok);
+}
+.health-verdict.warn .icon,
+.health-warn .icon {
+  color: var(--warn);
+}
+.health-verdict.error .icon,
+.health-error .icon {
+  color: var(--err);
+}
+.health-checks {
+  margin: 0 0 var(--s-6);
+  display: grid;
+  gap: var(--s-1);
+}
+.health-checks li {
+  display: grid;
+  grid-template-columns: 16px 1fr auto;
+  gap: var(--s-3);
+  align-items: start;
+  padding: 10px var(--s-1);
+  border-bottom: 1px solid var(--hair);
+}
+.health-checks li .icon {
+  margin-top: 2px;
+}
+.health-checks b {
+  font-weight: 500;
+}
+.health-checks p {
+  margin: 2px 0 0;
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+.health-checks small {
+  color: var(--gold);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.health-block {
+  margin: 0 0 var(--s-6);
+}
+.health-block h3 {
+  margin: 0 0 10px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.health-block dl {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: var(--s-2) var(--s-4);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+.health-block dt {
+  color: var(--dim);
+}
+.health-block dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.health-block small {
+  color: var(--faint);
+}

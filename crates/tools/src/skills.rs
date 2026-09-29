@@ -2081,10 +2081,8 @@ mod tests {
         std::fs::write(d.join("SKILL.md"), body).unwrap();
     }
 
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("medha-skills-test-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmp() -> test_support::Scratch {
+        test_support::scratch("medha-skills-test")
     }
 
     const DEPLOY: &str = "---\nname = \"deploy-fly\"\ndescription = \"Deploy a FastAPI app to Fly.io\"\ntriggers = [\"deploy\", \"fly.io\"]\nrequired_tools = [\"shell.exec\"]\nversion = 1\n---\n\n## Steps\n1. flyctl launch\n";
@@ -2093,7 +2091,7 @@ mod tests {
     fn disabled_skills_are_listed_but_cannot_enter_context_or_be_loaded() {
         let root = tmp();
         write_skill(&root, "deploy-fly", DEPLOY);
-        let store = SkillStore::new(root.clone(), None);
+        let store = SkillStore::new(root.to_path_buf(), None);
         let known = tools(&["shell.exec", "skill"]);
         assert!(store.manifest(&known, None).contains("deploy-fly"));
         store.set_enabled("deploy-fly", false).unwrap();

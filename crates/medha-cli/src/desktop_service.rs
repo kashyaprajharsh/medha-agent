@@ -88,6 +88,8 @@ struct EventView {
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     verb: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
@@ -484,6 +486,7 @@ fn tool_view(steps: &mut transcript_view::Steps, event: &Event) -> Option<EventV
                 summary: outcome.summary,
                 output: outcome.output,
                 detail: outcome.detail,
+                error_code: outcome.error_code,
                 status: Some(status.to_owned()),
                 ..event_view(event, "tool_result", String::new())
             })

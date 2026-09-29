@@ -15,6 +15,7 @@ struct Endpoint {
     reasoning: ReasoningSupport,
     counter_available: bool,
     block_delay: std::time::Duration,
+    truncated: bool,
     turns: Mutex<VecDeque<Vec<Block>>>,
     sent: Mutex<Vec<PreparedModelRequest>>,
 }
@@ -51,6 +52,7 @@ impl Endpoint {
             reasoning: ReasoningSupport::Effort,
             counter_available: true,
             block_delay: std::time::Duration::ZERO,
+            truncated: false,
             turns: Mutex::new(turns.into()),
             sent: Mutex::new(Vec::new()),
         })
@@ -131,7 +133,8 @@ impl Provider for Endpoint {
             .pop_front()
             .unwrap_or_else(|| vec![Block::Text("finished".into())]);
         let delay = self.block_delay;
-        Ok(stream::iter(blocks.into_iter().map(Ok))
+        let cut_off = self.truncated.then_some(Err(ProviderError::Truncated));
+        Ok(stream::iter(blocks.into_iter().map(Ok).chain(cut_off))
             .then(move |block| async move {
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
@@ -460,11 +463,15 @@ async fn auxiliary_summary_scales_independently_of_the_chat_output_setting() {
         summarizer.summarize(None, &items).await.unwrap();
         let requests = endpoint.sent.lock().unwrap();
         let cap = requests[0].body["max_tokens"].as_u64().unwrap();
-        assert!(cap > 2_048 && cap <= 6_400);
         if support == ReasoningSupport::Unknown {
             assert!(requests[0].body.get("reasoning_effort").is_none());
+            assert!(
+                cap > 6_400,
+                "a model that may think gets the room left: {cap}"
+            );
         } else {
             assert_eq!(requests[0].body["reasoning_effort"], "none");
+            assert!(cap > 2_048 && cap <= 6_400);
         }
         assert_eq!(endpoint.requested_output_tokens(), Some(512));
     }
@@ -522,6 +529,16 @@ async fn unusable_summary_output_is_rejected_instead_of_persisting_a_partial_han
         assert!(matches!(error, ::context::SummarizeError::Invalid(_)));
         assert!(error.to_string().contains(reason), "{error}");
     }
+    let mut endpoint = Endpoint::new(8_000, vec![vec![Block::Text("incomplete".into())]]);
+    Arc::get_mut(&mut endpoint).unwrap().truncated = true;
+    let error = LlmSummarizer::new(endpoint)
+        .summarize(None, &[HistoryItem::text(Role::User, "TASK")])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("summary hit its output limit"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -809,17 +826,25 @@ async fn summary_provider_failure_does_not_replace_durable_history() {
         Arc::new(AutoDeny),
         Arc::new(NoVerify),
     );
-    let error = kernel
+    let (_, stop) = kernel
         .run_session(&session, history(), Budget::default(), &NullSink, None)
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("history was preserved"));
-    assert!(endpoint.sent.lock().unwrap().is_empty());
+        .expect("a failed summary must not end the turn");
+    assert_eq!(stop, StopReason::Finished);
     let events = log.events(session.id).await;
+    assert!(events.iter().any(|event| {
+        event.kind == EventKind::SummaryFailed
+            && event.payload["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("expired credential"))
+    }));
     assert!(
-        !events
+        events
             .iter()
-            .any(|event| event.kind == EventKind::Compaction)
+            .filter(|event| event.kind == EventKind::Compaction)
+            .all(|event| event.payload["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("[MEDHA extractive summary")))
     );
     assert_eq!(
         events
@@ -828,12 +853,6 @@ async fn summary_provider_failure_does_not_replace_durable_history() {
             .count(),
         80
     );
-    let recovered = runtime(endpoint, log, Arc::new(LargeTool(AtomicUsize::new(0))));
-    let (_, stop) = recovered
-        .run_session(&session, history(), Budget::default(), &NullSink, None)
-        .await
-        .unwrap();
-    assert_eq!(stop, StopReason::Finished);
 }
 
 #[tokio::test]

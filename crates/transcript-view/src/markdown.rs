@@ -1,7 +1,5 @@
-//! Markdown → HTML for the desktop transcript, parsed with the same
-//! `pulldown-cmark` options as the TUI. Model text is untrusted: raw HTML is
-//! escaped as text, only web and mail links survive, and images are never
-//! fetched — their alt text is shown instead.
+//! Markdown → HTML for the desktop transcript, with the TUI's `pulldown-cmark` options.
+//! Model text is untrusted: raw HTML stays text (bar a few bare tags), only web/mail links, no image fetches.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -24,6 +22,33 @@ struct Writer {
     cell: usize,
     in_head: bool,
     links: Vec<bool>,
+    html_block: Option<String>,
+}
+
+/// `<br>`, `<kbd>`, `<sub>`, `<sup>` without attributes; anything else stays text.
+fn allowed_tag(html: &str) -> Option<&'static str> {
+    Some(match html.trim().to_ascii_lowercase().as_str() {
+        "<br>" | "<br/>" | "<br />" => "<br>",
+        "<kbd>" => "<kbd>",
+        "</kbd>" => "</kbd>",
+        "<sub>" => "<sub>",
+        "</sub>" => "</sub>",
+        "<sup>" => "<sup>",
+        "</sup>" => "</sup>",
+        _ => return None,
+    })
+}
+
+/// An HTML block made only of allowed tags, such as a lone `<br>`.
+fn allowed_tags(block: &str) -> Option<String> {
+    let mut rest = block.trim();
+    let mut out = String::new();
+    while !rest.is_empty() {
+        let end = rest.find('>')? + 1;
+        out.push_str(allowed_tag(&rest[..end])?);
+        rest = rest[end..].trim_start();
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 impl Writer {
@@ -31,7 +56,14 @@ impl Writer {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => self.text(&text),
+            Event::Html(text) if self.html_block.is_some() => {
+                self.html_block.get_or_insert_default().push_str(&text);
+            }
+            Event::InlineHtml(text) => match allowed_tag(&text) {
+                Some(tag) => self.out.push_str(tag),
+                None => self.text(&text),
+            },
+            Event::Text(text) | Event::Html(text) => self.text(&text),
             Event::Code(code) | Event::InlineMath(code) => {
                 self.out.push_str("<code>");
                 self.text(&code);
@@ -121,6 +153,7 @@ impl Writer {
                 self.links.push(safe);
             }
             Tag::Image { .. } => self.out.push_str("<span class=\"md-image\">"),
+            Tag::HtmlBlock => self.html_block = Some(String::new()),
             _ => {}
         }
     }
@@ -154,6 +187,17 @@ impl Writer {
                 }
             }
             TagEnd::Image => self.out.push_str("</span>"),
+            TagEnd::HtmlBlock => {
+                let block = self.html_block.take().unwrap_or_default();
+                if let Some(tags) = allowed_tags(&block) {
+                    self.out.push_str(&tags);
+                } else {
+                    // Shown as source, as written, rather than run together as prose.
+                    self.out.push_str("<pre data-lang=\"html\"><code>");
+                    self.text(&block);
+                    self.out.push_str("</code></pre>");
+                }
+            }
             _ => {}
         }
     }

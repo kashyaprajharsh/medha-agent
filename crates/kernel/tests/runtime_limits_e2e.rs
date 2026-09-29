@@ -114,7 +114,14 @@ struct CountingExecutor {
 #[async_trait]
 impl Executor for CountingExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+        vec![ToolSpec {
+            name: "test.read".into(),
+            description: String::new(),
+            schema: json!({}),
+            blast_radius: self.blast_radius("test.read").unwrap_or(BlastRadius::Read),
+            category: kernel::ToolCategory::Other,
+            icon: String::new(),
+        }]
     }
 
     fn blast_radius(&self, _tool: &str) -> Option<BlastRadius> {
@@ -245,6 +252,230 @@ fn intent(index: usize) -> Block {
         tool: "test.read".into(),
         args: json!({}),
     })
+}
+
+#[derive(Default)]
+struct ReviewedCalls(Mutex<Vec<String>>);
+
+impl kernel::Policy for ReviewedCalls {
+    fn authorize(
+        &self,
+        _autonomy: kernel::AutonomyLevel,
+        intent: &ToolIntent,
+        _radius: Option<BlastRadius>,
+    ) -> kernel::Decision {
+        self.0.lock().unwrap().push(intent.tool.clone());
+        kernel::Decision::Human
+    }
+}
+
+#[async_trait]
+impl kernel::HumanGate for ReviewedCalls {
+    async fn confirm(
+        &self,
+        action: &str,
+        _detail: Option<&str>,
+        _escalated: bool,
+    ) -> kernel::Approval {
+        self.0.lock().unwrap().push(action.into());
+        kernel::Approval::Once
+    }
+}
+
+struct ChangingCatalog {
+    empty: bool,
+    catalog_reads: AtomicUsize,
+    executions: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Executor for ChangingCatalog {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let reads = self.catalog_reads.fetch_add(1, Ordering::SeqCst);
+        let mut names = if self.empty {
+            vec![]
+        } else {
+            vec!["test.read", "test_read"]
+        };
+        // A fresh executor lookup would wrongly admit a tool not offered in
+        // the request. Its risk metadata also deliberately looks legitimate.
+        if reads > 0 {
+            names.push("mcp__mcp-remote__brave_search");
+        }
+        names
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: String::new(),
+                schema: json!({}),
+                blast_radius: BlastRadius::Read,
+                category: kernel::ToolCategory::Other,
+                icon: String::new(),
+            })
+            .collect()
+    }
+
+    fn blast_radius(&self, _tool: &str) -> Option<BlastRadius> {
+        Some(BlastRadius::Read)
+    }
+
+    async fn execute(&self, intent: &ToolIntent) -> Observation {
+        self.executions.lock().unwrap().push(intent.tool.clone());
+        Observation::ok(&intent.id, json!({"content": "read successfully"}))
+    }
+}
+
+#[tokio::test]
+async fn unavailable_calls_skip_policy_gate_and_execution_and_feed_back_the_request_catalog() {
+    for empty in [false, true] {
+        let unknown = "mcp__mcp-remote__brave_search";
+        let guesses = (0..3)
+            .map(|i| {
+                Block::ToolIntent(ToolIntent {
+                    id: format!("guess-{i}"),
+                    tool: unknown.into(),
+                    args: json!({"query": "agents"}),
+                })
+            })
+            .collect();
+        let mut turns = vec![Turn::Blocks(guesses)];
+        if !empty {
+            turns.push(Turn::Blocks(vec![intent(0)]));
+        }
+        let provider = Arc::new(LimitProvider::new(turns));
+        let executor = Arc::new(ChangingCatalog {
+            empty,
+            catalog_reads: AtomicUsize::new(0),
+            executions: Mutex::new(Vec::new()),
+        });
+        let policy = Arc::new(ReviewedCalls::default());
+        let gate = Arc::new(ReviewedCalls::default());
+        let log = Arc::new(InMemoryLog::new());
+        let runner = Kernel::new(
+            provider.clone(),
+            log.clone(),
+            executor.clone(),
+            Arc::new(Passthrough),
+            Arc::new(MemArtifacts),
+            policy.clone(),
+            gate.clone(),
+            Arc::new(NoVerify),
+        );
+        let session = Session::new();
+        let (_, stop) = runner
+            .run_session(
+                &session,
+                vec![Message::user("search")],
+                Budget::default(),
+                &kernel::NullSink,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop, StopReason::Finished);
+        let expected = if empty { vec![] } else { vec!["test.read"] };
+        assert_eq!(*policy.0.lock().unwrap(), expected);
+        assert_eq!(*executor.executions.lock().unwrap(), expected);
+        assert_eq!(gate.0.lock().unwrap().len(), expected.len());
+        assert_eq!(executor.catalog_reads.load(Ordering::SeqCst), 1);
+        let events = log.events(session.id).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::PolicyDecision)
+                .count(),
+            expected.len()
+        );
+        for i in 0..3 {
+            let id = format!("guess-{i}");
+            let obs = events
+                .iter()
+                .find(|e| e.kind == EventKind::ToolObs && e.payload["intent_id"] == id)
+                .unwrap();
+            assert_eq!(obs.payload["status"], "error");
+            let payload = &obs.payload["payload"];
+            assert_eq!(payload["error_code"], "tool_unavailable");
+            assert_eq!(payload["requested_tool"], unknown);
+            // Uses the same collision-safe mapping as the provider.
+            assert_eq!(
+                payload["available_tools"],
+                if empty {
+                    json!([])
+                } else {
+                    json!(["test_read", "test_read_"])
+                }
+            );
+            let requests = provider.requests.lock().unwrap();
+            let feedback = requests[1]
+                .messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some(id.as_str()))
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&feedback.content).unwrap(),
+                *payload
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn unavailable_calls_keep_their_call_order_slot_among_real_results() {
+    let guess = Block::ToolIntent(ToolIntent {
+        id: "guess".into(),
+        tool: "mcp__mcp-remote__brave_search".into(),
+        args: json!({}),
+    });
+    let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![
+        intent(0),
+        guess,
+        intent(1),
+    ])]));
+    let executor = Arc::new(ChangingCatalog {
+        empty: false,
+        catalog_reads: AtomicUsize::new(0),
+        executions: Mutex::new(Vec::new()),
+    });
+    let log = Arc::new(InMemoryLog::new());
+    let runner = Kernel::new(
+        provider.clone(),
+        log.clone(),
+        executor.clone(),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    );
+    let session = Session::new();
+    runner
+        .run_session(
+            &session,
+            vec![Message::user("search")],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(executor.executions.lock().unwrap().len(), 2);
+    let order = ["call-0", "guess", "call-1"];
+    let logged: Vec<_> = log
+        .events(session.id)
+        .await
+        .into_iter()
+        .filter(|e| e.kind == EventKind::ToolObs)
+        .map(|e| e.payload["intent_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(logged, order);
+    // Templates that render tool results without ids pair them by position.
+    let requests = provider.requests.lock().unwrap();
+    let fed_back: Vec<_> = requests[1]
+        .messages
+        .iter()
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    assert_eq!(fed_back, order);
 }
 
 fn one_second_wall_budget() -> Budget {
@@ -589,8 +820,8 @@ async fn plan_blocks_writes_shell_delegation_and_unknown_tools_even_with_allow_a
     assert_eq!(
         events
             .iter()
-            .filter(|e| e.kind == EventKind::PolicyDecision
-                && e.payload.to_string().contains("plan mode permits"))
+            .filter(|e| e.kind == EventKind::ToolObs
+                && e.payload["payload"]["error_code"] == "tool_unavailable")
             .count(),
         4
     );

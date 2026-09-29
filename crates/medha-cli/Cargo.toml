@@ -34,6 +34,7 @@ futures.workspace = true
 async-trait.workspace = true
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+tempfile = "3"
 url = "2"
 reqwest = { workspace = true }
 sha2 = "0.10"
@@ -80,5 +81,5 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [dev-dependencies]
+test-support = { path = "../test-support" }
 flate2 = "1"
-tempfile = "3"

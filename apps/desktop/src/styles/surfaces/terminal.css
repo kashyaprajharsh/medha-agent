@@ -1,0 +1,127 @@
+/* The terminal drawer and its tabs. */
+.terminal-drawer {
+  flex: none;
+  min-height: 160px;
+  max-height: calc(100% - 180px);
+  display: flex;
+  flex-direction: column;
+  background: var(--canvas);
+  border-top: 1px solid var(--line);
+  animation: rise-in var(--t-slow) var(--ease-out) both;
+}
+.terminal-drawer[hidden],
+.terminal-pane[hidden] {
+  display: none;
+}
+.terminal-grip {
+  height: 6px;
+  flex: none;
+  cursor: ns-resize;
+  touch-action: none;
+  transition: background var(--t-fast);
+}
+.terminal-grip:hover,
+.terminal-grip:focus-visible {
+  background: var(--gold-wash);
+}
+.terminal-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 0 var(--s-4) 5px;
+  min-height: 34px;
+  border-bottom: 1px solid var(--hair);
+}
+.terminal-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  min-width: 0;
+  overflow-x: auto;
+}
+.terminal-tab {
+  display: flex;
+  align-items: center;
+  border-radius: var(--r-sm);
+  flex: none;
+  transition: background var(--t-fast);
+}
+.terminal-tab:hover,
+.terminal-tab:has([aria-selected="true"]) {
+  background: var(--hover);
+}
+.terminal-tab > [role="tab"] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px var(--s-2);
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+.terminal-tab > [aria-selected="true"] {
+  color: var(--text);
+}
+.terminal-tab .icon {
+  width: 13px;
+  height: 13px;
+}
+.terminal-tab small {
+  color: var(--faint);
+  font-size: 10px;
+}
+.terminal-tab-close {
+  padding: 6px 5px;
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity var(--t-fast), color var(--t-fast);
+}
+.terminal-tab:hover .terminal-tab-close,
+.terminal-tab:focus-within .terminal-tab-close {
+  opacity: 1;
+}
+.terminal-tab-close:hover {
+  color: var(--text);
+}
+.terminal-location {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: var(--text-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.terminal-panes {
+  position: relative;
+  min-height: 0;
+  flex: 1;
+}
+.terminal-pane {
+  position: absolute;
+  inset: 0;
+  padding: var(--s-3) var(--s-4) var(--s-2);
+  display: flex;
+  flex-direction: column;
+}
+.terminal-canvas {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.terminal-canvas .xterm {
+  height: 100%;
+}
+.terminal-error {
+  font-size: var(--text-xs);
+  color: var(--err);
+  margin: 6px 0 0;
+}
+.terminal-empty {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-3);
+  color: var(--dim);
+  font-size: var(--text-xs);
+}

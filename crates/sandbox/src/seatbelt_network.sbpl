@@ -1,0 +1,11 @@
+; Added only once the user grants network: sockets, DNS and certificate checks.
+(allow network*)
+(allow system-socket)
+(allow mach-lookup
+  (global-name "com.apple.SystemConfiguration.configd")
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.dnssd.service")
+  (global-name "com.apple.networkd")
+  (global-name "com.apple.trustd")
+  (global-name "com.apple.trustd.agent")
+  (global-name "com.apple.ocspd"))

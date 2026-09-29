@@ -36,14 +36,14 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
-          key: minimum-rust-1.88
+          key: minimum-rust-1.89
       - name: Check minimum supported Rust
-        run: cargo +1.88 check --workspace --all-targets --locked
+        run: cargo +1.89 check --workspace --all-targets --locked
 
   # Formatting and linting are platform-independent.
   lint:

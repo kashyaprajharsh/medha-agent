@@ -164,6 +164,7 @@
   inset: 0;
   z-index: 900;
   background: var(--scrim);
+  animation: fade-in var(--t-base) var(--ease-out) both;
 }
 .cx-sheet {
   position: fixed;
@@ -181,6 +182,18 @@
   box-shadow:
     var(--shadow),
     inset 0 0 0 1px var(--hair);
+  animation: cx-sheet-in var(--t-slow) var(--ease-out) both;
+}
+[data-look="glass"] .cx-sheet {
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--pane-frost);
+  backdrop-filter: var(--pane-frost);
+  box-shadow:
+    var(--e2-shadow),
+    inset 0 0 0 1px var(--glass-edge);
+}
+[data-look="glass"] .cx-asks button {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
 }
 .cx-close {
   position: absolute;
@@ -389,11 +402,8 @@
   }
 }
 ::view-transition-group(*) {
-  animation-duration: 420ms;
+  animation-duration: var(--t-slow);
   animation-timing-function: var(--ease);
-}
-::view-transition-new(cx-sheet) {
-  animation: cx-sheet-in 380ms var(--ease-out) both;
 }
 ::view-transition-old(cx-sheet) {
   animation: cx-sheet-out 220ms ease-in both;
@@ -412,6 +422,8 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .cx-label,
+  .cx-sheet,
+  .cx-scrim,
   .cx-connect.waiting::before {
     animation: none;
   }

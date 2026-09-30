@@ -83,7 +83,6 @@ export function Connectors({
   const [openId, setOpenId] = useState<string>();
   const [phase, setPhase] = useState<Phase>("idle");
   const [problem, setProblem] = useState("");
-  const [flying, setFlying] = useState<string>();
   const created = useRef<string | null>(null);
   const waitingFor = useRef<string | null>(null);
   const signIn = useMcpSignIn(sessionKey, (event) => {
@@ -118,12 +117,14 @@ export function Connectors({
   const rest = shown.filter((c) => !c.server && !c.evidence);
 
   function show(id: string | undefined) {
-    setFlying(id ?? openId);
-    transition(() => {
+    const change = () => {
       setOpenId(id);
       setPhase(id && all.find((c) => c.id === id && state(c) === "ready") ? "done" : "idle");
       setProblem("");
-    });
+    };
+    // Opening is immediate; closing glides, so a newly connected app is seen moving into place.
+    if (id) change();
+    else transition(change);
   }
 
   useEffect(() => {
@@ -184,12 +185,7 @@ export function Connectors({
       onClick={() => show(c.id)}
       aria-label={`${c.name}: ${detail}`}
     >
-      <img
-        className="cx-plate"
-        src={logo(c.id)}
-        alt=""
-        style={flying === c.id && openId !== c.id ? { viewTransitionName: "cx-logo" } : undefined}
-      />
+      <img className="cx-plate" src={logo(c.id)} alt="" />
       <span className="cx-text">
         <span className="cx-name">{c.name}</span>
         <span className="cx-desc">{detail}</span>
@@ -271,7 +267,7 @@ export function Connectors({
               <Icon name="x" />
             </button>
             <div className="cx-hero">
-              <img className="cx-plate" src={logo(open.id)} alt="" style={{ viewTransitionName: "cx-logo" }} />
+              <img className="cx-plate" src={logo(open.id)} alt="" />
               <div>
                 <h2>{open.name}</h2>
                 <small>{LABEL[open.category]}</small>

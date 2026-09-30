@@ -97,6 +97,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tasks", "list currently owned shell tasks"),
     ("/lsp", "language-server sessions and health"),
     (
+        "/connect",
+        "connect an app — Linear, Notion, Figma… · /connect <name> connects it directly",
+    ),
+    (
         "/mcp",
         "MCP servers — manage · connect · remove · add  ·  /mcp catalog <search> to browse the registry",
     ),
@@ -1118,11 +1122,19 @@ pub(crate) struct CatalogPick {
     pub cursor: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectorPick {
+    pub id: String,
+    pub label: String,
+}
+
 /// Reasoning control / session picker kind. Not `Copy` — some variants own data.
 #[derive(Clone)]
 enum PickerKind {
     /// `/mcp catalog`: registry servers Medha can set up.
     McpCatalog(Vec<CatalogPick>),
+    /// `/connect`: the reviewed connectors.
+    Connectors(Vec<ConnectorPick>),
     Reasoning(ReasoningPanelState),
     /// Browse past sessions to resume. Holds the list from `log.sessions()`.
     Session(Vec<kernel::SessionMeta>),
@@ -1332,6 +1344,9 @@ impl PickerKind {
             PickerKind::McpCatalog(_) => {
                 " MCP catalog — ↑↓ select · Enter fills in /mcp add · Esc close ".into()
             }
+            PickerKind::Connectors(_) => {
+                " connect an app — ↑↓ select · Enter connects · Esc close ".into()
+            }
             PickerKind::RemoveSkill(name) => {
                 format!(" remove user skill '{name}'? — ↑↓ move · Enter confirm · Esc back ")
             }
@@ -1479,6 +1494,7 @@ impl PickerKind {
                     .collect()
             }
             PickerKind::McpCatalog(picks) => picks.iter().map(|pick| pick.label.clone()).collect(),
+            PickerKind::Connectors(picks) => picks.iter().map(|pick| pick.label.clone()).collect(),
             PickerKind::Skill(skills) => SKILL_HUB_ACTIONS
                 .iter()
                 .map(|(label, _)| (*label).to_string())

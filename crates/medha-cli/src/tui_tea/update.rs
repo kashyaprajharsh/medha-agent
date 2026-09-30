@@ -1446,6 +1446,14 @@ pub(super) fn handle_key<P, L>(
                     }
                     return;
                 }
+                if let PickerKind::Connectors(picks) = &picker.kind {
+                    let id = picks.get(picker.selected).map(|pick| pick.id.clone());
+                    model.picker = None;
+                    if let Some(id) = id {
+                        connect_connector(model, &id, tx);
+                    }
+                    return;
+                }
                 if let PickerKind::McpCatalog(picks) = &picker.kind {
                     let choice = picks.get(picker.selected).cloned();
                     model.picker = None;
@@ -3188,6 +3196,8 @@ enum SlashAction {
     McpAdd(String),
     /// `/mcp catalog [search]` — browse the public MCP Registry.
     McpCatalog(String),
+    /// `/connect [app]` — the reviewed connectors.
+    Connect(String),
     /// `/usage` — tokens and cost for this session and the last week.
     Usage,
     Memory(String),
@@ -3287,6 +3297,9 @@ fn classify_slash(cmd: &str) -> SlashAction {
             SlashAction::McpAdd(c.strip_prefix("mcp add").unwrap_or("").trim().to_string())
         }
         "usage" => SlashAction::Usage,
+        c if c.strip_prefix("connect").is_some_and(is_cmd_boundary) => {
+            SlashAction::Connect(c.strip_prefix("connect").unwrap_or("").trim().to_string())
+        }
         c if c.strip_prefix("mcp catalog").is_some_and(is_cmd_boundary) => SlashAction::McpCatalog(
             c.strip_prefix("mcp catalog")
                 .unwrap_or("")
@@ -3481,6 +3494,7 @@ fn dispatch_slash<P, L>(
         SlashAction::McpStart(id) => start_mcp_server(kernel, &id, tx),
         SlashAction::McpAdd(args) => mcp_add(model, &args, tx),
         SlashAction::McpCatalog(query) => search_mcp_catalog(model, &query, tx),
+        SlashAction::Connect(query) => connect_command(model, &query, tx),
         SlashAction::Usage => show_usage(model, kernel, session.id, tx),
         SlashAction::Memory(name) => open_memory(model, &name, kernel, tx),
         SlashAction::SkillPicker => open_skill_picker(model),
@@ -3663,31 +3677,148 @@ fn mcp_add(model: &mut Model, args: &str, tx: &mpsc::UnboundedSender<TuiEvent>) 
         model.push_notice(format!("mcp add: could not save config.toml: {error}"));
         return;
     }
-    if let Some(manager) = model.mcp.clone() {
+    if launch_mcp_server(model, &id, &server, url, tx) {
         model.push_notice(format!("(adding MCP server '{id}' …)"));
-        let resolved = config::resolve_mcp_server(&id, &server);
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            // Report the status list either way: a failed server shows up as a
-            // row with its state and reason, which beats a bare error string.
-            // The server decides what happens next: an OAuth challenge goes
-            // straight to the browser, an ambiguous one asks how to authenticate.
-            match manager.add_server(resolved).await {
-                Err(mcp::Error::NeedsAuth(_)) => return authorize_mcp_server(manager, id, tx),
-                Err(mcp::Error::NeedsToken(_)) => {
-                    let _ = tx.send(TuiEvent::McpNeedsAuth { server: id, url });
-                    return;
-                }
-                _ => {}
-            }
-            let servers = serde_json::json!({ "servers": manager.status().await });
-            let _ = tx.send(TuiEvent::McpStatus(Ok(servers)));
-        });
     } else {
         model.push_notice(format!(
             "added '{id}' to config.toml (MCP host unavailable)"
         ));
     }
+    open_mcp_picker(model);
+}
+
+/// Starts a configured server; false when this session has no MCP host.
+fn launch_mcp_server(
+    model: &mut Model,
+    id: &str,
+    server: &config::McpServer,
+    url: String,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) -> bool {
+    let Some(manager) = model.mcp.clone() else {
+        return false;
+    };
+    let resolved = config::resolve_mcp_server(id, server);
+    let (id, tx) = (id.to_string(), tx.clone());
+    tokio::spawn(async move {
+        // Report the status list either way: a failed server shows up as a
+        // row with its state and reason, which beats a bare error string.
+        // The server decides what happens next: an OAuth challenge goes
+        // straight to the browser, an ambiguous one asks how to authenticate.
+        match manager.add_server(resolved).await {
+            Err(mcp::Error::NeedsAuth(_)) => return authorize_mcp_server(manager, id, tx),
+            Err(mcp::Error::NeedsToken(_)) => {
+                let _ = tx.send(TuiEvent::McpNeedsAuth { server: id, url });
+                return;
+            }
+            _ => {}
+        }
+        let servers = serde_json::json!({ "servers": manager.status().await });
+        let _ = tx.send(TuiEvent::McpStatus(Ok(servers)));
+    });
+    true
+}
+
+#[derive(Debug, PartialEq)]
+enum ConnectorChoice {
+    One(String),
+    Many(Vec<super::ConnectorPick>),
+    Nothing,
+}
+
+/// An exact name, or a search only one app matches, picks it; anything else
+/// is a list, with already-connected apps marked.
+fn connector_choice(
+    query: &str,
+    configured: &std::collections::BTreeMap<String, config::McpServer>,
+) -> ConnectorChoice {
+    let query = query.trim().to_lowercase();
+    let all = crate::connectors::catalog();
+    if let Some(exact) = all
+        .iter()
+        .find(|c| !query.is_empty() && (c.id == query || c.name.to_lowercase() == query))
+    {
+        return ConnectorChoice::One(exact.id.clone());
+    }
+    let hits: Vec<_> = all
+        .iter()
+        .filter(|c| {
+            [&c.id, &c.name, &c.description]
+                .iter()
+                .any(|text| text.to_lowercase().contains(&query))
+        })
+        .collect();
+    match hits.as_slice() {
+        [] => ConnectorChoice::Nothing,
+        [one] if !query.is_empty() => ConnectorChoice::One(one.id.clone()),
+        _ => ConnectorChoice::Many(
+            hits.iter()
+                .map(|c| super::ConnectorPick {
+                    id: c.id.clone(),
+                    label: format!(
+                        "{} {} — {}",
+                        if c.configured(configured).is_some() {
+                            "✓"
+                        } else {
+                            " "
+                        },
+                        c.name,
+                        c.description
+                    ),
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn connect_command(model: &mut Model, query: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let configured = config::load()
+        .ok()
+        .flatten()
+        .map(|cfg| cfg.mcp)
+        .unwrap_or_default();
+    match connector_choice(query, &configured) {
+        ConnectorChoice::One(id) => connect_connector(model, &id, tx),
+        ConnectorChoice::Many(picks) => {
+            model.picker = Some(Picker::new(PickerKind::Connectors(picks)));
+        }
+        ConnectorChoice::Nothing => model.push_notice(format!(
+            "no app matches '{}' — /connect lists them all",
+            query.trim()
+        )),
+    }
+}
+
+/// Saves the connector as an ordinary server entry and starts it; an OAuth
+/// app then opens its own sign-in page in the browser.
+fn connect_connector(model: &mut Model, id: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
+    let Some(connector) = crate::connectors::find(id) else {
+        return;
+    };
+    let mut installed = None;
+    if let Err(error) = config::edit(|cfg| {
+        let id = connector.install(&mut cfg.mcp);
+        installed = cfg.mcp.get(&id).cloned().map(|server| (id, server));
+        Ok(())
+    }) {
+        return model.push_notice(format!("connect: could not save config.toml: {error}"));
+    }
+    let Some((id, server)) = installed else {
+        return;
+    };
+    if !launch_mcp_server(model, &id, &server, server.url.clone(), tx) {
+        return model.push_notice(format!(
+            "saved {} — it connects in your next session (MCP is off in this one)",
+            connector.name
+        ));
+    }
+    model.push_notice(match connector.sign_in {
+        crate::connectors::SignIn::Oauth => format!(
+            "(connecting {} — sign in on its own page in your browser; Medha never sees your password)",
+            connector.name
+        ),
+        crate::connectors::SignIn::None => format!("(connecting {} …)", connector.name),
+    });
     open_mcp_picker(model);
 }
 
@@ -6705,6 +6836,47 @@ mod fix_tests {
         assert_eq!(
             classify_slash("detach all"),
             SlashAction::Detach("all".into())
+        );
+    }
+
+    #[test]
+    fn connect_picks_one_app_when_the_words_do_and_lists_otherwise() {
+        assert_eq!(
+            classify_slash("connect"),
+            SlashAction::Connect(String::new())
+        );
+        assert_eq!(
+            classify_slash("connect Notion"),
+            SlashAction::Connect("Notion".into())
+        );
+        let none = std::collections::BTreeMap::new();
+        let one = |q| connector_choice(q, &none);
+        assert_eq!(one("Notion"), ConnectorChoice::One("notion".into()));
+        assert_eq!(one("confluence"), ConnectorChoice::One("atlassian".into()));
+        assert_eq!(one("no such app"), ConnectorChoice::Nothing);
+        let ConnectorChoice::Many(postgres) = one("postgres") else {
+            panic!("two apps mention Postgres");
+        };
+        assert_eq!(postgres.len(), 2);
+
+        let by_hand = std::collections::BTreeMap::from([(
+            "my-linear".to_string(),
+            config::McpServer {
+                url: "https://mcp.linear.app/mcp/".into(),
+                ..Default::default()
+            },
+        )]);
+        let ConnectorChoice::Many(all) = connector_choice("", &by_hand) else {
+            panic!("an empty search lists every app");
+        };
+        assert_eq!(all.len(), crate::connectors::catalog().len());
+        let linear = all.iter().find(|pick| pick.id == "linear").unwrap();
+        assert!(linear.label.starts_with("✓ Linear"), "{}", linear.label);
+        assert!(
+            all.iter()
+                .filter(|pick| pick.label.starts_with('✓'))
+                .count()
+                == 1
         );
     }
 

@@ -73,6 +73,7 @@ export function Extensions({
     params: Record<string, unknown>;
   }>();
   const [statuses, setStatuses] = useState<Record<string, McpStatus>>({});
+  const [statusesRead, setStatusesRead] = useState(false);
   const [mcpOpen, setMcpOpen] = useState("");
   const [pluginView, setPluginView] = useState<"installed" | "browse">("installed");
   const [skillView, setSkillView] = useState<"installed" | "browse" | "manage">("installed");
@@ -135,31 +136,34 @@ export function Extensions({
       active = false;
     };
   }, [refresh, sessionKey]);
+  const [statusTick, setStatusTick] = useState(0);
   useEffect(() => {
     if (!sessionKey) return;
     let active = true;
+    let recheck: ReturnType<typeof setTimeout> | undefined;
     void ensureOpen()
       .then(() => api.liveCall(sessionKey, "extensions.catalog"))
       .then((catalog) => {
         if (active) {
+          const servers = (catalog.mcp as (McpStatus & { server: string })[]) || [];
           setTools((catalog.tools as Tool[]) ?? []);
-          setStatuses(
-            Object.fromEntries(
-              (
-                (catalog.mcp as (McpStatus & { server: string })[]) || []
-              ).map((server) => [server.server, server]),
-            ),
-          );
+          setStatuses(Object.fromEntries(servers.map((server) => [server.server, server])));
+          setStatusesRead(true);
           if (catalog.skills) setSkills(catalog.skills as Skill[]);
           const runtime = catalog.plugins as { plugins: Plugin[] };
           if (runtime?.plugins) setPlugins(runtime.plugins);
+          // The bridge does not announce state changes, so a server still
+          // coming up is read again until it settles.
+          if (servers.some((server) => ["connecting", "reconnecting", "degraded"].includes(server.state)))
+            recheck = setTimeout(() => setStatusTick((value) => value + 1), 1500);
         }
       })
       .catch((cause) => active && setError(String(cause)));
     return () => {
       active = false;
+      clearTimeout(recheck);
     };
-  }, [tab, sessionKey, refresh]);
+  }, [tab, sessionKey, refresh, statusTick]);
   async function act(method: string, params: Record<string, unknown>) {
     setBusy(true);
     setError("");
@@ -246,7 +250,7 @@ export function Extensions({
           <Connectors
             sessionKey={sessionKey}
             ensureOpen={ensureOpen}
-            statuses={statuses}
+            statuses={statusesRead ? statuses : undefined}
             hashes={Object.fromEntries(mcp.map((server) => [server.id, server.hash]))}
             query={query}
             refresh={refresh}

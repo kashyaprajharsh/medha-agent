@@ -69,7 +69,8 @@ export function Connectors({
 }: {
   sessionKey: string | null;
   ensureOpen: () => Promise<void>;
-  statuses: Record<string, McpStatus>;
+  /** Undefined until the chat's bridge has reported once. */
+  statuses: Record<string, McpStatus> | undefined;
   hashes: Record<string, string>;
   query: string;
   refresh: number;
@@ -109,7 +110,7 @@ export function Connectors({
   }, [refresh]);
 
   const open = all.find((c) => c.id === openId);
-  const state = (c: Connector) => (c.server ? statuses[c.server]?.state : undefined);
+  const state = (c: Connector) => (c.server ? statuses?.[c.server]?.state : undefined);
   const needle = query.trim().toLowerCase();
   const shown = all.filter((c) => !needle || [c.name, c.description, ...c.asks].join(" ").toLowerCase().includes(needle));
   const mine = shown.filter((c) => c.server);
@@ -205,7 +206,7 @@ export function Connectors({
 
   function connectedRow(c: Connector) {
     const s = state(c);
-    const tools = c.server ? statuses[c.server]?.tools : undefined;
+    const tools = c.server ? statuses?.[c.server]?.tools : undefined;
     if (s === "needs_auth")
       return row(c, "Sign-in expired. The app asked for a fresh sign-in.", <span className="cx-fix">Sign in again</span>, "cx-ledger expired");
     if (s === "failed" || s === "parked")
@@ -217,7 +218,9 @@ export function Connectors({
           {tools} {tools === 1 ? "tool" : "tools"}
         </span>
       ) : (
-        <span className="cx-state dim">{s === "connecting" || s === "reconnecting" ? "Connecting…" : "Connects in new chats"}</span>
+        <span className="cx-state dim">
+          {!statuses ? "" : s === "connecting" || s === "reconnecting" ? "Connecting…" : "Connects in new chats"}
+        </span>
       );
     return row(c, usage(c), trailing, "cx-ledger");
   }

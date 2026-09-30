@@ -1,0 +1,8 @@
+id = "coros"
+name = "COROS"
+category = "health"
+description = "Workouts, training load, sleep and recovery."
+url = "https://mcp.coros.com/mcp"
+sign_in = "oauth"
+source = "https://support.coros.com/hc/en-us/articles/50841795180948"
+asks = ["How was my training load this week?", "Summarise last night's sleep and HRV", "Compare my last three long runs"]

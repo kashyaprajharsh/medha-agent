@@ -1,0 +1,8 @@
+id = "craft"
+name = "Craft"
+category = "productivity"
+description = "Documents and notes in your Craft space."
+url = "https://mcp.craft.do/my/mcp"
+sign_in = "oauth"
+source = "https://support.craft.do/hc/en-us/articles/29455875123101"
+asks = ["Find my notes from the planning session", "Add today's decisions to the project doc", "Summarise the Research space"]

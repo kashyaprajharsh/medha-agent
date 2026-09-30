@@ -1,0 +1,9 @@
+id = "webflow"
+name = "Webflow"
+category = "design"
+description = "Sites, pages and CMS collections."
+url = "https://mcp.webflow.com/mcp"
+sign_in = "oauth"
+source = "https://developers.webflow.com/mcp/reference/getting-started"
+asks = ["List the pages on my marketing site", "Add a blog post draft to the CMS", "Which CMS items were edited this week?"]
+detect = ["npm:webflow-api"]

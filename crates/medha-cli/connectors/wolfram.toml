@@ -1,0 +1,8 @@
+id = "wolfram"
+name = "Wolfram"
+category = "search"
+description = "Computation, math and curated data."
+url = "https://agenttools.wolfram.com/mcp"
+sign_in = "none"
+source = "https://www.wolfram.com/agent-tools/"
+asks = ["What's the integral of x² sin x?", "Convert 42 miles per gallon to litres per 100 km", "How far is Mars from Earth today?"]

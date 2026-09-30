@@ -148,6 +148,22 @@ pub async fn run(argv: &[String]) -> Result<()> {
 }
 
 async fn handle(log: &store::SqliteLog, workspace: &std::path::Path, req: Request) -> Response {
+    if req.method == "extensions.connectors" {
+        return match super::config::load() {
+            Ok(cfg) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_secs_f64())
+                    .unwrap_or_default();
+                let servers = cfg.map(|cfg| cfg.mcp).unwrap_or_default();
+                Response::ok(
+                    req.id,
+                    crate::connectors::listing(log, workspace, &servers, now).await,
+                )
+            }
+            Err(error) => Response::error(req.id, error.to_string()),
+        };
+    }
     if req.method.starts_with("extensions.")
         || req.method.starts_with("instructions.")
         || (req.method.starts_with("settings.") && req.method != "settings.defaults")

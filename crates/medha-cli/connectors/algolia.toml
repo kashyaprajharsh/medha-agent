@@ -1,0 +1,9 @@
+id = "algolia"
+name = "Algolia"
+category = "developer"
+description = "Search indices, records and analytics."
+url = "https://mcp.algolia.com/mcp"
+sign_in = "oauth"
+source = "https://www.algolia.com/doc/guides/model-context-protocol/productivity-mcp"
+asks = ["Which searches returned no results this week?", "Show the settings for the products index", "Search the docs index for installation"]
+detect = ["npm:algoliasearch", "pypi:algoliasearch"]

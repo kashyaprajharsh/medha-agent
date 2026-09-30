@@ -1,0 +1,9 @@
+id = "grafana"
+name = "Grafana"
+category = "developer"
+description = "Dashboards, alerts and queries in Grafana Cloud."
+url = "https://mcp.grafana.com/mcp"
+sign_in = "oauth"
+source = "https://grafana.com/docs/grafana-cloud/ai-tools/mcp-servers/cloud-mcp/"
+asks = ["Which alerts fired today?", "Show the API latency dashboard", "Query error rates for the last six hours"]
+detect = ["npm:@grafana/faro-web-sdk"]

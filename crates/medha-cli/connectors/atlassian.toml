@@ -1,0 +1,9 @@
+id = "atlassian"
+name = "Atlassian"
+category = "productivity"
+description = "Jira issues and Confluence pages."
+url = "https://mcp.atlassian.com/v1/mcp/authv2"
+sign_in = "oauth"
+source = "https://support.atlassian.com/rovo/docs/getting-started-with-the-atlassian-remote-mcp-server/"
+asks = ["What's assigned to me in Jira this sprint?", "Summarise the Confluence page on our release process", "File a Jira bug for the failing checkout test"]
+detect = ["npm:jira.js", "pypi:jira", "pypi:atlassian-python-api"]

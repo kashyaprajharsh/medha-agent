@@ -1,0 +1,9 @@
+id = "cloudflare"
+name = "Cloudflare"
+category = "developer"
+description = "Workers, DNS and the rest of your account."
+url = "https://mcp.cloudflare.com/mcp?codemode=false"
+sign_in = "oauth"
+source = "https://developers.cloudflare.com/agents/model-context-protocol/cloudflare/servers-for-cloudflare/"
+asks = ["List my Workers and their last deploy", "Which DNS records point at the API?", "Show errors from the worker in the last hour"]
+detect = ["wrangler.toml", "wrangler.json", "wrangler.jsonc"]

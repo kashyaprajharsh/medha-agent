@@ -1,0 +1,9 @@
+id = "dropbox"
+name = "Dropbox"
+category = "productivity"
+description = "Files and folders in your Dropbox."
+url = "https://mcp.dropbox.com/mcp"
+sign_in = "oauth"
+source = "https://help.dropbox.com/integrations/connect-dropbox-mcp-server"
+asks = ["Find the latest contract PDF in my Dropbox", "What files changed in the Design folder today?", "Summarise the Q3 report"]
+detect = ["npm:dropbox", "pypi:dropbox"]

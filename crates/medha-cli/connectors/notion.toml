@@ -1,0 +1,9 @@
+id = "notion"
+name = "Notion"
+category = "productivity"
+description = "Pages, databases and comments."
+url = "https://mcp.notion.com/mcp"
+sign_in = "oauth"
+source = "https://developers.notion.com/docs/mcp"
+asks = ["Summarise last week's meeting notes", "Add today's decisions to the project page", "Find the onboarding checklist"]
+detect = ["npm:@notionhq/client", "pypi:notion-client"]

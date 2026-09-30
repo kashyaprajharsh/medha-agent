@@ -1,0 +1,9 @@
+id = "intercom"
+name = "Intercom"
+category = "communication"
+description = "Conversations, contacts and help center articles."
+url = "https://mcp.intercom.com/mcp"
+sign_in = "oauth"
+source = "https://developers.intercom.com/docs/guides/mcp"
+asks = ["Summarise the open conversations from today", "Find help articles about password resets", "Which customers asked about refunds this week?"]
+detect = ["npm:intercom-client", "npm:@intercom/messenger-js-sdk"]

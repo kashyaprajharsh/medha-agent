@@ -1,0 +1,8 @@
+id = "alphavantage"
+name = "Alpha Vantage"
+category = "finance"
+description = "Stock, forex and crypto prices, fundamentals and indicators."
+url = "https://mcp.alphavantage.co/mcp"
+sign_in = "oauth"
+source = "https://mcp.alphavantage.co/"
+asks = ["What's Apple's price and P/E today?", "Compare revenue growth for NVDA and AMD", "Show the EUR to INR trend this month"]

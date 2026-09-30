@@ -1,0 +1,8 @@
+id = "wordpress-com"
+name = "WordPress.com"
+category = "design"
+description = "Posts, pages and site settings."
+url = "https://public-api.wordpress.com/wpcom/v2/mcp/v1"
+sign_in = "oauth"
+source = "https://developer.wordpress.com/docs/mcp/"
+asks = ["Draft a post announcing the new release", "List my recent posts and their status", "Update the About page"]

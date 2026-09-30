@@ -1,0 +1,8 @@
+id = "clickup"
+name = "ClickUp"
+category = "productivity"
+description = "Tasks, docs and spaces."
+url = "https://mcp.clickup.com/mcp"
+sign_in = "oauth"
+source = "https://developer.clickup.com/docs/connect-an-ai-assistant-to-clickups-mcp-server"
+asks = ["What's due for me this week in ClickUp?", "Create a task for the login bug", "Summarise the Roadmap doc"]

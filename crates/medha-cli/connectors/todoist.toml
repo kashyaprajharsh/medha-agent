@@ -1,0 +1,8 @@
+id = "todoist"
+name = "Todoist"
+category = "productivity"
+description = "Tasks, projects and due dates."
+url = "https://ai.todoist.net/mcp"
+sign_in = "oauth"
+source = "https://www.todoist.com/help/articles/todoist-mcp-server"
+asks = ["What's on my Todoist today?", "Add a task to review the pull request tomorrow", "Which tasks are overdue?"]

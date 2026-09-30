@@ -1,0 +1,8 @@
+id = "canva"
+name = "Canva"
+category = "design"
+description = "Designs, templates and brand assets."
+url = "https://mcp.canva.com/mcp"
+sign_in = "oauth"
+source = "https://www.canva.dev/docs/mcp/"
+asks = ["Find my latest presentation design", "Create a social post from our brand template", "List the designs shared with me this week"]

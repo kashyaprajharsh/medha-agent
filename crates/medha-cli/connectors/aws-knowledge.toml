@@ -1,0 +1,9 @@
+id = "aws-knowledge"
+name = "AWS Knowledge"
+category = "developer"
+description = "AWS documentation and best practices."
+url = "https://knowledge-mcp.global.api.aws"
+sign_in = "none"
+source = "https://awslabs.github.io/mcp/servers/aws-knowledge-mcp-server/"
+asks = ["What's the recommended way to rotate RDS credentials?", "Explain S3 bucket policies versus ACLs", "What are Lambda's memory and timeout limits?"]
+detect = ["cdk.json", "samconfig.toml"]

@@ -82,6 +82,36 @@ impl Runtime {
                 "The server changed since review. Reload its details before connecting.".into(),
             );
         }
+        self.start(id, server, writer).await
+    }
+
+    /// Clicking Connect on a reviewed entry is its review, so no hash is asked.
+    pub async fn connect_connector(
+        &self,
+        params: &Value,
+        writer: &Arc<crate::acp::Writer>,
+    ) -> Result<Value, String> {
+        let connector = params["id"]
+            .as_str()
+            .and_then(crate::connectors::find)
+            .ok_or("Unknown connector")?;
+        let mut installed = None;
+        crate::config::edit(|cfg| {
+            let id = connector.install(&mut cfg.mcp);
+            installed = cfg.mcp.get(&id).cloned().map(|server| (id, server));
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+        let (id, server) = installed.ok_or("Connector could not be saved")?;
+        self.start(&id, &server, writer).await
+    }
+
+    async fn start(
+        &self,
+        id: &str,
+        server: &crate::config::McpServer,
+        writer: &Arc<crate::acp::Writer>,
+    ) -> Result<Value, String> {
         let manager = self
             .mcp
             .as_ref()

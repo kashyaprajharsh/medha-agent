@@ -1,0 +1,8 @@
+id = "attio"
+name = "Attio"
+category = "sales"
+description = "CRM records, lists and notes."
+url = "https://mcp.attio.com/mcp"
+sign_in = "oauth"
+source = "https://attio.com/help/apps/other-apps/using-the-attio-mcp-server"
+asks = ["Which deals moved stage this week?", "Add a note to the Acme record", "List companies we haven't contacted in a month"]

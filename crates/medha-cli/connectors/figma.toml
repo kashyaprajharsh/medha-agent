@@ -1,0 +1,8 @@
+id = "figma"
+name = "Figma"
+category = "design"
+description = "Design files, components and variables."
+url = "https://mcp.figma.com/mcp"
+sign_in = "oauth"
+source = "https://developers.figma.com/docs/figma-mcp-server/remote-server-installation/"
+asks = ["Turn this Figma frame into React components", "What colours and spacing does our design system use?", "Summarise the comments on the checkout design"]

@@ -1,0 +1,8 @@
+id = "globalping"
+name = "Globalping"
+category = "developer"
+description = "Ping, traceroute and DNS checks from probes worldwide."
+url = "https://mcp.globalping.dev/mcp"
+sign_in = "oauth"
+source = "https://github.com/jsdelivr/globalping-mcp-server"
+asks = ["Ping our API from Europe and Asia", "Traceroute to example.com from three countries", "Check DNS for our domain worldwide"]

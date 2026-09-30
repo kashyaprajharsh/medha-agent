@@ -1,0 +1,9 @@
+id = "betterstack"
+name = "Better Stack"
+category = "developer"
+description = "Uptime monitors, incidents and logs."
+url = "https://mcp.betterstack.com"
+sign_in = "oauth"
+source = "https://betterstack.com/docs/getting-started/integrations/mcp/"
+asks = ["Which monitors are down right now?", "Summarise last night's incident", "Search today's logs for timeout errors"]
+detect = ["npm:@logtail/node", "npm:@logtail/browser"]

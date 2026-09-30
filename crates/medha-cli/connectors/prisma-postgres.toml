@@ -1,0 +1,9 @@
+id = "prisma-postgres"
+name = "Prisma Postgres"
+category = "developer"
+description = "Databases, backups and migrations."
+url = "https://mcp.prisma.io/mcp"
+sign_in = "oauth"
+source = "https://www.prisma.io/docs/postgres/integrations/mcp-server"
+asks = ["Show my Prisma Postgres databases", "Back up the database before this migration", "Which migrations have run?"]
+detect = ["prisma/schema.prisma"]

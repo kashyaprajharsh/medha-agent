@@ -1,0 +1,8 @@
+id = "context7"
+name = "Context7"
+category = "developer"
+description = "Current documentation for libraries and frameworks."
+url = "https://mcp.context7.com/mcp"
+sign_in = "none"
+source = "https://context7.com/docs/resources/all-clients"
+asks = ["Show the current docs for React's useEffect", "How do I configure Next.js middleware?", "What changed in the latest Tailwind release?"]

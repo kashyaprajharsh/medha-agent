@@ -1,0 +1,8 @@
+id = "deepwiki"
+name = "DeepWiki"
+category = "developer"
+description = "Documentation for public GitHub repositories."
+url = "https://mcp.deepwiki.com/mcp"
+sign_in = "none"
+source = "https://docs.devin.ai/work-with-devin/deepwiki-mcp"
+asks = ["How is the tokio runtime structured?", "Explain the architecture of vercel/next.js", "Where does ripgrep handle .gitignore?"]

@@ -1,0 +1,9 @@
+id = "buildkite"
+name = "Buildkite"
+category = "developer"
+description = "Pipelines, builds and job logs."
+url = "https://mcp.buildkite.com/mcp"
+sign_in = "oauth"
+source = "https://buildkite.com/docs/apis/mcp-server"
+asks = ["Why did the last main build fail?", "Show the slowest steps in the pipeline", "Retry the failed job on my branch"]
+detect = [".buildkite/pipeline.yml"]

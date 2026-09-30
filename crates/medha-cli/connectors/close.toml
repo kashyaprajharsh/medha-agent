@@ -1,0 +1,8 @@
+id = "close"
+name = "Close"
+category = "sales"
+description = "Leads, contacts and sales activity."
+url = "https://mcp.close.com/mcp"
+sign_in = "oauth"
+source = "https://help.close.com/docs/mcp-server"
+asks = ["Which leads haven't been contacted this week?", "Log a call with the Acme lead", "Summarise my pipeline"]

@@ -1,0 +1,9 @@
+id = "zapier"
+name = "Zapier"
+category = "productivity"
+description = "Actions in the apps you have connected to Zapier."
+url = "https://mcp.zapier.com/api/mcp/mcp"
+sign_in = "oauth"
+source = "https://docs.zapier.com/mcp/home"
+asks = ["What actions can you run through my Zapier account?", "Post a summary of this change to our team channel", "Add this lead to the sales spreadsheet"]
+detect = ["npm:zapier-platform-core"]

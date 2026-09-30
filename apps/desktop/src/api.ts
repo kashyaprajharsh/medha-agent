@@ -125,6 +125,7 @@ export type LiveMethod =
   | "extensions.reload"
   | "extensions.catalog"
   | "mcp.connect"
+  | "connectors.connect"
   | "mcp.disconnect"
   | "mcp.signin"
   | "tasks.list"

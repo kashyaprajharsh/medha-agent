@@ -1,0 +1,9 @@
+id = "mixpanel"
+name = "Mixpanel"
+category = "analytics"
+description = "Events, funnels and user reports."
+url = "https://mcp.mixpanel.com/mcp"
+sign_in = "oauth"
+source = "https://docs.mixpanel.com/docs/mcp"
+asks = ["How many users finished onboarding this week?", "Show retention for last month's cohort", "Which events dropped after the release?"]
+detect = ["npm:mixpanel", "npm:mixpanel-browser", "pypi:mixpanel"]

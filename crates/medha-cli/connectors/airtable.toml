@@ -1,0 +1,9 @@
+id = "airtable"
+name = "Airtable"
+category = "productivity"
+description = "Bases, tables and records."
+url = "https://mcp.airtable.com/mcp"
+sign_in = "oauth"
+source = "https://support.airtable.com/articles/9897799762-using-the-airtable-mcp-server"
+asks = ["List the records added to my Content base this week", "Summarise the Launch tracker table", "Add a row for today's customer call"]
+detect = ["npm:airtable", "pypi:pyairtable"]

@@ -1,0 +1,9 @@
+id = "netlify"
+name = "Netlify"
+category = "developer"
+description = "Sites, deploys and environment settings."
+url = "https://netlify-mcp.netlify.app/mcp"
+sign_in = "oauth"
+source = "https://docs.netlify.com/build/build-with-ai/agent-setup-guides/agent-setup-overview/"
+asks = ["Why did the last deploy fail?", "List the site's environment variables", "Roll back to the previous deploy"]
+detect = ["netlify.toml"]

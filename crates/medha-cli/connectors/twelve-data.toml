@@ -1,0 +1,8 @@
+id = "twelve-data"
+name = "Twelve Data"
+category = "finance"
+description = "Real-time and historical market data."
+url = "https://mcp.twelvedata.com/mcp"
+sign_in = "oauth"
+source = "https://twelvedata.com/docs"
+asks = ["Show TSLA's daily chart for this quarter", "What's the RSI for BTC/USD right now?", "Compare the S&P 500 and Nasdaq this year"]

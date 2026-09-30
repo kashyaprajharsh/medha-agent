@@ -7,6 +7,7 @@ mod acp_questions;
 mod agents;
 mod attachments;
 mod config;
+mod connectors;
 mod desktop_changes;
 mod desktop_controls;
 mod desktop_extensions;

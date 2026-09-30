@@ -1,0 +1,8 @@
+id = "comfy-cloud"
+name = "Comfy Cloud"
+category = "design"
+description = "Image and video generation workflows."
+url = "https://cloud.comfy.org/mcp"
+sign_in = "oauth"
+source = "https://docs.comfy.org/agent-tools/cloud"
+asks = ["List my saved workflows", "Run my upscale workflow on this image", "Generate a product shot from this prompt"]

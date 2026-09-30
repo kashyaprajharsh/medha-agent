@@ -1,0 +1,9 @@
+id = "amplitude"
+name = "Amplitude"
+category = "analytics"
+description = "Product analytics charts, cohorts and events."
+url = "https://mcp.amplitude.com/mcp"
+sign_in = "oauth"
+source = "https://amplitude.com/docs/amplitude-ai/amplitude-mcp"
+asks = ["How did signups trend this month?", "Which features do new users try first?", "Build a funnel from signup to first project"]
+detect = ["npm:@amplitude/analytics-browser", "npm:@amplitude/analytics-node"]

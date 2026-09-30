@@ -1,0 +1,8 @@
+id = "adobe"
+name = "Adobe"
+category = "design"
+description = "Photoshop, Illustrator, Firefly, Express and Stock."
+url = "https://adobe-creativity.adobe.io/mcp"
+sign_in = "oauth"
+source = "https://github.com/AdobeDocs/adobe-creativity-mcp"
+asks = ["Remove the background from this product photo", "Make three banner sizes from this design", "Find stock photos of a city at sunrise"]

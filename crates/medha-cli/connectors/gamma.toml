@@ -1,0 +1,8 @@
+id = "gamma"
+name = "Gamma"
+category = "design"
+description = "Presentations, documents and web pages."
+url = "https://mcp.gamma.app/mcp"
+sign_in = "oauth"
+source = "https://developers.gamma.app/docs/gamma-mcp-server"
+asks = ["Turn these notes into a presentation", "Make a deck that explains this README", "Draft a one-page site for the launch"]

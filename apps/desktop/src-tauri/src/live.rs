@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use transcript_view::Steps;
 
-const REQUESTS: [&str; 21] = [
+const REQUESTS: [&str; 22] = [
     "mcp.signin",
+    "connectors.connect",
     "tasks.list",
     "memory.list",
     "memory.pin",

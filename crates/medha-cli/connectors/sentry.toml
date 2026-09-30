@@ -1,0 +1,9 @@
+id = "sentry"
+name = "Sentry"
+category = "developer"
+description = "Errors, issues and releases."
+url = "https://mcp.sentry.dev/mcp"
+sign_in = "oauth"
+source = "https://docs.sentry.io/product/sentry-mcp/"
+asks = ["Which errors started after the last deploy?", "Explain the top crash in the API", "Link this fix to its Sentry issue"]
+detect = ["npm:@sentry/node", "npm:@sentry/nextjs", "npm:@sentry/react", "npm:@sentry/browser", "pypi:sentry-sdk"]

@@ -1,0 +1,8 @@
+id = "klaviyo"
+name = "Klaviyo"
+category = "sales"
+description = "Email and SMS campaigns, flows and audiences."
+url = "https://mcp.klaviyo.com/mcp?core-tools-only=true&disable-tools-with-user-generated-content=true"
+sign_in = "oauth"
+source = "https://developers.klaviyo.com/en/docs/klaviyo_mcp_server"
+asks = ["How did last week's campaign perform?", "Which flows bring in the most revenue?", "Draft an email for the spring sale"]

@@ -1,0 +1,9 @@
+id = "motherduck"
+name = "MotherDuck"
+category = "developer"
+description = "SQL queries over your MotherDuck databases."
+url = "https://api.motherduck.com/mcp"
+sign_in = "oauth"
+source = "https://motherduck.com/docs/key-tasks/ai-and-motherduck/mcp-setup/"
+asks = ["What tables are in my analytics database?", "Chart signups by week", "Explain why this query is slow"]
+detect = ["npm:@motherduck/wasm-client"]

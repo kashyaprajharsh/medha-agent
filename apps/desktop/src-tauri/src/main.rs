@@ -360,6 +360,7 @@ async fn extension_request(
         "extensions.update.preview",
         "extensions.update.apply",
         "extensions.mcp.registry",
+        "extensions.connectors",
         "extensions.hooks.list",
         "extensions.hooks.add",
         "extensions.hooks.remove",

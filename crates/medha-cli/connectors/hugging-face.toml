@@ -1,0 +1,9 @@
+id = "hugging-face"
+name = "Hugging Face"
+category = "developer"
+description = "Models, datasets and Spaces on the Hub."
+url = "https://huggingface.co/mcp"
+sign_in = "none"
+source = "https://huggingface.co/docs/hub/agents-mcp"
+asks = ["Find a small text embedding model", "Compare these two models on downloads and license", "Search for datasets about code review"]
+detect = ["npm:@huggingface/inference", "pypi:transformers", "pypi:huggingface-hub", "pypi:huggingface_hub"]

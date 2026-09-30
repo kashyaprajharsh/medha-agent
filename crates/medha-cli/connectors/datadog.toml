@@ -1,0 +1,9 @@
+id = "datadog"
+name = "Datadog"
+category = "developer"
+description = "Metrics, logs, traces and monitors."
+url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
+sign_in = "oauth"
+source = "https://docs.datadoghq.com/bits_ai/mcp_server/"
+asks = ["Which monitors are alerting?", "Show p95 latency for the API over the last day", "Find checkout error logs from the last hour"]
+detect = ["datadog.yaml", "npm:dd-trace", "pypi:ddtrace"]

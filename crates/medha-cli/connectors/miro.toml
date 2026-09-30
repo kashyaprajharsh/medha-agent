@@ -1,0 +1,8 @@
+id = "miro"
+name = "Miro"
+category = "design"
+description = "Boards, sticky notes and diagrams."
+url = "https://mcp.miro.com/"
+sign_in = "oauth"
+source = "https://developers.miro.com/docs/connecting-to-miro-mcp"
+asks = ["Summarise the sticky notes on our retro board", "Draw this architecture as a diagram on a new board", "Turn the planning board into a task list"]

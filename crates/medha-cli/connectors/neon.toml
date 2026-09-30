@@ -1,0 +1,9 @@
+id = "neon"
+name = "Neon"
+category = "developer"
+description = "Postgres projects, branches and queries."
+url = "https://mcp.neon.tech/mcp"
+sign_in = "oauth"
+source = "https://neon.com/docs/ai/neon-mcp-server"
+asks = ["Create a branch of the production database", "Show the slowest queries this week", "Run this migration on a test branch"]
+detect = ["npm:@neondatabase/serverless"]

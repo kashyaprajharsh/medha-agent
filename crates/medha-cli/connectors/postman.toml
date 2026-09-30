@@ -1,0 +1,8 @@
+id = "postman"
+name = "Postman"
+category = "developer"
+description = "Collections, requests and API workspaces."
+url = "https://mcp.postman.com/minimal"
+sign_in = "oauth"
+source = "https://learning.postman.com/docs/reference/postman-api/postman-mcp-server/postman-mcp-remote-server/"
+asks = ["List the requests in the Payments collection", "Run the smoke test collection", "Add this endpoint to our API workspace"]

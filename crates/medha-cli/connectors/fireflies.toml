@@ -1,0 +1,8 @@
+id = "fireflies"
+name = "Fireflies"
+category = "productivity"
+description = "Meeting transcripts and summaries."
+url = "https://api.fireflies.ai/mcp"
+sign_in = "oauth"
+source = "https://docs.fireflies.ai/getting-started/mcp-configuration"
+asks = ["Summarise yesterday's product meeting", "What action items came out of my calls this week?", "Find where pricing came up in recent calls"]

@@ -1,0 +1,9 @@
+id = "linear"
+name = "Linear"
+category = "productivity"
+description = "Issues, projects and cycles."
+url = "https://mcp.linear.app/mcp"
+sign_in = "oauth"
+source = "https://linear.app/docs/mcp"
+asks = ["What's blocking the current cycle?", "Draft issues for the TODOs in this branch", "Which of my issues changed since yesterday?"]
+detect = ["npm:@linear/sdk"]

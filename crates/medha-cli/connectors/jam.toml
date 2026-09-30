@@ -1,0 +1,8 @@
+id = "jam"
+name = "Jam"
+category = "developer"
+description = "Bug reports with console logs, network requests and replays."
+url = "https://mcp.jam.dev/mcp"
+sign_in = "oauth"
+source = "https://jam.dev/docs/debug-a-jam/mcp"
+asks = ["Summarise the latest bug report", "What console errors did the reporter hit?", "Turn this Jam into a fix plan"]

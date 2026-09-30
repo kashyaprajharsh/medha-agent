@@ -1,0 +1,9 @@
+id = "semgrep"
+name = "Semgrep"
+category = "developer"
+description = "Code scans for security issues and bugs."
+url = "https://mcp.semgrep.ai/mcp"
+sign_in = "oauth"
+source = "https://semgrep.dev/docs/mcp"
+asks = ["Scan this repository for security issues", "Explain this finding and suggest a fix", "Which rules flagged the auth module?"]
+detect = [".semgrep.yml", "semgrep.yml"]

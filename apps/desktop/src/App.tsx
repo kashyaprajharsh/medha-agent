@@ -445,6 +445,16 @@ export function App() {
     setDraftKey(`draft-${crypto.randomUUID()}`);
   }
 
+  /** A new chat with its first message written but not sent. */
+  function startWith(prompt: string) {
+    drafts += 1;
+    setPage("chat");
+    setPreview(null);
+    const key = `draft-${crypto.randomUUID()}`;
+    setDraftKey(key);
+    setText((all) => ({ ...all, [key]: prompt }));
+  }
+
   function submit(
     message = currentKey ? (text.current[currentKey] ?? "") : "",
   ) {
@@ -836,6 +846,7 @@ export function App() {
                 await ensureOpen(currentKey, draftKey ? null : selected);
             }}
             locked={settingsLocked}
+            onAsk={startWith}
           />
         )}
         {page === "settings" && (

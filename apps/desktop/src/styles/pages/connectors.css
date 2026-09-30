@@ -1,0 +1,423 @@
+/* Connectors: real brand icons carry the colour; everything around them stays quiet. */
+.cx-lede {
+  color: var(--dim);
+  line-height: 1.6;
+  margin: 0 0 var(--s-8);
+}
+.cx-section {
+  margin-bottom: 36px;
+}
+.cx-section h3 {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  margin: 0 0 var(--s-3);
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+.cx-section h3 span {
+  color: var(--faint);
+  font-weight: 400;
+  font-size: var(--text-sm);
+}
+.cx-rows {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px var(--s-3);
+  margin: 0 -14px;
+}
+.cx-row {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  border-radius: var(--r-lg);
+  text-align: left;
+  transition:
+    background var(--t-fast),
+    box-shadow var(--t-fast);
+}
+.cx-row:hover {
+  background: var(--hover);
+}
+.cx-row:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--gold) 60%, transparent);
+  outline-offset: 2px;
+}
+[data-look="soft"] .cx-row:hover {
+  background: transparent;
+  box-shadow: var(--e1-shadow);
+}
+.cx-plate {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-md);
+  box-shadow: 0 0 0 1px var(--hair);
+  transition: scale var(--t-base) var(--ease-out);
+}
+.cx-row:hover .cx-plate {
+  scale: 1.05;
+}
+.cx-text {
+  min-width: 0;
+}
+.cx-name {
+  display: block;
+  font-weight: 600;
+  font-size: var(--text-md);
+}
+.cx-desc {
+  display: block;
+  margin-top: 1px;
+  color: var(--dim);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cx-suggested .cx-desc {
+  color: var(--faint);
+}
+.cx-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--dim);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+.cx-state.dim {
+  color: var(--faint);
+}
+.cx-state .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.cx-go {
+  color: var(--faint);
+  opacity: 0;
+  translate: -4px 0;
+  transition:
+    opacity var(--t-fast),
+    translate var(--t-base) var(--ease-out);
+}
+.cx-row:is(:hover, :focus-visible) .cx-go {
+  opacity: 1;
+  translate: 0 0;
+}
+.cx-fix {
+  padding: 6px 14px;
+  border-radius: var(--r-full);
+  color: var(--gold);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gold) 40%, transparent);
+}
+.cx-row:hover .cx-fix {
+  background: var(--gold-wash);
+}
+
+/* The connected list is the page's one framed group: what Medha did, per app. */
+.cx-rows.one {
+  grid-template-columns: 1fr;
+  gap: 0;
+  margin: 0;
+  border-radius: var(--r-lg);
+  box-shadow: inset 0 0 0 1px var(--hair);
+}
+[data-look="soft"] .cx-rows.one {
+  box-shadow: var(--e1-shadow);
+}
+.cx-rows.one .cx-row {
+  border-radius: 0;
+  padding: 14px 16px;
+}
+.cx-rows.one .cx-row:hover {
+  box-shadow: none;
+  background: var(--hover);
+}
+.cx-rows.one .cx-row:first-child {
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+}
+.cx-rows.one .cx-row:last-child {
+  border-radius: 0 0 var(--r-lg) var(--r-lg);
+}
+.cx-rows.one .cx-row:only-child {
+  border-radius: var(--r-lg);
+}
+.cx-rows.one .cx-row + .cx-row {
+  border-top: 1px solid var(--hair);
+}
+.cx-ledger .cx-desc {
+  color: var(--text);
+}
+.cx-ledger.expired .cx-desc {
+  color: var(--warn);
+}
+
+/* The sheet floats over the page, sized to what it says. */
+.cx-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  background: var(--scrim);
+}
+.cx-sheet {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  z-index: 901;
+  width: min(420px, calc(100vw - 20px));
+  max-height: calc(100vh - 20px);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 28px 28px 24px;
+  border-radius: var(--r-xl);
+  background: var(--overlay);
+  box-shadow:
+    var(--shadow),
+    inset 0 0 0 1px var(--hair);
+}
+.cx-close {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  color: var(--faint);
+  display: grid;
+  place-items: center;
+}
+.cx-close:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.cx-hero {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+.cx-hero .cx-plate {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--r-lg);
+}
+.cx-hero h2 {
+  margin: 0;
+  font-size: var(--text-xl);
+}
+.cx-hero small {
+  color: var(--faint);
+  font-size: var(--text-sm);
+}
+.cx-about {
+  margin: 0 0 22px;
+  color: var(--dim);
+  line-height: 1.6;
+}
+.cx-sheet h4 {
+  margin: 0 0 10px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.cx-asks {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 22px;
+  padding: 0;
+  list-style: none;
+}
+.cx-asks button {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  text-align: left;
+  color: var(--text);
+  font-size: var(--text-sm);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  transition: background var(--t-fast);
+}
+.cx-asks button:not(:disabled):hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+.cx-asks button:disabled {
+  color: var(--faint);
+  cursor: default;
+  background: color-mix(in srgb, var(--text) 2.5%, transparent);
+}
+.cx-facts {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 9px;
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+.cx-facts li {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  line-height: 1.45;
+}
+.cx-facts .icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--faint);
+}
+
+/* The gilded fill is the Medha logo's own gradient. */
+.cx-foot {
+  margin-top: 26px;
+}
+.cx-connect {
+  position: relative;
+  isolation: isolate;
+  width: 100%;
+  height: 44px;
+  border-radius: var(--r-full);
+  font-weight: 600;
+  font-size: var(--text-sm);
+  transition:
+    background var(--t-base),
+    color var(--t-base),
+    box-shadow var(--t-base),
+    filter var(--t-fast),
+    translate var(--t-fast);
+}
+.cx-connect.gild {
+  background: linear-gradient(180deg, var(--logo-top) -35%, var(--logo-mid) 55%, var(--logo-base) 150%);
+  color: var(--gold-ink);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, white 45%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, black 18%, transparent),
+    var(--e1-shadow),
+    0 4px 12px -6px color-mix(in srgb, var(--gold) 55%, transparent);
+}
+.cx-connect.gild:hover {
+  filter: brightness(1.07);
+  translate: 0 -1px;
+}
+.cx-connect.busy {
+  background: transparent;
+  color: var(--text);
+  box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--gold) 25%, transparent);
+  cursor: default;
+}
+.cx-connect.waiting::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: conic-gradient(from var(--cx-a), transparent 0 60%, var(--gold-hi) 82%, transparent 100%);
+  -webkit-mask:
+    linear-gradient(black 0 0) content-box,
+    linear-gradient(black 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: cx-orbit 1.6s linear infinite;
+}
+.cx-connect.done {
+  background: var(--gold-wash);
+  color: var(--gold);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gold) 30%, transparent);
+  cursor: default;
+}
+.cx-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  animation: cx-label-in var(--t-slow) var(--ease-out);
+}
+.cx-label .icon {
+  width: 15px;
+  height: 15px;
+}
+.cx-label .ext {
+  opacity: 0.75;
+}
+.cx-hint {
+  margin: 10px 0 0;
+  min-height: 1.4em;
+  text-align: center;
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+.cx-link {
+  color: var(--gold);
+  font-size: inherit;
+}
+.cx-link.quiet {
+  margin-left: 8px;
+  color: var(--dim);
+}
+.cx-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.cx-problem {
+  margin: 12px 0 0;
+  color: var(--err);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+@property --cx-a {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes cx-orbit {
+  to {
+    --cx-a: 360deg;
+  }
+}
+@keyframes cx-label-in {
+  from {
+    opacity: 0;
+    translate: 0 8px;
+  }
+}
+::view-transition-group(*) {
+  animation-duration: 420ms;
+  animation-timing-function: var(--ease);
+}
+::view-transition-new(cx-sheet) {
+  animation: cx-sheet-in 380ms var(--ease-out) both;
+}
+::view-transition-old(cx-sheet) {
+  animation: cx-sheet-out 220ms ease-in both;
+}
+@keyframes cx-sheet-in {
+  from {
+    translate: 36px 0;
+    opacity: 0;
+  }
+}
+@keyframes cx-sheet-out {
+  to {
+    translate: 36px 0;
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cx-label,
+  .cx-connect.waiting::before {
+    animation: none;
+  }
+}
+@media (max-width: 760px) {
+  .cx-rows {
+    grid-template-columns: 1fr;
+  }
+}

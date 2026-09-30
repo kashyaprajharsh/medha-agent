@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Connectors } from "./Connectors";
 import { Icon } from "./Icon";
 import { useWorkspaceApi } from "./Workspace";
 import { McpDetails, McpForm, mcpView as serverView, useMcpSignIn, type McpPrefill, type McpServer, type McpStatus } from "./McpServers";
@@ -57,10 +58,12 @@ export function Extensions({
   sessionKey,
   ensureOpen,
   locked,
+  onAsk,
 }: {
   sessionKey: string | null;
   ensureOpen: () => Promise<void>;
   locked: boolean;
+  onAsk: (prompt: string) => void;
 }) {
   const api = useWorkspaceApi();
   const [updating, setUpdating] = useState<Update>();
@@ -75,13 +78,29 @@ export function Extensions({
   const [skillView, setSkillView] = useState<"installed" | "browse" | "manage">("installed");
   const [mcpView, setMcpView] = useState<"yours" | "catalog">("yours");
   const [prefill, setPrefill] = useState<McpPrefill>();
+  const onConnectors = useRef(true);
   const signIn = useMcpSignIn(sessionKey, (event) => {
+    setRefresh((value) => value + 1);
+    // The Connectors sheet reports its own sign-ins.
+    if (onConnectors.current) return;
     setNotice(event.ok ? `Signed in to ${event.server}` : "");
     if (!event.ok) setError(`Sign-in to ${event.server} failed: ${event.error ?? "unknown error"}`);
-    setRefresh((value) => value + 1);
   });
-  const [tab, setTab] = useState("skills");
+  const [tab, setTab] = useState("connectors");
+  onConnectors.current = tab === "connectors";
   const [query, setQuery] = useState("");
+  const filter = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const typing = event.target instanceof HTMLElement && event.target.closest("input, textarea, [contenteditable]");
+      if (event.key === "/" && !typing && filter.current) {
+        event.preventDefault();
+        filter.current.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [mcp, setMcp] = useState<Mcp[]>([]);
@@ -182,7 +201,7 @@ export function Extensions({
       <div className="page-content extensions-page">
         <div className="extension-head">
           <div className="page-tabs" role="tablist" aria-label="Extensions">
-            {["skills", "plugins", "MCP", "hooks", "tool access"].map((name) => (
+            {["connectors", "skills", "plugins", "MCP", "hooks", "tool access"].map((name) => (
               <button
                 key={name}
                 role="tab"
@@ -204,9 +223,10 @@ export function Extensions({
           {!(tab === "skills" && skillView !== "installed") &&
             !(tab === "plugins" && pluginView === "browse") && (
               <input
+                ref={filter}
                 className="filter-input"
-                aria-label="Filter extensions"
-                placeholder="Filter"
+                aria-label={tab === "connectors" ? "Search apps" : "Filter extensions"}
+                placeholder={tab === "connectors" ? "Search apps" : "Filter"}
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
               />
@@ -221,6 +241,18 @@ export function Extensions({
           <p className="quiet" role="status">
             {notice}
           </p>
+        )}
+        {tab === "connectors" && (
+          <Connectors
+            sessionKey={sessionKey}
+            ensureOpen={ensureOpen}
+            statuses={statuses}
+            hashes={Object.fromEntries(mcp.map((server) => [server.id, server.hash]))}
+            query={query}
+            refresh={refresh}
+            onChanged={() => setRefresh((value) => value + 1)}
+            onAsk={onAsk}
+          />
         )}
         {tab === "skills" && (
           <div className="segmented">

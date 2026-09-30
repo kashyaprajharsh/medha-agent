@@ -1,0 +1,8 @@
+id = "microsoft-learn"
+name = "Microsoft Learn"
+category = "developer"
+description = "Microsoft and Azure documentation."
+url = "https://learn.microsoft.com/api/mcp"
+sign_in = "none"
+source = "https://learn.microsoft.com/en-us/training/support/mcp-get-started"
+asks = ["How do I authenticate to Azure from a container?", "Find the docs for .NET minimal APIs", "What are the limits of Azure Functions?"]

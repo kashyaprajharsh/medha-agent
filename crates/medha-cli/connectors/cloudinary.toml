@@ -1,0 +1,9 @@
+id = "cloudinary"
+name = "Cloudinary"
+category = "design"
+description = "Images and videos in your media library."
+url = "https://asset-management.mcp.cloudinary.com/mcp"
+sign_in = "oauth"
+source = "https://cloudinary.com/documentation/cloudinary_llm_mcp"
+asks = ["Find product images uploaded this month", "Which assets are tagged homepage?", "Get a resized link for the hero image"]
+detect = ["npm:cloudinary", "npm:next-cloudinary", "pypi:cloudinary"]

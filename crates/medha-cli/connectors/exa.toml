@@ -1,0 +1,8 @@
+id = "exa"
+name = "Exa"
+category = "search"
+description = "Web search and page contents."
+url = "https://mcp.exa.ai/mcp"
+sign_in = "none"
+source = "https://docs.exa.ai/reference/exa-mcp"
+asks = ["Find recent research on retrieval evaluation", "Get the full text of this article", "Find companies building developer tools in Berlin"]

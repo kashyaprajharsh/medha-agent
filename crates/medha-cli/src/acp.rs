@@ -1514,6 +1514,8 @@ where
                         Some(if running || agents.as_ref().is_some_and(|control| !control.active().is_empty()) || !kernel.executor.background_tasks().is_empty() { Err("Finish active work before connecting a server.".into()) } else { extensions.connect(&params, &writer).await })
                     } else if method == "mcp.signin" {
                         Some(extensions.sign_in_again(&params, &writer).await)
+                    } else if method == "connectors.connect" {
+                        Some(if running || agents.as_ref().is_some_and(|control| !control.active().is_empty()) || !kernel.executor.background_tasks().is_empty() { Err("Finish active work before connecting a server.".into()) } else { extensions.connect_connector(&params, &writer).await })
                     } else if method == "memory.list" {
                         Some(crate::desktop_memory::list(extensions.memory.as_ref()).await)
                     } else if method == "memory.pin" || method == "memory.forget" {

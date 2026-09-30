@@ -198,6 +198,11 @@ impl LiveSessions {
         }
         let mut command = Command::new(crate::service::backend_executable()?);
         command.arg("--acp");
+        if let Some((address, token)) = crate::mcp_host::env() {
+            command
+                .env("MEDHA_MCP_HOST", address)
+                .env("MEDHA_MCP_HOST_TOKEN", token);
+        }
         if let Some(id) = resume {
             command.arg("--resume").arg(id);
         }

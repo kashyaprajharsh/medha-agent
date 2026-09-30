@@ -10,7 +10,7 @@ sandbox = { version = "0.1.8", path = "../sandbox" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "time"] }
+tokio = { workspace = true, features = ["process", "io-util", "time", "net"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 # Official MCP SDK: stdio child-process transport + client lifecycle. Pinned to a
@@ -32,6 +32,7 @@ futures.workspace = true
 # client trait names `sse_stream` types in the stream it returns.
 async-trait = "0.1"
 sse-stream = "0.2"
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 # Process-group teardown: uvx/npx fork the real server, so killing the direct

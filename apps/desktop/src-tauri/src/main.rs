@@ -1,6 +1,7 @@
 mod files;
 mod git;
 mod live;
+mod mcp_host;
 mod service;
 mod terminal;
 mod usage;

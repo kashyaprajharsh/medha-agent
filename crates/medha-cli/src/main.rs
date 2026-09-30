@@ -20,6 +20,7 @@ mod desktop_service;
 mod desktop_skills;
 mod hook_files;
 mod lock_edit;
+mod mcp_host;
 mod plugin_session;
 mod plugins_cmd;
 mod skill_hub;
@@ -843,6 +844,9 @@ async fn main() -> Result<()> {
     if raw.get(1).map(|s| s == "desktop-service").unwrap_or(false) {
         return desktop_service::run(&raw[2..]).await;
     }
+    if raw.get(1).map(|s| s == "mcp-host").unwrap_or(false) {
+        return mcp_host::run(&raw[2..]).await;
+    }
 
     let cli = Cli::parse();
     let effort_override = match cli.reasoning_effort.clone() {
@@ -1482,15 +1486,24 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
     let configured_mcp: std::collections::HashSet<String> =
         mcp_servers.iter().map(|server| server.id.clone()).collect();
+    let shared_mcp: std::collections::HashSet<String> = model_profiles
+        .lock()
+        .map(|cfg| {
+            cfg.mcp
+                .iter()
+                .filter(|(_, server)| mcp_host::is_shared(server))
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let plugin_mcp = session_plugins.mcp_servers(&configured_mcp);
     let plugin_mcp_ids = plugin_mcp.iter().map(|server| server.id.clone()).collect();
     mcp_servers.extend(plugin_mcp);
     // An idle manager allows live additions without a restart.
     let mcp_manager = {
-        let had_servers = !mcp_servers.is_empty();
-        let mcp_config = mcp::Config {
+        let mcp_config = |servers: Vec<mcp::ServerConfig>| mcp::Config {
             enabled: true,
-            servers: mcp_servers,
+            servers,
             startup_timeout: std::time::Duration::from_millis(lock.mcp.startup_timeout_ms),
             request_timeout: std::time::Duration::from_millis(lock.mcp.request_timeout_ms),
             max_text_chars: lock.mcp.max_text_chars,
@@ -1501,8 +1514,47 @@ async fn main() -> Result<()> {
             auth_timeout: std::time::Duration::from_millis(lock.mcp.auth_timeout_ms),
             http_timeout: std::time::Duration::from_millis(lock.mcp.http_timeout_ms),
             tokens: Some(Arc::new(config::McpTokens)),
+            cache: Some(medha_home.join("mcp-cache")),
         };
-        let manager = Arc::new(mcp::McpManager::new(cwd.clone(), mcp_config));
+        // With a shared host, the user's remote servers are the host's to run;
+        // without one answering, this chat runs them as before.
+        let mut manager = None;
+        if let Some(endpoint) = mcp_host::endpoint() {
+            let own: Vec<_> = mcp_servers
+                .iter()
+                .filter(|server| !shared_mcp.contains(&server.id))
+                .cloned()
+                .collect();
+            let attached = mcp::McpManager::new(cwd.clone(), mcp_config(own.clone()));
+            // A host that is still starting gets a moment to bind.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let joined = loop {
+                match tokio::time::timeout_at(
+                    deadline.into(),
+                    attached.attach_hub(endpoint.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => break true,
+                    Ok(Err(_)) if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    _ => break false,
+                }
+            };
+            if joined {
+                mcp_servers = own;
+                manager = Some(attached);
+            } else {
+                eprintln!(
+                    "note: Medha's connection host did not answer; this chat connects its own MCP servers"
+                );
+            }
+        }
+        let had_servers = !mcp_servers.is_empty();
+        let manager = Arc::new(
+            manager.unwrap_or_else(|| mcp::McpManager::new(cwd.clone(), mcp_config(mcp_servers))),
+        );
         registry.register_mcp(manager.clone());
         if had_servers {
             tokio::spawn({

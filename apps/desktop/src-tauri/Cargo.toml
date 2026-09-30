@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 rfd = "0.17"
 portable-pty = "0.9"
 base64 = "0.22"
+getrandom = "0.3"
 media = { path = "../../../crates/media" }
 transcript-view = { path = "../../../crates/transcript-view" }
 

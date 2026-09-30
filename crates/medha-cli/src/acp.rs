@@ -1417,6 +1417,8 @@ where
     let mut roster = agents.clone().map(crate::acp_agents::Roster::new);
     let mut roster_tick = tokio::time::interval(ROSTER_INTERVAL);
     roster_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Connection changes are pushed to the window as they happen.
+    let mut mcp_changes = extensions.mcp.as_ref().map(|manager| manager.subscribe());
     let mut prompt_reply: Option<Value> = None;
     writer.notify(
         "ready",
@@ -1648,6 +1650,11 @@ where
             _ = roster_tick.tick(), if roster.is_some() => {
                 if let Some(update) = roster.as_mut().and_then(crate::acp_agents::Roster::changed) {
                     writer.notify("agents", update);
+                }
+            }
+            Ok(()) = async { mcp_changes.as_mut().expect("guarded").changed().await }, if mcp_changes.is_some() => {
+                if let Some(manager) = &extensions.mcp {
+                    writer.notify("mcp.status", json!({ "servers": manager.status().await }));
                 }
             }
             _ = writer.cancelled() => break,

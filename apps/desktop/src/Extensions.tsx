@@ -136,34 +136,45 @@ export function Extensions({
       active = false;
     };
   }, [refresh, sessionKey]);
-  const [statusTick, setStatusTick] = useState(0);
+  const showStatuses = (servers: (McpStatus & { server: string })[]) => {
+    setStatuses(Object.fromEntries(servers.map((server) => [server.server, server])));
+    setStatusesRead(true);
+  };
   useEffect(() => {
     if (!sessionKey) return;
     let active = true;
-    let recheck: ReturnType<typeof setTimeout> | undefined;
     void ensureOpen()
       .then(() => api.liveCall(sessionKey, "extensions.catalog"))
       .then((catalog) => {
         if (active) {
-          const servers = (catalog.mcp as (McpStatus & { server: string })[]) || [];
           setTools((catalog.tools as Tool[]) ?? []);
-          setStatuses(Object.fromEntries(servers.map((server) => [server.server, server])));
-          setStatusesRead(true);
+          showStatuses((catalog.mcp as (McpStatus & { server: string })[]) || []);
           if (catalog.skills) setSkills(catalog.skills as Skill[]);
           const runtime = catalog.plugins as { plugins: Plugin[] };
           if (runtime?.plugins) setPlugins(runtime.plugins);
-          // The bridge does not announce state changes, so a server still
-          // coming up is read again until it settles.
-          if (servers.some((server) => ["connecting", "reconnecting", "degraded"].includes(server.state)))
-            recheck = setTimeout(() => setStatusTick((value) => value + 1), 1500);
         }
       })
       .catch((cause) => active && setError(String(cause)));
     return () => {
       active = false;
-      clearTimeout(recheck);
     };
-  }, [tab, sessionKey, refresh, statusTick]);
+  }, [tab, sessionKey, refresh]);
+  // The chat announces every connection change, so the page never has to ask again.
+  useEffect(() => {
+    if (!sessionKey) return;
+    let off: (() => void) | undefined;
+    let gone = false;
+    void api
+      .onLive((key, frame) => {
+        if (key === sessionKey && frame.method === "mcp.status")
+          showStatuses(((frame.params as { servers?: (McpStatus & { server: string })[] })?.servers) ?? []);
+      })
+      .then((unlisten) => (gone ? unlisten() : (off = unlisten)));
+    return () => {
+      gone = true;
+      off?.();
+    };
+  }, [sessionKey]);
   async function act(method: string, params: Record<string, unknown>) {
     setBusy(true);
     setError("");

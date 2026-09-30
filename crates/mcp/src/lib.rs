@@ -30,17 +30,19 @@ use rmcp::transport::{
 };
 use rmcp::{ClientHandler, model::Tool};
 use sandbox::{BackendKind, ExecRequest, NetPolicy, SandboxConfig, select_backend};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     process::Command,
-    sync::{Mutex, RwLock as AsyncRwLock, Semaphore, mpsc},
+    sync::{Mutex, RwLock as AsyncRwLock, Semaphore, mpsc, watch},
     task::JoinSet,
     time::{Instant, MissedTickBehavior, timeout},
 };
 use tokio_util::sync::CancellationToken;
 
+mod cache;
+pub mod hub;
 mod lapse;
 mod oauth;
 mod renewal;
@@ -315,6 +317,8 @@ pub struct Config {
     pub http_timeout: Duration,
     /// Persistence for remote OAuth credentials.
     pub tokens: Option<Arc<dyn TokenStore>>,
+    /// Where last-known tool lists are kept; `None` starts every server empty.
+    pub cache: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -333,13 +337,14 @@ impl Default for Config {
             auth_timeout: Duration::from_secs(300),
             http_timeout: Duration::from_secs(60),
             tokens: None,
+            cache: None,
         }
     }
 }
 
 /// Connection lifecycle. `Parked` and `Failed` are both quiescent, but only
 /// `Failed` is permanent — a parked server still self-probes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerState {
     /// Switched off in the config; nothing is spawned or connected.
@@ -387,16 +392,16 @@ impl fmt::Display for ServerState {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatus {
     pub server: String,
     pub state: ServerState,
     /// Tools exposed to the model.
     pub tools: usize,
     /// Tools the server offers that the filter (or a malformed name) withheld.
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub hidden: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
@@ -414,7 +419,7 @@ pub struct StartPreview {
 }
 
 /// A projected MCP tool, ready to expose to the model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolSpec {
     pub name: String,
     pub description: String,
@@ -423,7 +428,7 @@ pub struct McpToolSpec {
 
 /// A tool-call result flattened to text. The text is complete — capping and
 /// artifact spill happen at the tool layer, which owns the artifact store.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallOutput {
     pub server: String,
     pub tool: String,
@@ -433,7 +438,7 @@ pub struct CallOutput {
 
 /// A server's exposed tools plus the raw names its filter withheld, so the tool
 /// browser can show the whole catalogue with the filtered ones switched off.
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Catalog {
     exposed: Vec<McpToolSpec>,
     hidden: Vec<String>,
@@ -576,6 +581,10 @@ struct ManagerInner {
     tools: RwLock<HashMap<String, Catalog>>,
     changed_tx: mpsc::UnboundedSender<String>,
     changed_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    /// Bumped whenever any server's state or catalogue changes.
+    revision: watch::Sender<u64>,
+    /// The shared host, when this manager runs inside a chat that has one.
+    hub: std::sync::RwLock<Option<Arc<hub::Link>>>,
     supervising: AtomicBool,
     cancel: CancellationToken,
 }
@@ -604,15 +613,31 @@ impl McpManager {
             .map(|server| (server.id.clone(), Slot::new(server.clone())))
             .collect();
         let (changed_tx, changed_rx) = mpsc::unbounded_channel();
+        // Servers that will connect on their own start with their last-known
+        // tools; a gated or switched-off server shows nothing until it runs.
+        let seeded = config
+            .cache
+            .as_deref()
+            .map(|dir| {
+                config
+                    .servers
+                    .iter()
+                    .filter(|server| !server.requires_approval && !server.disabled)
+                    .filter_map(|server| Some((server.id.clone(), cache::load(dir, server)?)))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             inner: Arc::new(ManagerInner {
                 workspace: normalize(&workspace),
                 config,
                 servers: Mutex::new(servers),
                 mutations: Mutex::new(()),
-                tools: RwLock::new(HashMap::new()),
+                tools: RwLock::new(seeded),
                 changed_tx,
                 changed_rx: Mutex::new(Some(changed_rx)),
+                revision: watch::Sender::new(0),
+                hub: std::sync::RwLock::new(None),
                 supervising: AtomicBool::new(false),
                 cancel: CancellationToken::new(),
             }),
@@ -621,6 +646,107 @@ impl McpManager {
 
     pub fn enabled(&self) -> bool {
         self.inner.config.enabled
+    }
+
+    /// Wakes whenever a server's state or tools change; read [`Self::status`]
+    /// or [`Self::tool_specs`] after it fires.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.revision.subscribe()
+    }
+
+    /// Attach to the shared host: its servers join this manager's own, and
+    /// every operation on them is carried out by the host.
+    pub async fn attach_hub(&self, endpoint: hub::Endpoint) -> Result<(), Error> {
+        let weak = Arc::downgrade(&self.inner);
+        let link = hub::Link::attach(endpoint, move || {
+            if let Some(inner) = weak.upgrade() {
+                inner
+                    .revision
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
+            }
+        })
+        .await?;
+        *self.inner.hub.write().expect("mcp hub lock") = Some(link);
+        self.announce();
+        Ok(())
+    }
+
+    fn hub(&self) -> Option<Arc<hub::Link>> {
+        self.inner.hub.read().expect("mcp hub lock").clone()
+    }
+
+    /// The host, if it runs this server.
+    fn hub_for(&self, server: &str) -> Option<Arc<hub::Link>> {
+        self.hub().filter(|link| link.owns(server))
+    }
+
+    /// Every server's state with its tools, for the host to publish.
+    pub(crate) async fn snapshot(&self) -> hub::Snapshot {
+        let servers = self.status().await;
+        let catalogs = self.catalogs().clone();
+        hub::Snapshot { servers, catalogs }
+    }
+
+    /// Run `server` without disturbing a connection that already serves it:
+    /// a second chat asking for a connected server must not reconnect it for
+    /// everyone. Changed settings replace it; a stalled one is retried.
+    pub(crate) async fn ensure(&self, server: ServerConfig) -> Result<ServerStatus, Error> {
+        let current = {
+            let servers = self.inner.servers.lock().await;
+            servers
+                .get(&server.id)
+                .filter(|slot| cache::fingerprint(&slot.config) == cache::fingerprint(&server))
+                .map(|slot| slot.state)
+        };
+        match current {
+            None => self.add_server(server).await,
+            Some(ServerState::NeedsAuth) => Err(Error::NeedsAuth(server.id)),
+            Some(ServerState::NeedsToken) => Err(Error::NeedsToken(server.id)),
+            Some(
+                ServerState::Ready
+                | ServerState::Connecting
+                | ServerState::Reconnecting
+                | ServerState::Degraded,
+            ) => {
+                self.settle(&server.id).await;
+                self.server_status(&server.id).await
+            }
+            Some(_) => self.approve_and_connect(&server.id, None).await,
+        }
+    }
+
+    /// A call made while its server is still coming up waits for the outcome,
+    /// bounded by the startup timeout, instead of failing on a race.
+    async fn settle(&self, server: &str) {
+        let mut changes = self.subscribe();
+        let deadline = Instant::now() + self.inner.config.startup_timeout;
+        loop {
+            let state = self
+                .inner
+                .servers
+                .lock()
+                .await
+                .get(server)
+                .map(|slot| slot.state);
+            if !matches!(
+                state,
+                Some(ServerState::Connecting | ServerState::Reconnecting | ServerState::Degraded)
+            ) {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, changes.changed())
+                .await
+                .map_or(true, |changed| changed.is_err())
+            {
+                return;
+            }
+        }
+    }
+
+    fn announce(&self) {
+        self.inner
+            .revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     /// Cap the tool layer applies before spilling the remainder to an artifact.
@@ -655,6 +781,14 @@ impl McpManager {
     }
 
     pub async fn start_preview(&self, server_id: &str) -> Result<StartPreview, Error> {
+        if self.hub_for(server_id).is_some() {
+            return Ok(StartPreview {
+                server: server_id.to_string(),
+                transport: "http".into(),
+                target: String::new(),
+                approval_required: false,
+            });
+        }
         let server = self.server_config(server_id).await?;
         Ok(StartPreview {
             server: server.id,
@@ -668,6 +802,13 @@ impl McpManager {
     pub async fn add_server(&self, server: ServerConfig) -> Result<ServerStatus, Error> {
         if !self.inner.config.enabled {
             return Err(Error::Disabled);
+        }
+        // A remote server from the user's config belongs to the shared host;
+        // anything the host does not recognise runs here.
+        if let (Some(link), Transport::Remote { .. }) = (self.hub(), &server.transport)
+            && let Some(status) = link.ensure(&server.id).await?
+        {
+            return Ok(status);
         }
         self.ensure_supervisor();
         // Scoped to the swap itself. `connect_one` takes the same two locks, so
@@ -702,6 +843,9 @@ impl McpManager {
     /// Remove a server at runtime (from `/mcp remove`): protocol shutdown, reap
     /// its process tree, and purge its tools.
     pub async fn remove_server(&self, server_id: &str) -> Result<(), Error> {
+        if let Some(link) = self.hub_for(server_id) {
+            return link.remove(server_id).await;
+        }
         let _mutation = self.inner.mutations.lock().await;
         let _exclusive = self.exclusive(server_id).await;
         let retiree = {
@@ -726,6 +870,16 @@ impl McpManager {
         server_id: &str,
         announce: Option<&UrlSink>,
     ) -> Result<ServerStatus, Error> {
+        if let Some(link) = self.hub_for(server_id) {
+            return match (link.ensure(server_id).await, announce) {
+                (Err(Error::NeedsAuth(_)), Some(announce)) => {
+                    link.authorize(server_id, announce).await
+                }
+                (Ok(Some(status)), _) => Ok(status),
+                (Ok(None), _) => Err(Error::UnknownServer(server_id.to_string())),
+                (Err(error), _) => Err(error),
+            };
+        }
         self.ensure_supervisor();
         let generation = {
             let mut servers = self.inner.servers.lock().await;
@@ -755,6 +909,9 @@ impl McpManager {
         server_id: &str,
         announce: &UrlSink,
     ) -> Result<ServerStatus, Error> {
+        if let Some(link) = self.hub_for(server_id) {
+            return link.authorize(server_id, announce).await;
+        }
         // Snapshot config and generation together so they cannot come from
         // different server incarnations.
         let (server, generation) = {
@@ -773,6 +930,7 @@ impl McpManager {
             slot.detail = Some("signing in…".into());
             (slot.config.clone(), slot.generation)
         };
+        self.announce();
         // `Auto` reaches here once the probe found an OAuth challenge, so both
         // it and an explicit `OAuth` are valid sign-in targets.
         let Transport::Remote {
@@ -836,6 +994,9 @@ impl McpManager {
         server_id: &str,
         disabled: bool,
     ) -> Result<ServerStatus, Error> {
+        if let Some(link) = self.hub_for(server_id) {
+            return link.set_disabled(server_id, disabled).await;
+        }
         // Scoped: `connect_one` below takes both of these itself, and neither is
         // re-entrant. Held across that call this deadlocks outright.
         let (retiree, generation) = {
@@ -888,6 +1049,9 @@ impl McpManager {
             .values()
             .flat_map(|catalog| catalog.exposed.iter().cloned())
             .collect();
+        if let Some(link) = self.hub() {
+            specs.extend(link.tool_specs());
+        }
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
     }
@@ -900,6 +1064,9 @@ impl McpManager {
     /// model. Drives the tool browser, so a filtered tool is still listed —
     /// switched off rather than invisible.
     pub fn server_tools(&self, server_id: &str) -> Vec<(String, bool)> {
+        if let Some(link) = self.hub_for(server_id) {
+            return link.server_tools(server_id);
+        }
         let catalogs = self.catalogs();
         let Some(catalog) = catalogs.get(server_id) else {
             return Vec::new();
@@ -919,6 +1086,9 @@ impl McpManager {
     /// Whether this server's credentials must be obtained interactively before
     /// it can connect.
     pub async fn needs_sign_in(&self, server_id: &str) -> bool {
+        if let Some(link) = self.hub_for(server_id) {
+            return link.state(server_id) == Some(ServerState::NeedsAuth);
+        }
         self.inner
             .servers
             .lock()
@@ -933,6 +1103,10 @@ impl McpManager {
             return Err(Error::Disabled);
         }
         let (server, tool) = parse_qualified(qualified)?;
+        if let Some(link) = self.hub_for(&server) {
+            return link.call(qualified, args).await;
+        }
+        self.settle(&server).await;
         let (peer, gate, generation, schema, admission, lapse) = {
             let servers = self.inner.servers.lock().await;
             let slot = servers
@@ -1024,6 +1198,11 @@ impl McpManager {
             .iter()
             .map(|(id, slot)| status_of(id, slot, catalogs.get(id)))
             .collect();
+        drop(catalogs);
+        drop(servers);
+        if let Some(link) = self.hub() {
+            out.extend(link.statuses());
+        }
         out.sort_by(|a, b| a.server.cmp(&b.server));
         out
     }
@@ -1092,6 +1271,7 @@ impl McpManager {
                             if slot.failures >= self.inner.config.max_reconnects {
                                 slot.state = ServerState::Parked;
                                 slot.retry_at = Some(now + self.inner.config.park_probe);
+                                self.tools_mut().remove(&slot.config.id);
                             } else {
                                 slot.state = ServerState::Degraded;
                                 slot.retry_at = Some(now + backoff(slot.failures));
@@ -1109,6 +1289,9 @@ impl McpManager {
                     _ => {}
                 }
             }
+        }
+        if !retirees.is_empty() {
+            self.announce();
         }
         // Reap the retired process tree before spawning a replacement.
         for retiree in retirees.into_iter().filter(|r| !r.is_empty()) {
@@ -1154,6 +1337,9 @@ impl McpManager {
                 };
                 if slot.generation != generation || !slot.state.is_live() {
                     return;
+                }
+                if let Some(dir) = &self.inner.config.cache {
+                    cache::save(dir, &slot.config, &catalog);
                 }
                 self.tools_mut().insert(server_id.to_string(), catalog);
                 slot.proven = true;
@@ -1204,11 +1390,13 @@ impl McpManager {
             };
             let server = slot.config.clone();
             // Detach bumps the generation, so this attempt owns what follows.
+            // The last-known tools stay listed through the attempt: calls wait
+            // for it, and the outcome replaces or withdraws them.
             let previous = slot.detach();
             let generation = slot.generation;
-            self.tools_mut().remove(server_id);
             (previous, generation, server)
         };
+        self.announce();
         let (previous, generation, server) = previous_and_generation;
         if !previous.is_empty() {
             previous.retire().await;
@@ -1241,7 +1429,10 @@ impl McpManager {
                             // lock let a superseded attempt install its
                             // catalogue over the live one.
                             self.tools_mut()
-                                .insert(server_id.to_string(), connected.catalog);
+                                .insert(server_id.to_string(), connected.catalog.clone());
+                            if let Some(dir) = &self.inner.config.cache {
+                                cache::save(dir, &server, &connected.catalog);
+                            }
                             None
                         }
                         // Removed mid-connect: retire the new client, don't leak it.
@@ -1266,6 +1457,12 @@ impl McpManager {
     }
 
     async fn record_failure(&self, server_id: &str, generation: u64, error: &Error) {
+        self.record_failure_quietly(server_id, generation, error)
+            .await;
+        self.announce();
+    }
+
+    async fn record_failure_quietly(&self, server_id: &str, generation: u64, error: &Error) {
         let mut servers = self.inner.servers.lock().await;
         let Some(slot) = servers.get_mut(server_id) else {
             return;
@@ -1280,26 +1477,30 @@ impl McpManager {
             Error::NeedsAuth(_) => {
                 slot.state = ServerState::NeedsAuth;
                 slot.retry_at = None;
-                return;
             }
             Error::NeedsToken(_) => {
                 slot.state = ServerState::NeedsToken;
                 slot.retry_at = None;
-                return;
             }
-            _ => {}
+            _ => {
+                slot.failures = slot.failures.saturating_add(1);
+                if error.is_terminal() {
+                    slot.state = ServerState::Failed;
+                    slot.retry_at = None;
+                } else if slot.failures >= self.inner.config.max_reconnects {
+                    // Park instead of hot-looping; a slow self-probe still revives it.
+                    slot.state = ServerState::Parked;
+                    slot.retry_at = Some(Instant::now() + self.inner.config.park_probe);
+                } else {
+                    slot.state = ServerState::Degraded;
+                    slot.retry_at = Some(Instant::now() + backoff(slot.failures));
+                }
+            }
         }
-        slot.failures = slot.failures.saturating_add(1);
-        if error.is_terminal() {
-            slot.state = ServerState::Failed;
-            slot.retry_at = None;
-        } else if slot.failures >= self.inner.config.max_reconnects {
-            // Park instead of hot-looping; a slow self-probe still revives it.
-            slot.state = ServerState::Parked;
-            slot.retry_at = Some(Instant::now() + self.inner.config.park_probe);
-        } else {
-            slot.state = ServerState::Degraded;
-            slot.retry_at = Some(Instant::now() + backoff(slot.failures));
+        // A brief outage keeps the last-known tools; anything needing a person
+        // or a long wait withdraws them so the model stops reaching for them.
+        if slot.state != ServerState::Degraded {
+            self.tools_mut().remove(server_id);
         }
     }
 
@@ -1338,6 +1539,8 @@ impl McpManager {
         {
             slot.state = state;
             slot.detail = detail;
+            drop(servers);
+            self.announce();
         }
     }
 
@@ -1649,8 +1852,38 @@ impl McpManager {
         self.inner.tools.read().expect("mcp tools lock poisoned")
     }
 
-    fn tools_mut(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Catalog>> {
-        self.inner.tools.write().expect("mcp tools lock poisoned")
+    fn tools_mut(&self) -> ToolsWrite<'_> {
+        ToolsWrite {
+            tools: self.inner.tools.write().expect("mcp tools lock poisoned"),
+            revision: &self.inner.revision,
+        }
+    }
+}
+
+/// Write access to the catalogues that announces the change on release. A
+/// listener woken here reads through the same lock, so it sees the new tools.
+struct ToolsWrite<'a> {
+    tools: std::sync::RwLockWriteGuard<'a, HashMap<String, Catalog>>,
+    revision: &'a watch::Sender<u64>,
+}
+
+impl std::ops::Deref for ToolsWrite<'_> {
+    type Target = HashMap<String, Catalog>;
+    fn deref(&self) -> &Self::Target {
+        &self.tools
+    }
+}
+
+impl std::ops::DerefMut for ToolsWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tools
+    }
+}
+
+impl Drop for ToolsWrite<'_> {
+    fn drop(&mut self) {
+        self.revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 }
 

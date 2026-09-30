@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 enum Turn {
     Blocks(Vec<Block>),
+    Failed(Vec<Block>, ProviderError),
     InfiniteEmptyBlocks,
     HangBeforeFirstByte,
 }
@@ -73,6 +74,9 @@ impl Provider for LimitProvider {
         let turn = self.turns.lock().unwrap().pop_front();
         match turn {
             Some(Turn::Blocks(blocks)) => Ok(stream::iter(blocks.into_iter().map(Ok)).boxed()),
+            Some(Turn::Failed(blocks, error)) => {
+                Ok(stream::iter(blocks.into_iter().map(Ok).chain([Err(error)])).boxed())
+            }
             Some(Turn::InfiniteEmptyBlocks) => {
                 Ok(
                     stream::unfold((), |_| async { Some((Ok(Block::Text(String::new())), ())) })
@@ -255,7 +259,230 @@ fn intent(index: usize) -> Block {
 }
 
 #[derive(Default)]
+struct CorrectionSink {
+    restarts: AtomicUsize,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl kernel::StreamSink for CorrectionSink {
+    fn supports_restart(&self) -> bool {
+        true
+    }
+    fn restarted(&self) {
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+    }
+    fn notice(&self, text: &str) {
+        if text.contains("Asking the model to correct")
+            && let Some(cancel) = &self.cancel
+        {
+            cancel.cancel();
+        }
+    }
+}
+
+fn invalid_call() -> ProviderError {
+    ProviderError::invalid_tool_call("test.read", "bad", "incomplete JSON arguments")
+}
+
+#[tokio::test]
+async fn invalid_call_feedback_recovers_without_executing_or_replaying_the_failed_batch() {
+    for failed in [
+        Turn::Failed(
+            vec![Block::Text("partial".into()), intent(99)],
+            invalid_call(),
+        ),
+        Turn::Blocks(vec![intent(99), intent(99)]),
+    ] {
+        let provider = Arc::new(LimitProvider::new(vec![
+            failed,
+            Turn::Blocks(vec![intent(0)]),
+        ]));
+        let executor = Arc::new(CountingExecutor::default());
+        let kernel = kernel_with(provider.clone(), executor.clone());
+        let session = Session::new();
+        let sink = CorrectionSink::default();
+        let (_, stop) = kernel
+            .run_session(
+                &session,
+                vec![Message::user("go")],
+                Budget::default(),
+                &sink,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop, StopReason::Finished);
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.restarts.load(Ordering::SeqCst), 1);
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        let feedback = requests[1].messages.last().unwrap();
+        assert!(
+            feedback.content.contains("incomplete JSON arguments")
+                || feedback.content.contains("duplicate tool-call id")
+        );
+        assert!(
+            feedback
+                .content
+                .contains("No tools from that response executed")
+        );
+        assert_eq!(feedback.trust, Some(kernel::TrustLabel::Tool));
+        assert_eq!(
+            requests[1].ordered_messages().last(),
+            Some(&feedback.ordered())
+        );
+        assert!(!requests[1].messages.iter().any(|m| m.content == "partial"));
+        let events = kernel.log.events(session.id).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.kind == EventKind::ModelIntent && e.payload["id"] == "call-99")
+        );
+        assert!(
+            kernel::project_messages(&events)
+                .iter()
+                .any(|m| m.content == feedback.content)
+        );
+    }
+}
+
+#[tokio::test]
+async fn correction_is_bounded_and_respects_budget_cancellation_and_fatal_errors() {
+    for case in ["limit", "budget", "cancel", "fatal"] {
+        let turns = (0..4)
+            .map(|_| {
+                Turn::Failed(
+                    Vec::new(),
+                    if case == "fatal" {
+                        ProviderError::Decode("invalid provider configuration".into())
+                    } else {
+                        invalid_call()
+                    },
+                )
+            })
+            .collect();
+        let provider = Arc::new(LimitProvider::new(turns));
+        let executor = Arc::new(CountingExecutor::default());
+        let kernel = kernel_with(provider.clone(), executor.clone());
+        let (_handle, queue) = kernel::InterruptQueue::pair();
+        let sink = CorrectionSink {
+            cancel: (case == "cancel").then(|| queue.token()),
+            ..Default::default()
+        };
+        let result = kernel
+            .run_session(
+                &Session::new(),
+                vec![Message::user("go")],
+                Budget {
+                    max_tokens: (case == "budget").then_some(50),
+                    ..Budget::default()
+                },
+                &sink,
+                Some(queue),
+            )
+            .await;
+        match case {
+            "limit" => assert!(matches!(result, Err(KernelError::InvalidToolCall(_)))),
+            "budget" => assert_eq!(result.unwrap().1, StopReason::Budget(BudgetStop::Tokens)),
+            "cancel" => assert_eq!(result.unwrap().1, StopReason::Interrupted),
+            _ => assert!(matches!(result, Err(KernelError::Provider(_)))),
+        }
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            if case == "limit" { 3 } else { 1 }
+        );
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[derive(Default)]
 struct ReviewedCalls(Mutex<Vec<String>>);
+
+#[tokio::test]
+async fn failed_turns_resume_without_readmitting_prompts_or_losing_completed_work() {
+    for (failure, completed_work) in [("decode", false), ("timeout", true), ("corrections", true)] {
+        let mut turns = if completed_work {
+            vec![Turn::Blocks(vec![intent(0)])]
+        } else {
+            Vec::new()
+        };
+        for _ in 0..if failure == "corrections" { 3 } else { 1 } {
+            turns.push(Turn::Failed(
+                Vec::new(),
+                match failure {
+                    "decode" => ProviderError::Decode("broken response".into()),
+                    "timeout" => ProviderError::ProgressTimeout { waited_secs: 60 },
+                    _ => invalid_call(),
+                },
+            ));
+        }
+        let provider = Arc::new(LimitProvider::new(turns));
+        let executor = Arc::new(CountingExecutor::default());
+        let kernel = kernel_with(provider.clone(), executor.clone());
+        let session = Session::new();
+        assert!(
+            kernel
+                .run_session(
+                    &session,
+                    vec![Message::user("go")],
+                    Budget::default(),
+                    &kernel::NullSink,
+                    None
+                )
+                .await
+                .is_err()
+        );
+        let events = kernel.log.events(session.id).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.payload["turn_failed"] == true)
+                .count(),
+            1
+        );
+        let mut restored = kernel::project_messages(&events);
+        assert!(
+            restored
+                .last()
+                .unwrap()
+                .content
+                .contains("[runtime: turn failed]")
+        );
+        // A real repeated instruction must be admitted once, even though its
+        // text equals the failed prompt. Recovery must not deduplicate it away.
+        restored.push(Message::user("go"));
+        kernel
+            .run_session(
+                &session,
+                restored,
+                Budget::default(),
+                &kernel::NullSink,
+                None,
+            )
+            .await
+            .unwrap();
+        let requests = provider.requests.lock().unwrap();
+        let resumed = &requests.last().unwrap().messages;
+        assert_eq!(resumed.iter().filter(|m| m.content == "go").count(), 2);
+        assert_eq!(
+            resumed.iter().any(|m| m.role == kernel::Role::Tool),
+            completed_work
+        );
+        assert_eq!(
+            executor.starts.load(Ordering::SeqCst),
+            usize::from(completed_work)
+        );
+        drop(requests);
+        let events = kernel.log.events(session.id).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.is_from_person() && e.payload["text"] == "go")
+                .count(),
+            2
+        );
+    }
+}
 
 impl kernel::Policy for ReviewedCalls {
     fn authorize(

@@ -30,7 +30,8 @@ fn legacy_tool(name: &str) -> Option<(&'static str, Value)> {
     let (tool, extra) = match name {
         "fs.read" | "image.view" | "read_artifact" => ("read", json!({})),
         "word_count" => ("read", json!({"count": true})),
-        "fs.write" | "fs.edit" | "multi_edit" => ("edit", json!({})),
+        "fs.write" => ("write", json!({})),
+        "fs.edit" | "multi_edit" => ("edit", json!({})),
         "fs.list" => ("ls", json!({})),
         "code_outline" | "references" => ("code", json!({})),
         "skill.load" | "skill.list" => ("skill", json!({})),

@@ -649,6 +649,55 @@ pub fn portable_tool_name_map(available: &[String]) -> HashMap<String, String> {
     map
 }
 
+/// Names models carry over from other agents, and the tool that does that job
+/// here. Only a hint: the call is still refused, never silently rerouted.
+const FOREIGN_TOOL_NAMES: &[(&str, &str)] = &[
+    ("write_file", "write"),
+    ("create_file", "write"),
+    ("file_write", "write"),
+    ("str_replace_editor", "edit"),
+    ("str_replace", "edit"),
+    ("replace", "edit"),
+    ("multiedit", "edit"),
+    ("edit_file", "edit"),
+    ("apply_patch", "edit"),
+    ("bash", "shell.exec"),
+    ("shell", "shell.exec"),
+    ("run_command", "shell.exec"),
+    ("run_terminal_cmd", "shell.exec"),
+    ("execute_command", "shell.exec"),
+    ("read_file", "read"),
+    ("view", "read"),
+    ("list_dir", "ls"),
+    ("list_files", "ls"),
+    ("grep_search", "grep"),
+    ("find_files", "glob"),
+    ("webfetch", "web"),
+    ("websearch", "web"),
+    ("web_search", "web"),
+    ("todowrite", "update_plan"),
+];
+
+/// The wire name of the tool a refused call most likely meant, when that tool
+/// is on offer: a differently cased name, or a well-known name for the same job.
+pub fn suggested_tool(
+    requested: &str,
+    wire_to_canonical: &HashMap<String, String>,
+) -> Option<String> {
+    let lower = requested.to_ascii_lowercase();
+    if let Some(wire) = wire_to_canonical
+        .keys()
+        .find(|wire| wire.to_ascii_lowercase() == lower)
+    {
+        return Some(wire.clone());
+    }
+    let (_, canonical) = FOREIGN_TOOL_NAMES.iter().find(|(name, _)| *name == lower)?;
+    wire_to_canonical
+        .iter()
+        .find(|(_, target)| target.as_str() == *canonical)
+        .map(|(wire, _)| wire.clone())
+}
+
 /// Why a model-supplied tool reference could not be made canonical.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ToolNameError {
@@ -701,6 +750,41 @@ pub fn canonical_tool_names(
         }
     }
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_name_points_at_the_tool_for_that_job_when_it_is_offered() {
+        let offered = portable_tool_name_map(&[
+            "write".into(),
+            "edit".into(),
+            "shell.exec".into(),
+            "read".into(),
+        ]);
+        assert_eq!(
+            suggested_tool("write_file", &offered).as_deref(),
+            Some("write")
+        );
+        assert_eq!(
+            suggested_tool("str_replace_editor", &offered).as_deref(),
+            Some("edit")
+        );
+        assert_eq!(
+            suggested_tool("Bash", &offered).as_deref(),
+            Some("shell_exec")
+        );
+        assert_eq!(suggested_tool("Read", &offered).as_deref(), Some("read"));
+        assert_eq!(suggested_tool("frobnicate", &offered), None);
+        let read_only = portable_tool_name_map(&["read".into()]);
+        assert_eq!(
+            suggested_tool("write_file", &read_only),
+            None,
+            "never suggest a tool not on offer"
+        );
+    }
 }
 
 #[cfg(test)]

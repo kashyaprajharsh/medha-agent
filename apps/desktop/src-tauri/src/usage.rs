@@ -31,6 +31,8 @@ pub fn merge(summaries: Vec<Value>, days: u64) -> Value {
     let mut total = json!({"cost_usd": null});
     let mut models: Map<String, Value> = Map::new();
     let mut by_day: Map<String, Value> = Map::new();
+    let mut day_models: Map<String, Value> = Map::new();
+    let mut incomplete_days = std::collections::HashSet::new();
     let mut sessions = Vec::new();
     for summary in summaries {
         add_usage(&mut total, &summary["total"]);
@@ -46,7 +48,29 @@ pub fn merge(summaries: Vec<Value>, days: u64) -> Value {
                 add_usage(&mut slot["usage"], &row["usage"]);
             }
         }
+        for day in summary["by_day"].as_array().into_iter().flatten() {
+            let name = day["day"].as_str().unwrap_or_default();
+            let Some(rows) = day["models"].as_array().filter(|rows| !rows.is_empty()) else {
+                incomplete_days.insert(name.to_owned());
+                continue;
+            };
+            let target = day_models.entry(name).or_insert_with(|| json!({}));
+            for row in rows {
+                let model = row["model"].as_str().unwrap_or_default();
+                if target.get(model).is_none() {
+                    target[model] = json!({"model": model, "usage": {"cost_usd": null}});
+                }
+                add_usage(&mut target[model]["usage"], &row["usage"]);
+            }
+        }
         sessions.extend(summary["sessions"].as_array().cloned().unwrap_or_default());
+    }
+    for (day, models) in day_models {
+        // Never present a partial breakdown as the full day's usage when an
+        // older backend contributed totals without per-model rows.
+        if !incomplete_days.contains(&day) {
+            by_day[&day]["models"] = models.as_object().unwrap().values().cloned().collect();
+        }
     }
     let mut models: Vec<Value> = models.into_values().collect();
     models.sort_by_key(|row| std::cmp::Reverse(tokens(row)));

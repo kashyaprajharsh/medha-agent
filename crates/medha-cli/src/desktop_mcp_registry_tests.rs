@@ -1,5 +1,89 @@
 use super::*;
 
+#[test]
+fn github_uses_numbered_pages_and_the_full_registry_keeps_opaque_cursors() {
+    let featured = search_url(" git & tools ", Some("2"), Source::Featured).unwrap();
+    let params: std::collections::HashMap<_, _> = featured.query_pairs().collect();
+    assert_eq!(params["page"], "2");
+    assert_eq!(params["search"], "git & tools");
+    assert!(!params.contains_key("cursor"));
+    let full = search_url("", Some("bookmark+/=&?"), Source::Full).unwrap();
+    let params: std::collections::HashMap<_, _> = full.query_pairs().collect();
+    assert_eq!(params["cursor"], "bookmark+/=&?");
+    assert_eq!(params["version"], "latest");
+    assert!(!params.contains_key("page"));
+    assert_eq!(
+        listing(&json!({"metadata": {"page": 1, "total_pages": 2}}))["next"],
+        "2"
+    );
+    assert!(listing(&json!({"metadata": {"page": 2, "total_pages": 2}}))["next"].is_null());
+}
+
+#[test]
+fn curated_github_serena_and_unity_have_usable_setups() {
+    // Public catalogue setup metadata captured on 2026-09-29, without READMEs.
+    let fixture = serde_json::from_str(include_str!("fixtures/mcp-catalog.json")).unwrap();
+    let listed = listing(&fixture);
+    let github = &listed["servers"][0]["setups"][0];
+    assert_eq!(github["sign_in"], "token");
+    assert!(github.get("unsupported").is_none());
+    let serena = &listed["servers"][1]["setups"][0];
+    assert_eq!(
+        serena["command"],
+        json!([
+            "uvx",
+            "--from",
+            "git+https://github.com/oraios/serena",
+            "serena",
+            "start-mcp-server",
+            "--context",
+            "ide-assistant"
+        ])
+    );
+    let unity = &listed["servers"][2]["setups"][0];
+    assert_eq!(
+        unity["command"],
+        json!([
+            "uv",
+            "--directory",
+            "{unity_mcp_server_src}",
+            "run",
+            "server.py"
+        ])
+    );
+    assert_eq!(unity["inputs"][0]["name"], "unity_mcp_server_src");
+    assert!(
+        unity["inputs"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Absolute path")
+    );
+}
+
+#[test]
+fn runtime_options_precede_the_package_and_flags_need_no_value() {
+    let setup = package(&json!({
+        "registryType": "pypi", "identifier": "tool", "version": "latest",
+        "transport": {"type": "stdio"},
+        "runtimeArguments": [{"type": "named", "name": "--python", "value": "3.12"}],
+        "packageArguments": [{"type": "named", "name": "--verbose", "isRequired": true}]
+    }));
+    assert_eq!(
+        setup["command"],
+        json!(["uvx", "--python", "3.12", "tool", "--verbose"])
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the public GitHub MCP catalogue"]
+async fn live_featured_catalogue_has_a_distinct_second_page() {
+    let first = search("", None, Source::Featured).await.unwrap();
+    let cursor = first["next"].as_str().expect("first page has a next page");
+    let second = search("", Some(cursor), Source::Featured).await.unwrap();
+    assert!(!second["servers"].as_array().unwrap().is_empty());
+    assert_ne!(first["servers"][0]["name"], second["servers"][0]["name"]);
+}
+
 fn page(server: Value, status: &str) -> Value {
     json!({
         "servers": [{"server": server, "_meta": {"io.modelcontextprotocol.registry/official": {"status": status}}}],

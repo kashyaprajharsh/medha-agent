@@ -86,6 +86,14 @@ impl Runtime {
             .mcp
             .as_ref()
             .ok_or("MCP is disabled in this workspace")?;
+        if let Some(ready) = manager
+            .status()
+            .await
+            .into_iter()
+            .find(|status| status.server == id && status.state == mcp::ServerState::Ready)
+        {
+            return serde_json::to_value(ready).map_err(|e| e.to_string());
+        }
         let outcome = manager
             .add_server(crate::config::resolve_mcp_server(id, server))
             .await;

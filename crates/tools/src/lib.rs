@@ -9,6 +9,7 @@ use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolS
 
 mod agents;
 mod browser;
+mod edit_match;
 mod shell_hints;
 pub use agents::{ParentHandle, SessionHandle};
 
@@ -941,13 +942,13 @@ impl ToolRegistry {
                 browser,
             }),
         }));
+        r.register(Arc::new(FsWrite {
+            sbx: sandbox.clone(),
+            pins: Default::default(),
+            lsp: r.lsp.clone(),
+            artifacts: artifacts.clone(),
+        }));
         r.register(Arc::new(Edit {
-            write: FsWrite {
-                sbx: sandbox.clone(),
-                pins: Default::default(),
-                lsp: r.lsp.clone(),
-                artifacts: artifacts.clone(),
-            },
             replace: FsEdit {
                 sbx: sandbox.clone(),
                 pins: Default::default(),
@@ -1507,11 +1508,9 @@ impl Tool for FsRead {
     }
 }
 
-/// Changing a file: replace it whole, replace one substring, or apply several
-/// substitutions atomically. One blast radius and one mutation lane between
-/// them, and the argument shapes are disjoint, so the verb needs no `op`.
+/// Changing part of a file: one substring, or several substitutions atomically.
+/// Whole-file writes belong to `write`.
 struct Edit {
-    write: FsWrite,
     replace: FsEdit,
     many: MultiEdit,
 }
@@ -1522,13 +1521,14 @@ impl Tool for Edit {
         "edit"
     }
     fn description(&self) -> &str {
-        "Change a file. Give `content` to create it or replace it whole. Give \
-         `old_string` and `new_string` to replace one exact substring — it must match \
-         uniquely unless `replace_all` is true. Give `edits` to apply several \
-         substitutions to the same file atomically, in order, each seeing the previous \
-         one's result: all of them land or none do, which is cheaper and safer than \
-         repeating this tool. Returns a unified diff. Supports paths outside the \
-         workspace with permission."
+        "Change part of an existing file. Give `old_string` (text copied from the file) and \
+         `new_string` (what replaces it) — it must match one place unless `replace_all` is \
+         true. Give \
+         `edits` to apply several substitutions to the same file atomically, in order, \
+         each seeing the previous one's result: all of them land or none do, which is \
+         cheaper and safer than repeating this tool. To create a file or replace a whole \
+         file, use `write`. Returns a unified diff. Supports paths outside the workspace \
+         with permission."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::ReversibleLocal
@@ -1541,13 +1541,12 @@ impl Tool for Edit {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Workspace-relative or absolute path" },
-                "content": { "type": "string", "description": "Whole new contents; creates or replaces the file" },
-                "old_string": { "type": "string", "description": "Exact text to replace" },
-                "new_string": { "type": "string", "description": "Replacement text" },
-                "replace_all": { "type": "boolean", "description": "Replace every match instead of requiring a unique one" },
+                "old_string": { "type": "string", "description": "Text to replace, copied from the file. Must match exactly one place unless replace_all is true; add nearby lines to make it unique. Differences in indentation, trailing spaces or quote style are tolerated, different content is not" },
+                "new_string": { "type": "string", "description": "Text that replaces old_string; must differ from it. An empty string deletes old_string" },
+                "replace_all": { "type": "boolean", "description": "Replace every match instead of requiring exactly one (default false)" },
                 "edits": {
                     "type": "array",
-                    "description": "Several substitutions applied in order to one file, all-or-nothing",
+                    "description": "Several old_string/new_string pairs applied in order to one file, each seeing the previous result; if any fails, none is applied",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -1565,12 +1564,11 @@ impl Tool for Edit {
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         match self.shape(args) {
             Some(Shape::Many) => self.many.execute(args).await,
-            Some(Shape::Write) => self.write.execute(args).await,
             Some(Shape::Replace) => self.replace.execute(args).await,
             None => Err(ToolError::Args(
-                "edit takes exactly one of: `content` (replace the file), \
-                 `old_string`+`new_string` (replace a substring), or `edits` (several \
-                 substitutions at once)"
+                "edit takes exactly one of: `old_string`+`new_string` (replace a \
+                 substring) or `edits` (several substitutions at once). To create or \
+                 replace a whole file, use `write`."
                     .into(),
             )),
         }
@@ -1582,21 +1580,19 @@ impl Tool for Edit {
     async fn preview(&self, args: &Value) -> Option<String> {
         match self.shape(args)? {
             Shape::Many => self.many.preview(args).await,
-            Shape::Write => self.write.preview(args).await,
             Shape::Replace => self.replace.preview(args).await,
         }
     }
 }
 
 enum Shape {
-    Write,
     Replace,
     Many,
 }
 
 impl Edit {
-    /// Which of the three edits this call is, or `None` when the arguments name
-    /// more than one shape or none at all.
+    /// Which edit this call is, or `None` when the arguments name more than one
+    /// shape or none at all — including a whole-file `content`, which is `write`'s.
     fn shape(&self, args: &Value) -> Option<Shape> {
         match (
             args.get("edits").is_some(),
@@ -1606,7 +1602,6 @@ impl Edit {
             args.get("replace_all").is_some(),
         ) {
             (true, false, false, false, false) => Some(Shape::Many),
-            (false, true, false, false, false) => Some(Shape::Write),
             (false, false, true, true, _) => Some(Shape::Replace),
             _ => None,
         }
@@ -1622,13 +1617,13 @@ struct FsWrite {
 #[async_trait]
 impl Tool for FsWrite {
     fn name(&self) -> &str {
-        "edit"
+        "write"
     }
     fn description(&self) -> &str {
-        "Write a whole UTF-8 text file (creates parent dirs; snapshots any prior \
-         version; returns a diff). Use this for NEW files or full rewrites; prefer \
-         `edit` to change part of an existing file (smaller, reviewable diff). \
-         Supports paths outside workspace with permission."
+        "Create a file, or replace a whole file, with `content` (UTF-8 text). Creates \
+         parent directories, snapshots any prior version and returns a diff. To change \
+         part of an existing file, use `edit` instead: a smaller diff to review. \
+         Supports paths outside the workspace with permission."
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::ReversibleLocal
@@ -1949,20 +1944,9 @@ impl Tool for FsEdit {
         )
         .map_err(|_| ToolError::Failed(format!("{path} is not valid UTF-8")))?;
         self.pins.check(args, &path, &inspection.state)?;
-        // CRLF-tolerant byte-exact match (see `resolve_edit`).
-        let (old_s, new_s) = resolve_edit(&content, &old_s, &new_s)
-            .ok_or_else(|| ToolError::Failed(format!("old_string not found in {path}. No changes applied. Re-read the current file and copy an exact substring, including whitespace and punctuation; do not retry the same unmatched text.")))?;
-        let count = content.matches(&old_s).count();
-        if count > 1 && !replace_all {
-            return Err(ToolError::Failed(format!(
-                "old_string appears {count} times in {path}; pass replace_all or use a more specific string"
-            )));
-        }
-        let updated = if replace_all {
-            content.replace(&old_s, &new_s)
-        } else {
-            content.replacen(&old_s, &new_s, 1)
-        };
+        let done = edit_match::replace(&content, &old_s, &new_s, replace_all)
+            .map_err(|miss| ToolError::Failed(missed(miss, &path)))?;
+        let updated = done.text;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
         let snapshot = self
             .sbx
@@ -1978,9 +1962,12 @@ impl Tool for FsEdit {
             // pre-rendered unified diff string.
             "old": content,
             "new": updated,
-            "replacements": if replace_all { count } else { 1 },
+            "replacements": done.count,
             "snapshot": snapshot
         });
+        if done.loose {
+            out["note"] = json!(edit_match::LOOSE_NOTE);
+        }
         if let Some(report) = post_edit_lsp(
             &self.lsp,
             &self.sbx,
@@ -2013,23 +2000,10 @@ impl Tool for FsEdit {
         let inspection = self.sbx.inspect_if_permitted(path).await.ok()??;
         self.pins.pin(args, &inspection.state);
         let content = String::from_utf8(inspection.bytes.unwrap_or_default()).ok()?;
-        let Some((old_s, new_s)) = resolve_edit(&content, old_s, new_s) else {
-            return Some(format!(
-                "(old_string not found in {path} — this edit would fail)"
-            ));
-        };
-        let count = content.matches(&old_s).count();
-        if count > 1 && !replace_all {
-            return Some(format!(
-                "(old_string appears {count}× in {path}; needs replace_all or a more specific match)"
-            ));
+        match edit_match::replace(&content, old_s, new_s, replace_all) {
+            Ok(done) => Some(cap_preview(&make_diff(path, &content, &done.text))),
+            Err(miss) => Some(format!("({} — this edit would fail)", missed(miss, path))),
         }
-        let updated = if replace_all {
-            content.replace(&old_s, &new_s)
-        } else {
-            content.replacen(&old_s, &new_s, 1)
-        };
-        Some(cap_preview(&make_diff(path, &content, &updated)))
     }
 }
 
@@ -5681,41 +5655,29 @@ fn validate_edit(old: &str, new: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// Resolve the (old, new) pair to use for a byte-exact edit, tolerating a
-/// line-ending mismatch. On a CRLF file `new` is always normalized to CRLF so a
-/// replacement never leaves mixed endings — this matters even when `old` matched
-/// exactly (the model can supply a CRLF `old` but an LF-only `new`). If `old`
-/// isn't found verbatim, retries with `old`'s endings normalized to CRLF (the
-/// model may hold LF-only text from an earlier read). `None` if neither form is
-/// present. `to_crlf` is idempotent, so an already-CRLF `new` is unchanged.
-fn resolve_edit(content: &str, old: &str, new: &str) -> Option<(String, String)> {
-    let file_is_crlf = content.contains("\r\n");
-    let to_crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
-    if content.contains(old) {
-        let new = if file_is_crlf {
-            to_crlf(new)
-        } else {
-            new.to_string()
-        };
-        return Some((old.to_string(), new));
+fn missed(miss: edit_match::Miss, path: &str) -> String {
+    match miss {
+        edit_match::Miss::NotFound => format!(
+            "old_string not found in {path}. No changes applied. Re-read the current file and \
+             copy the text to change exactly; do not retry the same unmatched text."
+        ),
+        edit_match::Miss::Ambiguous(count) => format!(
+            "old_string matches {count} places in {path}; pass replace_all or include more \
+             surrounding lines so it matches one"
+        ),
     }
-    if file_is_crlf {
-        let crlf_old = to_crlf(old);
-        if content.contains(&crlf_old) {
-            return Some((crlf_old, to_crlf(new)));
-        }
-    }
-    None
 }
 
-fn apply_edits(content: &str, edits: &[Value]) -> Result<String, ToolError> {
+/// The edited text, and whether any edit needed a loose match.
+fn apply_edits(content: &str, edits: &[Value]) -> Result<(String, bool), ToolError> {
     apply_edits_inner(content, edits).map_err(|err| ToolError::Failed(format!(
         "{err}. Entire batch aborted; no edits applied. Re-read the current file, correct the failing edit, and resubmit all intended edits."
     )))
 }
 
-fn apply_edits_inner(content: &str, edits: &[Value]) -> Result<String, ToolError> {
+fn apply_edits_inner(content: &str, edits: &[Value]) -> Result<(String, bool), ToolError> {
     let mut cur = content.to_string();
+    let mut loose = false;
     for (i, e) in edits.iter().enumerate() {
         let n = i + 1;
         let old = e
@@ -5731,21 +5693,19 @@ fn apply_edits_inner(content: &str, edits: &[Value]) -> Result<String, ToolError
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let (old, new) = resolve_edit(&cur, old, new)
-            .ok_or_else(|| ToolError::Failed(format!("edit #{n}: old_string not found")))?;
-        let count = cur.matches(&old).count();
-        if count > 1 && !replace_all {
-            return Err(ToolError::Failed(format!(
-                "edit #{n}: old_string appears {count} times; pass replace_all or use a more specific string"
-            )));
-        }
-        cur = if replace_all {
-            cur.replace(&old, &new)
-        } else {
-            cur.replacen(&old, &new, 1)
-        };
+        let done = edit_match::replace(&cur, old, new, replace_all).map_err(|miss| {
+            ToolError::Failed(match miss {
+                edit_match::Miss::NotFound => format!("edit #{n}: old_string not found"),
+                edit_match::Miss::Ambiguous(count) => format!(
+                    "edit #{n}: old_string matches {count} places; pass replace_all or include \
+                     more surrounding lines so it matches one"
+                ),
+            })
+        })?;
+        loose |= done.loose;
+        cur = done.text;
     }
-    Ok(cur)
+    Ok((cur, loose))
 }
 
 #[async_trait]
@@ -5818,7 +5778,7 @@ impl Tool for MultiEdit {
         )
         .map_err(|_| ToolError::Failed(format!("{path} is not valid UTF-8")))?;
         self.pins.check(args, &path, &inspection.state)?;
-        let updated = apply_edits(&content, edits)?;
+        let (updated, loose) = apply_edits(&content, edits)?;
         let baseline = pre_edit_lsp(&self.lsp, &self.sbx, &path, &content).await;
         let snapshot = self
             .sbx
@@ -5834,6 +5794,9 @@ impl Tool for MultiEdit {
             "new": updated,
             "snapshot": snapshot
         });
+        if loose {
+            out["note"] = json!(edit_match::LOOSE_NOTE);
+        }
         if let Some(report) = post_edit_lsp(
             &self.lsp,
             &self.sbx,
@@ -5857,7 +5820,7 @@ impl Tool for MultiEdit {
         self.pins.pin(args, &inspection.state);
         let content = String::from_utf8(inspection.bytes.unwrap_or_default()).ok()?;
         match apply_edits(&content, edits) {
-            Ok(updated) => Some(cap_preview(&make_diff(path, &content, &updated))),
+            Ok((updated, _)) => Some(cap_preview(&make_diff(path, &content, &updated))),
             Err(e) => Some(format!("({e} — this edit batch would fail)")),
         }
     }
@@ -6920,6 +6883,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_owns_whole_files_and_edit_only_changes_part() {
+        let dir = test_support::scratch("medha-tools");
+        let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
+        let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
+        let call = |tool: &str, args: Value| ToolIntent {
+            id: tool.into(),
+            tool: tool.into(),
+            args,
+        };
+
+        for content in ["first\n", "second\n"] {
+            let obs = reg
+                .execute(&call(
+                    "write",
+                    json!({ "path": "a.txt", "content": content }),
+                ))
+                .await;
+            assert_eq!(
+                obs.status,
+                kernel::ObsStatus::Ok,
+                "write creates, then replaces"
+            );
+        }
+        let refused = reg
+            .execute(&call("edit", json!({ "path": "a.txt", "content": "x" })))
+            .await;
+        assert_eq!(refused.status, kernel::ObsStatus::Error);
+        assert!(
+            refused.payload.to_string().contains("use `write`"),
+            "{}",
+            refused.payload
+        );
+        let changed = reg
+            .execute(&call(
+                "edit",
+                json!({ "path": "a.txt", "old_string": "second", "new_string": "third" }),
+            ))
+            .await;
+        assert_eq!(changed.status, kernel::ObsStatus::Ok);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "third\n"
+        );
+        let schema = reg
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "edit")
+            .unwrap()
+            .schema;
+        assert!(
+            schema["properties"].get("content").is_none(),
+            "edit no longer offers whole-file content"
+        );
+    }
+
+    #[tokio::test]
     async fn registry_executes_fs_write_then_read() {
         let dir = test_support::scratch("medha-tools");
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
@@ -6931,7 +6950,7 @@ mod tests {
 
         let write = ToolIntent {
             id: "1".into(),
-            tool: "edit".into(),
+            tool: "write".into(),
             args: json!({ "path": "x.txt", "content": "hi" }),
         };
         let obs = reg.execute(&write).await;
@@ -6996,7 +7015,7 @@ mod tests {
         let observation = reg
             .execute(&ToolIntent {
                 id: "lsp-write".into(),
-                tool: "edit".into(),
+                tool: "write".into(),
                 args: json!({ "path": "main.rs", "content": "fn main() {}" }),
             })
             .await;
@@ -7435,7 +7454,7 @@ mod tests {
 
         reg.execute(&ToolIntent {
             id: "1".into(),
-            tool: "edit".into(),
+            tool: "write".into(),
             args: json!({ "path": "f.txt", "content": "alpha\nbeta\ngamma\n" }),
         })
         .await;
@@ -7487,7 +7506,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(ok, "1-2 three\n");
+        assert_eq!(ok, ("1-2 three\n".to_string(), false));
         // A missing old_string aborts the WHOLE batch (nothing applied).
         let err = apply_edits(
             src,
@@ -7508,7 +7527,7 @@ mod tests {
                 &[json!({ "old_string": "a", "new_string": "b", "replace_all": true })]
             )
             .unwrap(),
-            "b b b"
+            ("b b b".to_string(), false)
         );
     }
 
@@ -7624,7 +7643,7 @@ mod tests {
         let reg = ToolRegistry::with_workspace(sbx, mem_artifacts());
         reg.execute(&ToolIntent {
             id: "1".into(),
-            tool: "edit".into(),
+            tool: "write".into(),
             args: json!({ "path": "f.txt", "content": "alpha\nbeta\n" }),
         })
         .await;
@@ -7675,7 +7694,7 @@ mod tests {
 
         reg.execute(&ToolIntent {
             id: "1".into(),
-            tool: "edit".into(),
+            tool: "write".into(),
             args: json!({ "path": "f.txt", "content": "alpha\nbeta\ngamma\n" }),
         })
         .await;
@@ -7707,7 +7726,7 @@ mod tests {
         let np = reg
             .preview(&ToolIntent {
                 id: "4".into(),
-                tool: "edit".into(),
+                tool: "write".into(),
                 args: json!({ "path": "new.txt", "content": "hello\n" }),
             })
             .await
@@ -7738,7 +7757,7 @@ mod tests {
 
         let attempt = |id: &str, path: &str, content: &str| ToolIntent {
             id: id.into(),
-            tool: "edit".into(),
+            tool: "write".into(),
             args: json!({ "path": path, "content": content }),
         };
 
@@ -7796,7 +7815,7 @@ mod tests {
         // Write a test file
         reg.execute(&ToolIntent {
             id: "1".into(),
-            tool: "edit".into(),
+            tool: "write".into(),
             args: json!({ "path": "test.txt", "content": "hello world\nthis is a test\nthree lines here" }),
         })
         .await;
@@ -7909,7 +7928,7 @@ mod tests {
         let reg = reg_in(&dir);
         run(
             &reg,
-            "edit",
+            "write",
             json!({ "path": "f.txt", "content": "one\r\ntwo\r\nthree\r\n" }),
         )
         .await;
@@ -7953,7 +7972,7 @@ mod tests {
         let reg = reg_in(&dir);
         run(
             &reg,
-            "edit",
+            "write",
             json!({ "path": "f.txt", "content": "a\r\nb\r\nc\r\n" }),
         )
         .await;
@@ -7984,7 +8003,7 @@ mod tests {
         let reg = reg_in(&dir);
         run(
             &reg,
-            "edit",
+            "write",
             json!({ "path": "f.txt", "content": "one\r\ntwo\r\n" }),
         )
         .await;
@@ -8015,7 +8034,7 @@ mod tests {
         let reg = reg_in(&dir);
         run(
             &reg,
-            "edit",
+            "write",
             json!({ "path": "f.txt", "content": "one\r\ntwo\r\n" }),
         )
         .await;
@@ -8042,13 +8061,52 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The approval card shows the loose edit that will land, the model is told
+    /// its copy drifted, and a stale edit in a batch still writes nothing.
+    #[tokio::test]
+    async fn a_drifted_copy_edits_the_file_the_card_showed() {
+        let dir = std::env::temp_dir().join(format!("medha-loose-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        let file = "def f():\n    x = 1\n    return x\n";
+        run(&reg, "write", json!({ "path": "f.py", "content": file })).await;
+        let intent = ToolIntent {
+            id: "loose".into(),
+            tool: "edit".into(),
+            args: json!({
+                "path": "f.py", "old_string": "x = 1  \nreturn x", "new_string": "x = 2\nreturn x"
+            }),
+        };
+        let preview = reg.preview(&intent).await.expect("edit preview");
+        assert!(preview.contains("+    x = 2"), "{preview}");
+        let edited = reg.execute(&intent).await;
+        assert_eq!(edited.status, kernel::ObsStatus::Ok, "{edited:?}");
+        assert_eq!(edited.payload["note"], edit_match::LOOSE_NOTE);
+        let read = || async {
+            run(&reg, "read", json!({ "path": "f.py" })).await.payload["content"].clone()
+        };
+        assert_eq!(read().await, "def f():\n    x = 2\n    return x\n");
+
+        let batch = run(
+            &reg,
+            "edit",
+            json!({ "path": "f.py", "edits": [
+                { "old_string": "x = 2  ", "new_string": "x = 3" },
+                { "old_string": "return y", "new_string": "return 0" }
+            ]}),
+        )
+        .await;
+        assert_ne!(batch.status, kernel::ObsStatus::Ok);
+        assert_eq!(read().await, "def f():\n    x = 2\n    return x\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn ranged_read_huge_limit_does_not_overflow() {
         let dir = std::env::temp_dir().join(format!("medha-ovf-{}", ulid_like()));
         let reg = reg_in(&dir);
         run(
             &reg,
-            "edit",
+            "write",
             json!({ "path": "f.txt", "content": "a\nb\nc\n" }),
         )
         .await;
@@ -8082,7 +8140,7 @@ mod tests {
     async fn edit_rejects_empty_and_noop_old_string() {
         let dir = std::env::temp_dir().join(format!("medha-empty-{}", ulid_like()));
         let reg = reg_in(&dir);
-        run(&reg, "edit", json!({ "path": "f.txt", "content": "abc" })).await;
+        run(&reg, "write", json!({ "path": "f.txt", "content": "abc" })).await;
 
         let empty = run(
             &reg,
@@ -8654,7 +8712,7 @@ mod tests {
         let reg = Arc::new(reg_in(&dir));
         run(
             &reg,
-            "edit",
+            "write",
             json!({ "path": "f.txt", "content": "alpha beta" }),
         )
         .await;
@@ -8693,10 +8751,10 @@ mod tests {
     async fn glob_star_does_not_cross_slash() {
         let dir = std::env::temp_dir().join(format!("medha-glob-{}", ulid_like()));
         let reg = reg_in(&dir);
-        run(&reg, "edit", json!({ "path": "top.rs", "content": "" })).await;
+        run(&reg, "write", json!({ "path": "top.rs", "content": "" })).await;
         run(
             &reg,
-            "edit",
+            "write",
             json!({ "path": "src/main.rs", "content": "" }),
         )
         .await;

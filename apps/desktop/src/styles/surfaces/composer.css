@@ -196,59 +196,138 @@
   transition: stroke-dasharray 400ms var(--ease-out);
 }
 
-.attachments {
+/* Context for this one message, set in its first line before the text. The
+   skill is the only lit token; one glint marks its arrival. */
+.msg-tokens {
+  position: absolute;
+  top: calc(var(--s-4) - 1px);
+  left: 18px;
+  right: 18px;
+  z-index: 1;
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding: var(--s-3) var(--s-3) 0;
+  pointer-events: none;
 }
-.attachment {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  padding: var(--s-1) 6px var(--s-1) var(--s-1);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--canvas);
-  font-size: var(--text-xs);
+/* Highlighted words, not boxes: a marker wash behind bold text, no border. */
+.msg-token {
+  position: relative;
+  height: 23px;
   max-width: 220px;
-  animation: pop-in var(--t-base) var(--ease-out) both;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 1px 0 5px;
+  overflow: hidden;
+  border-radius: var(--r-sm);
+  background: var(--hover);
+  color: var(--text);
+  font-size: var(--text-md);
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: auto;
+  animation: token-in var(--t-base) var(--ease-out) both;
+  transition: box-shadow var(--t-fast), background var(--t-fast);
 }
-.attachment img {
-  width: 30px;
-  height: 30px;
+.msg-token img {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  border-radius: calc(var(--r-sm) / 2);
   object-fit: cover;
-  border-radius: calc(var(--r-md) - 4px);
 }
-.attachment span {
+.msg-token-label {
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
-.attachment button {
-  padding: 3px;
+.msg-token button {
+  flex: none;
   display: grid;
   place-items: center;
-  border-radius: var(--r-full);
-  color: var(--faint);
-  transition: color var(--t-fast), background var(--t-fast);
+  width: 16px;
+  height: 16px;
+  border-radius: var(--r-sm);
+  color: currentColor;
+  opacity: 0.4;
+  transition: opacity var(--t-fast), background var(--t-fast);
 }
-.attachment button:hover {
-  color: var(--text);
+.msg-token:hover button,
+.msg-token.armed button {
+  opacity: 1;
+}
+.msg-token button:hover {
   background: var(--hover);
 }
-.attachment .icon {
-  width: 13px;
+.msg-token button .icon {
+  width: 10px;
+  height: 10px;
 }
-.attachment-note {
-  display: block;
-  font-size: var(--text-xs);
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.token-skill {
+  background: var(--gold-wash);
+  color: var(--gold);
+}
+.token-image {
   color: var(--dim);
+  font-weight: 500;
 }
+.token-skill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 30%, var(--glint) 50%, transparent 70%);
+  transform: translateX(-110%);
+  /* An even sweep: an ease-out curve crosses the token in a blink. */
+  animation: token-glint 650ms var(--ease-move) 120ms both;
+  pointer-events: none;
+}
+.msg-token.armed {
+  box-shadow: inset 0 -2px 0 currentColor;
+}
+.msg-token.leaving {
+  animation: token-out var(--t-fast) var(--ease) both;
+}
+.msg-token.sent {
+  display: inline;
+  height: auto;
+  margin-right: 5px;
+  padding: 1px 5px;
+  font-size: inherit;
+  line-height: inherit;
+  animation: none;
+}
+.msg-token.sent::after {
+  display: none;
+}
+.composer textarea {
+  transition: text-indent 160ms var(--ease-out);
+}
+.composer-announce {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+@keyframes token-in {
+  from {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+}
+@keyframes token-out {
+  to {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+}
+@keyframes token-glint {
+  to {
+    transform: translateX(110%);
+  }
+}
+
 .drop-hint {
   display: flex;
   justify-content: center;
@@ -287,12 +366,18 @@
   color: var(--faint);
 }
 .slash-menu b {
-  width: 92px;
+  flex: none;
+  min-width: 92px;
   font-weight: 500;
+  white-space: nowrap;
 }
 .slash-menu span {
+  min-width: 0;
+  overflow: hidden;
   font-size: var(--text-xs);
   color: var(--dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (max-width: 780px) {

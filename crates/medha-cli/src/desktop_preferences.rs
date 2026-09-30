@@ -618,11 +618,19 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
 }
 
 pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Result<Value> {
+    if let Some(result) = crate::desktop_skills::handle(method, params, workspace).await {
+        return result;
+    }
     match method {
         "extensions.mcp.registry" => {
             crate::desktop_mcp_registry::search(
                 params["query"].as_str().unwrap_or_default(),
                 params["cursor"].as_str(),
+                if params["source"] == "full" {
+                    crate::desktop_mcp_registry::Source::Full
+                } else {
+                    crate::desktop_mcp_registry::Source::Featured
+                },
             )
             .await
         }

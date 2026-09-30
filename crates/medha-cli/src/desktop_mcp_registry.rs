@@ -7,24 +7,71 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 const REGISTRY: &str = "https://registry.modelcontextprotocol.io/v0/servers";
+/// GitHub's curated list: the same server format, ranked by stars, and fast to search.
+const FEATURED: &str = "https://api.mcp.github.com/v0.1/servers";
 
-pub(crate) async fn search(query: &str, cursor: Option<&str>) -> anyhow::Result<Value> {
-    let mut request = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Featured,
+    Full,
+}
+
+pub(crate) async fn search(
+    query: &str,
+    cursor: Option<&str>,
+    source: Source,
+) -> anyhow::Result<Value> {
+    let name = match source {
+        Source::Featured => "GitHub’s MCP list",
+        Source::Full => "The MCP Registry",
+    };
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
         .build()?
-        .get(REGISTRY)
-        .query(&[("limit", "30"), ("version", "latest")]);
-    if !query.trim().is_empty() {
-        request = request.query(&[("search", query.trim())]);
-    }
-    if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-        request = request.query(&[("cursor", cursor)]);
-    }
-    let response = request.send().await?;
+        .get(search_url(query, cursor, source)?)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                anyhow::anyhow!("{name} took too long to answer. Try again in a moment.")
+            } else {
+                anyhow::anyhow!("Couldn't reach {name}. Check your connection and try again.")
+            }
+        })?;
     if !response.status().is_success() {
-        anyhow::bail!("The MCP Registry answered {}", response.status());
+        anyhow::bail!("{name} answered {}", response.status());
     }
     Ok(listing(&response.json::<Value>().await?))
+}
+
+fn search_url(query: &str, cursor: Option<&str>, source: Source) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(match source {
+        Source::Featured => FEATURED,
+        Source::Full => REGISTRY,
+    })?;
+    let mut params = url.query_pairs_mut();
+    params.append_pair("limit", "30");
+    let cursor = cursor.filter(|cursor| !cursor.is_empty());
+    match source {
+        // GitHub also supports numbered pages. Use that API instead of its
+        // opaque bookmarks, which have been rejected on subsequent requests.
+        Source::Featured => {
+            let page = cursor.unwrap_or("1").parse::<u64>()?;
+            anyhow::ensure!(page > 0, "Invalid catalogue page");
+            params.append_pair("page", &page.to_string());
+        }
+        Source::Full => {
+            params.append_pair("version", "latest");
+            if let Some(cursor) = cursor {
+                params.append_pair("cursor", cursor);
+            }
+        }
+    }
+    if !query.trim().is_empty() {
+        params.append_pair("search", query.trim());
+    }
+    drop(params);
+    Ok(url)
 }
 
 /// Active servers with the ways Medha can set each one up.
@@ -52,17 +99,28 @@ pub(crate) fn listing(page: &Value) -> Value {
                     .flatten()
                     .map(package),
             );
+            let github = &server["_meta"]["io.modelcontextprotocol.registry/publisher-provided"]["github"];
+            let owner = text(&github["nameWithOwner"]).split('/').next().unwrap_or_default();
             json!({
                 "name": server["name"],
-                "title": server["title"],
+                "title": if server["title"].is_null() { &github["displayName"] } else { &server["title"] },
                 "description": server["description"],
                 "version": server["version"],
                 "repository": server["repository"]["url"],
+                "stars": github["stargazerCount"],
+                "organization": (github["isInOrganization"] == true && !owner.is_empty()).then_some(owner),
                 "setups": setups,
             })
         })
         .collect();
-    json!({"servers": servers, "next": page["metadata"]["nextCursor"]})
+    let next = match (
+        page["metadata"]["page"].as_u64(),
+        page["metadata"]["total_pages"].as_u64(),
+    ) {
+        (Some(current), Some(total)) => json!((current < total).then(|| (current + 1).to_string())),
+        _ => page["metadata"]["nextCursor"].clone(),
+    };
+    json!({"servers": servers, "next": next})
 }
 
 fn text(value: &Value) -> &str {
@@ -83,7 +141,8 @@ fn remote(remote: &Value) -> Value {
         [] => "detect",
         [header]
             if text(&header["name"]).eq_ignore_ascii_case("authorization")
-                && text(&header["value"]).starts_with("Bearer ") =>
+                && (text(&header["value"]).is_empty()
+                    || text(&header["value"]).starts_with("Bearer ")) =>
         {
             "token"
         }
@@ -105,36 +164,41 @@ fn package(package: &Value) -> Value {
     if text(&package["transport"]["type"]) != "stdio" {
         return unsupported("runs as a network service, not a local process");
     }
-    let mut command = match text(&package["registryType"]) {
-        "npm" => vec![
-            "npx".to_owned(),
-            "-y".to_owned(),
-            versioned(identifier, version, "@"),
-        ],
-        "pypi" => vec!["uvx".to_owned(), versioned(identifier, version, "==")],
+    let runtime = text(&package["runtimeHint"]);
+    let (mut command, package_name) = match text(&package["registryType"]) {
+        "npm" if runtime.is_empty() || runtime == "npx" => (
+            vec!["npx".to_owned(), "-y".to_owned()],
+            Some(versioned(identifier, version, "@")),
+        ),
+        "pypi" if runtime.is_empty() || runtime == "uvx" => (
+            vec!["uvx".to_owned()],
+            Some(versioned(identifier, version, "==")),
+        ),
+        // Some curated entries describe an installed executable, such as
+        // `uv --directory {path} run server.py`, rather than a registry package.
+        "other" if !runtime.is_empty() && runtime == identifier => (vec![runtime.to_owned()], None),
         other => {
             return unsupported(&format!(
                 "is a {other} package, which Medha cannot start yet"
             ));
         }
     };
-    for argument in package["packageArguments"].as_array().into_iter().flatten() {
-        let value = argument["value"]
-            .as_str()
-            .or_else(|| argument["default"].as_str());
-        match (value, argument["isRequired"].as_bool().unwrap_or(false)) {
-            (Some(value), _) => {
-                if let Some(flag) = argument["name"]
-                    .as_str()
-                    .filter(|_| argument["type"] == "named")
-                {
-                    command.push(flag.to_owned());
-                }
-                command.push(value.to_owned());
-            }
-            (None, true) => return unsupported("needs arguments Medha cannot fill in"),
-            (None, false) => {}
-        }
+    let mut inputs = Vec::new();
+    if let Err(reason) = arguments(&package["runtimeArguments"], &mut command, &mut inputs) {
+        return unsupported(reason);
+    }
+    // The curated list can include the CLI and its subcommand in the runtime
+    // arguments already. Appending the package again would break that command.
+    let has_cli = package["runtimeArguments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|arg| arg["type"] == "positional" && arg["valueHint"] == "cli");
+    if let Some(package_name) = package_name.filter(|_| !has_cli) {
+        command.push(package_name);
+    }
+    if let Err(reason) = arguments(&package["packageArguments"], &mut command, &mut inputs) {
+        return unsupported(reason);
     }
     let variables: Vec<Value> = package["environmentVariables"]
         .as_array()
@@ -146,11 +210,57 @@ fn package(package: &Value) -> Value {
                 "description": variable["description"],
                 "required": variable["isRequired"].as_bool().unwrap_or(false),
                 "secret": variable["isSecret"].as_bool().unwrap_or(false),
-                "default": variable["default"],
+                "default": variable.get("value").unwrap_or(&variable["default"]),
             })
         })
         .collect();
-    json!({"kind": "local", "package": identifier, "command": command, "variables": variables})
+    json!({"kind": "local", "package": identifier, "command": command, "variables": variables, "inputs": inputs})
+}
+
+/// Arguments are argv entries, never shell fragments. A named argument with
+/// no value is a flag; curated entries can put its value in the next entry.
+fn arguments(
+    arguments: &Value,
+    command: &mut Vec<String>,
+    inputs: &mut Vec<Value>,
+) -> Result<(), &'static str> {
+    for argument in arguments.as_array().into_iter().flatten() {
+        let value = argument["value"]
+            .as_str()
+            .or_else(|| argument["default"].as_str());
+        let flag = argument["name"]
+            .as_str()
+            .filter(|name| !name.is_empty() && argument["type"] == "named");
+        match (value, argument["isRequired"].as_bool().unwrap_or(false)) {
+            (Some(value), _) => {
+                if let Some(variables) = argument["variables"].as_object() {
+                    for (name, variable) in variables {
+                        if !value.contains(&format!("{{{name}}}")) {
+                            continue;
+                        }
+                        if variable["isSecret"] == true {
+                            return Err("needs a secret in its command arguments");
+                        }
+                        if !inputs.iter().any(|input| input["name"] == *name) {
+                            inputs.push(json!({
+                                "name": name,
+                                "description": variable["description"],
+                                "default": variable["default"],
+                            }));
+                        }
+                    }
+                }
+                if let Some(flag) = flag {
+                    command.push(flag.to_owned());
+                }
+                command.push(value.to_owned());
+            }
+            (None, _) if flag.is_some() => command.push(flag.unwrap().to_owned()),
+            (None, true) => return Err("needs arguments Medha cannot fill in"),
+            (None, false) => {}
+        }
+    }
+    Ok(())
 }
 
 /// A short server id from a registry name like `io.github.org/tool-mcp`.
@@ -226,7 +336,7 @@ pub(crate) fn add_command(name: &str, setup: &Value) -> Option<(String, usize)> 
 }
 
 fn versioned(identifier: &str, version: &str, separator: &str) -> String {
-    if version.is_empty() {
+    if version.is_empty() || version == "latest" {
         identifier.to_owned()
     } else {
         format!("{identifier}{separator}{version}")

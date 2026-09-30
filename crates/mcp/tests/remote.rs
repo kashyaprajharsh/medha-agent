@@ -1,13 +1,19 @@
-use std::{sync::Arc, time::Duration};
+mod common;
 
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+use common::read_http_request;
 use mcp::{
     Config, Error, McpManager, RemoteAuth, ServerConfig, ServerState, TokenStore, Transport,
 };
 use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-};
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 async fn spawn_server(required_bearer: Option<&'static str>) -> String {
     spawn_with_challenge(required_bearer, None).await
@@ -69,33 +75,45 @@ async fn spawn_with_challenge(
     format!("http://127.0.0.1:{port}/mcp")
 }
 
-/// Reads through the declared body because TCP reads may be partial.
-async fn read_http_request(stream: &mut TcpStream) -> Option<String> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        let read = stream.read(&mut chunk).await.ok()?;
-        if read == 0 {
-            return Some(String::from_utf8_lossy(&buf).into_owned());
+const OAUTH_CHALLENGE: &str =
+    r#"Bearer resource_metadata="https://example.test/.well-known/oauth-protected-resource""#;
+
+/// A server that refuses GET and decides per request whether to demand
+/// credentials: `calls` gates only `tools/call`, `posts` gates everything.
+async fn spawn_gated(calls: Arc<AtomicBool>, posts: bool, challenge: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                let Some(request) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                let body = request.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+                let head = if request.starts_with("GET") {
+                    "405 Method Not Allowed\r\n".to_string()
+                } else if posts || (calls.load(Ordering::SeqCst) && body.contains("\"tools/call\""))
+                {
+                    format!("401 Unauthorized\r\nWWW-Authenticate: {challenge}\r\n")
+                } else {
+                    let payload = reply(body).to_string();
+                    format!(
+                        "200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                };
+                let response = if head.starts_with("200") {
+                    format!("HTTP/1.1 {head}")
+                } else {
+                    format!("HTTP/1.1 {head}Content-Length: 0\r\n\r\n")
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
         }
-        buf.extend_from_slice(&chunk[..read]);
-        let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-            continue;
-        };
-        let content_length = String::from_utf8_lossy(&buf[..head_end])
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.trim()
-                    .eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        if buf.len() >= head_end + 4 + content_length {
-            return Some(String::from_utf8_lossy(&buf).into_owned());
-        }
-    }
+    });
+    format!("http://127.0.0.1:{port}/mcp")
 }
 
 fn reply(body: &str) -> Value {
@@ -286,6 +304,63 @@ async fn a_bare_challenge_asks_for_a_token() {
 
     assert_eq!(manager.status().await[0].state, ServerState::NeedsToken);
     assert!(!manager.needs_sign_in("hosted").await);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_that_checks_sign_in_per_call_asks_for_it() {
+    // Connecting and listing need nothing; only a call is refused. The server
+    // must not stay "connected" while every call fails.
+    let url = spawn_gated(Arc::new(AtomicBool::new(true)), false, OAUTH_CHALLENGE).await;
+    let manager = McpManager::new(
+        std::env::temp_dir(),
+        remote("hosted", url, RemoteAuth::Auto),
+    );
+    manager.connect_startup().await;
+    assert_eq!(manager.status().await[0].state, ServerState::Ready);
+
+    let outcome = manager.call("mcp__hosted__ping", &json!({})).await;
+
+    assert!(matches!(outcome, Err(Error::NeedsAuth(_))), "{outcome:?}");
+    assert_eq!(manager.status().await[0].state, ServerState::NeedsAuth);
+    assert!(manager.needs_sign_in("hosted").await);
+    assert!(manager.tool_specs().is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_that_refuses_get_is_still_probed_for_sign_in() {
+    // A 405 to GET is about the method, not credentials; the real request
+    // is what reveals the sign-in.
+    let url = spawn_gated(Arc::new(AtomicBool::new(false)), true, OAUTH_CHALLENGE).await;
+    let manager = McpManager::new(
+        std::env::temp_dir(),
+        remote("hosted", url, RemoteAuth::Auto),
+    );
+    manager.connect_startup().await;
+
+    assert_eq!(manager.status().await[0].state, ServerState::NeedsAuth);
+    assert!(manager.needs_sign_in("hosted").await);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_refused_mid_session_asks_for_a_new_one() {
+    let refusing = Arc::new(AtomicBool::new(false));
+    let url = spawn_gated(Arc::clone(&refusing), false, OAUTH_CHALLENGE).await;
+    let manager = McpManager::new(
+        std::env::temp_dir(),
+        remote("hosted", url, RemoteAuth::Bearer("s3cret".into())),
+    );
+    manager.connect_startup().await;
+    assert_eq!(manager.status().await[0].state, ServerState::Ready);
+
+    refusing.store(true, Ordering::SeqCst);
+    let outcome = manager.call("mcp__hosted__ping", &json!({})).await;
+
+    // A configured token was refused: a browser sign-in is not the remedy.
+    assert!(matches!(outcome, Err(Error::NeedsToken(_))), "{outcome:?}");
+    assert_eq!(manager.status().await[0].state, ServerState::NeedsToken);
     manager.shutdown().await;
 }
 

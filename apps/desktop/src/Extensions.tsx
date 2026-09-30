@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { Icon } from "./Icon";
 import { useWorkspaceApi } from "./Workspace";
-import { McpDetails, McpForm, useMcpSignIn, type McpPrefill, type McpServer, type McpStatus } from "./McpServers";
+import { McpDetails, McpForm, mcpView as serverView, useMcpSignIn, type McpPrefill, type McpServer, type McpStatus } from "./McpServers";
 import { McpCatalog } from "./McpCatalog";
 import { PluginBrowse, PluginDoctor } from "./PluginBrowse";
+import { SkillBrowse } from "./SkillBrowse";
+import { SkillManage } from "./SkillManage";
 import { Hooks } from "./Hooks";
 import { ToolPreset } from "./ToolPreset";
 type Plugin = {
@@ -70,6 +72,7 @@ export function Extensions({
   const [statuses, setStatuses] = useState<Record<string, McpStatus>>({});
   const [mcpOpen, setMcpOpen] = useState("");
   const [pluginView, setPluginView] = useState<"installed" | "browse">("installed");
+  const [skillView, setSkillView] = useState<"installed" | "browse" | "manage">("installed");
   const [mcpView, setMcpView] = useState<"yours" | "catalog">("yours");
   const [prefill, setPrefill] = useState<McpPrefill>();
   const signIn = useMcpSignIn(sessionKey, (event) => {
@@ -91,6 +94,7 @@ export function Extensions({
   const [source, setSource] = useState("");
   const [review, setReview] = useState<Plugin>();
   const [connect, setConnect] = useState<Mcp>();
+  const [autoConnect, setAutoConnect] = useState(false);
   const [adding, setAdding] = useState(false);
   const [notices, setNotices] = useState<string[]>([]);
   useEffect(() => {
@@ -196,13 +200,17 @@ export function Extensions({
               </button>
             ))}
           </div>
-          <input
-            className="filter-input"
-            aria-label="Filter extensions"
-            placeholder="Filter"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-          />
+          {/* Browse views lead with their own search; one search box per view. */}
+          {!(tab === "skills" && skillView !== "installed") &&
+            !(tab === "plugins" && pluginView === "browse") && (
+              <input
+                className="filter-input"
+                aria-label="Filter extensions"
+                placeholder="Filter"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+              />
+            )}
         </div>
         {error && (
           <p className="surface-error" role="alert">
@@ -215,6 +223,25 @@ export function Extensions({
           </p>
         )}
         {tab === "skills" && (
+          <div className="segmented">
+            {(["installed", "browse", "manage"] as const).map((view) => (
+              <button key={view} aria-pressed={skillView === view} onClick={() => setSkillView(view)}>
+                {view[0].toUpperCase() + view.slice(1)}
+              </button>
+            ))}
+          </div>
+        )}
+        {tab === "skills" && skillView === "browse" && (
+          <SkillBrowse
+            installed={new Set(skills.map((skill) => skill.name))}
+            busy={busy || locked}
+            onInstall={(from) => act("extensions.skill.install", { source: from })}
+          />
+        )}
+        {tab === "skills" && skillView === "manage" && (
+          <SkillManage busy={busy || locked} onChanged={() => setRefresh((value) => value + 1)} />
+        )}
+        {tab === "skills" && skillView === "installed" && (
           <>
             <form
               className="plugin-install"
@@ -335,7 +362,6 @@ export function Extensions({
         )}
         {tab === "plugins" && pluginView === "browse" && (
           <PluginBrowse
-            query={query}
             busy={busy || locked}
             onInstall={(from) => act("extensions.install", { source: from })}
           />
@@ -575,25 +601,30 @@ export function Extensions({
             {mcpView === "yours" && <>
             {mcp
               .filter((server) => matches(server.id, server.url))
-              .map((server) => (
+              .map((server) => {
+                const view = serverView(server, statuses[server.id], signIn.pending?.server === server.id);
+                const signInTo =
+                  server.url && sessionKey
+                    ? () => {
+                        setBusy(true);
+                        setError("");
+                        signIn.start(server.id);
+                        void ensureOpen()
+                          .then(() => api.liveCall(sessionKey, "mcp.signin", { id: server.id, hash: server.hash }))
+                          .then(() => setNotice(`Finish signing in to ${server.id} in your browser.`))
+                          .catch((cause) => setError(String(cause)))
+                          .finally(() => setBusy(false));
+                      }
+                    : undefined;
+                return (
                 <div className="mcp-server" key={server.id}>
                 <section className="settings-row">
                   <div>
                     <b>{server.id}</b>
                     <p>{server.url || server.executable}</p>
-                    <small>
-                      {statuses[server.id]?.state
-                        ? `${statuses[server.id].state.replaceAll("_", " ")} · ${statuses[server.id].tools} tools`
-                        : server.disabled
-                          ? "Disabled"
-                          : server.trust === "trusted"
-                            ? "Trusted"
-                            : "Asks before starting"}
-                      {server.signed_in
-                        ? " · signed in"
-                        : server.auth === "oauth"
-                          ? " · not signed in"
-                          : server.key_present && " · key saved"}
+                    <small className="mcp-state">
+                      <span className={`agent-dot ${view.dot}`} aria-hidden="true" />
+                      {view.label}
                     </small>
                   </div>
                   <div className="row-actions">
@@ -604,15 +635,25 @@ export function Extensions({
                     >
                       Details
                     </button>
-                    <button
-                      className="btn-line"
-                      disabled={busy || locked || !sessionKey}
-                      onClick={() => setConnect(server)}
-                    >
-                      Connect
-                    </button>
-                    {statuses[server.id] &&
-                      statuses[server.id].state !== "stopped" && (
+                    {view.action === "connect" && (
+                      <button
+                        className="btn-line"
+                        disabled={busy || locked || !sessionKey}
+                        title={sessionKey ? undefined : "Open a chat to connect"}
+                        onClick={() => {
+                          setAutoConnect(server.trust === "trusted");
+                          setConnect(server);
+                        }}
+                      >
+                        Connect
+                      </button>
+                    )}
+                    {view.action === "signin" && signInTo && (
+                      <button className="btn-line" disabled={busy || locked} onClick={signInTo}>
+                        Sign in
+                      </button>
+                    )}
+                    {view.action === "disconnect" && (
                         <button
                           className="btn-line"
                           disabled={busy || locked}
@@ -656,25 +697,13 @@ export function Extensions({
                     tools={tools}
                     busy={busy || locked}
                     onUpdate={(patch) => void act("settings.mcp.update", { id: server.id, ...patch })}
-                    onSignIn={
-                      server.url && sessionKey
-                        ? () => {
-                            setBusy(true);
-                            setError("");
-                            signIn.start(server.id);
-                            void ensureOpen()
-                              .then(() => api.liveCall(sessionKey, "mcp.signin", { id: server.id, hash: server.hash }))
-                              .then(() => setNotice(`Finish signing in to ${server.id} in your browser.`))
-                              .catch((cause) => setError(String(cause)))
-                              .finally(() => setBusy(false));
-                          }
-                        : undefined
-                    }
+                    onSignIn={signInTo}
                     onSignOut={() => void act("settings.mcp.signout", { id: server.id })}
                   />
                 )}
                 </div>
-              ))}
+                );
+              })}
             {signIn.pending && (
               <div className="mcp-signin" role="status">
                 <span>Signing in to {signIn.pending.server} — finish in your browser.</span>
@@ -743,7 +772,15 @@ export function Extensions({
               {!connect.url && (
                 <pre className="io">{connect.command.join(" ")}</pre>
               )}
-              <p>This server can provide tools in the current chat.</p>
+              <p>Its tools become available in this chat.</p>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={autoConnect}
+                  onChange={(event) => setAutoConnect(event.target.checked)}
+                />
+                Connect automatically in new chats
+              </label>
               <div className="row-actions">
                 <button
                   className="btn-line"
@@ -764,8 +801,15 @@ export function Extensions({
                           hash: connect.hash,
                         }),
                       )
-                      .then((result) => {
+                      .then(async (result) => {
                         setConnect(undefined);
+                        // After connecting: saving changes the definition the connect was checked against.
+                        if (autoConnect !== (connect.trust === "trusted")) {
+                          await api.settings("settings.mcp.update", {
+                            id: connect.id,
+                            trust: autoConnect ? "trusted" : "workspace",
+                          });
+                        }
                         if (result.state === "signing_in") signIn.start(connect.id);
                         setNotice(
                           result.state === "ready"

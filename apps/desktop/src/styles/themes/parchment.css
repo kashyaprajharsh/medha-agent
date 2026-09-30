@@ -17,6 +17,7 @@
   --gold-hi: #b8802c;
   --gold-ink: #fff8e8;
   --gold-wash: rgba(140, 92, 14, 0.1);
+  --glint: rgba(255, 250, 238, 0.95);
   --code: #704a0c;
   --link: #845410;
   --ok: #2e6c34;
@@ -37,4 +38,9 @@
   --syntax-function: #236983;
   --syntax-comment: #77756f;
   --syntax-attr: #a0393c;
+  /* Chart series: CVD-safe adjacent pairs; three sit under 3:1, so values also appear as text. */
+  --chart-1: #2a78d6;
+  --chart-2: #eb6834;
+  --chart-3: #1baf7a;
+  --chart-4: #eda100;
 }

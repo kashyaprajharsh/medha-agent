@@ -23,6 +23,34 @@ export type McpServer = {
 
 export type McpStatus = { state: string; tools: number; hidden?: number; detail?: string };
 
+export type McpAction = "connect" | "signin" | "disconnect" | "none";
+
+/** What a server's state means to the person, and the one action it needs now. */
+export function mcpView(server: McpServer, status: McpStatus | undefined, signingIn: boolean): { dot: string; label: string; action: McpAction } {
+  if (signingIn) return { dot: "running", label: "Finish signing in in your browser", action: "none" };
+  const state = status?.state ?? (server.disabled ? "disabled" : "stopped");
+  switch (state) {
+    case "ready":
+      return { dot: "completed", label: `Connected, ${status!.tools} ${status!.tools === 1 ? "tool" : "tools"}`, action: "disconnect" };
+    case "connecting":
+    case "reconnecting":
+      return { dot: "running", label: "Connecting…", action: "none" };
+    case "degraded":
+      return { dot: "exhausted", label: "Connection lost, reconnecting…", action: "none" };
+    case "needs_auth":
+      return { dot: "exhausted", label: "Sign in to connect", action: "signin" };
+    case "needs_token":
+      return { dot: "exhausted", label: "Needs an API key or token. Remove the server and add it again with one.", action: "none" };
+    case "parked":
+    case "failed":
+      return { dot: "failed", label: status?.detail ? `Couldn't connect: ${status.detail}` : "Couldn't connect", action: "connect" };
+    case "disabled":
+      return { dot: "", label: "Turned off", action: "none" };
+    default:
+      return { dot: "", label: server.trust === "trusted" ? "Connects automatically in new chats" : "Not connected", action: "connect" };
+  }
+}
+
 type Variable = { name: string; value: string; hint?: string; secret?: boolean };
 
 /** A catalog entry's chosen setup, used to fill the form in. */
@@ -34,6 +62,7 @@ export type McpPrefill = {
   tokenHelp?: string;
   command?: string[];
   variables?: { name: string; description?: string; required: boolean; secret: boolean; default?: string | null }[];
+  inputs?: { name: string; description?: string; default?: string | null }[];
 };
 
 /** Everything `/mcp add` takes, as a form: remote servers sign in with OAuth or a
@@ -47,6 +76,9 @@ export function McpForm({ busy, onSave, initial }: { busy: boolean; onSave: (arg
   const [token, setToken] = useState("");
   const [command, setCommand] = useState(initial?.command?.[0] ?? "npx");
   const [argumentsText, setArguments] = useState(initial?.command ? initial.command.slice(1).join("\n") : "-y\nserver-package");
+  const [inputs, setInputs] = useState<Record<string, string>>(
+    Object.fromEntries((initial?.inputs ?? []).map((input) => [input.name, input.default ?? ""])),
+  );
   const [key, setKey] = useState("");
   const [keyVariable, setKeyVariable] = useState(secrets[0]?.name ?? "API_KEY");
   const [variables, setVariables] = useState<Variable[]>(
@@ -83,7 +115,14 @@ export function McpForm({ busy, onSave, initial }: { busy: boolean; onSave: (arg
       flags.push("--env", `${variable.name}=${variable.value}`);
     }
     if (!command.trim()) throw new Error("Enter an executable");
-    return [...flags, "--", command.trim(), ...argumentsText.split("\n").filter((line) => line.length > 0)];
+    const resolved = argumentsText.split("\n").filter((line) => line.length > 0).map((argument) =>
+      argument.replace(/\{([^{}]+)\}/g, (placeholder, name: string) => {
+        if (!(name in inputs)) return placeholder;
+        if (!inputs[name].trim()) throw new Error(`Enter ${name.replaceAll("_", " ")}`);
+        return inputs[name];
+      }),
+    );
+    return [...flags, "--", command.trim(), ...resolved];
   }
 
   return (
@@ -151,6 +190,13 @@ export function McpForm({ busy, onSave, initial }: { busy: boolean; onSave: (arg
             Arguments
             <textarea value={argumentsText} onChange={(event) => setArguments(event.target.value)} placeholder="One argument per line" />
           </label>
+          {initial?.inputs?.map((input) => (
+            <label key={input.name}>
+              {input.name.replaceAll("_", " ")}
+              <input value={inputs[input.name]} onChange={(event) => setInputs({ ...inputs, [input.name]: event.target.value })} />
+              {input.description && <small className="quiet">{input.description}</small>}
+            </label>
+          ))}
           <div className="mcp-key">
             <label>
               API key (optional)
@@ -192,7 +238,7 @@ export function McpForm({ busy, onSave, initial }: { busy: boolean; onSave: (arg
         <summary>Access</summary>
         <label className="checkbox-label">
           <input type="checkbox" checked={trusted} onChange={(event) => setTrusted(event.target.checked)} />
-          Trusted: connect on start without asking
+          Connect automatically in new chats
         </label>
         <label className="checkbox-label">
           <input type="checkbox" checked={network} onChange={(event) => setNetwork(event.target.checked)} />
@@ -231,6 +277,7 @@ export function McpDetails({ server, status, tools, busy, onUpdate, onSignIn, on
   const exposed = tools.filter((tool) => tool.name.startsWith(prefix)).map((tool) => ({ name: tool.name.slice(prefix.length), description: tool.description }));
   const rows = [...exposed, ...server.deny_tools.filter((name) => !exposed.some((tool) => tool.name === name)).map((name) => ({ name, description: "" }))];
   const connected = status?.state === "ready";
+  const needsSignIn = !server.signed_in || ["needs_auth", "failed", "parked"].includes(status?.state ?? "");
   const toggle = (name: string, on: boolean) =>
     onUpdate({ deny_tools: on ? server.deny_tools.filter((denied) => denied !== name) : [...server.deny_tools, name] });
   return (
@@ -239,8 +286,8 @@ export function McpDetails({ server, status, tools, busy, onUpdate, onSignIn, on
         <h4>Sign-in</h4>
         {server.auth === "oauth" || server.signed_in ? (
           <div className="mcp-line">
-            <span>{server.signed_in ? "Signed in with OAuth" : "Not signed in"}</span>
-            {onSignIn && (
+            <span>{!server.signed_in ? "Not signed in" : status?.state === "needs_auth" ? "Sign-in expired" : "Signed in"}</span>
+            {onSignIn && needsSignIn && (
               <button className="btn-line" disabled={busy} onClick={onSignIn}>
                 {server.signed_in ? "Sign in again" : "Sign in"}
               </button>
@@ -291,7 +338,7 @@ export function McpDetails({ server, status, tools, busy, onUpdate, onSignIn, on
         <h4>Access</h4>
         <label className="checkbox-label">
           <input type="checkbox" disabled={busy} checked={server.trust === "trusted"} onChange={(event) => onUpdate({ trust: event.target.checked ? "trusted" : "workspace" })} />
-          Trusted: connect on start without asking
+          Connect automatically in new chats
         </label>
         <label className="checkbox-label">
           <input type="checkbox" disabled={busy} checked={server.network !== false} onChange={(event) => onUpdate({ network: event.target.checked ? null : false })} />

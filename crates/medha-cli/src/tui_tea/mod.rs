@@ -370,7 +370,7 @@ pub(crate) enum TuiEvent {
         oneshot::Sender<Option<Vec<kernel::Answer>>>,
     ),
     Done(Vec<Message>, StopReason),
-    Error(String),
+    Error(String, Option<Vec<Message>>),
     /// The task which owned a force-aborted foreground turn has been dropped.
     /// Events it queued before cancellation are ignored until this marker; the
     /// marker is sent only after joining that task, so the next turn cannot

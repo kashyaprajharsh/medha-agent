@@ -7,6 +7,7 @@ import {
   SessionSettings,
 } from "./api";
 import { Icon, type IconName } from "./Icon";
+import { MessageTokens, type MessageToken, type TokenLayout } from "./MessageTokens";
 
 export type Control = "model" | "reasoning" | "mode";
 type Props = {
@@ -35,6 +36,11 @@ type Props = {
   onRewind: () => void;
   onSettings: () => void;
   onExtensions: () => void;
+  /** Enabled skills the `/` menu offers alongside its commands. */
+  skills?: { name: string; description: string }[];
+  /** The skill riding along with the next message, if one was chosen. */
+  skill?: string;
+  onSkill?: (name: string | null) => void | Promise<void>;
 };
 
 const MODES = [
@@ -110,21 +116,55 @@ export function Composer(props: Props) {
   const [dragging, setDragging] = useState(false);
   const [commandIndex, setCommandIndex] = useState(0);
   const [commandHidden, setCommandHidden] = useState(false);
+  const [armed, setArmed] = useState<string | null>(null);
+  const [leaving, setLeaving] = useState<string | null>(null);
+  const [layout, setLayout] = useState<TokenLayout>({ indent: 0, lift: 0 });
+  const tokens: MessageToken[] = [
+    ...(props.skill ? [{ id: "skill", kind: "skill" as const, label: props.skill }] : []),
+    ...props.attachments.map((attachment) => ({
+      id: attachment.id,
+      kind: "image" as const,
+      label: attachment.name,
+      preview: attachment.preview,
+      title: attachment.note || attachment.name,
+    })),
+  ];
+  const armedToken = tokens.find((token) => token.id === armed);
+  function removeToken(id: string) {
+    setArmed(null);
+    setLeaving(id);
+    const drop = () => {
+      setLeaving(null);
+      if (id === "skill") props.onSkill?.(null);
+      else props.onAttachments(props.attachments.filter((item) => item.id !== id));
+    };
+    // Exits are faster than entries; without motion the token just goes.
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) drop();
+    else window.setTimeout(drop, 120);
+    input.current?.focus();
+  }
   const slash =
-    !commandHidden && /^\/[a-z]*$/i.test(value)
+    !commandHidden && /^\/[a-z0-9-]*$/i.test(value)
       ? value.slice(1).toLowerCase()
       : null;
-  const commands =
+  const commands: { id: string; icon: IconName; description: string; skill?: boolean }[] =
     slash === null
       ? []
-      : COMMANDS.filter((command) => command.id.startsWith(slash));
+      : [
+          ...COMMANDS.filter((command) => command.id.startsWith(slash)),
+          ...(props.skills ?? [])
+            .filter((skill) => skill.name.toLowerCase().includes(slash))
+            .slice(0, 8)
+            .map((skill) => ({ id: skill.name, icon: "file" as IconName, description: skill.description, skill: true })),
+        ];
 
-  useEffect(() => {
+  function fit() {
     const box = input.current;
     if (!box) return;
     box.style.height = "auto";
     box.style.height = `${Math.min(box.scrollHeight, 200)}px`;
-  }, [value]);
+  }
+  useEffect(fit, [value, layout]);
   useEffect(() => {
     setCommandIndex(0);
   }, [value]);
@@ -212,7 +252,10 @@ export function Composer(props: Props) {
   }
   function command(id: string) {
     change("");
-    if (id === "model" || id === "reasoning" || id === "mode")
+    if (commands.find((item) => item.id === id)?.skill)
+      // A skill that fails to load is this message's problem, shown here.
+      void Promise.resolve(props.onSkill?.(id)).catch((cause) => setError(`Couldn't use ${id}: ${String(cause)}`));
+    else if (id === "model" || id === "reasoning" || id === "mode")
       props.onControl(id);
     else if (id === "new") props.onNew();
     else if (id === "clear") {
@@ -260,34 +303,16 @@ export function Composer(props: Props) {
           if (!busy) void attach([...event.dataTransfer.files]);
         }}
       >
-        {props.attachments.length > 0 && (
-          <div className="attachments">
-            {props.attachments.map((attachment) => (
-              <div className="attachment" key={attachment.id}>
-                <img src={attachment.preview} alt="" />
-                <span title={attachment.note || attachment.name}>
-                  {attachment.name}
-                  {attachment.note && (
-                    <small className="attachment-note">{attachment.note}</small>
-                  )}
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    props.onAttachments(
-                      props.attachments.filter(
-                        (item) => item.id !== attachment.id,
-                      ),
-                    )
-                  }
-                  aria-label={`Remove ${attachment.name}`}
-                >
-                  <Icon name="x" />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
+        <MessageTokens
+          tokens={tokens}
+          armed={armed}
+          leaving={leaving}
+          onRemove={removeToken}
+          onLayout={setLayout}
+        />
+        <span className="composer-announce" aria-live="polite">
+          {armedToken ? `Press Backspace again to remove ${armedToken.label}` : ""}
+        </span>
         {dragging && (
           <div className="drop-hint">
             <Icon name="clip" />
@@ -299,6 +324,12 @@ export function Composer(props: Props) {
           rows={1}
           value={value}
           disabled={props.disabled}
+          style={{
+            textIndent: layout.indent || undefined,
+            paddingTop: layout.lift ? `calc(var(--s-4) + ${layout.lift}px)` : undefined,
+          }}
+          // The indent slides, which rewraps the text; size it once it settles.
+          onTransitionEnd={fit}
           aria-label="Message Medha"
           placeholder={
             props.running
@@ -317,6 +348,16 @@ export function Composer(props: Props) {
             }
           }}
           onKeyDown={(event) => {
+            const box = event.currentTarget;
+            if (event.key === "Backspace" && tokens.length && box.selectionStart === 0 && box.selectionEnd === 0) {
+              // First press marks the token nearest the text; a second removes it.
+              event.preventDefault();
+              const last = tokens[tokens.length - 1];
+              if (armed === last.id) removeToken(last.id);
+              else setArmed(last.id);
+              return;
+            }
+            if (armed) setArmed(null);
             if (
               commands.length &&
               ["ArrowDown", "ArrowUp"].includes(event.key)
@@ -359,7 +400,7 @@ export function Composer(props: Props) {
               >
                 <Icon name={item.icon} />
                 <b>/{item.id}</b>
-                <span>{item.description}</span>
+                <span>{item.skill ? `Use skill · ${item.description}` : item.description}</span>
               </button>
             ))}
           </div>

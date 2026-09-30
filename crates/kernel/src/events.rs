@@ -739,8 +739,8 @@ pub fn rollback_plan_in(
         let Some(result) = e.payload.get("payload").and_then(Value::as_object) else {
             continue;
         };
-        // Write-family results (fs.write / fs.edit / fs.multi_edit) are exactly
-        // those carrying both a `path` and a `snapshot` key (id or null).
+        // File-changing results (`write`, `edit`) are exactly those carrying
+        // both a `path` and a `snapshot` key (id or null), whatever the tool name.
         if !result.contains_key("snapshot") {
             continue;
         }

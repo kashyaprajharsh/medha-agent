@@ -82,8 +82,17 @@ pub(crate) async fn collect<L: EventLog>(
     (all, sessions)
 }
 
-/// A chat's usage, the last time it made a call, and the sub-agents counted in it.
-type SessionTally = (Total, f64, std::collections::HashSet<Ulid>);
+/// A chat's usage, the last time it made a call, the sub-agents counted in it, and its usage by model.
+type SessionTally = (Total, f64, std::collections::HashSet<Ulid>, ByModel);
+type ByModel = HashMap<String, Total>;
+
+fn by_model_view(models: &ByModel) -> Vec<Value> {
+    let mut rows: Vec<_> = models.iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    rows.into_iter()
+        .map(|(model, total)| json!({"model": model, "usage": total.view()}))
+        .collect()
+}
 
 #[derive(Default)]
 struct Total {
@@ -150,13 +159,11 @@ pub(crate) fn summarize(
     let mut total = Total::default();
     let mut models: HashMap<String, Total> = HashMap::new();
     let mut by_session: HashMap<Ulid, SessionTally> = HashMap::new();
-    let mut by_day: HashMap<String, Total> = HashMap::new();
+    let mut by_day: HashMap<String, (Total, ByModel)> = HashMap::new();
     for call in calls {
+        let model = model_label(&call.identity);
         total.add(call);
-        models
-            .entry(model_label(&call.identity))
-            .or_default()
-            .add(call);
+        models.entry(model.clone()).or_default().add(call);
         let owner = root(call.session);
         let entry = by_session.entry(owner).or_default();
         entry.0.add(call);
@@ -164,6 +171,7 @@ pub(crate) fn summarize(
         if owner != call.session {
             entry.2.insert(call.session);
         }
+        entry.3.entry(model.clone()).or_default().add(call);
         let day = chrono::DateTime::from_timestamp(call.ts as i64, 0)
             .map(|time| {
                 time.with_timezone(&chrono::Local)
@@ -171,27 +179,30 @@ pub(crate) fn summarize(
                     .to_string()
             })
             .unwrap_or_default();
-        by_day.entry(day).or_default().add(call);
+        let entry = by_day.entry(day).or_default();
+        entry.0.add(call);
+        entry.1.entry(model).or_default().add(call);
     }
     let tokens = |total: &Total| total.prompt + total.completion;
     let mut models: Vec<(String, Total)> = models.into_iter().collect();
     models.sort_by_key(|(_, total)| std::cmp::Reverse(tokens(total)));
     let mut sessions_view: Vec<(Ulid, SessionTally)> = by_session.into_iter().collect();
-    sessions_view.sort_by_key(|(_, (total, _, _))| std::cmp::Reverse(tokens(total)));
-    let mut days_view: Vec<(String, Total)> = by_day.into_iter().collect();
+    sessions_view.sort_by_key(|(_, (total, ..))| std::cmp::Reverse(tokens(total)));
+    let mut days_view: Vec<(String, (Total, ByModel))> = by_day.into_iter().collect();
     days_view.sort_by(|a, b| a.0.cmp(&b.0));
     json!({
         "days": days,
         "total": total.view(),
         "models": models.iter().map(|(model, total)| json!({"model": model, "usage": total.view()})).collect::<Vec<_>>(),
-        "sessions": sessions_view.iter().take(20).map(|(id, (total, last, agents))| json!({
+        "sessions": sessions_view.iter().take(20).map(|(id, (total, last, agents, by_model))| json!({
             "id": id.to_string(),
             "title": sessions.get(id).map(|(title, _)| title.as_str()).unwrap_or(""),
             "last_ts": last,
             "agents": agents.len(),
             "usage": total.view(),
+            "models": by_model_view(by_model),
         })).collect::<Vec<_>>(),
-        "by_day": days_view.iter().map(|(day, total)| json!({"day": day, "usage": total.view()})).collect::<Vec<_>>(),
+        "by_day": days_view.iter().map(|(day, (total, by_model))| json!({"day": day, "usage": total.view(), "models": by_model_view(by_model)})).collect::<Vec<_>>(),
     })
 }
 

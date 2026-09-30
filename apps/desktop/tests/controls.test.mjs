@@ -1133,3 +1133,166 @@ test("a failed syntax worker releases requests and leaves readable plain text", 
     globalThis.Worker = previous;
   }
 });
+
+const { Usage } = await import(await moduleUrl("Usage"));
+const { UsageChart } = await import(await moduleUrl("UsageChart"));
+const { McpForm } = await import(await moduleUrl("McpServers"));
+const { McpCatalog } = await import(await moduleUrl("McpCatalog"));
+const tally = (calls, prompt, cost = 0.09) => ({
+  calls, prompt_tokens: prompt, completion_tokens: 0, cached_tokens: 0,
+  cost_usd: cost, unpriced_calls: cost === null ? calls : 0,
+});
+function usageSummary(breakdown = true) {
+  const now = new Date();
+  const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const total = tally(47, 1200);
+  const models = [{ model: "alpha", usage: tally(40, 1000, 0.08) }, { model: "beta", usage: tally(7, 200, 0.01) }];
+  return {
+    total, models,
+    by_day: [{ day, usage: total, ...(breakdown ? { models } : {}) }],
+    sessions: [{ id: "chat", title: "Recorded chat", agents: 1, usage: total, ...(breakdown ? { models } : {}) }],
+  };
+}
+
+test("legacy usage still draws daily totals and chats without per-model fields", async () => {
+  globalThis.__medhaControlsTest.api.usage = async () => usageSummary(false);
+  await act(async () => root.render(h(Usage)));
+  assert.ok([...document.querySelectorAll(".usage-stack")].some((bar) => parseFloat(bar.style.height) > 0));
+  const daily = document.querySelector(".usage-daily tbody");
+  assert.equal(daily.children.length, 1);
+  assert.match(daily.textContent, /1.2k/);
+  assert.match(daily.textContent, /\$0.09/);
+  assert.match(document.querySelector(".usage-sessions").textContent, /Recorded chat/);
+  assert.equal(document.querySelector('[aria-label="Model"]').disabled, true);
+  const ticks = [...document.querySelectorAll(".usage-y span")].map((node) => node.textContent);
+  assert.equal(new Set(ticks).size, 3);
+});
+
+test("model filtering keeps chart, daily numbers and chats in agreement", async () => {
+  globalThis.__medhaControlsTest.api.usage = async () => usageSummary();
+  await act(async () => root.render(h(Usage)));
+  await click(document.querySelector('[aria-label="Model"]'));
+  await click(option("beta"));
+  assert.match(document.querySelector(".usage-totals").textContent, /Model calls7/);
+  assert.match(document.querySelector(".usage-daily tbody").textContent, /200\$0.01/);
+  assert.match(document.querySelector(".usage-sessions").textContent, /200 tokens · \$0.01/);
+  assert.equal(document.querySelectorAll(".usage-stack i").length, 1);
+});
+
+test("zero and single-token charts never print duplicate rounded ticks", async () => {
+  for (const count of [0, 1]) {
+    await act(async () => root.render(h(UsageChart, {
+      days: [{ day: "2026-09-29", values: { a: count }, cost: "$0.00" }],
+      series: [{ key: "a", label: "a", slot: 0 }], format: (n) => String(Math.round(n)),
+    })));
+    const ticks = [...document.querySelectorAll(".usage-y span")].map((node) => node.textContent).filter(Boolean);
+    assert.equal(new Set(ticks).size, ticks.length);
+    assert.deepEqual(ticks, count ? ["2", "1", "0"] : ["0"]);
+  }
+});
+
+test("Unity setup requires its folder and preserves spaces as one argument", async () => {
+  const saved = [];
+  await act(async () => root.render(h(McpForm, {
+    busy: false, onSave: async (args) => saved.push(args),
+    initial: { id: "unity", transport: "local", command: ["uv", "--directory", "{unity_mcp_server_src}", "run", "server.py"],
+      inputs: [{ name: "unity_mcp_server_src", description: "Unity server source folder" }] },
+  })));
+  const form = document.querySelector("form");
+  await act(async () => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  assert.equal(saved.length, 0);
+  assert.match(document.querySelector('[role="alert"]').textContent, /Enter unity mcp server src/);
+  const input = [...document.querySelectorAll("label")].find((node) => node.textContent.includes("unity mcp server src")).querySelector("input");
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  await act(async () => {
+    setter.call(input, "/Users/test/Library/Application Support/UnityMCP/src");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  assert.deepEqual(saved, [["unity", "--", "uv", "--directory", "/Users/test/Library/Application Support/UnityMCP/src", "run", "server.py"]]);
+});
+
+test("catalogue Show more appends distinct entries and forwards the next page", async () => {
+  const calls = [];
+  const row = (name) => ({ name, version: "1", setups: [] });
+  globalThis.__medhaControlsTest.api.extensions = async (_method, params) => {
+    calls.push(params);
+    return params.cursor ? { servers: [row("one"), row("two")], next: null } : { servers: [row("one")], next: "2" };
+  };
+  await act(async () => root.render(h(McpCatalog, { onPick() {} })));
+  await click(document.querySelector(".more"));
+  assert.equal(calls[1].cursor, "2");
+  assert.equal(calls[1].source, "featured");
+  assert.equal(document.querySelectorAll(".catalog-list > li").length, 2);
+  assert.equal(document.querySelector(".more"), null);
+});
+
+test("the / menu offers enabled skills and choosing one selects it for the next message", async () => {
+  const picked = [];
+  await act(async () =>
+    root.render(
+      h(Composer, {
+        value: "", onChange() {}, onSend() {}, onStop() {}, running: false, disabled: false, placeholder: "Task",
+        settings, settingsLocked: false, control: null, onControl() {}, onLoadSettings: async () => {},
+        onConfigure: async () => {}, showReasoning: false, onShowReasoning() {}, attachments: [], onAttachments() {},
+        onSurface() {}, onNew() {}, onRewind() {}, onSettings() {}, onExtensions() {},
+        skills: [{ name: "frontend-design", description: "Distinctive UI" }, { name: "pdf", description: "PDF files" }],
+        onSkill: (name) => picked.push(name),
+      }),
+    ),
+  );
+  const textarea = document.querySelector("textarea");
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+  await act(() => {
+    setter.call(textarea, "/fro");
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const offered = [...document.querySelectorAll('[role="option"]')].map((node) => node.querySelector("b").textContent);
+  assert.deepEqual(offered, ["/frontend-design"], "a partial name narrows to the matching skill");
+  await click(document.querySelector('[role="option"]'));
+  assert.deepEqual(picked, ["frontend-design"]);
+});
+
+test("a message sent with a skill leads with its token, and never shows the procedure", async () => {
+  const { UserText } = await import(await moduleUrl("UserText"));
+  const text =
+    "Redesign the pricing page\n\n[Loaded skill: frontend-design] Follow this procedure for the current and related work:\n\n# Frontend Design\n\nSECRET-PROCEDURE-BODY";
+  await act(async () => root.render(h(UserText, { text })));
+  const message = document.querySelector(".you-text p");
+  assert.equal(message.firstElementChild.className, "msg-token token-skill sent", "the token comes before the text");
+  assert.equal(message.textContent, "frontend-designRedesign the pricing page");
+  assert.doesNotMatch(document.body.textContent, /SECRET-PROCEDURE-BODY/);
+});
+
+test("Backspace at the start of the message marks the nearest token first, then removes it", async () => {
+  let attachments = [{ id: "a1", name: "mock.png", mime: "image/png", data: "", preview: "data:," }];
+  const removedSkills = [];
+  const props = () => ({
+    value: "", onChange() {}, onSend() {}, onStop() {}, running: false, disabled: false, placeholder: "Task",
+    settings, settingsLocked: false, control: null, onControl() {}, onLoadSettings: async () => {},
+    onConfigure: async () => {}, showReasoning: false, onShowReasoning() {}, attachments,
+    onAttachments: (next) => {
+      attachments = next;
+    },
+    onSurface() {}, onNew() {}, onRewind() {}, onSettings() {}, onExtensions() {},
+    skill: "frontend-design", onSkill: (name) => removedSkills.push(name),
+  });
+  globalThis.matchMedia = () => ({ matches: true });
+  await act(async () => root.render(h(Composer, props())));
+  const textarea = document.querySelector("textarea");
+  const labels = () => [...document.querySelectorAll(".msg-token")].map((node) => node.textContent);
+  assert.deepEqual(labels(), ["frontend-design", "mock.png"], "the skill leads, then the image");
+
+  await key(textarea, "Backspace");
+  assert.ok(document.querySelector(".msg-token.armed").textContent.includes("mock.png"), "first press only marks");
+  assert.equal(attachments.length, 1);
+  assert.match(document.querySelector(".composer-announce").textContent, /Backspace again to remove mock.png/);
+
+  await key(textarea, "Backspace");
+  assert.deepEqual(attachments, [], "second press removes the image");
+  await act(async () => root.render(h(Composer, props())));
+  await key(textarea, "a");
+  await key(textarea, "Backspace");
+  await key(textarea, "Backspace");
+  assert.deepEqual(removedSkills, [null], "any other key disarms, so the skill needs its own two presses");
+});

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
 import type { McpPrefill } from "./McpServers";
 import { Spinner } from "./Spinner";
@@ -12,9 +12,24 @@ type Setup = {
   token_help?: string;
   command?: string[];
   variables?: McpPrefill["variables"];
+  inputs?: McpPrefill["inputs"];
   unsupported?: string;
 };
-type Server = { name: string; title?: string; description?: string; version?: string; repository?: string; setups: Setup[] };
+type Server = {
+  name: string;
+  title?: string;
+  description?: string;
+  version?: string;
+  repository?: string;
+  stars?: number;
+  organization?: string;
+  setups: Setup[];
+};
+type Source = "featured" | "full";
+
+function stars(count: number) {
+  return count < 1000 ? String(count) : `${(count / 1000).toFixed(count < 10_000 ? 1 : 0)}k`;
+}
 
 /** Short, lowercase server name from a registry id like `io.github.org/tool-mcp`. */
 function shortName(name: string) {
@@ -22,35 +37,47 @@ function shortName(name: string) {
   return last.replace(/[-_]?mcp[-_]?(server)?$/i, "").replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "server";
 }
 
-/** The public MCP Registry, searched on demand. Entries are not reviewed by
- * Medha; choosing one only fills in the add form. */
+/** GitHub's curated MCP list first, the full public registry on request. Entries
+ * are not reviewed by Medha; choosing one only fills in the add form. */
 export function McpCatalog({ onPick }: { onPick: (prefill: McpPrefill) => void }) {
   const api = useWorkspaceApi();
   const [query, setQuery] = useState("");
   const [submitted, setSubmitted] = useState("");
+  const [source, setSource] = useState<Source>("featured");
   const [servers, setServers] = useState<Server[]>([]);
   const [next, setNext] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const latest = useRef(0);
 
   async function load(search: string, cursor: string | null) {
+    const request = ++latest.current;
     setLoading(true);
     setError("");
+    if (!cursor) {
+      setServers([]);
+      setNext(null);
+    }
     try {
-      const result = await api.extensions("extensions.mcp.registry", { query: search, cursor });
+      const result = await api.extensions("extensions.mcp.registry", { query: search, cursor, source });
+      if (request !== latest.current) return;
       const rows = result.servers as Server[];
-      setServers((previous) => (cursor ? [...previous, ...rows] : rows));
+      setServers((previous) => {
+        const combined = cursor ? [...previous, ...rows] : rows;
+        // Star rankings can move between page requests.
+        return combined.filter((server, index) => combined.findIndex((other) => other.name === server.name && other.version === server.version) === index);
+      });
       setNext((result.next as string | null) ?? null);
     } catch (cause) {
-      setError(String(cause));
+      if (request === latest.current) setError(String(cause).replace(/^Error:\s*/, ""));
     } finally {
-      setLoading(false);
+      if (request === latest.current) setLoading(false);
     }
   }
 
   useEffect(() => {
     void load(submitted, null);
-  }, [submitted]);
+  }, [submitted, source]);
 
   function pick(server: Server, setup: Setup) {
     onPick({
@@ -61,6 +88,7 @@ export function McpCatalog({ onPick }: { onPick: (prefill: McpPrefill) => void }
       tokenHelp: setup.token_help,
       command: setup.command,
       variables: setup.variables,
+      inputs: setup.inputs,
     });
   }
 
@@ -75,11 +103,29 @@ export function McpCatalog({ onPick }: { onPick: (prefill: McpPrefill) => void }
       >
         <label>
           <Icon name="search" />
-          <input aria-label="Search the MCP Registry" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search servers, e.g. github, postgres, notion" />
+          <input aria-label="Search MCP servers" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search servers, e.g. github, postgres, notion" />
         </label>
         <button className="btn-line" disabled={loading}>Search</button>
       </form>
-      <p className="quiet">From the public MCP Registry. Listings are published by their authors and aren’t reviewed by Medha — check the source before you connect.</p>
+      <p className="quiet">
+        {source === "featured"
+          ? "Popular servers from GitHub’s MCP list, most-starred first."
+          : "Every server in the public MCP Registry. "}
+        {source === "full" && (
+          <button className="link-btn" onClick={() => setSource("featured")}>Back to GitHub’s list</button>
+        )}{" "}
+        Listings are published by their authors and aren’t reviewed by Medha — check the source before you connect.
+      </p>
+      {loading && !servers.length && (
+        <p className="quiet" role="status">
+          <Spinner />{" "}
+          {source === "full"
+            ? submitted
+              ? `Searching the full registry for “${submitted}”… it can take a little while.`
+              : "Loading the full registry…"
+            : "Searching…"}
+        </p>
+      )}
       {error && <p className="surface-error" role="alert">{error}</p>}
       <ul className="catalog-list">
         {servers.map((server) => {
@@ -87,11 +133,19 @@ export function McpCatalog({ onPick }: { onPick: (prefill: McpPrefill) => void }
           return (
             <li key={`${server.name}@${server.version}`}>
               <div className="catalog-main">
-                <b>{server.title || server.name}</b>
+                <b>
+                  {server.title || server.name}
+                  {server.organization && (
+                    <span className="default-label" title={`Published by the ${server.organization} organization on GitHub`}>
+                      Official
+                    </span>
+                  )}
+                </b>
                 {server.description && <p>{server.description}</p>}
                 <small>
                   {server.name}
                   {server.version && ` · ${server.version}`}
+                  {typeof server.stars === "number" && ` · ★ ${stars(server.stars)}`}
                   {server.repository && (
                     <>
                       {" · "}
@@ -114,8 +168,27 @@ export function McpCatalog({ onPick }: { onPick: (prefill: McpPrefill) => void }
           );
         })}
       </ul>
-      {loading && <p className="quiet"><Spinner /> Searching…</p>}
-      {!loading && !servers.length && !error && <p className="quiet">No servers found.</p>}
+      {loading && servers.length > 0 && <p className="quiet"><Spinner /> Loading more…</p>}
+      {!loading && !servers.length && !error && (
+        <div className="catalog-empty">
+          <p className="quiet">
+            {submitted
+              ? `Nothing in ${source === "featured" ? "GitHub’s list" : "the registry"} matches “${submitted}”.`
+              : "No servers found."}{" "}
+            {source === "featured" ? "The full registry has many more." : "If you know the server’s address, add it yourself."}
+          </p>
+          <div className="row-actions">
+            {source === "featured" && (
+              <button className="btn-line" onClick={() => setSource("full")}>
+                Search the full registry
+              </button>
+            )}
+            <button className="btn-line" onClick={() => onPick({ id: shortName(submitted || "server"), transport: "remote" })}>
+              Add by address
+            </button>
+          </div>
+        </div>
+      )}
       {next && !loading && (
         <button className="more" onClick={() => void load(submitted, next)}>Show more</button>
       )}

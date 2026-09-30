@@ -262,6 +262,17 @@ impl ImageInputMode {
     }
 }
 
+/// Invalid model output, rejected before any calls from the response execute.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "invalid tool call '{tool}' ({call_id}): {reason}; no tools from this response were executed"
+)]
+pub struct InvalidToolCall {
+    pub tool: String,
+    pub call_id: String,
+    pub reason: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("transport error: {0}")]
@@ -278,6 +289,8 @@ pub enum ProviderError {
     ProgressTimeout { waited_secs: u64 },
     #[error("decode error: {0}")]
     Decode(String),
+    #[error(transparent)]
+    InvalidToolCall(InvalidToolCall),
     #[error(
         "model response was truncated at its output limit; no tools from this response were executed. Retry with smaller writes or adjust the output allowance"
     )]
@@ -314,11 +327,21 @@ pub enum ProviderFailure {
     PayloadTooLarge,
     /// This model/endpoint cannot accept the image modality.
     UnsupportedImage,
+    /// Requires model-visible correction, not a replay of the same request.
+    InvalidToolCall,
     Transient,
     Fatal,
 }
 
 impl ProviderError {
+    pub fn invalid_tool_call(tool: &str, call_id: &str, reason: impl Into<String>) -> Self {
+        Self::InvalidToolCall(InvalidToolCall {
+            tool: tool.into(),
+            call_id: call_id.into(),
+            reason: reason.into(),
+        })
+    }
+
     /// Transient failures worth retrying with backoff: network/transport drops,
     /// rate limits (429), and server errors (5xx). A context-length 400 is NOT
     /// retryable as-is (retrying sends the same over-long request) — it's handled
@@ -349,6 +372,7 @@ impl ProviderError {
 
     pub fn classify(&self) -> ProviderFailure {
         match self {
+            ProviderError::InvalidToolCall(_) => ProviderFailure::InvalidToolCall,
             ProviderError::Transport(_) | ProviderError::Stream(_) => ProviderFailure::Transient,
             ProviderError::Throttled { status, body, .. } => {
                 if *status == 429 || (500..600).contains(status) {

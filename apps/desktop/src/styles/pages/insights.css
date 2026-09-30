@@ -20,32 +20,173 @@
   font-size: var(--text-lg);
   font-variant-numeric: tabular-nums;
 }
-.usage-days {
+.usage-filters {
   display: flex;
-  align-items: flex-end;
-  gap: 3px;
-  height: 72px;
-  margin: var(--s-4) 0 var(--s-6);
-  padding-bottom: 6px;
+  align-items: center;
+  gap: var(--s-3);
+  margin: 0 0 var(--s-4);
+}
+.usage-filters .segmented button {
+  white-space: nowrap;
+}
+.usage-body.refreshing {
+  opacity: 0.55;
+  transition: opacity var(--t-base);
+}
+.usage-chart {
+  margin: var(--s-4) 0 var(--s-3);
+}
+.usage-chart .slot-0 { background: var(--chart-1); }
+.usage-chart .slot-1 { background: var(--chart-2); }
+.usage-chart .slot-2 { background: var(--chart-3); }
+.usage-chart .slot-3 { background: var(--chart-4); }
+.usage-chart .slot-4 { background: var(--faint); }
+.usage-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-4);
+  margin: 0 0 var(--s-3);
+  padding: 0;
+  list-style: none;
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+.usage-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+.usage-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: var(--r-swatch);
+}
+.usage-plot {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: var(--s-2);
+}
+.usage-y {
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  height: 160px;
+  color: var(--faint);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.usage-y span {
+  line-height: 1;
+  transform: translateY(-50%);
+}
+.usage-y span:last-child {
+  transform: translateY(50%);
+}
+.usage-bars {
+  position: relative;
+  grid-row: 1;
+  display: flex;
+  height: 160px;
   border-bottom: 1px solid var(--hair);
+  background: linear-gradient(var(--hair), var(--hair)) 0 0 / 100% 1px no-repeat,
+    linear-gradient(var(--hair), var(--hair)) 0 50% / 100% 1px no-repeat;
+  outline: none;
 }
-.usage-days span {
+.usage-bars:focus-visible {
+  box-shadow: 0 0 0 2px var(--soft-ring, var(--gold-wash));
+  border-radius: var(--r-sm);
+}
+.usage-col {
   flex: 1;
-  height: 100%;
   display: flex;
   align-items: flex-end;
+  justify-content: center;
+  min-width: 0;
+  height: 100%;
 }
-.usage-days i {
-  display: block;
-  width: 100%;
-  border-radius: 3px 3px 0 0;
-  background: color-mix(in srgb, var(--gold) 55%, transparent);
+.usage-col.active {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+.usage-stack {
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 2px;
+  width: min(24px, 70%);
+  min-height: 0;
+  overflow: hidden;
+  border-radius: var(--r-mark) var(--r-mark) 0 0;
   transform-origin: bottom;
   animation: grow-up var(--t-slow) var(--ease-out) both;
-  transition: background var(--t-fast);
 }
-.usage-days span:hover i {
-  background: var(--gold);
+.usage-stack i {
+  display: block;
+  flex-basis: 0;
+  min-height: 2px;
+}
+.usage-x {
+  grid-column: 2;
+  display: flex;
+  margin-top: var(--s-1);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+.usage-x span {
+  flex: 1;
+  min-width: 0;
+  overflow: visible;
+  white-space: nowrap;
+  text-align: center;
+}
+.usage-tip {
+  position: absolute;
+  top: 0;
+  z-index: 2;
+  display: grid;
+  gap: 2px;
+  min-width: 160px;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  background: var(--raised);
+  box-shadow: var(--e2-shadow);
+  color: var(--text);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.usage-tip[data-side="right"] {
+  transform: translateX(8px);
+}
+.usage-tip[data-side="left"] {
+  transform: translateX(calc(-100% - 8px));
+}
+.usage-tip small {
+  color: var(--dim);
+}
+.usage-tip-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--dim);
+}
+.usage-tip-row b {
+  color: var(--text);
+}
+.usage-key {
+  width: 10px;
+  height: 2px;
+  border-radius: var(--r-swatch);
+}
+.usage-daily {
+  margin: 0 0 var(--s-6);
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+.usage-daily summary {
+  cursor: pointer;
+  margin-bottom: var(--s-2);
 }
 .usage-block {
   margin: 0 0 var(--s-6);

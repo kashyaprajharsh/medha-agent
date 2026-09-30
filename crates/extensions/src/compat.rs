@@ -244,7 +244,7 @@ const TOOL_NAMES: &[(&str, &str)] = &[
     ("shell.exec", "Bash"),
     ("read", "Read"),
     ("edit", "Edit"),
-    ("edit", "Write"),
+    ("write", "Write"),
     ("edit", "MultiEdit"),
     ("glob", "Glob"),
     ("grep", "Grep"),

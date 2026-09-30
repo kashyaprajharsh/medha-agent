@@ -342,6 +342,7 @@ fn completed_control_view(
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut intents = Vec::new();
+    let mut call_ids = std::collections::HashSet::new();
     for part in &message.parts {
         match part {
             ContentPart::Text(part) => text.push_str(&part.text),
@@ -350,11 +351,20 @@ fn completed_control_view(
                     reasoning.push_str(summary);
                 }
             }
-            ContentPart::ToolCall(part) => intents.push(ToolIntent {
-                id: part.id.clone(),
-                tool: part.tool.clone(),
-                args: part.args.clone(),
-            }),
+            ContentPart::ToolCall(part) => {
+                if !call_ids.insert(&part.id) {
+                    return Err(crate::provider::ProviderError::invalid_tool_call(
+                        &part.tool,
+                        &part.id,
+                        "duplicate tool-call id in the response",
+                    ));
+                }
+                intents.push(ToolIntent {
+                    id: part.id.clone(),
+                    tool: part.tool.clone(),
+                    args: part.args.clone(),
+                });
+            }
             ContentPart::ToolResult(_) => {
                 return Err(crate::provider::ProviderError::Decode(
                     "provider completed assistant message contained a tool result".into(),
@@ -466,6 +476,7 @@ const MAX_PROVIDER_STREAM_BYTES: usize = 8 * 1024 * 1024;
 /// How many times a turn's model stream is retried on a transient provider
 /// failure (429 / 5xx / network drop / stalled stream) before giving up.
 const MAX_TURN_RETRIES: u32 = 5;
+const MAX_TOOL_CALL_CORRECTIONS: u32 = 2;
 
 /// First backoff nap between stream retries.
 const RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -1042,6 +1053,38 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     pub async fn run_session(
         &self,
         session: &Session,
+        messages: Vec<Message>,
+        budget: crate::budgets::Budget,
+        sink: &dyn StreamSink,
+        interrupts: Option<crate::interrupts::InterruptQueue>,
+    ) -> Result<(Vec<Message>, StopReason), KernelError> {
+        let outcome = self
+            .run_session_inner(session, messages, budget, sink, interrupts)
+            .await;
+        if let Err(error) = &outcome
+            && !matches!(
+                error,
+                KernelError::Log(_) | KernelError::Interrupted | KernelError::Budget(_)
+            )
+        {
+            let reason: String = error.to_string().chars().take(1024).collect();
+            let mut event = Event::user_input(
+                session,
+                &format!(
+                    "[runtime: turn failed] {reason}\nThe task did not finish. Previously recorded tool results \
+                 remain valid; use them when continuing instead of restarting completed work."
+                ),
+                TrustLabel::Tool,
+            );
+            event.payload["turn_failed"] = serde_json::json!(true);
+            self.log.append(event).await?;
+        }
+        outcome
+    }
+
+    async fn run_session_inner(
+        &self,
+        session: &Session,
         mut messages: Vec<Message>,
         budget: crate::budgets::Budget,
         sink: &dyn StreamSink,
@@ -1071,6 +1114,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // twice, and the projection only collapses adjacent identical turns.
         let history_started = std::time::Instant::now();
         let prior_events = self.log.checked_events(session.id).await?;
+        // A surface restored from the log may end with user-channel failure
+        // feedback. That whole prefix is already admitted, even across usage,
+        // hook and compaction events; only its new suffix is a new prompt.
+        let projected = crate::events::project_messages(&prior_events);
+        let system_len = messages
+            .iter()
+            .take_while(|m| m.role == Role::System)
+            .count();
+        let admitted = (!projected.is_empty()
+            && messages[system_len..].len() >= projected.len()
+            && messages[system_len..]
+                .iter()
+                .zip(&projected)
+                .all(|(a, b)| same_legacy_message(a, b)))
+        .then_some(system_len + projected.len());
         let already = logged_tail(&prior_events);
         // Retried input is already durable but still belongs to this evidence
         // window. Skipping its append must not also erase its provenance or
@@ -1080,7 +1138,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             window_taint = window_taint.min(input.trust);
         }
         let mut logged_cursor = 0;
-        let fresh = unlogged_tail(&messages);
+        let fresh = admitted.unwrap_or_else(|| unlogged_tail(&messages));
         let new_image_submission = messages[fresh..]
             .iter()
             .any(|message| !message.attachments.is_empty());
@@ -1090,11 +1148,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // Membership matching reordered duplicate lines, while comparing
             // text alone could treat a Tool/Web report as a trusted retry.
             let trust = message.trust.unwrap_or(TrustLabel::User);
-            if already.get(logged_cursor).is_some_and(|input| {
-                input.content == message.content
-                    && input.trust == trust
-                    && input.attachments == serde_json::json!(message.attachments)
-            }) {
+            if admitted.is_none()
+                && already.get(logged_cursor).is_some_and(|input| {
+                    input.content == message.content
+                        && input.trust == trust
+                        && input.attachments == serde_json::json!(message.attachments)
+                })
+            {
                 logged_cursor += 1;
                 continue;
             }
@@ -1258,6 +1318,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // candidate, the request is rebuilt and re-counted before sending.
             let mut overflow_retried = false;
             let mut image_fallback_retried = false;
+            let mut tool_call_corrections = 0;
             let mut force_text_images = false;
             let mut compaction_passes = 0u32;
             let (turn, request_tools) = 'model_call: loop {
@@ -1590,6 +1651,34 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             .collect();
                         break (t, tools);
                     }
+                    Err(KernelError::InvalidToolCall(error))
+                        if tool_call_corrections < MAX_TOOL_CALL_CORRECTIONS =>
+                    {
+                        tool_call_corrections += 1;
+                        // Keep invalid calls out of canonical history. Only bounded
+                        // diagnostic data is fed back, never raw model arguments.
+                        let detail = serde_json::json!({
+                            "tool": error.tool.chars().take(128).collect::<String>(),
+                            "call_id": error.call_id.chars().take(128).collect::<String>(),
+                            "error": error.reason.chars().take(512).collect::<String>(),
+                        });
+                        let feedback = format!(
+                            "[tool-call validation] Your response contained an invalid tool call: {detail}. \
+                             No tools from that response executed. Regenerate all intended calls with \
+                             valid tool names and complete JSON objects matching their schemas."
+                        );
+                        let mut event = Event::user_input(session, &feedback, TrustLabel::Tool);
+                        event.payload["tool_call_correction"] = detail;
+                        self.log.append(event).await?;
+                        let message = Message::user(feedback).carrying(TrustLabel::Tool);
+                        ordered_messages.push(message.ordered());
+                        messages.push(message);
+                        sink.notice(&format!(
+                            "Invalid tool call. Asking the model to correct it ({tool_call_corrections}/{MAX_TOOL_CALL_CORRECTIONS})…"
+                        ));
+                        // Rebuild and re-count: feedback changes the request body.
+                        continue 'model_call;
+                    }
                     Err(KernelError::UnsupportedImage)
                         if !image_fallback_retried
                             && self.provider.image_input_mode() == crate::ImageInputMode::Auto
@@ -1720,16 +1809,19 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // in its call-order slot — some chat templates pair results by position.
             let mut unavailable = std::collections::HashMap::new();
             if intents.iter().any(|i| !request_tools.contains(&i.tool)) {
-                let mut available: Vec<String> = crate::portable_tool_name_map(&request_tools)
-                    .into_keys()
-                    .collect();
+                let wire = crate::portable_tool_name_map(&request_tools);
+                let mut available: Vec<String> = wire.keys().cloned().collect();
                 available.sort();
                 for intent in intents.iter().filter(|i| !request_tools.contains(&i.tool)) {
+                    let next = match crate::types::suggested_tool(&intent.tool, &wire) {
+                        Some(tool) => format!("Use `{tool}` for this instead."),
+                        None => "Choose an available tool.".to_string(),
+                    };
                     let mut observation = Observation::error(
                         &intent.id,
                         format!(
-                            "Tool '{}' is unavailable in this request. Choose an available tool; \
-                             approval cannot enable this tool. Do not retry this name.",
+                            "Tool '{}' is unavailable in this request. {next} Approval cannot \
+                             enable this tool; do not retry this name.",
                             intent.tool
                         ),
                     );
@@ -2177,6 +2269,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             return Err(KernelError::UnsupportedImage);
                         }
                         crate::provider::ProviderFailure::UnsupportedImage => {}
+                        crate::provider::ProviderFailure::InvalidToolCall => {
+                            if emitted && sink.supports_restart() {
+                                sink.restarted();
+                            }
+                            if let crate::provider::ProviderError::InvalidToolCall(error) = e {
+                                return Err(KernelError::InvalidToolCall(error));
+                            }
+                        }
                         crate::provider::ProviderFailure::Transient
                         | crate::provider::ProviderFailure::Fatal => {}
                     }
@@ -2645,10 +2745,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             }
         }
         let file_changed = observation.status == crate::types::ObsStatus::Ok
-            && matches!(
-                intent.tool.as_str(),
-                "fs.write" | "fs.edit" | "fs.multi_edit"
-            );
+            && matches!(intent.tool.as_str(), "write" | "edit");
         Self::attach_hook_contexts(&mut observation, &contexts);
         if let Some(problem) = problem {
             let prior_status = observation.status.clone();

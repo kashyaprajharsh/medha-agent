@@ -37,6 +37,9 @@
   --r-md: calc(12px * var(--radius-scale));
   --r-lg: calc(16px * var(--radius-scale));
   --r-xl: calc(22px * var(--radius-scale));
+  /* Chart marks: a bar's data end and a legend swatch. */
+  --r-mark: 4px;
+  --r-swatch: 2px;
 }
 :root[data-text-size="small"] {
   --reading-size: 15px;

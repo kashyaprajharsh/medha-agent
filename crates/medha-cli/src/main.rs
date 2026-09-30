@@ -16,10 +16,12 @@ mod desktop_memory;
 mod desktop_preferences;
 mod desktop_rewind;
 mod desktop_service;
+mod desktop_skills;
 mod hook_files;
 mod lock_edit;
 mod plugin_session;
 mod plugins_cmd;
+mod skill_hub;
 mod skill_judge;
 mod tui_tea;
 mod usage_insights;
@@ -84,6 +86,31 @@ fn apply_budget_env(mut b: kernel::Budget) -> Result<kernel::Budget> {
         b.max_wall_s = Some(w);
     }
     Ok(b)
+}
+
+/// On failure, the log includes work and admissions missing from the caller's
+/// pre-turn copy. Preserve its system instructions and replace the rest.
+async fn failed_turn_history<L: kernel::EventLog>(
+    log: &L,
+    session: &kernel::Session,
+    previous: &[kernel::Message],
+    error: String,
+) -> (String, Option<Vec<kernel::Message>>) {
+    match log.checked_events(session.id).await {
+        Ok(events) => {
+            let mut history: Vec<_> = previous
+                .iter()
+                .take_while(|m| m.role == kernel::Role::System)
+                .cloned()
+                .collect();
+            history.extend(kernel::project_messages(&events));
+            (error, Some(history))
+        }
+        Err(log_error) => (
+            format!("{error}; could not restore session history: {log_error}"),
+            None,
+        ),
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -2486,8 +2513,8 @@ fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
     out.extend(["shell.exec", "agent.spawn"].map(String::from));
     for part in parts {
         match part {
-            "all" => out.extend(["edit", "shell.exec"].map(String::from)),
-            "writes" => out.extend(["edit"].map(String::from)),
+            "all" => out.extend(["write", "edit", "shell.exec"].map(String::from)),
+            "writes" => out.extend(["write", "edit"].map(String::from)),
             "shell" => out.push("shell.exec".into()),
             "agents" => out.push("agent.spawn".into()),
             other => out.push(other.to_string()),
@@ -2718,7 +2745,12 @@ impl PrintSink {
 
 impl kernel::StreamSink for PrintSink {
     fn supports_restart(&self) -> bool {
-        false
+        true
+    }
+
+    fn restarted(&self) {
+        println!("\n[Previous response incomplete — restarting the response]\n");
+        let _ = std::io::stdout().flush();
     }
 
     fn notice(&self, text: &str) {
@@ -2785,7 +2817,7 @@ fn salient_arg(tool: &str, args: &serde_json::Value) -> String {
     // First key present wins, so one tool covering several verbs still labels
     // each of them with the argument that identifies the call.
     let keys: &[&str] = match tool {
-        "read" | "edit" | "ls" | "code" => &["path", "symbol"],
+        "read" | "write" | "edit" | "ls" | "code" => &["path", "symbol"],
         "shell.exec" => &["command"],
         "web" => &["query", "url"],
         "grep" | "glob" => &["pattern"],
@@ -2876,7 +2908,8 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
         }
         "read" => format!("{} chars", chars("content")),
         "ls" => format!("{} entries", arr("entries")),
-        "edit" => format!("wrote {}", s("path")),
+        "write" => format!("wrote {}", s("path")),
+        "edit" => format!("edited {}", s("path")),
         // One tool, three shapes: a search answers with a count, a fetch with a
         // page, a crawl with pages.
         "web" => {
@@ -3102,7 +3135,19 @@ where
                         transcript = updated;
                         println!(); // separate the answer from the next prompt
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => {
+                        let (error, history) = failed_turn_history(
+                            kernel.log.as_ref(),
+                            &session,
+                            &transcript,
+                            e.to_string(),
+                        )
+                        .await;
+                        if let Some(history) = history {
+                            transcript = history;
+                        }
+                        eprintln!("error: {error}");
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => println!("(^C — type /exit to quit)"),

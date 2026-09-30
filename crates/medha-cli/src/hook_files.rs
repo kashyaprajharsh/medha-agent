@@ -38,7 +38,7 @@ pub(crate) const EVENTS: &[(&str, &str, bool)] = &[
 pub(crate) const TOOLS: &[(&str, &str)] = &[
     ("*", "All tools"),
     ("shell.exec", "Shell commands"),
-    ("edit", "File edits"),
+    ("write,edit", "File changes"),
     ("read", "File reads"),
     ("web", "Web search and fetch"),
     ("mcp__*", "MCP server tools"),

@@ -88,7 +88,7 @@ fn the_tool_catalogue_stays_within_its_budget() {
     let chars: usize = catalogue.iter().map(|(_, size)| size).sum();
 
     assert!(
-        catalogue.len() <= 24,
+        catalogue.len() <= 25,
         "{} static tools registered: {names:?}",
         catalogue.len()
     );

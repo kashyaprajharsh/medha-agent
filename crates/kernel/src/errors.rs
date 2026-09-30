@@ -3,6 +3,9 @@ pub enum KernelError {
     #[error("provider error: {0}")]
     Provider(String),
 
+    #[error(transparent)]
+    InvalidToolCall(crate::provider::InvalidToolCall),
+
     #[error("event log error: {0}")]
     Log(String),
 

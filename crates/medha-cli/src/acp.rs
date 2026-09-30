@@ -545,7 +545,7 @@ struct AcpSink {
 fn acp_tool_kind(tool: &str) -> &'static str {
     match tool {
         "read" | "ls" | "skill" => "read",
-        "edit" => "edit",
+        "write" | "edit" => "edit",
         "grep" | "glob" | "code" | "sessions.search" => "search",
         "shell.exec" | "git" | "diagnostics" => "execute",
         "web" => "fetch",
@@ -1612,6 +1612,8 @@ where
                         }
                     }
                     Some(Ok(TurnDone::Err(e))) => {
+                        let (e, history) = crate::failed_turn_history(kernel.log.as_ref(), &session, &transcript, e).await;
+                        if let Some(history) = history { transcript = history; }
                         match reply {
                             Some(id) => { writer.error(id, -32000, e); }
                             None => { writer.event("turn.error", json!({ "message": e })); }
@@ -1619,6 +1621,8 @@ where
                     }
                     Some(Err(error)) => {
                         let message = format!("turn task failed: {error}");
+                        let (message, history) = crate::failed_turn_history(kernel.log.as_ref(), &session, &transcript, message).await;
+                        if let Some(history) = history { transcript = history; }
                         match reply {
                             Some(id) => { writer.error(id, -32000, message); }
                             None => { writer.event("turn.error", json!({ "message": message })); }

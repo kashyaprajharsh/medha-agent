@@ -41,7 +41,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod lapse;
 mod oauth;
+mod renewal;
+
+use lapse::{ChallengeWatch, Lapse, Needs};
 
 /// Prefix that marks a tool as MCP-provided and namespaces it by server.
 pub const TOOL_PREFIX: &str = "mcp__";
@@ -482,6 +486,8 @@ struct Slot {
     /// under an older generation cannot overwrite the newer client. Drawn from a
     /// process-wide counter — a per-slot reset would collide after replacement.
     generation: u64,
+    /// Latched by a remote connection whose credentials stopped getting it in.
+    lapse: Option<Arc<Lapse>>,
 }
 
 impl Slot {
@@ -511,12 +517,14 @@ impl Slot {
             proven: false,
             retry_at: None,
             generation: next_generation(),
+            lapse: None,
         }
     }
 
     /// Detach the live connection so it can be retired outside the map lock.
     fn detach(&mut self) -> Retiree {
         self.peer = None;
+        self.lapse = None;
         self.proven = false;
         self.generation = next_generation();
         Retiree {
@@ -555,6 +563,7 @@ struct Connected {
     peer: Peer<RoleClient>,
     pid: Option<u32>,
     catalog: Catalog,
+    lapse: Option<Arc<Lapse>>,
 }
 
 struct ManagerInner {
@@ -924,7 +933,7 @@ impl McpManager {
             return Err(Error::Disabled);
         }
         let (server, tool) = parse_qualified(qualified)?;
-        let (peer, gate, generation, schema, admission) = {
+        let (peer, gate, generation, schema, admission, lapse) = {
             let servers = self.inner.servers.lock().await;
             let slot = servers
                 .get(&server)
@@ -952,7 +961,14 @@ impl McpManager {
                     server: server.clone(),
                     tool: tool.clone(),
                 })?;
-            (peer, gate, slot.generation, schema, admission)
+            (
+                peer,
+                gate,
+                slot.generation,
+                schema,
+                admission,
+                slot.lapse.clone(),
+            )
         };
         validate_arguments(&schema, args).map_err(|reason| Error::BadArguments {
             tool: qualified.to_string(),
@@ -981,7 +997,14 @@ impl McpManager {
         let result = match timeout(self.inner.config.request_timeout, peer.call_tool(params)).await
         {
             Ok(Ok(result)) => result,
-            Ok(Err(error)) => return Err(Error::Protocol(error.to_string())),
+            Ok(Err(error)) => {
+                let Some(needs) = lapse.and_then(|lapse| lapse.get()) else {
+                    return Err(Error::Protocol(error.to_string()));
+                };
+                drop(_admitted);
+                self.withdraw(&server, generation, needs).await;
+                return Err(needs.error(server));
+            }
             Err(_) => return Err(Error::Timeout(self.inner.config.request_timeout)),
         };
         // A completed round trip is the proof that resets the reconnect budget.
@@ -1102,7 +1125,7 @@ impl McpManager {
     /// Re-list a server's catalogue. Doubles as the liveness probe: a successful
     /// round trip is what proves a fresh connection and clears its failure count.
     async fn refresh_tools(&self, server_id: &str, expected: Option<u64>) {
-        let Some((peer, filter, generation)) = ({
+        let Some((peer, filter, generation, lapse)) = ({
             let servers = self.inner.servers.lock().await;
             servers.get(server_id).and_then(|slot| {
                 if expected.is_some_and(|generation| slot.generation != generation)
@@ -1110,9 +1133,14 @@ impl McpManager {
                 {
                     return None;
                 }
-                slot.peer
-                    .clone()
-                    .map(|peer| (peer, slot.config.tools.clone(), slot.generation))
+                slot.peer.clone().map(|peer| {
+                    (
+                        peer,
+                        slot.config.tools.clone(),
+                        slot.generation,
+                        slot.lapse.clone(),
+                    )
+                })
             })
         }) else {
             return;
@@ -1130,6 +1158,9 @@ impl McpManager {
                 self.tools_mut().insert(server_id.to_string(), catalog);
                 slot.proven = true;
                 slot.failures = 0;
+            }
+            Ok(Err(_)) if let Some(needs) = lapse.and_then(|lapse| lapse.get()) => {
+                self.withdraw(server_id, generation, needs).await;
             }
             outcome => {
                 let detail = match outcome {
@@ -1201,6 +1232,7 @@ impl McpManager {
                             slot.client = Some(connected.client);
                             slot.peer = Some(connected.peer);
                             slot.pid = connected.pid;
+                            slot.lapse = connected.lapse;
                             slot.state = ServerState::Ready;
                             slot.detail = None;
                             slot.retry_at = None;
@@ -1269,6 +1301,28 @@ impl McpManager {
             slot.state = ServerState::Degraded;
             slot.retry_at = Some(Instant::now() + backoff(slot.failures));
         }
+    }
+
+    /// The server stopped accepting this connection's credentials mid-session:
+    /// withdraw the tools and wait for a human, rather than stay "ready" while
+    /// every call fails.
+    async fn withdraw(&self, server_id: &str, generation: u64, needs: Needs) {
+        let retiree = {
+            let mut servers = self.inner.servers.lock().await;
+            let Some(slot) = servers.get_mut(server_id) else {
+                return;
+            };
+            if slot.generation != generation {
+                return;
+            }
+            let retiree = slot.detach();
+            slot.state = needs.state();
+            slot.detail = Some(needs.detail().into());
+            slot.retry_at = None;
+            self.tools_mut().remove(server_id);
+            retiree
+        };
+        retiree.retire().await;
     }
 
     async fn set_state(
@@ -1383,36 +1437,54 @@ impl McpManager {
         let config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
         match auth {
             RemoteAuth::None => {
-                self.handshake(
-                    server,
-                    StreamableHttpClientTransport::with_client(reqwest::Client::new(), config),
-                )
-                .await
+                let client = ChallengeWatch::new(reqwest::Client::new(), false);
+                let lapse = client.lapse();
+                let outcome = self
+                    .handshake(
+                        server,
+                        StreamableHttpClientTransport::with_client(client, config),
+                    )
+                    .await;
+                watched(&server.id, lapse, outcome)
             }
             RemoteAuth::Bearer(token) => {
                 if token.trim().is_empty() {
                     return Err(Error::NeedsToken(server.id.clone()));
                 }
-                self.handshake(
-                    server,
-                    StreamableHttpClientTransport::with_client(
-                        reqwest::Client::new(),
-                        config.auth_header(token.clone()),
-                    ),
-                )
-                .await
+                let client = ChallengeWatch::new(reqwest::Client::new(), true);
+                let lapse = client.lapse();
+                let outcome = self
+                    .handshake(
+                        server,
+                        StreamableHttpClientTransport::with_client(
+                            client,
+                            config.auth_header(token.clone()),
+                        ),
+                    )
+                    .await;
+                watched(&server.id, lapse, outcome)
             }
             RemoteAuth::OAuth => {
-                let stored = self
-                    .stored_token(&server.id, url)
+                let store = self
+                    .inner
+                    .config
+                    .tokens
+                    .clone()
                     .ok_or_else(|| Error::NeedsAuth(server.id.clone()))?;
-                let client =
-                    oauth::client_from_stored(url, &stored, self.inner.config.http_timeout).await?;
-                self.handshake(
-                    server,
-                    StreamableHttpClientTransport::with_client(client, config),
+                let client = oauth::client_from_stored(
+                    url,
+                    renewal::Persisted::new(store, &server.id, url),
+                    self.inner.config.http_timeout,
                 )
-                .await
+                .await?;
+                let lapse = client.lapse();
+                let outcome = self
+                    .handshake(
+                        server,
+                        StreamableHttpClientTransport::with_client(client, config),
+                    )
+                    .await;
+                watched(&server.id, lapse, outcome)
             }
             // Let the server decide, so configuring one is just a pasted URL.
             RemoteAuth::Auto => {
@@ -1471,6 +1543,7 @@ impl McpManager {
                 client,
                 pid: None,
                 catalog: build_catalog(&server.id, &server.tools, tools),
+                lapse: None,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(Error::Timeout(deadline)),
@@ -1610,6 +1683,24 @@ async fn watch_tool_changes(weak: Weak<ManagerInner>, mut rx: mpsc::UnboundedRec
             return;
         }
         McpManager { inner }.refresh_tools(&server, None).await;
+    }
+}
+
+/// Attach a remote connection's latch. A refusal it latched during the
+/// handshake is reported as what the server needs, so the slot waits for a
+/// human instead of retrying credentials that cannot work.
+fn watched(
+    server: &str,
+    lapse: Arc<Lapse>,
+    outcome: Result<Connected, Error>,
+) -> Result<Connected, Error> {
+    match (outcome, lapse.get()) {
+        (Ok(mut connected), _) => {
+            connected.lapse = Some(lapse);
+            Ok(connected)
+        }
+        (Err(_), Some(needs)) => Err(needs.error(server.to_string())),
+        (Err(error), None) => Err(error),
     }
 }
 

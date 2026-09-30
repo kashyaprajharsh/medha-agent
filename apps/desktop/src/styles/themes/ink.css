@@ -17,6 +17,7 @@
   --gold-hi: #efcd90;
   --gold-ink: #16171b;
   --gold-wash: rgba(223, 180, 108, 0.12);
+  --glint: rgba(239, 205, 144, 0.5);
   --code: #dbc090;
   --link: #e5c184;
   --ok: #96c480;
@@ -37,4 +38,9 @@
   --syntax-function: #8fc6e7;
   --syntax-comment: #9a9fa7;
   --syntax-attr: #e7a2a2;
+  /* Chart series, in order: CVD-safe adjacent pairs and >= 3:1 on this canvas. */
+  --chart-1: #3987e5;
+  --chart-2: #d95926;
+  --chart-3: #199e70;
+  --chart-4: #c98500;
 }

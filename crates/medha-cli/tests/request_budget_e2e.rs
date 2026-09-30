@@ -111,7 +111,7 @@ fn captured_request(preset: &str) -> serde_json::Value {
 fn full_and_minimal_wire_requests_obey_their_capabilities_and_budgets() {
     let full = captured_request("full");
     let minimal = captured_request("minimal");
-    for (request, count, max_bytes) in [(&full, 24, 45_000), (&minimal, 5, 14_000)] {
+    for (request, count, max_bytes) in [(&full, 25, 45_000), (&minimal, 6, 14_000)] {
         assert_eq!(request["tools"].as_array().unwrap().len(), count);
         let bytes = serde_json::to_vec(request).unwrap().len();
         assert!(
@@ -154,6 +154,9 @@ fn full_and_minimal_wire_requests_obey_their_capabilities_and_budgets() {
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect();
     names.sort();
-    assert_eq!(names, ["edit", "glob", "grep", "read", "shell_exec"]);
+    assert_eq!(
+        names,
+        ["edit", "glob", "grep", "read", "shell_exec", "write"]
+    );
     assert!(minimal_system.contains("trust boundary"));
 }

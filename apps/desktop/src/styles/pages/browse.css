@@ -1,0 +1,242 @@
+/* Browse and manage views for skills and plugins: one prominent search, quiet rows below it. */
+.browse-search {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  margin: 0 0 var(--s-4);
+  padding: 0 var(--s-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  background: var(--raised);
+  box-shadow: var(--e1-shadow);
+  color: var(--faint);
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+.browse-search:focus-within {
+  border-color: color-mix(in srgb, var(--gold) 55%, var(--line));
+  box-shadow: 0 0 0 3px var(--gold-wash), var(--e1-shadow);
+  color: var(--gold);
+}
+.browse-search input {
+  flex: 1;
+  min-width: 0;
+  padding: var(--s-4) 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: var(--text-base) var(--font-ui);
+}
+.browse-search input::placeholder {
+  color: var(--faint);
+}
+.browse-search input::-webkit-search-cancel-button {
+  cursor: pointer;
+}
+
+.browse-scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin: 0 0 var(--s-4);
+}
+.browse-scope button {
+  padding: var(--s-1) var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  color: var(--dim);
+  font-size: var(--text-sm);
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+.browse-scope button span {
+  margin-left: var(--s-1);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.browse-scope button:hover {
+  color: var(--text);
+}
+.browse-scope button[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--gold) 45%, var(--line));
+  background: var(--gold-wash);
+  color: var(--text);
+}
+
+.browse-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.browse-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-5);
+  padding: var(--s-3) var(--s-3);
+  margin: 0 calc(-1 * var(--s-3));
+  border-radius: var(--r-md);
+  transition: background var(--t-fast);
+}
+.browse-row:hover {
+  background: var(--hover);
+}
+.browse-row > div {
+  min-width: 0;
+}
+.browse-row b {
+  font-weight: 600;
+}
+.browse-row small {
+  margin-left: var(--s-2);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+.browse-row p {
+  display: -webkit-box;
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: var(--dim);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.browse-row .btn-line,
+.browse-row .market-installed {
+  flex: none;
+}
+.browse-list > .quiet {
+  padding: var(--s-4) 0;
+}
+.browse-more {
+  display: block;
+  margin: var(--s-4) auto 0;
+}
+.browse-loading {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+.browse-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  margin: var(--s-5) 0 0;
+  color: var(--faint);
+  font-size: var(--text-sm);
+}
+.browse-foot .link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+}
+
+.browse-manage {
+  margin: var(--s-6) 0 0;
+  padding: var(--s-4) 0 0;
+  border-top: 1px solid var(--hair);
+}
+.browse-manage summary {
+  cursor: pointer;
+  color: var(--dim);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.browse-manage summary:hover {
+  color: var(--text);
+}
+.browse-manage[open] summary {
+  margin-bottom: var(--s-3);
+}
+.browse-manage-add {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+}
+.browse-manage-add .plugin-install {
+  flex: 1;
+  margin: 0;
+}
+
+.manage-section {
+  padding: var(--s-5) 0;
+}
+.manage-section + .manage-section {
+  border-top: 1px solid var(--hair);
+}
+.manage-section > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-5);
+  margin-bottom: var(--s-3);
+}
+.manage-section h2 {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 600;
+}
+.manage-section header p {
+  max-width: 62ch;
+  margin: var(--s-1) 0 0;
+  color: var(--dim);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+}
+.manage-section code {
+  font-size: var(--text-xs);
+}
+.manage-actions {
+  display: flex;
+  flex: none;
+  gap: var(--s-2);
+}
+.manage-list {
+  list-style: none;
+  margin: 0 0 var(--s-3);
+  padding: 0;
+}
+.manage-list li {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  min-height: 44px;
+  padding: var(--s-1) 0;
+}
+.manage-list li + li {
+  border-top: 1px solid var(--hair);
+}
+.manage-list b {
+  font-weight: 500;
+}
+.manage-status {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dim);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status-available,
+.status-updated,
+.status-synced,
+.status-installed {
+  color: var(--gold);
+}
+.status-failed {
+  color: var(--err);
+}
+.manage-note {
+  margin: 0;
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+
+@media (max-width: 780px) {
+  .manage-section > header,
+  .browse-manage-add {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

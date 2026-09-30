@@ -215,6 +215,16 @@
 .doctor-checks span {
   color: var(--dim);
 }
+.settings-row .mcp-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-top: var(--s-1);
+  color: var(--dim);
+}
+.mcp-state .agent-dot {
+  flex: none;
+}
 .mcp-signin {
   display: flex;
   align-items: center;

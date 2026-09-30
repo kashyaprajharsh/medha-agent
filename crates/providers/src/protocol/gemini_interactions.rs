@@ -484,17 +484,22 @@ fn decode_steps(
                 }
             }
             "function_call" => {
-                let id = required_string(step, "id", "Gemini function call")?;
-                let wire = required_string(step, "name", "Gemini function call")?;
+                let id = required_call_string(step, "id")?;
+                let wire = required_call_string(step, "name")?;
                 if step.get("signature").is_some() {
                     return Err(ProviderError::Decode(
                         "Gemini standard function call unexpectedly contained a signature".into(),
                     ));
                 }
+                let args = super::validate_tool_arguments(
+                    &wire,
+                    &id,
+                    step.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                )?;
                 parts.push(ContentPart::ToolCall(kernel::ToolCallPart {
                     id,
                     tool: names.get(&wire).cloned().unwrap_or(wire),
-                    args: step.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                    args,
                     provider_state: Vec::new(),
                 }));
             }
@@ -515,6 +520,20 @@ fn required_string(value: &Value, field: &str, context: &str) -> Result<String, 
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| ProviderError::Decode(format!("{context} omitted required '{field}'")))
+}
+
+fn required_call_string(step: &Value, field: &str) -> Result<String, ProviderError> {
+    required_string(step, field, "Gemini function call").map_err(|_| {
+        ProviderError::invalid_tool_call(
+            step.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>"),
+            step.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>"),
+            format!("missing tool-call {field}"),
+        )
+    })
 }
 
 fn blocks_for_message(message: &ModelMessage) -> Vec<Block> {
@@ -551,6 +570,14 @@ pub(crate) fn parse_interaction(
                 .get("error")
                 .map(Value::to_string)
                 .unwrap_or_else(|| "Gemini interaction failed".into()),
+        ));
+    }
+    if !matches!(
+        value.get("status").and_then(Value::as_str),
+        Some("completed" | "requires_action")
+    ) {
+        return Err(ProviderError::Stream(
+            "Gemini response omitted a terminal interaction status".into(),
         ));
     }
     let steps = value
@@ -683,8 +710,8 @@ impl ResponseDecoder {
                     ));
                 }
                 StepAccum::FunctionCall {
-                    id: required_string(step, "id", "Gemini function-call step.start")?,
-                    name: required_string(step, "name", "Gemini function-call step.start")?,
+                    id: required_call_string(step, "id")?,
+                    name: required_call_string(step, "name")?,
                     initial_arguments: step
                         .get("arguments")
                         .filter(|arguments| !arguments.is_null())
@@ -838,9 +865,14 @@ impl ResponseDecoder {
                     initial_arguments.unwrap_or_else(|| json!({}))
                 } else {
                     serde_json::from_str(&argument_deltas).map_err(|error| {
-                        ProviderError::Decode(format!("Gemini function arguments: {error}"))
+                        ProviderError::invalid_tool_call(
+                            &name,
+                            &id,
+                            format!("invalid or incomplete JSON arguments: {error}"),
+                        )
                     })?
                 };
+                let args = super::validate_tool_arguments(&name, &id, args)?;
                 let canonical = self.names.get(&name).cloned().unwrap_or(name);
                 vec![ContentPart::ToolCall(kernel::ToolCallPart {
                     id,
@@ -1538,6 +1570,68 @@ mod tests {
                 block,
                 Block::CompletedMessage(message) if message.has_provider_state()
             )));
+        }
+    }
+
+    #[test]
+    fn nonterminal_responses_cannot_authorize_calls() {
+        for status in [Value::Null, json!("in_progress"), json!("cancelled")] {
+            let body = json!({"status":status, "steps":[
+                {"type":"function_call", "id":"c", "name":"write", "arguments":{}}
+            ]})
+            .to_string();
+            assert!(matches!(
+                parse_interaction(&body, &HashMap::new()),
+                Err(ProviderError::Stream(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_calls_never_release_a_partial_batch() {
+        for arguments in [json!([]), json!("encoded"), Value::Null] {
+            let body = json!({"status":"requires_action", "steps":[
+                {"type":"function_call", "id":"ok", "name":"read", "arguments":{}},
+                {"type":"function_call", "id":"bad", "name":"read", "arguments":arguments}
+            ]})
+            .to_string();
+            assert!(matches!(
+                parse_interaction(&body, &HashMap::new()),
+                Err(ProviderError::InvalidToolCall(_))
+            ));
+        }
+        let body =
+            json!({"status":"requires_action", "steps":[{"type":"function_call", "id":"bad", "arguments":{}}]}).to_string();
+        assert!(matches!(
+            parse_interaction(&body, &HashMap::new()),
+            Err(ProviderError::InvalidToolCall(_))
+        ));
+
+        for arguments in [r#"{"query":"unfinished"#, "[]"] {
+            let mut decoder = ResponseDecoder::new(HashMap::new());
+            for value in [
+                json!({"event_type":"step.start", "index":0, "step":{"type":"function_call", "id":"ok", "name":"read", "arguments":{}}}),
+                json!({"event_type":"step.stop", "index":0}),
+                json!({"event_type":"step.start", "index":1, "step":{"type":"function_call", "id":"bad", "name":"web"}}),
+                json!({"event_type":"step.delta", "index":1, "delta":{"type":"arguments_delta", "arguments":arguments}}),
+            ] {
+                assert!(
+                    decoder
+                        .push(&SseEvent {
+                            event: None,
+                            data: value.to_string()
+                        })
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            let error = decoder
+                .push(&SseEvent {
+                    event: None,
+                    data: json!({"event_type":"step.stop", "index":1}).to_string(),
+                })
+                .unwrap_err();
+            assert!(matches!(error, ProviderError::InvalidToolCall(_)));
         }
     }
 

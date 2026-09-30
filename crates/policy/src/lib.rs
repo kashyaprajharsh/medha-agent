@@ -77,15 +77,22 @@ impl Default for DefaultPolicy {
     }
 }
 
+/// Changing files is one capability to the operator, split into two tools for
+/// the model: a rule naming either gates both, so neither route skips it.
+const FILE_TOOLS: [&str; 2] = ["write", "edit"];
+
 impl DefaultPolicy {
     /// Whether an otherwise-allowed tool escalates to the human gate. The dial only
     /// turns `Allow`→`Human`, never the reverse, so it cannot loosen the floor:
     /// `careful` gates the full set, `normal` allows reversible edits, `yolo` none.
     fn escalates(&self, autonomy: AutonomyLevel, tool: &str) -> bool {
+        let file_tool = FILE_TOOLS.contains(&tool);
+        let named = self.approve.contains(tool)
+            || (file_tool && FILE_TOOLS.iter().any(|name| self.approve.contains(*name)));
         match autonomy {
             AutonomyLevel::Plan => false,
-            AutonomyLevel::Careful => self.approve.contains(tool),
-            AutonomyLevel::Normal => tool != "edit" && self.approve.contains(tool),
+            AutonomyLevel::Careful => named,
+            AutonomyLevel::Normal => !file_tool && named,
             AutonomyLevel::Yolo => false,
         }
     }
@@ -968,6 +975,26 @@ mod tests {
             ),
             Decision::Allow
         ));
+    }
+
+    /// Splitting file changes into two tools must not open a way around a rule:
+    /// naming either one gates both, and `normal` lets both through alike.
+    #[test]
+    fn a_rule_naming_either_file_tool_gates_both() {
+        for named in ["edit", "write"] {
+            let policy = DefaultPolicy::requiring_approval([named]);
+            for tool in ["write", "edit"] {
+                assert!(
+                    policy.escalates(AutonomyLevel::Careful, tool),
+                    "{named} gates {tool}"
+                );
+                assert!(
+                    !policy.escalates(AutonomyLevel::Normal, tool),
+                    "normal applies {tool}"
+                );
+            }
+            assert!(!policy.escalates(AutonomyLevel::Careful, "read"));
+        }
     }
 
     #[test]

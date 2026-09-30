@@ -55,6 +55,16 @@ fn sub_agents_count_in_their_parent_and_unknown_cost_stays_unknown() {
     assert_eq!(top["title"], "Fix the login bug");
     assert_eq!(top["agents"], 1);
     assert_eq!(top["usage"]["calls"], 2);
+    assert_eq!(top["models"][0]["usage"], top["usage"]);
+    let daily_models = summary["by_day"][0]["models"].as_array().unwrap();
+    assert_eq!(daily_models.len(), 2);
+    assert_eq!(
+        daily_models
+            .iter()
+            .map(|row| row["usage"]["calls"].as_u64().unwrap())
+            .sum::<u64>(),
+        3
+    );
     let local_model = summary["models"]
         .as_array()
         .unwrap()

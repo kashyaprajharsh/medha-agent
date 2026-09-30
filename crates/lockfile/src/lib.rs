@@ -121,9 +121,9 @@ impl Default for ToolsConfig {
     }
 }
 
-/// The smallest set that can still do the work: read a file, change one, run a
-/// command, and find things by content or by name.
-pub const MINIMAL_TOOLS: [&str; 5] = ["read", "edit", "shell.exec", "grep", "glob"];
+/// The smallest set that can still do the work: read a file, create or change
+/// one, run a command, and find things by content or by name.
+pub const MINIMAL_TOOLS: [&str; 6] = ["read", "write", "edit", "shell.exec", "grep", "glob"];
 
 impl ToolsConfig {
     pub fn validate(&self) -> Result<(), String> {

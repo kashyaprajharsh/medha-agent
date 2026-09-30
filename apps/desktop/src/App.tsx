@@ -126,6 +126,26 @@ export function App() {
   const [attachments, setAttachments] = useState<Record<string, Attachment[]>>(
     {},
   );
+  const [skills, setSkills] = useState<{ name: string; description: string }[]>([]);
+  const [skillFor, setSkillFor] = useState<Record<string, { name: string; message: string }>>({});
+  useEffect(() => {
+    let active = true;
+    const load = () =>
+      void api
+        .extensions()
+        .then((catalog) => {
+          if (!active) return;
+          const rows = (catalog.skills as { name: string; description: string; enabled: boolean }[]) ?? [];
+          setSkills(rows.filter((skill) => skill.enabled).map(({ name, description }) => ({ name, description })));
+        })
+        .catch(() => {});
+    load();
+    window.addEventListener("medha-preferences", load);
+    return () => {
+      active = false;
+      window.removeEventListener("medha-preferences", load);
+    };
+  }, [api]);
   const [branch, setBranch] = useState<string | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const following = useRef(false);
@@ -429,9 +449,14 @@ export function App() {
     message = currentKey ? (text.current[currentKey] ?? "") : "",
   ) {
     const images = currentKey ? (attachments[currentKey] ?? []) : [];
-    const body =
+    const typed =
       message.trim() || (images.length ? "Describe the attached images." : "");
-    if (!currentKey || !body) return;
+    if (!currentKey || !typed) return;
+    // The request leads; the skill's procedure follows in the same words the
+    // TUI uses, so the model sees the same thing on either surface.
+    const skill = skillFor[currentKey];
+    const body = skill ? `${typed}\n\n${skill.message}` : typed;
+    if (skill) setSkillFor(({ [currentKey]: _, ...rest }) => rest);
     setText((all) => ({ ...all, [currentKey]: "" }));
     setAway(false);
     setAttachments((all) => ({ ...all, [currentKey]: [] }));
@@ -953,6 +978,19 @@ export function App() {
             onSettings={() => setPage("settings")}
             onExtensions={() => setPage("extensions")}
             contextPercent={state?.contextPercent}
+            skills={skills}
+            skill={currentKey ? skillFor[currentKey]?.name : undefined}
+            onSkill={(name) => {
+              if (!currentKey) return;
+              const key = currentKey;
+              if (!name) {
+                setSkillFor(({ [key]: _, ...rest }) => rest);
+                return;
+              }
+              return api
+                .extensions("extensions.skill.use", { name })
+                .then((loaded) => setSkillFor((all) => ({ ...all, [key]: { name, message: String(loaded.message) } })));
+            }}
           />
         )}
         {terminalUsed && (

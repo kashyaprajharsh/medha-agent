@@ -7,23 +7,28 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use futures::StreamExt;
 use rmcp::transport::auth::{
-    AuthClient, OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture,
-    OAuthHttpRedirectPolicy, OAuthHttpRequest, OAuthState, OAuthTokenResponse,
+    AuthorizationManager, OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture,
+    OAuthHttpRedirectPolicy, OAuthHttpRequest, OAuthState,
 };
-use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     time::timeout,
 };
 
-use crate::{Error, UrlSink};
+use crate::{
+    Error, UrlSink,
+    renewal::{Persisted, RenewingClient, StoredTokens},
+};
 
 /// What the browser is told once the provider redirects back.
 const DONE_PAGE: &str = "<!doctype html><meta charset=utf-8><title>Medha</title>\
@@ -31,14 +36,6 @@ const DONE_PAGE: &str = "<!doctype html><meta charset=utf-8><title>Medha</title>
 <p>Authorization complete — you can close this tab and return to Medha.</p>";
 const MAX_OAUTH_BODY: usize = 1024 * 1024;
 const MAX_OAUTH_REDIRECTS: usize = 5;
-
-/// Persisted credentials. The refresh token lives here, so a remote server
-/// reconnects at launch without a browser.
-#[derive(Serialize, Deserialize)]
-struct StoredTokens {
-    client_id: String,
-    token: OAuthTokenResponse,
-}
 
 /// Bearer tokens and authorization codes must not cross a plaintext hop.
 /// Loopback is exempt so a locally hosted server is still usable.
@@ -173,6 +170,9 @@ struct HardenedOAuthClient {
     follow: reqwest::Client,
     stop: reqwest::Client,
     policy: EndpointPolicy,
+    /// Whether the last answer was a refusal (RFC 6749 §5.2 answers 400 or
+    /// 401), so a dead grant can be told from an unreachable endpoint.
+    refused: Arc<AtomicBool>,
 }
 
 impl HardenedOAuthClient {
@@ -187,6 +187,7 @@ impl HardenedOAuthClient {
             follow,
             stop,
             policy,
+            refused: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -209,10 +210,15 @@ impl OAuthHttpClient for HardenedOAuthClient {
             };
             let request = reqwest::Request::try_from(request)
                 .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+            self.refused.store(false, Ordering::Release);
             let response = client
                 .execute(request)
                 .await
                 .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+            self.refused.store(
+                matches!(response.status().as_u16(), 400 | 401),
+                Ordering::Release,
+            );
             let mut builder = oauth2::http::Response::builder()
                 .status(response.status())
                 .version(response.version());
@@ -264,11 +270,39 @@ pub(crate) async fn probe(url: &str, http: Duration) -> Challenge {
     let Ok(client) = follow_client(policy, http) else {
         return Challenge::Open;
     };
-    let Ok(response) = client.get(url).send().await else {
+    let Ok(mut response) = client.get(url).send().await else {
         // Unreachable hosts are a connection problem, not an auth one; let the
         // real connect attempt report it properly.
         return Challenge::Open;
     };
+    // Streamable HTTP servers need not serve GET, and a 405 says nothing about
+    // credentials: ask again the way a client really connects.
+    if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "medha", "version": env!("CARGO_PKG_VERSION") }
+            }
+        });
+        let Ok(posted) = client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .body(initialize.to_string())
+            .send()
+            .await
+        else {
+            return Challenge::Open;
+        };
+        response = posted;
+    }
     if !matches!(response.status().as_u16(), 401 | 403) {
         return Challenge::Open;
     }
@@ -286,27 +320,28 @@ pub(crate) async fn probe(url: &str, http: Duration) -> Challenge {
 }
 
 /// Rebuild an authorized HTTP client from persisted credentials, so a session
-/// reconnects — and silently refreshes — without user interaction.
+/// reconnects — and silently refreshes — without user interaction. The store
+/// stays attached: each refresh persists, with the token's real age.
 pub(crate) async fn client_from_stored(
     url: &str,
-    blob: &str,
+    store: Persisted,
     http: Duration,
-) -> Result<AuthClient<reqwest::Client>, Error> {
-    let stored: StoredTokens = serde_json::from_str(blob)
-        .map_err(|error| Error::Auth(format!("stored credentials are unreadable: {error}")))?;
-    let oauth_http = Arc::new(HardenedOAuthClient::new(url, http)?);
-    let mut state = OAuthState::new_with_oauth_http_client(url, oauth_http)
+) -> Result<RenewingClient, Error> {
+    // Unreadable is no better than absent: only a sign-in recovers either.
+    if store.tokens().await.is_none() {
+        return Err(Error::NeedsAuth(store.server().to_string()));
+    }
+    let oauth_http = HardenedOAuthClient::new(url, http)?;
+    let refused = Arc::clone(&oauth_http.refused);
+    let mut manager = AuthorizationManager::new_with_oauth_http_client(url, Arc::new(oauth_http))
         .await
         .map_err(auth_failed)?;
-    state
-        .set_credentials(&stored.client_id, stored.token)
-        .await
-        .map_err(auth_failed)?;
-    let manager = state.into_authorization_manager().ok_or_else(|| {
-        Error::Auth("stored credentials did not restore an authorized session".into())
-    })?;
+    manager.set_credential_store(store.clone());
+    if !manager.initialize_from_store().await.map_err(auth_failed)? {
+        return Err(Error::NeedsAuth(store.server().to_string()));
+    }
     let resource = follow_client(EndpointPolicy::new(url)?, http)?;
-    Ok(AuthClient::new(resource, manager))
+    Ok(RenewingClient::new(resource, manager, store, refused))
 }
 
 /// Run the interactive flow: discover, open the browser, catch the loopback
@@ -361,7 +396,7 @@ pub(crate) async fn authorize(
         .map_err(auth_failed)?;
     let (client_id, token) = state.get_credentials().await.map_err(auth_failed)?;
     let token = token.ok_or_else(|| Error::Auth("the provider returned no token".into()))?;
-    serde_json::to_string(&StoredTokens { client_id, token }).map_err(auth_failed)
+    serde_json::to_string(&StoredTokens::issued_now(client_id, token)).map_err(auth_failed)
 }
 
 struct Callback {

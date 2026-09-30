@@ -2645,7 +2645,10 @@ pub(super) fn handle_agent_event(
                 StopReason::Finished | StopReason::Blocked => {}
             }
         }
-        TuiEvent::Error(e) => {
+        TuiEvent::Error(e, recovered) => {
+            if let Some(history) = recovered {
+                *transcript = history;
+            }
             model.last_turn_reasoning_received = Some(model.reasoning_received_this_turn);
             model.push_main_notice(format!("error: {e}"));
             model.running = false;
@@ -3727,12 +3730,18 @@ fn show_usage<P, L>(
 /// Choosing an entry only pre-fills `/mcp add`, so nothing is saved unseen.
 fn search_mcp_catalog(model: &mut Model, query: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let (query, tx) = (query.to_string(), tx.clone());
-    model.push_notice("(searching the MCP Registry …)");
+    model.push_notice("(searching MCP servers …)");
     tokio::spawn(async move {
-        let result = crate::desktop_mcp_registry::search(&query, None)
+        use crate::desktop_mcp_registry::{Source, search};
+        let mut result = search(&query, None, Source::Featured)
             .await
-            .map(|listing| catalog_picks(&listing))
-            .map_err(|error| error.to_string());
+            .map(|listing| catalog_picks(&listing));
+        if !query.trim().is_empty() && matches!(&result, Ok(picks) if picks.is_empty()) {
+            result = search(&query, None, Source::Full)
+                .await
+                .map(|listing| catalog_picks(&listing));
+        }
+        let result = result.map_err(|error| error.to_string());
         let _ = tx.send(TuiEvent::McpCatalog(result));
     });
 }
@@ -5027,8 +5036,8 @@ pub(super) fn spawn_turn<P, L>(
     }
 
     // Graceful interruption: the kernel owns cancellation now. Esc trips the
-    // handle; run_session ALWAYS returns (settled history + StopReason), so
-    // there is no select! race dropping the session future mid-tool anymore.
+    // handle; the kernel settles cancellation before returning. On failure,
+    // recover the admitted history from the durable log.
     let (handle, queue) = kernel::InterruptQueue::pair();
     let approval_cancel = queue.token();
     // The control plane watches this so an `agent.wait` ends the moment you
@@ -5087,6 +5096,11 @@ pub(super) fn spawn_turn<P, L>(
             return;
         }
         let sink = TuiSink { tx: tx.clone() };
+        let system: Vec<_> = messages
+            .iter()
+            .take_while(|m| m.role == kernel::Role::System)
+            .cloned()
+            .collect();
         tracing::info!(session = %session.id,
             elapsed_ms = submitted_at.elapsed().as_millis() as u64,
             "tui preparation finished");
@@ -5110,7 +5124,14 @@ pub(super) fn spawn_turn<P, L>(
             Err(e) => {
                 // Left undelivered on purpose: they arrive again next turn.
                 // Delivery is at-least-once, so a repeat beats silent loss.
-                let _ = tx.send(TuiEvent::Error(e.to_string()));
+                let (error, history) = crate::failed_turn_history(
+                    kernel.log.as_ref(),
+                    &session,
+                    &system,
+                    e.to_string(),
+                )
+                .await;
+                let _ = tx.send(TuiEvent::Error(error, history));
             }
         }
     }));
@@ -5620,51 +5641,19 @@ fn hub_notice(model: &mut Model, text: impl std::fmt::Display) {
     model.upsert_notice(HUB_LEAD, format!("{HUB_LEAD}{text}"));
 }
 
-/// The registered skill sources; empty on any error (missing file / bad config).
-fn registered_taps() -> Vec<tools::Tap> {
-    config::user_taps_path()
-        .ok()
-        .map(tools::TapStore::new)
-        .and_then(|s| s.list().ok())
-        .unwrap_or_default()
-}
-
-/// Sources to browse/search: the shipped defaults plus the user's own (deduped),
-/// so search works out of the box without registering anything.
-fn browse_taps() -> Vec<tools::Tap> {
-    let mut taps = tools::hub::default_taps();
-    for t in registered_taps() {
-        if !taps.iter().any(|d| d.key() == t.key()) {
-            taps.push(t);
-        }
-    }
-    taps
-}
-
 /// Open the interactive sources sub-picker: shipped built-ins (non-removable)
 /// plus the user's own (removable), an "Add a source…" row, and "Back".
 fn open_sources_picker(model: &mut Model) {
-    let defaults = tools::hub::default_taps();
-    let mut sources: Vec<(String, String, bool)> = defaults
-        .iter()
-        .map(|t| (t.repo.clone(), t.path.clone(), false))
+    let sources = crate::skill_hub::sources()
+        .into_iter()
+        .map(|source| (source.tap.repo, source.tap.path, !source.built_in))
         .collect();
-    for t in registered_taps() {
-        if defaults.iter().any(|d| d.key() == t.key()) {
-            continue; // a user source shadowing a default: show once, as built-in
-        }
-        sources.push((t.repo.clone(), t.path.clone(), true));
-    }
     model.picker = Some(Picker::new(PickerKind::SkillSources(sources)));
 }
 
 /// Remove a registered source by its `repo/path` key and report the result.
 fn remove_source(model: &mut Model, key: &str) {
-    let path = match config::user_taps_path() {
-        Ok(p) => p,
-        Err(e) => return hub_notice(model, format!("sources unavailable: {e}")),
-    };
-    match tools::TapStore::new(path).remove(key) {
+    match crate::skill_hub::remove_source(key) {
         Ok(0) => hub_notice(model, format!("no source matching '{key}'")),
         Ok(n) => hub_notice(model, format!("✔ removed {n} source(s)")),
         Err(e) => hub_notice(model, format!("could not remove source: {e}")),
@@ -5760,23 +5749,23 @@ fn skill_sources(model: &mut Model, args: &str) {
                 Some((a, b)) => (a, Some(b.trim())),
                 None => (rest, None),
             };
-            match tools::Tap::parse(spec, path_arg) {
-                Ok(tap) => match store.add(tap.clone()) {
-                    Ok(true) => hub_notice(model, format!("✔ added source {}", tap.key())),
-                    Ok(false) => hub_notice(model, format!("updated source {}", tap.key())),
-                    Err(e) => hub_notice(model, format!("could not add source: {e}")),
-                },
-                Err(e) => hub_notice(
+            if let Err(e) = tools::Tap::parse(spec, path_arg) {
+                return hub_notice(
                     model,
                     format!("usage: /skill sources add <owner/repo> [subpath] — {e}"),
-                ),
+                );
+            }
+            match crate::skill_hub::add_source(spec, path_arg) {
+                Ok((tap, true)) => hub_notice(model, format!("✔ added source {}", tap.key())),
+                Ok((tap, false)) => hub_notice(model, format!("updated source {}", tap.key())),
+                Err(e) => hub_notice(model, format!("could not add source: {e}")),
             }
         }
         "remove" | "rm" => {
             if rest.is_empty() {
                 return hub_notice(model, "usage: /skill sources remove <owner/repo>");
             }
-            match store.remove(rest) {
+            match crate::skill_hub::remove_source(rest) {
                 Ok(0) => hub_notice(model, format!("no source matching '{rest}'")),
                 Ok(n) => hub_notice(model, format!("✔ removed {n} source(s) matching '{rest}'")),
                 Err(e) => hub_notice(model, format!("could not remove source: {e}")),
@@ -5791,7 +5780,7 @@ fn skill_sources(model: &mut Model, args: &str) {
 
 /// Searches configured and built-in sources; an empty query browses all metadata.
 fn search_skills(model: &mut Model, query: &str, tx: &mpsc::UnboundedSender<TuiEvent>) {
-    let taps = browse_taps();
+    let taps = crate::skill_hub::browse();
     if taps.is_empty() {
         return hub_notice(model, NO_SOURCES);
     }
@@ -5815,14 +5804,7 @@ fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEve
     let Some(store) = model.skills.clone() else {
         return model.push_notice("skills unavailable in this session");
     };
-    // Only active, user-scoped skills are updatable (project skills are committed
-    // config; provenance exists only for installed user skills).
-    let names: Vec<String> = store
-        .discover(&model.known_tools)
-        .effective()
-        .filter(|l| l.skill.scope == tools::SkillScope::User)
-        .map(|l| l.skill.name.clone())
-        .collect();
+    let names = crate::skill_hub::user_skills(&store, &model.known_tools);
     if names.is_empty() {
         return model.push_notice("no installed user skills to update");
     }
@@ -5844,41 +5826,29 @@ fn update_skills(model: &mut Model, arg: &str, tx: &mpsc::UnboundedSender<TuiEve
     let tx = tx.clone();
     tokio::spawn(async move {
         let targets = single.clone().map(|n| vec![n]).unwrap_or(names);
-        let mut lines = Vec::new();
-        for name in targets {
-            match tools::hub::check_update(&store, &name).await {
-                tools::hub::UpdateStatus::UpToDate => lines.push(format!("✓ {name} — up to date")),
-                tools::hub::UpdateStatus::ModifiedLocally => lines.push(format!(
-                    "✎ {name} — modified locally (protected; not updated)"
-                )),
-                tools::hub::UpdateStatus::Unmanaged(reason) => {
-                    lines.push(format!("· {name} — {reason}"))
+        let apply = apply_all || single.is_some();
+        let short = |to: &str| to[..to.len().min(8)].to_string();
+        let mut lines: Vec<String> = crate::skill_hub::updates(&store, targets, apply)
+            .await
+            .into_iter()
+            .map(|(name, outcome)| match outcome {
+                crate::skill_hub::Update::UpToDate => format!("✓ {name} — up to date"),
+                crate::skill_hub::Update::ModifiedLocally => {
+                    format!("✎ {name} — modified locally (protected; not updated)")
                 }
-                tools::hub::UpdateStatus::Available { to, .. } => {
-                    let short = &to[..to.len().min(8)];
-                    if apply_all || single.is_some() {
-                        match store.provenance(&name).map(|p| p.source) {
-                            Some(source) => match store.install_from(&source).await {
-                                Ok(r) => {
-                                    let flag = if r.scan_verdict == "caution" {
-                                        " (⚠ guard flagged — /skill info to review)"
-                                    } else {
-                                        ""
-                                    };
-                                    lines.push(format!("✔ updated {name} → {short}{flag}"));
-                                }
-                                Err(e) => lines.push(format!("✖ {name} — update failed: {e}")),
-                            },
-                            None => lines.push(format!("✖ {name} — source unavailable")),
-                        }
-                    } else {
-                        lines.push(format!(
-                            "↑ {name} — update available → {short}  (apply: /skill update {name})"
-                        ));
-                    }
-                }
-            }
-        }
+                crate::skill_hub::Update::Unmanaged(reason) => format!("· {name} — {reason}"),
+                crate::skill_hub::Update::Available(to) => format!(
+                    "↑ {name} — update available → {}  (apply: /skill update {name})",
+                    short(&to)
+                ),
+                crate::skill_hub::Update::Updated { to, caution } => format!(
+                    "✔ updated {name} → {}{}",
+                    short(&to),
+                    if caution { GUARD_FLAG } else { "" }
+                ),
+                crate::skill_hub::Update::Failed(error) => format!("✖ {name} — {error}"),
+            })
+            .collect();
         if !apply_all && single.is_none() {
             lines.push("apply: /skill update <name> · /skill update --all".to_string());
         }
@@ -5899,21 +5869,14 @@ fn lock_skills(model: &mut Model) {
     let Some(store) = model.skills.clone() else {
         return model.push_notice("skills unavailable in this session");
     };
-    let names: Vec<String> = store
-        .discover(&model.known_tools)
-        .effective()
-        .filter(|l| l.skill.scope == tools::SkillScope::User)
-        .map(|l| l.skill.name.clone())
-        .collect();
-    let entries = tools::hub::lock_entries(&store, &names);
+    let names = crate::skill_hub::user_skills(&store, &model.known_tools);
     let path = match config::skills_lock_path() {
         Ok(p) => p,
         Err(e) => return model.push_notice(format!("could not locate lockfile: {e}")),
     };
-    match tools::SkillLock::new(path.clone()).write(entries.clone()) {
-        Ok(()) => model.push_notice(format!(
-            "✔ locked {} skill(s) → {}\n  commit it so your team can /skill sync the same set",
-            entries.len(),
+    match crate::skill_hub::lock(&store, &names, &path) {
+        Ok(count) => model.push_notice(format!(
+            "✔ locked {count} skill(s) → {}\n  commit it so your team can /skill sync the same set",
             path.display()
         )),
         Err(e) => model.push_notice(format!("could not write lockfile: {e}")),
@@ -5930,7 +5893,7 @@ fn sync_skills(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
         Ok(p) => p,
         Err(e) => return model.push_notice(format!("could not locate lockfile: {e}")),
     };
-    let entries = match tools::SkillLock::new(path).read() {
+    let entries = match crate::skill_hub::locked(&path) {
         Ok(e) => e,
         Err(e) => return model.push_notice(format!("could not read lockfile: {e}")),
     };
@@ -5942,31 +5905,27 @@ fn sync_skills(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
     model.push_notice(format!("(syncing {} locked skill(s) …)", entries.len()));
     let tx = tx.clone();
     tokio::spawn(async move {
-        let mut lines = Vec::new();
-        for entry in entries {
-            // Already at the locked bytes → nothing to do.
-            if entry.content_hash.is_some()
-                && store.installed_hash(&entry.name) == entry.content_hash
-            {
-                lines.push(format!("✓ {} — already at locked revision", entry.name));
-                continue;
-            }
-            match store.install_from(&tools::hub::locked_source(&entry)).await {
-                Ok(r) => {
-                    let flag = if r.scan_verdict == "caution" {
-                        " (⚠ guard flagged — /skill info to review)"
-                    } else {
-                        ""
-                    };
-                    let verb = if r.replaced { "synced" } else { "installed" };
-                    lines.push(format!("✔ {verb} {}{flag}", entry.name));
+        let lines = crate::skill_hub::sync(&store, entries)
+            .await
+            .into_iter()
+            .map(|(name, outcome)| match outcome {
+                crate::skill_hub::Synced::Current => {
+                    format!("✓ {name} — already at locked revision")
                 }
-                Err(e) => lines.push(format!("✖ {} — {e}", entry.name)),
-            }
-        }
+                crate::skill_hub::Synced::Installed { replaced, caution } => format!(
+                    "✔ {} {name}{}",
+                    if replaced { "synced" } else { "installed" },
+                    if caution { GUARD_FLAG } else { "" }
+                ),
+                crate::skill_hub::Synced::Failed(error) => format!("✖ {name} — {error}"),
+            })
+            .collect();
         let _ = tx.send(TuiEvent::SkillUpdateReport(lines));
     });
 }
+
+/// Appended when the install scan flagged the package for review.
+const GUARD_FLAG: &str = " (⚠ guard flagged — /skill info to review)";
 
 fn show_skill_info(model: &mut Model, name: &str) {
     if name.is_empty() {
@@ -6125,15 +6084,11 @@ fn load_skill_by_name(model: &mut Model, name: &str, transcript: &mut Vec<Messag
         model.push_notice("skills unavailable in this session");
         return;
     };
-    match store.load(name, &model.known_tools) {
-        Ok(v) => {
-            let body = v.get("procedure").and_then(|s| s.as_str()).unwrap_or("");
-            let desc = v.get("description").and_then(|s| s.as_str()).unwrap_or("");
+    match crate::skill_hub::loaded_message(&store, name, &model.known_tools) {
+        Ok((desc, message)) => {
             // Inject as a user-role message so the model is guaranteed to see the
             // procedure on the next turn — same content `skill.load` would return.
-            transcript.push(Message::user(format!(
-                "[Loaded skill: {name}] Follow this procedure for the current and related work:\n\n{body}"
-            )));
+            transcript.push(Message::user(message));
             model.push_notice(format!(
                 "✔ loaded skill '{name}' — {desc}\n  It's in context now; tell me what to do and I'll follow it."
             ));
@@ -8172,6 +8127,54 @@ mod retry_render_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn failed_turn_replaces_stale_surface_history_from_the_log() {
+        use kernel::EventLog;
+        let (mut m, _workspace) = model();
+        let mut session = Session::new();
+        let log = kernel::InMemoryLog::new();
+        log.append(kernel::Event::user_message(&session, "go"))
+            .await
+            .unwrap();
+        log.append(kernel::Event::model_text(&session, "completed first step"))
+            .await
+            .unwrap();
+        log.append(kernel::Event::user_input(
+            &session,
+            "[runtime: turn failed] timeout",
+            kernel::TrustLabel::Tool,
+        ))
+        .await
+        .unwrap();
+        let mut transcript = vec![Message::system("S"), Message::user("go")];
+        let (error, history) =
+            crate::failed_turn_history(&log, &session, &transcript, "timeout".into()).await;
+        m.running = true;
+        handle_agent_event(
+            &mut m,
+            TuiEvent::Error(error, history),
+            &mut session,
+            &mut transcript,
+        );
+        assert!(!m.running);
+        assert_eq!(
+            transcript
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "S",
+                "go",
+                "completed first step",
+                "[runtime: turn failed] timeout"
+            ]
+        );
+        assert_eq!(
+            transcript.last().unwrap().trust,
+            Some(kernel::TrustLabel::Tool)
+        );
     }
 
     #[test]

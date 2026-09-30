@@ -178,6 +178,12 @@
 .catalog-list {
   margin-top: var(--s-2);
 }
+.catalog-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-4);
+}
 .catalog-list li,
 .memory-group li,
 .hook-list li {

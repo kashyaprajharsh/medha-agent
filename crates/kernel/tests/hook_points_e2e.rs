@@ -93,7 +93,7 @@ struct ReadTools;
 #[async_trait]
 impl Executor for ReadTools {
     fn specs(&self) -> Vec<ToolSpec> {
-        ["fs.edit", "read", "fail"]
+        ["write", "edit", "read", "fail"]
             .into_iter()
             .map(|name| ToolSpec {
                 name: name.into(),
@@ -249,17 +249,20 @@ async fn run(
 
 #[tokio::test]
 async fn a_successful_file_edit_emits_file_change_once() {
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        tool_call("fs.edit"),
-        vec![Block::Text("done".into())],
-    ]));
-    let hooks = Arc::new(PointHooks::default());
-    let kernel = build(provider, Arc::new(InMemoryLog::new()), hooks.clone());
-    assert_eq!(
-        run(&kernel, &Session::new(), &Notices::default()).await,
-        StopReason::Finished
-    );
-    assert_eq!(hooks.count(HookPoint::FileChange), 1);
+    // Both file tools, by the names the model is actually offered.
+    for tool in ["write", "edit"] {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_call(tool),
+            vec![Block::Text("done".into())],
+        ]));
+        let hooks = Arc::new(PointHooks::default());
+        let kernel = build(provider, Arc::new(InMemoryLog::new()), hooks.clone());
+        assert_eq!(
+            run(&kernel, &Session::new(), &Notices::default()).await,
+            StopReason::Finished
+        );
+        assert_eq!(hooks.count(HookPoint::FileChange), 1, "{tool}");
+    }
 }
 
 struct ReviewAll;

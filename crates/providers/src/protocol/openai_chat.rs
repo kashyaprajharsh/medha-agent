@@ -637,12 +637,12 @@ impl ResponseDecoder {
         if let Some(block) = self.think_filter.flush() {
             blocks.push(block);
         }
-        let intents = finalize_tool_calls(self.accum, &self.names)?;
         if !self.completed {
             return Err(ProviderError::Stream(
                 "stream ended before completing the model response; no tools were executed".into(),
             ));
         }
+        let intents = finalize_tool_calls(self.accum, &self.names)?;
         blocks.extend(intents.into_iter().map(Block::ToolIntent));
         Ok(blocks)
     }
@@ -658,6 +658,11 @@ pub(crate) fn parse_completion(
         .map_err(|error| ProviderError::Stream(format!("non-streaming response parse: {error}")))?;
     if let Some(error) = parsed.error {
         return Err(ProviderError::Response(error_message(error)));
+    }
+    if parsed.choices.is_empty() {
+        return Err(ProviderError::Stream(
+            "completion omitted its response choice".into(),
+        ));
     }
 
     let mut blocks = Vec::new();
@@ -680,18 +685,24 @@ pub(crate) fn parse_completion(
             }
         }
         for (index, tool_call) in message.tool_calls.into_iter().enumerate() {
-            let Some(function) = tool_call.function else {
-                continue;
-            };
-            let Some(name) = function.name.filter(|name| !name.is_empty()) else {
-                continue;
-            };
             let id = tool_call
                 .id
                 .filter(|id| !id.is_empty())
                 .unwrap_or_else(|| format!("call_{index}"));
-            let arguments =
-                parse_tool_arguments(&name, function.arguments.as_deref().unwrap_or_default())?;
+            let function = tool_call.function.ok_or_else(|| {
+                ProviderError::invalid_tool_call("<unknown>", &id, "missing function definition")
+            })?;
+            let name = function
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    ProviderError::invalid_tool_call("<unknown>", &id, "missing tool name")
+                })?;
+            let arguments = parse_tool_arguments(
+                &name,
+                &id,
+                function.arguments.as_deref().unwrap_or_default(),
+            )?;
             blocks.push(Block::ToolIntent(ToolIntent {
                 id,
                 tool: names.get(&name).cloned().unwrap_or(name),
@@ -800,15 +811,19 @@ pub(crate) fn finalize_tool_calls(
 ) -> Result<Vec<ToolIntent>, ProviderError> {
     let mut intents = Vec::new();
     for (index, (id, name, arguments)) in accum {
-        if name.is_empty() {
-            continue;
-        }
         let id = if id.is_empty() {
             format!("call_{index}")
         } else {
             id
         };
-        let arguments = parse_tool_arguments(&name, &arguments)?;
+        if name.trim().is_empty() {
+            return Err(ProviderError::invalid_tool_call(
+                "<unknown>",
+                &id,
+                "missing tool name",
+            ));
+        }
+        let arguments = parse_tool_arguments(&name, &id, &arguments)?;
         intents.push(ToolIntent {
             id,
             tool: names.get(&name).cloned().unwrap_or(name),
@@ -837,21 +852,23 @@ fn validate_finish_reason(reason: Option<&str>) -> Result<(), ProviderError> {
     }
 }
 
-fn parse_tool_arguments(name: &str, arguments: &str) -> Result<serde_json::Value, ProviderError> {
+fn parse_tool_arguments(
+    name: &str,
+    id: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, ProviderError> {
     let value = if arguments.trim().is_empty() {
         serde_json::json!({})
     } else {
-        serde_json::from_str(arguments).map_err(|error| ProviderError::Decode(format!(
-            "invalid or incomplete JSON arguments for tool '{name}': {error}; no tools from this response were executed",
-        )))?
+        serde_json::from_str(arguments).map_err(|error| {
+            ProviderError::invalid_tool_call(
+                name,
+                id,
+                format!("invalid or incomplete JSON arguments: {error}"),
+            )
+        })?
     };
-    let value = repair_args(value);
-    if !value.is_object() {
-        return Err(ProviderError::Decode(format!(
-            "arguments for tool '{name}' must be a JSON object; no tools from this response were executed"
-        )));
-    }
-    Ok(value)
+    super::validate_tool_arguments(name, id, repair_args(value))
 }
 
 pub(crate) fn repair_args(arguments: serde_json::Value) -> serde_json::Value {
@@ -1096,8 +1113,10 @@ mod tests {
         let error = parse_completion(&body, &HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("incomplete JSON arguments"));
         assert!(error.to_string().contains("fs_write"));
-        let mut decoder = ResponseDecoder::new(HashMap::new());
-        decoder
+        assert!(matches!(error, ProviderError::InvalidToolCall(_)));
+        for completed in [false, true] {
+            let mut decoder = ResponseDecoder::new(HashMap::new());
+            decoder
             .push(&SseEvent {
                 event: None,
                 data: serde_json::json!({"choices":[{"delta":{"tool_calls":[
@@ -1106,13 +1125,23 @@ mod tests {
                 .to_string(),
             })
             .unwrap();
-        assert!(
-            decoder
-                .finish()
-                .unwrap_err()
-                .to_string()
-                .contains("incomplete JSON arguments")
-        );
+            if completed {
+                decoder
+                    .push(&SseEvent {
+                        event: None,
+                        data: "[DONE]".into(),
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    decoder.finish(),
+                    Err(ProviderError::InvalidToolCall(_))
+                ));
+            } else {
+                let error = decoder.finish().unwrap_err();
+                assert!(matches!(error, ProviderError::Stream(_)));
+                assert!(error.is_retryable());
+            }
+        }
     }
 
     #[test]
@@ -1129,7 +1158,39 @@ mod tests {
             (1, ("b".into(), "fs_write".into(), r#"{"path":"b"#.into())),
         ]);
         assert!(finalize_tool_calls(accum, &HashMap::new()).is_err());
-        assert!(parse_tool_arguments("fs_write", "[]").is_err());
+        assert!(parse_tool_arguments("fs_write", "a", "[]").is_err());
+    }
+
+    #[test]
+    fn missing_response_choice_cannot_silently_finish_the_turn() {
+        for body in ["{}", r#"{"choices":[],"usage":{"prompt_tokens":10}}"#] {
+            assert!(matches!(
+                parse_completion(body, &HashMap::new()),
+                Err(ProviderError::Stream(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn nameless_calls_are_rejected_instead_of_silently_finishing() {
+        for function in [
+            serde_json::Value::Null,
+            serde_json::json!({"arguments":"{}"}),
+        ] {
+            let body = serde_json::json!({"choices":[{"message":{"tool_calls":[
+                {"id":"bad", "function":function}
+            ]}}]})
+            .to_string();
+            assert!(matches!(
+                parse_completion(&body, &HashMap::new()),
+                Err(ProviderError::InvalidToolCall(_))
+            ));
+        }
+        let accum = BTreeMap::from([(0, ("bad".into(), String::new(), "{}".into()))]);
+        assert!(matches!(
+            finalize_tool_calls(accum, &HashMap::new()),
+            Err(ProviderError::InvalidToolCall(_))
+        ));
     }
 
     #[test]

@@ -268,12 +268,13 @@ pub(crate) async fn listing<L: EventLog>(
         .iter()
         .map(|connector| {
             let server = connector.configured(servers);
+            let off = server.is_some_and(|id| servers[id].disabled);
             let mut row = serde_json::to_value(connector).unwrap_or_default();
             row["server"] = json!(server);
+            row["off"] = json!(off);
             row["activity"] = json!(server.and_then(|id| used.get(id)));
             row["evidence"] = json!(
-                server
-                    .is_none()
+                (server.is_none() || off)
                     .then(|| project.evidence(connector))
                     .flatten()
             );

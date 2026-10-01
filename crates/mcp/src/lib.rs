@@ -149,7 +149,7 @@ impl Error {
 
 /// Per-server tool exposure filter. `allow` (when non-empty) whitelists, then
 /// `deny` subtracts. Entries are exact names or a single trailing `*` glob.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolFilter {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
@@ -173,7 +173,7 @@ fn glob(pattern: &str, name: &str) -> bool {
 }
 
 /// How Medha reaches a server.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
     /// Local child process spoken to over stdio, sandboxed with a sanitized
     /// environment.
@@ -244,7 +244,7 @@ pub type UrlSink = tokio::sync::mpsc::UnboundedSender<String>;
 
 /// One configured server. Built from the user config; `requires_approval` gates
 /// a project-defined command behind a one-time human preview.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerConfig {
     pub id: String,
     pub transport: Transport,
@@ -671,6 +671,23 @@ impl McpManager {
         Ok(())
     }
 
+    /// Makes servers added since the host started known to it, without approving or enabling one.
+    pub async fn share(&self, servers: Vec<ServerConfig>) {
+        let Some(link) = self.hub() else {
+            return;
+        };
+        let mut set = JoinSet::new();
+        for server in servers {
+            let (this, link) = (self.clone(), Arc::clone(&link));
+            set.spawn(async move {
+                if let Ok(None) = link.ensure(&server.id, false).await {
+                    let _ = this.ensure(server, false).await;
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+    }
+
     fn hub(&self) -> Option<Arc<hub::Link>> {
         self.inner.hub.read().expect("mcp hub lock").clone()
     }
@@ -687,32 +704,78 @@ impl McpManager {
         hub::Snapshot { servers, catalogs }
     }
 
-    /// Run `server` without disturbing a connection that already serves it:
-    /// a second chat asking for a connected server must not reconnect it for
-    /// everyone. Changed settings replace it; a stalled one is retried.
-    pub(crate) async fn ensure(&self, server: ServerConfig) -> Result<ServerStatus, Error> {
+    /// Run `server` without reconnecting it for everyone; changed settings, a
+    /// new key among them, replace it. Only a person's `connect` retries,
+    /// enables or approves.
+    pub(crate) async fn ensure(
+        &self,
+        server: ServerConfig,
+        connect: bool,
+    ) -> Result<ServerStatus, Error> {
         let current = {
             let servers = self.inner.servers.lock().await;
             servers
                 .get(&server.id)
-                .filter(|slot| cache::fingerprint(&slot.config) == cache::fingerprint(&server))
+                .filter(|slot| slot.config == server)
                 .map(|slot| slot.state)
         };
-        match current {
-            None => self.add_server(server).await,
-            Some(ServerState::NeedsAuth) => Err(Error::NeedsAuth(server.id)),
-            Some(ServerState::NeedsToken) => Err(Error::NeedsToken(server.id)),
-            Some(
-                ServerState::Ready
-                | ServerState::Connecting
-                | ServerState::Reconnecting
-                | ServerState::Degraded,
+        match (current, connect) {
+            (None, true) => self.add_server(server).await,
+            (None, false) => {
+                let id = server.id.clone();
+                if let Some(generation) = self.install(server, false).await {
+                    self.ensure_supervisor();
+                    let _ = self.connect_one(&id, generation).await;
+                }
+                self.server_status(&id).await
+            }
+            (
+                Some(
+                    ServerState::Ready
+                    | ServerState::Connecting
+                    | ServerState::Reconnecting
+                    | ServerState::Degraded,
+                ),
+                _,
             ) => {
                 self.settle(&server.id).await;
                 self.server_status(&server.id).await
             }
-            Some(_) => self.approve_and_connect(&server.id, None).await,
+            (Some(_), false) => self.server_status(&server.id).await,
+            (Some(ServerState::NeedsAuth), true) => Err(Error::NeedsAuth(server.id)),
+            (Some(ServerState::NeedsToken), true) => Err(Error::NeedsToken(server.id)),
+            (Some(_), true) => self.approve_and_connect(&server.id, None).await,
         }
+    }
+
+    /// The generation to connect, when `server` should run; `approved` is a person adding it.
+    async fn install(&self, server: ServerConfig, approved: bool) -> Option<u64> {
+        // Scoped to the swap itself. `connect_one` takes the same two locks, so
+        // holding them across it would deadlock; and the exclusive lease exists
+        // to drain calls admitted against the *old* incarnation, which is done
+        // the moment the replacement is in the map.
+        let (replaced, generation) = {
+            let _mutation = self.inner.mutations.lock().await;
+            let _exclusive = self.exclusive(&server.id).await;
+            let mut servers = self.inner.servers.lock().await;
+            let mut slot = Slot::new(server.clone());
+            if approved && !slot.config.disabled {
+                slot.state = ServerState::Connecting;
+            }
+            let generation = (slot.state == ServerState::Connecting).then_some(slot.generation);
+            let replaced = servers
+                .insert(server.id.clone(), slot)
+                .map(|mut old| old.detach());
+            // Remove the stale catalogue under the lock that publishes its
+            // replacement.
+            self.tools_mut().remove(&server.id);
+            (replaced, generation)
+        };
+        if let Some(retiree) = replaced {
+            retiree.retire().await;
+        }
+        self.announce();
+        generation
     }
 
     /// A call made while its server is still coming up waits for the outcome,
@@ -806,37 +869,22 @@ impl McpManager {
         // A remote server from the user's config belongs to the shared host;
         // anything the host does not recognise runs here.
         if let (Some(link), Transport::Remote { .. }) = (self.hub(), &server.transport)
-            && let Some(status) = link.ensure(&server.id).await?
+            && let Some(status) = link.ensure(&server.id, true).await?
         {
             return Ok(status);
         }
         self.ensure_supervisor();
-        // Scoped to the swap itself. `connect_one` takes the same two locks, so
-        // holding them across it would deadlock; and the exclusive lease exists
-        // to drain calls admitted against the *old* incarnation, which is done
-        // the moment the replacement is in the map.
-        let (replaced, generation) = {
-            let _mutation = self.inner.mutations.lock().await;
-            let _exclusive = self.exclusive(&server.id).await;
-            let mut servers = self.inner.servers.lock().await;
-            let mut slot = Slot::new(server.clone());
-            // A runtime add is its own approval; connect it without a second gate.
-            if !slot.config.disabled {
-                slot.state = ServerState::Connecting;
+        // A runtime add is its own approval; connect it without a second gate.
+        match self.install(server.clone(), true).await {
+            Some(generation) => self.connect_one(&server.id, generation).await?,
+            None => {
+                return Err(Error::ServerNotReady {
+                    server: server.id,
+                    state: ServerState::Disabled,
+                    detail: None,
+                });
             }
-            let generation = slot.generation;
-            let replaced = servers
-                .insert(server.id.clone(), slot)
-                .map(|mut old| old.detach());
-            // Remove the stale catalogue under the lock that publishes its
-            // replacement.
-            self.tools_mut().remove(&server.id);
-            (replaced, generation)
-        };
-        if let Some(retiree) = replaced {
-            retiree.retire().await;
         }
-        self.connect_one(&server.id, generation).await?;
         self.server_status(&server.id).await
     }
 
@@ -871,7 +919,7 @@ impl McpManager {
         announce: Option<&UrlSink>,
     ) -> Result<ServerStatus, Error> {
         if let Some(link) = self.hub_for(server_id) {
-            return match (link.ensure(server_id).await, announce) {
+            return match (link.ensure(server_id, true).await, announce) {
                 (Err(Error::NeedsAuth(_)), Some(announce)) => {
                     link.authorize(server_id, announce).await
                 }

@@ -124,8 +124,20 @@ impl Runtime {
         {
             return serde_json::to_value(ready).map_err(|e| e.to_string());
         }
+        // Connect is what turns a disconnected server back on, for every chat.
+        let mut server = server.clone();
+        if server.disabled {
+            server.disabled = false;
+            crate::config::edit(|cfg| {
+                if let Some(saved) = cfg.mcp.get_mut(id) {
+                    saved.disabled = false;
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        }
         let outcome = manager
-            .add_server(crate::config::resolve_mcp_server(id, server))
+            .add_server(crate::config::resolve_mcp_server(id, &server))
             .await;
         self.configured_mcp
             .lock()
@@ -201,14 +213,20 @@ fn sign_in(manager: Arc<mcp::McpManager>, id: String, writer: Arc<crate::acp::Wr
 }
 
 impl Runtime {
+    /// Off for every chat and remembered; calls already running finish first.
     pub async fn disconnect(&self, params: &Value) -> Result<Value, String> {
         let id = params["id"].as_str().ok_or("Server name required")?;
-        self.mcp
-            .as_ref()
-            .ok_or("MCP is disabled")?
-            .remove_server(id)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(json!({"disconnected": true}))
+        let manager = self.mcp.as_ref().ok_or("MCP is disabled")?;
+        crate::config::edit(|cfg| {
+            if let Some(saved) = cfg.mcp.get_mut(id) {
+                saved.disabled = true;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+        match manager.set_disabled(id, true).await {
+            Ok(_) | Err(mcp::Error::UnknownServer(_)) => Ok(json!({"disconnected": true})),
+            Err(error) => Err(error.to_string()),
+        }
     }
 }

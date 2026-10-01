@@ -21,11 +21,35 @@ pub(crate) fn endpoint() -> Option<mcp::hub::Endpoint> {
     Some(mcp::hub::Endpoint { address, token })
 }
 
+/// One needing approval stays per chat, so an approval never reaches other chats.
 pub(crate) fn is_shared(server: &config::McpServer) -> bool {
-    !server.url.is_empty() && server.command.is_empty()
+    !server.url.is_empty() && server.command.is_empty() && server.trust == "trusted"
 }
 
+/// The desktop discards the host's output, so a failure to start is kept here.
 pub async fn run(args: &[String]) -> anyhow::Result<()> {
+    let outcome = host(args).await;
+    if let (Err(error), Ok(home)) = (&outcome, config::medha_home()) {
+        let log = home.join("mcp-host.log");
+        if std::fs::metadata(&log).is_ok_and(|meta| meta.len() > 256 * 1024) {
+            let _ = std::fs::remove_file(&log);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
+            use std::io::Write;
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let _ = writeln!(file, "{at} {error:#}");
+        }
+    }
+    outcome
+}
+
+async fn host(args: &[String]) -> anyhow::Result<()> {
     let address = args
         .iter()
         .position(|arg| arg == "--socket")
@@ -80,3 +104,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&address);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "mcp_host_tests.rs"]
+mod tests;

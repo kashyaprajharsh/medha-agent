@@ -1543,6 +1543,15 @@ async fn main() -> Result<()> {
                 }
             };
             if joined {
+                let shared: Vec<_> = mcp_servers
+                    .iter()
+                    .filter(|server| shared_mcp.contains(&server.id))
+                    .cloned()
+                    .collect();
+                tokio::spawn({
+                    let attached = attached.clone();
+                    async move { attached.share(shared).await }
+                });
                 mcp_servers = own;
                 manager = Some(attached);
             } else {

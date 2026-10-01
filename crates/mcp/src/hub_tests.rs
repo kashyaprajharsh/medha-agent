@@ -20,6 +20,17 @@ fn only_the_exact_token_opens_the_channel() {
 }
 
 #[test]
+fn the_proof_is_standard_hmac_and_bound_to_its_role() {
+    // RFC 4231, test case 2.
+    assert_eq!(
+        mac("Jefe", "what do ya want for nothing?"),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
+    assert_ne!(proof("t0ken", "host", "n1"), proof("t0ken", "chat", "n1"));
+    assert_ne!(proof("t0ken", "host", "n1"), proof("t0ken", "host", "n2"));
+}
+
+#[test]
 fn sign_in_errors_survive_the_trip_between_processes() {
     let wire: WireError = Error::NeedsAuth("linear".into()).into();
     let back: Error = serde_json::from_value::<WireError>(serde_json::to_value(&wire).unwrap())

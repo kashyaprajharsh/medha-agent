@@ -88,7 +88,8 @@ pub(crate) fn save(dir: &Path, server: &ServerConfig, catalog: &Catalog) {
         return;
     }
     let target = path(dir, &server.id);
-    let staged = target.with_extension("json.tmp");
+    // Per process: the host and a chat may save the same server at once.
+    let staged = target.with_extension(format!("json.{}.tmp", std::process::id()));
     if std::fs::write(&staged, text).is_ok() {
         let _ = std::fs::rename(&staged, &target);
     }

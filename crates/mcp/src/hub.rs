@@ -1,7 +1,7 @@
 //! One set of remote MCP connections shared by every chat. A host process owns
 //! the connections; each chat attaches over a private local channel and sees
-//! the host's servers as its own. Frames are newline-delimited JSON, and the
-//! first frame must carry the host's token.
+//! the host's servers as its own. Frames are newline-delimited JSON, and each
+//! side proves it holds the token without the token crossing the channel.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -180,6 +180,29 @@ fn same_secret(a: &str, b: &str) -> bool {
             == 0
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn nonce() -> Result<String, Error> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| Error::Protocol(error.to_string()))?;
+    Ok(hex(&bytes))
+}
+
+/// Each side proves it holds the token without sending it.
+fn proof(token: &str, role: &str, nonce: &str) -> String {
+    mac(token, &format!("{role}:{nonce}"))
+}
+
+fn mac(secret: &str, message: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+    mac.update(message.as_bytes());
+    hex(&mac.finalize().into_bytes())
+}
+
 /// A chat's attachment to the host: a mirror of the shared servers, kept
 /// current by the host's snapshots, and the requests that act on them.
 pub struct Link {
@@ -225,17 +248,38 @@ impl Link {
         let (read, write) = tokio::io::split(stream);
         let mut reader = BufReader::new(read);
         *self.writer.lock().await = Some(Box::new(write));
-        let hello = json!({"id": 0, "method": "hello", "params": {"token": self.endpoint.token}});
+        let closed = || Error::Protocol("the connection host closed the channel".into());
+        let silent = || Error::Protocol("the connection host did not answer".into());
+        // The host proves itself first: whatever took its address learns nothing.
+        let ours = nonce()?;
+        let hello = json!({"id": 0, "method": "hello", "params": {"nonce": ours}});
         if !send(&self.writer, &hello).await {
+            return Err(closed());
+        }
+        let challenge = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader))
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(silent)?;
+        let offered = challenge["result"]["proof"].as_str().unwrap_or_default();
+        let theirs = challenge["result"]["nonce"].as_str().unwrap_or_default();
+        if theirs.len() != ours.len()
+            || !same_secret(offered, &proof(&self.endpoint.token, "host", &ours))
+        {
             return Err(Error::Protocol(
-                "the connection host closed the channel".into(),
+                "the connection host could not prove it is Medha's".into(),
             ));
+        }
+        let answer = json!({"id": 1, "method": "prove",
+            "params": {"proof": proof(&self.endpoint.token, "chat", theirs)}});
+        if !send(&self.writer, &answer).await {
+            return Err(closed());
         }
         let reply = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader))
             .await
             .ok()
             .flatten()
-            .ok_or_else(|| Error::Protocol("the connection host did not answer".into()))?;
+            .ok_or_else(silent)?;
         let snapshot: Snapshot = serde_json::from_value(reply["result"].clone())
             .map_err(|_| Error::Protocol("the connection host refused this chat".into()))?;
         *self.mirror.write().expect("hub mirror lock") = snapshot;
@@ -399,10 +443,12 @@ impl Link {
         serde_json::from_value(output).map_err(|error| Error::Protocol(error.to_string()))
     }
 
-    /// Ask the host to run a server from the user's config. `Ok(None)` means
-    /// the host does not share it and the chat should run it itself.
-    pub async fn ensure(&self, server: &str) -> Result<Option<ServerStatus>, Error> {
-        let outcome = self.request("ensure", json!({"server": server})).await;
+    /// `connect` is a person asking, which may retry or enable the server.
+    /// `Ok(None)` means the host does not share it and the chat runs it itself.
+    pub async fn ensure(&self, server: &str, connect: bool) -> Result<Option<ServerStatus>, Error> {
+        let outcome = self
+            .request("ensure", json!({"server": server, "connect": connect}))
+            .await;
         if !matches!(outcome, Err(WireError::NotShared)) {
             self.claimed
                 .lock()
@@ -465,14 +511,30 @@ where
     let Ok(Some(hello)) = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader)).await else {
         return;
     };
-    let offered = hello["params"]["token"].as_str().unwrap_or_default();
-    if hello["method"] != "hello" || !same_secret(offered, &token) {
+    let theirs = hello["params"]["nonce"].as_str().unwrap_or_default();
+    let Ok(ours) = nonce() else {
+        return;
+    };
+    if hello["method"] != "hello" || theirs.len() != ours.len() {
+        return;
+    }
+    let challenge = json!({"id": hello["id"],
+        "result": {"proof": proof(&token, "host", theirs), "nonce": ours}});
+    if !send(&writer, &challenge).await {
+        return;
+    }
+    let Ok(Some(answer)) = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader)).await
+    else {
+        return;
+    };
+    let offered = answer["params"]["proof"].as_str().unwrap_or_default();
+    if answer["method"] != "prove" || !same_secret(offered, &proof(&token, "chat", &ours)) {
         return;
     }
     let mut changes = manager.subscribe();
     if !send(
         &writer,
-        &json!({"id": hello["id"], "result": manager.snapshot().await}),
+        &json!({"id": answer["id"], "result": manager.snapshot().await}),
     )
     .await
     {
@@ -523,7 +585,8 @@ async fn handle(
         }
         "ensure" => {
             let config = resolve(&server).ok_or(WireError::NotShared)?;
-            Ok(status(manager.ensure(config).await?))
+            let connect = request.params["connect"].as_bool().unwrap_or(false);
+            Ok(status(manager.ensure(config, connect).await?))
         }
         "remove" => {
             manager.remove_server(&server).await?;

@@ -17,11 +17,16 @@ pub fn env() -> Option<(String, String)> {
         .map(|host| (host.address.clone(), host.token.clone()))
 }
 
+fn random_hex(bytes: usize) -> Option<String> {
+    let mut random = vec![0u8; bytes];
+    getrandom::fill(&mut random).ok()?;
+    Some(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn start() -> Option<Endpoint> {
-    let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).ok()?;
-    let token: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
-    let address = address(&token[..16]);
+    let token = random_hex(32)?;
+    // The address is visible to other local users, so it shares nothing with the token.
+    let address = address(&random_hex(8)?);
     let backend = crate::service::backend_executable().ok()?;
     let (host_address, host_token) = (address.clone(), token.clone());
     std::thread::spawn(move || supervise(backend, host_address, host_token));

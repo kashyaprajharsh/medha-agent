@@ -6,21 +6,35 @@
 :root[data-look="glass"],
 [data-look="glass"] {
   --radius-scale: 1.1;
-  --glass: color-mix(in srgb, var(--overlay) 84%, transparent);
+  --glass: color-mix(in srgb, var(--overlay) 62%, transparent);
   --glass-edge: color-mix(in srgb, var(--text) 7%, transparent);
   --frost: blur(24px) saturate(1.5);
   /* A floating pane sits over the tinted canvas, not the bare desktop; the lift
      brings it back to the tone it has when docked. */
   --pane-frost: blur(24px) saturate(1.5) brightness(1.7);
+  /* A card over the dimmed page carries the desktop's colour, not just its light. */
+  --float-frost: blur(30px) saturate(1.9) brightness(1.35);
   --hover: color-mix(in srgb, var(--text) 8%, transparent);
   --sheen: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --glass-light: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0) 40%);
+  --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.14), inset 0 0 0 1px rgba(255, 255, 255, 0.07);
   --e1-shadow: var(--sheen), 0 1px 2px rgba(0, 0, 0, 0.18);
   --e2-shadow: var(--sheen), 0 2px 8px rgba(0, 0, 0, 0.14), 0 16px 40px rgba(0, 0, 0, 0.24);
 }
+/* A heavy dim leaves the glass nothing but black to frost. */
+:root[data-look="glass"]:not([data-theme="light"]) {
+  --scrim: rgba(8, 9, 12, 0.3);
+}
+/* Light glass needs the desktop to show through and a lit edge; a near-solid
+   cream pane reads exactly like the soft look. */
 :root[data-theme="light"][data-look="glass"],
 [data-theme="light"] [data-look="glass"] {
   --sheen: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  --glass: color-mix(in srgb, var(--overlay) 60%, transparent);
   --pane-frost: var(--frost);
+  --float-frost: blur(30px) saturate(1.8) brightness(1.1);
+  --glass-light: linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0) 38%);
+  --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.9), inset 0 0 0 1px rgba(255, 255, 255, 0.55);
   --e1-shadow: var(--sheen), 0 1px 2px rgba(74, 56, 26, 0.08);
   --e2-shadow: var(--sheen), 0 2px 8px rgba(74, 56, 26, 0.07), 0 16px 40px rgba(74, 56, 26, 0.14);
 }
@@ -120,45 +134,64 @@
 }
 
 /* Neo: ink outlines and hard offset shadows on every raised thing. */
+/* Neo: printed ink. Only what you act on is lifted off the page; what you read
+   is outlined flat, so the screen keeps a hierarchy instead of a pile of boxes. */
 :root[data-look="neo"],
 [data-look="neo"] {
-  --radius-scale: 0.55;
-  /* Dark ink vanishes on a dark canvas, so the dark theme draws light outlines over gold shadows. */
-  --neo-ink: #a9acb6;
-  --neo-drop: color-mix(in srgb, var(--gold) 62%, #000);
+  --radius-scale: 0.35;
+  /* Dark ink vanishes on a dark canvas, so the dark theme draws warm light
+     outlines and lifts controls on true gold. */
+  --neo-ink: color-mix(in srgb, var(--text) 78%, transparent);
+  --neo-drop: var(--gold);
+  --neo-rule: color-mix(in srgb, var(--text) 30%, transparent);
+  --neo-pick: color-mix(in srgb, var(--gold) 22%, transparent);
   --hair: color-mix(in srgb, var(--text) 22%, transparent);
   --line: color-mix(in srgb, var(--text) 55%, transparent);
   --e1-shadow: 3px 3px 0 var(--neo-drop);
-  --e2-shadow: 5px 5px 0 var(--neo-drop);
+  --e2-shadow: 4px 4px 0 var(--neo-drop);
 }
 :root[data-theme="light"][data-look="neo"],
 [data-theme="light"] [data-look="neo"] {
   --neo-ink: #1c1a16;
   --neo-drop: #1c1a16;
+  --neo-rule: color-mix(in srgb, #1c1a16 70%, transparent);
+  --neo-pick: color-mix(in srgb, var(--gold) 16%, transparent);
 }
 [data-look="neo"] :is(.side, .head, .status) {
-  border-color: var(--neo-ink);
-  border-width: 2px;
+  border-color: var(--neo-rule);
 }
 [data-look="neo"] :is(.btn-gold, .btn-line, .send, .stop, .starter, .look-option, .tool-preset-options button) {
   box-shadow:
     inset 0 0 0 2px var(--neo-ink),
     var(--e1-shadow);
+  transition:
+    transform var(--t-fast) var(--ease),
+    box-shadow var(--t-fast) var(--ease);
+}
+[data-look="neo"] :is(.btn-gold, .btn-line, .send, .stop, .starter, .look-option):not(:disabled):hover {
+  transform: translate(-1px, -1px);
+  box-shadow:
+    inset 0 0 0 2px var(--neo-ink),
+    4px 4px 0 var(--neo-drop);
 }
 [data-look="neo"] :is(.btn-gold, .btn-line, .send, .stop, .starter, .look-option):not(:disabled):active {
   transform: translate(3px, 3px);
   box-shadow: inset 0 0 0 2px var(--neo-ink);
 }
 [data-look="neo"]
-  :is(.you, .ask, .plan, .composer, .settings-form, .market, .question-card, .palette, .control-popover, .select-menu, .slash-menu, .confirm-dialog, .md pre, .md table, .usage-totals div) {
+  :is(.composer, .question-card, .palette, .control-popover, .select-menu, .slash-menu, .confirm-dialog) {
   border-color: var(--neo-ink);
   box-shadow:
     inset 0 0 0 2px var(--neo-ink),
     var(--e2-shadow);
 }
+[data-look="neo"] :is(.you, .ask, .plan, .settings-form, .market, .md pre, .usage-totals div) {
+  border-color: var(--neo-ink);
+  box-shadow: inset 0 0 0 1.5px var(--neo-ink);
+}
 [data-look="neo"] .md table {
-  border-width: 2px;
-  box-shadow: var(--e2-shadow);
+  border: 1.5px solid var(--neo-ink);
+  box-shadow: none;
 }
 [data-look="neo"] .composer:focus-within {
   box-shadow:
@@ -166,15 +199,15 @@
     var(--e2-shadow);
 }
 [data-look="neo"] :is(.step-icon, .agents .agent-row .agent-dot) {
-  box-shadow: inset 0 0 0 2px var(--neo-ink);
+  box-shadow: inset 0 0 0 1.5px var(--neo-ink);
 }
 [data-look="neo"] :is(.sess.active, .side-btn.active) {
-  box-shadow: inset 0 0 0 2px var(--neo-ink);
+  background: var(--neo-pick);
+  box-shadow: inset 0 0 0 1.5px var(--neo-ink);
 }
+/* Tool work is secondary to what the person said, so it takes the lighter rule. */
 [data-look="neo"] .work:not(.is-running) .work-head[aria-expanded="false"] {
-  box-shadow:
-    inset 0 0 0 2px var(--neo-ink),
-    var(--e1-shadow);
+  box-shadow: inset 0 0 0 1px var(--neo-rule);
 }
 
 /* Soft: one tone everywhere; raised things are extruded, inputs are pressed in. */

@@ -49,6 +49,41 @@
   background: transparent;
   box-shadow: var(--e1-shadow);
 }
+[data-look="neo"] .cx-row:hover {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--neo-ink);
+}
+[data-look="neo"] .cx-sheet {
+  box-shadow:
+    inset 0 0 0 2px var(--neo-ink),
+    var(--e2-shadow);
+}
+[data-look="neo"] .cx-asks button {
+  box-shadow: inset 0 0 0 1.5px var(--neo-ink);
+}
+[data-look="neo"] .cx-asks button:not(:disabled):hover {
+  background: var(--neo-pick);
+}
+[data-look="neo"] .cx-connect {
+  border-radius: var(--r-md);
+}
+[data-look="neo"] .cx-connect.gild {
+  background: var(--gold);
+  box-shadow:
+    inset 0 0 0 2px var(--neo-ink),
+    var(--e1-shadow);
+}
+[data-look="neo"] .cx-connect.gild:hover {
+  filter: none;
+  translate: -1px -1px;
+  box-shadow:
+    inset 0 0 0 2px var(--neo-ink),
+    4px 4px 0 var(--neo-drop);
+}
+[data-look="neo"] .cx-connect.gild:active {
+  translate: 3px 3px;
+  box-shadow: inset 0 0 0 2px var(--neo-ink);
+}
 .cx-plate {
   width: 40px;
   height: 40px;
@@ -185,12 +220,12 @@
   animation: cx-sheet-in var(--t-slow) var(--ease-out) both;
 }
 [data-look="glass"] .cx-sheet {
-  background: var(--glass);
-  -webkit-backdrop-filter: var(--pane-frost);
-  backdrop-filter: var(--pane-frost);
+  background: var(--glass-light), var(--glass);
+  -webkit-backdrop-filter: var(--float-frost);
+  backdrop-filter: var(--float-frost);
   box-shadow:
     var(--e2-shadow),
-    inset 0 0 0 1px var(--glass-edge);
+    var(--glass-rim);
 }
 [data-look="glass"] .cx-asks button {
   background: color-mix(in srgb, var(--text) 6%, transparent);
@@ -401,12 +436,18 @@
     translate: 0 8px;
   }
 }
-::view-transition-group(*) {
-  animation-duration: var(--t-slow);
-  animation-timing-function: var(--ease);
+.cx-sheet.leaving {
+  animation: cx-sheet-out var(--t-base) ease-in both;
+  pointer-events: none;
 }
-::view-transition-old(cx-sheet) {
-  animation: cx-sheet-out 220ms ease-in both;
+.cx-scrim.leaving {
+  animation: cx-fade-out var(--t-base) ease-in both;
+  pointer-events: none;
+}
+@keyframes cx-fade-out {
+  to {
+    opacity: 0;
+  }
 }
 @keyframes cx-sheet-in {
   from {

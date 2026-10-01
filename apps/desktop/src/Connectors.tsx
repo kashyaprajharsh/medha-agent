@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { createPortal, flushSync } from "react-dom";
+import { createPortal } from "react-dom";
 import { Icon } from "./Icon";
 import { useWorkspaceApi } from "./Workspace";
 import { useMcpSignIn, type McpStatus } from "./McpServers";
@@ -12,6 +12,7 @@ export type Connector = {
   source: string;
   asks: string[];
   server: string | null;
+  off?: boolean;
   activity: { last_used: number; this_week: number } | null;
   evidence: string | null;
 };
@@ -50,13 +51,6 @@ function usage(c: Connector) {
   return `Used ${ago(c.activity.last_used)}.${week ? ` ${week} ${week === 1 ? "action" : "actions"} this week, all approved by you.` : ""}`;
 }
 
-/** Runs `change` as a view transition where the platform has them, so shared elements glide. */
-function transition(change: () => void) {
-  const doc = document as Document & { startViewTransition?: (cb: () => void) => unknown };
-  if (!doc.startViewTransition || matchMedia("(prefers-reduced-motion: reduce)").matches) return change();
-  doc.startViewTransition(() => flushSync(change));
-}
-
 export function Connectors({
   sessionKey,
   ensureOpen,
@@ -81,6 +75,7 @@ export function Connectors({
   const [all, setAll] = useState<Connector[]>([]);
   const [error, setError] = useState("");
   const [openId, setOpenId] = useState<string>();
+  const [leaving, setLeaving] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
   const [problem, setProblem] = useState("");
   const created = useRef<string | null>(null);
@@ -112,24 +107,34 @@ export function Connectors({
   const state = (c: Connector) => (c.server ? statuses?.[c.server]?.state : undefined);
   const needle = query.trim().toLowerCase();
   const shown = all.filter((c) => !needle || [c.name, c.description, ...c.asks].join(" ").toLowerCase().includes(needle));
-  const mine = shown.filter((c) => c.server);
-  const suggested = shown.filter((c) => !c.server && c.evidence);
-  const rest = shown.filter((c) => !c.server && !c.evidence);
+  const on = (c: Connector) => Boolean(c.server) && !c.off;
+  const mine = shown.filter(on);
+  const suggested = shown.filter((c) => !on(c) && c.evidence);
+  const rest = shown.filter((c) => !on(c) && !c.evidence);
 
   function show(id: string | undefined) {
-    const change = () => {
-      setOpenId(id);
-      setPhase(id && all.find((c) => c.id === id && state(c) === "ready") ? "done" : "idle");
-      setProblem("");
-    };
-    // Opening is immediate; closing glides, so a newly connected app is seen moving into place.
-    if (id) change();
-    else transition(change);
+    setLeaving(false);
+    setOpenId(id);
+    setPhase(id && all.find((c) => c.id === id && state(c) === "ready") ? "done" : "idle");
+    setProblem("");
+  }
+
+  // The real sheet animates out, so glass stays glass until it is gone.
+  function close() {
+    if (!openId) return;
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) return show(undefined);
+    setLeaving(true);
   }
 
   useEffect(() => {
+    if (!leaving) return;
+    const done = setTimeout(() => show(undefined), 600);
+    return () => clearTimeout(done);
+  }, [leaving]);
+
+  useEffect(() => {
     if (!openId) return;
-    const onKey = (event: KeyboardEvent) => event.key === "Escape" && show(undefined);
+    const onKey = (event: KeyboardEvent) => event.key === "Escape" && close();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
@@ -181,7 +186,6 @@ export function Connectors({
     <button
       key={c.id}
       className={`cx-row ${kind}`}
-      style={{ viewTransitionName: `cx-r-${c.id}` }}
       onClick={() => show(c.id)}
       aria-label={`${c.name}: ${detail}`}
     >
@@ -261,9 +265,17 @@ export function Connectors({
       {open &&
         createPortal(
         <>
-          <div className="cx-scrim" onClick={() => show(undefined)} />
-          <aside className="cx-sheet" role="dialog" aria-modal="true" aria-label={open.name} style={{ viewTransitionName: "cx-sheet" }}>
-            <button className="cx-close" aria-label="Close" autoFocus onClick={() => show(undefined)}>
+          <div className={`cx-scrim${leaving ? " leaving" : ""}`} onClick={close} />
+          <aside
+            className={`cx-sheet${leaving ? " leaving" : ""}`}
+            role="dialog"
+            aria-modal="true"
+            aria-label={open.name}
+            onAnimationEnd={(event) => {
+              if (leaving && event.target === event.currentTarget) show(undefined);
+            }}
+          >
+            <button className="cx-close" aria-label="Close" autoFocus onClick={close}>
               <Icon name="x" />
             </button>
             <div className="cx-hero">

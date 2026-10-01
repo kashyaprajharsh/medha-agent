@@ -9,10 +9,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, Once, Weak};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use transcript_view::Steps;
+
+use crate::sleep::{self, Rest, Settled, Wake};
 
 const REQUESTS: [&str; 22] = [
     "mcp.signin",
@@ -146,7 +148,11 @@ struct Live {
     child: Child,
     input: ChildStdin,
     next_id: u64,
+    emit: Emit,
+    rest: Arc<Rest>,
 }
+
+type Emit = Arc<dyn Fn(Value) + Send + Sync>;
 
 impl Drop for Live {
     fn drop(&mut self) {
@@ -168,20 +174,48 @@ impl Drop for Live {
     }
 }
 
+type Open = HashMap<String, Live>;
+
+static EVERY: Mutex<Vec<Weak<Inner>>> = Mutex::new(Vec::new());
+static SWEEPER: Once = Once::new();
+
 pub struct LiveSessions {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     workspace: PathBuf,
-    open: Mutex<HashMap<String, Live>>,
+    open: Mutex<Open>,
+    backend: Option<PathBuf>,
+    env: Vec<(String, String)>,
 }
 
 impl LiveSessions {
     pub fn new(workspace: PathBuf) -> Self {
-        Self {
+        Self::launching(workspace, None, Vec::new())
+    }
+
+    fn launching(workspace: PathBuf, backend: Option<PathBuf>, env: Vec<(String, String)>) -> Self {
+        let inner = Arc::new(Inner {
             workspace,
             open: Mutex::new(HashMap::new()),
+            backend,
+            env,
+        });
+        if let Ok(mut every) = EVERY.lock() {
+            every.push(Arc::downgrade(&inner));
         }
+        SWEEPER.call_once(|| {
+            std::thread::spawn(sweep_forever);
+        });
+        Self { inner }
     }
 
     pub fn open(&self, app: &AppHandle, key: &str, resume: Option<&str>) -> Result<(), String> {
+        self.open_to(forward(app, key), key, resume)
+    }
+
+    fn open_to(&self, emit: Emit, key: &str, resume: Option<&str>) -> Result<(), String> {
         if !is_token(key) {
             return Err("invalid live session key".into());
         }
@@ -190,14 +224,136 @@ impl LiveSessions {
         {
             return Err("invalid session id".into());
         }
-        let mut open = self.open.lock().map_err(|error| error.to_string())?;
+        let mut open = self.inner.awake(key)?;
         if let Some(live) = open.get_mut(key)
             && matches!(live.child.try_wait(), Ok(None))
         {
             return Ok(());
         }
-        let mut command = Command::new(crate::service::backend_executable()?);
-        command.arg("--acp");
+        let live = self.inner.spawn(&emit, resume, None)?;
+        open.insert(key.to_owned(), live);
+        Ok(())
+    }
+
+    pub fn request(&self, key: &str, method: &str, params: Value) -> Result<u64, String> {
+        if !REQUESTS.contains(&method) {
+            return Err(format!("{method} is not a desktop request"));
+        }
+        let mut open = self.inner.awake(key)?;
+        let live = open.get_mut(key).ok_or("this session is not live")?;
+        let id = live.next_id;
+        live.next_id += 1;
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        writeln!(live.input, "{frame}")
+            .and_then(|()| live.input.flush())
+            .map_err(|error| format!("Medha stopped: {error}"))?;
+        Ok(id)
+    }
+
+    pub fn close(&self, key: &str) -> Result<(), String> {
+        let removed = self
+            .inner
+            .open
+            .lock()
+            .map_err(|error| error.to_string())?
+            .remove(key);
+        drop(removed);
+        Ok(())
+    }
+}
+
+fn every() -> Vec<Arc<Inner>> {
+    EVERY
+        .lock()
+        .map(|mut every| {
+            every.retain(|inner| inner.strong_count() > 0);
+            every.iter().filter_map(Weak::upgrade).collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Only a chat that was opened is looked for, so focusing one never creates anything.
+pub fn wake(key: &str) {
+    let key = key.to_owned();
+    std::thread::spawn(move || {
+        for inner in every() {
+            let opened = inner.open.lock().is_ok_and(|open| open.contains_key(&key));
+            if opened {
+                drop(inner.awake(&key));
+            }
+        }
+    });
+}
+
+fn sweep_forever() {
+    loop {
+        std::thread::sleep(sleep::SWEEP);
+        for inner in every() {
+            inner.sweep(Instant::now());
+        }
+    }
+}
+
+impl Inner {
+    fn sweep(&self, now: Instant) {
+        let Ok(mut open) = self.open.lock() else {
+            return;
+        };
+        for (key, live) in open.iter_mut() {
+            if sleep::is_focused(key) || !matches!(live.child.try_wait(), Ok(None)) {
+                continue;
+            }
+            if let Some(ask) = live.rest.ask(now, sleep::GRACE)
+                && writeln!(live.input, "{ask}")
+                    .and_then(|()| live.input.flush())
+                    .is_err()
+            {
+                live.rest.closed();
+            }
+        }
+    }
+
+    /// Decides under the same lock the sweep asks under, so a sleep question
+    /// is either waited out here or written after the caller's frame.
+    fn awake(&self, key: &str) -> Result<MutexGuard<'_, Open>, String> {
+        loop {
+            let mut open = self.open.lock().map_err(|error| error.to_string())?;
+            let Some(live) = open.get(key) else {
+                return Ok(open);
+            };
+            let Some(now) = live.rest.current() else {
+                let rest = Arc::clone(&live.rest);
+                drop(open);
+                rest.settle()?;
+                continue;
+            };
+            let Settled::Asleep(wake) = now else {
+                live.rest.touch();
+                return Ok(open);
+            };
+            let (emit, next_id) = (Arc::clone(&live.emit), live.next_id);
+            let mut woken = self.spawn(&emit, wake.resume.as_deref(), Some(&wake))?;
+            // Ids keep counting, so no answer is matched to an earlier request.
+            woken.next_id = next_id;
+            if let Some(gone) = open.insert(key.to_owned(), woken) {
+                std::thread::spawn(move || drop(gone));
+            }
+            return Ok(open);
+        }
+    }
+
+    fn spawn(
+        &self,
+        emit: &Emit,
+        resume: Option<&str>,
+        wake: Option<&Wake>,
+    ) -> Result<Live, String> {
+        let backend = match &self.backend {
+            Some(backend) => backend.clone(),
+            None => crate::service::backend_executable()?,
+        };
+        let mut command = Command::new(backend);
+        command.arg("--acp").envs(self.env.iter().cloned());
         if let Some((address, token)) = crate::mcp_host::env() {
             command
                 .env("MEDHA_MCP_HOST", address)
@@ -205,6 +361,10 @@ impl LiveSessions {
         }
         if let Some(id) = resume {
             command.arg("--resume").arg(id);
+        }
+        if let Some(wake) = wake {
+            let settings = wake.settings.clone().unwrap_or_else(|| json!({}));
+            command.env("MEDHA_ACP_SETTINGS", settings.to_string());
         }
         let mut child = command
             .current_dir(&self.workspace)
@@ -230,10 +390,14 @@ impl LiveSessions {
             }
         });
 
-        let (app, key_owned) = (app.clone(), key.to_owned());
+        let rest = Rest::new();
+        let emitter = Arc::clone(emit);
         // A bounded pipe decouples blocking stdout reads from timed UI updates.
         // It cannot build an unbounded backlog when the renderer is slower.
         let (sender, frames) = sync_channel(64);
+        let reading = Arc::clone(&rest);
+        // A resumed chat is one the window knows; a fresh one brings a new session id.
+        let mut greeted = wake.is_none_or(|wake| wake.resume.is_none());
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -243,73 +407,53 @@ impl LiveSessions {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
-                if let Ok(frame) = serde_json::from_str::<Value>(&line)
-                    && sender.send(frame).is_err()
-                {
+                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if reading.answer(&frame) {
+                    continue;
+                }
+                if !greeted && frame["method"] == "ready" {
+                    greeted = true;
+                    continue;
+                }
+                if sender.send(frame).is_err() {
                     break;
                 }
             }
         });
+        let pumping = Arc::clone(&rest);
         std::thread::spawn(move || {
             let mut segment = String::new();
             let mut steps = Steps::default();
             pump_stream(frames, |frame| {
-                forward(
-                    &app,
-                    &key_owned,
-                    render(sanitize(frame, &mut steps), &mut segment),
-                );
+                emitter(render(sanitize(frame, &mut steps), &mut segment));
             });
+            if pumping.closed() {
+                return;
+            }
             let stderr = tail
                 .lock()
                 .map(|tail| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
                 .unwrap_or_default();
-            forward(
-                &app,
-                &key_owned,
-                json!({ "method": "exit", "params": { "stderr": stderr } }),
-            );
+            emitter(json!({ "method": "exit", "params": { "stderr": stderr } }));
         });
 
-        open.insert(
-            key.to_owned(),
-            Live {
-                child,
-                input,
-                next_id: 1,
-            },
-        );
-        Ok(())
-    }
-
-    pub fn request(&self, key: &str, method: &str, params: Value) -> Result<u64, String> {
-        if !REQUESTS.contains(&method) {
-            return Err(format!("{method} is not a desktop request"));
-        }
-        let mut open = self.open.lock().map_err(|error| error.to_string())?;
-        let live = open.get_mut(key).ok_or("this session is not live")?;
-        let id = live.next_id;
-        live.next_id += 1;
-        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        writeln!(live.input, "{frame}")
-            .and_then(|()| live.input.flush())
-            .map_err(|error| format!("Medha stopped: {error}"))?;
-        Ok(id)
-    }
-
-    pub fn close(&self, key: &str) -> Result<(), String> {
-        let removed = self
-            .open
-            .lock()
-            .map_err(|error| error.to_string())?
-            .remove(key);
-        drop(removed);
-        Ok(())
+        Ok(Live {
+            child,
+            input,
+            next_id: 1,
+            emit: Arc::clone(emit),
+            rest,
+        })
     }
 }
 
-fn forward(app: &AppHandle, key: &str, frame: Value) {
-    let _ = app.emit("medha-live", json!({ "key": key, "frame": frame }));
+fn forward(app: &AppHandle, key: &str) -> Emit {
+    let (app, key) = (app.clone(), key.to_owned());
+    Arc::new(move |frame| {
+        let _ = app.emit("medha-live", json!({ "key": key, "frame": frame }));
+    })
 }
 
 fn sanitize(mut frame: Value, steps: &mut Steps) -> Value {
@@ -398,3 +542,7 @@ pub(crate) fn is_ulid(id: &str) -> bool {
 #[cfg(test)]
 #[path = "live_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "live_sleep_tests.rs"]
+mod sleep_tests;

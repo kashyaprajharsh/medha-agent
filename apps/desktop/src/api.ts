@@ -248,6 +248,8 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
         workspaceId,
         sessionId,
       }),
+    liveFocus: (key: string | null) =>
+      invoke<void>("live_focus", { key: key ? keyFor(key) : null }),
     liveOpen: (key: string, sessionId: string | null) =>
       invoke<void>("live_open", { workspaceId, key: keyFor(key), sessionId }),
     liveRequest: (

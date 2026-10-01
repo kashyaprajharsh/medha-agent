@@ -482,3 +482,17 @@ async fn session_start_runs_once_per_session_and_not_for_sub_agents() {
     assert_eq!(hooks.count(HookPoint::SessionStart), 1);
     assert_eq!(hooks.count(HookPoint::PromptSubmit), 2);
 }
+
+#[tokio::test]
+async fn a_chat_continued_from_an_earlier_process_does_not_start_again() {
+    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    let hooks = Arc::new(PointHooks::default());
+    let kernel = build(provider, Arc::new(InMemoryLog::new()), hooks.clone());
+    let woken = Session::new();
+    kernel.continue_session(woken.id);
+    run(&kernel, &woken, &Notices::default()).await;
+    assert_eq!(hooks.count(HookPoint::SessionStart), 0);
+    assert_eq!(hooks.count(HookPoint::PromptSubmit), 1);
+    run(&kernel, &Session::new(), &Notices::default()).await;
+    assert_eq!(hooks.count(HookPoint::SessionStart), 1);
+}

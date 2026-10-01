@@ -236,6 +236,9 @@ export function App() {
     sessionId: draftKey ? null : selected,
   };
   useEffect(() => {
+    void api.liveFocus(currentKey).catch(() => undefined);
+  }, [api, currentKey]);
+  useEffect(() => {
     let active = true;
     void api
       .workspace()

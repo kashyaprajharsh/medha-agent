@@ -3,6 +3,7 @@ mod git;
 mod live;
 mod mcp_host;
 mod service;
+mod sleep;
 mod terminal;
 mod usage;
 mod workspaces;
@@ -166,6 +167,13 @@ fn live_request(
         .resolve(&workspace_id, Some(&key), None)?
         .live
         .request(&key, &method, params)
+}
+#[tauri::command]
+fn live_focus(key: Option<String>) {
+    sleep::focus(key.clone());
+    if let Some(key) = key {
+        live::wake(&key);
+    }
 }
 #[tauri::command]
 fn live_close(
@@ -482,6 +490,7 @@ fn main() {
             session_changes,
             live_open,
             live_request,
+            live_focus,
             live_close,
             terminal_open,
             terminal_write,

@@ -92,6 +92,27 @@ fn change(params: &Value, reasoning: kernel::ReasoningConfig) -> Result<Change, 
     }
 }
 
+/// The changes that put a fresh chat back the way [`settings`] described it;
+/// the profile goes first because switching it resets the rest.
+pub(crate) fn restore(saved: &Value) -> Vec<Value> {
+    let mut changes = Vec::new();
+    if let Some(profile) = saved["profile"].as_str() {
+        changes.push(json!({ "profile": profile }));
+    }
+    if let Some(mode) = saved["mode"].as_str() {
+        changes.push(json!({ "mode": mode }));
+    }
+    match (saved["reasoning"].as_str(), saved["effort"].as_str()) {
+        (_, Some(effort)) if effort != "auto" => changes.push(json!({ "effort": effort })),
+        (Some(reasoning), _) => changes.push(json!({ "reasoning": reasoning })),
+        _ => {}
+    }
+    if let Some(on) = saved["streaming"].as_bool() {
+        changes.push(json!({ "streaming": on }));
+    }
+    changes
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
     method: &str,
@@ -271,6 +292,31 @@ mod tests {
         ] {
             assert!(change(&request, kernel::ReasoningConfig::default()).is_err());
         }
+    }
+    #[test]
+    fn a_woken_chat_gets_its_settings_back_profile_first_and_each_one_valid() {
+        let saved = json!({ "profile": "beta", "mode": "yolo", "reasoning": "on",
+            "effort": "high", "streaming": false, "model": "ignored", "profiles": [] });
+        let changes = restore(&saved);
+        assert_eq!(
+            changes[0],
+            json!({ "profile": "beta" }),
+            "switching profile resets the rest"
+        );
+        assert_eq!(
+            changes[2],
+            json!({ "effort": "high" }),
+            "a chosen effort implies reasoning on"
+        );
+        assert_eq!(changes.len(), 4);
+        for request in &changes[1..] {
+            assert!(
+                change(request, kernel::ReasoningConfig::default()).is_ok(),
+                "{request}"
+            );
+        }
+        let off = restore(&json!({ "reasoning": "off", "effort": "auto" }));
+        assert_eq!(off, vec![json!({ "reasoning": "off" })]);
     }
     #[test]
     fn reasoning_off_clears_effort_and_auto_preserves_provider_defaults() {

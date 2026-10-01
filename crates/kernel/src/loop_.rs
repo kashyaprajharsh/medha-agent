@@ -641,6 +641,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         self
     }
 
+    /// Records that `session` already started in an earlier process of the same chat.
+    pub fn continue_session(&self, session: ulid::Ulid) {
+        if let Ok(mut started) = self.started_sessions.lock() {
+            started.insert(session);
+        }
+    }
+
     /// Install the host-side hook runner. Hooks can narrow or escalate a tool
     /// decision, but this boundary exposes no way to register a model tool.
     /// Applies hook enable/disable decisions to this running process.

@@ -22,6 +22,8 @@ const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const TURN_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const TURN_ABORT_GRACE: Duration = Duration::from_secs(2);
 const ROSTER_INTERVAL: Duration = Duration::from_millis(500);
+/// Settings a chat had when the desktop put it to sleep, handed back on waking.
+const RESTORE_ENV: &str = "MEDHA_ACP_SETTINGS";
 
 enum Outbound {
     Frame(Vec<u8>),
@@ -1420,6 +1422,32 @@ where
     // Connection changes are pushed to the window as they happen.
     let mut mcp_changes = extensions.mcp.as_ref().map(|manager| manager.subscribe());
     let mut prompt_reply: Option<Value> = None;
+    if let Some(saved) = std::env::var(RESTORE_ENV)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    {
+        // Its start hooks already added their context to this conversation.
+        if !resumed.is_empty() {
+            kernel.continue_session(session.id);
+        }
+        for change in crate::desktop_controls::restore(&saved) {
+            if let Some(Err(error)) = crate::desktop_controls::handle(
+                "session.configure",
+                &change,
+                &kernel,
+                &mut session,
+                &mut model,
+                &mut active_profile,
+                &model_config,
+                false,
+                agents.as_ref(),
+            )
+            .await
+            {
+                eprintln!("note: could not restore {change}: {error}");
+            }
+        }
+    }
     writer.notify(
         "ready",
         json!({
@@ -1442,6 +1470,7 @@ where
 
     let mut reports_ready = true; // Also collect reports retained across restart.
     let mut turn_requested = false;
+    let mut asleep = false;
     loop {
         if !running && (turn_requested || reports_ready) {
             reports_ready = false;
@@ -1530,6 +1559,16 @@ where
                         Some(if running || agents.as_ref().is_some_and(|control| !control.active().is_empty()) || !kernel.executor.background_tasks().is_empty() { Err("Finish or stop active work before reloading extensions.".into()) } else { extensions.reload().await })
                     } else if method == "extensions.catalog" {
                         Some(Ok(extensions.catalog(&kernel).await))
+                    } else if method == "session.sleep" {
+                        // Nothing is read after a yes, so a frame sent behind it is never half-handled.
+                        asleep = !running && agents.as_ref().is_none_or(|control| control.active().is_empty() && control.cached_unmerged() == 0) && kernel.executor.background_tasks().is_empty();
+                        if asleep {
+                            let resumable = !kernel.log.events(session.id).await.is_empty();
+                            let settings = crate::desktop_controls::handle("session.settings", &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, running, agents.as_ref()).await.and_then(Result::ok);
+                            Some(Ok(json!({ "slept": true, "session": resumable.then(|| session.id.to_string()), "settings": settings })))
+                        } else {
+                            Some(Ok(json!({ "slept": false })))
+                        }
                     } else {
                         crate::desktop_controls::handle(method, &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, running, agents.as_ref()).await
                     };
@@ -1544,6 +1583,7 @@ where
                             }
                             Err(error) => rpc_error(&writer, &id, -32001, error),
                         }
+                        if asleep { break; }
                         continue;
                     }
                     if matches!(method, "cancel" | "interrupt" | "shutdown" | "exit") { crate::acp_questions::clear(&questions); }
@@ -1664,13 +1704,16 @@ where
     settle_turn(&mut interrupt, &pending, &mut turns, TURN_SHUTDOWN_GRACE).await;
     deny_pending(&pending);
     crate::acp_questions::clear(&questions);
-    kernel
-        .observe_hook(
-            &session,
-            kernel::HookPoint::SessionEnd,
-            json!({ "source": "acp" }),
-        )
-        .await;
+    // A sleeping chat has not ended; it wakes on the next message.
+    if !asleep {
+        kernel
+            .observe_hook(
+                &session,
+                kernel::HookPoint::SessionEnd,
+                json!({ "source": "acp" }),
+            )
+            .await;
+    }
     writer_task.finish(&writer).await;
     Ok(())
 }

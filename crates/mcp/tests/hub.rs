@@ -3,6 +3,7 @@
 mod common;
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{
         Arc,
@@ -13,7 +14,7 @@ use std::{
 
 use common::read_http_request;
 use mcp::{
-    Config, McpManager, RemoteAuth, ServerConfig, ServerState, TokenStore, Transport,
+    Config, McpManager, RemoteAuth, ServerConfig, ServerState, TokenStore, ToolFilter, Transport,
     hub::{Endpoint, Resolve},
 };
 use serde_json::{Value, json};
@@ -140,7 +141,7 @@ async fn host_with(
     let file = Arc::clone(&user);
     let resolve: Resolve = Arc::new(move |id: &str| {
         let servers = file.lock().unwrap();
-        servers.iter().find(|server| server.id == id).cloned()
+        Ok(servers.iter().find(|server| server.id == id).cloned())
     });
     let (serving, address, token) = (
         manager.clone(),
@@ -258,6 +259,11 @@ async fn known_tools_are_listed_before_the_server_answers() {
         config(vec![hosted(&url)], Some(cache.clone())),
     );
     first.connect_startup().await;
+    // The last-known tools are saved once the server answers, which may outlast startup.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !cache.join("hosted.json").is_file() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     first.shutdown().await;
 
     let next = McpManager::new(
@@ -410,6 +416,8 @@ async fn turning_a_server_off_in_one_chat_lets_another_chats_call_finish() {
     let (_host, endpoint) = host(&url, dir.path()).await;
     let first = chat(dir.path(), &endpoint).await;
     let second = chat(dir.path(), &endpoint).await;
+    // The call must be running when the server goes off, not still waiting to connect.
+    reaches(&second, "hosted", ServerState::Ready).await;
 
     let call = tokio::spawn({
         let second = second.clone();
@@ -461,5 +469,113 @@ async fn an_impostor_at_the_address_never_learns_the_token() {
     assert!(
         !heard.contains(token),
         "the token crossed the channel: {heard}"
+    );
+}
+
+fn offered(chat: &McpManager, server: &str) -> bool {
+    let prefix = format!("mcp__{server}__");
+    chat.tool_specs()
+        .iter()
+        .any(|spec| spec.name.starts_with(&prefix))
+}
+
+async fn settles(chat: &McpManager, server: &str, want: bool) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while offered(chat, server) != want && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    offered(chat, server) == want
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chat_already_open_follows_every_change_to_the_users_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = counting_server(Arc::new(AtomicUsize::new(0))).await;
+    let named = |id: &str, disabled: bool| ServerConfig {
+        id: id.into(),
+        disabled,
+        ..hosted(&url)
+    };
+    let both = vec![hosted(&url), named("other", false)];
+    let (host, endpoint, _) = host_with(both.clone(), dir.path()).await;
+    let chat = chat(dir.path(), &endpoint).await;
+    assert!(settles(&chat, "other", true).await);
+
+    let none = HashSet::new();
+    host.reconcile(vec![hosted(&url), named("other", true)], &none)
+        .await;
+    assert!(
+        settles(&chat, "other", false).await,
+        "a server switched off in the config kept its tools in an open chat"
+    );
+    host.reconcile(both, &none).await;
+    assert!(
+        settles(&chat, "other", true).await,
+        "switched back on, it stayed off"
+    );
+    host.reconcile(vec![hosted(&url)], &none).await;
+    assert!(
+        settles(&chat, "other", false).await,
+        "a removed server stayed in the chat"
+    );
+    assert!(offered(&chat, "hosted"), "a kept server left with it");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_whose_key_cannot_be_read_holds_back_only_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = counting_server(Arc::new(AtomicUsize::new(0))).await;
+    let other = ServerConfig {
+        id: "other".into(),
+        ..hosted(&url)
+    };
+    let (host, endpoint, _) = host_with(vec![hosted(&url), other], dir.path()).await;
+    let chat = chat(dir.path(), &endpoint).await;
+    assert!(settles(&chat, "hosted", true).await);
+    assert!(settles(&chat, "other", true).await);
+
+    // "other" was removed from the config while "hosted"'s key could not be read.
+    let held = HashSet::from(["hosted".to_string()]);
+    host.reconcile(Vec::new(), &held).await;
+    assert!(
+        settles(&chat, "other", false).await,
+        "an unreadable key elsewhere kept a removed server in the chat"
+    );
+    assert!(
+        offered(&chat, "hosted"),
+        "a running server was dropped because its key could not be read"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_switched_off_leaves_an_open_chat_while_its_server_stays_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = counting_server(Arc::new(AtomicUsize::new(0))).await;
+    let (host, endpoint, _) = host_with(vec![hosted(&url)], dir.path()).await;
+    let chat = chat(dir.path(), &endpoint).await;
+    assert!(settles(&chat, "hosted", true).await);
+
+    let ping_off = ServerConfig {
+        tools: ToolFilter {
+            allow: Vec::new(),
+            deny: vec!["ping".into()],
+        },
+        ..hosted(&url)
+    };
+    host.reconcile(vec![ping_off], &HashSet::new()).await;
+    assert!(
+        settles(&chat, "hosted", false).await,
+        "a tool switched off still reached the model"
+    );
+    assert_eq!(
+        reaches(&chat, "hosted", ServerState::Ready).await,
+        Some(ServerState::Ready),
+        "switching one tool off took its whole server down"
+    );
+    assert!(
+        chat.server_tools("hosted")
+            .iter()
+            .any(|(name, on)| name == "ping" && !on),
+        "the switched-off tool should still be listed, switched off"
     );
 }

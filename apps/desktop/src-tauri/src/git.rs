@@ -72,6 +72,9 @@ fn repository(dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
 /// Changes under `dir`. A folder that is not itself a repository, such as one
 /// holding several projects, reports the repositories directly inside it.
 pub fn status(dir: &Path) -> Result<Value, String> {
+    if !dir.exists() {
+        return Ok(json!({"repository": false, "files": []}));
+    }
     if repository(dir)?.is_some() {
         return Ok(json!({"repository": true, "files": entries(dir, dir)?}));
     }

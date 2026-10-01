@@ -888,6 +888,37 @@ impl McpManager {
         self.server_status(&server.id).await
     }
 
+    /// Run exactly `servers`, as the host does with the user's config: one removed,
+    /// switched off or edited there changes for every chat, and one left as it
+    /// was keeps its connection. One `held` back (still in the config, its key
+    /// unreadable) keeps running as it is; it never holds back the others.
+    pub async fn reconcile(
+        &self,
+        servers: Vec<ServerConfig>,
+        held: &std::collections::HashSet<String>,
+    ) {
+        let stale: Vec<String> = self
+            .inner
+            .servers
+            .lock()
+            .await
+            .keys()
+            .filter(|id| !held.contains(*id) && servers.iter().all(|server| &server.id != *id))
+            .cloned()
+            .collect();
+        for id in stale {
+            let _ = self.remove_server(&id).await;
+        }
+        let mut set = JoinSet::new();
+        for server in servers {
+            let this = self.clone();
+            set.spawn(async move {
+                let _ = this.ensure(server, false).await;
+            });
+        }
+        while set.join_next().await.is_some() {}
+    }
+
     /// Remove a server at runtime (from `/mcp remove`): protocol shutdown, reap
     /// its process tree, and purge its tools.
     pub async fn remove_server(&self, server_id: &str) -> Result<(), Error> {

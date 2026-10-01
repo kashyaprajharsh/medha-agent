@@ -5,7 +5,6 @@ mod mcp_host;
 mod service;
 mod sleep;
 mod terminal;
-mod usage;
 mod workspaces;
 
 use serde_json::Value;
@@ -61,7 +60,7 @@ fn workspace_reveal(
     files::open_path(
         &state
             .workspaces
-            .resolve(&workspace_id, chat_key.as_deref(), session_id.as_deref())?
+            .start(&workspace_id, chat_key.as_deref(), session_id.as_deref())?
             .path,
     )
 }
@@ -150,7 +149,7 @@ fn live_open(
 ) -> Result<(), String> {
     state
         .workspaces
-        .resolve(&workspace_id, Some(&key), session_id.as_deref())?
+        .start(&workspace_id, Some(&key), session_id.as_deref())?
         .live
         .open(&app, &key, session_id.as_deref())
 }
@@ -203,7 +202,7 @@ async fn terminal_open(
     let runtime =
         state
             .workspaces
-            .resolve(&workspace_id, chat_key.as_deref(), session_id.as_deref())?;
+            .start(&workspace_id, chat_key.as_deref(), session_id.as_deref())?;
     let mut terminals = state.terminals.lock().map_err(|e| e.to_string())?;
     if terminals.len() >= 16 {
         return Err("Close an unused terminal before opening another".into());
@@ -383,10 +382,12 @@ async fn extension_request(
     {
         return Err("Unsupported extension action".into());
     }
-    let runtime =
-        state
-            .workspaces
-            .resolve(&workspace_id, chat_key.as_deref(), session_id.as_deref())?;
+    let runtime = state.workspaces.for_request(
+        &workspace_id,
+        chat_key.as_deref(),
+        session_id.as_deref(),
+        &method,
+    )?;
     tauri::async_runtime::spawn_blocking(move || runtime.request_params(&method, params))
         .await
         .map_err(|error| error.to_string())?
@@ -437,13 +438,21 @@ async fn settings_request(
     {
         return Err("Unsupported settings action".into());
     }
-    let runtime =
-        state
-            .workspaces
-            .resolve(&workspace_id, chat_key.as_deref(), session_id.as_deref())?;
-    tauri::async_runtime::spawn_blocking(move || runtime.request_params(&method, params))
-        .await
-        .map_err(|error| error.to_string())?
+    let runtime = state.workspaces.for_request(
+        &workspace_id,
+        chat_key.as_deref(),
+        session_id.as_deref(),
+        &method,
+    )?;
+    let shared = method.starts_with("settings.mcp.") || method.starts_with("settings.keys.");
+    let result =
+        tauri::async_runtime::spawn_blocking(move || runtime.request_params(&method, params))
+            .await
+            .map_err(|error| error.to_string())?;
+    if shared && result.is_ok() {
+        mcp_host::changed();
+    }
+    result
 }
 #[tauri::command]
 async fn image_admit(request: tauri::ipc::Request<'_>) -> Result<Value, String> {

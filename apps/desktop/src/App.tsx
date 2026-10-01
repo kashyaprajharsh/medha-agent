@@ -51,8 +51,6 @@ function store(key: string, value: string) {
   }
 }
 
-let drafts = 0;
-
 export function App() {
   const api = useWorkspaceApi();
   const context = useWorkspace();
@@ -82,6 +80,8 @@ export function App() {
   const [draftKey, setDraftKey] = useState<string | null>(
     () => `draft-${crypto.randomUUID()}`,
   );
+  // Nothing sent from it yet: "New session" returns here instead of piling up empty chats.
+  const spareDraft = useRef(draftKey);
   const [events, setEvents] = useState<HistoryEvent[]>([]);
   const [reload, setReload] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -441,19 +441,22 @@ export function App() {
     };
   }, [context.active, theme]);
 
+  function spare() {
+    spareDraft.current ??= `draft-${crypto.randomUUID()}`;
+    return spareDraft.current;
+  }
+
   function startNew() {
-    drafts += 1;
     setPage("chat");
     setPreview(null);
-    setDraftKey(`draft-${crypto.randomUUID()}`);
+    setDraftKey(spare());
   }
 
   /** A new chat with its first message written but not sent. */
   function startWith(prompt: string) {
-    drafts += 1;
     setPage("chat");
     setPreview(null);
-    const key = `draft-${crypto.randomUUID()}`;
+    const key = spare();
     setDraftKey(key);
     setText((all) => ({ ...all, [key]: prompt }));
   }
@@ -473,6 +476,7 @@ export function App() {
     setText((all) => ({ ...all, [currentKey]: "" }));
     setAway(false);
     setAttachments((all) => ({ ...all, [currentKey]: [] }));
+    if (currentKey === spareDraft.current) spareDraft.current = null;
     void send(currentKey, draftKey ? null : selected, body, images).catch(
       () => {
         setText((all) => ({

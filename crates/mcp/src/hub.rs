@@ -497,8 +497,10 @@ impl Link {
 }
 
 /// Which servers the host may run: an id from the user's own config, resolved
-/// by the host itself. A chat can name a server, never define one.
-pub type Resolve = Arc<dyn Fn(&str) -> Option<ServerConfig> + Send + Sync>;
+/// by the host itself. A chat can name a server, never define one. An error is
+/// a definition that could not be read, a saved key among it: the server the
+/// host already runs must then stay as it is.
+pub type Resolve = Arc<dyn Fn(&str) -> Result<Option<ServerConfig>, String> + Send + Sync>;
 
 /// Serve one attached chat until it disconnects.
 pub async fn serve<S>(manager: McpManager, stream: S, token: Arc<str>, resolve: Resolve)
@@ -584,7 +586,9 @@ async fn handle(
             Ok(serde_json::to_value(output).unwrap_or(Value::Null))
         }
         "ensure" => {
-            let config = resolve(&server).ok_or(WireError::NotShared)?;
+            let config = resolve(&server)
+                .map_err(|message| WireError::Other { message })?
+                .ok_or(WireError::NotShared)?;
             let connect = request.params["connect"].as_bool().unwrap_or(false);
             Ok(status(manager.ensure(config, connect).await?))
         }

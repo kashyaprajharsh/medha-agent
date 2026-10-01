@@ -6370,7 +6370,8 @@ pub(super) fn run_slash<P: kernel::Provider>(
             let fix = c.strip_prefix("pulse").unwrap_or("").trim() == "fix";
             // Snapshot the live profile registry for a prompt-free config read.
             let snapshot = model.model_config.lock().ok().map(|g| g.clone());
-            let report = config::pulse(snapshot.as_ref(), None, None);
+            let here = std::env::current_dir().ok();
+            let report = config::pulse(snapshot.as_ref(), None, None, here.as_deref());
             let mut text = report.render();
             if fix {
                 if let Ok(mut guard) = model.model_config.lock() {

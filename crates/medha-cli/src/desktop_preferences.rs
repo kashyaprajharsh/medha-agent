@@ -351,7 +351,12 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
         }
         "settings.health" => {
             let cfg = config::load()?;
-            Ok(health_view(&config::pulse(cfg.as_ref(), None, None)))
+            Ok(health_view(&config::pulse(
+                cfg.as_ref(),
+                None,
+                None,
+                Some(workspace),
+            )))
         }
         "settings.health.fix" => {
             let mut applied = Vec::new();

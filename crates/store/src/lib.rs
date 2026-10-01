@@ -577,8 +577,33 @@ impl SqliteLog {
         ensure_hash_version_column(&mut conn)?;
         migrate_event_chain_v2(&mut conn)?;
         backfill_event_fts(&mut conn)?;
+        Ok(Self::around(conn, mutation_lock, global_mutation_lock))
+    }
 
-        Ok(Self {
+    /// Open an existing log to look at it: no schema change, no migration and no
+    /// write lock, so listing chats never waits on one that is mid-turn.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| StoreError::Db(error.to_string()))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|error| StoreError::Db(error.to_string()))?;
+        Ok(Self::around(
+            conn,
+            path.with_extension("mutations.db"),
+            None,
+        ))
+    }
+
+    fn around(
+        conn: Connection,
+        mutation_lock: PathBuf,
+        global_mutation_lock: Option<PathBuf>,
+    ) -> Self {
+        Self {
             conn: Arc::new(Mutex::new(conn)),
             verified_version: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -586,7 +611,7 @@ impl SqliteLog {
             runtime_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             mutation_lock,
             global_mutation_lock,
-        })
+        }
     }
 
     fn mutation_lock_for(&self, mutation_key: &str) -> PathBuf {
@@ -747,6 +772,34 @@ impl SqliteLog {
                 last_ts: last,
                 events: count as u64,
             });
+        }
+        Ok(out)
+    }
+
+    /// Sub-agent starts as (dispatching session, payload), for display only like
+    /// [`Self::list_sessions`]: reading the whole log to find them grows with history.
+    pub fn agent_spawns(&self) -> Result<Vec<(Ulid, serde_json::Value)>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Db("lock poisoned".into()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, payload FROM events
+                 WHERE kind = 'agent.spawned' ORDER BY rowid ASC",
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (session, payload) = row.map_err(|e| StoreError::Db(e.to_string()))?;
+            if let (Ok(session), Ok(payload)) =
+                (Ulid::from_string(&session), serde_json::from_str(&payload))
+            {
+                out.push((session, payload));
+            }
         }
         Ok(out)
     }
@@ -1326,19 +1379,26 @@ fn migrate_event_chain_v2(conn: &mut Connection) -> Result<(), StoreError> {
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| StoreError::Db(error.to_string()))?;
-    let rows = load_chain_rows(&tx)?;
-    let legacy = rows
-        .iter()
-        .any(|(_, row, _)| row.hash_version != EVENT_HASH_VERSION);
+    // Asked of SQLite, not of every row in memory: this runs on each open, and a
+    // long history made every chat process load its whole log just to start.
+    let (legacy, empty): (bool, bool) = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE hash_version != ?1),
+                    NOT EXISTS(SELECT 1 FROM events)",
+            [EVENT_HASH_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| StoreError::Db(error.to_string()))?;
 
     if !legacy {
-        if rows.is_empty() && read_chain_anchor(&tx)?.is_none() {
+        if empty && read_chain_anchor(&tx)?.is_none() {
             set_chain_anchor(&tx, 0, &[0u8; 32])?;
         }
         tx.commit()
             .map_err(|error| StoreError::Db(error.to_string()))?;
         return Ok(());
     }
+    let rows = load_chain_rows(&tx)?;
 
     // Authenticate the old representation before changing any link.
     let (old_count, old_head) = validated_chain(&rows)?;
@@ -1552,6 +1612,25 @@ mod tests {
         assert_eq!(sessions[1].id, s1.id);
         assert_eq!(sessions[1].title, "first task here");
         assert_eq!(sessions[1].events, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_read_only_log_lists_sessions_while_a_chat_is_writing() {
+        let dir = std::env::temp_dir().join(format!("medha-ro-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let session = kernel::Session::default();
+        let log = SqliteLog::open(&db).unwrap();
+        log.append(Event::user_message(&session, "mid-turn"))
+            .await
+            .unwrap();
+        let writer = Connection::open(&db).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let listed = SqliteLog::open_read_only(&db)
+            .and_then(|log| log.list_sessions())
+            .expect("listing waited on the chat's write lock");
+        assert_eq!(listed[0].title, "mid-turn");
         std::fs::remove_dir_all(&dir).ok();
     }
 

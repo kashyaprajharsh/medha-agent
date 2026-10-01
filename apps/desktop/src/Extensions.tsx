@@ -197,7 +197,16 @@ export function Extensions({
               ? "Skill installed"
               : `Installed and off. Review these findings before enabling: ${(result.findings as string[]).join("; ")}`
             : method === "settings.mcp.update"
-              ? "Saved. Reconnect the server to apply it to this chat."
+              ? // The shared host applies a trusted remote server's change to every chat itself.
+                mcp.some(
+                  (s) =>
+                    s.id === params.id &&
+                    s.url &&
+                    !s.executable &&
+                    s.trust === "trusted",
+                )
+                ? "Saved"
+                : "Saved. Reconnect the server to apply it to this chat."
               : method === "settings.mcp.signout"
                 ? "Signed out. The server stays configured."
                 : "Saved",

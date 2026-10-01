@@ -334,7 +334,8 @@ async fn run_gate_command(args: Vec<String>) -> Result<()> {
 fn run_pulse_command(args: &[String]) -> Result<()> {
     let fix = args.iter().any(|a| a == "--fix" || a == "fix");
     let cfg = config::load()?;
-    let report = config::pulse(cfg.as_ref(), None, None);
+    let here = std::env::current_dir().ok();
+    let report = config::pulse(cfg.as_ref(), None, None, here.as_deref());
     print!("{}", report.render());
 
     if fix {

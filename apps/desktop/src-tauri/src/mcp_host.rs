@@ -1,7 +1,8 @@
 //! One `medha mcp-host` per app, restarted at the same address so chats reattach on their own.
 
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::io::Write;
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 struct Endpoint {
@@ -10,6 +11,17 @@ struct Endpoint {
 }
 
 static HOST: OnceLock<Option<Endpoint>> = OnceLock::new();
+static PIPE: Mutex<Option<ChildStdin>> = Mutex::new(None);
+
+/// Tells the host a server or a key was just saved, so open chats follow at once
+/// instead of when the host next looks at the config file.
+pub fn changed() {
+    if let Ok(mut pipe) = PIPE.lock()
+        && let Some(pipe) = pipe.as_mut()
+    {
+        let _ = pipe.write_all(b"\n").and_then(|()| pipe.flush());
+    }
+}
 
 pub fn env() -> Option<(String, String)> {
     HOST.get_or_init(start)
@@ -50,8 +62,13 @@ fn supervise(backend: std::path::PathBuf, address: String, token: String) {
         if let Ok(mut child) = spawned {
             // The host exits when this pipe closes, which happens when the app does.
             let stdin = child.stdin.take();
+            if let Ok(mut pipe) = PIPE.lock() {
+                *pipe = stdin;
+            }
             let _ = child.wait();
-            drop(stdin);
+            if let Ok(mut pipe) = PIPE.lock() {
+                pipe.take();
+            }
         }
         if started.elapsed() > Duration::from_secs(30) {
             delay = Duration::from_millis(500);

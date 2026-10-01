@@ -345,3 +345,33 @@ fn a_recorded_verifier_result_shows_as_a_check_and_a_person_quoting_one_does_not
     assert_eq!(page.events[0].text.as_deref(), Some("cargo test passed"));
     assert_eq!(page.events[0].output, None);
 }
+
+#[tokio::test]
+async fn a_subagent_session_is_listed_under_the_chat_that_dispatched_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = store::SqliteLog::open(dir.path().join("events.db")).unwrap();
+    let (parent, child, unrelated) = (Session::new(), Session::new(), Session::new());
+    let dispatch = Event::agent_dispatched(
+        &parent,
+        Ulid::new(),
+        "kernel",
+        child.id,
+        "Audit the kernel loop",
+        Ulid::new(),
+    );
+    for event in [
+        Event::user_message(&parent, "Review the kernel"),
+        dispatch,
+        Event::user_message(&child, "Audit the kernel loop"),
+        Event::user_message(&unrelated, "Something else"),
+    ] {
+        log.append(event).await.unwrap();
+    }
+    let views = list_session_views(&log).unwrap();
+    let view = |id: Ulid| views.iter().find(|view| view.id == id.to_string()).unwrap();
+    assert_eq!(view(child.id).parent_id, Some(parent.id.to_string()));
+    assert_eq!(view(child.id).title, "kernel");
+    assert_eq!(view(parent.id).parent_id, None);
+    assert_eq!(view(parent.id).title, "Review the kernel");
+    assert_eq!(view(unrelated.id).parent_id, None);
+}

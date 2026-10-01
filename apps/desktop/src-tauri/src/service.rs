@@ -81,6 +81,25 @@ impl Service {
     }
 }
 
+#[cfg(test)]
+impl Service {
+    /// Any child with pipes: lifecycle tests never send it a request.
+    pub(crate) fn stand_in() -> Self {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+            next_id: 1,
+        }
+    }
+}
+
 impl Drop for Service {
     fn drop(&mut self) {
         let _ = self.child.kill();

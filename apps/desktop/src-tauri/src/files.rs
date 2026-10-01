@@ -19,6 +19,10 @@ pub fn resolve(root: &Path, requested: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 pub fn list(root: &Path, directory: &str) -> Result<Value, String> {
+    // A chat that has not started has no folder yet, so nothing in it.
+    if !root.exists() {
+        return Ok(json!([]));
+    }
     let directory = resolve(root, directory)?;
     let mut rows = Vec::new();
     for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {

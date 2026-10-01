@@ -170,7 +170,9 @@ export function Connectors({
 
   async function disconnect(server: string, forget: boolean) {
     waitingFor.current = null;
-    if (sessionKey) await api.liveCall(sessionKey, "mcp.disconnect", { id: server }).catch(() => undefined);
+    const live = sessionKey && (await api.liveCall(sessionKey, "mcp.disconnect", { id: server }).then(() => true, () => false));
+    // No chat is running to switch it off: the saved setting does, for every chat.
+    if (!live && !forget) await api.settings("settings.mcp.update", { id: server, disabled: true }).catch(() => undefined);
     if (forget) await api.settings("settings.mcp.remove", { id: server }).catch(() => undefined);
     onChanged();
   }

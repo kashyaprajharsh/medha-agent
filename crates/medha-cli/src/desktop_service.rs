@@ -206,6 +206,62 @@ async fn handle(log: &store::SqliteLog, workspace: &std::path::Path, req: Reques
             Ok(sessions) => Response::ok(req.id, sessions),
             Err(error) => Response::error(req.id, error.to_string()),
         },
+        "library.sessions" => {
+            let prune_before = req.params["prune_before"].as_f64();
+            let mut rows = Vec::new();
+            for folder in library_chats(workspace) {
+                let listed = chat_store(&folder)
+                    .map(|events| list_session_views(&store::SqliteLog::open_read_only(events)?));
+                let sessions = match listed {
+                    Some(Ok(sessions)) => sessions,
+                    None => Vec::new(),
+                    Some(Err(error)) => {
+                        eprintln!("skipping {}: {error:#}", folder.display());
+                        continue;
+                    }
+                };
+                if sessions.is_empty() {
+                    if let Some(before) = prune_before {
+                        prune_unused(&folder, before);
+                    }
+                    continue;
+                }
+                for session in sessions {
+                    let mut row = json!(session);
+                    row["folder"] = json!(folder);
+                    rows.push(row);
+                }
+            }
+            Response::ok(req.id, rows)
+        }
+        "library.usage" => {
+            let days = req.params["days"].as_u64().unwrap_or(30).clamp(1, 365) as u32;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs_f64())
+                .unwrap_or_default();
+            let (mut calls, mut sessions) = (Vec::new(), HashMap::new());
+            for events in library_chats(workspace)
+                .iter()
+                .filter_map(|folder| chat_store(folder))
+            {
+                // A chat left out would show a total that is too low as if it were right.
+                let log = match store::SqliteLog::open(&events) {
+                    Ok(log) => log,
+                    Err(error) => {
+                        let reason = format!("A chat's history could not be read: {error}");
+                        return Response::error(req.id, reason);
+                    }
+                };
+                let (more, known) = crate::usage_insights::collect(&log, days, now).await;
+                calls.extend(more);
+                sessions.extend(known);
+            }
+            Response::ok(
+                req.id,
+                crate::usage_insights::summarize(&calls, &sessions, days),
+            )
+        }
         "sessions.events" => {
             let Some(id) = req
                 .session_id
@@ -255,6 +311,44 @@ async fn handle(log: &store::SqliteLog, workspace: &std::path::Path, req: Reques
     }
 }
 
+/// The Personal library keeps each chat in its own folder; one process reads them all.
+fn library_chats(library: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(library) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("chat-"))
+        .filter_map(|entry| entry.path().canonicalize().ok())
+        .filter(|folder| folder.is_dir() && folder.starts_with(library))
+        .collect()
+}
+
+/// Where a chat's history is kept, or `None` for one that never started.
+fn chat_store(folder: &std::path::Path) -> Option<PathBuf> {
+    let events = super::config::existing_state_dir(folder)?.join("events.db");
+    events.is_file().then_some(events)
+}
+
+/// A chat with no sessions and an empty folder, untouched since `before`, was never used.
+fn prune_unused(folder: &std::path::Path, before: f64) {
+    let untouched = std::fs::metadata(folder)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|at| at.as_secs_f64() < before);
+    if !untouched {
+        return;
+    }
+    // Found first: the lookup needs the folder. `remove_dir` refuses one that is not empty.
+    let state = super::config::existing_state_dir(folder);
+    if std::fs::remove_dir(folder).is_ok()
+        && let Some(state) = state
+    {
+        let _ = std::fs::remove_dir_all(state);
+    }
+}
+
 fn list_session_views(log: &store::SqliteLog) -> Result<Vec<SessionView>> {
     let sessions = log.list_sessions()?;
     let session_ids = sessions
@@ -262,30 +356,22 @@ fn list_session_views(log: &store::SqliteLog) -> Result<Vec<SessionView>> {
         .map(|session| session.id)
         .collect::<std::collections::HashSet<_>>();
     let mut parents = HashMap::new();
-    for event in log.all_events()? {
-        if event.kind != EventKind::AgentSpawned {
-            continue;
-        }
-        let Some(child) = event
-            .payload
+    for (session, payload) in log.agent_spawns()? {
+        let Some(child) = payload
             .get("child")
             .and_then(Value::as_str)
             .and_then(|id| Ulid::from_string(id).ok())
         else {
             continue;
         };
-        if session_ids.contains(&event.session_id)
-            && session_ids.contains(&child)
-            && child != event.session_id
-        {
-            let name = event
-                .payload
+        if session_ids.contains(&session) && session_ids.contains(&child) && child != session {
+            let name = payload
                 .get("agent")
                 .and_then(Value::as_str)
                 .unwrap_or("Subagent");
             parents
                 .entry(child)
-                .or_insert_with(|| (event.session_id, name.to_owned()));
+                .or_insert_with(|| (session, name.to_owned()));
         }
     }
     Ok(sessions

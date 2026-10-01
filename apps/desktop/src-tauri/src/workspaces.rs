@@ -7,8 +7,37 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
+
+/// Seconds an empty chat folder is left alone before it counts as unused.
+const UNUSED_CHAT_GRACE: f64 = 600.0;
+const SERVICE_IDLE: Duration = Duration::from_secs(300);
+const SERVICE_SWEEP: Duration = Duration::from_secs(60);
+
+type Runtimes = Mutex<HashMap<PathBuf, Arc<Runtime>>>;
+
+/// Runs while the registry lives: idle services stop instead of piling up for every chat ever opened.
+fn rest_idle_services(runtimes: Weak<Runtimes>) {
+    loop {
+        std::thread::sleep(SERVICE_SWEEP);
+        let Some(runtimes) = runtimes.upgrade() else {
+            return;
+        };
+        let all: Vec<_> = runtimes
+            .lock()
+            .map(|runtimes| runtimes.values().cloned().collect())
+            .unwrap_or_default();
+        drop(runtimes);
+        for runtime in all {
+            runtime.rest(Instant::now());
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Workspace {
@@ -21,8 +50,9 @@ pub struct Workspace {
 /// Requests that wait on git or the network. They run in a second service
 /// process: the backend answers one request at a time, and a slow clone must
 /// never hold up session history.
-pub(crate) const SLOW_REQUESTS: [&str; 9] = [
+pub(crate) const SLOW_REQUESTS: [&str; 10] = [
     "usage.summary",
+    "library.usage",
     "extensions.mcp.registry",
     "extensions.install",
     "extensions.update.preview",
@@ -33,10 +63,30 @@ pub(crate) const SLOW_REQUESTS: [&str; 9] = [
     "settings.model.discover",
 ];
 
+/// Requests that change the chat's own folder or its state, not the user's settings.
+const CHAT_WRITES: [&str; 15] = [
+    "settings.tools.save",
+    "instructions.save",
+    "extensions.install",
+    "extensions.enable",
+    "extensions.disable",
+    "extensions.remove",
+    "extensions.rollback",
+    "extensions.update.apply",
+    "extensions.hooks.add",
+    "extensions.hooks.remove",
+    "extensions.skill.configure",
+    "extensions.skill.install",
+    "extensions.skill.remove",
+    "extensions.skills.lock",
+    "extensions.skills.sync",
+];
+
 pub struct Runtime {
     pub path: PathBuf,
     service: Mutex<Option<Service>>,
     jobs: Mutex<Option<Service>>,
+    used: Mutex<Instant>,
     pub live: LiveSessions,
     pub terminals: Terminals,
 }
@@ -48,6 +98,7 @@ impl Runtime {
             path,
             service: Mutex::new(None),
             jobs: Mutex::new(None),
+            used: Mutex::new(Instant::now()),
         }
     }
     fn with_service<T>(
@@ -66,7 +117,25 @@ impl Runtime {
         }) {
             *service = None;
         }
+        if let Ok(mut used) = self.used.lock() {
+            *used = Instant::now();
+        }
         result
+    }
+    /// Stops service processes nobody has asked anything of lately; a request in
+    /// flight holds its slot, so it is never cut off. The next request starts one again.
+    fn rest(&self, now: Instant) {
+        let idle = self
+            .used
+            .lock()
+            .is_ok_and(|used| now.saturating_duration_since(*used) >= SERVICE_IDLE);
+        if idle {
+            for slot in [&self.service, &self.jobs] {
+                if let Ok(mut service) = slot.try_lock() {
+                    service.take();
+                }
+            }
+        }
     }
     pub fn request(
         &self,
@@ -92,10 +161,37 @@ pub struct Workspaces {
     data: PathBuf,
     initial: String,
     entries: Mutex<Vec<Workspace>>,
-    runtimes: Mutex<HashMap<PathBuf, Arc<Runtime>>>,
+    runtimes: Arc<Runtimes>,
     sessions: Mutex<HashMap<String, PathBuf>>,
     chats: Mutex<HashMap<String, PathBuf>>,
+    /// Held while the app runs, so the next one to open knows it is not alone.
+    _running: Option<std::fs::File>,
+    /// Set when no other app was open at launch, and spent by the first listing:
+    /// unused chats are cleared only then, before any of them can be in use.
+    prune: AtomicBool,
 }
+
+/// Marks this app as running and reports whether it is the only one.
+fn mark_running(data: &std::path::Path) -> (Option<std::fs::File>, bool) {
+    let open = |name: &str| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(data.join(name))
+    };
+    let (Ok(deciding), Ok(file)) = (open("launching.lock"), open("running.lock")) else {
+        return (None, false);
+    };
+    // One app decides at a time: two launched together cannot both find themselves alone.
+    if deciding.lock().is_err() {
+        return (None, false);
+    }
+    let alone = file.try_lock().is_ok() && file.unlock().is_ok();
+    let held = file.lock_shared().is_ok();
+    (Some(file), alone && held)
+}
+
 impl Workspaces {
     pub fn new(data: PathBuf, explicit: Option<PathBuf>) -> Result<Self, String> {
         let personal = data.join("personal");
@@ -117,11 +213,17 @@ impl Workspaces {
                 personal: true,
             },
         );
+        let runtimes = Arc::new(Mutex::new(HashMap::new()));
+        let watched = Arc::downgrade(&runtimes);
+        std::thread::spawn(move || rest_idle_services(watched));
+        let (running, alone) = mark_running(&data);
         let registry = Self {
+            _running: running,
+            prune: AtomicBool::new(alone),
             data,
             initial: "personal".into(),
             entries: Mutex::new(entries),
-            runtimes: Mutex::new(HashMap::new()),
+            runtimes,
             sessions: Mutex::new(HashMap::new()),
             chats: Mutex::new(HashMap::new()),
         };
@@ -193,11 +295,49 @@ impl Workspaces {
             .or_insert_with(|| Arc::new(Runtime::new(path)))
             .clone())
     }
+    /// Never creates anything: a Personal draft owns no folder until it starts.
     pub fn resolve(
         &self,
         id: &str,
         key: Option<&str>,
         session: Option<&str>,
+    ) -> Result<Arc<Runtime>, String> {
+        self.place(id, key, session, false)
+    }
+    /// Where a chat really begins: its first message, or a terminal opened in it.
+    pub fn start(
+        &self,
+        id: &str,
+        key: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<Arc<Runtime>, String> {
+        self.place(id, key, session, true)
+    }
+    /// Where a settings or extension request runs. A draft has no folder to read,
+    /// so reading asks the library; writing into the chat starts it, or the
+    /// change would land where the chat never looks.
+    pub fn for_request(
+        &self,
+        id: &str,
+        key: Option<&str>,
+        session: Option<&str>,
+        method: &str,
+    ) -> Result<Arc<Runtime>, String> {
+        if CHAT_WRITES.contains(&method) {
+            return self.start(id, key, session);
+        }
+        let runtime = self.resolve(id, key, session)?;
+        if runtime.path.exists() {
+            return Ok(runtime);
+        }
+        self.runtime(self.workspace(id)?.path)
+    }
+    fn place(
+        &self,
+        id: &str,
+        key: Option<&str>,
+        session: Option<&str>,
+        create: bool,
     ) -> Result<Arc<Runtime>, String> {
         let workspace = self.workspace(id)?;
         if !workspace.personal {
@@ -239,6 +379,9 @@ impl Workspaces {
                 return self.runtime(path.clone());
             }
             let path = workspace.path.join(format!("chat-{key}"));
+            if !create && !path.exists() {
+                return self.runtime(path);
+            }
             std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
             let path = path.canonicalize().map_err(|e| e.to_string())?;
             if !path.starts_with(&workspace.path) {
@@ -258,21 +401,8 @@ impl Workspaces {
                 .runtime(workspace.path)?
                 .request_params("usage.summary", params);
         }
-        let mut summaries = Vec::new();
-        for entry in std::fs::read_dir(&workspace.path).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if !entry.file_type().map_err(|e| e.to_string())?.is_dir()
-                || !entry.file_name().to_string_lossy().starts_with("chat-")
-            {
-                continue;
-            }
-            let path = entry.path().canonicalize().map_err(|e| e.to_string())?;
-            summaries.push(
-                self.runtime(path)?
-                    .request_params("usage.summary", params.clone())?,
-            );
-        }
-        Ok(crate::usage::merge(summaries, days))
+        self.runtime(workspace.path)?
+            .request_params("library.usage", params)
     }
     pub fn list_sessions(&self, id: &str) -> Result<Value, String> {
         let workspace = self.workspace(id)?;
@@ -281,27 +411,26 @@ impl Workspaces {
                 .runtime(workspace.path)?
                 .request("sessions.list", None, None);
         }
-        let mut rows = Vec::new();
-        for entry in std::fs::read_dir(&workspace.path).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if !entry.file_type().map_err(|e| e.to_string())?.is_dir()
-                || !entry.file_name().to_string_lossy().starts_with("chat-")
+        let prune_before = self.prune.swap(false, Ordering::AcqRel).then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |now| now.as_secs_f64() - UNUSED_CHAT_GRACE)
+        });
+        let value = self
+            .runtime(workspace.path.clone())?
+            .request_params("library.sessions", json!({ "prune_before": prune_before }))?;
+        let mut rows = value.as_array().cloned().ok_or("Invalid session list")?;
+        let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
+        for row in &mut rows {
+            let folder = row.as_object_mut().and_then(|row| row.remove("folder"));
+            let folder = folder.as_ref().and_then(Value::as_str).map(PathBuf::from);
+            if let (Some(id), Some(folder)) = (row["id"].as_str(), folder)
+                && folder.starts_with(&workspace.path)
             {
-                continue;
+                sessions.insert(id.into(), folder);
             }
-            let path = entry.path().canonicalize().map_err(|e| e.to_string())?;
-            let value = self
-                .runtime(path.clone())?
-                .request("sessions.list", None, None)?;
-            let items = value.as_array().ok_or("Invalid session list")?;
-            let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
-            for row in items {
-                if let Some(id) = row["id"].as_str() {
-                    sessions.insert(id.into(), path.clone());
-                }
-            }
-            rows.extend(items.iter().cloned());
         }
+        drop(sessions);
         rows.sort_by(|a, b| {
             b["last_ts"]
                 .as_f64()
@@ -358,5 +487,70 @@ mod tests {
         let reopened = Workspaces::new(root.join("app"), Some(root.join("repo"))).unwrap();
         assert_eq!(reopened.initial, first.id);
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn a_draft_owns_nothing_on_disk_until_it_starts() {
+        let root = std::env::temp_dir().join(format!("medha-drafts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let registry = Workspaces::new(root.join("app"), None).unwrap();
+        let library = registry.workspace("personal").unwrap().path;
+        let chats = || std::fs::read_dir(&library).unwrap().count();
+
+        let draft = registry.resolve("personal", Some("draft-x"), None).unwrap();
+        assert_eq!(crate::files::list(&draft.path, "").unwrap(), json!([]));
+        assert_eq!(crate::git::status(&draft.path).unwrap()["files"], json!([]));
+        let request = |method| registry.for_request("personal", Some("draft-x"), None, method);
+        assert_eq!(request("settings.list").unwrap().path, library);
+        assert_eq!(chats(), 0, "looking at a draft created a folder");
+
+        let started = request("settings.tools.save").unwrap();
+        assert!(
+            started.path.is_dir() && started.path != library,
+            "a draft's own setting was saved where the chat never reads"
+        );
+        assert!(
+            Arc::ptr_eq(&draft, &started),
+            "a started draft must keep its runtime, or its live chat is lost"
+        );
+        let again = registry.resolve("personal", Some("draft-x"), None).unwrap();
+        assert!(Arc::ptr_eq(&again, &started));
+        assert_eq!(chats(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn only_an_app_running_alone_clears_unused_chats() {
+        let root = std::env::temp_dir().join(format!("medha-alone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let first = Workspaces::new(root.join("app"), None).unwrap();
+        let second = Workspaces::new(root.join("app"), None).unwrap();
+        assert!(first.prune.load(Ordering::Acquire));
+        assert!(
+            !second.prune.load(Ordering::Acquire),
+            "a second app could delete a draft the first still has open"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn an_idle_service_stops_but_one_answering_a_request_is_kept() {
+        let runtime = Runtime::new(std::env::temp_dir());
+        *runtime.service.lock().unwrap() = Some(Service::stand_in());
+        *runtime.jobs.lock().unwrap() = Some(Service::stand_in());
+        runtime.rest(Instant::now());
+        assert!(
+            runtime.service.lock().unwrap().is_some(),
+            "a service in use was stopped"
+        );
+
+        let answering = runtime.jobs.lock().unwrap();
+        runtime.rest(Instant::now() + SERVICE_IDLE);
+        drop(answering);
+        assert!(
+            runtime.service.lock().unwrap().is_none(),
+            "an idle service kept running"
+        );
+        assert!(
+            runtime.jobs.lock().unwrap().is_some(),
+            "a request in flight was cut off"
+        );
     }
 }

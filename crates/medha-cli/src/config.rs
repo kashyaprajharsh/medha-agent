@@ -550,6 +550,14 @@ pub fn state_dir(workspace: &std::path::Path) -> Result<PathBuf> {
     select_state_dir(&home, &workspace)
 }
 
+/// A workspace's state only if it already has one bound to it; reading never mints an empty store.
+pub fn existing_state_dir(workspace: &std::path::Path) -> Option<PathBuf> {
+    let workspace = workspace.canonicalize().ok()?;
+    let candidate = state_dir_in(&medha_home().ok()?, &workspace);
+    let stored = std::fs::read_to_string(candidate.join(WORKSPACE_ID_MARKER)).ok()?;
+    (stored == workspace_path_identity(&workspace)).then_some(candidate)
+}
+
 fn state_dir_in(home: &std::path::Path, workspace: &std::path::Path) -> PathBuf {
     home.join("projects").join(encode_workspace(workspace))
 }
@@ -999,10 +1007,13 @@ pub struct Pulse {
 }
 
 /// Build diagnostics without probing the keychain or external services.
+/// `project` is the folder whose `medha.lock` applies: the terminal's own, or
+/// the workspace a desktop service was started for, never where the app launched.
 pub fn pulse(
     cfg: Option<&Config>,
     flag_base_url: Option<String>,
     flag_model: Option<String>,
+    project: Option<&std::path::Path>,
 ) -> Pulse {
     let scan_prefixed = |prefixes: &[&str]| -> Vec<String> {
         let mut names: Vec<String> = std::env::vars()
@@ -1015,8 +1026,7 @@ pub fn pulse(
     let medha_env = scan_prefixed(&["MEDHA_"]);
     let ignored_env = scan_prefixed(IGNORED_ENV_PREFIXES);
 
-    let cwd_lock = std::env::current_dir().ok().map(|d| d.join("medha.lock"));
-    let (project_lock, lock_executor) = match cwd_lock {
+    let (project_lock, lock_executor) = match project.map(|folder| folder.join("medha.lock")) {
         Some(p) if p.exists() => {
             let executor = lockfile::MedhaLock::load(&p)
                 .ok()
@@ -1784,7 +1794,22 @@ pub fn delete_mcp_key(id: &str, server: &McpServer) {
 }
 
 pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
-    let key = load_key(&mcp_key_id(id, server));
+    mcp_server_with(id, server, load_key(&mcp_key_id(id, server)))
+}
+
+/// For the shared host, which replaces a running server whose key changed: a key
+/// it could not read must not pass for one that was removed.
+pub(crate) fn read_mcp_server(id: &str, server: &McpServer) -> Result<mcp::ServerConfig> {
+    // Only a server that sends a key can be held back by one that cannot be read.
+    let key = if server.auth == "bearer" || !server.command.is_empty() {
+        read_key(&mcp_key_id(id, server))?
+    } else {
+        None
+    };
+    Ok(mcp_server_with(id, server, key))
+}
+
+fn mcp_server_with(id: &str, server: &McpServer, key: Option<String>) -> mcp::ServerConfig {
     // Resolve `${key}` at spawn time so previews and argv never contain the secret.
     let transport = if server.url.is_empty() {
         mcp::Transport::Stdio {
@@ -1852,6 +1877,32 @@ pub(crate) fn load_key(base_url: &str) -> Option<String> {
     })
     .ok()
     .flatten()
+}
+
+/// Like [`load_key`], except that a store which could not be read is an error
+/// instead of "no key".
+pub(crate) fn read_key(id: &str) -> Result<Option<String>> {
+    with_credentials_lock(|| {
+        let path = credentials_path()?;
+        let filed = match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str::<CredentialsFile>(&text)
+                .with_context(|| format!("reading {}", path.display()))?
+                .keys
+                .remove(id)
+                .filter(|key| !key.is_empty()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        if !prefer_keychain() {
+            return Ok(filed.or_else(|| keychain_load_key(id)));
+        }
+        match keyring::Entry::new(KEYRING_SERVICE, id).and_then(|entry| entry.get_password()) {
+            Ok(key) if !key.is_empty() => Ok(Some(key)),
+            Ok(_) | Err(keyring::Error::NoEntry) => Ok(filed),
+            Err(_) if filed.is_some() => Ok(filed),
+            Err(error) => Err(error).context("reading the OS keychain"),
+        }
+    })
 }
 
 #[cfg(test)]

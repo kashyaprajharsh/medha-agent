@@ -58,12 +58,24 @@ async fn hosted_server(
                         json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
                                "serverInfo": {"name": "hosted", "version": "0"}})
                     }
-                    Some("tools/list") => json!({"tools": [{"name": "ping",
-                        "description": "Ping the hosted server", "inputSchema": {"type": "object"}}]}),
+                    Some("tools/list") => json!({"tools": [
+                        {"name": "ping", "description": "Ping the hosted server",
+                         "inputSchema": {"type": "object"}},
+                        {"name": "draw", "description": "Draw on a screen",
+                         "inputSchema": {"type": "object"},
+                         "_meta": {"ui": {"resourceUri": "ui://hosted/draw"}}},
+                        {"name": "save", "description": "For the screen only",
+                         "inputSchema": {"type": "object"},
+                         "_meta": {"ui": {"visibility": ["app"]}}}]}),
                     Some("tools/call") => {
                         tokio::time::sleep(delay).await;
-                        json!({"content": [{"type": "text", "text": "pong"}], "isError": false})
+                        json!({"content": [{"type": "text", "text": "pong"}], "isError": false,
+                               "structuredContent": {"tool": message["params"]["name"]}})
                     }
+                    Some("resources/read") => json!({"contents": [{
+                        "uri": message["params"]["uri"], "mimeType": "text/html;profile=mcp-app",
+                        "text": "<html>hosted</html>",
+                        "_meta": {"ui": {"csp": {"connectDomains": ["https://api.hosted.example"]}}}}]}),
                     _ => json!({}),
                 };
                 let payload =
@@ -577,5 +589,47 @@ async fn a_tool_switched_off_leaves_an_open_chat_while_its_server_stays_on() {
             .iter()
             .any(|(name, on)| name == "ping" && !on),
         "the switched-off tool should still be listed, switched off"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_screen_works_the_same_through_the_shared_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = counting_server(Arc::new(AtomicUsize::new(0))).await;
+    let (_host, endpoint) = host(&url, dir.path()).await;
+    let chat = chat(dir.path(), &endpoint).await;
+
+    let specs = chat.tool_specs();
+    let draw = specs.iter().find(|spec| spec.name == "mcp__hosted__draw");
+    assert_eq!(
+        draw.and_then(|spec| spec.screen.as_deref()),
+        Some("ui://hosted/draw")
+    );
+    assert!(
+        !specs.iter().any(|spec| spec.name == "mcp__hosted__save"),
+        "a tool kept for screens was offered to the model through the host"
+    );
+
+    let drawn = chat.call("mcp__hosted__draw", &json!({})).await.unwrap();
+    assert_eq!(drawn.screen.as_deref(), Some("ui://hosted/draw"));
+    assert_eq!(drawn.result.unwrap()["structuredContent"]["tool"], "draw");
+
+    assert!(chat.call("mcp__hosted__save", &json!({})).await.is_err());
+    let saved = chat
+        .call_from_screen("hosted", "save", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(saved.result.unwrap()["structuredContent"]["tool"], "save");
+
+    let page = chat
+        .read_screen("hosted", "ui://hosted/draw")
+        .await
+        .unwrap();
+    assert_eq!(page.html, "<html>hosted</html>");
+    assert_eq!(page.connect, ["https://api.hosted.example"]);
+    assert!(
+        chat.read_screen("hosted", "https://evil.example/")
+            .await
+            .is_err()
     );
 }

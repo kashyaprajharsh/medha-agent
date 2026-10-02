@@ -38,6 +38,7 @@ export type HistoryEvent = {
   child_id?: string;
   detail?: string;
   duration_ms?: number;
+  screen?: ToolScreen;
 };
 
 export type EventPage = { events: HistoryEvent[]; next_cursor: string | null };
@@ -124,6 +125,9 @@ export type LiveMethod =
   | "question.respond"
   | "extensions.reload"
   | "extensions.catalog"
+  | "mcp.screens"
+  | "mcp.screen"
+  | "mcp.screen.call"
   | "mcp.connect"
   | "connectors.connect"
   | "mcp.disconnect"
@@ -141,6 +145,18 @@ export type FileEntry = {
   path: string;
   directory: boolean;
   size: number;
+};
+/** The web origins a server declared for its screen; the frame may reach these and no others. */
+export type ScreenOrigins = { connect: string[]; resources: string[]; frames: string[] };
+/** A screen a tool's server offers for a result: where its page is, and what it draws. */
+export type ToolScreen = {
+  server: string;
+  tool: string;
+  resource: string;
+  /** The call's arguments as text, while the model is still writing them. */
+  partial?: string;
+  input?: unknown;
+  result?: unknown;
 };
 export type FilePreview = {
   kind: string;
@@ -220,6 +236,26 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
     preview: (path: string) =>
       invoke<FilePreview>("file_preview", { ...scope(), path }),
     openFile: (path: string) => invoke<void>("file_open", { ...scope(), path }),
+    revealFile: (path: string) => invoke<void>("file_reveal", { ...scope(), path }),
+    mediaLink: (path: string) =>
+      invoke<{ url: string; size: number }>("media_link", { ...scope(), path }),
+    saveOutput: (name: string, content: { text: string } | { bytes: Uint8Array } | { path: string }) =>
+      invoke<boolean>("output_save", {
+        ...scope(),
+        name,
+        path: "path" in content ? content.path : undefined,
+        data:
+          "path" in content
+            ? undefined
+            : Array.from("bytes" in content ? content.bytes : new TextEncoder().encode(content.text)),
+      }),
+    screenPut: (html: string, run: boolean, online: boolean, app?: ScreenOrigins) =>
+      invoke<string>("screen_put", { html, run, online, app }),
+    screenDrop: (url: string) => invoke<void>("screen_drop", { url }),
+    screenKeep: (server: string, uri: string, page: unknown) =>
+      invoke<void>("screen_keep", { server, uri, page }),
+    screenKept: (server: string, uri: string) =>
+      invoke<Record<string, unknown> | null>("screen_kept", { server, uri }),
     gitStatus: () =>
       invoke<{ repository: boolean; files: GitFile[] }>("git_status", scope()),
     gitDiff: (path: string, staged: boolean) =>

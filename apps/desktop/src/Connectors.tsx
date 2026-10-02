@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { createPortal } from "react-dom";
 import { Icon } from "./Icon";
+import { Sheet } from "./Sheet";
 import { useWorkspaceApi } from "./Workspace";
 import { useMcpSignIn, type McpStatus } from "./McpServers";
 
@@ -75,7 +75,6 @@ export function Connectors({
   const [all, setAll] = useState<Connector[]>([]);
   const [error, setError] = useState("");
   const [openId, setOpenId] = useState<string>();
-  const [leaving, setLeaving] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
   const [problem, setProblem] = useState("");
   const created = useRef<string | null>(null);
@@ -113,31 +112,10 @@ export function Connectors({
   const rest = shown.filter((c) => !on(c) && !c.evidence);
 
   function show(id: string | undefined) {
-    setLeaving(false);
     setOpenId(id);
     setPhase(id && all.find((c) => c.id === id && state(c) === "ready") ? "done" : "idle");
     setProblem("");
   }
-
-  // The real sheet animates out, so glass stays glass until it is gone.
-  function close() {
-    if (!openId) return;
-    if (matchMedia("(prefers-reduced-motion: reduce)").matches) return show(undefined);
-    setLeaving(true);
-  }
-
-  useEffect(() => {
-    if (!leaving) return;
-    const done = setTimeout(() => show(undefined), 600);
-    return () => clearTimeout(done);
-  }, [leaving]);
-
-  useEffect(() => {
-    if (!openId) return;
-    const onKey = (event: KeyboardEvent) => event.key === "Escape" && close();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  });
 
   async function connect(c: Connector) {
     if (!sessionKey) return setProblem("Open a chat in this workspace first, then connect.");
@@ -264,22 +242,8 @@ export function Connectors({
         );
       })}
       {all.length > 0 && !shown.length && <p className="quiet">No apps match “{query.trim()}”.</p>}
-      {open &&
-        createPortal(
-        <>
-          <div className={`cx-scrim${leaving ? " leaving" : ""}`} onClick={close} />
-          <aside
-            className={`cx-sheet${leaving ? " leaving" : ""}`}
-            role="dialog"
-            aria-modal="true"
-            aria-label={open.name}
-            onAnimationEnd={(event) => {
-              if (leaving && event.target === event.currentTarget) show(undefined);
-            }}
-          >
-            <button className="cx-close" aria-label="Close" autoFocus onClick={close}>
-              <Icon name="x" />
-            </button>
+      {open && (
+          <Sheet label={open.name} onClose={() => show(undefined)}>
             <div className="cx-hero">
               <img className="cx-plate" src={logo(open.id)} alt="" />
               <div>
@@ -338,9 +302,7 @@ export function Connectors({
                 {problem}
               </p>
             )}
-          </aside>
-        </>,
-          document.body,
+          </Sheet>
         )}
     </div>
   );

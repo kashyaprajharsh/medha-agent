@@ -350,6 +350,41 @@
   transform-origin: bottom center;
   animation: pop-in var(--t-base) var(--ease-out) both;
 }
+/* A menu opens toward the room it was measured to have, and is never taller than that room. */
+.slash-menu {
+  max-height: var(--menu-room, none);
+  overflow-y: auto;
+}
+/* Its title and footer hold their place; only the part between them gives way and scrolls. */
+.composer .control-popover {
+  display: flex;
+  flex-direction: column;
+  max-height: var(--menu-room, none);
+  /* Only for a window too short even for that: then the whole menu scrolls. */
+  overflow-y: auto;
+}
+.composer .control-popover > .model-options {
+  min-height: 84px;
+}
+.composer .control-popover > * {
+  flex: none;
+}
+.composer .control-popover > :is(.model-options, .popover-body) {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+.composer.menus-down .control-popover,
+.composer.menus-down .slash-menu {
+  top: calc(100% + var(--s-2));
+  bottom: auto;
+}
+.composer.menus-down .control-popover {
+  transform-origin: top left;
+}
+.composer.menus-down .slash-menu {
+  transform-origin: top center;
+}
 .slash-menu button {
   display: flex;
   align-items: center;

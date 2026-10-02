@@ -34,3 +34,16 @@ test("every request the pages make is one the native bridge lets through", async
 
   assert.deepEqual(blocked, [], "add these to the bridge allowlist in src-tauri/src/main.rs");
 });
+
+// The other direction: a page redrawn without one of its controls still passes
+// every test of what remains. Each thing the bridge can do for the Extensions
+// pages must still be asked for by some page.
+test("no extension action the bridge offers has lost its control", async () => {
+  const bridge = await readFile(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8");
+  const files = (await readdir(src)).filter((name) => /\.tsx?$/.test(name));
+  const code = (await Promise.all(files.map((name) => readFile(new URL(name, src), "utf8")))).join("\n");
+
+  const orphaned = [...allowlist(bridge, "extension_request")].filter((method) => !code.includes(`"${method}"`)).sort();
+
+  assert.deepEqual(orphaned, [], "these can no longer be reached from any page");
+});

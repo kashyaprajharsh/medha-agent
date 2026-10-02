@@ -36,7 +36,14 @@ export function MessageTokens({
 
   useLayoutEffect(() => {
     const node = box.current;
-    if (!node) return;
+    // With the last token gone there is nothing to measure, and the text goes back to the margin.
+    if (!node) {
+      if (reported.current !== "0:0") {
+        reported.current = "0:0";
+        onLayout({ indent: 0, lift: 0 });
+      }
+      return;
+    }
     const measure = () => {
       const items = [...node.children] as HTMLElement[];
       const last = items[items.length - 1];

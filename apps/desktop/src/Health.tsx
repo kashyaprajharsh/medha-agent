@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { PageTop, ViewBar } from "./ExtensionParts";
 import { Icon } from "./Icon";
 import { Spinner } from "./Spinner";
 import { useWorkspaceApi } from "./Workspace";
@@ -66,19 +67,18 @@ export function Health() {
   const errors = report?.checks.filter((check) => check.health === "error").length ?? 0;
   const warnings = report?.checks.filter((check) => check.health === "warn").length ?? 0;
   const active = report?.active && !("error" in report.active) ? report.active : undefined;
+  const again = (
+    <button className="ext-add" onClick={() => setRefresh((value) => value + 1)}>
+      <Icon name="refresh" />
+      Check again
+    </button>
+  );
   return (
     <div className="health">
-      <div className="page-heading">
-        <div>
-          <h2>Health</h2>
-          <p>Whether Medha can run, and where each part of its setup comes from.</p>
-        </div>
-        <button className="btn-line" onClick={() => setRefresh((value) => value + 1)}>
-          <Icon name="refresh" />
-          Check again
-        </button>
-      </div>
+      <PageTop title="Health">Whether Medha can run, and where each part of its setup comes from.</PageTop>
       {error && <p className="surface-error" role="alert">{error}</p>}
+      {/* With no verdict to sit beside, the way to try again stands alone. */}
+      {!report && error && <ViewBar>{again}</ViewBar>}
       {!report && !error && <p className="quiet">Checking…</p>}
       {report && (
         <>
@@ -91,6 +91,7 @@ export function Health() {
                 Fix automatically
               </button>
             )}
+            {again}
           </div>
           {fixed && (
             <p className="quiet" role="status">

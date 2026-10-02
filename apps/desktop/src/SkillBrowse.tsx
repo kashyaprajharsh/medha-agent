@@ -80,6 +80,7 @@ export function SkillBrowse({ installed, busy, onInstall }: { installed: Set<str
               key={hit.install_url}
               name={hit.name}
               meta={hit.repo}
+              several={sources > 1}
               description={hit.description}
               action={
                 installed.has(hit.name) ? (

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { PageTop } from "./ExtensionParts";
 import { Select } from "./Select";
 import { SLOTS, UsageChart, type Day, type Series } from "./UsageChart";
 import { useWorkspaceApi } from "./Workspace";
@@ -124,14 +125,9 @@ export function Usage() {
   const total = view?.total;
   return (
     <div className="usage-page">
-      <div className="page-heading">
-        <div>
-          <h2>Usage</h2>
-          <p>Tokens and cost from each model call in this workspace, sub-agents included.</p>
-        </div>
-      </div>
+      <PageTop title="Usage">Tokens and cost from each model call in this workspace, sub-agents included.</PageTop>
       <div className="usage-filters">
-        <div className="segmented small" aria-label="Time range">
+        <div className="ext-seg" aria-label="Time range">
           {RANGES.map((range) => (
             <button key={range} aria-pressed={days === range} onClick={() => setDays(range)}>
               {range} days

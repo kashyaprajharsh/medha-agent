@@ -1,4 +1,4 @@
-import type { LiveFrame, SessionSettings } from "./api";
+import type { LiveFrame, SessionSettings, ToolScreen } from "./api";
 
 export type Approval = {
   gateId: number;
@@ -31,6 +31,8 @@ export type Step = {
   input?: string;
   summary?: string;
   output?: string;
+  /** A screen the tool's server offers for this result. */
+  screen?: ToolScreen;
   started?: number;
   ended?: number;
 };
@@ -98,7 +100,15 @@ export type LiveState = {
   settled: number;
   // Messages a stopped or failed turn never read, waiting for the composer.
   returned?: string[];
+  /** Calls to a server's tool that the model is still writing, for a screen to draw from. */
+  writing?: WritingCall[];
 };
+
+export type WritingCall = { id: string; tool: string; text: string };
+// A turn writes few such calls at once and a drawing is small; past this a
+// screen simply waits for the finished call.
+const MAX_WRITING = 4;
+const MAX_WRITING_TEXT = 1024 * 1024;
 
 export const startingLive = (): LiveState => ({
   status: "starting",
@@ -398,7 +408,29 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
         });
         return { ...item, steps };
       });
-      return { ...state, items };
+      // A call that failed has no screen coming; one that worked keeps what was
+      // written until its screen arrives, so the drawing is never taken down between.
+      const writing = params.ok === true ? state.writing : state.writing?.filter((call) => call.id !== id);
+      return { ...state, items, writing };
+    }
+    case "tool.input": {
+      const [id, tool, delta] = [str(params.id), str(params.tool), str(params.delta)];
+      if (!id || !tool || !delta) return state;
+      const calls = state.writing ?? [];
+      const call = calls.find((other) => other.id === id) ?? { id, tool, text: "" };
+      if (call.text.length + delta.length > MAX_WRITING_TEXT) return state;
+      const rest = calls.filter((other) => other.id !== id).slice(1 - MAX_WRITING);
+      return { ...state, writing: [...rest, { ...call, text: call.text + delta }] };
+    }
+    case "tool.screen": {
+      const screen = params.screen as ToolScreen | undefined;
+      if (!screen || typeof screen.resource !== "string") return state;
+      const items = state.items.map((item) =>
+        item.kind === "tools"
+          ? { ...item, steps: item.steps.map((step) => (step.id === params.id ? { ...step, screen } : step)) }
+          : item,
+      );
+      return { ...state, items, writing: state.writing?.filter((call) => call.id !== params.id) };
     }
     case "context_pressure":
       return {
@@ -461,7 +493,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
         items.at(-1)?.kind === "reasoning"
       )
         items.pop();
-      return { ...state, items, notice: "Reconnecting to the model…" };
+      return { ...state, items, writing: undefined, notice: "Reconnecting to the model…" };
     }
     case "usage":
       return {
@@ -522,6 +554,7 @@ function settle(state: LiveState, notice?: string): LiveState {
     activity: undefined,
     approvals: [],
     questions: [],
+    writing: undefined,
     items: [...closeAll(state.items), ...queuedMessages(state)],
     notice,
     settled: state.settled + 1,

@@ -1,8 +1,6 @@
 /* Settings panels: MCP servers, keys, catalog, memory, tools, hooks and tasks. */
 .section-title,
 .usage-block h3,
-.key-group h3,
-.memory-group h3,
 .bg-tasks h3 {
   margin: 0 0 var(--s-2);
   color: var(--dim);
@@ -10,8 +8,6 @@
   font-weight: 500;
 }
 .list-plain,
-.key-group ul,
-.memory-group ul,
 .catalog-list,
 .hook-list,
 .hook-review,
@@ -121,45 +117,15 @@
   color: var(--faint);
 }
 
-.key-group,
-.memory-group {
-  margin: 0 0 var(--s-6);
+.key-list {
+  list-style: none;
+  padding: 0;
 }
-.key-group li {
+.key-actions {
+  flex: none;
+  min-width: 130px;
   display: flex;
-  align-items: center;
-  gap: var(--s-4);
-  padding: 11px 0;
-  border-bottom: 1px solid var(--hair);
-  font-size: var(--text-sm);
-}
-.key-main {
-  flex: 1;
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-.key-main b {
-  font-weight: 500;
-}
-.key-main code {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-.key-status {
-  color: var(--faint);
-  font-size: var(--text-sm);
-  white-space: nowrap;
-}
-.key-status.set {
-  color: var(--ok);
-}
-.key-actions,
-.memory-actions {
-  display: flex;
+  justify-content: flex-end;
   gap: var(--s-3);
   font-size: var(--text-sm);
   white-space: nowrap;
@@ -184,17 +150,12 @@
   justify-content: space-between;
   gap: var(--s-4);
 }
-.catalog-list li,
-.memory-group li,
-.hook-list li {
+.catalog-list li {
   display: flex;
   gap: var(--s-4);
   align-items: flex-start;
   padding: var(--s-3) 0;
   border-bottom: 1px solid var(--hair);
-}
-.hook-list li {
-  align-items: center;
 }
 .catalog-main {
   flex: 1;
@@ -202,8 +163,7 @@
   display: grid;
   gap: 3px;
 }
-.catalog-main b,
-.hook-list b {
+.catalog-main b {
   font-weight: 500;
   font-size: var(--text-md);
 }
@@ -227,32 +187,10 @@
   flex-wrap: wrap;
   justify-content: flex-end;
 }
-.memory-main {
-  flex: 1;
-  min-width: 0;
-}
-.memory-main p {
-  margin: 0 0 var(--s-1);
-  font-size: var(--text-md);
-  line-height: 1.5;
-}
-.memory-main small {
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-.memory-pin {
-  color: var(--gold);
-}
-.memory-pin .icon {
-  width: 11px;
-  height: 11px;
-  margin-right: 3px;
-  vertical-align: -1px;
-}
 .memory-source {
   display: grid;
   gap: var(--s-1);
-  margin: 10px 0 0;
+  margin: 0 0 var(--s-6);
   padding: var(--s-2) var(--s-3);
   border-left: 2px solid var(--line);
   color: var(--dim);
@@ -321,23 +259,6 @@
   margin-right: var(--s-2);
   border-radius: 50%;
   background: var(--ok);
-}
-.hook-list li > div {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-  flex: 1;
-}
-.hook-list small {
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-.hook-list code {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  color: var(--dim);
-  font-size: var(--text-xs);
 }
 .hook-confirm {
   display: flex;

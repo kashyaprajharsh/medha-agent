@@ -390,3 +390,32 @@ test("unavailable tools retain a structured error through live and history views
   assert.equal(stepVerb(denied), "Brave search");
   assert.equal(stepStatusLabel(denied), "Denied");
 });
+
+test("a call being written is kept only while it is useful, and never without bound", () => {
+  const feed = (state, id, delta, tool = "mcp__draw__view") => reduceLive(state, event("tool.input", { id, tool, delta }));
+  let state = feed(feed(startingLive(), "a", '{"elements":"['), "a", '{}]"}');
+  assert.deepEqual(state.writing, [{ id: "a", tool: "mcp__draw__view", text: '{"elements":"[{}]"}' }]);
+
+  // Its screen arriving is what ends it; the result alone leaves the drawing up.
+  state = reduceLive(state, event("tool.call", { id: "a", tool: "mcp__draw__view" }));
+  state = reduceLive(state, event("tool.observation", { id: "a", tool: "mcp__draw__view", ok: true }));
+  assert.equal(state.writing.length, 1);
+  state = reduceLive(state, event("tool.screen", { id: "a", screen: { server: "draw", tool: "view", resource: "ui://draw/view" } }));
+  assert.deepEqual(state.writing, []);
+  assert.equal(state.items.at(-1).steps[0].screen.resource, "ui://draw/view");
+
+  // A failed call, a retry and the end of the turn each drop what was written.
+  state = feed(state, "b", "{");
+  state = reduceLive(state, event("tool.call", { id: "b", tool: "mcp__draw__view" }));
+  state = reduceLive(state, event("tool.observation", { id: "b", tool: "mcp__draw__view", ok: false }));
+  assert.deepEqual(state.writing, []);
+  assert.equal(reduceLive(feed(state, "c", "{"), event("model.restarted")).writing, undefined);
+  assert.equal(reduceLive(feed(state, "c", "{"), event("turn.done")).writing, undefined);
+
+  // Many calls, or one enormous one, stop growing the window's memory.
+  for (const id of ["1", "2", "3", "4", "5", "6"]) state = feed(state, id, "{");
+  assert.deepEqual(state.writing.map((call) => call.id), ["3", "4", "5", "6"]);
+  const big = "x".repeat(600 * 1024);
+  state = feed(feed(feed(state, "6", big), "6", big), "6", big);
+  assert.ok(state.writing.at(-1).text.length <= 1024 * 1024);
+});

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Add, PageTop, ViewBar } from "./ExtensionParts";
 import { Icon } from "./Icon";
 import { Select } from "./Select";
 import { useWorkspaceApi } from "./Workspace";
@@ -24,6 +25,8 @@ export function Hooks({ locked }: { locked: boolean }) {
   const api = useWorkspaceApi();
   const [listing, setListing] = useState<Listing>();
   const [adding, setAdding] = useState(false);
+  // The moment the form opens on, when it was opened from that moment's row.
+  const [startAt, setStartAt] = useState("");
   const [reviewing, setReviewing] = useState(false);
   const [removing, setRemoving] = useState("");
   const [busy, setBusy] = useState(false);
@@ -67,20 +70,19 @@ export function Hooks({ locked }: { locked: boolean }) {
   const toolLabel = (matcher: string) => listing?.tools.find((tool) => tool.matcher === matcher)?.label ?? matcher;
   return (
     <div className="hooks-page">
-      <div className="page-heading">
-        <div>
-          <h2>Hooks</h2>
-          <p>Scripts that run at set moments of Medha’s work. They live in this project’s .medha/hooks folder.</p>
-        </div>
-        <button className="btn-line" disabled={locked} onClick={() => setAdding(!adding)}>
-          <Icon name="plus" />
-          Add hook
-        </button>
-      </div>
+      <PageTop title="Hooks">
+        Your own scripts, run at set moments of Medha’s work. They live in this project’s <code>.medha/hooks</code>{" "}
+        folder.
+      </PageTop>
+      <ViewBar>
+        <Add label="Add hook" open={adding} onClick={() => !locked && setAdding(!adding)} />
+      </ViewBar>
       {error && <p className="surface-error" role="alert">{error}</p>}
       {notice && <p className="quiet" role="status">{notice}</p>}
       {adding && listing && (
         <HookForm
+          key={startAt}
+          initial={startAt}
           events={events}
           tools={listing.tools}
           busy={busy || locked}
@@ -112,39 +114,76 @@ export function Hooks({ locked }: { locked: boolean }) {
           )}
         </div>
       )}
-      {listing && !listing.hooks.length && !adding && (
-        <p className="quiet">No hooks in this project yet.</p>
+      {listing && listing.hooks.length > 0 && (
+        <section className="ix-group">
+          <h3>
+            In this project <span>{listing.hooks.length}</span>
+          </h3>
+          <ul className="ix hook-list">
+            {listing.hooks.map((hook) => {
+              const key = `${hook.event}/${hook.file}`;
+              return (
+                <li className="ix-row" key={key}>
+                  <span className="ix-main">
+                    <b>{sentence(describe(hook.event).split(" — ")[0])}</b>
+                    <code className="ix-sum mono" title={hook.command}>
+                      {hook.command}
+                    </code>
+                  </span>
+                  <small className="ix-note">{hook.matcher === "*" ? hook.event : `${hook.event} · ${toolLabel(hook.matcher)}`}</small>
+                  {removing === key ? (
+                    <span className="hook-confirm">
+                      <button className="btn-line" onClick={() => setRemoving("")}>Keep</button>
+                      <button
+                        className="btn-line danger"
+                        disabled={busy || locked}
+                        onClick={() => void run("extensions.hooks.remove", { event: hook.event, file: hook.file }, "Hook removed.").then(() => setRemoving(""))}
+                      >
+                        Remove
+                      </button>
+                    </span>
+                  ) : (
+                    <button className="link-btn" disabled={locked} onClick={() => setRemoving(key)}>
+                      Remove
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </section>
       )}
-      <ul className="hook-list">
-        {listing?.hooks.map((hook) => {
-          const key = `${hook.event}/${hook.file}`;
-          return (
-            <li key={key}>
-              <div>
-                <b>{sentence(describe(hook.event).split(" — ")[0])}</b>
-                <small>{hook.matcher === "*" ? hook.event : `${hook.event} · ${toolLabel(hook.matcher)}`}</small>
-                <code title={hook.command}>{hook.command}</code>
-              </div>
-              {removing === key ? (
-                <span className="hook-confirm">
-                  <button className="btn-line" onClick={() => setRemoving("")}>Keep</button>
-                  <button
-                    className="btn-line danger"
-                    disabled={busy || locked}
-                    onClick={() => void run("extensions.hooks.remove", { event: hook.event, file: hook.file }, "Hook removed.").then(() => setRemoving(""))}
-                  >
-                    Remove
-                  </button>
-                </span>
-              ) : (
-                <button className="link-btn" disabled={locked} onClick={() => setRemoving(key)}>
-                  Remove
+      {/* An empty page says what could be here: each moment a script can run at, and what it can do then. */}
+      {listing && (
+        <section className="ix-group">
+          <h3>
+            Moments you can use {!listing.hooks.length && <span>none in use yet</span>}
+          </h3>
+          <div className="ix">
+            {events.map((event) => {
+              const [when, can] = event.description.split(" — ");
+              return (
+                <button
+                  className="ix-row moment"
+                  key={event.name}
+                  disabled={locked}
+                  aria-label={`Add a hook ${when}`}
+                  onClick={() => {
+                    setStartAt(event.name);
+                    setAdding(true);
+                  }}
+                >
+                  <span className="ix-main">
+                    <b>{sentence(when)}</b>
+                    <span className="ix-sum">{can ? sentence(can) : ""}</span>
+                  </span>
+                  <Icon name="plus" />
                 </button>
-              )}
-            </li>
-          );
-        })}
-      </ul>
+              );
+            })}
+          </div>
+        </section>
+      )}
       {reviewing && project && listing && (
         <div className="dialog-backdrop">
           <section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="hooks-review">
@@ -179,17 +218,19 @@ export function Hooks({ locked }: { locked: boolean }) {
 }
 
 function HookForm({
+  initial,
   events,
   tools,
   busy,
   onSave,
 }: {
+  initial: string;
   events: Event[];
   tools: Tool[];
   busy: boolean;
   onSave: (event: string, matcher: string, command: string) => Promise<void>;
 }) {
-  const [event, setEvent] = useState(events[0]?.name ?? "pre-tool");
+  const [event, setEvent] = useState(initial || (events[0]?.name ?? "pre-tool"));
   const [matcher, setMatcher] = useState("*");
   const [command, setCommand] = useState("");
   const chosen = events.find((candidate) => candidate.name === event);

@@ -99,6 +99,7 @@ export function toBlocks(events: HistoryEvent[]): Block[] {
           step.detail = event.detail;
           step.summary = event.summary;
           step.output = event.output;
+          step.screen = event.screen;
           step.ended = event.ts;
         }
         break;

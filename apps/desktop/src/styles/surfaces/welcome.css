@@ -1,89 +1,118 @@
 /* The welcome screen and empty states. */
+/* A new session: the composer is the page, so it sits in the middle with the rest around it. */
+.main.home {
+  overflow-y: auto;
+}
+/* Centred in the page, whatever its height. */
+.main.home .scroll {
+  flex: 0 0 auto;
+  margin-top: auto;
+  overflow: visible;
+}
+.main.home .thread {
+  min-height: 0;
+  padding-top: var(--s-6);
+  padding-bottom: 0;
+}
 .welcome {
-  min-height: 62vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding-bottom: var(--s-6);
   text-align: center;
 }
-.welcome > * {
+.welcome > *,
+.starters {
   animation: rise-in var(--t-slow) var(--ease-out) both;
 }
 .welcome > :nth-child(2) {
-  animation-delay: 40ms;
+  animation-delay: 50ms;
 }
 .welcome > :nth-child(3) {
-  animation-delay: 80ms;
-}
-.welcome > :nth-child(4) {
-  animation-delay: 120ms;
-}
-.welcome > :nth-child(n + 5) {
-  animation-delay: 160ms;
-}
-.welcome-logo {
-  width: 96px;
-  height: auto;
-  margin-bottom: 18px;
-}
-:root[data-theme="light"] .welcome-logo {
-  padding: 18px;
-  border-radius: var(--r-xl);
-  background: var(--logo-tile);
-}
-.welcome-name {
-  margin: 0 0 18px;
-  font-size: 44px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  background: linear-gradient(
-    180deg,
-    var(--logo-top) 12%,
-    var(--logo-mid) 55%,
-    var(--logo-base) 92%
-  );
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-.welcome-tag {
-  margin: 0 0 28px;
-  color: var(--dim);
+  animation-delay: 100ms;
 }
 .starters {
-  display: grid;
-  gap: var(--s-2);
-  width: min(440px, 100%);
+  animation-delay: 180ms;
 }
-.starter {
-  display: flex;
+.welcome .veena {
+  width: 300px;
+  margin-bottom: var(--s-5);
+  opacity: 0.9;
+}
+/* A short window keeps the question and the composer; the drawing is what gives way. */
+@media (max-height: 720px) {
+  .welcome .veena {
+    display: none;
+  }
+  .main.home .thread {
+    padding-top: var(--s-6);
+  }
+}
+.welcome h2 {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.welcome-where {
+  margin: 0;
+  color: var(--dim);
+  line-height: 1.5;
+}
+.welcome-where b {
+  color: var(--text);
+  font-weight: 600;
+}
+.starters {
+  width: min(560px, calc(100% - 56px));
+  margin: 0 auto auto;
+  /* As much below as the page keeps above, so the middle is the true middle. */
+  padding: var(--s-5) 0 var(--s-6);
+}
+.start-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
   align-items: center;
-  gap: var(--s-3);
-  padding: var(--s-3) var(--s-4);
+  gap: var(--s-4);
+  width: 100%;
+  padding: 11px 14px;
   border-radius: var(--r-lg);
   color: var(--dim);
+  font-size: var(--text-md);
   text-align: left;
-  box-shadow: inset 0 0 0 1px var(--hair);
   transition:
-    background var(--t-fast),
-    color var(--t-fast),
-    box-shadow var(--t-fast),
-    transform var(--t-fast) var(--ease-out);
+    color var(--t-base),
+    background var(--t-base) var(--ease-out),
+    box-shadow var(--t-base) var(--ease-out);
 }
-.starter:hover {
+.start-row + .start-row::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  top: 0;
+  height: 1px;
+  background: var(--hair);
+  transition: opacity var(--t-fast);
+}
+.start-row:hover {
   color: var(--text);
-  background: var(--hover);
-  box-shadow: inset 0 0 0 1px var(--line);
+  background: var(--raised);
+  box-shadow: var(--e1-shadow);
 }
-.starter:active {
-  transform: scale(0.99);
+.start-row:hover::before,
+.start-row:hover + .start-row::before {
+  opacity: 0;
 }
-.starter .icon {
+.start-row:active {
+  scale: 0.99;
+}
+.start-row .icon {
   color: var(--faint);
   transition: color var(--t-fast);
 }
-.starter:hover .icon {
+.start-row:hover .icon {
   color: var(--gold);
 }
 

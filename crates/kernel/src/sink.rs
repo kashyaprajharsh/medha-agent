@@ -19,6 +19,10 @@ pub trait StreamSink: Send + Sync {
     /// sniffed from partial args) is known while arguments are still arriving. Lets a
     /// surface show "writing medha.html…" during a large call.
     fn tool_started(&self, _tool: &str, _target: Option<&str>) {}
+    /// The next piece of a tool call's arguments while the model is still writing
+    /// them, under the id the finished call will carry. Lets a surface draw what a
+    /// tool is being asked for as it arrives. Not a call: nothing here is run.
+    fn tool_input(&self, _id: &str, _tool: &str, _delta: &str) {}
     /// A tool call the model just requested (about to execute).
     fn tool_call(&self, _tool: &str, _args: &Value) {}
     /// A tool call with its provider-assigned correlation id. Older surfaces
@@ -32,6 +36,9 @@ pub trait StreamSink: Send + Sync {
     fn tool_result_with_id(&self, _id: &str, tool: &str, ok: bool, payload: &Value) {
         self.tool_result(tool, ok, payload);
     }
+    /// A screen the tool's server offers for this result, and what it draws.
+    /// For a surface that can show it; it is never part of the model's context.
+    fn tool_screen(&self, _id: &str, _screen: &Value) {}
     /// Last provider-reported usage snapshot, once per request attempt.
     /// Interrupted/failed attempts may have only a partial snapshot; attempts
     /// without usage emit no callback. Retries are separate attempts.

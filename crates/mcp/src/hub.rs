@@ -18,8 +18,8 @@ use tokio::io::{
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{
-    CallOutput, Catalog, Error, McpManager, McpToolSpec, ServerConfig, ServerState, ServerStatus,
-    TOOL_PREFIX, UrlSink,
+    CallOutput, Catalog, Error, McpManager, McpToolSpec, Screen, ServerConfig, ServerState,
+    ServerStatus, TOOL_PREFIX, UrlSink,
 };
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -436,11 +436,26 @@ impl Link {
             .map(|status| status.state)
     }
 
-    pub async fn call(&self, qualified: &str, args: &Value) -> Result<CallOutput, Error> {
+    pub async fn call(
+        &self,
+        qualified: &str,
+        args: &Value,
+        screen: bool,
+    ) -> Result<CallOutput, Error> {
         let output = self
-            .request("call", json!({"tool": qualified, "args": args}))
+            .request(
+                "call",
+                json!({"tool": qualified, "args": args, "screen": screen}),
+            )
             .await?;
         serde_json::from_value(output).map_err(|error| Error::Protocol(error.to_string()))
+    }
+
+    pub async fn read_screen(&self, server: &str, uri: &str) -> Result<Screen, Error> {
+        let page = self
+            .request("screen", json!({"server": server, "uri": uri}))
+            .await?;
+        serde_json::from_value(page).map_err(|error| Error::Protocol(error.to_string()))
     }
 
     /// `connect` is a person asking, which may retry or enable the server.
@@ -582,8 +597,16 @@ async fn handle(
     let status = |status: ServerStatus| serde_json::to_value(status).unwrap_or(Value::Null);
     match request.method.as_str() {
         "call" => {
-            let output = manager.call(&text("tool"), &request.params["args"]).await?;
+            // An older chat sends no flag, and is the model calling.
+            let screen = request.params["screen"].as_bool().unwrap_or(false);
+            let output = manager
+                .call_as(&text("tool"), &request.params["args"], screen)
+                .await?;
             Ok(serde_json::to_value(output).unwrap_or(Value::Null))
+        }
+        "screen" => {
+            let page = manager.read_screen(&server, &text("uri")).await?;
+            Ok(serde_json::to_value(page).unwrap_or(Value::Null))
         }
         "ensure" => {
             let config = resolve(&server)

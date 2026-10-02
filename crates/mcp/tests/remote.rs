@@ -34,6 +34,12 @@ async fn spawn_with_challenge(
                 let Some(request) = read_http_request(&mut stream).await else {
                     return;
                 };
+                if !common::named(&request) {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
                 let authorized = match required_bearer {
                     Some(token) => request.lines().any(|line| {
                         line.to_ascii_lowercase().starts_with("authorization:")

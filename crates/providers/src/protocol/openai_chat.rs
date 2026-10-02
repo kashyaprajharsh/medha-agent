@@ -787,6 +787,15 @@ pub(crate) fn process_sse_event(
                     }
                 }
                 if let Some(arguments) = function.arguments {
+                    // Under the id the finished call will have, so a surface can
+                    // tie what it drew from these pieces to the call that follows.
+                    if !entry.1.is_empty() && !arguments.is_empty() {
+                        blocks.push(Block::ToolInput {
+                            id: call_id(&entry.0, index),
+                            name: entry.1.clone(),
+                            delta: arguments.clone(),
+                        });
+                    }
                     entry.2.push_str(&arguments);
                     if !entry.1.is_empty()
                         && !target_announced.contains(&index)
@@ -805,17 +814,22 @@ pub(crate) fn process_sse_event(
     Ok(blocks)
 }
 
+/// The id a streamed call is known by: the provider's, or its place in the reply.
+fn call_id(id: &str, index: u32) -> String {
+    if id.is_empty() {
+        format!("call_{index}")
+    } else {
+        id.to_string()
+    }
+}
+
 pub(crate) fn finalize_tool_calls(
     accum: BTreeMap<u32, (String, String, String)>,
     names: &HashMap<String, String>,
 ) -> Result<Vec<ToolIntent>, ProviderError> {
     let mut intents = Vec::new();
     for (index, (id, name, arguments)) in accum {
-        let id = if id.is_empty() {
-            format!("call_{index}")
-        } else {
-            id
-        };
+        let id = call_id(&id, index);
         if name.trim().is_empty() {
             return Err(ProviderError::invalid_tool_call(
                 "<unknown>",

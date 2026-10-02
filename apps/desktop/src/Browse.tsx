@@ -1,5 +1,7 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
+import { restOf, summaryOf } from "./ExtensionParts";
 import { Icon } from "./Icon";
+import { Sheet } from "./Sheet";
 
 /** How many results a browse view paints before asking to show the rest. */
 export const BROWSE_PAGE = 40;
@@ -14,16 +16,44 @@ export function BrowseSearch({ label, placeholder, value, onChange }: { label: s
   );
 }
 
-/** A catalog entry: what it is, where it comes from, and the one thing to do with it. */
-export function BrowseRow({ name, meta, description, action }: { name: string; meta?: string; description?: string; action: ReactNode }) {
+/**
+ * A catalog entry on one line: what it is, where it comes from, and the one thing
+ * to do with it. The row opens the entry in full, with the same thing to do.
+ */
+export function BrowseRow({
+  name,
+  meta,
+  /** Whether where it comes from tells the rows apart; with one source it is said only in full. */
+  several = true,
+  description,
+  action,
+}: {
+  name: string;
+  meta?: string;
+  several?: boolean;
+  description?: string;
+  action: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
   return (
-    <li className="browse-row">
-      <div>
+    <li className="ix-row">
+      <button className="ix-main" onClick={() => setOpen(true)}>
         <b>{name}</b>
-        {meta && <small>{meta}</small>}
-        {description && <p>{description}</p>}
-      </div>
-      {action}
+        <span className="ix-sum">{description ? summaryOf(description) : ""}</span>
+      </button>
+      {meta && several && <small className="ix-note">{meta}</small>}
+      <span className="ix-act">{action}</span>
+      {open && (
+        <Sheet label={name} onClose={() => setOpen(false)}>
+          <div className="sheet-title">
+            <h2>{name}</h2>
+          </div>
+          {meta && <p className="sheet-from">From {meta}</p>}
+          {description && <p className="sheet-lead">{summaryOf(description)}</p>}
+          {description && restOf(description) && <p className="sheet-more">{restOf(description)}</p>}
+          <div className="sheet-actions">{action}</div>
+        </Sheet>
+      )}
     </li>
   );
 }

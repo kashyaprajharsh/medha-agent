@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { PageTop } from "./ExtensionParts";
 import { useWorkspaceApi } from "./Workspace";
 
 type Key = {
@@ -62,15 +63,13 @@ export function Keys() {
           : "Signs in with OAuth"
         : "Not set";
     return (
-      <li key={slot}>
-        <div className="key-main">
+      <li key={slot} className="ix-row key">
+        <span className="ix-main" title={key.label}>
           <b>{key.label}</b>
-          {key.detail && <code>{key.detail}</code>}
-        </div>
-        <span className={`key-status ${key.present || key.signed_in ? "set" : ""}`}>
-          {status}
-          {key.in_use && " · in use"}
+          <code className="ix-sum mono">{key.detail?.replace(/^https:\/\//, "")}</code>
         </span>
+        {key.in_use && <span className="ix-chip gold">In use</span>}
+        <small className={`ix-note ${key.present || key.signed_in ? "ok" : ""}`}>{status}</small>
         {editing === slot ? (
           <form
             className="key-edit"
@@ -109,20 +108,19 @@ export function Keys() {
     : [];
   return (
     <div className="keys-page">
-      <div className="page-heading">
-        <div>
-          <h2>Keys</h2>
-          <p>Every key Medha uses. Values are never shown{listing ? `; new keys are kept in ${listing.store}` : ""}.</p>
-        </div>
-      </div>
+      <PageTop title="Keys">
+        Every key Medha uses. Values are never shown{listing ? `; new keys are kept in ${listing.store}` : ""}.
+      </PageTop>
       {error && <p className="surface-error" role="alert">{error}</p>}
       {!listing && !error && <p className="quiet">Reading keys…</p>}
       {groups.map(
         ([title, keys]) =>
           keys.length > 0 && (
-            <section className="key-group" key={title}>
-              <h3>{title}</h3>
-              <ul>{keys.map(row)}</ul>
+            <section className="ix-group" key={title}>
+              <h3>
+                {title} <span>{keys.length}</span>
+              </h3>
+              <ul className="ix key-list">{keys.map(row)}</ul>
             </section>
           ),
       )}

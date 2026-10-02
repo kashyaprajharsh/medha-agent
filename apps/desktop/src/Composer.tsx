@@ -1,5 +1,5 @@
 import { Select } from "./Select";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import {
   desktop,
   type Attachment,
@@ -10,6 +10,11 @@ import { Icon, type IconName } from "./Icon";
 import { MessageTokens, type MessageToken, type TokenLayout } from "./MessageTokens";
 
 export type Control = "model" | "reasoning" | "mode";
+// The window's own bar above the page, the gap a menu keeps from an edge, and the least a menu is given.
+const HEAD = 56;
+const MARGIN = 12;
+const SMALLEST = 180;
+
 type Props = {
   value: string;
   resetRevision?: number;
@@ -109,6 +114,9 @@ export function Composer(props: Props) {
   const input = useRef<HTMLTextAreaElement>(null);
   const chooser = useRef<HTMLInputElement>(null);
   const controls = useRef<HTMLDivElement>(null);
+  const box = useRef<HTMLFormElement>(null);
+  // Where a menu has room: the composer sits at the foot of a chat and mid-page on a new session.
+  const [room, setRoom] = useState<{ down: boolean; most: number }>();
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -283,11 +291,34 @@ export function Composer(props: Props) {
         .includes(query.toLowerCase()),
     ) ?? [];
   const support = props.settings?.reasoning_support;
+  const menu = Boolean(props.control) || commands.length > 0;
+  useLayoutEffect(() => {
+    if (!menu) return setRoom(undefined);
+    const measure = () => {
+      if (!box.current) return;
+      const edge = box.current.getBoundingClientRect();
+      // The page the composer sits in is what a menu must stay inside: it ends above the status line.
+      const page = box.current.closest(".main")?.getBoundingClientRect();
+      const above = edge.top - (page?.top ?? 0) - HEAD - MARGIN;
+      const below = (page?.bottom ?? window.innerHeight) - edge.bottom - MARGIN;
+      setRoom({ down: below > above, most: Math.max(above, below, SMALLEST) });
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [menu]);
+  // The arrow keys move through the commands; the one they are on stays in view.
+  const menuList = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    menuList.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
+  }, [commandIndex]);
 
   return (
     <div className="composer-wrap">
       <form
-        className={`composer ${dragging ? "dragging" : ""}`}
+        ref={box}
+        style={room && ({ "--menu-room": `${room.most}px` } as CSSProperties)}
+        className={`composer ${dragging ? "dragging" : ""} ${room?.down ? "menus-down" : ""}`}
         onSubmit={(event) => {
           event.preventDefault();
           if (canSend) props.onSend();
@@ -388,7 +419,7 @@ export function Composer(props: Props) {
           }}
         />
         {commands.length > 0 && (
-          <div className="slash-menu" role="listbox" aria-label="Chat commands">
+          <div className="slash-menu" ref={menuList} role="listbox" aria-label="Chat commands">
             {commands.map((item, index) => (
               <button
                 type="button"
@@ -540,25 +571,28 @@ export function Composer(props: Props) {
                   </button>
                 </>
               )}
-              {props.control === "mode" &&
-                MODES.map((mode) => (
-                  <button
-                    type="button"
-                    className="setting-option"
-                    key={mode.id}
-                    disabled={locked}
-                    aria-pressed={props.settings?.mode === mode.id}
-                    onClick={() => void configure({ mode: mode.id })}
-                  >
-                    <span className="option-radio" />
-                    <span>
-                      <b>{mode.title}</b>
-                      <small>{mode.description}</small>
-                    </span>
-                  </button>
-                ))}
+              {props.control === "mode" && (
+                <div className="popover-body">
+                  {MODES.map((mode) => (
+                    <button
+                      type="button"
+                      className="setting-option"
+                      key={mode.id}
+                      disabled={locked}
+                      aria-pressed={props.settings?.mode === mode.id}
+                      onClick={() => void configure({ mode: mode.id })}
+                    >
+                      <span className="option-radio" />
+                      <span>
+                        <b>{mode.title}</b>
+                        <small>{mode.description}</small>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
               {props.control === "reasoning" && (
-                <>
+                <div className="popover-body">
                   <div className="setting-section">
                     <label>Model reasoning</label>
                     <div className="segmented">
@@ -638,7 +672,7 @@ export function Composer(props: Props) {
                         ? "Reasoning support is unverified for this profile. The provider validates each choice."
                         : "Effort affects the model. Expanding thinking only changes the display."}
                   </p>
-                </>
+                </div>
               )}
               {loading && (
                 <p className="popover-note" role="status">

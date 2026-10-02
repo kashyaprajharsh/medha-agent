@@ -111,6 +111,9 @@ struct EventView {
     detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
+    /// A screen the tool's server offers for this result, and what it draws.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screen: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -590,6 +593,7 @@ fn tool_view(steps: &mut transcript_view::Steps, event: &Event) -> Option<EventV
                 detail: outcome.detail,
                 error_code: outcome.error_code,
                 status: Some(status.to_owned()),
+                screen: event.payload.get("screen").cloned(),
                 ..event_view(event, "tool_result", String::new())
             })
         }

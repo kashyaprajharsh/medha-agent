@@ -11,83 +11,6 @@
   align-items: center;
   gap: var(--s-2);
 }
-.plugin-row {
-  border-bottom: 1px solid var(--hair);
-}
-.plugin-head {
-  display: flex;
-  width: 100%;
-  text-align: left;
-  align-items: center;
-  gap: var(--s-4);
-  padding: var(--s-5) var(--s-2);
-  margin: 0 calc(-1 * var(--s-2));
-  border-radius: var(--r-md);
-  transition: background var(--t-fast);
-}
-.plugin-head:hover {
-  background: var(--hover);
-}
-.plugin-head > span:nth-child(2) {
-  flex: 1;
-}
-.plugin-head b {
-  display: block;
-  font-size: var(--text-base);
-  font-weight: 600;
-}
-.plugin-head small {
-  display: block;
-  color: var(--faint);
-  font-size: var(--text-xs);
-  margin-top: 6px;
-}
-.plugin-head > .icon {
-  transition: transform var(--t-base) var(--ease-out);
-}
-.plugin-head[aria-expanded="true"] > .icon {
-  transform: rotate(90deg);
-}
-.plugin-state {
-  font-size: var(--text-xs);
-  color: var(--dim);
-}
-.plugin-marker {
-  color: var(--faint);
-  font-size: var(--text-lg);
-}
-.plugin-marker.enabled {
-  color: var(--ok);
-}
-.plugin-marker.failed {
-  color: var(--err);
-}
-.plugin-detail {
-  padding: 0 0 22px 33px;
-  animation: fade-in var(--t-base) var(--ease-out) both;
-}
-.plugin-detail h3 {
-  color: var(--dim);
-  font-size: var(--text-xs);
-  font-weight: 500;
-  margin: var(--s-5) 0 10px;
-}
-.plugin-detail ul {
-  list-style: none;
-  padding: 0;
-}
-.plugin-detail li {
-  display: flex;
-  gap: 18px;
-  margin: 10px 0;
-}
-.plugin-detail li span {
-  width: 100px;
-  color: var(--dim);
-}
-.plugin-detail li b {
-  font-weight: 500;
-}
 .access-list {
   padding-left: 18px !important;
   color: var(--dim);
@@ -96,22 +19,6 @@
 }
 .access-list li {
   display: list-item;
-}
-.tool-access-row {
-  border-bottom: 1px solid var(--hair);
-  padding: var(--s-4) 0;
-}
-.tool-access-row summary {
-  display: flex;
-  justify-content: space-between;
-  cursor: pointer;
-}
-.tool-access-row p {
-  color: var(--dim);
-  line-height: 1.65;
-}
-.tool-access-row small {
-  color: var(--dim);
 }
 
 .market {
@@ -215,12 +122,53 @@
 .doctor-checks span {
   color: var(--dim);
 }
-.settings-row .mcp-state {
+.mcp-state {
   display: inline-flex;
   align-items: center;
   gap: var(--s-2);
-  margin-top: var(--s-1);
   color: var(--dim);
+  font-size: var(--text-sm);
+}
+.ix-row > .mcp-state {
+  flex: none;
+  max-width: 320px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* In the sheet the details are the sheet's own sections, not a card inside it. */
+.cx-sheet .mcp-details {
+  margin: var(--s-6) 0 var(--s-4);
+  padding: 0;
+  border: 0;
+  background: none;
+  gap: var(--s-6);
+}
+.cx-sheet .mcp-details h4 {
+  color: var(--dim);
+}
+/* A sheet is narrow: a tool's name gets its own line and what it does wraps under it. */
+.cx-sheet .mcp-tools {
+  max-height: none;
+  overflow: visible;
+}
+.cx-sheet .mcp-tools .checkbox-label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 2px var(--s-3);
+  padding: var(--s-2) 0;
+}
+.cx-sheet .mcp-tools input {
+  margin-top: 3px;
+}
+.cx-sheet .mcp-tools span {
+  grid-column: 2;
+  display: -webkit-box;
+  white-space: normal;
+  line-height: 1.5;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
 }
 .mcp-state .agent-dot {
   flex: none;
@@ -238,8 +186,656 @@
   animation: rise-in var(--t-base) var(--ease-out) both;
 }
 
-@media (max-width: 780px) {
-  .plugin-head {
-    gap: 10px;
+/* A tab's top: its name, one line on what it holds, then one row of controls. */
+.ext-top,
+.ext-bar,
+.ix-group {
+  animation: rise-in var(--t-slow) var(--ease-out) both;
+}
+.ext-top {
+  margin-bottom: var(--s-6);
+}
+.ext-top h2 {
+  margin: 0 0 6px;
+}
+.ext-top p {
+  margin: 0;
+  max-width: 62ch;
+  color: var(--dim);
+  line-height: 1.5;
+}
+.ext-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s-3);
+  margin-bottom: var(--s-6);
+}
+.ext-bar-end {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-3);
+}
+.ext-seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: var(--r-full);
+  background: var(--well);
+  box-shadow: var(--pressed);
+  font-size: var(--text-sm);
+}
+.ext-seg button {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 5px 14px;
+  border-radius: var(--r-full);
+  color: var(--dim);
+  transition:
+    color var(--t-fast),
+    background var(--t-base) var(--ease-out),
+    box-shadow var(--t-base) var(--ease-out);
+}
+.ext-seg button:hover {
+  color: var(--text);
+}
+.ext-seg button[aria-pressed="true"] {
+  background: var(--raised);
+  color: var(--text);
+  box-shadow: var(--e1-shadow);
+}
+.ext-seg i {
+  font-style: normal;
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+.ext-find {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex: 0 1 220px;
+  min-width: 120px;
+  height: 32px;
+  padding: 0 var(--s-3);
+  border-radius: var(--r-full);
+  background: var(--well);
+  box-shadow: var(--pressed);
+  color: var(--faint);
+  transition: box-shadow var(--t-base) var(--ease-out);
+}
+.ext-find:focus-within {
+  box-shadow:
+    var(--pressed),
+    0 0 0 3px var(--gold-wash);
+}
+.ext-find .icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.ext-find input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: none;
+  color: var(--text);
+  font: var(--text-sm) var(--font-ui);
+}
+.ext-find input::placeholder {
+  color: var(--faint);
+}
+.ext-find kbd {
+  padding: 0 6px;
+  border-radius: var(--r-xs);
+  font: var(--text-xs) var(--font-ui);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.ext-find:focus-within kbd {
+  display: none;
+}
+.ext-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 14px;
+  border-radius: var(--r-full);
+  background: var(--raised);
+  box-shadow: var(--e1-shadow);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  transition:
+    translate var(--t-fast) var(--ease-out),
+    scale var(--t-fast) var(--ease-out),
+    box-shadow var(--t-fast);
+}
+.ext-add:hover {
+  translate: 0 -1px;
+  box-shadow: var(--e2-shadow);
+}
+.ext-add:active {
+  translate: 0 0;
+  scale: 0.97;
+}
+.ext-add .icon {
+  width: 14px;
+  height: 14px;
+}
+
+/* The index: one line each, set like a contents page. A row opens the thing in full. */
+.ix-group {
+  margin-bottom: var(--s-8);
+  animation-delay: 60ms;
+}
+.ix-group > h3 {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  margin: 0 0 var(--s-2);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--dim);
+}
+.ix-group > h3 span {
+  color: var(--faint);
+  font-weight: 400;
+}
+.ix-hint {
+  margin: 0;
+  color: var(--faint);
+  font-size: var(--text-sm);
+}
+.ix-hint code {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+.ix {
+  margin: 0 -14px;
+}
+.ix-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--s-5);
+  padding: 0 14px;
+  border-radius: var(--r-lg);
+  transition:
+    background var(--t-base) var(--ease-out),
+    box-shadow var(--t-base) var(--ease-out);
+}
+.ix-row + .ix-row::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  top: 0;
+  height: 1px;
+  background: var(--hair);
+  transition: opacity var(--t-fast);
+}
+.ix-row:hover,
+.ix-row:focus-within {
+  background: var(--raised);
+  box-shadow: var(--e1-shadow);
+}
+.ix-row:hover::before,
+.ix-row:hover + .ix-row::before,
+.ix-row:focus-within::before,
+.ix-row:focus-within + .ix-row::before {
+  opacity: 0;
+}
+.ix-main {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--s-5);
+  padding: 13px 0;
+  text-align: left;
+}
+.ix-main:focus-visible {
+  outline: 0;
+}
+.ix-main b {
+  font-size: var(--text-md);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color var(--t-base);
+}
+.ix-sum {
+  color: var(--dim);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color var(--t-base);
+}
+.ix-row.off .ix-main b {
+  color: var(--dim);
+}
+.ix-row.off .ix-sum {
+  color: var(--faint);
+}
+.ix-note {
+  color: var(--faint);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.mono {
+  font-family: var(--font-mono);
+}
+.ix-main .mono {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.ix-sum.mono {
+  font-size: var(--text-xs);
+}
+.ext-top code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+/* A moment a script can run at: the whole row starts one. */
+.ix-row.moment {
+  width: 100%;
+  text-align: left;
+}
+.ix-row.moment .ix-main {
+  grid-template-columns: 250px minmax(0, 1fr);
+}
+.ix-row.moment > .icon {
+  width: 28px;
+  height: 28px;
+  padding: 7px;
+  border-radius: 50%;
+  color: var(--faint);
+  transition:
+    color var(--t-fast),
+    background var(--t-fast);
+}
+.ix-row.moment:hover > .icon {
+  color: var(--gold);
+  background: var(--gold-wash);
+}
+.hook-list .ix-main {
+  grid-template-columns: 250px minmax(0, 1fr);
+}
+/* A tool: one line, and the whole of what it does when asked. */
+.ix-row.tool {
+  display: block;
+}
+.ix-row.tool summary {
+  display: flex;
+  align-items: center;
+  gap: var(--s-5);
+  cursor: pointer;
+  list-style: none;
+}
+.ix-row.tool summary::-webkit-details-marker {
+  display: none;
+}
+.ix-row.tool[open] .ix-sum {
+  visibility: hidden;
+}
+.ix-row.tool p {
+  margin: 0;
+  padding: 0 0 var(--s-4) calc(190px + var(--s-5));
+  color: var(--dim);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+}
+.ix-note.reach-reversible_local {
+  color: var(--dim);
+}
+.ix-note.reach-irreversible_local,
+.ix-note.reach-external {
+  color: var(--warn);
+}
+.ix-group .ext-bar {
+  margin-bottom: var(--s-4);
+}
+/* What a row offers to do: one width, so the lines above and below keep their columns. */
+.ix-act {
+  flex: none;
+  min-width: 96px;
+  display: flex;
+  justify-content: flex-end;
+}
+.ix-chip {
+  padding: 2px 9px;
+  border-radius: var(--r-full);
+  color: var(--dim);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.ix-chip.warn {
+  color: var(--warn);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 40%, transparent);
+}
+/* On is a quiet state in a list: the names lead, the switches only confirm. */
+.switch.quiet-on[aria-checked="true"] {
+  background: var(--gold-wash);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gold) 45%, transparent);
+}
+.switch.quiet-on[aria-checked="true"]::after {
+  background: var(--gold);
+}
+.switch.quiet-on::after {
+  transition:
+    transform var(--t-slow) var(--ease-spring),
+    background var(--t-base);
+}
+
+/* Inside the sheet: the thing in full. */
+.cx-sheet > * {
+  animation: rise-in var(--t-slow) var(--ease-out) 90ms both;
+}
+.cx-sheet > .cx-close {
+  animation: none;
+}
+.sheet-title {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  margin: var(--s-8) 0 var(--s-3);
+}
+.sheet-title h2 {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.sheet-from {
+  margin: calc(-1 * var(--s-2)) 0 var(--s-4);
+  color: var(--faint);
+  font-size: var(--text-sm);
+}
+.sheet-lead {
+  margin: 0 0 var(--s-4);
+  font-size: var(--text-base);
+  line-height: 1.55;
+}
+.sheet-more {
+  margin: 0 0 var(--s-6);
+  color: var(--dim);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+}
+.sheet-more.clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  position: relative;
+}
+.sheet-more button {
+  margin-left: var(--s-2);
+  color: var(--link);
+}
+.sheet-more.clamp button {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  padding-left: var(--s-6);
+  background: linear-gradient(to right, transparent, var(--overlay) 30%);
+}
+.sheet-title small {
+  margin-left: var(--s-2);
+  color: var(--faint);
+  font-size: var(--text-sm);
+  font-weight: 400;
+  letter-spacing: 0;
+}
+.sheet-h {
+  margin: var(--s-2) 0 var(--s-3);
+  color: var(--dim);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.sheet-parts {
+  list-style: none;
+  margin: 0 0 var(--s-6);
+  padding: 0;
+  display: grid;
+  gap: var(--s-2);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+.sheet-parts li {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: var(--s-4);
+}
+.sheet-parts span {
+  color: var(--faint);
+}
+.ix-chip.bad {
+  color: var(--err);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--err) 40%, transparent);
+}
+.sheet-actions {
+  flex-wrap: wrap;
+}
+.sheet-facts {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 10px var(--s-4);
+  margin: 0 0 var(--s-6);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.sheet-facts dt {
+  color: var(--faint);
+}
+.sheet-facts dd {
+  margin: 0;
+}
+.sheet-facts dd.warn {
+  color: var(--warn);
+}
+.sheet-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-top: var(--s-4);
+}
+.sheet-quiet {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: var(--text-sm);
+  transition: color var(--t-fast);
+}
+.sheet-quiet:hover:not(:disabled) {
+  color: var(--err);
+}
+/* The page narrows with the window and with the panels beside it, so it is the page that is measured. */
+.page-content {
+  container-type: inline-size;
+}
+/* The same rows, where a page of settings uses them. */
+.ix-chip.gold {
+  color: var(--gold);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gold) 40%, transparent);
+}
+.ix-note.ok {
+  color: var(--ok);
+}
+.ix-note.warn {
+  color: var(--warn);
+}
+.ix-sum i {
+  font-style: normal;
+  color: var(--faint);
+}
+/* A row that is one thought, not a name and a note. */
+.ix-main.whole {
+  grid-template-columns: minmax(0, 1fr);
+}
+.ix-sum.lead {
+  color: var(--text);
+  font-size: var(--text-md);
+}
+/* A row that is one of a few to choose between. */
+.ix-row.pick {
+  width: 100%;
+  gap: var(--s-4);
+  text-align: left;
+}
+.ix-row.pick[aria-checked="true"] {
+  background: var(--gold-wash);
+}
+.ix-row.pick[aria-checked="true"] > .option-radio {
+  border: 4px solid var(--gold);
+}
+.ix-row.pick > .option-radio {
+  flex: none;
+}
+.page-content .settings-form.plain {
+  max-width: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+}
+/* A key is named for everything that uses it, which can be several models: the name gets the room. */
+.ix-row.key .ix-main {
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+}
+.settings-form.plain > label,
+.settings-form.plain > .btn-gold {
+  max-width: 520px;
+}
+.settings-form.plain > .btn-gold {
+  justify-self: start;
+}
+.sheet-title h2.claim {
+  font-size: var(--text-lg);
+  line-height: 1.4;
+}
+.sheet-facts dd.mono {
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+.ext-seg button {
+  white-space: nowrap;
+}
+/* Instructions: the files down the side, the one being written beside them. */
+.instruction-editor {
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: var(--s-8);
+  align-items: start;
+}
+.instruction-files {
+  display: grid;
+  gap: var(--s-5);
+  margin-left: -10px;
+}
+.instruction-files h3 {
+  margin: 0 0 var(--s-1) 10px;
+  color: var(--faint);
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+.instruction-files button {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: var(--s-2) 10px;
+  border-radius: var(--r-md);
+  text-align: left;
+  transition:
+    background var(--t-base) var(--ease-out),
+    box-shadow var(--t-base) var(--ease-out);
+}
+.instruction-files button:hover {
+  background: var(--hover);
+}
+.instruction-files button[aria-current="true"] {
+  background: var(--raised);
+  box-shadow: var(--e1-shadow);
+}
+.instruction-files i {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-top: 7px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+}
+.instruction-files i.written {
+  background: var(--gold);
+  box-shadow: none;
+}
+.instruction-files span {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.instruction-files b {
+  font-size: var(--text-md);
+  font-weight: 500;
+  color: var(--dim);
+}
+.instruction-files [aria-current="true"] b {
+  font-weight: 600;
+  color: var(--text);
+}
+.instruction-files small {
+  color: var(--faint);
+  font-size: var(--text-xs);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.instruction-page {
+  display: grid;
+  gap: var(--s-4);
+  min-width: 0;
+}
+.instruction-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  min-width: 0;
+}
+.instruction-foot code {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--faint);
+  font: var(--text-xs) var(--font-mono);
+}
+@container (max-width: 620px) {
+  .instruction-editor {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--s-5);
+  }
+}
+@container (max-width: 620px) {
+  .ix-main,
+  .ix-row.moment .ix-main,
+  .hook-list .ix-main {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+  .ix-row.tool p {
+    padding-left: 0;
+  }
+  .ix-row > .mcp-state {
+    display: none;
   }
 }

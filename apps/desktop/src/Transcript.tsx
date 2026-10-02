@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { Markdown } from "./Markdown";
 import { Icon } from "./Icon";
+import { Screens } from "./OutputPlate";
 import { PlanCard, Reasoning, StepGroup } from "./Steps";
 import type { Block, SubagentRun } from "./timeline";
 import { clock, doingLine, duration, outcomeLabel } from "./timeline";
@@ -114,7 +115,7 @@ export const Transcript = memo(function Transcript({
       case "assistant":
         // The backend escapes all model text and keeps only web and mail links.
         return block.html ? (
-          <Markdown html={block.html} />
+          <Markdown html={block.html} scope={block.id} at={block.ts} />
         ) : (
           <div className="prose plain">{block.text}</div>
         );
@@ -139,7 +140,12 @@ export const Transcript = memo(function Transcript({
           </details>
         );
       case "tools":
-        return <StepGroup steps={block.steps} />;
+        return (
+          <>
+            <StepGroup steps={block.steps} />
+            <Screens steps={block.steps} at={block.ts} />
+          </>
+        );
       case "subagents":
         return (
           <SubagentCard

@@ -24,10 +24,11 @@ import { LiveTail } from "./LiveTail";
 import { Palette, type Action } from "./Palette";
 import { medhaIcon, Sidebar } from "./Sidebar";
 import { WorkSurface, type SurfaceTab } from "./WorkSurface";
+import { OutputScope } from "./OutputScope";
 import { toBlocks, type SubagentRun } from "./timeline";
 import { Transcript } from "./Transcript";
 import { useLive } from "./useLive";
-import { Welcome } from "./Welcome";
+import { Starters, Welcome } from "./Welcome";
 import { WorkspaceMenu } from "./WorkspaceMenu";
 
 const TerminalDrawer = lazy(() =>
@@ -709,11 +710,33 @@ export function App() {
   }, [palette]);
   const fresh =
     draftKey && (!state || state.sent.length === 0) && !state?.error;
+  // A new session's own screen: the composer in the middle of the page, not at its foot.
+  const home = Boolean(fresh) && page === "chat";
 
   return (
+    <OutputScope
+      chat={currentKey}
+      viewing={surface === "preview" && !preview}
+      onShow={() => {
+        setPreview(null);
+        setSurface("preview");
+      }}
+      onMade={() => {
+        if (preview || (surface && surface !== "preview")) return false;
+        setSurface("preview");
+        return true;
+      }}
+      onAsk={(request) => {
+        if (!currentKey) return;
+        setText((all) => ({
+          ...all,
+          [currentKey]: [all[currentKey], request].filter(Boolean).join("\n\n"),
+        }));
+      }}
+    >
     <div
       ref={appRoot}
-      className={`shell ${surface || preview ? "with-panel" : ""} ${sidebarOpen ? "sidebar-open" : "sidebar-hidden"} ${sidebarPeek && !sidebarOpen ? "sidebar-peek" : ""}`}
+      className={`shell ${surface || preview ? "with-panel" : ""} ${surface === "preview" && !preview ? "previewing" : ""}${sidebarOpen ? "sidebar-open" : "sidebar-hidden"} ${sidebarPeek && !sidebarOpen ? "sidebar-peek" : ""}`}
     >
       {!sidebarOpen && (
         <div
@@ -756,7 +779,7 @@ export function App() {
         onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
       />
 
-      <main className="main">
+      <main className={home ? "main home" : "main"}>
         <header className="head">
           <button
             type="button"
@@ -888,7 +911,7 @@ export function App() {
         >
           <div className="thread">
             {fresh && (
-              <Welcome folder={folder} onPick={(starter) => submit(starter)} />
+              <Welcome folder={folder} branch={branch} />
             )}
             {!draftKey && loading && !current && (
               <div className="empty">
@@ -1011,6 +1034,7 @@ export function App() {
             }}
           />
         )}
+        {home && <Starters folder={folder} onPick={(starter) => submit(starter)} />}
         {terminalUsed && (
           <Suspense fallback={<p className="quiet">Opening terminal…</p>}>
             <TerminalDrawer
@@ -1100,5 +1124,6 @@ export function App() {
 
       </footer>
     </div>
+    </OutputScope>
   );
 }

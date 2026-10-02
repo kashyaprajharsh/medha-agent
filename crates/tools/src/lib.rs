@@ -1181,6 +1181,16 @@ impl Executor for ToolRegistry {
                         "content": cut.map_or(out.text.as_str(), |index| &out.text[..index]),
                         "truncated": cut.is_some(),
                     });
+                    // The screen draws the whole result; the model reads only the text above.
+                    if let Some(resource) = &out.screen {
+                        payload[kernel::TOOL_SCREEN_FIELD] = json!({
+                            "server": out.server,
+                            "tool": out.tool,
+                            "resource": resource,
+                            "input": intent.args,
+                            "result": out.result,
+                        });
+                    }
                     if let (Some(_), Some(store)) = (cut, &self.artifacts) {
                         attach_artifact(&mut payload, out.text.into_bytes(), store).await;
                     }

@@ -16,6 +16,7 @@ mod desktop_mcp_registry;
 mod desktop_memory;
 mod desktop_preferences;
 mod desktop_rewind;
+mod desktop_screens;
 mod desktop_service;
 mod desktop_skills;
 mod hook_files;

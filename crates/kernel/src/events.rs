@@ -22,9 +22,14 @@ pub const EVENT_HASH_VERSION: u8 = 2;
 /// retained in the event log, but must never be shown to a model or UI.
 pub const AGENT_REPORT_ACKS_FIELD: &str = "_agent_report_dispatches";
 
+/// What a tool's screen draws: kept in the event log so a reopened chat can
+/// show the screen again, handed to the surface, and never put before a model.
+pub const TOOL_SCREEN_FIELD: &str = "_tool_screen";
+
 pub(crate) fn strip_private_observation_fields(payload: &mut Value) {
     if let Some(object) = payload.as_object_mut() {
         object.remove(AGENT_REPORT_ACKS_FIELD);
+        object.remove(TOOL_SCREEN_FIELD);
     }
 }
 
@@ -423,7 +428,16 @@ impl Event {
     /// tools pass `TrustLabel::Tool`; web-facing tools pass `TrustLabel::Web`
     /// so downstream layers can treat fetched content as untrusted.
     pub fn tool_obs(s: &Session, o: &Observation, trust: TrustLabel) -> Self {
-        let payload = serde_json::to_value(o).unwrap_or(Value::Null);
+        let mut payload = serde_json::to_value(o).unwrap_or(Value::Null);
+        // A screen's data is stored beside the result, not in it: everything
+        // that reads a stored result, for a model or a search, never meets it.
+        let screen = payload
+            .get_mut("payload")
+            .and_then(Value::as_object_mut)
+            .and_then(|result| result.remove(TOOL_SCREEN_FIELD));
+        if let Some(screen) = screen {
+            payload["screen"] = screen;
+        }
         Self::new(s, EventKind::ToolObs, payload, trust)
     }
 
@@ -1736,6 +1750,41 @@ mod tests {
         };
         assert!(!result.content.contains(AGENT_REPORT_ACKS_FIELD));
         assert!(result.content.contains("reports"));
+    }
+
+    #[test]
+    fn what_a_tool_screen_draws_is_kept_for_the_surface_and_never_replayed_to_a_model() {
+        let session = Session::new();
+        let event = Event::tool_obs(
+            &session,
+            &Observation::ok(
+                "draw-1",
+                json!({
+                    "content": "Drew 3 shapes",
+                    TOOL_SCREEN_FIELD: {"resource": "ui://x/draw", "result": {"secret-shape": 1}},
+                }),
+            ),
+            TrustLabel::Tool,
+        );
+        assert_eq!(
+            event.payload["screen"]["resource"], "ui://x/draw",
+            "a reopened chat could not show the screen again"
+        );
+        assert!(
+            !event.payload["payload"]
+                .to_string()
+                .contains("secret-shape"),
+            "the stored result itself carries the screen's data"
+        );
+        let legacy = project_messages(std::slice::from_ref(&event));
+        let ordered = project_ordered_messages(std::slice::from_ref(&event));
+        let ContentPart::ToolResult(result) = &ordered[0].parts[0] else {
+            panic!("expected ordered tool result")
+        };
+        for seen in [&legacy[0].content, &result.content] {
+            assert!(seen.contains("Drew 3 shapes"));
+            assert!(!seen.contains("secret-shape") && !seen.contains(TOOL_SCREEN_FIELD));
+        }
     }
 
     #[test]

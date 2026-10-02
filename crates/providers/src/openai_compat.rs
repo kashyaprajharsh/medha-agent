@@ -1479,6 +1479,44 @@ mod sse_tests {
     }
 
     #[test]
+    fn a_tool_calls_arguments_are_passed_on_as_written_under_the_id_the_call_will_have() {
+        let mut accum = BTreeMap::new();
+        let mut tf = ThinkTagFilter::default();
+        let mut announced = HashSet::new();
+        let pieces = [
+            serde_json::json!({"index": 0, "id": "call_a", "function": {"name": "mcp__draw__view", "arguments": ""}}),
+            serde_json::json!({"index": 0, "function": {"arguments": "{\"elements\":\"[{\\\"type\\\":"}}),
+            serde_json::json!({"index": 0, "function": {"arguments": "\\\"rect\\\"}]\"}"}}),
+            // A second call with no id of its own is known by its place, as its finished call is.
+            serde_json::json!({"index": 1, "function": {"name": "mcp__draw__view", "arguments": "{}"}}),
+        ];
+        let mut written: BTreeMap<String, String> = BTreeMap::new();
+        for piece in pieces {
+            let record = format!(
+                "data: {}\n",
+                serde_json::json!({"choices":[{"delta":{"tool_calls":[piece]}}]})
+            );
+            for block in process_sse_record(&record, &mut accum, &mut tf, &mut announced).unwrap() {
+                if let Block::ToolInput { id, name, delta } = block {
+                    assert_eq!(name, "mcp__draw__view");
+                    assert!(!delta.is_empty(), "an empty piece says nothing");
+                    written.entry(id).or_default().push_str(&delta);
+                }
+            }
+        }
+        let calls = finalize_tool_calls(accum, &std::collections::HashMap::new()).unwrap();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            let pieces: serde_json::Value = serde_json::from_str(&written[&call.id]).unwrap();
+            assert_eq!(
+                pieces, call.args,
+                "the pieces of {} are its arguments",
+                call.id
+            );
+        }
+    }
+
+    #[test]
     fn answer_mentioning_think_tags_streams_fully_visible() {
         let full = "Reasoning support (Shape 1: `reasoning_content` field; Shape 2: `<think>` tags)\n- Tool call strategies: `Native`, `Guided` (planned)\n- `models.dev` integration for pricing";
         let deltas = [

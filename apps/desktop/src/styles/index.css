@@ -18,6 +18,7 @@
 @import "./surfaces/composer.css";
 @import "./surfaces/agents.css";
 @import "./surfaces/work-surface.css";
+@import "./surfaces/outputs.css";
 @import "./surfaces/files.css";
 @import "./surfaces/terminal.css";
 @import "./pages/pages.css";

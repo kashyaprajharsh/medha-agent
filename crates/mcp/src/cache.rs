@@ -12,6 +12,8 @@ struct Entry {
     fingerprint: String,
     exposed: Vec<McpToolSpec>,
     hidden: Vec<String>,
+    #[serde(default)]
+    app_only: Vec<McpToolSpec>,
 }
 
 /// Credentials count by kind only, so a rotated token keeps the entry.
@@ -72,6 +74,7 @@ pub(crate) fn load(dir: &Path, server: &ServerConfig) -> Option<Catalog> {
     (entry.fingerprint == fingerprint(server)).then_some(Catalog {
         exposed: entry.exposed,
         hidden: entry.hidden,
+        app_only: entry.app_only,
     })
 }
 
@@ -80,6 +83,7 @@ pub(crate) fn save(dir: &Path, server: &ServerConfig, catalog: &Catalog) {
         fingerprint: fingerprint(server),
         exposed: catalog.exposed.clone(),
         hidden: catalog.hidden.clone(),
+        app_only: catalog.app_only.clone(),
     };
     let Ok(text) = serde_json::to_string(&entry) else {
         return;

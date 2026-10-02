@@ -1,4 +1,4 @@
-import { Fragment, memo } from "react";
+import { Fragment, memo, useMemo } from "react";
 import { Markdown } from "./Markdown";
 import { Icon } from "./Icon";
 import {
@@ -11,12 +11,16 @@ import {
   type QuestionForm,
 } from "./live";
 import { LiveAgents } from "./LiveAgents";
+import { Screens } from "./OutputPlate";
 import { Questions } from "./Questions";
 import { Spinner } from "./Spinner";
 import { PlanCard, Reasoning, StepGroup } from "./Steps";
 import { clock } from "./timeline";
 import { TurnHead } from "./Transcript";
 import { UserText } from "./UserText";
+
+// A live reply is newer than anything saved, so its outputs sort last.
+const LIVE = 1e12;
 
 type Props = {
   state: LiveState;
@@ -43,6 +47,10 @@ export const LiveTail = memo(function LiveTail({
     (state.status === "starting" && state.sent.length > 0);
   const last = state.items.at(-1);
   const queued = queuedMessages(state);
+  const steps = useMemo(
+    () => state.items.flatMap((item) => (item.kind === "tools" ? item.steps : [])),
+    [state.items],
+  );
   let replying = false;
   const gap =
     working &&
@@ -76,6 +84,9 @@ export const LiveTail = memo(function LiveTail({
           </Fragment>
         );
       })}
+      {/* Every screen of the turn sits here, from the first piece of its call to
+          its result, so the one that drew the pieces is never replaced by another. */}
+      <Screens steps={steps} writing={state.writing} at={LIVE} fresh />
       {queued.map((message) => (
         <UserMessage key={message.id} message={message} pending />
       ))}
@@ -180,7 +191,7 @@ export const LiveTail = memo(function LiveTail({
     if (item.kind === "plan") return <PlanCard plan={item.plan} />;
     const streaming = working && index === state.items.length - 1;
     return item.html ? (
-      <Markdown html={item.html} className={streaming ? "streaming" : ""} />
+      <Markdown html={item.html} streaming={streaming} scope={`live-${index}`} at={LIVE + index} fresh />
     ) : (
       <div className={`prose plain ${streaming ? "streaming" : ""}`}>
         {item.text}

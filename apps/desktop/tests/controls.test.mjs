@@ -32,12 +32,20 @@ const modules = new Map([
     "Workspace",
     "data:text/javascript," +
       encodeURIComponent(
-        "export function useWorkspace(){return globalThis.__medhaControlsTest} export function useWorkspaceApi(){return globalThis.__medhaControlsTest.api}",
+        "const scope={current:{chatKey:null,sessionId:null}}; export function useWorkspace(){return {scope,...globalThis.__medhaControlsTest}} export function useWorkspaceApi(){return globalThis.__medhaControlsTest.api}",
       ),
   ],
   [
     "api",
     "data:text/javascript," + encodeURIComponent("export const desktop = {}"),
+  ],
+  [
+    // The diagram engine needs a real browser; a whole diagram here is one that ends in a node.
+    "outputRender",
+    "data:text/javascript," +
+      encodeURIComponent(
+        "export async function drawDiagram(source){return /--> *\\w/.test(source.split('\\n').at(-1))?{svg:'<svg data-lines=\"'+source.split('\\n').length+'\"></svg>'}:{problem:'Its last line is unfinished.'}} export function drawingUrl(){return 'blob:drawing'}",
+      ),
   ],
 ]);
 async function moduleUrl(name) {
@@ -965,6 +973,297 @@ test("Markdown adds only one copy control under StrictMode effect replay", async
     ),
   );
   assert.equal(document.querySelectorAll(".code-copy").length, 1);
+});
+
+test("a diagram grows while it is written, keeps its last good drawing, and opens only when whole", async () => {
+  const { Markdown } = await import(await moduleUrl("Markdown"));
+  const { OutputsProvider } = await import(await moduleUrl("outputContext"));
+  const shown = [];
+  const outputs = { open: null, all: [], viewing: false, stopped: [], online: [], show: (output) => shown.push(output) };
+  const reply = async (body, streaming) => {
+    await act(() =>
+      root.render(
+        h(
+          OutputsProvider,
+          { value: outputs },
+          h(Markdown, {
+            html: `<p>Here.</p><pre data-lang="mermaid"><code>${body}</code></pre>`,
+            scope: "live-0",
+            streaming,
+          }),
+        ),
+      ),
+    );
+    // Effects start once the render settles; while writing it redraws on a beat.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 300)));
+  };
+  const plate = () => document.querySelector(".out-plate");
+
+  await reply("flowchart LR\n  A --&gt;", true);
+  assert.equal(document.querySelector(".prose").textContent, "Here.");
+  assert.equal(plate().querySelector(".out-source").textContent, "flowchart LR\n  A -->");
+  assert.equal(plate().querySelector(".out-status").textContent, "Writing");
+  await click(plate().querySelector(".out-stage"));
+  assert.equal(shown.length, 0, "a half-written output does not open");
+
+  await reply("flowchart LR\n  A --&gt; B", true);
+  assert.equal(plate().querySelector(".out-diagram svg").dataset.lines, "2");
+  await reply("flowchart LR\n  A --&gt; B\n  B --&gt;", true);
+  assert.equal(plate().querySelector(".out-diagram svg").dataset.lines, "2", "the last good drawing stays");
+  assert.equal(plate().querySelector(".out-tail").textContent, "B -->");
+  assert.equal(plate().querySelector(".out-problem"), null, "no error while it is still being written");
+
+  await reply("---\ntitle: Read path\n---\nflowchart LR\n  A --&gt; B\n  B --&gt; C", false);
+  assert.equal(plate().querySelector(".out-status"), null);
+  await click(plate().querySelector("button.out-name"));
+  assert.deepEqual(shown, [
+    {
+      anchor: "live-0:1",
+      kind: "diagram",
+      source: "---\ntitle: Read path\n---\nflowchart LR\n  A --> B\n  B --> C",
+      path: undefined,
+      screen: undefined,
+      name: "Read path",
+    },
+  ]);
+
+  await reply("flowchart LR\n  A --&gt;", false);
+  assert.match(plate().querySelector(".out-problem").textContent, /couldn't be drawn.*unfinished/);
+  assert.equal(plate().querySelector("button.out-name"), null);
+});
+
+test("a diagram grows while text keeps arriving, without waiting for a pause", async () => {
+  const { Markdown } = await import(await moduleUrl("Markdown"));
+  const { OutputsProvider } = await import(await moduleUrl("outputContext"));
+  const outputs = { open: null, all: [], viewing: false, stopped: [], online: [] };
+  let body = "flowchart LR";
+  const seen = [];
+  // A new piece every 30 ms for a second: faster than any pause the drawing could wait for.
+  for (let piece = 0; piece < 34; piece++) {
+    body += piece % 3 === 0 ? `\n  N${piece} --&gt; ` : `M${piece}`;
+    await act(() =>
+      root.render(
+        h(
+          OutputsProvider,
+          { value: outputs },
+          h(Markdown, { html: `<pre data-lang="mermaid"><code>${body}</code></pre>`, scope: "live-0", streaming: true }),
+        ),
+      ),
+    );
+    await act(() => new Promise((resolve) => setTimeout(resolve, 30)));
+    seen.push(Number(document.querySelector(".out-diagram svg")?.dataset.lines ?? 0));
+  }
+  assert.ok(seen[12] > 0, "it is drawn well before the text stops");
+  assert.ok(new Set(seen).size > 3, `it keeps growing as lines arrive: ${seen}`);
+  assert.equal(document.querySelector(".out-status").textContent, "Writing");
+});
+
+test("a deck saved as PowerPoint reads back as the same slides, and nothing in a file is run", async () => {
+  globalThis.DOMParser = dom.window.DOMParser;
+  const { writeDeck } = await import(await moduleUrl("outputDeckWrite"));
+  const { readDeck } = await import(await moduleUrl("outputDeckRead"));
+  const hostile = '<img src=x onerror=alert(1)><script>alert(2)</script>';
+  const deck = {
+    head: "",
+    body: "",
+    slides: [
+      "<section><h1>Reads no longer wait</h1><p>One writer &amp; four readers.</p></section>",
+      `<section><h2>Checked</h2><ul><li>42 tests</li><li>${hostile.replaceAll("<", "&lt;")}</li></ul></section>`,
+    ],
+  };
+  const read = await readDeck(await writeDeck(deck, "Reads"));
+  const said = read.slides.map((slide) => slide.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+  assert.deepEqual(said, ["Reads no longer wait One writer &amp; four readers.", `Checked 42 tests ${hostile.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}`]);
+  for (const slide of read.slides) assert.doesNotMatch(slide, /<script|<img src=x|onerror=alert\(1\)>/);
+  await assert.rejects(readDeck(new TextEncoder().encode("not a zip")));
+
+  // A chart is drawn from its stored numbers; a label is only ever text.
+  const { chartMarkup } = await import(await moduleUrl("outputDeckChart"));
+  const point = (value, at = 0) => `<c:pt idx="${at}"><c:v>${value}</c:v></c:pt>`;
+  const chart = (kind) =>
+    new DOMParser().parseFromString(
+      `<c:chartSpace xmlns:c="urn:c"><c:plotArea><c:${kind}><c:ser><c:tx>${point("Before")}</c:tx>` +
+        `<c:cat>${point("&lt;script&gt;alert(1)&lt;/script&gt;")}${point("8 writers", 1)}</c:cat>` +
+        `<c:val>${point(41)}${point(182, 1)}</c:val></c:ser></c:${kind}></c:plotArea></c:chartSpace>`,
+      "application/xml",
+    );
+  const bars = chartMarkup(chart("barChart"), ["#123456"]);
+  assert.equal(bars.match(/<rect [^>]*rx="3"/g).length, 2, "one bar for each number");
+  assert.match(bars, /&lt;script&gt;alert\(1\)/);
+  assert.doesNotMatch(bars, /<script/);
+  assert.match(chartMarkup(chart("pieChart"), ["#123456", "#abcdef"]), /<path d="M/);
+  assert.equal(chartMarkup(chart("radarChart"), []), undefined, "a kind it cannot draw is not drawn wrong");
+});
+
+test("a screen is told nothing until it is ready, and gets only what the person allows", async () => {
+  const { bridge } = await import(await moduleUrl("outputBridge"));
+  const sent = [];
+  const asked = [];
+  let allow = false;
+  const gate = (what) => (asked.push(what), allow ? Promise.resolve() : Promise.reject(new Error("The person did not allow this.")));
+  const link = bridge(
+    {
+      context: () => ({ theme: "dark", displayMode: "fullscreen" }),
+      callTool: async (name, args) => (await gate(`call ${name}`), { content: [{ type: "text", text: JSON.stringify(args) }] }),
+      openLink: (url) => gate(`open ${url}`),
+      say: (text) => gate(`say ${text}`),
+      readPage: async (uri) => ({ uri }),
+    },
+    (message) => sent.push(message),
+    5,
+  );
+  link.feed({ input: { elements: 3 }, result: { content: [], structuredContent: { ok: true } } });
+  const settle = (after = 0) => new Promise((resolve) => setTimeout(resolve, after));
+  const rpc = (id, method, params) => link.receive({ jsonrpc: "2.0", id, method, params });
+
+  // Not JSON-RPC, or not yet ready: nothing is sent back unprompted.
+  for (const junk of [null, "hi", { method: "tools/call" }, { jsonrpc: "2.0" }]) link.receive(junk);
+  link.changed({ theme: "light" });
+  assert.deepEqual(sent, []);
+
+  rpc(1, "ui/initialize", { protocolVersion: "2026-01-26" });
+  await settle();
+  assert.equal(sent[0].result.hostContext.theme, "dark");
+  assert.equal(sent.length, 1, "the result waits for the screen to say it is ready");
+  link.receive({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+  link.receive({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+  // A page that has only just said so is not listening yet; what is sent now would be lost.
+  assert.equal(sent.length, 1, "the drawing is not sent in the same moment the screen says it is ready");
+  await settle(20);
+  assert.deepEqual(sent.slice(1).map((message) => message.method), [
+    "ui/notifications/tool-input",
+    "ui/notifications/tool-result",
+  ]);
+  assert.deepEqual(sent[1].params, { arguments: { elements: 3 } });
+
+  // Refused by the person: the screen is told so, and nothing happened.
+  rpc(2, "tools/call", { name: "save_scene", arguments: { id: 7 } });
+  rpc(3, "ui/open-link", { url: "javascript:alert(1)" });
+  rpc(4, "ui/open-link", { url: "https://excalidraw.com/#room" });
+  rpc(5, "sampling/createMessage", {});
+  await settle();
+  const reply = (id) => sent.find((message) => message.id === id);
+  assert.match(reply(2).error.message, /did not allow/);
+  assert.match(reply(3).error.message, /Only a web link/);
+  assert.ok(reply(4).error && reply(5).error.code === -32601);
+  assert.deepEqual(asked, ["call save_scene", "open https://excalidraw.com/#room"], "a bad link never reaches the person");
+
+  allow = true;
+  rpc(6, "tools/call", { name: "save_scene", arguments: { id: 7 } });
+  rpc(7, "ui/message", { role: "user", content: { type: "text", text: "Make the pool blue" } });
+  await settle();
+  assert.equal(reply(6).result.content[0].text, '{"id":7}');
+  assert.deepEqual(reply(7).result, {});
+  assert.equal(asked.at(-1), "say Make the pool blue");
+});
+
+test("a screen draws a call as the model writes it, and is told everything again after a reload", async () => {
+  const { bridge, halfWritten } = await import(await moduleUrl("outputBridge"));
+  // Arguments cut off anywhere still read as the part that is whole.
+  const whole = '{"elements":"[{\\"type\\":\\"rect\\",\\"x\\":10}]","title":"Read \\u0041 path","n":[1,2.5,{"a":null}]}';
+  for (let cut = 1; cut <= whole.length; cut++) {
+    const read = halfWritten(whole.slice(0, cut));
+    assert.ok(read === undefined || typeof read === "object", `cut at ${cut}: ${whole.slice(0, cut)}`);
+  }
+  assert.deepEqual(halfWritten(whole), JSON.parse(whole));
+  assert.deepEqual(halfWritten('{"elements":"[{\\"type\\":\\"re'), { elements: '[{"type":"re' });
+  assert.deepEqual(halfWritten('{"a":[1,2,{"b":"x"},{"c":'), { a: [1, 2, { b: "x" }] });
+  assert.deepEqual(halfWritten('{"a":1,"b'), { a: 1 });
+  assert.deepEqual(halfWritten('{"a":"tail\\'), { a: "tail" });
+  assert.equal(halfWritten(""), undefined);
+
+  const sent = [];
+  const link = bridge({ context: () => ({}) }, (message) => sent.push(message), 5);
+  const said = () => sent.filter((message) => message.method).map((message) => [message.method.split("/").at(-1), message.params]);
+  const start = async () => {
+    link.receive({ jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    link.receive({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+
+  link.feed({ partial: { boxes: ["Writer"] } });
+  assert.deepEqual(said(), [], "nothing is said before the screen is ready");
+  await start();
+  link.feed({ partial: { boxes: ["Writer", "WAL"] } });
+  link.feed({ partial: { boxes: ["Writer", "WAL"] }, input: { boxes: ["Writer", "WAL", "SQLite"] } });
+  link.feed({ partial: { boxes: ["late"] }, input: { boxes: ["Writer", "WAL", "SQLite"] } });
+  link.feed({ input: { boxes: ["Writer", "WAL", "SQLite"] }, result: { content: [] } });
+  assert.deepEqual(said(), [
+    ["tool-input-partial", { arguments: { boxes: ["Writer"] } }],
+    ["tool-input-partial", { arguments: { boxes: ["Writer", "WAL"] } }],
+    ["tool-input", { arguments: { boxes: ["Writer", "WAL", "SQLite"] } }],
+    ["tool-result", { content: [] }],
+  ]);
+
+  // The frame was unloaded and came back: the new page is given the finished call and its result.
+  sent.length = 0;
+  await start();
+  assert.deepEqual(said(), [
+    ["tool-input", { arguments: { boxes: ["Writer", "WAL", "SQLite"] } }],
+    ["tool-result", { content: [] }],
+  ]);
+});
+
+test("a revision takes the viewer with it, but never away from a version the person chose", async () => {
+  const { Markdown } = await import(await moduleUrl("Markdown"));
+  const { OutputScope } = await import(await moduleUrl("OutputScope"));
+  const { useOutputs } = await import(await moduleUrl("outputContext"));
+  let outputs;
+  let writing = -1;
+  let free = true;
+  const Probe = () => ((outputs = useOutputs()), null);
+  const version = (body) =>
+    `<pre data-lang="mermaid"><code>---\ntitle: Read path\n---\nflowchart LR\n  A --&gt; ${body}</code></pre>`;
+  const chat = async (...replies) => {
+    await act(() =>
+      root.render(
+        h(
+          OutputScope,
+          { chat: "c", viewing: true, onShow() {}, onMade: () => free, onAsk() {} },
+          h(Probe),
+          replies.map((html, index) =>
+            h(Markdown, { key: index, html, scope: `r${index}`, at: index, streaming: index === writing }),
+          ),
+        ),
+      ),
+    );
+    await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+  };
+
+  await chat(version("B"));
+  await act(() => outputs.show(outputs.all[0]));
+  assert.equal(outputs.open.anchor, "r0:0");
+
+  await chat(version("B"), version("C"));
+  assert.equal(outputs.open.anchor, "r1:0", "the viewer follows the revision");
+  assert.equal(document.querySelectorAll(".out-plate").length, 1, "the first version keeps its plate");
+  assert.match(document.querySelector(".out-revision.current").textContent, /Read path.*v2/);
+
+  await act(() => outputs.follow(outputs.all[0]));
+  await chat(version("B"), version("C"), version("D"));
+  assert.equal(outputs.open.anchor, "r0:0", "a chosen older version stays put");
+  assert.deepEqual(outputs.all.map((output) => output.anchor), ["r0:0", "r1:0", "r2:0"]);
+
+  await chat(version("B"));
+  assert.deepEqual(outputs.all.map((output) => output.anchor), ["r0:0"], "a reply that leaves takes its outputs");
+
+  // What Medha finishes writing opens by itself, unless the person is busy elsewhere.
+  const other = '<pre data-lang="mermaid"><code>flowchart LR\n  X --&gt; Y</code></pre>';
+  await act(() => outputs.browse());
+  writing = 1;
+  await chat(version("B"), other);
+  assert.equal(outputs.open, null, "nothing opens while it is still being written");
+  writing = -1;
+  await chat(version("B"), other);
+  assert.equal(outputs.open.anchor, "r1:0");
+  await act(() => outputs.browse());
+  free = false;
+  writing = 2;
+  await chat(version("B"), other, other);
+  writing = -1;
+  await chat(version("B"), other, other);
+  assert.equal(outputs.open, null, "it stays out of the way of another panel");
 });
 
 test("a rejected follow-up does not mark an active agent idle", async () => {

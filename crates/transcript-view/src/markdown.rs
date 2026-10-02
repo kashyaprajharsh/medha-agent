@@ -152,7 +152,16 @@ impl Writer {
                 }
                 self.links.push(safe);
             }
-            Tag::Image { .. } => self.out.push_str("<span class=\"md-image\">"),
+            Tag::Image { dest_url, .. } => {
+                // Only a file beside the chat is named; a remote image is never fetched.
+                if local_path(&dest_url) {
+                    self.out.push_str("<span class=\"md-image\" data-src=\"");
+                    self.text(&dest_url);
+                    self.out.push_str("\">");
+                } else {
+                    self.out.push_str("<span class=\"md-image\">");
+                }
+            }
             Tag::HtmlBlock => self.html_block = Some(String::new()),
             _ => {}
         }
@@ -214,6 +223,14 @@ impl Writer {
             }
         }
     }
+}
+
+fn local_path(url: &str) -> bool {
+    let url = url.trim();
+    let scheme = url
+        .find(':')
+        .is_some_and(|colon| !url[..colon].contains(['/', '?', '#']));
+    !url.is_empty() && !scheme && !url.starts_with("//")
 }
 
 fn safe_url(url: &str) -> bool {

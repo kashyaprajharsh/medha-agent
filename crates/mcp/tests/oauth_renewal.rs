@@ -76,6 +76,10 @@ async fn spawn_provider(access: Option<&str>, refresh: &str) -> (String, Shared)
 fn route(provider: &Shared, request: &str) -> (&'static str, String, String) {
     let line = request.lines().next().unwrap_or_default();
     let body = request.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    // Sign-in, renewal and the calls themselves are all refused from a client with no name.
+    if !common::named(request) {
+        return ("403 Forbidden", String::new(), String::new());
+    }
     let mut state = provider.lock().unwrap();
     if line.starts_with("POST /token") {
         return match state.endpoint {

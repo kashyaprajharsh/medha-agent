@@ -3,24 +3,23 @@
   display: flex;
   align-items: center;
   gap: var(--s-3);
-  margin: 0 0 var(--s-4);
+  margin: 0 0 var(--s-5);
   padding: 0 var(--s-4);
-  border: 1px solid var(--line);
   border-radius: var(--r-full);
-  background: var(--raised);
-  box-shadow: var(--e1-shadow);
+  background: var(--well);
+  box-shadow: var(--pressed);
   color: var(--faint);
-  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+  transition: box-shadow var(--t-base) var(--ease-out);
 }
 .browse-search:focus-within {
-  border-color: color-mix(in srgb, var(--gold) 55%, var(--line));
-  box-shadow: 0 0 0 3px var(--gold-wash), var(--e1-shadow);
-  color: var(--gold);
+  box-shadow:
+    var(--pressed),
+    0 0 0 3px var(--gold-wash);
 }
 .browse-search input {
   flex: 1;
   min-width: 0;
-  padding: var(--s-4) 0;
+  padding: var(--s-3) 0;
   border: 0;
   outline: 0;
   background: transparent;
@@ -62,51 +61,18 @@
   color: var(--text);
 }
 
+/* The rows are the index's own: one line each, opening in full. */
 .browse-list {
   list-style: none;
-  margin: 0;
+  margin: 0 -14px;
   padding: 0;
 }
-.browse-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--s-5);
-  padding: var(--s-3) var(--s-3);
-  margin: 0 calc(-1 * var(--s-3));
-  border-radius: var(--r-md);
-  transition: background var(--t-fast);
-}
-.browse-row:hover {
-  background: var(--hover);
-}
-.browse-row > div {
-  min-width: 0;
-}
-.browse-row b {
-  font-weight: 600;
-}
-.browse-row small {
-  margin-left: var(--s-2);
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-.browse-row p {
-  display: -webkit-box;
-  margin: 2px 0 0;
-  overflow: hidden;
-  color: var(--dim);
-  font-size: var(--text-sm);
-  line-height: 1.5;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
-.browse-row .btn-line,
-.browse-row .market-installed {
+.browse-list .btn-line,
+.browse-list .market-installed {
   flex: none;
 }
 .browse-list > .quiet {
-  padding: var(--s-4) 0;
+  padding: var(--s-4) 14px;
 }
 .browse-more {
   display: block;

@@ -31,6 +31,13 @@ def catalog():
         return [spec("bad__name"), spec("new\nline"), spec("x" * 200), spec("fine")]
     if mode == "stale":
         return [spec("trigger"), spec("old")]
+    if mode == "screens":
+        ui = lambda **meta: {"_meta": {"ui": meta}}
+        return [dict(spec("draw"), **ui(resourceUri="ui://fake/draw")),
+                dict(spec("save"), **ui(visibility=["app"])),
+                dict(spec("plan"), **ui(visibility=["model"])),
+                dict(spec("legacy"), **{"_meta": {"ui/resourceUri": "ui://fake/legacy"}}),
+                dict(spec("odd"), **ui(resourceUri="https://evil.example/page"))]
     tools = [spec("echo", ["text"]), spec("slow"), spec("leak"), spec("big"), spec("spawn")]
     if mode == "churn":
         tools.append(spec("grow"))
@@ -42,6 +49,8 @@ for line in sys.stdin:
     if not line: continue
     msg = json.loads(line); mid = msg.get("id"); method = msg.get("method")
     if method == "initialize":
+        offered = msg["params"].get("capabilities",{}).get("extensions",{})
+        shows = offered.get("io.modelcontextprotocol/ui",{}).get("mimeTypes")
         send({"jsonrpc":"2.0","id":mid,"result":{
             "protocolVersion": msg["params"].get("protocolVersion","2025-06-18"),
             "capabilities":{"tools":{"listChanged":True}},
@@ -72,10 +81,22 @@ for line in sys.stdin:
             text = "A" * 50000
         else:
             text = "echo: " + str(args.get("text",""))
-        send({"jsonrpc":"2.0","id":mid,"result":{
-            "content":[{"type":"text","text":text}],"isError":False}})
+        result = {"content":[{"type":"text","text":text}],"isError":False}
+        if name == "draw":
+            result["structuredContent"] = {"shapes": 3, "shows": shows}
+        send({"jsonrpc":"2.0","id":mid,"result":result})
         if die_after_call:
             os._exit(1)
+    elif method == "resources/read":
+        csp = {"connectDomains": ["https://api.fake.example", "http://plain.example", "https://*",
+                                  "javascript:alert(1)", "https://ok.example; script-src *",
+                                  "https://127.0.0.1", "https://router.local", "https://db.internal:5432"],
+               "resourceDomains": ["https://cdn.fake.example", "https://*.fake.example"]}
+        send({"jsonrpc":"2.0","id":mid,"result":{"contents":[{
+            "uri": msg["params"]["uri"], "mimeType": "text/html;profile=mcp-app",
+            "text": "<html>draw</html>",
+            "_meta": {"ui": {"csp": csp, "prefersBorder": True,
+                             "permissions": {"clipboardWrite": {}, "camera": {}}}}}]}})
     elif mid is not None:
         send({"jsonrpc":"2.0","id":mid,"result":{}})
 "#;
@@ -607,5 +628,76 @@ async fn switching_a_server_off_parks_it_without_forgetting_it() {
     manager.set_disabled("fake", true).await.unwrap();
     manager.approve_and_connect("fake", None).await.unwrap();
     assert_eq!(manager.status().await[0].state, ServerState::Ready);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_screen_reaches_only_what_its_server_opened_to_it() {
+    let Some(fake) = Fake::new() else { return };
+    let manager = McpManager::new(
+        fake.path().to_path_buf(),
+        config(server("fake", fake.command("screens", None))),
+    );
+    manager.connect_startup().await;
+
+    // The model is offered everything except the tool kept for screens.
+    let specs = manager.tool_specs();
+    let screen_of = |tool: &str| {
+        let spec = specs
+            .iter()
+            .find(|spec| spec.name == format!("mcp__fake__{tool}"));
+        spec.unwrap_or_else(|| panic!("{tool} is offered"))
+            .screen
+            .clone()
+    };
+    assert!(!specs.iter().any(|spec| spec.name == "mcp__fake__save"));
+    assert_eq!(screen_of("draw").as_deref(), Some("ui://fake/draw"));
+    assert_eq!(screen_of("legacy").as_deref(), Some("ui://fake/legacy"));
+    assert_eq!(screen_of("odd"), None, "only a ui:// page is a screen");
+
+    let model = manager.call("mcp__fake__save", &json!({})).await;
+    assert!(matches!(model, Err(Error::UnknownTool { .. })), "{model:?}");
+    let saved = manager
+        .call_from_screen("fake", "save", &json!({}))
+        .await
+        .unwrap();
+    assert!(
+        saved.result.is_some(),
+        "a screen is answered with the whole result"
+    );
+    let closed = manager.call_from_screen("fake", "plan", &json!({})).await;
+    assert!(
+        matches!(closed, Err(Error::UnknownTool { .. })),
+        "{closed:?}"
+    );
+
+    // The whole result travels beside the text, for the screen to draw, and the
+    // server was told Medha can show screens.
+    let drawn = manager.call("mcp__fake__draw", &json!({})).await.unwrap();
+    assert_eq!(drawn.screen.as_deref(), Some("ui://fake/draw"));
+    let result = drawn
+        .result
+        .expect("a tool with a screen carries its result");
+    assert_eq!(result["structuredContent"]["shapes"], 3);
+    assert_eq!(
+        result["structuredContent"]["shows"],
+        json!(["text/html;profile=mcp-app"])
+    );
+    let plain = manager.call("mcp__fake__plan", &json!({})).await.unwrap();
+    assert!(plain.screen.is_none() && plain.result.is_none());
+
+    // Of the origins the page declares, only whole secure ones are kept.
+    let page = manager.read_screen("fake", "ui://fake/draw").await.unwrap();
+    assert_eq!(page.html, "<html>draw</html>");
+    assert_eq!(page.connect, ["https://api.fake.example"]);
+    assert_eq!(
+        page.resources,
+        ["https://cdn.fake.example", "https://*.fake.example"]
+    );
+    assert_eq!(page.border, Some(true));
+    assert!(page.clipboard, "the one permission that is passed on");
+    for other in ["file:///etc/passwd", "https://evil.example/", "fake/draw"] {
+        assert!(manager.read_screen("fake", other).await.is_err(), "{other}");
+    }
     manager.shutdown().await;
 }

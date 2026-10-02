@@ -22,6 +22,7 @@ use std::{
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientInfo, ContentBlock, Implementation,
+    ReadResourceRequestParams, ReadResourceResult, ResourceContents,
 };
 use rmcp::service::{NotificationContext, Peer, RoleClient, RunningService, ServiceExt};
 use rmcp::transport::{
@@ -56,6 +57,14 @@ pub const TOOL_PREFIX: &str = "mcp__";
 const CLOSE_GRACE: Duration = Duration::from_secs(3);
 /// Tool descriptions are model context and an injection surface; bound them.
 const MAX_DESCRIPTION: usize = 1_024;
+/// The MCP Apps extension: a tool may come with a `ui://` page that shows its result.
+const SCREEN_EXTENSION: &str = "io.modelcontextprotocol/ui";
+const SCREEN_MIME: &str = "text/html;profile=mcp-app";
+const SCREEN_SCHEME: &str = "ui://";
+const MAX_SCREEN_URI: usize = 512;
+const MAX_SCREEN_HTML: usize = 8 * 1024 * 1024;
+const MAX_SCREEN_RESULT: usize = 4 * 1024 * 1024;
+const MAX_SCREEN_ORIGINS: usize = 32;
 /// Concurrent in-flight calls allowed against a server that declares parallel-safe.
 const PARALLEL_CALLS: usize = 8;
 
@@ -424,6 +433,16 @@ pub struct McpToolSpec {
     pub name: String,
     pub description: String,
     pub schema: Value,
+    /// The `ui://` screen the server offers for this tool's result, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<String>,
+    /// Whether a screen may call this tool. True unless the server says otherwise.
+    #[serde(default = "yes", skip_serializing_if = "Clone::clone")]
+    pub app: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// A tool-call result flattened to text. The text is complete — capping and
@@ -434,6 +453,27 @@ pub struct CallOutput {
     pub tool: String,
     pub text: String,
     pub is_error: bool,
+    /// The `ui://` screen this tool's result is shown on, if its server offers one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<String>,
+    /// The result as the server sent it, carried only for a screen to draw:
+    /// when the tool has one, or a screen made the call. `Null` if too large.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+}
+
+/// A screen's page, with only the web origins its server declared for it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Screen {
+    pub html: String,
+    pub connect: Vec<String>,
+    pub resources: Vec<String>,
+    pub frames: Vec<String>,
+    pub border: Option<bool>,
+    /// The server asked that its screen may put things on the clipboard. Reading
+    /// the clipboard, the camera, the microphone and location are never passed on.
+    #[serde(default)]
+    pub clipboard: bool,
 }
 
 /// A server's exposed tools plus the raw names its filter withheld, so the tool
@@ -442,6 +482,9 @@ pub struct CallOutput {
 struct Catalog {
     exposed: Vec<McpToolSpec>,
     hidden: Vec<String>,
+    /// Tools a server keeps for its own screens. Never offered to the model.
+    #[serde(default)]
+    app_only: Vec<McpToolSpec>,
 }
 
 /// A live connection taken out of its slot, awaiting shutdown and process reap.
@@ -550,6 +593,14 @@ impl ClientHandler for Handler {
     fn get_info(&self) -> ClientInfo {
         let mut info = ClientInfo::default();
         info.client_info = Implementation::new("medha", env!("CARGO_PKG_VERSION"));
+        // Tells a server Medha can show its screens, so it offers them.
+        if let Ok(shows) = serde_json::from_value(serde_json::json!({ "mimeTypes": [SCREEN_MIME] }))
+        {
+            info.capabilities
+                .extensions
+                .get_or_insert_with(Default::default)
+                .insert(SCREEN_EXTENSION.to_string(), shows);
+        }
         info
     }
 
@@ -1176,17 +1227,117 @@ impl McpManager {
             .is_some_and(|slot| slot.state == ServerState::NeedsAuth)
     }
 
-    /// Invoke `mcp__<server>__<tool>` with the given arguments.
+    /// Invoke `mcp__<server>__<tool>` with the given arguments, as the model.
     pub async fn call(&self, qualified: &str, args: &Value) -> Result<CallOutput, Error> {
+        self.call_as(qualified, args, false).await
+    }
+
+    /// A screen calling a tool on its own server. It reaches the tools the
+    /// server opened to screens, including those kept from the model.
+    pub async fn call_from_screen(
+        &self,
+        server: &str,
+        tool: &str,
+        args: &Value,
+    ) -> Result<CallOutput, Error> {
+        self.call_as(&qualify(server, tool), args, true).await
+    }
+
+    async fn call_as(
+        &self,
+        qualified: &str,
+        args: &Value,
+        screen: bool,
+    ) -> Result<CallOutput, Error> {
         if !self.inner.config.enabled {
             return Err(Error::Disabled);
         }
         let (server, tool) = parse_qualified(qualified)?;
         if let Some(link) = self.hub_for(&server) {
-            return link.call(qualified, args).await;
+            return link.call(qualified, args, screen).await;
         }
+        let mut params = CallToolRequestParams::new(tool.clone());
+        if let Some(object) = args.as_object() {
+            params = params.with_arguments(object.clone());
+        }
+        let (resource, result) = self
+            .round_trip(
+                &server,
+                |catalog| {
+                    let spec = catalog
+                        .exposed
+                        .iter()
+                        .chain(catalog.app_only.iter().filter(|_| screen))
+                        .find(|spec| spec.name == qualified && (!screen || spec.app))
+                        .ok_or_else(|| Error::UnknownTool {
+                            server: server.clone(),
+                            tool: tool.clone(),
+                        })?;
+                    validate_arguments(&spec.schema, args).map_err(|reason| {
+                        Error::BadArguments {
+                            tool: qualified.to_string(),
+                            reason,
+                        }
+                    })?;
+                    Ok(spec.screen.clone())
+                },
+                |peer, _| async move { peer.call_tool(params).await },
+            )
+            .await?;
+        Ok(CallOutput {
+            is_error: result.is_error.unwrap_or(false),
+            text: flatten(&result),
+            result: (screen || resource.is_some()).then(|| {
+                serde_json::to_value(&result)
+                    .ok()
+                    .filter(|value| value.to_string().len() <= MAX_SCREEN_RESULT)
+                    .unwrap_or(Value::Null)
+            }),
+            screen: resource,
+            server,
+            tool,
+        })
+    }
+
+    /// The page of a screen a server offers, with the origins it declared.
+    pub async fn read_screen(&self, server: &str, uri: &str) -> Result<Screen, Error> {
+        if !self.inner.config.enabled {
+            return Err(Error::Disabled);
+        }
+        if !uri.starts_with(SCREEN_SCHEME) || uri.len() > MAX_SCREEN_URI {
+            return Err(Error::Protocol(format!("'{uri}' is not a screen")));
+        }
+        if let Some(link) = self.hub_for(server) {
+            return link.read_screen(server, uri).await;
+        }
+        let params = ReadResourceRequestParams::new(uri);
+        let ((), read) = self
+            .round_trip(
+                server,
+                |_| Ok(()),
+                |peer, ()| async move { peer.read_resource(params).await },
+            )
+            .await?;
+        screen_page(read)
+    }
+
+    /// One request to a server under the rules every request obeys: it goes to
+    /// the live incarnation it was checked against, waits its turn, and never
+    /// runs after that incarnation was disabled or replaced. `pick` reads the
+    /// server's catalogue for the same incarnation the request is sent to.
+    async fn round_trip<P, T, E, Fut>(
+        &self,
+        server: &str,
+        pick: impl FnOnce(&Catalog) -> Result<P, Error>,
+        send: impl FnOnce(Peer<RoleClient>, &P) -> Fut,
+    ) -> Result<(P, T), Error>
+    where
+        E: std::fmt::Display,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let server = server.to_string();
         self.settle(&server).await;
-        let (peer, gate, generation, schema, admission, lapse) = {
+        let (peer, gate, generation, picked, admission, lapse) = {
             let servers = self.inner.servers.lock().await;
             let slot = servers
                 .get(&server)
@@ -1202,36 +1353,19 @@ impl McpManager {
                     });
                 }
             };
-            // Read the schema while holding the slot lock. Catalogue publication
+            // Read the catalogue while holding the slot lock. Catalogue publication
             // follows the same servers→tools lock order, so peer, generation,
             // filter and schema all describe one incarnation.
-            let schema = self
-                .catalogs()
-                .get(&server)
-                .and_then(|catalog| catalog.exposed.iter().find(|spec| spec.name == qualified))
-                .map(|spec| spec.schema.clone())
-                .ok_or_else(|| Error::UnknownTool {
-                    server: server.clone(),
-                    tool: tool.clone(),
-                })?;
+            let picked = pick(self.catalogs().get(&server).unwrap_or(&Catalog::default()))?;
             (
                 peer,
                 gate,
                 slot.generation,
-                schema,
+                picked,
                 admission,
                 slot.lapse.clone(),
             )
         };
-        validate_arguments(&schema, args).map_err(|reason| Error::BadArguments {
-            tool: qualified.to_string(),
-            reason,
-        })?;
-
-        let mut params = CallToolRequestParams::new(tool.clone());
-        if let Some(object) = args.as_object() {
-            params = params.with_arguments(object.clone());
-        }
         let _permit = gate.acquire().await.map_err(|_| Error::ServerNotReady {
             server: server.clone(),
             state: ServerState::Stopped,
@@ -1247,8 +1381,7 @@ impl McpManager {
         // wire" for a swap to slip through.
         let _admitted = admission.read().await;
         self.ensure_live_generation(&server, generation).await?;
-        let result = match timeout(self.inner.config.request_timeout, peer.call_tool(params)).await
-        {
+        let result = match timeout(self.inner.config.request_timeout, send(peer, &picked)).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {
                 let Some(needs) = lapse.and_then(|lapse| lapse.get()) else {
@@ -1262,12 +1395,7 @@ impl McpManager {
         };
         // A completed round trip is the proof that resets the reconnect budget.
         self.mark_proven(&server, generation).await;
-        Ok(CallOutput {
-            server,
-            tool,
-            is_error: result.is_error.unwrap_or(false),
-            text: flatten(&result),
-        })
+        Ok((picked, result))
     }
 
     pub async fn status(&self) -> Vec<ServerStatus> {
@@ -1719,7 +1847,7 @@ impl McpManager {
         let config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
         match auth {
             RemoteAuth::None => {
-                let client = ChallengeWatch::new(reqwest::Client::new(), false);
+                let client = ChallengeWatch::new(oauth::named_client(), false);
                 let lapse = client.lapse();
                 let outcome = self
                     .handshake(
@@ -1733,7 +1861,7 @@ impl McpManager {
                 if token.trim().is_empty() {
                     return Err(Error::NeedsToken(server.id.clone()));
                 }
-                let client = ChallengeWatch::new(reqwest::Client::new(), true);
+                let client = ChallengeWatch::new(oauth::named_client(), true);
                 let lapse = client.lapse();
                 let outcome = self
                     .handshake(
@@ -2037,6 +2165,7 @@ fn backoff(failures: u32) -> Duration {
 fn build_catalog(server: &str, filter: &ToolFilter, tools: Vec<Tool>) -> Catalog {
     let mut exposed = Vec::with_capacity(tools.len());
     let mut hidden = Vec::new();
+    let mut app_only = Vec::new();
     for tool in tools {
         // A malformed name would mis-route a later call; a filtered one is
         // deliberate. Neither reaches the model's context.
@@ -2044,15 +2173,120 @@ fn build_catalog(server: &str, filter: &ToolFilter, tools: Vec<Tool>) -> Catalog
             hidden.push(tool.name.to_string());
             continue;
         }
-        exposed.push(McpToolSpec {
+        let (screen, model, app) = screen_meta(tool.meta.as_ref().map(|meta| &meta.0));
+        let spec = McpToolSpec {
             name: qualify(server, &tool.name),
             description: truncate(tool.description.as_deref().unwrap_or(""), MAX_DESCRIPTION),
             schema: Value::Object(tool.input_schema.as_ref().clone()),
-        });
+            screen,
+            app,
+        };
+        if model {
+            exposed.push(spec);
+        } else if app {
+            app_only.push(spec);
+        }
     }
     exposed.sort_by(|a, b| a.name.cmp(&b.name));
+    app_only.sort_by(|a, b| a.name.cmp(&b.name));
     hidden.sort();
-    Catalog { exposed, hidden }
+    Catalog {
+        exposed,
+        hidden,
+        app_only,
+    }
+}
+
+/// The page from a screen read, and the origins its server declared, each
+/// checked: only whole `https://` (or `wss://`) origins, never a wildcard scheme.
+fn screen_page(read: ReadResourceResult) -> Result<Screen, Error> {
+    let found = read.contents.into_iter().find_map(|content| match content {
+        ResourceContents::TextResourceContents {
+            mime_type: Some(kind),
+            text,
+            meta,
+            ..
+        } if kind.starts_with("text/html") => Some((text, meta)),
+        _ => None,
+    });
+    let Some((html, meta)) = found else {
+        return Err(Error::Protocol(
+            "the server sent no page for this screen".into(),
+        ));
+    };
+    if html.len() > MAX_SCREEN_HTML {
+        return Err(Error::Protocol("this screen's page is too large".into()));
+    }
+    let ui = meta.as_ref().and_then(|meta| meta.0.get("ui"));
+    let origins = |key: &str| -> Vec<String> {
+        ui.and_then(|ui| ui.get("csp"))
+            .and_then(|csp| csp.get(key))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|origin| screen_origin(origin))
+            .take(MAX_SCREEN_ORIGINS)
+            .map(str::to_string)
+            .collect()
+    };
+    Ok(Screen {
+        connect: origins("connectDomains"),
+        resources: origins("resourceDomains"),
+        frames: origins("frameDomains"),
+        border: ui
+            .and_then(|ui| ui.get("prefersBorder"))
+            .and_then(Value::as_bool),
+        clipboard: ui
+            .and_then(|ui| ui.get("permissions"))
+            .and_then(|asked| asked.get("clipboardWrite"))
+            .is_some_and(Value::is_object),
+        html,
+    })
+}
+
+/// An origin a screen may be allowed: a secure scheme, a public hostname, an
+/// optional port, and nothing that could widen or break out of a policy line.
+/// An address or a local name is refused: a screen has no business with this machine.
+fn screen_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("wss://"))
+    else {
+        return false;
+    };
+    let rest = rest.strip_prefix("*.").unwrap_or(rest);
+    let (host, port) = rest.split_once(':').unwrap_or((rest, "443"));
+    let last = host.rsplit('.').next().unwrap_or_default();
+    host.contains('.')
+        && host.len() <= 253
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        && last.len() >= 2
+        && last.chars().all(|c| c.is_ascii_alphabetic())
+        && !matches!(last, "localhost" | "local" | "internal" | "lan" | "home")
+        && port.parse::<u16>().is_ok()
+}
+
+/// A tool's screen and who may call it, from its `_meta.ui`. Anything malformed
+/// reads as the default: no screen, callable by the model and by a screen.
+fn screen_meta(meta: Option<&serde_json::Map<String, Value>>) -> (Option<String>, bool, bool) {
+    let ui = meta.and_then(|meta| meta.get("ui"));
+    let resource = ui
+        .and_then(|ui| ui.get("resourceUri"))
+        .or_else(|| meta.and_then(|meta| meta.get("ui/resourceUri")))
+        .and_then(Value::as_str)
+        .filter(|uri| uri.starts_with(SCREEN_SCHEME) && uri.len() <= MAX_SCREEN_URI)
+        .map(str::to_string);
+    let Some(visible) = ui
+        .and_then(|ui| ui.get("visibility"))
+        .and_then(Value::as_array)
+    else {
+        return (resource, true, true);
+    };
+    let has = |who: &str| visible.iter().any(|entry| entry.as_str() == Some(who));
+    (resource, has("model"), has("app"))
 }
 
 /// A tool name must be a plain bounded identifier: no collision with the `__`

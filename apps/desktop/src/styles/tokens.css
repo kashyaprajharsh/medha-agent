@@ -2,6 +2,8 @@
 :root {
   --font-ui: "Anek Latin", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Fragment Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  /* What a drawing sits on in every theme: it carries its own colours and expects a light page. */
+  --paper: #fffdf8;
 
   --text-xs: 12px;
   --text-sm: 13.5px;
@@ -26,6 +28,8 @@
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   --ease-move: cubic-bezier(0.77, 0, 0.175, 1);
+  /* Overshoots a little and settles: for a small thing that snaps into place. */
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
   --t-fast: 120ms;
   --t-base: 200ms;
   --t-slow: 280ms;

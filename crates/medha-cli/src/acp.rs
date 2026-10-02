@@ -674,6 +674,23 @@ impl kernel::StreamSink for AcpSink {
             json!({ "id": id, "tool": tool, "ok": ok, "payload": payload }),
         );
     }
+    fn tool_input(&self, id: &str, tool: &str, delta: &str) {
+        // Only a server's tool can have a screen to draw this on, and only
+        // Medha's own window draws one. Everything else is told at the call.
+        if !self.peer.is_acp() && mcp::McpManager::is_mcp_tool(tool) {
+            self.writer.event(
+                "tool.input",
+                json!({ "id": id, "tool": tool, "delta": delta }),
+            );
+        }
+    }
+    fn tool_screen(&self, id: &str, screen: &Value) {
+        // Only Medha's own window draws screens; another editor gets the text result.
+        if !self.peer.is_acp() {
+            self.writer
+                .event("tool.screen", json!({ "id": id, "screen": screen }));
+        }
+    }
     fn usage(&self, usage: &kernel::Usage) {
         self.writer.event(
             "usage",
@@ -1547,6 +1564,12 @@ where
                         Some(extensions.sign_in_again(&params, &writer).await)
                     } else if method == "connectors.connect" {
                         Some(if running || agents.as_ref().is_some_and(|control| !control.active().is_empty()) || !kernel.executor.background_tasks().is_empty() { Err("Finish active work before connecting a server.".into()) } else { extensions.connect_connector(&params, &writer).await })
+                    } else if method == "mcp.screens" {
+                        Some(crate::desktop_screens::offered(&extensions.mcp))
+                    } else if method == "mcp.screen" {
+                        Some(crate::desktop_screens::page(&extensions.mcp, &params).await)
+                    } else if method == "mcp.screen.call" {
+                        Some(crate::desktop_screens::call(&extensions.mcp, &params).await)
                     } else if method == "memory.list" {
                         Some(crate::desktop_memory::list(extensions.memory.as_ref()).await)
                     } else if method == "memory.pin" || method == "memory.forget" {

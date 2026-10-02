@@ -5,38 +5,14 @@ import { useWorkspaceApi } from "./Workspace";
 import { McpDetails, McpForm, mcpView as serverView, useMcpSignIn, type McpPrefill, type McpServer, type McpStatus } from "./McpServers";
 import { McpCatalog } from "./McpCatalog";
 import { PluginBrowse, PluginDoctor } from "./PluginBrowse";
+import { PluginList, type Plugin } from "./PluginList";
 import { SkillBrowse } from "./SkillBrowse";
+import { Sheet } from "./Sheet";
+import { SkillList, type Skill } from "./SkillList";
 import { SkillManage } from "./SkillManage";
+import { Add, Find, PageTop, summaryOf, ViewBar } from "./ExtensionParts";
 import { Hooks } from "./Hooks";
 import { ToolPreset } from "./ToolPreset";
-type Plugin = {
-  id: string;
-  name: string;
-  description?: string;
-  version: string;
-  scope: string;
-  activation: string;
-  hash: string;
-  grant: Record<string, unknown> | null;
-  can_rollback: boolean;
-  blocked?: string;
-  components: { id: string; kind: string }[];
-  permissions: {
-    network_hosts: string[];
-    read_paths: string[];
-    write_paths: string[];
-    secrets: string[];
-  };
-  health: { id: string; state: string; error?: string }[];
-};
-type Skill = {
-  name: string;
-  description: string;
-  scope: string;
-  enabled: boolean;
-  available: boolean | null;
-  missing_tools: string[];
-};
 type Mcp = McpServer;
 type Update = {
   id: string;
@@ -53,6 +29,13 @@ type Tool = {
   description: string;
   category: string;
   radius: string;
+};
+// How far a tool reaches, in the words a person would use for it.
+const REACH: Record<string, string> = {
+  read: "Looks only",
+  reversible_local: "Changes you can undo",
+  irreversible_local: "Changes that stay",
+  external: "Reaches outside",
 };
 export function Extensions({
   sessionKey,
@@ -106,7 +89,6 @@ export function Extensions({
   const [skills, setSkills] = useState<Skill[]>([]);
   const [mcp, setMcp] = useState<Mcp[]>([]);
   const [tools, setTools] = useState<Tool[]>([]);
-  const [opened, setOpened] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -116,6 +98,7 @@ export function Extensions({
   const [connect, setConnect] = useState<Mcp>();
   const [autoConnect, setAutoConnect] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [installing, setInstalling] = useState(false);
   const [notices, setNotices] = useState<string[]>([]);
   useEffect(() => {
     let active = true;
@@ -188,6 +171,7 @@ export function Extensions({
       setRemoving(undefined);
       setUpdating(undefined);
       setAdding(false);
+      setInstalling(false);
       setSource("");
       setNotice(
         method === "extensions.install"
@@ -230,7 +214,8 @@ export function Extensions({
                 key={name}
                 role="tab"
                 aria-selected={tab === name}
-                onClick={() => {
+                onClick={(event) => {
+                  event.currentTarget.scrollIntoView({ block: "nearest", inline: "nearest" });
                   setTab(name);
                   setQuery("");
                 }}
@@ -244,8 +229,8 @@ export function Extensions({
             ))}
           </div>
           {/* Browse views lead with their own search; one search box per view. */}
-          {!(tab === "skills" && skillView !== "installed") &&
-            !(tab === "plugins" && pluginView === "browse") && (
+          {/* A redrawn tab carries its search in its own bar. */}
+          {tab === "connectors" && (
               <input
                 ref={filter}
                 className="filter-input"
@@ -279,13 +264,25 @@ export function Extensions({
           />
         )}
         {tab === "skills" && (
-          <div className="segmented">
-            {(["installed", "browse", "manage"] as const).map((view) => (
-              <button key={view} aria-pressed={skillView === view} onClick={() => setSkillView(view)}>
-                {view[0].toUpperCase() + view.slice(1)}
-              </button>
-            ))}
-          </div>
+          <>
+            <PageTop title="Skills">What Medha knows how to do. It loads one when your task calls for it.</PageTop>
+            <ViewBar
+              views={[
+                { id: "installed", label: "Installed", count: skills.length },
+                { id: "browse", label: "Browse" },
+                { id: "manage", label: "Manage" },
+              ]}
+              view={skillView}
+              onView={setSkillView}
+            >
+              {skillView === "installed" && (
+                <>
+                  <Find box={filter} label="Find a skill" value={query} onChange={setQuery} />
+                  <Add label="Add skill" open={installing} onClick={() => setInstalling(!installing)} />
+                </>
+              )}
+            </ViewBar>
+          </>
         )}
         {tab === "skills" && skillView === "browse" && (
           <SkillBrowse
@@ -299,122 +296,68 @@ export function Extensions({
         )}
         {tab === "skills" && skillView === "installed" && (
           <>
-            <form
-              className="plugin-install"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void act("extensions.skill.install", { source });
-              }}
-            >
-              <label>
-                <Icon name="plus" />
-                <input
-                  required
-                  aria-label="Skill source"
-                  value={source}
-                  onChange={(event) => setSource(event.target.value)}
-                  placeholder="Skill folder, SKILL.md, or GitHub folder URL"
-                />
-              </label>
-              <button
-                className="btn-line"
-                disabled={busy || locked || !source.trim()}
+            {installing && (
+              <form
+                className="plugin-install"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void act("extensions.skill.install", { source });
+                }}
               >
-                Install skill
-              </button>
-            </form>
-            <p className="page-lede">
-              Instructions Medha can load when a task matches. Your skills apply
-              across workspaces.
-            </p>
-            {["user", "project", "plugin"].map((scope) => {
-              const rows = skills.filter(
-                (skill) =>
-                  skill.scope === scope &&
-                  matches(skill.name, skill.description),
-              );
-              return (
-                rows.length > 0 && (
-                  <section key={scope}>
-                    <h2 className="ext-group">
-                      {scope === "user"
-                        ? "Yours"
-                        : scope === "project"
-                          ? "This project"
-                          : "From plugins"}
-                    </h2>
-                    {rows.map((skill) => (
-                      <div className="settings-row" key={skill.name}>
-                        <div>
-                          <b>{skill.name}</b>
-                          <p>{skill.description}</p>
-                          {skill.available === false && skill.enabled && (
-                            <small>
-                              Needs {skill.missing_tools.join(", ")}
-                            </small>
-                          )}
-                        </div>
-                        {scope !== "plugin" ? (
-                          <button
-                            className="switch"
-                            role="switch"
-                            aria-checked={skill.enabled}
-                            aria-label={`Use ${skill.name}`}
-                            disabled={busy || locked}
-                            onClick={() =>
-                              void act("extensions.skill.configure", {
-                                name: skill.name,
-                                enabled: !skill.enabled,
-                              })
-                            }
-                          />
-                        ) : (
-                          <small>Managed by plugin</small>
-                        )}
-                        {scope === "user" && (
-                          <details className="row-more">
-                            <summary aria-label={`More options for ${skill.name}`}>
-                              •••
-                            </summary>
-                            <div>
-                              <button
-                                disabled={busy || locked}
-                                onClick={() =>
-                                  setRemoving({
-                                    title: `Remove ${skill.name}?`,
-                                    method: "extensions.skill.remove",
-                                    params: { name: skill.name },
-                                  })
-                                }
-                              >
-                                Remove
-                              </button>
-                            </div>
-                          </details>
-                        )}
-                      </div>
-                    ))}
-                  </section>
-                )
-              );
-            })}
-            {!skills.length && (
-              <p className="quiet">
-                No skills installed. Add SKILL.md packages in your Medha skills
-                folder, or install a plugin that includes skills.
-              </p>
+                <label>
+                  <Icon name="plus" />
+                  <input
+                    required
+                    autoFocus
+                    aria-label="Skill source"
+                    value={source}
+                    onChange={(event) => setSource(event.target.value)}
+                    placeholder="Skill folder, SKILL.md, or GitHub folder URL"
+                  />
+                </label>
+                <button className="btn-line" disabled={busy || locked || !source.trim()}>
+                  Install skill
+                </button>
+              </form>
             )}
+            <SkillList
+              skills={skills}
+              matches={matches}
+              searching={Boolean(query)}
+              disabled={busy || locked}
+              onToggle={(skill) => void act("extensions.skill.configure", { name: skill.name, enabled: !skill.enabled })}
+              onRemove={(skill) =>
+                setRemoving({
+                  title: `Remove ${skill.name}?`,
+                  method: "extensions.skill.remove",
+                  params: { name: skill.name },
+                })
+              }
+              onAsk={onAsk}
+            />
           </>
         )}
         {tab === "plugins" && (
-          <div className="segmented">
-            <button aria-pressed={pluginView === "installed"} onClick={() => setPluginView("installed")}>
-              Installed
-            </button>
-            <button aria-pressed={pluginView === "browse"} onClick={() => setPluginView("browse")}>
-              Browse
-            </button>
-          </div>
+          <>
+            <PageTop title="Plugins">
+              Bundles of skills, servers and scripts. One stays off until you have seen what it can touch.
+            </PageTop>
+            <ViewBar
+              views={[
+                { id: "installed", label: "Installed", count: plugins.length },
+                { id: "browse", label: "Browse" },
+              ]}
+              view={pluginView}
+              onView={setPluginView}
+            >
+              {pluginView === "installed" && (
+                <>
+                  <Find box={filter} label="Find a plugin" value={query} onChange={setQuery} />
+                  <Add label="Add plugin" open={installing} onClick={() => setInstalling(!installing)} />
+                </>
+              )}
+            </ViewBar>
+          </>
         )}
         {tab === "plugins" && pluginView === "browse" && (
           <PluginBrowse
@@ -424,219 +367,96 @@ export function Extensions({
         )}
         {tab === "plugins" && pluginView === "installed" && (
           <>
-            <PluginDoctor />
-            <form
-              className="plugin-install"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void act("extensions.install", { source });
-              }}
-            >
-              <label>
-                <Icon name="plus" />
-                <input
-                  required
-                  aria-label="Plugin source"
-                  value={source}
-                  onChange={(event) => setSource(event.target.value)}
-                  placeholder="owner/repo, name@marketplace, or a folder"
-                />
-              </label>
-              <button
-                className="btn-line"
-                disabled={busy || locked || !source.trim()}
+            {installing && (
+              <form
+                className="plugin-install"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void act("extensions.install", { source });
+                }}
               >
-                Install
-              </button>
-            </form>
-            <p className="page-lede">
-              Plugins stay off until you review their access.
-            </p>
+                <label>
+                  <Icon name="plus" />
+                  <input
+                    required
+                    autoFocus
+                    aria-label="Plugin source"
+                    value={source}
+                    onChange={(event) => setSource(event.target.value)}
+                    placeholder="owner/repo, name@marketplace, or a folder"
+                  />
+                </label>
+                <button className="btn-line" disabled={busy || locked || !source.trim()}>
+                  Install
+                </button>
+              </form>
+            )}
             {notices.map((message) => (
               <p className="surface-error" key={message}>
                 {message}
               </p>
             ))}
-            {plugins
-              .filter((plugin) => matches(plugin.name, plugin.description))
-              .map((plugin) => {
-                const key = `${plugin.scope}:${plugin.id}`;
-                const open = opened === key;
-                const enabled = plugin.activation === "enabled";
-                const failed = plugin.health.some(
-                  (component) => component.state === "failed",
-                );
-                return (
-                  <section key={key} className="plugin-row">
-                    <button
-                      className="plugin-head"
-                      aria-expanded={open}
-                      onClick={() => setOpened(open ? "" : key)}
-                    >
-                      <span
-                        className={`plugin-marker ${enabled ? "enabled" : ""} ${failed ? "failed" : ""}`}
-                      >
-                        {failed ? "×" : enabled ? "●" : "○"}
-                      </span>
-                      <span>
-                        <b>{plugin.name}</b>
-                        <small>
-                          {plugin.version} ·{" "}
-                          {[
-                            ...new Set(
-                              plugin.components.map(
-                                (component) => component.kind,
-                              ),
-                            ),
-                          ].join(", ")}
-                        </small>
-                      </span>
-                      <small>{plugin.scope}</small>
-                      <span className="plugin-state">
-                        {failed
-                          ? "Needs attention"
-                          : enabled
-                            ? "On"
-                            : plugin.activation.startsWith("changed")
-                              ? "Needs review"
-                              : "Off"}
-                      </span>
-                      <Icon name="chev" />
-                    </button>
-                    {open && (
-                      <div className="plugin-detail">
-                        {plugin.description && <p>{plugin.description}</p>}
-                        <h3>What it adds</h3>
-                        <ul>
-                          {plugin.components.map((component) => (
-                            <li key={component.id}>
-                              <span>{component.kind}</span>
-                              <b>{component.id}</b>
-                            </li>
-                          ))}
-                        </ul>
-                        <h3>Requested access</h3>
-                        <Access plugin={plugin} />
-                        {plugin.blocked && (
-                          <p className="surface-error">{plugin.blocked}</p>
-                        )}
-                        {plugin.health
-                          .filter((health) => health.error)
-                          .map((health) => (
-                            <p className="surface-error" key={health.id}>
-                              {health.id}: {health.error}
-                            </p>
-                          ))}
-                        <button
-                          className="btn-line"
-                          disabled={
-                            busy || locked || (!enabled && !plugin.grant)
-                          }
-                          onClick={() =>
-                            enabled
-                              ? void act("extensions.disable", {
-                                  id: plugin.id,
-                                  scope: plugin.scope,
-                                })
-                              : setReview(plugin)
-                          }
-                        >
-                          {enabled ? "Turn off" : "Review and enable"}
-                        </button>
-                        {plugin.scope === "user" && (
-                          <div className="row-actions">
-                            <button
-                              className="btn-line"
-                              disabled={busy || locked}
-                              onClick={() => {
-                                setBusy(true);
-                                setError("");
-                                void api
-                                  .extensions("extensions.update.preview", {
-                                    id: plugin.id,
-                                  })
-                                  .then((result) => {
-                                    const plan = result as Update;
-                                    if (plan.up_to_date)
-                                      setNotice("Already up to date");
-                                    else setUpdating(plan);
-                                  })
-                                  .catch((cause) => setError(String(cause)))
-                                  .finally(() => setBusy(false));
-                              }}
-                            >
-                              Check for updates
-                            </button>
-                            {plugin.can_rollback && (
-                              <button
-                                className="btn-line"
-                                disabled={busy || locked}
-                                onClick={() =>
-                                  setRemoving({
-                                    title: `Restore the previous version of ${plugin.name}?`,
-                                    method: "extensions.rollback",
-                                    params: { id: plugin.id },
-                                  })
-                                }
-                              >
-                                Previous version
-                              </button>
-                            )}
-                            <button
-                              className="btn-line"
-                              disabled={busy || locked}
-                              onClick={() =>
-                                setRemoving({
-                                  title: `Remove ${plugin.name}?`,
-                                  method: "extensions.remove",
-                                  params: { id: plugin.id },
-                                })
-                              }
-                            >
-                              Remove
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </section>
-                );
-              })}
-            {!plugins.length && (
-              <p className="quiet">No plugins discovered in this workspace.</p>
-            )}
+            <PluginList
+              plugins={plugins.filter((plugin) => matches(plugin.name, plugin.description))}
+              disabled={busy || locked}
+              onReview={setReview}
+              onTurnOff={(plugin) => void act("extensions.disable", { id: plugin.id, scope: plugin.scope })}
+              onCheckUpdate={(plugin) => {
+                setBusy(true);
+                setError("");
+                void api
+                  .extensions("extensions.update.preview", { id: plugin.id })
+                  .then((result) => {
+                    const plan = result as Update;
+                    if (plan.up_to_date) setNotice("Already up to date");
+                    else setUpdating(plan);
+                  })
+                  .catch((cause) => setError(String(cause)))
+                  .finally(() => setBusy(false));
+              }}
+              onRollback={(plugin) =>
+                setRemoving({
+                  title: `Restore the previous version of ${plugin.name}?`,
+                  method: "extensions.rollback",
+                  params: { id: plugin.id },
+                })
+              }
+              onRemove={(plugin) =>
+                setRemoving({
+                  title: `Remove ${plugin.name}?`,
+                  method: "extensions.remove",
+                  params: { id: plugin.id },
+                })
+              }
+            />
+            <PluginDoctor />
           </>
         )}
         {tab === "MCP" && (
           <>
-            <div className="page-heading">
-              <div>
-                <h2>MCP servers</h2>
-                <p>
-                  Connect tools and services. Medha asks before starting
-                  untrusted servers.
-                </p>
-              </div>
-              <button
-                className="btn-line"
+            <PageTop title="Servers">
+              Every tool server Medha can reach, with its sign-in, tools and access. Medha asks before starting one you
+              have not trusted.
+            </PageTop>
+            <ViewBar
+              views={[
+                { id: "yours", label: "Yours", count: mcp.length },
+                { id: "catalog", label: "Catalog" },
+              ]}
+              view={mcpView}
+              onView={setMcpView}
+            >
+              {mcpView === "yours" && <Find box={filter} label="Find a server" value={query} onChange={setQuery} />}
+              <Add
+                label="Add server"
+                open={adding && mcpView === "yours"}
                 onClick={() => {
                   setPrefill(undefined);
                   setMcpView("yours");
                   setAdding(!adding);
                 }}
-              >
-                <Icon name="plus" />
-                Add server
-              </button>
-            </div>
-            <div className="segmented">
-              <button aria-pressed={mcpView === "yours"} onClick={() => setMcpView("yours")}>
-                Your servers
-              </button>
-              <button aria-pressed={mcpView === "catalog"} onClick={() => setMcpView("catalog")}>
-                Catalog
-              </button>
-            </div>
+              />
+            </ViewBar>
             {mcpView === "catalog" && (
               <McpCatalog
                 onPick={(picked) => {
@@ -655,6 +475,7 @@ export function Extensions({
               />
             )}
             {mcpView === "yours" && <>
+            <div className="ix">
             {mcp
               .filter((server) => matches(server.id, server.url))
               .map((server) => {
@@ -672,31 +493,23 @@ export function Extensions({
                           .finally(() => setBusy(false));
                       }
                     : undefined;
-                return (
-                <div className="mcp-server" key={server.id}>
-                <section className="settings-row">
-                  <div>
-                    <b>{server.id}</b>
-                    <p>{server.url || server.executable}</p>
-                    <small className="mcp-state">
-                      <span className={`agent-dot ${view.dot}`} aria-hidden="true" />
-                      {view.label}
-                    </small>
-                  </div>
-                  <div className="row-actions">
-                    <button
-                      className="btn-line"
-                      aria-expanded={mcpOpen === server.id}
-                      onClick={() => setMcpOpen(mcpOpen === server.id ? "" : server.id)}
-                    >
-                      Details
-                    </button>
+                const state = (
+                  <small className="mcp-state">
+                    <span className={`agent-dot ${view.dot}`} aria-hidden="true" />
+                    {view.label}
+                  </small>
+                );
+                // The one thing the server needs now; the same button on the row and in the sheet.
+                const action = (
+                  <>
                     {view.action === "connect" && (
                       <button
                         className="btn-line"
                         disabled={busy || locked || !sessionKey}
                         title={sessionKey ? undefined : "Open a chat to connect"}
                         onClick={() => {
+                          // The question that follows is asked on the page, not over the sheet.
+                          setMcpOpen("");
                           setAutoConnect(server.trust === "trusted");
                           setConnect(server);
                         }}
@@ -710,56 +523,72 @@ export function Extensions({
                       </button>
                     )}
                     {view.action === "disconnect" && (
-                        <button
-                          className="btn-line"
-                          disabled={busy || locked}
-                          onClick={() => {
-                            setBusy(true);
-                            void api
-                              .liveCall(sessionKey!, "mcp.disconnect", {
-                                id: server.id,
-                              })
-                              .then(() => setRefresh((value) => value + 1))
-                              .catch((cause) => setError(String(cause)))
-                              .finally(() => setBusy(false));
-                          }}
-                        >
-                          Disconnect
-                        </button>
-                      )}
-                    <details className="row-more">
-                      <summary>•••</summary>
-                      <div>
-                        <button
-                          disabled={busy || locked}
-                          onClick={() => {
-                            setRemoving({
-                              title: `Remove MCP server ${server.id}?`,
-                              method: "settings.mcp.remove",
-                              params: { id: server.id },
-                            });
-                          }}
-                        >
-                          Remove server
-                        </button>
-                      </div>
-                    </details>
+                      <button
+                        className="btn-line"
+                        disabled={busy || locked}
+                        onClick={() => {
+                          setBusy(true);
+                          void api
+                            .liveCall(sessionKey!, "mcp.disconnect", {
+                              id: server.id,
+                            })
+                            .then(() => setRefresh((value) => value + 1))
+                            .catch((cause) => setError(String(cause)))
+                            .finally(() => setBusy(false));
+                        }}
+                      >
+                        Disconnect
+                      </button>
+                    )}
+                  </>
+                );
+                return (
+                  <div className="ix-row" key={server.id}>
+                    <button className="ix-main" onClick={() => setMcpOpen(server.id)}>
+                      <b>{server.id}</b>
+                      <span className="ix-sum mono">{(server.url || server.executable || "").replace(/^https:\/\//, "")}</span>
+                    </button>
+                    {state}
+                    <span className="ix-act">{action}</span>
+                    {mcpOpen === server.id && (
+                      <Sheet label={server.id} onClose={() => setMcpOpen("")}>
+                        <div className="sheet-title">
+                          <h2>{server.id}</h2>
+                        </div>
+                        <p className="sheet-from mono">{server.url || server.executable}</p>
+                        {state}
+                        <McpDetails
+                          server={server}
+                          status={statuses[server.id]}
+                          tools={tools}
+                          busy={busy || locked}
+                          onUpdate={(patch) => void act("settings.mcp.update", { id: server.id, ...patch })}
+                          onSignIn={signInTo}
+                          onSignOut={() => void act("settings.mcp.signout", { id: server.id })}
+                        />
+                        <div className="sheet-actions">
+                          {action}
+                          <button
+                            className="sheet-quiet"
+                            disabled={busy || locked}
+                            onClick={() => {
+                              setMcpOpen("");
+                              setRemoving({
+                                title: `Remove MCP server ${server.id}?`,
+                                method: "settings.mcp.remove",
+                                params: { id: server.id },
+                              });
+                            }}
+                          >
+                            Remove server
+                          </button>
+                        </div>
+                      </Sheet>
+                    )}
                   </div>
-                </section>
-                {mcpOpen === server.id && (
-                  <McpDetails
-                    server={server}
-                    status={statuses[server.id]}
-                    tools={tools}
-                    busy={busy || locked}
-                    onUpdate={(patch) => void act("settings.mcp.update", { id: server.id, ...patch })}
-                    onSignIn={signInTo}
-                    onSignOut={() => void act("settings.mcp.signout", { id: server.id })}
-                  />
-                )}
-                </div>
                 );
               })}
+            </div>
             {signIn.pending && (
               <div className="mcp-signin" role="status">
                 <span>Signing in to {signIn.pending.server} — finish in your browser.</span>
@@ -782,23 +611,37 @@ export function Extensions({
         {tab === "hooks" && <Hooks locked={locked} />}
         {tab === "tool access" && (
           <>
-            <h2>Tool access</h2>
+            <PageTop title="Tool access">
+              What Medha may reach for in new chats of this project. Chat mode controls approvals; every use is still
+              checked by Medha’s policy, and asked about when it matters.
+            </PageTop>
             <ToolPreset available={tools.length} locked={locked} />
-            <p className="page-lede">
-              Chat mode controls approvals. Tool arguments and workspace
-              permissions are checked by Medha’s policy on each call.
-            </p>
-            {tools
-              .filter((tool) => matches(tool.name, tool.description))
-              .map((tool) => (
-                <details className="tool-access-row" key={tool.name}>
-                  <summary>
-                    <b>{tool.name}</b>
-                    <small>{tool.radius.replaceAll("_", " ")}</small>
-                  </summary>
-                  <p>{tool.description}</p>
-                </details>
-              ))}
+            {tools.length > 0 && (
+              <section className="ix-group">
+                <ViewBar>
+                  <Find box={filter} label="Find a tool" value={query} onChange={setQuery} />
+                </ViewBar>
+                <h3>
+                  In this chat <span>{tools.length}</span>
+                </h3>
+                <div className="ix">
+                  {tools
+                    .filter((tool) => matches(tool.name, tool.description))
+                    .map((tool) => (
+                      <details className="ix-row tool" key={tool.name}>
+                        <summary>
+                          <span className="ix-main">
+                            <b className="mono">{tool.name}</b>
+                            <span className="ix-sum">{summaryOf(tool.description)}</span>
+                          </span>
+                          <small className={`ix-note reach-${tool.radius}`}>{REACH[tool.radius] ?? tool.radius.replaceAll("_", " ")}</small>
+                        </summary>
+                        <p>{tool.description}</p>
+                      </details>
+                    ))}
+                </div>
+              </section>
+            )}
             {!sessionKey && (
               <p className="quiet">
                 Open a chat to inspect its available tools.

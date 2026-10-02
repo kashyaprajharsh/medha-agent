@@ -120,14 +120,6 @@
 [data-look="glass"] :is(.side-sections, .side-foot) {
   border-top-color: transparent;
 }
-[data-look="glass"] .starter {
-  background: color-mix(in srgb, var(--raised) 55%, transparent);
-  box-shadow: var(--e1-shadow);
-}
-[data-look="glass"] .starter:hover {
-  background: var(--raised);
-  box-shadow: var(--e1-shadow);
-}
 [data-look="glass"] :is(.scrim, .dialog-backdrop) {
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
@@ -160,7 +152,7 @@
 [data-look="neo"] :is(.side, .head, .status) {
   border-color: var(--neo-rule);
 }
-[data-look="neo"] :is(.btn-gold, .btn-line, .send, .stop, .starter, .look-option, .tool-preset-options button) {
+[data-look="neo"] :is(.btn-gold, .btn-line, .send, .stop, .look-option, .tool-preset-options button) {
   box-shadow:
     inset 0 0 0 2px var(--neo-ink),
     var(--e1-shadow);
@@ -168,13 +160,13 @@
     transform var(--t-fast) var(--ease),
     box-shadow var(--t-fast) var(--ease);
 }
-[data-look="neo"] :is(.btn-gold, .btn-line, .send, .stop, .starter, .look-option):not(:disabled):hover {
+[data-look="neo"] :is(.btn-gold, .btn-line, .send, .stop, .look-option):not(:disabled):hover {
   transform: translate(-1px, -1px);
   box-shadow:
     inset 0 0 0 2px var(--neo-ink),
     4px 4px 0 var(--neo-drop);
 }
-[data-look="neo"] :is(.btn-gold, .btn-line, .send, .stop, .starter, .look-option):not(:disabled):active {
+[data-look="neo"] :is(.btn-gold, .btn-line, .send, .stop, .look-option):not(:disabled):active {
   transform: translate(3px, 3px);
   box-shadow: inset 0 0 0 2px var(--neo-ink);
 }
@@ -185,7 +177,7 @@
     inset 0 0 0 2px var(--neo-ink),
     var(--e2-shadow);
 }
-[data-look="neo"] :is(.you, .ask, .plan, .settings-form, .market, .md pre, .usage-totals div) {
+[data-look="neo"] :is(.you, .ask, .plan, .settings-form, .market, .md pre) {
   border-color: var(--neo-ink);
   box-shadow: inset 0 0 0 1.5px var(--neo-ink);
 }
@@ -249,14 +241,14 @@
   border-color: transparent;
 }
 [data-look="soft"]
-  :is(.you, .ask, .plan, .settings-form, .market, .question-card, .starter, .look-option, .usage-totals div, .md pre, .palette, .control-popover, .select-menu, .slash-menu, .confirm-dialog) {
+  :is(.you, .ask, .plan, .settings-form, .market, .question-card, .look-option, .md pre, .palette, .control-popover, .select-menu, .slash-menu, .confirm-dialog) {
   border-color: transparent;
   box-shadow: var(--e1-shadow), inset 0 0 0 1px var(--hair);
 }
 [data-look="soft"] :is(.btn-line, .send, .stop, .icon-btn.active, .sess.active, .side-btn.active, .step-icon, .segmented button[aria-pressed="true"]) {
   box-shadow: var(--soft-raised);
 }
-[data-look="soft"] :is(.btn-line, .btn-gold, .send, .stop, .chip, .icon-btn, .starter, .look-option, .sess, .side-btn):not(:disabled):active {
+[data-look="soft"] :is(.btn-line, .btn-gold, .send, .stop, .chip, .icon-btn, .look-option, .sess, .side-btn):not(:disabled):active {
   box-shadow: var(--soft-sunk);
 }
 [data-look="soft"] :is(.segmented, .model-search, .settings-form input, .settings-form select, .filter-input, .plugin-install input, .select-trigger, .key-edit input, .custom-answer, .instruction-editor textarea, .agent-message textarea) {

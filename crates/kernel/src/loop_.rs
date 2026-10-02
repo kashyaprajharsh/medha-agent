@@ -966,6 +966,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .log
             .append(Event::tool_obs(session, &obs, trust))
             .await?;
+        let screen = obs.payload.get(crate::events::TOOL_SCREEN_FIELD).cloned();
         crate::events::strip_private_observation_fields(&mut obs.payload);
         window_events.push(event.id);
         *window_taint = window_taint.min(trust);
@@ -976,6 +977,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         }
         let ok = matches!(obs.status, crate::types::ObsStatus::Ok);
         sink.tool_result_with_id(&id, &tool, ok, &obs.payload);
+        if let Some(screen) = &screen {
+            sink.tool_screen(&id, screen);
+        }
         let content = self
             .maybe_spill(serde_json::to_string(&obs.payload).unwrap_or_default())
             .await;
@@ -2516,6 +2520,12 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 Ok(Block::ToolStarted { name, target }) => {
                     emitted = true;
                     sink.tool_started(&name, target.as_deref());
+                }
+                // Passed straight on and kept nowhere: the finished call below is
+                // what is counted against the stream's size, admitted and logged.
+                Ok(Block::ToolInput { id, name, delta }) => {
+                    emitted = true;
+                    sink.tool_input(&id, &name, &delta);
                 }
                 Ok(Block::ToolIntent(it)) => {
                     if intents.len() >= MAX_TOOL_INTENTS_PER_TURN {

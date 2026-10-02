@@ -1,10 +1,13 @@
 mod files;
 mod git;
+mod kept;
 mod live;
 mod mcp_host;
+mod outputs;
 mod service;
 mod sleep;
 mod terminal;
+mod view;
 mod workspaces;
 
 use serde_json::Value;
@@ -18,6 +21,7 @@ use workspaces::{Runtime, Workspaces};
 struct DesktopState {
     workspaces: Arc<Workspaces>,
     terminals: Mutex<HashMap<String, Arc<Runtime>>>,
+    views: Arc<view::Views>,
 }
 #[tauri::command]
 fn workspace_list(state: State<'_, DesktopState>) -> Result<Value, String> {
@@ -478,9 +482,11 @@ fn main() {
                         .map_err(std::io::Error::other)?,
                 ),
                 terminals: Mutex::new(HashMap::new()),
+                views: Arc::default(),
             });
             Ok(())
         })
+        .register_asynchronous_uri_scheme_protocol(view::SCHEME, outputs::serve)
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 window.state::<DesktopState>().workspaces.close_terminals();
@@ -513,7 +519,14 @@ fn main() {
             extension_request,
             settings_request,
             open_link,
-            image_admit
+            image_admit,
+            outputs::screen_put,
+            outputs::screen_drop,
+            outputs::screen_keep,
+            outputs::screen_kept,
+            outputs::media_link,
+            outputs::file_reveal,
+            outputs::output_save
         ])
         .run(tauri::generate_context!())
         .expect("Medha desktop failed to open");

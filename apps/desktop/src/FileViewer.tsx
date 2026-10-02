@@ -3,6 +3,9 @@ import type { FilePreview } from "./api";
 import { Icon } from "./Icon";
 import { Markdown, SourceCode } from "./Markdown";
 import { useWorkspaceApi } from "./Workspace";
+import { OutputsProvider, SHOWN_ONLY } from "./outputContext";
+// Outputs inside a previewed file are shown in place: opening one would close the file.
+
 const PdfPreview = lazy(() => import("./PdfPreview"));
 const DocumentPreview = lazy(() => import("./DocumentPreview"));
 const TablePreview = lazy(() => import("./TablePreview"));
@@ -100,7 +103,9 @@ export function FileViewer({
         {file && (
           <Suspense fallback={<p className="quiet">Preparing preview…</p>}>
             {file.kind === "markdown" && !source ? (
-              <Markdown html={file.html || ""} />
+              <OutputsProvider value={SHOWN_ONLY}>
+                <Markdown html={file.html || ""} />
+              </OutputsProvider>
             ) : file.kind === "pdf" ? (
               <PdfPreview bytes={file.bytes!} />
             ) : file.kind === "document" ? (

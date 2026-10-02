@@ -1,7 +1,9 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { highlightCode } from "./highlight";
 import { Icon } from "./Icon";
 import { useWorkspace } from "./Workspace";
+import { mentionsOf, splitOutputs } from "./outputBlocks";
+import { Mentioned, Plate } from "./OutputPlate";
 import { highlightAsync } from "./syntax";
 
 const WORKER_THRESHOLD = 8_000;
@@ -33,15 +35,102 @@ export function codeHtml(text: string, language?: string) {
   }
   return html;
 }
+type MarkdownProps = {
+  html: string;
+  className?: string;
+  onFile?: (path: string) => void;
+  /** Names this reply's outputs, so an open one is found again as the reply grows. */
+  scope?: string;
+  /** When the reply was made, which orders its outputs among the chat's. */
+  at?: number;
+  streaming?: boolean;
+  /** The reply was made in this sitting, so what it names may open by itself. */
+  fresh?: boolean;
+};
+
 export const Markdown = memo(function Markdown({
   html,
   className = "",
   onFile,
-}: {
-  html: string;
-  className?: string;
-  onFile?: (path: string) => void;
-}) {
+  scope = "reply",
+  at = 0,
+  streaming = false,
+  fresh = false,
+}: MarkdownProps) {
+  const segments = useMemo(() => splitOutputs(html), [html]);
+  // Files the reply only names are looked for once it is whole, not on every word.
+  const named = useMemo(() => {
+    if (streaming) return [];
+    const shown = new Set(segments.map((segment) => (segment.type === "output" ? segment.path : undefined)));
+    return mentionsOf(html).filter((mention) => !shown.has(mention.path));
+  }, [html, segments, streaming]);
+  const prose = streaming ? `${className} streaming` : className;
+  if (segments.length === 1 && segments[0].type === "html" && !named.length)
+    return <Prose html={html} className={prose} onFile={onFile} />;
+  const last = segments.length - 1;
+  const rows: ReactNode[] = [];
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index];
+    if (segment.type === "html") {
+      rows.push(
+        <Prose
+          key={index}
+          html={segment.html}
+          className={index === last ? prose : className}
+          onFile={onFile}
+        />,
+      );
+      continue;
+    }
+    // Outputs made together sit side by side; a lone one keeps the same parent as it gains a neighbour.
+    const first = index;
+    const plates: ReactNode[] = [];
+    for (let next = segments[index]; next?.type === "output"; next = segments[++index])
+      plates.push(
+        <Plate
+          key={index}
+          anchor={`${scope}:${index}`}
+          kind={next.kind}
+          source={next.source}
+          path={next.path}
+          name={next.name}
+          writing={streaming && index === last}
+          order={at * 1000 + index}
+        />,
+      );
+    index--;
+    rows.push(
+      <div className="out-grid" key={first}>
+        {plates}
+      </div>,
+    );
+  }
+  if (named.length)
+    rows.push(
+      <div className="out-grid" key="named">
+        {named.map((mention, index) => (
+          <Mentioned
+            key={mention.path}
+            anchor={`${scope}:named:${mention.path}`}
+            kind={mention.kind}
+            source=""
+            path={mention.path}
+            name={mention.name}
+            writing={false}
+            order={at * 1000 + 900 + index}
+            fresh={fresh}
+          />
+        ))}
+      </div>,
+    );
+  return <>{rows}</>;
+});
+
+const Prose = memo(function Prose({
+  html,
+  className = "",
+  onFile,
+}: Pick<MarkdownProps, "html" | "className" | "onFile">) {
   const root = useRef<HTMLDivElement>(null);
   const workspace = useWorkspace();
   useEffect(() => {

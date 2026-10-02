@@ -800,9 +800,10 @@ impl ResponseDecoder {
             }
             (
                 StepAccum::FunctionCall {
+                    id,
+                    name,
                     initial_arguments,
                     argument_deltas,
-                    ..
                 },
                 "arguments_delta" | "arguments",
             ) => {
@@ -821,7 +822,15 @@ impl ResponseDecoder {
                 }
                 self.progressed = !chunk.is_empty();
                 argument_deltas.push_str(chunk);
-                Ok(Vec::new())
+                // Passed on as written, under the id the finished call carries.
+                Ok((!chunk.is_empty())
+                    .then(|| Block::ToolInput {
+                        id: id.clone(),
+                        name: name.clone(),
+                        delta: chunk.to_string(),
+                    })
+                    .into_iter()
+                    .collect())
             }
             (StepAccum::Unknown, _) => Ok(Vec::new()),
             _ => Err(ProviderError::Stream(format!(
@@ -1615,14 +1624,18 @@ mod tests {
                 json!({"event_type":"step.start", "index":1, "step":{"type":"function_call", "id":"bad", "name":"web"}}),
                 json!({"event_type":"step.delta", "index":1, "delta":{"type":"arguments_delta", "arguments":arguments}}),
             ] {
+                // What is being written may be shown as it arrives; it is never a call to run.
+                let blocks = decoder
+                    .push(&SseEvent {
+                        event: None,
+                        data: value.to_string(),
+                    })
+                    .unwrap();
                 assert!(
-                    decoder
-                        .push(&SseEvent {
-                            event: None,
-                            data: value.to_string()
-                        })
-                        .unwrap()
-                        .is_empty()
+                    blocks
+                        .iter()
+                        .all(|block| matches!(block, Block::ToolInput { id, .. } if id == "bad")),
+                    "{blocks:?}"
                 );
             }
             let error = decoder

@@ -91,6 +91,31 @@
 .setting-option > .icon:last-child {
   color: var(--gold);
 }
+/* A saved model is one line: its name, then what it points at for whoever needs to tell two apart. */
+.model-options .setting-option {
+  padding: var(--s-2) 10px;
+}
+.model-options .setting-option > span {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+}
+.model-options .setting-option b {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.model-options .setting-option small {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow-wrap: normal;
+  color: var(--faint);
+}
 .setting-section {
   padding: 10px;
   display: grid;

@@ -1069,6 +1069,14 @@ pub enum Block {
         name: String,
         target: Option<String>,
     },
+    /// The next piece of a tool call's arguments as the model writes them. Shown
+    /// live by a surface that can; the call itself still arrives whole as a
+    /// `ToolIntent`, and that is the only thing ever run or recorded.
+    ToolInput {
+        id: String,
+        name: String,
+        delta: String,
+    },
     /// End-of-response token accounting (from the provider's `usage`).
     Usage(Usage),
     /// Reasoning delta shown live but excluded from subsequent-turn history.

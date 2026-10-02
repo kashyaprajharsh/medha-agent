@@ -7,6 +7,7 @@ import { useEffect, useMemo, useState } from "react";
 import { type Patch, type SessionSettings } from "./api";
 import { Icon } from "./Icon";
 import type { LiveState } from "./live";
+import { Preview } from "./OutputPreview";
 import { SubagentPanel } from "./SubagentPanel";
 import {
   doingLine,
@@ -16,12 +17,8 @@ import {
   type SubagentRun,
 } from "./timeline";
 
-export type SurfaceTab =
-  | "agents"
-  | "changes"
-  | "files"
-  | "activity"
-  | "context";
+const TABS = ["preview", "agents", "changes", "files", "activity", "context"] as const;
+export type SurfaceTab = (typeof TABS)[number];
 type Props = {
   onFile: (path: string) => void;
   tab: SurfaceTab;
@@ -202,9 +199,7 @@ export function WorkSurface(props: Props) {
         role="tablist"
         aria-label="Work surface views"
       >
-        {(
-          ["agents", "changes", "files", "activity", "context"] as SurfaceTab[]
-        ).map((tab) => (
+        {TABS.map((tab) => (
           <button
             type="button"
             role="tab"
@@ -214,20 +209,10 @@ export function WorkSurface(props: Props) {
             aria-selected={props.tab === tab}
             onClick={() => props.onTab(tab)}
             onKeyDown={(event) => {
-              const tabs: SurfaceTab[] = [
-                "agents",
-                "changes",
-                "files",
-                "activity",
-                "context",
-              ];
               if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
                 event.preventDefault();
-                const next =
-                  tabs[
-                    (tabs.indexOf(tab) + (event.key === "ArrowRight" ? 1 : 4)) %
-                      5
-                  ];
+                const step = event.key === "ArrowRight" ? 1 : TABS.length - 1;
+                const next = TABS[(TABS.indexOf(tab) + step) % TABS.length];
                 props.onTab(next);
                 document.getElementById(`tab-${next}`)?.focus();
               }
@@ -247,6 +232,7 @@ export function WorkSurface(props: Props) {
         id={`surface-${props.tab}`}
         aria-labelledby={`tab-${props.tab}`}
       >
+        {props.tab === "preview" && <Preview />}
         {props.tab === "files" && (
           <FilesBrowser
             onFile={props.onFile}

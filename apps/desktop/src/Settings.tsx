@@ -4,7 +4,9 @@ import { Health } from "./Health";
 import { Keys } from "./Keys";
 import { Usage } from "./Usage";
 import { Memory } from "./Memory";
+import { Add, PageTop, ViewBar } from "./ExtensionParts";
 import { Icon } from "./Icon";
+import { Sheet } from "./Sheet";
 import { useWorkspace } from "./Workspace";
 type Model = {
   name: string;
@@ -38,6 +40,29 @@ type Instruction = {
   content: string;
   exists: boolean;
 };
+const hostOf = (url: string) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+};
+/** Whether a model has the key it needs, in a few words. */
+const keyOf = (model: Model) =>
+  model.key_present
+    ? { label: "Key saved", missing: false }
+    : model.profile.auth === "none"
+      ? { label: "No key required", missing: false }
+      : { label: "No saved key", missing: true };
+// The instruction files that follow the person into every project.
+const EVERYWHERE = ["persona", "global"];
+const fileOf = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
+const PROVIDERS = [
+  { id: "duckduckgo", name: "DuckDuckGo", note: "Works at once. No key needed." },
+  { id: "tavily", name: "Tavily", note: "Search made for agents. Needs an API key." },
+  { id: "brave", name: "Brave Search", note: "An independent index. Needs an API key." },
+  { id: "searxng", name: "SearXNG", note: "Your own search server, at an address you give." },
+];
 const LOOKS = [
   { id: "soft", name: "Soft", note: "Raised, rounded surfaces. The default." },
   { id: "flat", name: "Flat", note: "Calm and quiet." },
@@ -65,6 +90,13 @@ export function Settings({
   const [busy, setBusy] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const [confirm, setConfirm] = useState<{ model: Model; key: boolean }>();
+  const [opened, setOpened] = useState("");
+  const open = tab === "models" && editing === undefined ? models.find((model) => model.name === opened) : undefined;
+  // What follows is asked or done on the page, so the sheet steps aside for it.
+  const aside = (then: () => void) => {
+    setOpened("");
+    then();
+  };
   useEffect(() => {
     let active = true;
     setError("");
@@ -116,7 +148,9 @@ export function Settings({
                 role="tab"
                 aria-selected={tab === name}
                 key={name}
-                onClick={() => {
+                onClick={(event) => {
+                  // Where the tabs slide sideways, the one picked comes fully into view.
+                  event.currentTarget.scrollIntoView({ block: "nearest", inline: "nearest" });
                   setTab(name);
                   setEditing(undefined);
                   setNotice("");
@@ -143,20 +177,14 @@ export function Settings({
         {tab === "memory" && <Memory sessionKey={sessionKey} ensureOpen={ensureOpen} />}
         {tab === "models" && (
           <>
-            <div className="page-heading">
-              <div>
-                <h2>Models</h2>
-                <p>Saved models are available in the chat composer.</p>
-              </div>
-              <button
-                className="btn-line"
-                disabled={!protocols.length}
-                onClick={() => setEditing(null)}
-              >
-                <Icon name="plus" />
-                Add model
-              </button>
-            </div>
+            <PageTop title="Models">The models you have saved. Pick one for a chat from the box you type in.</PageTop>
+            <ViewBar>
+              <Add
+                label="Add model"
+                open={editing === null}
+                onClick={() => protocols.length && setEditing(editing === null ? undefined : null)}
+              />
+            </ViewBar>
             {editing !== undefined ? (
               <ModelForm
                 key={editing?.name || "new"}
@@ -167,66 +195,18 @@ export function Settings({
                 onSave={(params) => act("settings.model.save", params)}
               />
             ) : (
-              <div className="settings-list">
+              <div className="ix">
                 {models.map((model) => (
-                  <section key={model.name} className="settings-row">
-                    <div>
-                      <b>
-                        {model.name}
-                        {model.default && (
-                          <span className="default-label">Default</span>
-                        )}
-                      </b>
-                      <p>{model.profile.model}</p>
-                      <small>
-                        {model.profile.base_url} ·{" "}
-                        {model.key_present
-                          ? "Key saved"
-                          : model.profile.auth === "none"
-                            ? "No key required"
-                            : "No saved key"}
-                      </small>
-                    </div>
-                    <div className="row-actions">
-                      <button
-                        className="btn-line"
-                        onClick={() => setEditing(model)}
-                      >
-                        Edit
-                      </button>
-                      <details className="row-more">
-                        <summary aria-label={`More actions for ${model.name}`}>
-                          •••
-                        </summary>
-                        <div>
-                          {!model.default && (
-                            <button
-                              disabled={busy}
-                              onClick={() =>
-                                void act("settings.model.default", {
-                                  name: model.name,
-                                }).catch(() => {})
-                              }
-                            >
-                              Make default
-                            </button>
-                          )}
-                          {model.key_present && (
-                            <button
-                              onClick={() => setConfirm({ model, key: true })}
-                            >
-                              Remove API key
-                            </button>
-                          )}
-                          <button
-                            onClick={() => setConfirm({ model, key: false })}
-                          >
-                            Remove model
-                          </button>
-                        </div>
-                      </details>
-                    </div>
-                  </section>
+                  <div key={model.name} className="ix-row">
+                    <button className="ix-main" onClick={() => setOpened(model.name)}>
+                      <b>{model.name}</b>
+                      <span className="ix-sum">
+                        {model.profile.model} <i>on {hostOf(model.profile.base_url)}</i>
+                      </span>
+                    </button>
+                    {model.default && <span className="ix-chip gold">Default</span>}
+                    <small className={`ix-note ${keyOf(model).missing ? "warn" : ""}`}>{keyOf(model).label}</small>
+                  </div>
                 ))}
                 {!models.length && (
                   <p className="quiet">
@@ -235,7 +215,50 @@ export function Settings({
                 )}
               </div>
             )}
+            {open && (
+              <Sheet label={open.name} onClose={() => setOpened("")}>
+                <div className="sheet-title">
+                  <h2>{open.name}</h2>
+                  {open.default && <span className="ix-chip gold">Default</span>}
+                </div>
+                <dl className="sheet-facts">
+                  <dt>Model</dt>
+                  <dd className="mono">{open.profile.model}</dd>
+                  <dt>Endpoint</dt>
+                  <dd className="mono">{open.profile.base_url}</dd>
+                  <dt>Protocol</dt>
+                  <dd>{protocols.find((protocol) => protocol.value === open.profile.protocol)?.label ?? open.profile.protocol}</dd>
+                  <dt>Key</dt>
+                  <dd className={keyOf(open).missing ? "warn" : ""}>{keyOf(open).label}</dd>
+                </dl>
+                <div className="sheet-actions">
+                  <button className="btn-gold" onClick={() => aside(() => setEditing(open))}>
+                    Edit
+                  </button>
+                  {!open.default && (
+                    <button
+                      className="btn-line"
+                      disabled={busy}
+                      onClick={() => void act("settings.model.default", { name: open.name }).catch(() => {})}
+                    >
+                      Make default
+                    </button>
+                  )}
+                  {open.key_present && (
+                    <button className="btn-line" onClick={() => aside(() => setConfirm({ model: open, key: true }))}>
+                      Remove API key
+                    </button>
+                  )}
+                  <button className="sheet-quiet" onClick={() => aside(() => setConfirm({ model: open, key: false }))}>
+                    Remove model
+                  </button>
+                </div>
+              </Sheet>
+            )}
           </>
+        )}
+        {tab === "web search" && (
+          <PageTop title="Web search">The search service Medha uses when it looks something up on the web.</PageTop>
         )}
         {tab === "web search" && search && (
           <SearchForm
@@ -246,15 +269,10 @@ export function Settings({
         )}
         {tab === "instructions" && (
           <>
-            <div className="page-heading">
-              <div>
-                <h2>Instructions</h2>
-                <p>
-                  Persona and your instructions apply across projects. Project
-                  files apply in this folder. Changes load in a new chat.
-                </p>
-              </div>
-            </div>
+            <PageTop title="Instructions">
+              Persona and your instructions apply across projects. Project files apply in this folder. Changes load in
+              a new chat.
+            </PageTop>
             <InstructionEditor
               files={instructions}
               busy={busy}
@@ -264,7 +282,7 @@ export function Settings({
         )}
         {tab === "appearance" && (
           <>
-            <h2>Appearance</h2>
+            <PageTop title="Appearance">How Medha looks on this computer. Changes show at once.</PageTop>
             <div className="appearance-row">
               <label htmlFor="theme">Theme</label>
               <Select
@@ -904,7 +922,7 @@ function SearchForm({
   const [key, setKey] = useState("");
   return (
     <form
-      className="settings-form"
+      className="settings-form plain"
       onSubmit={(event) => {
         event.preventDefault();
         void onSave({ provider, url, key })
@@ -912,22 +930,28 @@ function SearchForm({
           .catch(() => {});
       }}
     >
-      <h2>Web search</h2>
-      <p>Choose the search service Medha uses for web research.</p>
-      <label>
-        Provider
-        <Select
-          value={provider}
-          onChange={(event) => {
-            setProvider(event.target.value);
-            setKey("");
-          }}
-        >
-          {["duckduckgo", "tavily", "brave", "searxng"].map((value) => (
-            <option key={value}>{value}</option>
-          ))}
-        </Select>
-      </label>
+      <div className="ix" role="radiogroup" aria-label="Provider">
+        {PROVIDERS.map((each) => (
+          <button
+            type="button"
+            role="radio"
+            key={each.id}
+            aria-checked={provider === each.id}
+            className="ix-row pick"
+            onClick={() => {
+              setProvider(each.id);
+              setKey("");
+            }}
+          >
+            <span className="option-radio" />
+            <span className="ix-main">
+              <b>{each.name}</b>
+              <span className="ix-sum">{each.note}</span>
+            </span>
+            {search.provider === each.id && <span className="ix-chip gold">In use</span>}
+          </button>
+        ))}
+      </div>
       {provider === "searxng" && (
         <label>
           Server URL
@@ -978,35 +1002,49 @@ function InstructionEditor({
   }, [file]);
   return (
     <div className="instruction-editor">
-      <Select
-        aria-label="Instructions file"
-        value={kind}
-        onChange={(event) => setKind(event.target.value)}
-      >
-        {files.map((item) => (
-          <option key={item.kind} value={item.kind}>
-            {item.title}
-            {item.exists ? "" : " · new"}
-          </option>
-        ))}
-      </Select>
-      <p className="quiet">{file?.path}</p>
-      <textarea
-        aria-label="Instructions"
-        spellCheck={false}
-        value={content}
-        onChange={(event) => setContent(event.target.value)}
-        placeholder="Write the guidance Medha should follow…"
-      />
-      <button
-        className="btn-gold"
-        disabled={busy || !file || content === file.content}
-        onClick={() =>
-          void onSave({ kind, content, before: file?.content }).catch(() => {})
-        }
-      >
-        Save instructions
-      </button>
+      <nav className="instruction-files" aria-label="Instructions file">
+        {[
+          { title: "Everywhere", rows: files.filter((item) => EVERYWHERE.includes(item.kind)) },
+          { title: "This project", rows: files.filter((item) => !EVERYWHERE.includes(item.kind)) },
+        ].map(
+          (group) =>
+            group.rows.length > 0 && (
+              <section key={group.title}>
+                <h3>{group.title}</h3>
+                {group.rows.map((item) => (
+                  <button key={item.kind} aria-current={kind === item.kind} onClick={() => setKind(item.kind)}>
+                    <i className={item.exists ? "written" : ""} />
+                    <span>
+                      <b>{item.title}</b>
+                      <small>{item.exists ? fileOf(item.path) : "Not written yet"}</small>
+                    </span>
+                  </button>
+                ))}
+              </section>
+            ),
+        )}
+      </nav>
+      <div className="instruction-page">
+        <textarea
+          aria-label="Instructions"
+          spellCheck={false}
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          placeholder="Write the guidance Medha should follow…"
+        />
+        <div className="instruction-foot">
+          <button
+            className="btn-gold"
+            disabled={busy || !file || content === file.content}
+            onClick={() =>
+              void onSave({ kind, content, before: file?.content }).catch(() => {})
+            }
+          >
+            Save instructions
+          </button>
+          <code title={file?.path}>{file?.path}</code>
+        </div>
+      </div>
     </div>
   );
 }

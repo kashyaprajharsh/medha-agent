@@ -31,8 +31,8 @@ pub use context::{
 pub use errors::KernelError;
 pub use events::{
     AGENT_REPORT_ACKS_FIELD, Event, EventKind, EventLog, FileRollback, InMemoryLog, MutationLease,
-    Provenance, SessionMeta, cut_index, project_messages, project_ordered_messages, rollback_plan,
-    rollback_plan_in,
+    Provenance, SessionMeta, TOOL_SCREEN_FIELD, cut_index, project_messages,
+    project_ordered_messages, rollback_plan, rollback_plan_in,
 };
 pub use executor::{BackgroundTask, Executor};
 pub use gate::{

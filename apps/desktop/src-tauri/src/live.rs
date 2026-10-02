@@ -16,7 +16,7 @@ use transcript_view::Steps;
 
 use crate::sleep::{self, Rest, Settled, Wake};
 
-const REQUESTS: [&str; 22] = [
+const REQUESTS: [&str; 25] = [
     "mcp.signin",
     "connectors.connect",
     "tasks.list",
@@ -35,6 +35,9 @@ const REQUESTS: [&str; 22] = [
     "question.respond",
     "extensions.reload",
     "extensions.catalog",
+    "mcp.screens",
+    "mcp.screen",
+    "mcp.screen.call",
     "mcp.connect",
     "mcp.disconnect",
     "session.rewind",
@@ -66,7 +69,8 @@ impl StreamFrames {
         let streaming = frame["method"] == "event"
             && matches!(
                 frame["params"]["kind"].as_str(),
-                Some("model.text" | "model.reasoning")
+                // A tool call's arguments arrive in the same rapid pieces as text does.
+                Some("model.text" | "model.reasoning" | "tool.input")
             )
             && frame["params"]["delta"].is_string();
         if !streaming {

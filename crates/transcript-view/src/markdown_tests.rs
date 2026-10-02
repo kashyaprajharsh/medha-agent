@@ -67,6 +67,21 @@ fn images_show_alt_text_and_are_never_fetched() {
 }
 
 #[test]
+fn an_image_names_only_a_local_file_and_cannot_break_out_of_the_attribute() {
+    let html = to_html("![load](out/write-load.png)");
+    assert!(html.contains("<span class=\"md-image\" data-src=\"out/write-load.png\">load</span>"));
+    for remote in [
+        "//tracker.example/p.png",
+        "javascript:alert(1)",
+        "data:image/png;base64,AA",
+    ] {
+        assert!(!to_html(&format!("![x]({remote})")).contains("data-src"));
+    }
+    let html = to_html("![x](<a\" onerror=\"x.png>)");
+    assert!(!html.contains("onerror=\"x"));
+}
+
+#[test]
 fn code_fence_languages_cannot_break_out_of_the_attribute() {
     let html = to_html("```rust\" onclick=\"x\nfn a() {}\n```");
     assert!(html.contains("<pre data-lang=\"rust\"><code>"));

@@ -16,7 +16,7 @@ use std::{
 
 use futures::StreamExt;
 use rmcp::transport::auth::{
-    AuthorizationManager, OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture,
+    AuthError, AuthorizationManager, OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture,
     OAuthHttpRedirectPolicy, OAuthHttpRequest, OAuthState,
 };
 use tokio::{
@@ -142,8 +142,21 @@ fn disallowed_host(host: &str) -> bool {
     }
 }
 
+/// Every request to a server says who is asking. Some vendors refuse a request
+/// that names no client outright, before it reaches their sign-in at all.
+const USER_AGENT: &str = concat!("Medha/", env!("CARGO_PKG_VERSION"));
+
+/// The client for a server that needs no sign-in of its own making.
+pub(crate) fn named_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .build()
+        .unwrap_or_default()
+}
+
 fn client_builder(total: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
         .timeout(total)
 }
@@ -344,6 +357,34 @@ pub(crate) async fn client_from_stored(
     Ok(RenewingClient::new(resource, manager, store, refused))
 }
 
+/// Discovers the provider and registers with it, to be redirected back to `host`.
+async fn begin(
+    url: &str,
+    http: &Arc<HardenedOAuthClient>,
+    host: &str,
+    port: u16,
+) -> Result<OAuthState, AuthError> {
+    let mut state = OAuthState::new_with_oauth_http_client(url, http.clone()).await?;
+    let redirect = format!("http://{host}:{port}/callback");
+    state
+        .start_authorization(&[], &redirect, Some("Medha"))
+        .await?;
+    Ok(state)
+}
+
+/// The address is the better name for this machine: it cannot be pointed
+/// elsewhere. Some providers only register the word, so it is the second try.
+async fn register(
+    url: &str,
+    http: &Arc<HardenedOAuthClient>,
+    port: u16,
+) -> Result<OAuthState, AuthError> {
+    match begin(url, http, "127.0.0.1", port).await {
+        Err(AuthError::RegistrationFailed(_)) => begin(url, http, "localhost", port).await,
+        began => began,
+    }
+}
+
 /// Run the interactive flow: discover, open the browser, catch the loopback
 /// redirect, exchange the code. Returns credentials for the token store.
 pub(crate) async fn authorize(
@@ -362,7 +403,6 @@ pub(crate) async fn authorize(
         .local_addr()
         .map_err(|error| Error::Auth(error.to_string()))?
         .port();
-    let redirect = format!("http://127.0.0.1:{port}/callback");
 
     // Discovery and registration hit endpoints named by the server's own metadata,
     // so transport policy must hold for the whole exchange. Those go over
@@ -370,11 +410,7 @@ pub(crate) async fn authorize(
     // endpoint that leaves the client — where the browser is sent.
     let policy = EndpointPolicy::new(url)?;
     let oauth_http = Arc::new(HardenedOAuthClient::new(url, http)?);
-    let mut state = OAuthState::new_with_oauth_http_client(url, oauth_http)
-        .await
-        .map_err(auth_failed)?;
-    state
-        .start_authorization(&[], &redirect, Some("Medha"))
+    let mut state = register(url, &oauth_http, port)
         .await
         .map_err(auth_failed)?;
     let authorize_url = state.get_authorization_url().await.map_err(auth_failed)?;
@@ -521,5 +557,72 @@ mod tests {
         assert_eq!(pairs[1], ("state".into(), "xyz".into()));
         assert_eq!(pairs[2], ("iss".into(), "https://issuer".into()));
         assert!(query_pairs("/favicon.ico").is_empty());
+    }
+
+    /// A provider that registers a client only when it is redirected to `localhost`.
+    async fn provider_that_refuses_the_address() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::AsyncReadExt;
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::clone(&asked);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 8192];
+                // One read is the whole of these small requests once the body has arrived.
+                while !String::from_utf8_lossy(&request).contains("\r\n\r\n")
+                    || (request.starts_with(b"POST") && !request.ends_with(b"}"))
+                {
+                    match stream.read(&mut chunk).await {
+                        Ok(read) if read > 0 => request.extend_from_slice(&chunk[..read]),
+                        _ => break,
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let body = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+                let (status, answer) = if !request.starts_with("POST /register") {
+                    ("404 Not Found", String::new())
+                } else {
+                    seen.lock().unwrap().push(body.to_string());
+                    if body.contains("127.0.0.1") {
+                        (
+                            "400 Bad Request",
+                            r#"{"error":"invalid_redirect_uri"}"#.into(),
+                        )
+                    } else {
+                        let registered = r#"{"client_id":"medha-test","redirect_uris":[]}"#;
+                        ("201 Created", registered.into())
+                    }
+                };
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                            answer.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (format!("http://127.0.0.1:{port}/mcp"), asked)
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_refuses_the_address_is_asked_again_by_name() {
+        let (url, asked) = provider_that_refuses_the_address().await;
+        let http = Arc::new(HardenedOAuthClient::new(&url, Duration::from_secs(5)).unwrap());
+        let state = register(&url, &http, 4242).await.unwrap();
+        let sent = state.get_authorization_url().await.unwrap();
+        assert!(
+            sent.contains("redirect_uri=http%3A%2F%2Flocalhost%3A4242%2Fcallback"),
+            "{sent}"
+        );
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 2, "the address first, then the name");
+        assert!(asked[0].contains("http://127.0.0.1:4242/callback"));
+        assert!(asked[1].contains("http://localhost:4242/callback"));
     }
 }

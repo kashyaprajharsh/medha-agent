@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { Icon } from "./Icon";
+import { useEffect, useRef, useState } from "react";
+import { Find, PageTop, ViewBar } from "./ExtensionParts";
+import { Sheet } from "./Sheet";
 import { useWorkspaceApi } from "./Workspace";
 
 type Entry = {
@@ -17,6 +18,8 @@ type Entry = {
 type Source = { session: string | null; kind?: string; ts?: number; excerpt?: string };
 
 const words = (text: string) => text.replaceAll("_", " ");
+const sentence = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
+const keyOf = (entry: Entry) => `${entry.scope}:${entry.name}`;
 
 /** What Medha remembers across chats, where each memory came from, and pin or
  * forget. Changes are recorded in the chat's log and apply from the next chat. */
@@ -28,6 +31,8 @@ export function Memory({ sessionKey, ensureOpen }: { sessionKey: string | null; 
   const [busy, setBusy] = useState("");
   const [forgetting, setForgetting] = useState("");
   const [sources, setSources] = useState<Record<string, Source>>({});
+  const [openKey, setOpenKey] = useState("");
+  const filter = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!sessionKey) return;
@@ -57,10 +62,17 @@ export function Memory({ sessionKey, ensureOpen }: { sessionKey: string | null; 
     }
   }
 
+  // Opening a memory shows where it came from; that is asked for once and kept.
+  function show(entry: Entry) {
+    setForgetting("");
+    setOpenKey(keyOf(entry));
+    void source(entry);
+  }
+
   async function source(entry: Entry) {
     if (!sessionKey) return;
-    const key = `${entry.scope}:${entry.name}`;
-    if (sources[key]) return setSources(({ [key]: _, ...rest }) => rest);
+    const key = keyOf(entry);
+    if (sources[key]) return;
     try {
       const found = (await api.liveCall(sessionKey, "memory.provenance", { scope: entry.scope, name: entry.name })) as Source;
       setSources((all) => ({ ...all, [key]: found }));
@@ -72,20 +84,21 @@ export function Memory({ sessionKey, ensureOpen }: { sessionKey: string | null; 
   if (!sessionKey) return <p className="quiet">Open a chat to see what Medha remembers.</p>;
   const needle = query.toLowerCase();
   const shown = (entries ?? []).filter((entry) => `${entry.name} ${entry.claim} ${entry.description}`.toLowerCase().includes(needle));
+  const open = entries?.find((entry) => keyOf(entry) === openKey);
+  const found = sources[openKey];
   const groups = [
     { title: "This project", rows: shown.filter((entry) => entry.scope === "project") },
     { title: "Everywhere", rows: shown.filter((entry) => entry.scope === "user") },
   ];
   return (
     <div className="memory-page">
-      <div className="page-heading">
-        <div>
-          <h2>Memory</h2>
-          <p>What Medha keeps between chats. Pinned memories are always included. Changes apply from the next chat.</p>
-        </div>
-      </div>
+      <PageTop title="Memory">
+        What Medha keeps between chats. Pinned memories are always included. Changes apply from the next chat.
+      </PageTop>
       {entries && entries.length > 8 && (
-        <input className="filter-input" placeholder="Filter memories" value={query} onChange={(event) => setQuery(event.target.value)} />
+        <ViewBar>
+          <Find box={filter} label="Find a memory" value={query} onChange={setQuery} />
+        </ViewBar>
       )}
       {error && <p className="surface-error" role="alert">{error}</p>}
       {!entries && !error && <p className="quiet">Reading memory…</p>}
@@ -93,57 +106,80 @@ export function Memory({ sessionKey, ensureOpen }: { sessionKey: string | null; 
       {groups.map(
         (group) =>
           group.rows.length > 0 && (
-            <section key={group.title} className="memory-group">
-              <h3>{group.title}</h3>
-              <ul>
+            <section key={group.title} className="ix-group">
+              <h3>
+                {group.title} <span>{group.rows.length}</span>
+              </h3>
+              <div className="ix">
                 {group.rows.map((entry) => {
-                  const key = `${entry.scope}:${entry.name}`;
-                  const found = sources[key];
+                  const key = keyOf(entry);
                   return (
-                    <li key={key}>
-                      <div className="memory-main">
-                        <p>{entry.claim}</p>
-                        <small>
-                          {entry.pinned && <span className="memory-pin"><Icon name="check" />Pinned · </span>}
-                          {words(entry.kind)} · {words(entry.confidence)} · from {entry.sessions} {entry.sessions === 1 ? "chat" : "chats"}
-                        </small>
-                        {found && (
-                          <blockquote className="memory-source">
-                            {found.session ? (
-                              <>
-                                <span>{found.excerpt || "No text recorded for this step."}</span>
-                                {found.ts && <small>{new Date(found.ts * 1000).toLocaleString()}</small>}
-                              </>
-                            ) : (
-                              <span>The chat this came from is no longer in this project’s history.</span>
-                            )}
-                          </blockquote>
-                        )}
-                      </div>
-                      <div className="memory-actions">
-                        <button className="link-btn" onClick={() => void source(entry)}>
-                          {found ? "Hide source" : "Where it came from"}
-                        </button>
-                        <button className="link-btn" disabled={busy === key} onClick={() => void change(entry, "memory.pin")}>
-                          {entry.pinned ? "Unpin" : "Pin"}
-                        </button>
-                        {forgetting === key ? (
-                          <>
-                            <button className="link-btn" onClick={() => setForgetting("")}>Keep</button>
-                            <button className="link-btn danger" disabled={busy === key} onClick={() => void change(entry, "memory.forget")}>
-                              Forget
-                            </button>
-                          </>
-                        ) : (
-                          <button className="link-btn" onClick={() => setForgetting(key)}>Forget</button>
-                        )}
-                      </div>
-                    </li>
+                    <div className="ix-row" key={key}>
+                      <button className="ix-main whole" onClick={() => show(entry)}>
+                        <span className="ix-sum lead">{entry.claim}</span>
+                      </button>
+                      {entry.pinned && <span className="ix-chip gold">Pinned</span>}
+                      <small className="ix-note">
+                        from {entry.sessions} {entry.sessions === 1 ? "chat" : "chats"}
+                      </small>
+                    </div>
                   );
                 })}
-              </ul>
+              </div>
             </section>
           ),
+      )}
+      {open && (
+        <Sheet label={open.claim} onClose={() => setOpenKey("")}>
+          <div className="sheet-title">
+            <h2 className="claim">{open.claim}</h2>
+          </div>
+          {open.description && <p className="sheet-more">{open.description}</p>}
+          <dl className="sheet-facts">
+            <dt>Kept for</dt>
+            <dd>{open.scope === "project" ? "This project" : "Every project"}</dd>
+            <dt>Kind</dt>
+            <dd>{sentence(words(open.kind))}</dd>
+            <dt>Confidence</dt>
+            <dd>{sentence(words(open.confidence))}</dd>
+            <dt>Seen in</dt>
+            <dd>
+              {open.sessions} {open.sessions === 1 ? "chat" : "chats"}
+            </dd>
+            <dt>Always used</dt>
+            <dd>{open.pinned ? "Yes, it is pinned" : "No, only when it is relevant"}</dd>
+          </dl>
+          <h3 className="sheet-h">Where it came from</h3>
+          {found ? (
+            <blockquote className="memory-source">
+              {found.session ? (
+                <>
+                  <span>{found.excerpt || "No text recorded for this step."}</span>
+                  {found.ts && <small>{new Date(found.ts * 1000).toLocaleString()}</small>}
+                </>
+              ) : (
+                <span>The chat this came from is no longer in this project’s history.</span>
+              )}
+            </blockquote>
+          ) : (
+            <p className="quiet">Looking it up…</p>
+          )}
+          <div className="sheet-actions">
+            <button className="btn-gold" disabled={busy === openKey} onClick={() => void change(open, "memory.pin")}>
+              {open.pinned ? "Unpin" : "Pin"}
+            </button>
+            {forgetting === openKey ? (
+              <>
+                <button className="btn-line" onClick={() => setForgetting("")}>Keep</button>
+                <button className="btn-line danger" disabled={busy === openKey} onClick={() => void change(open, "memory.forget")}>
+                  Forget it
+                </button>
+              </>
+            ) : (
+              <button className="sheet-quiet" onClick={() => setForgetting(openKey)}>Forget</button>
+            )}
+          </div>
+        </Sheet>
       )}
     </div>
   );

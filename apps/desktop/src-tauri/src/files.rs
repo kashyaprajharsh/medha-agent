@@ -73,11 +73,15 @@ pub fn read(root: &Path, requested: &str) -> Result<Value, String> {
         "pdf" => "pdf",
         "docx" => "document",
         "xlsx" => "spreadsheet",
+        "pptx" => "slides",
         "csv" | "tsv" => "table",
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => "image",
         _ => "text",
     };
-    let binary = matches!(kind, "pdf" | "document" | "spreadsheet" | "image");
+    let binary = matches!(
+        kind,
+        "pdf" | "document" | "spreadsheet" | "slides" | "image"
+    );
     let limit = if binary { MAX_BINARY } else { MAX_TEXT };
     if metadata.len() > limit {
         return Err(format!(

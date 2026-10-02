@@ -27,6 +27,7 @@ import { WorkSurface, type SurfaceTab } from "./WorkSurface";
 import { OutputScope } from "./OutputScope";
 import { toBlocks, type SubagentRun } from "./timeline";
 import { Transcript } from "./Transcript";
+import { UpdateReady } from "./UpdateReady";
 import { useLive } from "./useLive";
 import { Starters, Welcome } from "./Welcome";
 import { WorkspaceMenu } from "./WorkspaceMenu";
@@ -775,6 +776,7 @@ export function App() {
         onExtensions={() => setPage("extensions")}
         onSettings={() => setPage("settings")}
         page={page}
+        notice={<UpdateReady busy={runningSessions.size > 0} />}
         workspaceName={folder}
         onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
       />

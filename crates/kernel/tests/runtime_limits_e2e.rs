@@ -461,18 +461,20 @@ async fn failed_turns_resume_without_readmitting_prompts_or_losing_completed_wor
             )
             .await
             .unwrap();
-        let requests = provider.requests.lock().unwrap();
-        let resumed = &requests.last().unwrap().messages;
-        assert_eq!(resumed.iter().filter(|m| m.content == "go").count(), 2);
-        assert_eq!(
-            resumed.iter().any(|m| m.role == kernel::Role::Tool),
-            completed_work
-        );
+        // The lock is let go before the log is read: it must not be held across an await.
+        {
+            let requests = provider.requests.lock().unwrap();
+            let resumed = &requests.last().unwrap().messages;
+            assert_eq!(resumed.iter().filter(|m| m.content == "go").count(), 2);
+            assert_eq!(
+                resumed.iter().any(|m| m.role == kernel::Role::Tool),
+                completed_work
+            );
+        }
         assert_eq!(
             executor.starts.load(Ordering::SeqCst),
             usize::from(completed_work)
         );
-        drop(requests);
         let events = kernel.log.events(session.id).await;
         assert_eq!(
             events

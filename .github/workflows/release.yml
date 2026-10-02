@@ -51,6 +51,14 @@ jobs:
           sha="$(git rev-parse HEAD)"
           tag="v$version"
 
+          # The desktop app ships under the same tag, so it carries the same version.
+          shell_version="$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' apps/desktop/src-tauri/Cargo.toml | head -1)"
+          bundle_version="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' apps/desktop/src-tauri/tauri.conf.json | head -1)"
+          if [ "$shell_version" != "$version" ] || [ "$bundle_version" != "$version" ]; then
+            echo "desktop version ($shell_version, bundle $bundle_version) does not match workspace version $version" >&2
+            exit 1
+          fi
+
           if [ "$RELEASE_PUBLISH" = "true" ]; then
             # OIDC provenance describes the invoking ref, not a later checkout.
             if [ "$GITHUB_SHA" != "$sha" ]; then
@@ -78,6 +86,11 @@ jobs:
               || { echo "release tag does not exist: $tag" >&2; exit 1; }
             if [ "$sha" != "$tag_sha" ]; then
               echo "$tag points at $tag_sha, not checked-out SHA $sha" >&2
+              exit 1
+            fi
+            # An app shipped without its key could never accept an update.
+            if grep -Eq '"pubkey": *""' apps/desktop/src-tauri/tauri.conf.json; then
+              echo "the desktop app has no update public key in tauri.conf.json" >&2
               exit 1
             fi
           fi
@@ -177,8 +190,123 @@ jobs:
             medha-${{ matrix.target }}.zip*
           if-no-files-found: error
 
+  # The desktop app, with the `medha` program for the same target bundled inside.
+  desktop:
+    name: desktop ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+          - os: macos-15
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - os: macos-15
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+    # The update signing key lives in this environment, so its reviewers decide who may sign.
+    environment: ${{ (github.event_name == 'push' || inputs.publish) && 'release' || '' }}
+    defaults:
+      run:
+        working-directory: apps/desktop
+    env:
+      MEDHA_DESKTOP_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - id: toolchain
+        shell: bash
+        working-directory: .
+        run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libdbus-1-dev patchelf pkg-config file
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: desktop-${{ matrix.target }}
+          workspaces: |
+            .
+            apps/desktop/src-tauri
+
+      - run: npm ci
+
+      # Builds the window and the bundled program first, as tauri.conf.json says.
+      - name: Build
+        if: env.RELEASE_PUBLISH != 'true'
+        run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      # A published build also makes the files installed copies update from, signed
+      # with the key whose public half is built into the app.
+      - name: Build and sign updates
+        if: env.RELEASE_PUBLISH == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: >-
+          npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          --config src-tauri/tauri.updates.conf.json
+
+      # One flat folder of installers, each named for its target, with its checksum
+      # and, when signed, its update signature.
+      - name: Collect installers
+        shell: bash
+        run: |
+          bundle="src-tauri/target/${{ matrix.target }}/release/bundle"
+          stem="out/medha-desktop-${{ matrix.target }}"
+          mkdir -p out
+          keep() {
+            [ -f "$1" ] || return 0
+            cp "$1" "$stem.$2"
+            if [ -f "$1.sig" ]; then cp "$1.sig" "$stem.$2.sig"; fi
+          }
+          for file in "$bundle"/dmg/*.dmg; do keep "$file" dmg; done
+          for file in "$bundle"/macos/*.app.tar.gz; do keep "$file" app.tar.gz; done
+          for file in "$bundle"/deb/*.deb; do keep "$file" deb; done
+          for file in "$bundle"/appimage/*.AppImage; do keep "$file" AppImage; done
+          for file in "$bundle"/nsis/*-setup.exe; do keep "$file" exe; done
+          cd out
+          [ -n "$(ls)" ] || { echo "no installer was built" >&2; exit 1; }
+          for file in *; do
+            case "$file" in *.sig) continue ;; esac
+            if command -v shasum >/dev/null; then shasum -a 256 "$file" > "$file.sha256"
+            else sha256sum "$file" > "$file.sha256"; fi
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: medha-desktop-${{ matrix.target }}
+          path: apps/desktop/out/*
+          if-no-files-found: error
+
   release:
-    needs: [validate, ci, build]
+    needs: [validate, ci, build, desktop]
     if: ${{ (github.event_name == 'push' || inputs.publish) && needs.ci.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -201,6 +329,13 @@ jobs:
       - name: Stage installers
         run: cp install.sh install.ps1 dist/
 
+      # What an installed desktop app reads to learn of this release: where each
+      # platform's update is and the signature it must carry.
+      - name: Describe the desktop update
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: sh apps/desktop/scripts/describe-update.sh dist "$TAG"
+
       # Commit-pinned action; OIDC uses a short-lived Sigstore certificate.
       - name: Attest release provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
@@ -208,6 +343,11 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.dmg
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.exe
+            dist/latest.json
             dist/*.sha256
             dist/install.sh
             dist/install.ps1

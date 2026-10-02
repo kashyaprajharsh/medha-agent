@@ -7,6 +7,7 @@ mod outputs;
 mod service;
 mod sleep;
 mod terminal;
+mod update;
 mod view;
 mod workspaces;
 
@@ -475,6 +476,8 @@ async fn image_admit(request: tauri::ipc::Request<'_>) -> Result<Value, String> 
 fn main() {
     let explicit = workspaces::explicit_workspace();
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(update::Updates::default())
         .setup(move |app| {
             app.manage(DesktopState {
                 workspaces: Arc::new(
@@ -526,7 +529,9 @@ fn main() {
             outputs::screen_kept,
             outputs::media_link,
             outputs::file_reveal,
-            outputs::output_save
+            outputs::output_save,
+            update::update_check,
+            update::update_apply
         ])
         .run(tauri::generate_context!())
         .expect("Medha desktop failed to open");

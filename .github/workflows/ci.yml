@@ -143,3 +143,82 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
+
+  # The desktop app has its own dependency graph: a window in TypeScript and a
+  # shell in Rust that bundles the `medha` program. Each host OS builds and tests both.
+  desktop:
+    name: desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+
+      - name: Read pinned toolchain
+        id: toolchain
+        shell: bash
+        working-directory: .
+        run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy
+
+      # actions/setup-node v4.4.0, pinned to its commit.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      # The webview and tray libraries the shell links against, and D-Bus for the keyring.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libdbus-1-dev patchelf pkg-config
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: desktop-${{ matrix.os }}
+          workspaces: |
+            .
+            apps/desktop/src-tauri
+
+      - name: Install window dependencies
+        run: npm ci
+
+      # The shell embeds the built window and checks the bundled program exists,
+      # so both come before anything in Rust is compiled.
+      - name: Build the window
+        run: npm run build
+
+      - name: Test the window
+        run: npm test
+
+      - name: Build the bundled program
+        run: npm run prepare:backend
+
+      - name: Format
+        working-directory: apps/desktop/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test the shell
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked

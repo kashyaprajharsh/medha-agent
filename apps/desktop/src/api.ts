@@ -185,6 +185,8 @@ export const desktop = {
   workspaces: () =>
     invoke<{ initial: string; workspaces: Workspace[] }>("workspace_list"),
   chooseWorkspace: () => invoke<Workspace | null>("workspace_choose"),
+  updateCheck: () => invoke<{ version: string } | null>("update_check"),
+  updateApply: () => invoke<void>("update_apply"),
 };
 export type Scope = { chatKey: string | null; sessionId: string | null };
 export function createApi(workspaceId: string, getScope: () => Scope) {

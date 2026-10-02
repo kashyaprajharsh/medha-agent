@@ -7,15 +7,18 @@ const desktop = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const root = resolve(desktop, "../..");
 const release = process.argv.includes("--release");
 const profile = release ? "release" : "debug";
-const target = execFileSync("rustc", ["--print", "host-tuple"], { encoding: "utf8" }).trim();
-const suffix = process.platform === "win32" ? ".exe" : "";
+// A release for another architecture names its target; everything else builds for this machine.
+const cross = process.env.MEDHA_DESKTOP_TARGET;
+const target = cross || execFileSync("rustc", ["--print", "host-tuple"], { encoding: "utf8" }).trim();
+const suffix = target.includes("windows") ? ".exe" : "";
 
-execFileSync("cargo", ["build", "-p", "medha-cli", ...(release ? ["--release"] : [])], {
-  cwd: root,
-  stdio: "inherit",
-});
+execFileSync(
+  "cargo",
+  ["build", "-p", "medha-cli", "--locked", ...(release ? ["--release"] : []), ...(cross ? ["--target", cross] : [])],
+  { cwd: root, stdio: "inherit" },
+);
 
 const destination = join(desktop, "src-tauri", "binaries", `medha-${target}${suffix}`);
 mkdirSync(dirname(destination), { recursive: true });
-copyFileSync(join(root, "target", profile, `medha${suffix}`), destination);
+copyFileSync(join(root, "target", ...(cross ? [cross] : []), profile, `medha${suffix}`), destination);
 console.log(`Prepared Medha backend: ${destination}`);

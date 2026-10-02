@@ -39,7 +39,7 @@ sha2 = "0.10"
 fd-lock = "4"
 
 [dev-dependencies]
-test-support = { path = "../test-support" }
+test-support = { version = "0.1.8", path = "../test-support" }
 tokio-util = { version = "0.7" }
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -30,6 +30,15 @@
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data: blob:; font-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self' http://127.0.0.1:1420 medha-view: http://medha-view.localhost; media-src medha-view: http://medha-view.localhost; frame-src medha-view: http://medha-view.localhost"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENBQTNGNTUxOTIwOTU4MzgKUldRNFdBbVNVZldqeXNwVHNKSURMSGNDaUp2YmlucUI4R1pUS2NqREVzZ0lKcUFGRjJPS0RSL3UK",
+      "endpoints": [
+        "https://github.com/kashyaprajharsh/medha-agent/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true
+    }
+  },
   "bundle": {
     "active": true,
     "externalBin": [

@@ -5,13 +5,17 @@ on:
     branches: [main, master]
     paths:
       - "**/Cargo.toml"
-      - Cargo.lock
+      - "**/Cargo.lock"
+      - "apps/desktop/package.json"
+      - "apps/desktop/package-lock.json"
       - deny.toml
       - ".github/workflows/**"
   pull_request:
     paths:
       - "**/Cargo.toml"
-      - Cargo.lock
+      - "**/Cargo.lock"
+      - "apps/desktop/package.json"
+      - "apps/desktop/package-lock.json"
       - deny.toml
       - ".github/workflows/**"
   schedule:
@@ -54,3 +58,31 @@ jobs:
 
       - name: Licenses, dependency bans, and sources
         run: cargo deny --all-features check licenses bans sources
+
+      # The desktop shell resolves its own lockfile, so the same policy is run on it.
+      - name: Desktop shell advisories and yanked crates
+        run: >-
+          cargo deny --manifest-path apps/desktop/src-tauri/Cargo.toml --config deny.toml
+          --all-features check advisories
+
+      - name: Desktop shell licenses, dependency bans, and sources
+        run: >-
+          cargo deny --manifest-path apps/desktop/src-tauri/Cargo.toml --config deny.toml
+          --all-features check licenses bans sources
+
+  # What ships inside the desktop window: the packages it runs, not the tools that build it.
+  desktop-window:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+
+      - name: Known vulnerabilities in shipped packages
+        working-directory: apps/desktop
+        run: npm audit --omit=dev --audit-level=moderate

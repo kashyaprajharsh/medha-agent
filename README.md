@@ -34,6 +34,32 @@ It runs on whatever model you have — a local Ollama or vLLM server, a hosted g
 
 ## Install
 
+### Desktop app
+
+The whole of Medha in one window: your chats, the apps it connects to, a terminal, and the pages and diagrams it makes, shown beside the conversation. Everything is inside the app, so there is nothing else to install.
+
+| | Download |
+| --- | --- |
+| **Mac** (Apple silicon) | [Medha for Mac](https://github.com/kashyaprajharsh/medha-agent/releases/latest/download/medha-desktop-aarch64-apple-darwin.dmg) |
+| **Mac** (Intel) | [Medha for Intel Mac](https://github.com/kashyaprajharsh/medha-agent/releases/latest/download/medha-desktop-x86_64-apple-darwin.dmg) |
+| **Windows** | [Medha for Windows](https://github.com/kashyaprajharsh/medha-agent/releases/latest/download/medha-desktop-x86_64-pc-windows-msvc.exe) |
+| **Linux** | [AppImage](https://github.com/kashyaprajharsh/medha-agent/releases/latest/download/medha-desktop-x86_64-unknown-linux-gnu.AppImage) or [.deb](https://github.com/kashyaprajharsh/medha-agent/releases/latest/download/medha-desktop-x86_64-unknown-linux-gnu.deb) |
+
+Open the file and Medha is ready, and from then on it keeps itself up to date: a new version is fetched in the background and starts when you choose Restart. The first time, macOS asks you to right-click the app and choose Open, and Windows asks you to choose "More info", then "Run anyway".
+
+<details>
+<summary>Check a download, or build the app from source</summary>
+
+Every installer has a `.sha256` file beside it on the [releases page](https://github.com/kashyaprajharsh/medha-agent/releases/latest) and a signed build-provenance attestation: `gh attestation verify <file> --repo kashyaprajharsh/medha-agent`.
+
+```bash
+cd apps/desktop && npm ci && npx tauri build   # Rust 1.89+ and Node 24
+```
+
+</details>
+
+### Command line
+
 **Linux · macOS · WSL2**
 
 ```bash

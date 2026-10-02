@@ -1,5 +1,5 @@
 import type { Session } from "./api";
-import { useId, useState } from "react";
+import { type ReactNode, useId, useState } from "react";
 import { Icon } from "./Icon";
 
 export const medhaIcon = new URL("./assets/medha-logo.png", import.meta.url)
@@ -11,6 +11,7 @@ type Props = {
   onExtensions: () => void;
   onSettings: () => void;
   page: string;
+  notice?: ReactNode;
   workspaceName: string;
   sessions: Session[];
   subagentCounts: Map<string, number>;
@@ -225,6 +226,7 @@ export function Sidebar(props: Props) {
           </p>
         )}
       </nav>
+      {props.notice}
       <div className="side-sections">
         <button
           className={`side-btn ${props.page === "extensions" ? "active" : ""}`}

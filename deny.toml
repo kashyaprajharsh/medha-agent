@@ -3,10 +3,22 @@
 # reviewed explanation and an expiry/removal condition.
 
 [advisories]
-# All four are `unmaintained` notices (no vulnerability, no exploit path) in
-# transitive dependencies of pinned, widely-used direct deps. Remove each
-# entry when the named parent ships a release that drops the crate.
+# Every entry is an `unmaintained` notice (no vulnerability, no exploit path) in
+# a transitive dependency of a pinned, widely-used direct dep. Remove each
+# entry when the named parent ships a release that drops the crate. The same
+# policy checks the desktop shell's own graph, so an entry that belongs to one
+# graph is reported as not encountered in the other.
 ignore = [
+    # Desktop shell: the unic-* Unicode tables via tauri-utils → urlpattern.
+    # Drop when urlpattern moves to a maintained Unicode crate.
+    "RUSTSEC-2025-0075",
+    "RUSTSEC-2025-0080",
+    "RUSTSEC-2025-0081",
+    "RUSTSEC-2025-0098",
+    "RUSTSEC-2025-0100",
+    # Desktop shell, Linux only: proc-macro-error via the GTK 3 bindings the
+    # webview links against. Drop when Tauri moves to GTK 4.
+    "RUSTSEC-2024-0370",
     # bincode 1.x via syntect (syntax highlighting). Drop when syntect
     # migrates off bincode 1.
     "RUSTSEC-2025-0141",

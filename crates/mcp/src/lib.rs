@@ -1552,10 +1552,12 @@ impl McpManager {
                 slot.proven = true;
                 slot.failures = 0;
             }
-            Ok(Err(_)) if let Some(needs) = lapse.and_then(|lapse| lapse.get()) => {
-                self.withdraw(server_id, generation, needs).await;
-            }
             outcome => {
+                let refused = matches!(outcome, Ok(Err(_)));
+                if let Some(needs) = lapse.filter(|_| refused).and_then(|lapse| lapse.get()) {
+                    self.withdraw(server_id, generation, needs).await;
+                    return;
+                }
                 let detail = match outcome {
                     Ok(Err(error)) => error.to_string(),
                     _ => "tools/list timed out".to_string(),

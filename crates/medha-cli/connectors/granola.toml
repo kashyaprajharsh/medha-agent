@@ -1,0 +1,8 @@
+id = "granola"
+name = "Granola"
+category = "productivity"
+description = "Your meeting notes and transcripts."
+url = "https://mcp.granola.ai/mcp"
+sign_in = "oauth"
+source = "https://docs.granola.ai/help-center/sharing/integrations/mcp"
+asks = ["What did we decide in yesterday's planning meeting?", "List the action items I took on this week", "What has the team said about the pricing change?"]

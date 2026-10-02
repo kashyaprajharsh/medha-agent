@@ -1,0 +1,9 @@
+id = "apify"
+name = "Apify"
+category = "search"
+description = "Ready-made scrapers that collect data from websites."
+url = "https://mcp.apify.com"
+sign_in = "oauth"
+source = "https://docs.apify.com/platform/integrations/mcp"
+asks = ["Find a scraper for product pages and run it on this URL", "Collect the reviews for this app", "Show the results of my last run"]
+detect = ["npm:apify", "npm:apify-client", "pypi:apify-client"]

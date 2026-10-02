@@ -1,0 +1,9 @@
+id = "posthog"
+name = "PostHog"
+category = "analytics"
+description = "Product analytics, feature flags and error tracking."
+url = "https://mcp.posthog.com/mcp"
+sign_in = "oauth"
+source = "https://posthog.com/docs/model-context-protocol"
+asks = ["How many people finished onboarding this week?", "Which feature flags are still on for everyone?", "What are the most common errors since the last release?"]
+detect = ["npm:posthog-js", "npm:posthog-node", "pypi:posthog"]

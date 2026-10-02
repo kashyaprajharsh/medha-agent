@@ -1,0 +1,9 @@
+id = "planetscale"
+name = "PlanetScale"
+category = "developer"
+description = "Databases, branches and query insights."
+url = "https://mcp.pscale.dev/mcp/planetscale"
+sign_in = "oauth"
+source = "https://planetscale.com/docs/connect/mcp"
+asks = ["Which queries are slowest on the main branch?", "List my databases and their branches", "What would this schema change touch?"]
+detect = ["npm:@planetscale/database"]

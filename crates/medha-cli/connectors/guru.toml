@@ -1,0 +1,8 @@
+id = "guru"
+name = "Guru"
+category = "productivity"
+description = "Your company's verified knowledge."
+url = "https://mcp.api.getguru.com/mcp"
+sign_in = "oauth"
+source = "https://help.getguru.com/docs/connecting-gurus-mcp-server"
+asks = ["What is our refund policy?", "Find the card on how to rotate API keys", "What do we tell customers about data retention?"]

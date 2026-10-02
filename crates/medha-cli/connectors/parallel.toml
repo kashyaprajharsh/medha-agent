@@ -1,0 +1,8 @@
+id = "parallel"
+name = "Parallel Search"
+category = "search"
+description = "Web search and page reading built for agents."
+url = "https://search-mcp.parallel.ai/mcp"
+sign_in = "oauth"
+source = "https://docs.parallel.ai/integrations/mcp/search-mcp"
+asks = ["Search the web for how others solved this error", "Read these three pages and compare what they say", "What is new in this framework this month?"]

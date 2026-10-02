@@ -1,0 +1,9 @@
+id = "tavily"
+name = "Tavily"
+category = "search"
+description = "Web search, page extraction and site crawling."
+url = "https://mcp.tavily.com/mcp"
+sign_in = "oauth"
+source = "https://docs.tavily.com/documentation/mcp"
+asks = ["Search the web for this error message", "Read this page and pull out the pricing table", "What changed in this library's latest release?"]
+detect = ["npm:@tavily/core", "pypi:tavily-python"]

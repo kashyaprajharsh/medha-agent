@@ -1,0 +1,9 @@
+id = "langchain-docs"
+name = "LangChain Docs"
+category = "developer"
+description = "Current LangChain, LangGraph and LangSmith documentation."
+url = "https://docs.langchain.com/mcp"
+sign_in = "none"
+source = "https://docs.langchain.com/use-these-docs"
+asks = ["How do I add memory to a LangGraph agent?", "Show how to stream tool calls", "How do I trace this chain in LangSmith?"]
+detect = ["npm:langchain", "npm:@langchain/core", "pypi:langchain", "pypi:langgraph"]

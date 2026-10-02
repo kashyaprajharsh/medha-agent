@@ -1,0 +1,8 @@
+id = "lucid"
+name = "Lucid"
+category = "design"
+description = "Lucidchart and Lucidspark documents and diagrams."
+url = "https://mcp.lucid.app/mcp"
+sign_in = "oauth"
+source = "https://help.lucid.co/hc/en-us/articles/42578801807508-Integrate-Lucid-with-AI-tools-using-the-Lucid-MCP-server"
+asks = ["Draw a sequence diagram of this login flow", "Find the architecture diagram for the billing service", "Turn this team list into an org chart"]

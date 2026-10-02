@@ -1,0 +1,8 @@
+id = "gitmcp"
+name = "GitMCP"
+category = "developer"
+description = "Documentation and code from any public GitHub repository."
+url = "https://gitmcp.io/docs"
+sign_in = "none"
+source = "https://gitmcp.io"
+asks = ["How do I configure retries in the axios repository's docs?", "Search the tokio repository for how tasks are spawned", "What does the README of this library say about setup?"]

@@ -1,0 +1,9 @@
+id = "svelte"
+name = "Svelte"
+category = "developer"
+description = "Svelte and SvelteKit documentation, with a checker for your components."
+url = "https://mcp.svelte.dev/mcp"
+sign_in = "none"
+source = "https://svelte.dev/docs/mcp/overview"
+asks = ["Check this component for Svelte 5 mistakes", "How do runes replace stores?", "Show how load functions work in SvelteKit"]
+detect = ["svelte.config.js", "npm:svelte"]

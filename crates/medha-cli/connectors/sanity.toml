@@ -1,0 +1,9 @@
+id = "sanity"
+name = "Sanity"
+category = "developer"
+description = "Content, schemas and releases in your Sanity projects."
+url = "https://mcp.sanity.io"
+sign_in = "oauth"
+source = "https://www.sanity.io/docs/compute-and-ai/mcp-server"
+asks = ["Which documents are still drafts?", "Show the schema for the article type", "Find posts that have no cover image"]
+detect = ["sanity.config.ts", "sanity.config.js", "npm:sanity", "npm:@sanity/client"]

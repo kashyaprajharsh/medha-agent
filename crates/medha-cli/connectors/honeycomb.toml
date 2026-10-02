@@ -1,0 +1,9 @@
+id = "honeycomb"
+name = "Honeycomb"
+category = "developer"
+description = "Traces, queries and alerts from your services."
+url = "https://mcp.honeycomb.io/mcp"
+sign_in = "oauth"
+source = "https://docs.honeycomb.io/integrations/mcp/"
+asks = ["Which endpoint got slower after the last deploy?", "Show the traces behind this error", "Which alerts fired today?"]
+detect = ["npm:@honeycombio/opentelemetry-node", "pypi:honeycomb-opentelemetry"]

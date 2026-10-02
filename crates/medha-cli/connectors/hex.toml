@@ -1,0 +1,8 @@
+id = "hex"
+name = "Hex"
+category = "analytics"
+description = "Questions answered from your data and Hex projects."
+url = "https://app.hex.tech/mcp"
+sign_in = "oauth"
+source = "https://learn.hex.tech/docs/administration/mcp-server"
+asks = ["How did weekly signups change this quarter?", "Find the project that tracks churn", "Which plan brings in the most revenue?"]

@@ -1,0 +1,8 @@
+id = "coda"
+name = "Coda"
+category = "productivity"
+description = "Docs, pages, tables and rows."
+url = "https://coda.io/apis/mcp"
+sign_in = "oauth"
+source = "https://help.coda.io/hc/en-us/articles/44722661982989-Connect-to-the-Coda-MCP"
+asks = ["Summarise the roadmap doc", "Add a row to the bugs table for this failure", "Which rows in the launch tracker are still open?"]

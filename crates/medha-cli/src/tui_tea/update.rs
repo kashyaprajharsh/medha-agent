@@ -6856,9 +6856,9 @@ mod fix_tests {
         assert_eq!(one("confluence"), ConnectorChoice::One("atlassian".into()));
         assert_eq!(one("no such app"), ConnectorChoice::Nothing);
         let ConnectorChoice::Many(postgres) = one("postgres") else {
-            panic!("two apps mention Postgres");
+            panic!("several apps mention Postgres");
         };
-        assert_eq!(postgres.len(), 2);
+        assert!(postgres.len() > 1);
 
         let by_hand = std::collections::BTreeMap::from([(
             "my-linear".to_string(),

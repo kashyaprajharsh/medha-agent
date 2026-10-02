@@ -1,0 +1,9 @@
+id = "javadocs"
+name = "Javadocs"
+category = "developer"
+description = "Javadoc and sources for libraries on Maven Central."
+url = "https://www.javadocs.dev/mcp"
+sign_in = "none"
+source = "https://www.javadocs.dev/"
+asks = ["What is the latest version of Jackson Databind?", "Show the methods on Guava's ImmutableList", "How do I build a request with OkHttp?"]
+detect = ["pom.xml", "build.gradle", "build.gradle.kts"]

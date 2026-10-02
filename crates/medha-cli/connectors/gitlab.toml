@@ -1,0 +1,9 @@
+id = "gitlab"
+name = "GitLab"
+category = "developer"
+description = "Issues, merge requests and pipelines on GitLab.com."
+url = "https://gitlab.com/api/v4/mcp"
+sign_in = "oauth"
+source = "https://docs.gitlab.com/user/gitlab_duo/model_context_protocol/mcp_server/"
+asks = ["Why did the last pipeline on this branch fail?", "Which merge requests are waiting on my review?", "Open an issue for the bug I just found"]
+detect = [".gitlab-ci.yml", "npm:@gitbeaker/rest", "pypi:python-gitlab"]

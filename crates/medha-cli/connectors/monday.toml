@@ -1,0 +1,9 @@
+id = "monday"
+name = "monday.com"
+category = "productivity"
+description = "Boards, items and updates."
+url = "https://mcp.monday.com/mcp"
+sign_in = "oauth"
+source = "https://github.com/mondaycom/mcp"
+asks = ["What's overdue on the launch board?", "Add an item for each task in this plan", "Summarise this week's updates on my items"]
+detect = ["npm:monday-sdk-js"]

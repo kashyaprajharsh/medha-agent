@@ -1,0 +1,9 @@
+id = "contentful"
+name = "Contentful"
+category = "developer"
+description = "Entries, assets and content models in your spaces."
+url = "https://mcp.contentful.com/mcp"
+sign_in = "oauth"
+source = "https://www.contentful.com/developers/docs/tools/mcp-server/"
+asks = ["Which entries changed this week?", "Show the fields on the blog post model", "Find entries that link to a missing asset"]
+detect = ["npm:contentful", "npm:contentful-management", "pypi:contentful"]

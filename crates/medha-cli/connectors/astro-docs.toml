@@ -1,0 +1,9 @@
+id = "astro-docs"
+name = "Astro Docs"
+category = "developer"
+description = "Current Astro documentation."
+url = "https://mcp.docs.astro.build/mcp"
+sign_in = "none"
+source = "https://docs.astro.build/en/guides/build-with-ai/"
+asks = ["How do content collections work in Astro?", "Set up server islands on this page", "What changed in the latest Astro release?"]
+detect = ["astro.config.mjs", "astro.config.ts", "npm:astro"]

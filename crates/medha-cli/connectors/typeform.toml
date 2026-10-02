@@ -1,0 +1,9 @@
+id = "typeform"
+name = "Typeform"
+category = "productivity"
+description = "Forms and the answers people gave."
+url = "https://api.typeform.com/mcp"
+sign_in = "oauth"
+source = "https://www.typeform.com/developers/mcp/"
+asks = ["Summarise the answers to the feedback form", "Draft a short survey about onboarding", "How many people finished the signup form this week?"]
+detect = ["npm:@typeform/embed", "npm:@typeform/api-client"]

@@ -1,0 +1,8 @@
+id = "egnyte"
+name = "Egnyte"
+category = "productivity"
+description = "Files and folders in your company's Egnyte."
+url = "https://mcp-server.egnyte.com/mcp"
+sign_in = "oauth"
+source = "https://developers.egnyte.com/docs/Remote_MCP_Server"
+asks = ["Find the latest signed contract with this customer", "Summarise the documents in the launch folder", "Which files in this folder changed this week?"]

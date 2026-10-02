@@ -1,0 +1,9 @@
+id = "supabase"
+name = "Supabase"
+category = "developer"
+description = "Postgres tables, auth, storage and logs in your projects."
+url = "https://mcp.supabase.com/mcp"
+sign_in = "oauth"
+source = "https://supabase.com/docs/guides/getting-started/mcp"
+asks = ["Which tables have no row level security?", "Show the slowest queries from the last day", "Write a migration that adds an index for this query"]
+detect = ["supabase/config.toml", "npm:@supabase/supabase-js", "pypi:supabase"]

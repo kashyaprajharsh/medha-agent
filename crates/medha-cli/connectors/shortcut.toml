@@ -1,0 +1,8 @@
+id = "shortcut"
+name = "Shortcut"
+category = "productivity"
+description = "Stories, epics and iterations."
+url = "https://mcp.shortcut.com/mcp"
+sign_in = "oauth"
+source = "https://github.com/useshortcut/mcp-server-shortcut"
+asks = ["What's left in the current iteration?", "Write stories for the TODOs in this branch", "Which of my stories are blocked?"]

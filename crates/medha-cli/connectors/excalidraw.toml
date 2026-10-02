@@ -1,0 +1,8 @@
+id = "excalidraw"
+name = "Excalidraw"
+category = "design"
+description = "Hand-drawn diagrams you can open and edit."
+url = "https://mcp.excalidraw.com/mcp"
+sign_in = "none"
+source = "https://github.com/excalidraw/excalidraw-mcp"
+asks = ["Sketch how a request moves through this service", "Draw the tables in this schema and how they join", "Turn this plan into a whiteboard diagram"]

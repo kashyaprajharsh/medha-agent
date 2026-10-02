@@ -1,0 +1,8 @@
+id = "fathom"
+name = "Fathom"
+category = "productivity"
+description = "Recorded meetings, summaries and transcripts."
+url = "https://api.fathom.ai/mcp"
+sign_in = "oauth"
+source = "https://developers.fathom.ai/mcp"
+asks = ["What did the customer ask for on today's call?", "List the follow-ups from this week's meetings", "Find where we talked about the renewal"]

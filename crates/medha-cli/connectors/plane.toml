@@ -1,0 +1,8 @@
+id = "plane"
+name = "Plane"
+category = "productivity"
+description = "Work items, cycles and modules."
+url = "https://mcp.plane.so/http/mcp"
+sign_in = "oauth"
+source = "https://developers.plane.so/dev-tools/mcp-server"
+asks = ["What's open in the current cycle?", "Add work items for the bugs I found today", "Which work items changed since yesterday?"]

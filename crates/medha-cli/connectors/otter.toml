@@ -1,0 +1,8 @@
+id = "otter"
+name = "Otter.ai"
+category = "productivity"
+description = "Meeting transcripts, summaries and action items."
+url = "https://mcp.otter.ai/mcp"
+sign_in = "oauth"
+source = "https://help.otter.ai/hc/en-us/articles/35287607569687-Otter-MCP-Server"
+asks = ["What were the action items from my last meeting?", "Find the meeting where we discussed the migration", "Summarise this week's customer calls"]

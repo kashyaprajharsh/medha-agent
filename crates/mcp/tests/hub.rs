@@ -495,6 +495,18 @@ fn offered(chat: &McpManager, server: &str) -> bool {
         .any(|spec| spec.name.starts_with(&prefix))
 }
 
+fn tool_offered(chat: &McpManager, tool: &str) -> bool {
+    chat.tool_specs().iter().any(|spec| spec.name == tool)
+}
+
+async fn tool_settles(chat: &McpManager, tool: &str, want: bool) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tool_offered(chat, tool) != want && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tool_offered(chat, tool) == want
+}
+
 async fn settles(chat: &McpManager, server: &str, want: bool) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while offered(chat, server) != want && tokio::time::Instant::now() < deadline {
@@ -579,9 +591,19 @@ async fn a_tool_switched_off_leaves_an_open_chat_while_its_server_stays_on() {
         ..hosted(&url)
     };
     host.reconcile(vec![ping_off], &HashSet::new()).await;
+    // The server's other tool stays offered, so the wait is for `ping` alone: a wait for
+    // every tool to leave only passes in the moment the server is being replaced.
     assert!(
-        settles(&chat, "hosted", false).await,
+        tool_settles(&chat, "mcp__hosted__ping", false).await,
         "a tool switched off still reached the model"
+    );
+    assert!(
+        tool_settles(&chat, "mcp__hosted__draw", true).await,
+        "switching one tool off took its neighbour with it"
+    );
+    assert!(
+        !tool_offered(&chat, "mcp__hosted__ping"),
+        "the switched-off tool came back with its server"
     );
     assert_eq!(
         reaches(&chat, "hosted", ServerState::Ready).await,

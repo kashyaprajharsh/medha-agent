@@ -127,7 +127,7 @@ step "downloading medha $VERSION  ($TARGET)"
 fetch_to "$URL" "$tmp/$ASSET" || die "download failed: $URL
 This platform may not have a published build for $VERSION."
 
-# Older releases may omit checksums; all failures except a precise 404 fail closed.
+# Every release publishes a checksum beside each archive; a missing or unreadable one fails closed.
 checksum_status=0
 fetch_optional_to "$URL.sha256" "$tmp/$ASSET.sha256" || checksum_status=$?
 case "$checksum_status" in
@@ -154,7 +154,7 @@ case "$checksum_status" in
     [ "$expected" = "$actual" ] || die "checksum mismatch -- refusing to install"
     ok "checksum verified"
     ;;
-  2) note "no checksum published for this release; continuing without one" ;;
+  2) die "no checksum published at $URL.sha256 -- refusing an unverifiable install" ;;
   *) die "checksum download failed: $URL.sha256 -- refusing an unverifiable install" ;;
 esac
 

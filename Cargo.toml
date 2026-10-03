@@ -9,6 +9,7 @@ members = [
 [workspace.package]
 edition = "2024"
 version = "0.1.8"
+publish = false
 license = "Apache-2.0"
 rust-version = "1.89"
 
@@ -25,7 +26,7 @@ thiserror = "2"
 anyhow = "1"
 
 # Local crates
-kernel = { version = "0.1.8", path = "crates/kernel" }
-providers = { version = "0.1.8", path = "crates/providers" }
-context = { version = "0.1.8", path = "crates/context" }
-media = { version = "0.1.8", path = "crates/media" }
+kernel = { path = "crates/kernel" }
+providers = { path = "crates/providers" }
+context = { path = "crates/context" }
+media = { path = "crates/media" }

@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Medha",
-  "version": "0.1.8",
   "identifier": "app.medha.desktop",
   "build": {
     "beforeDevCommand": "npm run prepare:backend && npm run dev",
@@ -34,7 +33,8 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENBQTNGNTUxOTIwOTU4MzgKUldRNFdBbVNVZldqeXNwVHNKSURMSGNDaUp2YmlucUI4R1pUS2NqREVzZ0lKcUFGRjJPS0RSL3UK",
       "endpoints": [
-        "https://github.com/kashyaprajharsh/medha-agent/releases/latest/download/latest.json"
+        "https://github.com/kashyaprajharsh/medha-agent/releases/latest/download/latest.json",
+        "https://medha.manojavamlabs.com/latest.json"
       ],
       "requireSignedVersion": true
     }

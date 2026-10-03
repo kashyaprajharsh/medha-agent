@@ -1,6 +1,7 @@
 [package]
 name = "medha-cli"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -13,18 +14,18 @@ path = "src/main.rs"
 kernel.workspace = true
 providers.workspace = true
 context.workspace = true
-tools = { version = "0.1.8", path = "../tools" }
-memory = { version = "0.1.8", path = "../memory" }
-sandbox = { version = "0.1.8", path = "../sandbox" }
-store = { version = "0.1.8", path = "../store" }
+tools = { path = "../tools" }
+memory = { path = "../memory" }
+sandbox = { path = "../sandbox" }
+store = { path = "../store" }
 ulid.workspace = true
-policy = { version = "0.1.8", path = "../policy" }
-lockfile = { version = "0.1.8", path = "../lockfile" }
-lsp = { version = "0.1.8", path = "../lsp" }
-mcp = { version = "0.1.8", path = "../mcp" }
-orchestrator = { version = "0.1.8", path = "../orchestrator" }
-extensions = { version = "0.1.8", path = "../extensions" }
-gate = { version = "0.1.8", path = "../gate" }
+policy = { path = "../policy" }
+lockfile = { path = "../lockfile" }
+lsp = { path = "../lsp" }
+mcp = { path = "../mcp" }
+orchestrator = { path = "../orchestrator" }
+extensions = { path = "../extensions" }
+gate = { path = "../gate" }
 tokio = { workspace = true, features = ["process", "io-std", "io-util"] }
 tokio-util = { version = "0.7" }
 serde.workspace = true
@@ -47,7 +48,7 @@ ratatui = "0.30"
 # ratatui rendering so tables, code fences, and colors match the medha theme and
 # adapt to light/dark — no off-the-shelf renderer fits that + our virtualized scroll.
 pulldown-cmark = { version = "0.13", default-features = false }
-transcript-view = { version = "0.1.8", path = "../transcript-view" }
+transcript-view = { path = "../transcript-view" }
 # Code-fence syntax highlighting (same crate bat/delta/mdcat use). `default-fancy`
 # keeps it pure-Rust (fancy-regex, no Oniguruma C dependency).
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
@@ -81,5 +82,5 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [dev-dependencies]
-test-support = { version = "0.1.8", path = "../test-support" }
+test-support = { path = "../test-support" }
 flate2 = "1"

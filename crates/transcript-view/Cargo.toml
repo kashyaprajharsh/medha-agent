@@ -2,6 +2,7 @@
 name = "transcript-view"
 description = "What Medha's desktop transcript may show: safe Markdown and tool targets"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

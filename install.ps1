@@ -9,31 +9,6 @@
 
 $ErrorActionPreference = 'Stop'
 
-function Find-HttpStatusCode {
-    param([AllowNull()][object] $Exception)
-
-    # PowerShell 5 and 7 expose HTTP status on different exceptions.
-    $current = $Exception
-    for ($depth = 0; ($depth -lt 16) -and ($null -ne $current); $depth++) {
-        foreach ($candidate in @($current.StatusCode, $current.Response.StatusCode)) {
-            if ($null -ne $candidate) {
-                try {
-                    return [int] $candidate
-                } catch {
-                }
-            }
-        }
-        $current = $current.InnerException
-    }
-    return $null
-}
-
-function Get-HttpStatusCode {
-    param([System.Management.Automation.ErrorRecord] $ErrorRecord)
-
-    return (Find-HttpStatusCode $ErrorRecord.Exception)
-}
-
 function Get-ChecksumDigest {
     param([Parameter(Mandatory = $true)][string] $Path)
 
@@ -221,28 +196,19 @@ try {
         throw "Download failed: $Url`nThis platform may not have a published build for $Version."
     }
 
-    # Only a precise 404 may continue without a checksum.
+    # Every release publishes a checksum beside each archive; a missing or unreadable one fails closed.
     $sumFile = "$archive.sha256"
-    $checksumMissing = $false
     try {
         Invoke-WebRequest -Uri "$Url.sha256" -OutFile $sumFile @WebArgs
     } catch {
-        $status = Get-HttpStatusCode $_
-        if ($status -eq 404) {
-            $checksumMissing = $true
-            Write-Note 'no checksum published for this release; continuing without one'
-        } else {
-            throw "Checksum download failed: $Url.sha256 - refusing an unverifiable install. $($_.Exception.Message)"
-        }
+        throw "Checksum download failed: $Url.sha256 - refusing an unverifiable install. $($_.Exception.Message)"
     }
-    if (-not $checksumMissing) {
-        $expected = Get-ChecksumDigest $sumFile
-        $actual   = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($expected -cne $actual) {
-            throw "Checksum mismatch - refusing to install."
-        }
-        Write-Ok 'checksum verified'
+    $expected = Get-ChecksumDigest $sumFile
+    $actual   = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($expected -cne $actual) {
+        throw "Checksum mismatch - refusing to install."
     }
+    Write-Ok 'checksum verified'
 
     $binary = Join-Path $Tmp 'medha.exe'
     Expand-ValidatedMedhaArchive -Archive $archive -Output $binary

@@ -2,13 +2,14 @@
 name = "lockfile"
 edition.workspace = true
 version.workspace = true
+publish.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 kernel.workspace = true
 context.workspace = true
-sandbox = { version = "0.1.8", path = "../sandbox" }
+sandbox = { path = "../sandbox" }
 serde.workspace = true
 thiserror.workspace = true
 toml = "0.8"

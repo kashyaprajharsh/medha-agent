@@ -61,6 +61,9 @@ registries = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Our own crates are never published (publish = false), so their path dependencies carry no
+# version; every dependency from a registry must still name one.
+allow-wildcard-paths = true
 highlight = "all"
 skip = []
 skip-tree = []

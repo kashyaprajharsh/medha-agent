@@ -367,7 +367,8 @@ fn unix_installer_verifies_and_rejects_ambiguous_or_unsafe_inputs() {
         let case = TempDir::new().unwrap();
         let archive = case.path().join(format!("{name}.tar.gz"));
         make_archive(&archive, &entries);
-        let output = invoke(&case, &archive, "missing", "", false);
+        let digest = sha256(&archive);
+        let output = invoke(&case, &archive, "present", &digest, true);
         assert!(
             !output.status.success(),
             "{name} archive unexpectedly installed"
@@ -380,24 +381,28 @@ fn unix_installer_verifies_and_rejects_ambiguous_or_unsafe_inputs() {
 }
 
 #[test]
-fn wget_fallback_distinguishes_a_missing_checksum_from_transport_failure() {
-    let missing = TempDir::new().unwrap();
-    let archive = missing.path().join("valid.tar.gz");
-    make_archive(
-        &archive,
-        &[Entry {
-            name: "medha",
-            kind: EntryKind::Regular,
-            body: b"wget-installed",
-            link: "",
-        }],
-    );
-    let output = invoke_with_wget(&missing, &archive, "missing", "");
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(
-        fs::read(missing.path().join("installed/medha")).unwrap(),
-        b"wget-installed"
-    );
+fn a_missing_checksum_is_refused_with_curl_and_with_wget() {
+    for via_wget in [false, true] {
+        let missing = TempDir::new().unwrap();
+        let archive = missing.path().join("valid.tar.gz");
+        make_archive(
+            &archive,
+            &[Entry {
+                name: "medha",
+                kind: EntryKind::Regular,
+                body: b"must-not-install",
+                link: "",
+            }],
+        );
+        let output = if via_wget {
+            invoke_with_wget(&missing, &archive, "missing", "")
+        } else {
+            invoke(&missing, &archive, "missing", "", true)
+        };
+        assert!(!output.status.success(), "installed without a checksum");
+        assert!(stderr(&output).contains("no checksum published"));
+        assert!(!missing.path().join("installed/medha").exists());
+    }
 
     let transient = TempDir::new().unwrap();
     let archive = transient.path().join("valid.tar.gz");

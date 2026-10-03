@@ -1,11 +1,12 @@
 [package]
 name = "orchestrator"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-kernel = { version = "0.1.8", path = "../kernel" }
+kernel = { path = "../kernel" }
 async-trait.workspace = true
 futures.workspace = true
 fd-lock = "4"

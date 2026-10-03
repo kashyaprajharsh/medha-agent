@@ -2,14 +2,15 @@
 name = "gate"
 edition.workspace = true
 version.workspace = true
+publish.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 kernel.workspace = true
-store = { version = "0.1.8", path = "../store" }
-lockfile = { version = "0.1.8", path = "../lockfile" }
-sandbox = { version = "0.1.8", path = "../sandbox" }
+store = { path = "../store" }
+lockfile = { path = "../lockfile" }
+sandbox = { path = "../sandbox" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"

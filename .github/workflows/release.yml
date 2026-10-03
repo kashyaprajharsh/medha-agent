@@ -51,11 +51,15 @@ jobs:
           sha="$(git rev-parse HEAD)"
           tag="v$version"
 
-          # The desktop app ships under the same tag, so it carries the same version.
+          # The desktop app ships under the same tag, so it carries the same version; its bundle
+          # takes the version from its Cargo.toml, so tauri.conf.json must not name another.
           shell_version="$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' apps/desktop/src-tauri/Cargo.toml | head -1)"
-          bundle_version="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' apps/desktop/src-tauri/tauri.conf.json | head -1)"
-          if [ "$shell_version" != "$version" ] || [ "$bundle_version" != "$version" ]; then
-            echo "desktop version ($shell_version, bundle $bundle_version) does not match workspace version $version" >&2
+          if [ "$shell_version" != "$version" ]; then
+            echo "desktop version $shell_version does not match workspace version $version" >&2
+            exit 1
+          fi
+          if jq -e 'has("version")' apps/desktop/src-tauri/tauri.conf.json >/dev/null; then
+            echo "tauri.conf.json pins a version; remove it so the bundle uses Cargo.toml" >&2
             exit 1
           fi
 

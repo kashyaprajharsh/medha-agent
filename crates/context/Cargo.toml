@@ -2,6 +2,7 @@
 name = "context"
 edition.workspace = true
 version.workspace = true
+publish.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
@@ -14,10 +15,10 @@ futures.workspace = true
 thiserror.workspace = true
 tiktoken-rs = "0.12.0"
 tracing = "0.1"
-guard-policy = { package = "policy", version = "0.1.8", path = "../policy" }
+guard-policy = { package = "policy", path = "../policy" }
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-test-support = { version = "0.1.8", path = "../test-support" }
+test-support = { path = "../test-support" }
 tokio = { workspace = true, features = ["test-util"] }
 ulid.workspace = true

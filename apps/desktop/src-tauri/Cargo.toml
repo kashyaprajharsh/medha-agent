@@ -23,8 +23,8 @@ rfd = "0.17"
 portable-pty = "0.9"
 base64 = "0.22"
 getrandom = "0.3"
-media = { version = "0.1.8", path = "../../../crates/media" }
-transcript-view = { version = "0.1.8", path = "../../../crates/transcript-view" }
+media = { path = "../../../crates/media" }
+transcript-view = { path = "../../../crates/transcript-view" }
 tauri-plugin-updater = "2"
 
 [target.'cfg(unix)'.dependencies]

@@ -54,22 +54,6 @@ Assert-Throws { Get-ChecksumDigest $ambiguous } 'multiple digest tokens were acc
 Assert-True (-not (Test-PathContains 'C:\Tools\medha-old;C:\Else' 'C:\Tools\medha')) 'PATH substring was mistaken for an exact segment'
 Assert-True (Test-PathContains 'C:\Else;C:\Tools\medha\' 'c:\tools\MEDHA') 'normalized exact PATH segment was missed'
 
-$direct404 = [pscustomobject]@{ StatusCode = 404; Response = $null; InnerException = $null }
-$response503 = [pscustomobject]@{
-    StatusCode = $null
-    Response = [pscustomobject]@{ StatusCode = 503 }
-    InnerException = $null
-}
-$nested404 = [pscustomobject]@{
-    StatusCode = $null
-    Response = $null
-    InnerException = $direct404
-}
-Assert-True ((Find-HttpStatusCode $direct404) -eq 404) 'PowerShell 7 status shape was not recognized'
-Assert-True ((Find-HttpStatusCode $nested404) -eq 404) 'nested HTTP status was not recognized'
-Assert-True ((Find-HttpStatusCode $response503) -eq 503) 'Windows PowerShell response status shape was not recognized'
-Assert-True ((Find-HttpStatusCode $response503) -ne 404) 'transient response was mistaken for not-found'
-
 # ZipArchive itself lives in System.IO.Compression; only the ZipFile helpers
 # live in .FileSystem. PowerShell 7 resolves both from the shared framework,
 # but Windows PowerShell 5.1 loads .NET Framework assemblies by name, so

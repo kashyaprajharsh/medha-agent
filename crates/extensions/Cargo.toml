@@ -1,14 +1,15 @@
 [package]
 name = "extensions"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-medha-extension-api = { version = "0.1.8", path = "../extension-api" }
-kernel = { version = "0.1.8", path = "../kernel" }
-sandbox = { version = "0.1.8", path = "../sandbox" }
+medha-extension-api = { path = "../extension-api" }
+kernel = { path = "../kernel" }
+sandbox = { path = "../sandbox" }
 async-trait.workspace = true
 fd-lock = "4"
 serde.workspace = true

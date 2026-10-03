@@ -2,6 +2,7 @@
 name = "store"
 edition.workspace = true
 version.workspace = true
+publish.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
@@ -23,4 +24,4 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [dev-dependencies]
-test-support = { version = "0.1.8", path = "../test-support" }
+test-support = { path = "../test-support" }

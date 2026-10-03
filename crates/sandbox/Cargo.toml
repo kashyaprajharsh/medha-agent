@@ -2,6 +2,7 @@
 name = "sandbox"
 edition.workspace = true
 version.workspace = true
+publish.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
@@ -11,8 +12,8 @@ thiserror.workspace = true
 ulid.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "sync", "time", "rt"] }
-permissions = { version = "0.1.8", path = "../permissions" }
-kernel = { version = "0.1.8", path = "../kernel" }
+permissions = { path = "../permissions" }
+kernel = { path = "../kernel" }
 sha2 = "0.10"
 
 # Linux OS-native sandbox: Landlock LSM (kernel ≥5.13), no external binary.
@@ -30,5 +31,5 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [dev-dependencies]
-test-support = { version = "0.1.8", path = "../test-support" }
+test-support = { path = "../test-support" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time"] }

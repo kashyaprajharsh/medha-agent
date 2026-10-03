@@ -339,7 +339,9 @@ const REFUSED_SOCKET_ERRORS: &[&str] = &[
 ];
 
 fn refused_socket_line(line: &str) -> bool {
-    REFUSED_SOCKET_OPS.iter().any(|op| line.contains(op))
+    // A refused Unix socket is the jail's own wall; a network grant would not open it.
+    !line.contains("unix")
+        && REFUSED_SOCKET_OPS.iter().any(|op| line.contains(op))
         && REFUSED_SOCKET_ERRORS
             .iter()
             .any(|error| line.contains(error))
@@ -1580,18 +1582,8 @@ struct IsolatedHome {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const ISOLATED_HOMES: &str = "medha-native-homes";
 
-/// Holds an exclusive advisory lock on `path` without blocking.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn try_lock_file(path: &Path) -> Option<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .ok()?;
-    file.try_lock().ok()?;
-    Some(file)
-}
+use crate::scratch::try_lock_file;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_alive(pid: i32) -> bool {
@@ -1606,18 +1598,7 @@ fn process_alive(pid: i32) -> bool {
 /// Removes homes whose lock is free, and legacy `medha-native-home-<pid>-*` of exited processes.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn sweep_stale_homes(root: &Path, legacy: &Path) {
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let lock = entry.path();
-            if lock.extension().is_none_or(|ext| ext != "lock") {
-                continue;
-            }
-            if let Some(_released) = try_lock_file(&lock) {
-                let _ = std::fs::remove_dir_all(lock.with_extension(""));
-                let _ = std::fs::remove_file(&lock);
-            }
-        }
-    }
+    crate::scratch::sweep_unlocked(root);
     if let Ok(entries) = std::fs::read_dir(legacy) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -1769,41 +1750,13 @@ fn native_sensitive_paths() -> Vec<PathBuf> {
     let Some(home) = home_dir_from_env() else {
         return Vec::new();
     };
-    [
-        ".ssh",
-        ".aws",
-        ".azure",
-        ".medha",
-        ".gnupg",
-        ".docker",
-        ".kube",
-        ".config/gcloud",
-        ".config/gh",
-        ".config/pip",
-        ".config/pnpm",
-        ".git-credentials",
-        ".gitconfig",
-        ".netrc",
-        ".npmrc",
-        ".pypirc",
-        ".yarnrc",
-        ".yarnrc.yml",
-        ".gem/credentials",
-        ".gradle/gradle.properties",
-        ".m2/settings.xml",
-        ".nuget/NuGet.Config",
-        ".bash_history",
-        ".zsh_history",
-        ".python_history",
-        ".node_repl_history",
-        ".local/share/fish/fish_history",
-        ".cargo/credentials",
-        ".cargo/credentials.toml",
-    ]
-    .iter()
-    .map(|relative| home.join(relative))
-    .chain(permissions::protected_paths())
-    .collect()
+    // Commands also lose all of Medha's state; file tools keep the skills and worktrees in it.
+    permissions::CREDENTIAL_RELATIVE
+        .iter()
+        .chain([".medha"].iter())
+        .map(|relative| home.join(relative))
+        .chain(permissions::protected_paths())
+        .collect()
 }
 
 /// Resolve an absolute policy path through its deepest existing ancestor, so
@@ -2368,6 +2321,18 @@ impl SeatbeltBackend {
         if let Some(plugin) = &self.plugin {
             p.push_str(&sensitive_deny("file-write*", &plugin.package, &[]));
         }
+        // Git later runs what these name, outside the jail; Medha's own throwaway folders stay free.
+        let owned = self.approved.owned_roots();
+        for root in writable
+            .iter()
+            .filter(|root| **root != self.home.path && !owned.contains(root))
+        {
+            let git = sbpl_escape(&root.join(".git").to_string_lossy());
+            p.push_str(&format!(
+                "(deny file-write* (literal \"{git}\") (literal \"{git}/config\") \
+                 (literal \"{git}/commondir\") (subpath \"{git}/hooks\"))\n"
+            ));
+        }
         if self.effective_net(req) == NetPolicy::Allow {
             p.push_str(SEATBELT_NETWORK);
         }
@@ -2543,14 +2508,53 @@ impl LandlockBackend {
         }
         paths.extend(native_toolchain_read_roots());
         paths.extend(self.extra_writable.iter().cloned());
-        paths.extend(self.approved.read_roots());
-        paths.extend(self.approved.write_roots());
+        let secrets: Vec<PathBuf> = native_sensitive_paths()
+            .iter()
+            .filter_map(|path| resolve_native_policy_path(path))
+            .collect();
+        let skills = home_dir_from_env().map(|home| home.join(".medha/skills"));
+        for root in self
+            .approved
+            .read_roots()
+            .into_iter()
+            .chain(self.approved.write_roots())
+            .filter_map(|root| resolve_native_policy_path(&root))
+        {
+            roots_around_secrets(&root, &secrets, skills.as_deref(), &mut paths);
+        }
         paths.extend(safe_request_readable(&req.read_roots));
         paths.extend(safe_extra_writable(&req.write_roots));
         paths.retain(|path| path.exists());
         paths.sort();
         paths.dedup();
         paths
+    }
+}
+
+/// Landlock cannot deny inside an allowed tree, so a root holding secrets is split around them.
+#[cfg(target_os = "linux")]
+fn roots_around_secrets(
+    root: &Path,
+    secrets: &[PathBuf],
+    skills: Option<&Path>,
+    out: &mut Vec<PathBuf>,
+) {
+    let shared = skills.is_some_and(|skills| root.starts_with(skills));
+    if !shared && secrets.iter().any(|secret| root.starts_with(secret)) {
+        return;
+    }
+    if shared || !secrets.iter().any(|secret| secret.starts_with(root)) {
+        out.push(root.to_path_buf());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for child in entries.flatten().map(|entry| entry.path()) {
+        // A link may lead back up or into a secret; only real children are walked.
+        if child.canonicalize().is_ok_and(|real| real == child) {
+            roots_around_secrets(&child, secrets, skills, out);
+        }
     }
 }
 
@@ -2656,6 +2660,7 @@ impl ExecBackend for LandlockBackend {
             &self.writable_paths(req),
             self.effective_net(req),
         )?;
+        let sockets = crate::socket_filter::program(self.effective_net(req));
 
         let mut cmd = std::process::Command::new(&req.program);
         cmd.args(&req.args).current_dir(&req.cwd);
@@ -2670,10 +2675,15 @@ impl ExecBackend for LandlockBackend {
         unsafe {
             cmd.pre_exec(move || {
                 if let Some(r) = slot.take() {
-                    r.restrict_self()
+                    let status = r
+                        .restrict_self()
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    // Never run a command the kernel did not actually confine.
+                    if status.ruleset == landlock::RulesetStatus::NotEnforced {
+                        return Err(std::io::Error::from_raw_os_error(libc::ENOSYS));
+                    }
                 }
-                Ok(())
+                crate::socket_filter::install(&sockets)
             });
         }
 
@@ -2690,9 +2700,7 @@ impl ExecBackend for LandlockBackend {
         kernel::Containment::OsFsJail
     }
     fn denies_network(&self, req: &ExecRequest) -> bool {
-        // Config intent, not enforcement proof. On kernel <6.7 the rule no-ops,
-        // the command succeeds, and the failure-driven card never fires; on ≥6.7
-        // the failure itself proves enforcement. Neither needs a probe.
+        // The socket filter refuses every network family, whatever Landlock's own rule covers.
         self.effective_net(req) == NetPolicy::Deny
     }
 }
@@ -3204,13 +3212,17 @@ pub fn native_backend_available() -> bool {
     }
 }
 
+/// Landlock counts only when the kernel enforces it. The best-effort default would
+/// "succeed" on a kernel without Landlock and leave every command unconfined.
 #[cfg(target_os = "linux")]
 fn landlock_supported() -> bool {
-    use landlock::{ABI, Access, AccessFs, Ruleset, RulesetAttr};
-    Ruleset::default()
-        .handle_access(AccessFs::from_all(ABI::V1))
-        .and_then(|r| r.create())
-        .is_ok()
+    use landlock::{ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+    crate::socket_filter::supported()
+        && Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(ABI::V1))
+            .and_then(|r| r.create())
+            .is_ok()
 }
 
 #[cfg(test)]
@@ -3227,6 +3239,116 @@ mod tests {
             read_roots: Vec::new(),
             write_roots: Vec::new(),
         }
+    }
+
+    /// Sandbox tests skip where no sandbox exists, so CI on macOS and Linux sets this
+    /// to fail loudly instead of passing without having checked anything.
+    #[test]
+    fn required_native_sandbox_is_really_enforced() {
+        if std::env::var("MEDHA_REQUIRE_NATIVE_SANDBOX").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(
+            native_backend_available(),
+            "this machine must enforce the native sandbox"
+        );
+    }
+
+    /// Wherever Medha reports the native sandbox, a command really is confined.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn an_available_native_sandbox_blocks_writes_outside_the_workspace() {
+        if !native_backend_available() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("medha-confined-{}", ulid::Ulid::new()));
+        let (ws, outside) = (base.join("ws"), base.join("outside"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let (ws, outside) = (ws.canonicalize().unwrap(), outside.canonicalize().unwrap());
+        let backend = select_backend(
+            &SandboxConfig::default(),
+            Vec::new(),
+            ApprovedRoots::default(),
+            NetworkGrant::default(),
+        );
+        assert_eq!(backend.label(), "native");
+        let target = outside.join("escaped");
+        let script = format!("printf x > {}", shell_quote(&target.to_string_lossy()));
+        let _ = backend.run(req("/bin/sh", &["-c", &script], ws)).await;
+        assert!(
+            !target.exists(),
+            "a sandboxed command wrote outside its workspace"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An approved home folder must not carry its credential folders into the jail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_approved_root_is_split_around_the_secrets_inside_it() {
+        let base = std::env::temp_dir().join(format!("medha-split-{}", ulid::Ulid::new()));
+        for dir in [
+            ".ssh",
+            ".config/gh",
+            ".config/editor",
+            "projects",
+            ".medha/skills/pdf",
+        ] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let home = base.canonicalize().unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("keys")).unwrap();
+        let secrets = [
+            home.join(".ssh"),
+            home.join(".config/gh"),
+            home.join(".medha"),
+        ];
+        let skills = home.join(".medha/skills");
+        let mut granted = Vec::new();
+        roots_around_secrets(&home, &secrets, Some(&skills), &mut granted);
+        roots_around_secrets(&skills.join("pdf"), &secrets, Some(&skills), &mut granted);
+        granted.sort();
+        assert_eq!(
+            granted,
+            [
+                home.join(".config/editor"),
+                home.join(".medha/skills/pdf"),
+                home.join("projects"),
+            ]
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Git runs what its config and hooks name, later and outside the jail.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_children_cannot_plant_programs_in_the_workspace_repository() {
+        if !native_backend_available() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("medha-git-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(base.join(".git/hooks")).unwrap();
+        let ws = base.canonicalize().unwrap();
+        std::fs::write(ws.join(".git/config"), "[core]\n").unwrap();
+        let backend = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default());
+        let script = "printf x >> .git/config; printf x > .git/hooks/pre-commit; \
+                      printf x > .git/commondir; mv .git .moved; printf ok > .git/index";
+        let _ = backend
+            .run(req("/bin/sh", &["-c", script], ws.clone()))
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(ws.join(".git/config")).unwrap(),
+            "[core]\n"
+        );
+        assert!(!ws.join(".git/hooks/pre-commit").exists());
+        assert!(!ws.join(".git/commondir").exists());
+        assert!(!ws.join(".moved").exists());
+        assert!(
+            ws.join(".git/index").exists(),
+            "ordinary repository writes must still work"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Model commands must not consume input belonging to the Medha surface.
@@ -3909,7 +4031,7 @@ mod tests {
         // Everything not granted starts denied.
         assert!(profile.contains("(deny default)"));
         assert!(!profile.contains("(allow default)"));
-        assert!(!profile.contains("(allow network*)"));
+        assert!(!profile.contains("(remote ip)"));
         assert!(!profile.contains("(allow file-read* (subpath \"/\")"));
         // Traversal grants: the literal root and directory metadata only —
         // never a readable subtree.
@@ -4544,10 +4666,10 @@ mod tests {
         let be = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default())
             .with_network_grant(grant.clone());
         let r = req("sh", &["-c", "true"], std::env::temp_dir());
-        assert!(!be.profile(&r).contains("(allow network*)"));
+        assert!(!be.profile(&r).contains("(remote ip)"));
         assert_eq!(be.containment(), kernel::Containment::OsFsJailNoNet);
         grant.grant();
-        assert!(be.profile(&r).contains("(allow network*)"));
+        assert!(be.profile(&r).contains("(remote ip)"));
         assert_eq!(be.containment(), kernel::Containment::OsFsJail);
     }
 
@@ -4689,16 +4811,16 @@ mod tests {
     async fn once_scope_opens_the_profile_and_does_not_outlive_the_future() {
         let be = SeatbeltBackend::new(NetPolicy::Deny, vec![], ApprovedRoots::default());
         let r = req("sh", &["-c", "true"], std::env::temp_dir());
-        assert!(!be.profile(&r).contains("(allow network*)"));
+        assert!(!be.profile(&r).contains("(remote ip)"));
 
         let opened = kernel::network_once_scope(async { be.profile(&r) }).await;
         assert!(
-            opened.contains("(allow network*)"),
+            opened.contains("(remote ip)"),
             "a once-scoped run must reach the network"
         );
 
         assert!(
-            !be.profile(&r).contains("(allow network*)"),
+            !be.profile(&r).contains("(remote ip)"),
             "the grant must not outlive the scoped future"
         );
         assert_eq!(be.containment(), kernel::Containment::OsFsJailNoNet);

@@ -29,9 +29,49 @@ use std::{
     process::{Command, Stdio},
 };
 const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
+
+/// Overrides for every key in the repository's own config that would run a program.
+fn config_overrides(dir: &Path) -> Vec<String> {
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut overrides = vec![
+        "core.fsmonitor=false".to_owned(),
+        format!("core.hooksPath={null}"),
+    ];
+    let Ok(listed) = Command::new("git")
+        .args(["config", "--list", "--show-scope", "--name-only", "-z"])
+        .current_dir(dir)
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return overrides;
+    };
+    let mut fields = listed.stdout.split(|byte| *byte == 0);
+    while let (Some(scope), Some(key)) = (fields.next(), fields.next()) {
+        // The user's own global and system filters, such as large-file storage, stay on.
+        if !matches!(scope, b"local" | b"worktree") {
+            continue;
+        }
+        let driver = std::str::from_utf8(key)
+            .ok()
+            .and_then(|key| key.strip_prefix("filter."))
+            .and_then(|rest| rest.rsplit_once('.'));
+        if let Some((driver, _)) = driver {
+            overrides.extend(
+                ["clean=", "smudge=", "process=", "required=false"]
+                    .map(|setting| format!("filter.{driver}.{setting}")),
+            );
+        }
+    }
+    overrides.sort();
+    overrides.dedup();
+    overrides
+}
+
 fn run(dir: &Path, args: &[&str]) -> Result<(i32, Vec<u8>), String> {
+    let overrides = config_overrides(dir);
     let mut child = Command::new("git")
         .arg("--no-pager")
+        .args(overrides.iter().flat_map(|setting| ["-c", setting]))
         .args(args)
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -110,16 +150,22 @@ fn nested_repositories(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
         .collect())
 }
 
+/// A relative path as Git writes it: forward slashes on every system, so the panel
+/// and the diff lookup see the same string on Windows as everywhere else.
+fn slash(path: &Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// One repository's changes, with paths relative to `base` and the repository
 /// they belong to, so a diff can be read from the right place.
 fn entries(repo_dir: &Path, base: &Path) -> Result<Vec<Value>, String> {
     let Some(root) = repository(repo_dir)? else {
         return Ok(Vec::new());
     };
-    let repo = repo_dir
-        .strip_prefix(base)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let repo = repo_dir.strip_prefix(base).map(slash).unwrap_or_default();
     let (code, bytes) = run(
         repo_dir,
         &[
@@ -127,6 +173,8 @@ fn entries(repo_dir: &Path, base: &Path) -> Result<Vec<Value>, String> {
             "--porcelain=v1",
             "-z",
             "--untracked-files=all",
+            // A nested repository's own filters would run while Git checks it for edits.
+            "--ignore-submodules=dirty",
             "--",
             ".",
         ],
@@ -153,7 +201,7 @@ fn entries(repo_dir: &Path, base: &Path) -> Result<Vec<Value>, String> {
         let Ok(path) = absolute.strip_prefix(base) else {
             continue;
         };
-        files.push(json!({"path": path.to_string_lossy(), "repo": repo, "index": index.to_string(), "working": working.to_string(), "untracked": index == '?', "original": original.and_then(|p| root.join(p).strip_prefix(base).ok().map(|p| p.to_string_lossy().into_owned()))}));
+        files.push(json!({"path": slash(path), "repo": repo, "index": index.to_string(), "working": working.to_string(), "untracked": index == '?', "original": original.and_then(|p| root.join(p).strip_prefix(base).ok().map(slash))}));
     }
     Ok(files)
 }
@@ -169,7 +217,7 @@ pub fn diff(dir: &Path, path: &str, staged: bool) -> Result<Value, String> {
     let inside = |path: &str| -> String {
         Path::new(path)
             .strip_prefix(repo)
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(slash)
             .unwrap_or_else(|_| path.to_owned())
     };
     let (local, original) = (inside(path), entry["original"].as_str().map(inside));
@@ -183,7 +231,7 @@ pub fn diff(dir: &Path, path: &str, staged: bool) -> Result<Value, String> {
             &local,
         ]);
     } else {
-        args.push("--relative");
+        args.extend(["--relative", "--ignore-submodules=dirty"]);
         if staged {
             args.push("--cached");
         }

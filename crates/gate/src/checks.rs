@@ -1076,6 +1076,27 @@ mod tests {
         path
     }
 
+    /// Writes a fake runtime from a child process. Written here, a fork on another
+    /// test thread could inherit the write handle, and Linux then refuses to run the
+    /// script ("Text file busy") until that child execs.
+    #[cfg(unix)]
+    fn write_script(path: &Path, body: &str) {
+        use std::io::Write;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+    }
+
     fn art(workspace: PathBuf, pristine: PathBuf, events: Vec<Event>) -> RunArtifact {
         RunArtifact {
             workspace,
@@ -1474,17 +1495,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropping_container_lease_invokes_forced_removal() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = temp_workspace("gate-container-cleanup");
         let runtime = root.join("fake-runtime");
         let log = root.join("cleanup-argv");
-        std::fs::write(
+        write_script(
             &runtime,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n", log.display()),
+        );
         {
             let _lease = ContainerLease::new(runtime, "medha-gate-drop-test".into());
         }
@@ -1498,14 +1515,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn uncertain_create_absence_keeps_retrying_cleanup() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = temp_workspace("gate-container-late-register");
         let runtime = root.join("fake-runtime");
         let attempts = root.join("attempts");
-        std::fs::write(
+        write_script(
             &runtime,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 printf 'rm\n' >> "{attempts}"
 count=$(wc -l < "{attempts}")
@@ -1517,9 +1532,7 @@ exit 0
 "#,
                 attempts = attempts.display(),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
 
         let mut lease = ContainerLease::new(runtime, "medha-gate-late-test".into());
         lease.cleanup().await.unwrap();
@@ -1534,8 +1547,6 @@ exit 0
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_container_check_finishes_owned_cleanup_without_a_survivor() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = temp_workspace("gate-container-cancel");
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1545,9 +1556,9 @@ exit 0
         let running = root.join("running");
         let removed = root.join("removed");
         let survivor = root.join("survivor");
-        std::fs::write(
+        write_script(
             &runtime,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 case "$1" in
   create)
@@ -1580,9 +1591,7 @@ esac
                 running = running.display(),
                 removed = removed.display(),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
 
         let runner = CommandRunner::for_container_test(runtime, Duration::from_secs(10), 8 * 1024);
         let mut execution = Box::pin(execute_command(&runner, &workspace, "printf checked"));
@@ -1646,8 +1655,6 @@ esac
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_during_create_never_starts_the_workload() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = temp_workspace("gate-container-create-cancel");
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1656,9 +1663,9 @@ esac
         let creating = root.join("creating");
         let registered = root.join("registered");
         let removed = root.join("removed");
-        std::fs::write(
+        write_script(
             &runtime,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 case "$1" in
   create)
@@ -1685,9 +1692,7 @@ esac
                 registered = registered.display(),
                 removed = removed.display(),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
 
         let runner = CommandRunner::for_container_test(runtime, Duration::from_secs(10), 8 * 1024);
         let mut execution = Box::pin(execute_command(&runner, &workspace, "printf forbidden"));

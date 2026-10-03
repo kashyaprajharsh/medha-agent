@@ -211,7 +211,11 @@ Resolution order is **CLI flag > `MEDHA_*` env > `~/.medha/config.toml` > first-
 
 **Nothing executes on the model's word.** Deny-first policy, a shell danger scanner, and an approval gate that shows a real rendered diff, then pins it, so if the file changes between preview and execution the edit is refused. What you approved is what runs.
 
-**A real sandbox.** macOS Seatbelt and Linux Landlock by default, with Docker/Podman containers and remote SSH available. Network can be denied outright. `shell.exec` starts from an empty environment, so a leaked key never reaches an arbitrary command.
+**A real sandbox on macOS and Linux.** macOS Seatbelt and Linux Landlock by default, with Docker/Podman containers and remote SSH available. Network can be denied outright. `shell.exec` starts from an empty environment, so a leaked key never reaches an arbitrary command. Keys, tokens and local daemon sockets such as Docker's stay closed even after an approval; a command that needs them (`ssh`, `git push`, `docker`) runs outside the sandbox, once, when you approve that run.
+
+**Windows has no OS sandbox yet.** There, commands run with your own rights behind the danger scanner and the approval gate, the terminal shows `[no sandbox]`, and `yolo` still asks before builds and tests.
+
+Each session gets an empty scratch folder for throwaway files and test repositories. Commands and file tools use it without asking, and it is deleted when the session ends.
 
 Shell commands declare whether they need network access using `network: true` or `false`. For native execution, `workdir` selects the command's directory; `read_paths` and `write_paths` request access to existing absolute directories outside the workspace. Changing `workdir` does not expand the workspace's writable boundary. Missing network and folder permissions appear together before the command runs, with once, session, and project options in the TUI. A denied request runs nothing. Failed shell commands are not automatically replayed, because earlier steps may already have changed files. Trusted skill scripts are readable and executable, while Medha's credentials and session state remain protected.
 

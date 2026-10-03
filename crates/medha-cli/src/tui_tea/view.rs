@@ -1474,6 +1474,13 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         ),
     };
     left.push(Span::styled(format!("  [{mode_txt}]"), mode_style));
+    // Nothing confines commands here; the startup warning scrolls away, this does not.
+    if model.restore.exec_backend_label() == "host" {
+        left.push(Span::styled(
+            "  [no sandbox]",
+            Style::default().fg(theme::warn()),
+        ));
+    }
     // User-owned forms pause the activity indicator.
     let awaiting_user = model.clarify.is_some() || model.pending_approval().is_some();
     if awaiting_user {

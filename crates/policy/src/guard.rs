@@ -206,7 +206,7 @@ fn scan_text_with_mode(path: &str, text: &str, script: Option<ScriptKind>, out: 
                 severity: Severity::Dangerous,
                 reason,
             });
-        } else if !hard_only && let Some(reason) = crate::needs_review(&c, None) {
+        } else if !hard_only && let Some(reason) = crate::needs_review(&c, None, None) {
             out.push(Finding {
                 file: path.to_string(),
                 line: Some(line),

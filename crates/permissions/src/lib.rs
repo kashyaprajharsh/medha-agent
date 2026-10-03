@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 mod protected;
-pub use protected::{is_protected, protected_paths};
+pub use protected::{CREDENTIAL_RELATIVE, is_protected, protected_paths};
 
 #[derive(Debug, Error)]
 pub enum PermissionError {
@@ -26,7 +26,7 @@ pub enum PermissionError {
     #[error("User denied access to {path}")]
     Denied { path: PathBuf },
     #[error(
-        "{path} holds browser sessions, keychains or passwords; Medha never opens it, \
+        "{path} holds keys, tokens, browser sessions or keychains; Medha never opens it, \
          and no approval changes that"
     )]
     Protected { path: PathBuf },
@@ -127,6 +127,7 @@ pub struct ApprovedRoots {
 struct ApprovedRootsInner {
     read: HashSet<PathBuf>,
     write: HashSet<PathBuf>,
+    owned: HashSet<PathBuf>,
 }
 
 impl ApprovedRoots {
@@ -144,6 +145,26 @@ impl ApprovedRoots {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .write
             .insert(path);
+    }
+
+    /// A folder Medha created for this process: writable, never persisted, never the user's.
+    pub fn allow_owned(&self, path: PathBuf) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.write.insert(path.clone());
+        inner.owned.insert(path);
+    }
+
+    pub fn owned_roots(&self) -> Vec<PathBuf> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owned
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn read_roots(&self) -> Vec<PathBuf> {
@@ -1718,6 +1739,9 @@ mod tests {
             home.join(".config/google-chrome/Default/Cookies"),
             home.join("Library/Application Support/Google/Chrome/Default/Cookies"),
             home.join(".config/../.config/chromium/Default/Login Data"),
+            home.join(".ssh/id_ed25519"),
+            home.join(".gitconfig"),
+            home.join(".medha/projects/any/trust.lock"),
         ] {
             assert!(
                 matches!(

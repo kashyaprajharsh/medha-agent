@@ -16,6 +16,9 @@ pub mod exec;
 /// user-notification mechanism, which has no counterpart elsewhere.
 #[cfg(target_os = "linux")]
 pub(crate) mod netnotify;
+pub mod scratch;
+#[cfg(target_os = "linux")]
+pub(crate) mod socket_filter;
 pub use exec::{
     BackendKind, BoundedCommandOutput, ExecBackend, ExecError, ExecOutput, ExecRequest,
     HostBackend, NetPolicy, SandboxConfig, ShellOutcome, native_backend_available,
@@ -23,7 +26,10 @@ pub use exec::{
     run_command_bounded, run_command_bounded_with_input, run_shell_bounded, run_shell_bounded_with,
     select_backend,
 };
-pub use permissions::{ApprovedRoots, NetworkGrant, is_protected, protected_paths};
+pub use permissions::{
+    ApprovedRoots, CREDENTIAL_RELATIVE, NetworkGrant, is_protected, protected_paths,
+};
+pub use scratch::Scratch;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
@@ -136,6 +142,32 @@ impl WritePathGuard {
 fn refuse_protected(path: PathBuf) -> Result<PathBuf, SandboxError> {
     if is_protected(&path) {
         return Err(permissions::PermissionError::Protected { path }.into());
+    }
+    Ok(path)
+}
+
+/// Git later runs what its config and hooks name, outside any jail, so no file tool writes them.
+fn refuse_git_control(path: PathBuf) -> Result<PathBuf, SandboxError> {
+    let parts: Vec<&std::ffi::OsStr> = path.components().map(|part| part.as_os_str()).collect();
+    let named = |part: &std::ffi::OsStr, name: &str| part.eq_ignore_ascii_case(name);
+    let control = parts
+        .iter()
+        .position(|part| named(part, ".git"))
+        .map(|git| &parts[git + 1..])
+        .is_some_and(|inside| {
+            let own = inside.len() == 1 || inside.first().is_some_and(|dir| named(dir, "modules"));
+            let redirect = inside
+                .last()
+                .is_some_and(|leaf| named(leaf, "config") || named(leaf, "commondir"));
+            let hook = inside.first().is_some_and(|dir| named(dir, "hooks"))
+                || (own && inside.iter().any(|dir| named(dir, "hooks")));
+            hook || (own && redirect)
+        });
+    if control {
+        return Err(SandboxError::PermissionDenied(format!(
+            "Git runs what {} names, outside the sandbox; change it with a git command the user reviews",
+            path.display()
+        )));
     }
     Ok(path)
 }
@@ -2039,6 +2071,17 @@ impl WorkspaceSandbox {
         self
     }
 
+    /// Opens Medha's own throwaway folder to commands and file tools alike, with no prompt.
+    pub fn with_scratch(self, scratch: &Path) -> Self {
+        let resolved = scratch
+            .canonicalize()
+            .unwrap_or_else(|_| scratch.to_path_buf());
+        self.permission_manager
+            .approved_roots()
+            .allow_owned(resolved);
+        self
+    }
+
     /// Relocate the undo-snapshot directory out of the workspace. By default
     /// snapshots live at `<root>/.medha/snapshots`; the CLI points this at the
     /// per-workspace state dir (`~/.medha/projects/<enc>/snapshots`) so runtime
@@ -2204,7 +2247,7 @@ impl WorkspaceSandbox {
     }
 
     pub async fn resolve_for_write(&self, path: &str) -> Result<PathBuf, SandboxError> {
-        refuse_protected(self.resolve_any_for_write(path).await?)
+        refuse_git_control(refuse_protected(self.resolve_any_for_write(path).await?)?)
     }
 
     async fn resolve_any(&self, path: &str) -> Result<PathBuf, SandboxError> {
@@ -3698,6 +3741,37 @@ mod tests {
                 "write {relative}"
             );
         }
+    }
+
+    /// File tools run outside the OS jail, so its rule on Git's control files must hold here too.
+    #[tokio::test]
+    async fn file_tools_cannot_write_what_git_would_later_run() {
+        let dir = test_support::scratch("medha-git-control");
+        std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
+        let sbx = WorkspaceSandbox::new_jailed(&dir).unwrap();
+        for path in [
+            ".git/config",
+            ".git/commondir",
+            ".git/hooks/pre-commit",
+            ".GIT/Config",
+            ".git/modules/sub/config",
+            "nested/.git/hooks/post-merge",
+        ] {
+            assert!(
+                matches!(
+                    sbx.resolve_for_write(path).await,
+                    Err(SandboxError::PermissionDenied(_))
+                ),
+                "{path} was writable"
+            );
+        }
+        for path in [".git/info/exclude", ".git/refs/heads/config", "src/config"] {
+            assert!(sbx.resolve_for_write(path).await.is_ok(), "{path}");
+        }
+        assert!(
+            sbx.resolve(".git/config").await.is_ok(),
+            "reading stays open"
+        );
     }
 
     #[tokio::test]

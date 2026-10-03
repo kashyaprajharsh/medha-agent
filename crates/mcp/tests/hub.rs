@@ -46,7 +46,9 @@ async fn hosted_server(
                     })
                 {
                     let _ = stream
-                        .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
                         .await;
                     return;
                 }
@@ -80,10 +82,12 @@ async fn hosted_server(
                 };
                 let payload =
                     json!({"jsonrpc": "2.0", "id": message["id"], "result": result}).to_string();
+                // One request per connection, and it says so: unannounced, the client pools the
+                // socket and sometimes reuses it just as it closes.
                 let _ = stream
                     .write_all(
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
                             payload.len()
                         )
                         .as_bytes(),

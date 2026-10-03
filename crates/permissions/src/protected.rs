@@ -1,6 +1,40 @@
-//! Credential stores (browser profiles, keychains, password managers) no route or grant opens.
+//! Credential stores (keys, tokens, browser profiles, keychains) no route or grant opens.
 
 use std::path::{Component, Path, PathBuf};
+
+/// Keys, tokens and shell history beneath the home directory; one list for files and commands.
+pub const CREDENTIAL_RELATIVE: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".azure",
+    ".gnupg",
+    ".docker",
+    ".kube",
+    ".config/gcloud",
+    ".config/gh",
+    ".config/pip",
+    ".config/pnpm",
+    ".git-credentials",
+    ".gitconfig",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".gem/credentials",
+    ".gradle/gradle.properties",
+    ".m2/settings.xml",
+    ".nuget/NuGet.Config",
+    ".bash_history",
+    ".zsh_history",
+    ".python_history",
+    ".node_repl_history",
+    ".local/share/fish/fish_history",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".medha/credentials.toml",
+    ".medha/credentials.lock",
+];
 
 /// Beneath the home directory on every platform.
 const HOME_RELATIVE: &[&str] = &[
@@ -54,6 +88,7 @@ pub fn protected_paths() -> Vec<PathBuf> {
         .flat_map(|home| {
             HOME_RELATIVE
                 .iter()
+                .chain(CREDENTIAL_RELATIVE)
                 .map(move |relative| home.join(relative))
         })
         .collect();
@@ -80,7 +115,15 @@ pub fn is_protected(path: &Path) -> bool {
             .collect()
     });
     let path = fold(&lexical(path));
-    roots.iter().any(|root| path.starts_with(root))
+    roots.iter().any(|root| path.starts_with(root)) || is_trust_file(&path)
+}
+
+/// Medha's own grants; a file tool that could write them would approve itself.
+fn is_trust_file(path: &Path) -> bool {
+    let named = path
+        .file_name()
+        .is_some_and(|name| name == "trust.lock" || name == "lock_trust.toml");
+    named && path.components().any(|part| part.as_os_str() == ".medha")
 }
 
 fn lexical(path: &Path) -> PathBuf {

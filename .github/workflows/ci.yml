@@ -141,8 +141,13 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
+      # Every failing test on this system is reported in one run, not just the first.
+      # macOS and Linux runners must really enforce the native sandbox, so its tests
+      # cannot pass by skipping.
       - name: Test
-        run: cargo test --workspace --all-targets
+        env:
+          MEDHA_REQUIRE_NATIVE_SANDBOX: ${{ runner.os != 'Windows' && '1' || '' }}
+        run: cargo test --workspace --all-targets --no-fail-fast
 
   # The desktop app has its own dependency graph: a window in TypeScript and a
   # shell in Rust that bundles the `medha` program. Each host OS builds and tests both.
@@ -221,4 +226,4 @@ jobs:
 
       - name: Test the shell
         working-directory: apps/desktop/src-tauri
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast

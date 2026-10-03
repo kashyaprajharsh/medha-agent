@@ -1313,6 +1313,12 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
+    let jail = match sbx_cfg.backend {
+        sandbox::BackendKind::Container => policy::Jail::Active,
+        sandbox::BackendKind::Native if sandbox::native_backend_available() => policy::Jail::Active,
+        sandbox::BackendKind::Native => policy::Jail::Missing,
+        sandbox::BackendKind::Host | sandbox::BackendKind::Ssh => policy::Jail::Off,
+    };
     if sbx_cfg.backend == sandbox::BackendKind::Native && !sandbox::native_backend_available() {
         if sandbox::native_sandbox_supported() {
             eprintln!(
@@ -1353,21 +1359,25 @@ async fn main() -> Result<()> {
         approved: approved.clone(),
         net_grant: net_grant.clone(),
     };
-    let workspace = Arc::new(
-        WorkspaceSandbox::new_with_state_root(
-            cwd.clone(),
-            trust_path,
-            audit_path,
-            Some(gate.clone()),
-            approved,
-            medha_home.clone(),
-        )?
-        .with_exec_backend(exec_backend)
-        .with_network_grant(net_grant)?
-        // Bundled user-skill files are trusted configuration, not workspace data.
-        .with_readable_roots(&[config::user_skills_dir()?])
-        .with_snapshots_dir(state.join("snapshots")),
-    );
+    let mut workspace = WorkspaceSandbox::new_with_state_root(
+        cwd.clone(),
+        trust_path,
+        audit_path,
+        Some(gate.clone()),
+        approved,
+        medha_home.clone(),
+    )?
+    .with_exec_backend(exec_backend)
+    .with_network_grant(net_grant)?
+    // Bundled user-skill files are trusted configuration, not workspace data.
+    .with_readable_roots(&[config::user_skills_dir()?])
+    .with_snapshots_dir(state.join("snapshots"));
+    // Held to the end of the run; a temp directory that refuses it just means no scratch.
+    let scratch = sandbox::Scratch::create().ok();
+    if let Some(scratch) = &scratch {
+        workspace = workspace.with_scratch(scratch.path());
+    }
+    let workspace = Arc::new(workspace);
     // Ambiguous skill content receives both deterministic and model review.
     let security_judge = Arc::new(skill_judge::LlmJudge::new(provider.clone()));
     let context_file_loader = context::ctxfiles::ContextFileLoader::new()
@@ -1749,7 +1759,13 @@ async fn main() -> Result<()> {
     let policy = Arc::new(
         policy::DefaultPolicy::requiring_approval(approve_list(lock.policy.approve.clone()))
             .with_workspace(workspace.root())
-            .with_memory_write_approval(&lock.memory.write_approval),
+            .with_scratch(
+                scratch
+                    .as_ref()
+                    .map_or(std::path::Path::new(""), |s| s.path()),
+            )
+            .with_memory_write_approval(&lock.memory.write_approval)
+            .with_jail(jail),
     );
 
     let verifier: Arc<dyn kernel::Verifier> = match verify_cmd.clone() {
@@ -1859,8 +1875,16 @@ async fn main() -> Result<()> {
     let mut system = context::identity::system_prompt_for_tools(persona, &known_tools);
     // Give time-sensitive requests an explicit clock and workspace.
     let today = chrono::Local::now().format("%A, %-d %B %Y").to_string();
+    let scratch_line = scratch.as_ref().map_or_else(String::new, |scratch| {
+        format!(
+            "\n- Scratch folder: {} (yours, empty, deleted when this session ends). Put \
+             throwaway files, test repositories and experiments here, never in the workspace \
+             or /tmp; file tools and shell commands can use it without asking.",
+            scratch.path().display()
+        )
+    });
     system.push_str(&format!(
-        "\n\nEnvironment:\n- Today's date: {today}\n- Workspace: {}\n\nFor anything \
+        "\n\nEnvironment:\n- Today's date: {today}\n- Workspace: {}{scratch_line}\n\nFor anything \
          time-sensitive (news, prices, \"latest\"/\"recent\"/\"today\"), use the current \
          date above — do not assume an older year in your searches or answers.",
         cwd.display()

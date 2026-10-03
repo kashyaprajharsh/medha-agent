@@ -34,6 +34,8 @@ fn captured_request(preset: &str) -> serde_json::Value {
                 }
                 Err(error) => panic!("accept: {error}"),
             };
+            // Windows hands an accepted socket the listener's non-blocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

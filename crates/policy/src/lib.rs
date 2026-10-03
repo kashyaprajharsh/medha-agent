@@ -12,6 +12,25 @@ pub struct DefaultPolicy {
     /// Normalized root used to distinguish in-workspace deletion targets.
     workspace: Option<String>,
     memory_write_approval: MemoryWriteApproval,
+    jail: Jail,
+    scratch: Option<String>,
+}
+
+fn scan_root(root: &std::path::Path) -> Option<String> {
+    let root = root.to_string_lossy().to_lowercase().replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    (!root.is_empty()).then(|| root.to_string())
+}
+
+/// What confines a shell command, which decides how much may run unasked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Jail {
+    /// The operating system confines every command.
+    Active,
+    /// This machine has no jail, and the user did not ask to go without one.
+    Missing,
+    /// The user chose to run without one.
+    Off,
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +46,8 @@ impl DefaultPolicy {
             approve: HashSet::new(),
             workspace: None,
             memory_write_approval: MemoryWriteApproval::UserScope,
+            jail: Jail::Off,
+            scratch: None,
         }
     }
 
@@ -40,14 +61,25 @@ impl DefaultPolicy {
             approve: tools.into_iter().map(Into::into).collect(),
             workspace: None,
             memory_write_approval: MemoryWriteApproval::UserScope,
+            jail: Jail::Off,
+            scratch: None,
         }
+    }
+
+    pub fn with_jail(mut self, jail: Jail) -> Self {
+        self.jail = jail;
+        self
     }
 
     /// Treats absolute paths beneath `root` as in-workspace scan targets.
     pub fn with_workspace(mut self, root: impl AsRef<std::path::Path>) -> Self {
-        let s = root.as_ref().to_string_lossy().to_lowercase();
-        let s = s.replace('\\', "/").trim_end_matches('/').to_string();
-        self.workspace = (!s.is_empty()).then_some(s);
+        self.workspace = scan_root(root.as_ref());
+        self
+    }
+
+    /// Medha's own throwaway folder counts as inside, like the workspace.
+    pub fn with_scratch(mut self, root: impl AsRef<std::path::Path>) -> Self {
+        self.scratch = scan_root(root.as_ref());
         self
     }
 
@@ -96,6 +128,35 @@ impl DefaultPolicy {
             AutonomyLevel::Yolo => false,
         }
     }
+
+    /// The dial adjusted for the jail: reads skip the card inside one, builds need it without.
+    fn asks(&self, autonomy: AutonomyLevel, intent: &ToolIntent) -> bool {
+        let shell = intent.tool == "shell.exec";
+        match (autonomy, self.jail) {
+            (AutonomyLevel::Normal, Jail::Active) if shell && only_reads(intent) => false,
+            (AutonomyLevel::Yolo, Jail::Missing) if shell => {
+                self.approve.contains("shell.exec") && !only_reads(intent)
+            }
+            _ => self.escalates(autonomy, &intent.tool),
+        }
+    }
+}
+
+/// True when no command in the line builds, tests, deletes or otherwise runs workspace code.
+fn only_reads(intent: &ToolIntent) -> bool {
+    let command = intent
+        .args
+        .get("command")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    parse_shell_syntax(&command).is_ok_and(|syntax| {
+        !syntax.commands.is_empty()
+            && syntax.commands.iter().all(|command| {
+                effective_program(&command.words)
+                    .is_some_and(|(at, program)| reads_only(program, &command.words[at + 1..]))
+            })
+    })
 }
 
 impl Policy for DefaultPolicy {
@@ -112,7 +173,9 @@ impl Policy for DefaultPolicy {
         }
         let verdict = match intent.tool.as_str() {
             // These tools need constraints beyond their declared blast radius.
-            "shell.exec" => scan_command(intent, self.workspace.as_deref()),
+            "shell.exec" => {
+                scan_command(intent, self.workspace.as_deref(), self.scratch.as_deref())
+            }
             "git" => authorize_git(intent),
             "skill.save" => Decision::Human,
             // Applying an unseen sub-agent patch always requires review.
@@ -139,7 +202,7 @@ impl Policy for DefaultPolicy {
         };
 
         // Autonomy may strengthen Allow to Human, never weaken the safety floor.
-        if matches!(verdict, Decision::Allow) && self.escalates(autonomy, &intent.tool) {
+        if matches!(verdict, Decision::Allow) && self.asks(autonomy, intent) {
             return Decision::Human;
         }
         verdict
@@ -175,7 +238,7 @@ fn authorize_git(intent: &ToolIntent) -> Decision {
 /// Classify a `shell.exec` command: unambiguously destructive ones are denied,
 /// anything the static scan cannot reason about is escalated to the human gate.
 /// Fail-closed on ambiguity; only commands matching neither are allowed.
-fn scan_command(intent: &ToolIntent, workspace: Option<&str>) -> Decision {
+fn scan_command(intent: &ToolIntent, workspace: Option<&str>, scratch: Option<&str>) -> Decision {
     let cmd = intent
         .args
         .get("command")
@@ -193,7 +256,7 @@ fn scan_command(intent: &ToolIntent, workspace: Option<&str>) -> Decision {
     if matches!(rm_delete_tier(&c, workspace), Some(RmTier::OutOfWorkspace)) {
         return Decision::Human;
     }
-    if needs_review(&c, workspace).is_some() {
+    if needs_review(&c, workspace, scratch).is_some() {
         return Decision::Human;
     }
     Decision::Allow
@@ -485,12 +548,63 @@ fn rm_is_recursive(args: &[String]) -> bool {
     })
 }
 
-fn is_auto_allowed_program(program: &str, args: &[String]) -> bool {
+/// An inspection tool used in a way that cannot write a file or start a program.
+fn reads_only(program: &str, args: &[String]) -> bool {
+    inspects(program, args) && !writes_or_runs(program, args)
+}
+
+/// Options that turn an inspection tool into a writer or a launcher; `args` are lowercased.
+fn writes_or_runs(program: &str, args: &[String]) -> bool {
+    // Long options may be abbreviated to any unique prefix.
+    let long = |prefixes: &[&str]| {
+        args.iter()
+            .any(|arg| prefixes.iter().any(|prefix| arg.starts_with(prefix)))
+    };
+    // A cluster such as `-uo` carries the same flag as `-o`.
+    let short = |flags: &str| {
+        args.iter().any(|arg| {
+            arg.strip_prefix('-').is_some_and(|rest| {
+                !rest.starts_with('-') && rest.contains(|flag| flags.contains(flag))
+            })
+        })
+    };
     match program {
-        // Read-only shell primitives and source inspection.
+        "sort" => short("o") || long(&["--o", "--co"]),
+        "uniq" => args.iter().filter(|arg| !arg.starts_with('-')).count() > 1,
+        "tree" => short("or"),
+        "file" => short("c") || long(&["--c"]),
+        "rg" => short("z") || long(&["--pre", "--hostname-bin", "--search-zip"]),
+        "find" => args
+            .iter()
+            .any(|arg| arg.starts_with("-fprint") || arg == "-fls"),
+        "git" => long(&["--out", "--ext", "--textc", "--show-sig"]),
+        _ => false,
+    }
+}
+
+/// Shell primitives and source inspection: nothing here runs code from the workspace.
+fn inspects(program: &str, args: &[String]) -> bool {
+    match program {
         "ls" | "pwd" | "echo" | "printf" | "cat" | "head" | "tail" | "wc" | "sort" | "uniq"
         | "cut" | "tr" | "rg" | "grep" | "diff" | "cmp" | "stat" | "file" | "tree" | "du"
         | "date" | "which" | "where" | "true" | "false" | "sleep" => true,
+        "git" => args.first().is_some_and(|subcommand| {
+            matches!(
+                subcommand.as_str(),
+                "status" | "diff" | "log" | "show" | "blame" | "--version"
+            )
+        }),
+        // Mutation primaries were gated before any program is classified.
+        "find" => true,
+        _ => false,
+    }
+}
+
+fn is_auto_allowed_program(program: &str, args: &[String]) -> bool {
+    if inspects(program, args) {
+        return true;
+    }
+    match program {
         // Build/test entry points intentionally run workspace code; their
         // network and filesystem boundaries still come from the sandbox.
         "cargo" => args.first().is_some_and(|subcommand| {
@@ -510,17 +624,9 @@ fn is_auto_allowed_program(program: &str, args: &[String]) -> bool {
             )
         }),
         "rustc" | "rustfmt" | "go" | "make" | "cmake" | "ninja" | "pytest" => true,
-        "git" => args.first().is_some_and(|subcommand| {
-            matches!(
-                subcommand.as_str(),
-                "status" | "diff" | "log" | "show" | "blame" | "--version"
-            )
-        }),
         // Recursive rm has its own path-sensitive three-tier classifier. Other
         // forms are review-required below.
         "rm" => rm_is_recursive(args),
-        // Read-only find is allowed; mutation primaries were gated earlier.
-        "find" => true,
         _ => false,
     }
 }
@@ -847,7 +953,11 @@ fn argument_escapes_workspace(argument: &str, workspace: Option<&str>) -> bool {
     })
 }
 
-pub(crate) fn needs_review(c: &str, workspace: Option<&str>) -> Option<&'static str> {
+pub(crate) fn needs_review(
+    c: &str,
+    workspace: Option<&str>,
+    scratch: Option<&str>,
+) -> Option<&'static str> {
     let syntax = match parse_shell_syntax(c) {
         Ok(syntax) => syntax,
         Err(_) => return Some("contains unparseable or incomplete shell syntax"),
@@ -928,9 +1038,10 @@ pub(crate) fn needs_review(c: &str, workspace: Option<&str>) -> Option<&'static 
             return Some("uses a dynamic or consequential command");
         }
         if program != "rm"
-            && command.words[program_i + 1..]
-                .iter()
-                .any(|argument| argument_escapes_workspace(argument, workspace))
+            && command.words[program_i + 1..].iter().any(|argument| {
+                argument_escapes_workspace(argument, workspace)
+                    && scratch.is_none_or(|root| argument_escapes_workspace(argument, Some(root)))
+            })
         {
             return Some("references a path outside the authorized workspace");
         }
@@ -994,6 +1105,87 @@ mod tests {
                 );
             }
             assert!(!policy.escalates(AutonomyLevel::Careful, "read"));
+        }
+    }
+
+    /// Without a jail a build can touch the whole machine, so even yolo asks first.
+    #[test]
+    fn the_jail_decides_what_runs_unasked() {
+        let policy = |jail| DefaultPolicy::requiring_approval(["shell.exec"]).with_jail(jail);
+        let decide = |jail, mode, command: &str| {
+            policy(jail).authorize(mode, &shell(command), radius_of("shell.exec"))
+        };
+        use AutonomyLevel::{Careful, Normal, Yolo};
+        for (jail, mode, command, asks) in [
+            (Jail::Missing, Yolo, "cargo test", true),
+            (Jail::Missing, Yolo, "ls src", false),
+            (Jail::Off, Yolo, "cargo test", false),
+            (Jail::Active, Yolo, "cargo test", false),
+            (Jail::Active, Normal, "git status", false),
+            (Jail::Active, Normal, "cat a | grep b", false),
+            (Jail::Active, Normal, "cargo test", true),
+            (Jail::Active, Normal, "ls | make", true),
+            (Jail::Missing, Normal, "ls src", true),
+            (Jail::Active, Careful, "ls src", true),
+        ] {
+            assert_eq!(
+                matches!(decide(jail, mode, command), Decision::Human),
+                asks,
+                "{command} in {mode:?}"
+            );
+        }
+    }
+
+    /// A "read" that can write a file or start a program must not skip the card.
+    #[test]
+    fn an_inspection_tool_that_writes_or_launches_still_asks() {
+        let policy = DefaultPolicy::requiring_approval(["shell.exec"]).with_jail(Jail::Active);
+        let asks = |command: &str| {
+            matches!(
+                policy.authorize(
+                    AutonomyLevel::Normal,
+                    &shell(command),
+                    radius_of("shell.exec")
+                ),
+                Decision::Human
+            )
+        };
+        for command in [
+            "rg --pre ./evil.sh x",
+            "rg --pre-glob '*.x' x",
+            "rg --hostname-bin ./e x",
+            "rg -iz x",
+            "git log --ext-diff -p",
+            "git log --textconv -p",
+            "git diff --output=x.patch",
+            "git show --outp=x",
+            "sort -o src/main.rs in.txt",
+            "sort -uo x in",
+            "sort --o=x in",
+            "sort --compress-program=./e in",
+            "find . -fprint out",
+            "find . -fprintf out %p",
+            "find . -fls out",
+            "uniq in out",
+            "tree -o out",
+            "tree -R -H .",
+            "file -C -m magic",
+            "cat a | sort -o a",
+        ] {
+            assert!(asks(command), "{command} skipped the card");
+        }
+        for command in [
+            "rg -n todo src",
+            "git log --oneline -5",
+            "git diff",
+            "git show head",
+            "sort in.txt",
+            "find . -name x",
+            "uniq in",
+            "tree -l 2",
+            "file a.bin",
+        ] {
+            assert!(!asks(command), "{command} is a plain read");
         }
     }
 

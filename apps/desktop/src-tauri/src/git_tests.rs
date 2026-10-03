@@ -48,3 +48,49 @@ fn outside_a_repository_there_is_no_branch() {
     let dir = scratch("none");
     assert_eq!(branch(&dir.join("missing-child")), None);
 }
+
+/// A sandboxed command can edit a repository's config; the app must not run what it names.
+#[cfg(unix)]
+#[test]
+fn a_repositorys_own_config_cannot_run_a_program() {
+    use std::process::Command;
+    let root = scratch("hostile").canonicalize().unwrap();
+    let (repo, marker) = (root.join("repo"), root.join("ran"));
+    let nested = repo.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let git = |dir: &PathBuf, args: &[&str]| {
+        let done = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "git {args:?}");
+    };
+    let run = format!("sh -c 'touch {}; cat'", marker.display());
+    for (dir, filter) in [(&nested, "inner"), (&repo, "outer")] {
+        git(dir, &["init", "-q"]);
+        fs::write(dir.join("a.txt"), "a\n").unwrap();
+        fs::write(
+            dir.join(".gitattributes"),
+            format!("a.txt filter={filter}\n"),
+        )
+        .unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "first"]);
+        git(dir, &["config", &format!("filter.{filter}.clean"), &run]);
+        git(dir, &["config", "core.fsmonitor", &format!("{run} #")]);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(nested.join("a.txt"), "b\n").unwrap();
+    fs::write(repo.join("a.txt"), "b\n").unwrap();
+
+    git(&repo, &["status", "--porcelain"]);
+    assert!(marker.exists(), "the control repository is not hostile");
+    fs::remove_file(&marker).unwrap();
+
+    let rows = super::status(&repo).unwrap();
+    assert_eq!(rows["files"][0]["path"], "a.txt");
+    super::diff(&repo, "a.txt", false).unwrap();
+    assert!(!marker.exists(), "the repository's config ran a program");
+}

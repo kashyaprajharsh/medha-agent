@@ -5315,7 +5315,7 @@ impl Tool for ShellExec {
                 },
                 "outside_sandbox": {
                     "type": "boolean",
-                    "description": "Last resort, only after a result reported sandbox_blocked with no narrower fix: rerun this exact command once outside the OS sandbox. The user reviews every such run; never set it speculatively."
+                    "description": "Run this exact command once outside the OS sandbox; the user reviews every such run. Use it after a result reported sandbox_blocked with no narrower fix, or up front for a command that needs the user's own credentials or a local daemon, which the sandbox never opens: ssh, git push, docker, kubectl, cloud CLIs. Never set it speculatively for anything else."
                 },
                 "timeout_s": {
                     "type": "integer",
@@ -5342,9 +5342,16 @@ impl Tool for ShellExec {
         let timeout_s = plan.timeout_s;
         let workdir = plan.workdir;
         let deadline = std::time::Duration::from_secs(timeout_s);
+        let mut env = shell_env();
+        // An approved unsandboxed run acts as the user, so it may reach their key agent.
+        if plan.access.outside_sandbox
+            && let Ok(agent) = std::env::var("SSH_AUTH_SOCK")
+        {
+            env.push(("SSH_AUTH_SOCK".into(), agent));
+        }
         let invocation = self
             .sbx
-            .shell_invocation(&command, shell_env(), true)
+            .shell_invocation(&command, env, true)
             .with_working_dir(workdir.clone());
         // Reserve capacity before process creation. The reservation is
         // synchronous and RAII-owned, so rejection, spawn failure, panic, or
@@ -5422,9 +5429,12 @@ impl Tool for ShellExec {
                     "The command may lack filesystem access. Use workdir for the intended directory and request needed directories in read_paths/write_paths before rerunning. A blocked read does not mean a file or program is missing. The command was not replayed; check for partial side effects first."
                 );
             }
-            if denied_filesystem && invocation.jailed() && completed.exit_code != Some(0) {
+            if invocation.jailed() && completed.exit_code != Some(0) {
                 let output = format!("{}\n{}", completed.stdout, completed.stderr);
-                if let Some(next) = shell_hints::sandbox_blocked(&command, &output, &denied_paths) {
+                if (denied_filesystem || shell_hints::local_socket_refused(&output))
+                    && let Some(next) =
+                        shell_hints::sandbox_blocked(&command, &output, &denied_paths)
+                {
                     result["sandbox_blocked"] = json!(next);
                 }
             }

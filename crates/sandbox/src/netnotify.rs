@@ -32,9 +32,9 @@ const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 /// architecture's `connect` number. A filter that did not pin the architecture
 /// could be evaded by a process re-entering through a different syscall ABI.
 #[cfg(target_arch = "x86_64")]
-const ARCH_AND_CONNECT: (u32, u32) = (0xc000_003e, 42);
+pub(crate) const ARCH_AND_CONNECT: (u32, u32) = (0xc000_003e, 42);
 #[cfg(target_arch = "aarch64")]
-const ARCH_AND_CONNECT: (u32, u32) = (0xc000_00b7, 203);
+pub(crate) const ARCH_AND_CONNECT: (u32, u32) = (0xc000_00b7, 203);
 
 #[repr(C)]
 #[derive(Default)]
@@ -163,7 +163,7 @@ fn build_filter() -> Vec<libc::sock_filter> {
     ]
 }
 
-fn stmt(code: u16, k: u32) -> libc::sock_filter {
+pub(crate) fn stmt(code: u16, k: u32) -> libc::sock_filter {
     libc::sock_filter {
         code,
         jt: 0,
@@ -172,7 +172,7 @@ fn stmt(code: u16, k: u32) -> libc::sock_filter {
     }
 }
 
-fn jeq(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+pub(crate) fn jeq(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter {
         code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
         jt,

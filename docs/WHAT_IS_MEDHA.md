@@ -376,6 +376,17 @@ With the default `native` backend, the sandbox blocks:
 - Reads outside the workspace and explicit runtime/approved read roots,
   including credential locations such as `~/.ssh`
 - Network access (the default is `network = "deny"`; opt in explicitly)
+- Local Unix sockets outside the workspace, such as a container daemon's, even
+  once network is granted (Linux closes every Unix socket)
+- On macOS, writes to the workspace repository's `.git/config` and `.git/hooks`,
+  which Git would later run outside the jail
+
+Keys and tokens (`~/.ssh`, `~/.aws`, `~/.gitconfig` and the rest of one shared
+list) are refused to file tools and commands alike, with or without approval. A
+command that signs in with them runs outside the sandbox for that one approved run.
+
+Each session owns an empty scratch folder under the system temp directory. It is
+writable by commands and file tools without a prompt and removed at exit.
 
 The command danger scanner is a separate policy check, not an OS sandbox rule.
 
@@ -423,7 +434,10 @@ local filesystem sandbox.
 ### OS-Native Isolation
 
 - **macOS:** Uses Seatbelt sandboxing profiles
-- **Linux:** Uses Landlock LSM (Linux Security Module)
+- **Linux:** Uses Landlock LSM (Linux Security Module) for files and a seccomp
+  filter for sockets; without both, Medha falls back to no sandbox and says so
+- **Windows:** No OS sandbox yet. Commands run with the user's own rights behind
+  the scanner and the approval gate, and `yolo` still asks before builds and tests
 - **No Docker required** for default isolation
 - **Zero additional dependencies**
 

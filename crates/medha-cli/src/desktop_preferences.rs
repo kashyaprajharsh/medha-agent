@@ -202,7 +202,7 @@ fn settings(cfg: &config::Config) -> Value {
                 "auth": auth, "discovery": available, "providers": presets})
         })
         .collect();
-    json!({ "models": models, "protocols": protocols, "presets": config::provider_presets().iter().map(|(name, url)| json!({"name": name, "url": url})).collect::<Vec<_>>(), "search": { "provider": provider.as_str(), "searxng_url": cfg.search.searxng_url, "key_present": config::search_cred_id(provider).is_some_and(config::key_present) }, "mcp": mcp })
+    json!({ "models": models, "protocols": protocols, "presets": config::provider_presets().iter().map(|(name, url)| json!({"name": name, "url": url})).collect::<Vec<_>>(), "search": { "provider": provider.as_str(), "searxng_url": cfg.search.searxng_url, "key_present": config::search_cred_id(provider).is_some_and(config::key_present) }, "mcp": mcp, "keychain": config::prefer_keychain() })
 }
 fn instruction_path(workspace: &Path, kind: &str) -> Result<std::path::PathBuf> {
     match kind {
@@ -218,26 +218,35 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
     match method {
         "settings.list" => Ok(settings(&config::load()?.unwrap_or_default())),
         "settings.model.save" => {
-            let name = text(params, "name")?;
             let profile: config::ProviderConfig =
                 serde_json::from_value(params["profile"].clone())?;
             profile.validate().map_err(anyhow::Error::msg)?;
             let key = params["key"].as_str().filter(|key| !key.trim().is_empty());
+            let given = params["name"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty());
+            let mut saved = String::new();
             config::edit(|cfg| {
-                if cfg.models.contains_key(name) {
-                    cfg.models.insert(name.to_owned(), profile.clone());
+                // A model added without a name is named as the TUI names one.
+                let name = given.map_or_else(
+                    || config::derive_profile_name(cfg, &profile.model),
+                    str::to_owned,
+                );
+                if cfg.models.contains_key(&name) {
+                    cfg.models.insert(name.clone(), profile.clone());
                     if params["default"] == true {
-                        cfg.set_default_model(name)?;
+                        cfg.set_default_model(&name)?;
                     }
                 } else {
-                    cfg.add_model(name.to_owned(), profile.clone(), params["default"] == true)?;
+                    cfg.add_model(name.clone(), profile.clone(), params["default"] == true)?;
                 }
                 if let Some(key) = key {
                     config::store_key(&profile.base_url, key)?;
                 }
+                saved = name;
                 Ok(())
             })?;
-            Ok(json!({ "saved": true }))
+            Ok(json!({ "saved": true, "name": saved }))
         }
         "settings.model.default" => {
             config::edit(|cfg| cfg.set_default_model(text(params, "name")?))?;
@@ -309,6 +318,11 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
         "settings.keys" => Ok(crate::desktop_keys::list(
             &config::load()?.unwrap_or_default(),
         )),
+        "settings.keys.store" => {
+            let cfg = config::load()?.unwrap_or_default();
+            config::move_keys(&cfg, params["keychain"] == true)?;
+            Ok(json!({"saved": true}))
+        }
         "settings.keys.set" | "settings.keys.remove" => {
             let cfg = config::load()?.unwrap_or_default();
             if method == "settings.keys.set" {
@@ -654,6 +668,10 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
                 json!({"models": models.iter().map(|model| json!({"id": model.id, "context_length": model.context_length})).collect::<Vec<_>>() }),
             )
         }
+        // The size a session would fall back to when neither config nor server gives one.
+        "settings.model.context" => Ok(json!({
+            "published": providers::models_dev::context_window(text(params, "model")?).await
+        })),
         "extensions.skill.install" => {
             let skills = tools::SkillStore::new(
                 workspace.join(".medha/skills"),

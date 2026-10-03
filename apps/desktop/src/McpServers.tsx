@@ -65,9 +65,27 @@ export type McpPrefill = {
   inputs?: { name: string; description?: string; default?: string | null }[];
 };
 
+/** Where a secret goes, as the end of a sentence; it follows the choice made on the Keys page. */
+function useKeyPlace() {
+  const api = useWorkspaceApi();
+  const [keychain, setKeychain] = useState<boolean>();
+  useEffect(() => {
+    let active = true;
+    void api
+      .settings()
+      .then((result) => active && setKeychain(result.keychain === true))
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [api]);
+  return keychain === undefined ? "with your other keys" : keychain ? "in your system keychain" : "in your private keys file";
+}
+
 /** Everything `/mcp add` takes, as a form: remote servers sign in with OAuth or a
- * token, local ones get an API key and environment; secrets go to the keychain. */
+ * token, local ones get an API key and environment; secrets go to the key store. */
 export function McpForm({ busy, onSave, initial }: { busy: boolean; onSave: (args: string[]) => Promise<void>; initial?: McpPrefill }) {
+  const place = useKeyPlace();
   const secrets = initial?.variables?.filter((variable) => variable.secret) ?? [];
   const [id, setId] = useState(initial?.id ?? "");
   const [transport, setTransport] = useState<string>(initial?.transport ?? "remote");
@@ -174,9 +192,9 @@ export function McpForm({ busy, onSave, initial }: { busy: boolean; onSave: (arg
           )}
           <p className="quiet">
             {signIn === "oauth"
-              ? "Connecting opens your browser to sign in. Medha keeps the sign-in in your keychain."
+              ? `Connecting opens your browser to sign in. Medha keeps the sign-in ${place}.`
               : signIn === "token"
-                ? `${initial?.tokenHelp ? `${initial.tokenHelp}. ` : ""}The token is kept in your keychain, never in a file.`
+                ? `${initial?.tokenHelp ? `${initial.tokenHelp}. ` : ""}The token is kept ${place}, not in your config file.`
                 : "If the server asks for sign-in, Medha opens your browser when you connect."}
           </p>
         </>
@@ -228,7 +246,7 @@ export function McpForm({ busy, onSave, initial }: { busy: boolean; onSave: (arg
             <p className="quiet">Put secrets in API key, not here: variables are saved in your config file.</p>
             {variables.some((variable) => variable.secret) && (
               <p className="surface-error">
-                This server needs more than one secret. Only the API key goes to your keychain; {variables.filter((variable) => variable.secret).map((variable) => variable.name).join(", ")} would be saved in your config file.
+                This server needs more than one secret. Only the API key is kept {place}; {variables.filter((variable) => variable.secret).map((variable) => variable.name).join(", ")} would be saved in your config file.
               </p>
             )}
           </fieldset>
@@ -273,6 +291,7 @@ type DetailsProps = {
 
 /** A saved server's sign-in, secrets (named, never shown), tools and access. */
 export function McpDetails({ server, status, tools, busy, onUpdate, onSignIn, onSignOut }: DetailsProps) {
+  const place = useKeyPlace();
   const prefix = `mcp__${server.id}__`;
   const exposed = tools.filter((tool) => tool.name.startsWith(prefix)).map((tool) => ({ name: tool.name.slice(prefix.length), description: tool.description }));
   const rows = [...exposed, ...server.deny_tools.filter((name) => !exposed.some((tool) => tool.name === name)).map((name) => ({ name, description: "" }))];
@@ -302,8 +321,8 @@ export function McpDetails({ server, status, tools, busy, onUpdate, onSignIn, on
           <p className="quiet">
             {server.key_present
               ? server.url
-                ? "Token saved in your keychain"
-                : "API key saved in your keychain"
+                ? `Token saved ${place}`
+                : `API key saved ${place}`
               : server.url
                 ? "No sign-in. If the server asks, connecting opens your browser."
                 : "No API key"}

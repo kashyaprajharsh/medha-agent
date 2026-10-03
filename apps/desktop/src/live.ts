@@ -575,6 +575,9 @@ function lastLine(text?: string) {
 }
 
 export function explainError(message: string) {
+  if (/no model configured/i.test(message)) {
+    return "No model is connected yet. Choose “No model yet” below to connect one.";
+  }
   if (
     /transport error|error sending request|connection refused/i.test(message)
   ) {

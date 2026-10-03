@@ -83,9 +83,6 @@ export function Sidebar(props: Props) {
     groups.get(label)!.push(session);
   }
   for (const [label, rows] of groups) if (!rows.length) groups.delete(label);
-  const folder =
-    props.workspace.split(/[\\/]/).filter(Boolean).at(-1) || "Workspace";
-
   return (
     <aside
       id="session-sidebar"
@@ -222,7 +219,7 @@ export function Sidebar(props: Props) {
         })}
         {!props.loading && sessions.length === 0 && (
           <p className="side-empty">
-            No sessions in {folder} yet. Choose New session to get started.
+            No sessions in {props.workspaceName} yet. Choose New session to get started.
           </p>
         )}
       </nav>

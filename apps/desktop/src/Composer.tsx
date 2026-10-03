@@ -41,6 +41,8 @@ type Props = {
   onRewind: () => void;
   onSettings: () => void;
   onExtensions: () => void;
+  /** Set while no model is saved: the model chip opens setup instead of a list. */
+  onConnect?: () => void;
   /** Enabled skills the `/` menu offers alongside its commands. */
   skills?: { name: string; description: string }[];
   /** The skill riding along with the next message, if one was chosen. */
@@ -459,11 +461,13 @@ export function Composer(props: Props) {
             <button
               type="button"
               key={control}
-              className={`chip ${props.control === control ? "active" : ""}`}
+              className={`chip ${props.control === control ? "active" : ""}${control === "model" && props.onConnect ? " needs" : ""}`}
               aria-haspopup="dialog"
               aria-expanded={props.control === control}
               onClick={() =>
-                props.onControl(props.control === control ? null : control)
+                control === "model" && props.onConnect
+                  ? props.onConnect()
+                  : props.onControl(props.control === control ? null : control)
               }
             >
               <Icon
@@ -477,7 +481,9 @@ export function Composer(props: Props) {
               />
               <span className="chip-label">
                 {control === "model"
-                  ? props.settings?.profile || props.model || "Model"
+                  ? props.onConnect
+                    ? "No model yet"
+                    : props.settings?.profile || props.model || "Model"
                   : control === "reasoning"
                     ? props.settings?.reasoning === "off"
                       ? "Thinking off"

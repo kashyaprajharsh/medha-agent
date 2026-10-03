@@ -117,6 +117,30 @@
   color: var(--faint);
 }
 
+.key-store {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  margin-bottom: var(--s-8);
+}
+.key-store > span {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.key-store small {
+  color: var(--dim);
+  font-size: var(--text-sm);
+}
+.key-store .segmented {
+  flex: none;
+  margin: 0;
+}
+.key-store .segmented button {
+  padding: 7px var(--s-3);
+  white-space: nowrap;
+}
 .key-list {
   list-style: none;
   padding: 0;

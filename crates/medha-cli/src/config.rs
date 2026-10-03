@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+#[path = "key_store.rs"]
+mod key_store;
+pub(crate) use key_store::move_keys;
+
 const KEYRING_SERVICE: &str = "medha";
 
 const PRESETS: &[(&str, &str)] = &[
@@ -1494,10 +1498,16 @@ fn first_env(names: &[&str]) -> Option<String> {
         .find_map(|n| std::env::var(n).ok().filter(|v| !v.is_empty()))
 }
 
-fn prefer_keychain() -> bool {
+/// The environment decides where keys go, over the choice saved in Settings.
+pub(crate) fn key_store_forced() -> bool {
+    std::env::var("MEDHA_CRED_STORE").is_ok_and(|v| !v.is_empty())
+}
+
+pub(crate) fn prefer_keychain() -> bool {
     std::env::var("MEDHA_CRED_STORE")
         .ok()
         .filter(|v| !v.is_empty())
+        .or_else(|| read_credentials_file(&credentials_path().ok()?).store)
         .unwrap_or_else(|| {
             option_env!("MEDHA_DEFAULT_CRED_STORE")
                 .unwrap_or("file")
@@ -1512,6 +1522,9 @@ fn credentials_path() -> Result<PathBuf> {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CredentialsFile {
+    /// `keychain` or `file`, once chosen in Settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
     #[serde(default)]
     keys: BTreeMap<String, String>,
 }

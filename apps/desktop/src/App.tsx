@@ -15,6 +15,7 @@ import {
   type SessionSettings,
 } from "./api";
 import { FileViewer } from "./FileViewer";
+import { FirstRun } from "./FirstRun";
 import { Extensions } from "./Extensions";
 import { Rewind } from "./Rewind";
 import { Settings } from "./Settings";
@@ -122,6 +123,30 @@ export function App() {
   };
   const [control, setControl] = useState<Control | null>(null);
   const [defaults, setDefaults] = useState<SessionSettings>();
+  // With no model saved, setup opens by itself once; a task typed meanwhile waits for it.
+  const [modelless, setModelless] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const declined = useRef(false);
+  const held = useRef(false);
+  useEffect(() => {
+    let active = true;
+    const check = () =>
+      void api
+        .settings()
+        .then((result) => {
+          if (!active) return;
+          const none = (result.models as unknown[]).length === 0;
+          setModelless(none);
+          if (none && !declined.current) setConnecting(true);
+        })
+        .catch(() => {});
+    check();
+    window.addEventListener("medha-preferences", check);
+    return () => {
+      active = false;
+      window.removeEventListener("medha-preferences", check);
+    };
+  }, [api]);
   const [showReasoning, setShowReasoning] = useState(
     () => stored("medha-show-thinking") === "true",
   );
@@ -470,6 +495,12 @@ export function App() {
     const typed =
       message.trim() || (images.length ? "Describe the attached images." : "");
     if (!currentKey || !typed) return;
+    if (modelless) {
+      held.current = true;
+      setText((all) => ({ ...all, [currentKey]: message }));
+      setConnecting(true);
+      return;
+    }
     // The request leads; the skill's procedure follows in the same words the
     // TUI uses, so the model sees the same thing on either surface.
     const skill = skillFor[currentKey];
@@ -492,6 +523,12 @@ export function App() {
       },
     );
   }
+  // The task typed before a model existed goes out as soon as one does.
+  useEffect(() => {
+    if (modelless || !held.current) return;
+    held.current = false;
+    submit();
+  }, [modelless]);
 
   function togglePin(id: string) {
     setPinned((previous) => {
@@ -1020,6 +1057,7 @@ export function App() {
             onRewind={() => openRewind()}
             onSettings={() => setPage("settings")}
             onExtensions={() => setPage("extensions")}
+            onConnect={modelless ? () => setConnecting(true) : undefined}
             contextPercent={state?.contextPercent}
             skills={skills}
             skill={currentKey ? skillFor[currentKey]?.name : undefined}
@@ -1117,6 +1155,19 @@ export function App() {
           sessions={roots}
           onOpen={openSession}
           onClose={() => setPalette(false)}
+        />
+      )}
+      {connecting && (
+        <FirstRun
+          onDone={() => {
+            setConnecting(false);
+            setModelless(false);
+          }}
+          onClose={() => {
+            declined.current = true;
+            held.current = false;
+            setConnecting(false);
+          }}
         />
       )}
 

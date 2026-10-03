@@ -12,7 +12,7 @@ type Key = {
   oauth?: boolean;
   signed_in?: boolean;
 };
-type Listing = { models: Key[]; search: Key[]; mcp: Key[]; store: string };
+type Listing = { models: Key[]; search: Key[]; mcp: Key[]; store: string; keychain: boolean; forced: boolean };
 
 /** Every key Medha uses, on one page. Values are never shown or sent back. */
 export function Keys() {
@@ -48,6 +48,22 @@ export function Keys() {
       window.dispatchEvent(new CustomEvent("medha-preferences"));
     } catch (cause) {
       setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** Keep keys in the keychain or the private file; the saved ones move with the choice. */
+  async function keep(keychain: boolean) {
+    if (!listing || listing.keychain === keychain) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.settings("settings.keys.store", { keychain });
+      setRefresh((count) => count + 1);
+      window.dispatchEvent(new CustomEvent("medha-preferences"));
+    } catch (cause) {
+      setError(String(cause).replace(/^Error:\s*/, ""));
     } finally {
       setBusy(false);
     }
@@ -109,9 +125,31 @@ export function Keys() {
   return (
     <div className="keys-page">
       <PageTop title="Keys">
-        Every key Medha uses. Values are never shown{listing ? `; new keys are kept in ${listing.store}` : ""}.
+        Every key Medha uses. Values are never shown.
       </PageTop>
       {error && <p className="surface-error" role="alert">{error}</p>}
+      {listing && (
+        <div className="key-store">
+          <span>
+            <b>Where keys are kept</b>
+            <small>
+              {listing.forced
+                ? `In ${listing.store}. MEDHA_CRED_STORE is set on this computer, so it decides.`
+                : listing.keychain
+                  ? `In ${listing.store}. It may ask you to allow Medha again after an update.`
+                  : `In ${listing.store}.`}
+            </small>
+          </span>
+          <div className="segmented" role="group" aria-label="Where keys are kept">
+            <button aria-pressed={!listing.keychain} disabled={busy || listing.forced} onClick={() => void keep(false)}>
+              Private file
+            </button>
+            <button aria-pressed={listing.keychain} disabled={busy || listing.forced} onClick={() => void keep(true)}>
+              System keychain
+            </button>
+          </div>
+        </div>
+      )}
       {!listing && !error && <p className="quiet">Reading keys…</p>}
       {groups.map(
         ([title, keys]) =>

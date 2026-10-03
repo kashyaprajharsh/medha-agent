@@ -52,7 +52,12 @@ pub(crate) fn list(cfg: &config::Config) -> Value {
             })
         })
         .collect();
-    json!({"models": models, "search": search, "mcp": mcp, "store": config::credential_store_label()})
+    json!({
+        "models": models, "search": search, "mcp": mcp,
+        "store": config::credential_store_label(),
+        "keychain": config::prefer_keychain(),
+        "forced": config::key_store_forced(),
+    })
 }
 
 fn endpoint<'a>(cfg: &config::Config, id: &'a str) -> Result<&'a str> {

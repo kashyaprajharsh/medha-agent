@@ -1530,7 +1530,7 @@ anywhere lands in the log instead of on screen, and is restored on exit and via 
 panic hook.
 
 **Secrets never enter scrollback.** A slash command carrying a token is redacted from
-the transcript but stays recallable with ↑ — the key is already in the keychain, so a
+the transcript but stays recallable with ↑ — the key is already in the key store, so a
 second copy on screen is only somewhere to leak from.
 
 ### ACP — the editor bridge

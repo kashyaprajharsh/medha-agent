@@ -4477,7 +4477,10 @@ fn mcp_choose_auth(
         prefill_command(
             model,
             &format!("/mcp add {id} {url} --bearer "),
-            "paste the API token after --bearer (it goes to the OS keychain, never a file)",
+            &format!(
+                "paste the API token after --bearer (it is kept in {}, not in config.toml)",
+                config::credential_store_label()
+            ),
         );
         return;
     }

@@ -50,7 +50,7 @@ pub struct Workspace {
 /// Requests that wait on git or the network. They run in a second service
 /// process: the backend answers one request at a time, and a slow clone must
 /// never hold up session history.
-pub(crate) const SLOW_REQUESTS: [&str; 10] = [
+pub(crate) const SLOW_REQUESTS: [&str; 11] = [
     "usage.summary",
     "library.usage",
     "extensions.mcp.registry",
@@ -61,6 +61,7 @@ pub(crate) const SLOW_REQUESTS: [&str; 10] = [
     "extensions.marketplace.add",
     "extensions.marketplace.refresh",
     "settings.model.discover",
+    "settings.model.context",
 ];
 
 /// Requests that change the chat's own folder or its state, not the user's settings.

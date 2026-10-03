@@ -1492,6 +1492,7 @@ test("zero and single-token charts never print duplicate rounded ticks", async (
 
 test("Unity setup requires its folder and preserves spaces as one argument", async () => {
   const saved = [];
+  globalThis.__medhaControlsTest.api.settings = async () => ({ keychain: false });
   await act(async () => root.render(h(McpForm, {
     busy: false, onSave: async (args) => saved.push(args),
     initial: { id: "unity", transport: "local", command: ["uv", "--directory", "{unity_mcp_server_src}", "run", "server.py"],

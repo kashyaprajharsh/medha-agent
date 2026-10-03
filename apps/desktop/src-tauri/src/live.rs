@@ -250,7 +250,9 @@ impl LiveSessions {
         let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         writeln!(live.input, "{frame}")
             .and_then(|()| live.input.flush())
-            .map_err(|error| format!("Medha stopped: {error}"))?;
+            .map_err(|_| {
+                "This session has stopped. Start a new session to continue.".to_string()
+            })?;
         Ok(id)
     }
 

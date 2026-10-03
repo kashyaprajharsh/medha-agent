@@ -10,6 +10,7 @@
 @import "./surfaces/sidebar.css";
 @import "./surfaces/palette.css";
 @import "./surfaces/welcome.css";
+@import "./surfaces/first-run.css";
 @import "./surfaces/veena.css";
 @import "./surfaces/markdown.css";
 @import "./surfaces/chat.css";

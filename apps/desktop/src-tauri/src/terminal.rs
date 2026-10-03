@@ -3,7 +3,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 type OpenTerminals = Arc<Mutex<HashMap<String, Terminal>>>;
@@ -236,12 +236,11 @@ fn user_shell() -> PathBuf {
             .map(PathBuf::from)
             .filter(|shell| shell.is_absolute() && shell.is_file())
             .unwrap_or_else(|| {
-                Path::new(if cfg!(target_os = "macos") {
+                PathBuf::from(if cfg!(target_os = "macos") {
                     "/bin/zsh"
                 } else {
                     "/bin/sh"
                 })
-                .into()
             })
     }
     #[cfg(windows)]

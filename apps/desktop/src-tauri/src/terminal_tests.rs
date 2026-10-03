@@ -1,5 +1,7 @@
 use super::*;
+#[cfg(unix)]
 use std::sync::mpsc::{Receiver, channel};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[test]

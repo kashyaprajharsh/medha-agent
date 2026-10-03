@@ -305,11 +305,23 @@ async fn plugin_command_snippet_runs_in_its_sandbox_before_submission() {
         .unwrap();
     let commands = commands::load(store, &[]);
     assert!(commands::has_snippets(&commands, "/review Ada"));
-    let prompt =
+    let expanded =
         commands::expand_with_snippets(&commands, "/review Ada", store, &f.root.join("workspace"))
-            .await
-            .unwrap()
-            .unwrap();
+            .await;
+    // The runner's own backend decides: where it cannot prove network denial (Landlock
+    // never claims it), the snippet must be refused rather than run unconfined.
+    let backend = sandbox::select_backend(
+        &sandbox::SandboxConfig::default(),
+        Vec::new(),
+        sandbox::ApprovedRoots::default(),
+        sandbox::NetworkGrant::default(),
+    );
+    if sandbox::ExecBackend::containment(backend.as_ref()) != kernel::Containment::OsFsJailNoNet {
+        let error = expanded.expect_err("snippet ran without network isolation");
+        assert!(error.contains("sandbox is unavailable"), "{error}");
+        return;
+    }
+    let prompt = expanded.unwrap().unwrap();
     assert!(prompt.contains("[plugin command output — untrusted]\nhello\n"));
     assert!(prompt.ends_with(" for Ada."));
     let injected = commands::expand_with_snippets(

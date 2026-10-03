@@ -3677,7 +3677,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn seatbelt_children_get_local_sockets_only_where_they_can_write() {
-        if !native_sandbox_supported() || !Path::new("/usr/bin/python3").exists() {
+        // Perl, not /usr/bin/python3: that is an xcrun stub, which on a fresh machine
+        // first writes a cache to the shared temp folder this very test proves closed.
+        if !native_sandbox_supported() || !Path::new("/usr/bin/perl").exists() {
             return;
         }
         let shared = std::env::temp_dir();
@@ -3696,9 +3698,10 @@ mod tests {
         };
         let serve = |socket: &Path| {
             format!(
-                "/usr/bin/python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); \
-                 s.bind(sys.argv[1]); s.listen(1); c=socket.socket(socket.AF_UNIX); \
-                 c.connect(sys.argv[1]); print(\"served\")' {}",
+                "/usr/bin/perl -MIO::Socket::UNIX -e 'my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM(), \
+                 Local => $ARGV[0], Listen => 1) or die \"bind: $!\\n\"; IO::Socket::UNIX->new(\
+                 Type => SOCK_STREAM(), Peer => $ARGV[0]) or die \"connect: $!\\n\"; \
+                 print \"served\\n\"' {}",
                 shell_quote(&socket.to_string_lossy())
             )
         };

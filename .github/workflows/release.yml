@@ -204,18 +204,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `installer` is the name people download: Medha-<system>-<chip>.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bundles: deb,appimage
+            installer: Medha-Linux-x64
           - os: macos-15
             target: aarch64-apple-darwin
             bundles: app,dmg
+            installer: Medha-macOS-arm64
           - os: macos-15
             target: x86_64-apple-darwin
             bundles: app,dmg
+            installer: Medha-macOS-x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: nsis
+            installer: Medha-Windows-x64
     # The update signing key lives in this environment, so its reviewers decide who may sign.
     environment: ${{ (github.event_name == 'push' || inputs.publish) && 'release' || '' }}
     defaults:
@@ -277,13 +282,13 @@ jobs:
           npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
           --config src-tauri/tauri.updates.conf.json
 
-      # One flat folder of installers, each named for its target, with its checksum
-      # and, when signed, its update signature.
+      # One flat folder of installers, each named for its system and chip, with its
+      # checksum and, when signed, its update signature.
       - name: Collect installers
         shell: bash
         run: |
           bundle="src-tauri/target/${{ matrix.target }}/release/bundle"
-          stem="out/medha-desktop-${{ matrix.target }}"
+          stem="out/${{ matrix.installer }}"
           mkdir -p out
           keep() {
             [ -f "$1" ] || return 0

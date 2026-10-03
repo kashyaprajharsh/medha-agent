@@ -13,10 +13,10 @@ add() {
     '.[$key] = { url: $url, signature: ($sig | rtrimstr("\n")) }')"
 }
 
-add darwin-aarch64 medha-desktop-aarch64-apple-darwin.app.tar.gz
-add darwin-x86_64 medha-desktop-x86_64-apple-darwin.app.tar.gz
-add linux-x86_64 medha-desktop-x86_64-unknown-linux-gnu.AppImage
-add windows-x86_64 medha-desktop-x86_64-pc-windows-msvc.exe
+add darwin-aarch64 Medha-macOS-arm64.app.tar.gz
+add darwin-x86_64 Medha-macOS-x64.app.tar.gz
+add linux-x86_64 Medha-Linux-x64.AppImage
+add windows-x86_64 Medha-Windows-x64.exe
 
 jq -n --arg version "${tag#v}" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson platforms "$platforms" \
   '{ version: $version, pub_date: $date, platforms: $platforms }' > latest.json

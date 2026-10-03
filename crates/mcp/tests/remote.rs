@@ -36,7 +36,9 @@ async fn spawn_with_challenge(
                 };
                 if !common::named(&request) {
                     let _ = stream
-                        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                        .write_all(
+                            b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
                         .await;
                     return;
                 }
@@ -54,7 +56,7 @@ async fn spawn_with_challenge(
                     let _ = stream
                         .write_all(
                             format!(
-                                "HTTP/1.1 401 Unauthorized\r\n{header}Content-Length: 0\r\n\r\n"
+                                "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n{header}Content-Length: 0\r\n\r\n"
                             )
                             .as_bytes(),
                         )
@@ -67,7 +69,7 @@ async fn spawn_with_challenge(
                 let _ = stream
                     .write_all(
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n\
                              Content-Length: {}\r\n\r\n{payload}",
                             payload.len()
                         )
@@ -98,14 +100,16 @@ async fn spawn_gated(calls: Arc<AtomicBool>, posts: bool, challenge: &'static st
                 };
                 let body = request.split_once("\r\n\r\n").map_or("", |(_, b)| b);
                 let head = if request.starts_with("GET") {
-                    "405 Method Not Allowed\r\n".to_string()
+                    "405 Method Not Allowed\r\nConnection: close\r\n".to_string()
                 } else if posts || (calls.load(Ordering::SeqCst) && body.contains("\"tools/call\""))
                 {
-                    format!("401 Unauthorized\r\nWWW-Authenticate: {challenge}\r\n")
+                    format!(
+                        "401 Unauthorized\r\nConnection: close\r\nWWW-Authenticate: {challenge}\r\n"
+                    )
                 } else {
                     let payload = reply(body).to_string();
                     format!(
-                        "200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                        "200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
                         payload.len()
                     )
                 };

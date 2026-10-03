@@ -1,6 +1,6 @@
 [package]
 name = "medha-desktop"
-version = "0.1.8"
+version = "0.1.9"
 description = "Medha desktop shell"
 edition = "2024"
 rust-version = "1.89"

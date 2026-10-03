@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "context"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "futures",
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "extensions"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "fd-lock",
@@ -1286,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "gate"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "fd-lock",
  "glob",
@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "base64",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "lockfile"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "context",
  "kernel",
@@ -2167,7 +2167,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lsp"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dirs",
  "fd-lock",
@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "dirs",
@@ -2286,7 +2286,7 @@ dependencies = [
 
 [[package]]
 name = "medha-cli"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "medha-extension-api"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "semver",
  "serde",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "media"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "image",
@@ -2384,7 +2384,7 @@ dependencies = [
 
 [[package]]
 name = "memory"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "context",
@@ -2676,7 +2676,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orchestrator"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "fd-lock",
@@ -2775,7 +2775,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "permissions"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "dirs",
@@ -3017,7 +3017,7 @@ dependencies = [
 
 [[package]]
 name = "policy"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "kernel",
  "regex",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "providers"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3759,7 +3759,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "kernel",
@@ -4110,7 +4110,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "store"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "kernel",
@@ -4399,7 +4399,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "tempfile",
 ]
@@ -4644,7 +4644,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "fd-lock",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "transcript-view"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "pulldown-cmark",
  "serde_json",

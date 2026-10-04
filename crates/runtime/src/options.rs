@@ -32,4 +32,6 @@ pub struct SessionOptions {
     pub first_run_setup: bool,
     /// The surface can open model setup itself, so no saved model is not an error.
     pub may_start_unconfigured: bool,
+    /// Who runs the user's remote MCP servers for every chat, when someone does.
+    pub mcp_host: Option<mcp::hub::Endpoint>,
 }

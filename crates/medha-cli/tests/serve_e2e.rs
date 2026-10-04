@@ -810,3 +810,72 @@ async fn a_chat_in_the_backend_answers_its_own_requests_as_one_in_its_own_proces
         assert_eq!(in_backend, in_process, "{method}");
     }
 }
+
+/// A remote MCP server with one tool, counting how many times a client connected to it.
+fn remote_mcp_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let connected = Arc::new(AtomicUsize::new(0));
+    let counted = connected.clone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let Some((_, body)) = read_request(&mut stream) else {
+                continue;
+            };
+            let asked: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let result = match asked["method"].as_str() {
+                Some("initialize") => {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "hosted", "version": "0.0.1"}})
+                }
+                Some("tools/list") => json!({"tools": [{"name": "ping",
+                    "description": "Ping the hosted server", "inputSchema": {"type": "object"}}]}),
+                _ => json!({}),
+            };
+            let reply = json!({"jsonrpc": "2.0", "id": asked["id"], "result": result});
+            respond(&mut stream, "application/json", &reply.to_string());
+        }
+    });
+    (url, connected)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chats_in_the_backend_share_one_connection_to_a_remote_mcp_server() {
+    let world = World::new();
+    let (url, connected) = remote_mcp_server();
+    std::fs::create_dir_all(world.home()).unwrap();
+    let config = format!("[mcp.hosted]\nurl = \"{url}\"\ntrust = \"trusted\"\n");
+    std::fs::write(world.home().join("config.toml"), config).unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chats = [
+        client.open(&world.folder("one")).await,
+        client.open(&world.folder("two")).await,
+    ];
+
+    // Each chat is told the server is ready and offers its tool.
+    let mut ready = std::collections::HashSet::new();
+    while ready.len() < chats.len() {
+        let frame = match client.events.pop_front() {
+            Some(frame) => frame,
+            None => client.frame().await,
+        };
+        let said = &frame["params"]["frame"];
+        let hosted = said["params"]["servers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|server| server["server"] == "hosted" && server["state"] == "ready");
+        if said["method"] == "mcp.status" && hosted {
+            ready.insert(frame["params"]["session"].as_str().unwrap().to_string());
+        }
+    }
+    let connections = connected.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        connections, 1,
+        "each chat connected to the server for itself"
+    );
+}

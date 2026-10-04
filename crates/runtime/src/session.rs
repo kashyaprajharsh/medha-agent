@@ -435,7 +435,7 @@ pub async fn start(
         // With a shared host, the user's remote servers are the host's to run;
         // without one answering, this chat runs them as before.
         let mut manager = None;
-        if let Some(endpoint) = crate::mcp_shared::endpoint() {
+        if let Some(endpoint) = options.mcp_host.clone() {
             let own: Vec<_> = mcp_servers
                 .iter()
                 .filter(|server| !shared_mcp.contains(&server.id))

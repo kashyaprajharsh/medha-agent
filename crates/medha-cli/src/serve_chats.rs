@@ -34,12 +34,19 @@ impl Collected {
 /// A folder's chats, and what is asked about the folder, share its one opened
 /// workspace and so its one event log. A folder stays open once it has been
 /// used: reopening would check its whole log again on every request.
-#[derive(Default)]
 pub(crate) struct ServeChats {
     folders: Mutex<HashMap<PathBuf, Arc<Workspace>>>,
+    mcp_host: mcp::hub::Endpoint,
 }
 
 impl ServeChats {
+    pub(crate) fn new(mcp_host: mcp::hub::Endpoint) -> Self {
+        Self {
+            folders: Mutex::default(),
+            mcp_host,
+        }
+    }
+
     fn workspace(&self, folder: &Path, notices: &dyn Notices) -> anyhow::Result<Arc<Workspace>> {
         let mut folders = self
             .folders
@@ -100,7 +107,8 @@ impl Chats for ServeChats {
 
     async fn open(&self, params: &Value) -> Result<Opened, String> {
         let folder = folder(&params["folder"])?;
-        let options = options(params)?;
+        let mut options = options(params)?;
+        options.mcp_host = Some(self.mcp_host.clone());
         let restore = params
             .get("settings")
             .filter(|saved| saved.is_object())

@@ -45,6 +45,30 @@ async fn host(args: &[String]) -> anyhow::Result<()> {
         .filter(|value| !value.is_empty())
         .with_context(|| format!("{TOKEN_ENV} must be set"))?
         .into();
+    let changed = Arc::new(tokio::sync::Notify::new());
+    // The desktop writes here when it changes a server or a key, and closes it on exit.
+    let orphaned = {
+        let changed = Arc::clone(&changed);
+        async move {
+            let mut sink = [0u8; 64];
+            let mut stdin = tokio::io::stdin();
+            while matches!(stdin.read(&mut sink).await, Ok(read) if read > 0) {
+                changed.notify_one();
+            }
+        }
+    };
+    run_shared(&address, token, changed, orphaned).await
+}
+
+/// Owns the user's remote MCP connections and serves the chats that attach,
+/// until `stopped`. A backend runs this inside itself; the desktop's host
+/// process runs it until the desktop goes.
+pub(crate) async fn run_shared(
+    address: &str,
+    token: Arc<str>,
+    changed: Arc<tokio::sync::Notify>,
+    stopped: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
     let home = config::medha_home()?;
     let cfg = config::load()?.unwrap_or_default();
     let manager = mcp::McpManager::new(
@@ -62,8 +86,7 @@ async fn host(args: &[String]) -> anyhow::Result<()> {
         let manager = manager.clone();
         async move { manager.connect_startup().await }
     });
-    let changed = Arc::new(tokio::sync::Notify::new());
-    tokio::spawn(follow_config(manager.clone(), Arc::clone(&changed)));
+    tokio::spawn(follow_config(manager.clone(), changed));
     let resolve: mcp::hub::Resolve = Arc::new(|id: &str| {
         let Some(cfg) = config::load().ok().flatten() else {
             return Ok(None);
@@ -75,23 +98,15 @@ async fn host(args: &[String]) -> anyhow::Result<()> {
             .transpose()
             .map_err(|error| format!("{error:#}"))
     });
-    // The desktop writes here when it changes a server or a key, and closes it on exit.
-    let orphaned = async {
-        let mut sink = [0u8; 64];
-        let mut stdin = tokio::io::stdin();
-        while matches!(stdin.read(&mut sink).await, Ok(read) if read > 0) {
-            changed.notify_one();
-        }
-    };
     tokio::select! {
-        served = mcp::hub::run_host(manager.clone(), &address, token, resolve) => {
+        served = mcp::hub::run_host(manager.clone(), address, token, resolve) => {
             served.with_context(|| format!("could not listen on {address}"))?;
         }
-        () = orphaned => {}
+        () = stopped => {}
     }
     manager.shutdown().await;
     #[cfg(unix)]
-    let _ = std::fs::remove_file(&address);
+    let _ = std::fs::remove_file(address);
     Ok(())
 }
 

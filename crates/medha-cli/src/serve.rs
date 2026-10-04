@@ -23,17 +23,38 @@ pub(crate) fn directory(home: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn address(directory: &Path) -> String {
-    directory.join("backend.sock").display().to_string()
+fn address(directory: &Path, channel: &str) -> String {
+    directory
+        .join(format!("{channel}.sock"))
+        .display()
+        .to_string()
 }
 
 /// Pipe names are machine-wide, so the name is taken from this user's own folder.
 #[cfg(windows)]
-fn address(directory: &Path) -> String {
+fn address(directory: &Path, channel: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(directory.to_string_lossy().as_bytes());
     let tag: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    format!(r"\\.\pipe\medha-serve-{tag}")
+    format!(r"\\.\pipe\medha-serve-{channel}-{tag}")
+}
+
+/// The user's remote MCP servers connect once, here, and every chat attaches.
+/// A chat that finds no host answering runs its own, as it does without a backend.
+fn shared_mcp(directory: &Path) -> anyhow::Result<mcp::hub::Endpoint> {
+    let endpoint = mcp::hub::Endpoint {
+        address: address(directory, "mcp"),
+        token: new_token()?,
+    };
+    let (address, token) = (endpoint.address.clone(), endpoint.token.as_str().into());
+    tokio::spawn(async move {
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let stopped = std::future::pending();
+        if let Err(error) = crate::mcp_host::run_shared(&address, token, changed, stopped).await {
+            tracing::warn!("the shared MCP host stopped: {error:#}");
+        }
+    });
+    Ok(endpoint)
 }
 
 fn private(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -105,10 +126,11 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
         .init();
 
     let token: Arc<str> = new_token()?.into();
-    let address = address(&directory);
+    let address = address(&directory, "backend");
     private(&directory.join("token"), &token)?;
     private(&directory.join("address"), &address)?;
-    let backend = backend::Backend::new(ServeChats::default(), env!("CARGO_PKG_VERSION"));
+    let chats = ServeChats::new(shared_mcp(&directory)?);
+    let backend = backend::Backend::new(chats, env!("CARGO_PKG_VERSION"));
     tracing::info!(address = %address, "medha backend listening");
     println!("medha backend listening");
 

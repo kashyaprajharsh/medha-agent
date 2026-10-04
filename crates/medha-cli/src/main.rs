@@ -911,6 +911,7 @@ async fn main() -> Result<()> {
         search_env: config::SearchEnv::from_process(),
         budget: budget_limits,
         approve: std::env::var("MEDHA_APPROVE").ok(),
+        mcp_host: runtime::mcp_shared::endpoint(),
         first_run_setup: cli.setup,
         may_start_unconfigured: cli.setup
             || (!cli.acp

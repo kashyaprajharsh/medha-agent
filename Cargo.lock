@@ -228,6 +228,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "backend"
+version = "0.1.10"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "wire",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

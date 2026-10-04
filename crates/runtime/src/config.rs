@@ -548,8 +548,8 @@ pub fn user_taps_path() -> Result<PathBuf> {
     Ok(user_skills_dir()?.join("taps.toml"))
 }
 
-pub fn skills_lock_path() -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join("medha-skills.lock"))
+pub fn skills_lock_path(folder: &std::path::Path) -> PathBuf {
+    folder.join("medha-skills.lock")
 }
 
 pub fn state_dir(workspace: &std::path::Path) -> Result<PathBuf> {

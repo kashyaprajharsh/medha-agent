@@ -6004,8 +6004,8 @@ fn lock_skills(model: &mut Model) {
         return model.push_notice("skills unavailable in this session");
     };
     let names = crate::skill_hub::user_skills(&store, &model.known_tools);
-    let path = match config::skills_lock_path() {
-        Ok(p) => p,
+    let path = match std::env::current_dir() {
+        Ok(folder) => config::skills_lock_path(&folder),
         Err(e) => return model.push_notice(format!("could not locate lockfile: {e}")),
     };
     match crate::skill_hub::lock(&store, &names, &path) {
@@ -6023,8 +6023,8 @@ fn sync_skills(model: &mut Model, tx: &mpsc::UnboundedSender<TuiEvent>) {
     let Some(store) = model.skills.clone() else {
         return model.push_notice("skills unavailable in this session");
     };
-    let path = match config::skills_lock_path() {
-        Ok(p) => p,
+    let path = match std::env::current_dir() {
+        Ok(folder) => config::skills_lock_path(&folder),
         Err(e) => return model.push_notice(format!("could not locate lockfile: {e}")),
     };
     let entries = match crate::skill_hub::locked(&path) {

@@ -1119,24 +1119,29 @@ async fn wait_done_unbounded(mut rx: tokio::sync::watch::Receiver<bool>) -> bool
     true
 }
 
+/// Sleeps in the kernel until the leader exits; a poll can itself stall there.
 #[cfg(unix)]
-fn leader_exited_without_reap(pid: u32) -> std::io::Result<bool> {
+fn wait_for_leader_exit_without_reap(pid: u32) -> std::io::Result<()> {
     // WNOWAIT is the crucial part: it lets the supervisor observe exit while
     // the zombie leader continues to reserve the process-group id. Descendants
     // therefore cannot race a recycled id before teardown.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == 0 {
-        Ok(unsafe { info.si_pid() } != 0)
-    } else {
-        Err(std::io::Error::last_os_error())
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -1258,12 +1263,12 @@ fn process_tree_members(root: u32) -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// Leader first, then descendants parent-first, then the group as a whole. The
-/// ordering stops a shell waking after only its child was killed.
+/// The whole group is stopped before the process table is scanned, so a helper
+/// cannot finish its work during a slow scan; then leader, descendants, group.
 #[cfg(unix)]
 fn kill_group_parent_first(group: u32) {
     unsafe {
-        libc::kill(group as i32, libc::SIGSTOP);
+        libc::kill(-(group as i32), libc::SIGSTOP);
     }
     std::thread::sleep(std::time::Duration::from_millis(1));
     let mut members = process_tree_members(group);
@@ -1427,23 +1432,15 @@ fn spawn_background_with_limits(
                 .take()
                 .expect("supervisor owns child");
             let mut reaper = GroupReaper::new(Some(pid));
+            #[cfg(unix)]
+            let pre_reaped_status = match wait_for_leader_exit_without_reap(pid) {
+                Ok(()) => None,
+                // Conservative portability fallback: `wait` reaps the leader,
+                // so use it only if WNOWAIT failed.
+                Err(_) => child.wait().ok(),
+            };
+            #[cfg(not(unix))]
             let pre_reaped_status = loop {
-                #[cfg(unix)]
-                {
-                    match leader_exited_without_reap(pid) {
-                        Ok(true) => break None,
-                        Ok(false) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                        // Conservative portability fallback: `try_wait` can
-                        // reap the leader, so use it only if WNOWAIT failed.
-                        Err(_) => match child.try_wait() {
-                            Ok(Some(status)) => break Some(status),
-                            Ok(None) => {}
-                            Err(_) => break None,
-                        },
-                    }
-                }
-                #[cfg(not(unix))]
                 match child.try_wait() {
                     Ok(Some(status)) => break Some(status),
                     Ok(None) => {}
@@ -3561,12 +3558,22 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("medha-successpg-stress-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
+        // A helper acts only once every command has returned, so a slow kernel
+        // cannot fail this: any helper still alive then leaves its marker. It
+        // gives up after a minute so a killed test run leaves nothing looping.
+        let gate = dir.join("every-command-returned");
         let mut runs = Vec::new();
         for n in 0..128 {
             let cwd = dir.clone();
             let marker = dir.join(format!("survived-{n}.txt"));
+            let gate = gate.clone();
             runs.push(tokio::spawn(async move {
-                let script = format!("(sleep 1; touch {}) >/dev/null 2>&1 &", marker.display());
+                let gate = gate.display();
+                let script = format!(
+                    "(n=0; while [ ! -e {gate} ] && [ $n -lt 300 ]; do sleep 0.2; n=$((n+1)); \
+                     done; [ -e {gate} ] && touch {}) >/dev/null 2>&1 &",
+                    marker.display()
+                );
                 run_shell_bounded(
                     &script,
                     &cwd,
@@ -3593,6 +3600,7 @@ mod tests {
                 outcome.cancelled
             );
         }
+        std::fs::write(&gate, b"").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         let survivors = std::fs::read_dir(&dir)
             .unwrap()
@@ -3627,14 +3635,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn waitid_does_not_report_a_running_leader_as_exited() {
+    fn waiting_for_a_leader_ends_at_its_exit_and_leaves_it_unreaped() {
         use std::os::unix::process::CommandExt;
         let mut child = std::process::Command::new("/bin/sh");
-        child.args(["-c", "sleep 1"]).process_group(0);
+        child.args(["-c", "sleep 0.3; exit 7"]).process_group(0);
+        let started = std::time::Instant::now();
         let mut child = child.spawn().unwrap();
-        assert!(!leader_exited_without_reap(child.id()).unwrap());
-        kill_process_tree(child.id());
-        let _ = child.wait();
+        wait_for_leader_exit_without_reap(child.id()).unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert_eq!(child.wait().unwrap().code(), Some(7));
     }
 
     #[tokio::test]

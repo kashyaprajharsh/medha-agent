@@ -234,7 +234,7 @@ impl LivePlugins {
 
 /// MCP tool names are `mcp__<server>__<tool>`; provider tool names allow only
 /// ASCII letters, digits, `_`, and `-`, and `__` separates the parts.
-pub(crate) fn server_id(plugin_id: &str, component_id: &str) -> String {
+pub fn server_id(plugin_id: &str, component_id: &str) -> String {
     let mut id = String::new();
     for c in format!("{plugin_id}-{component_id}").chars() {
         let c = if c.is_ascii_alphanumeric() { c } else { '-' };

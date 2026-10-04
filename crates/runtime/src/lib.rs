@@ -1,3 +1,7 @@
 //! What every Medha surface builds on: configuration today, the session runtime next.
 
+pub mod attachments;
 pub mod config;
+pub mod plugin_session;
+pub mod skill_judge;
+pub mod vision;

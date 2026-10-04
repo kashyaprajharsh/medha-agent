@@ -23,16 +23,15 @@ impl TokenCounter for HeuristicCounter {
 /// the provider's `usage`. Fully offline — the vocabulary is embedded in the
 /// binary at compile time, so there is no network call or file to ship.
 pub struct BpeCounter {
-    bpe: tiktoken_rs::CoreBPE,
+    bpe: &'static tiktoken_rs::CoreBPE,
 }
 
 impl BpeCounter {
-    /// Build the `o200k_base` counter. The vocab is embedded, so this is
-    /// effectively infallible at runtime; a load failure is a build/packaging
-    /// bug, not a recoverable condition.
+    /// The `o200k_base` counter. Its vocabulary is embedded and built once per
+    /// process, about 34 MB, so every chat and every call shares one copy.
     pub fn o200k() -> Self {
         Self {
-            bpe: tiktoken_rs::o200k_base().expect("embedded o200k_base vocabulary loads"),
+            bpe: tiktoken_rs::o200k_base_singleton(),
         }
     }
 }

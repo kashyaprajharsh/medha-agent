@@ -22,6 +22,8 @@ mod hook_files;
 mod lock_edit;
 mod mcp_host;
 mod plugins_cmd;
+mod serve;
+mod serve_chats;
 mod skill_hub;
 mod tui_tea;
 mod usage_insights;
@@ -819,6 +821,9 @@ async fn main() -> Result<()> {
     }
     if raw.get(1).map(|s| s == "mcp-host").unwrap_or(false) {
         return mcp_host::run(&raw[2..]).await;
+    }
+    if raw.get(1).map(|s| s == "serve").unwrap_or(false) {
+        return serve::run(&raw[2..]).await;
     }
 
     let cli = Cli::parse();

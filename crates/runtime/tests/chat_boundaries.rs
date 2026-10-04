@@ -139,6 +139,21 @@ async fn a_grant_given_to_one_chat_is_not_usable_from_another() {
         );
     }
 
+    // What admits a client to the backend is outside every chat's reach unless its person opens it.
+    let token = root.path().join("home").join("serve").join("token");
+    std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+    std::fs::write(&token, "backend token").unwrap();
+    assert!(
+        sibling
+            .workspace
+            .read(&token.display().to_string())
+            .await
+            .is_err()
+    );
+    if jailed {
+        assert_eq!(cat(&sibling, &token).await, "", "a command read the token");
+    }
+
     assert!(!Arc::ptr_eq(&granted.agent_budget, &sibling.agent_budget));
     let spent = kernel::Budget {
         max_tokens: Some(1),

@@ -34,6 +34,8 @@ pub const CREDENTIAL_RELATIVE: &[&str] = &[
     ".cargo/credentials.toml",
     ".medha/credentials.toml",
     ".medha/credentials.lock",
+    // What admits a client to the backend; a chat that read it could drive every chat.
+    ".medha/serve/token",
 ];
 
 /// Beneath the home directory on every platform.

@@ -524,6 +524,13 @@ impl kernel::HumanGate for AcpGate {
             result = rx => result.unwrap_or(kernel::Approval::Deny),
             _ = self.writer.cancelled() => kernel::Approval::Deny,
         };
+        // A chat can have several clients; the ones that did not answer learn it is settled.
+        if !self.peer.is_acp() {
+            self.writer.notify(
+                "approval.resolved",
+                json!({ "gate_id": gate_id, "approved": approval.approved() }),
+            );
+        }
         if approval == kernel::Approval::Always && !escalated {
             self.always
                 .lock()

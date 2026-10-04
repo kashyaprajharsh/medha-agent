@@ -2301,6 +2301,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "backend",
  "base64",
  "chrono",
  "clap",
@@ -2311,6 +2312,7 @@ dependencies = [
  "flate2",
  "futures",
  "gate",
+ "getrandom 0.3.4",
  "image",
  "kernel",
  "libc",
@@ -2348,6 +2350,7 @@ dependencies = [
  "unicode-width 0.2.0",
  "url",
  "windows-sys 0.60.2",
+ "wire",
 ]
 
 [[package]]

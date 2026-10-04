@@ -14,7 +14,7 @@ impl Notices for Quiet {
 }
 
 /// Replies `echo: <last user message>` so a chat that got another chat's turn is caught.
-async fn endpoint() -> (String, Arc<Mutex<Vec<String>>>) {
+async fn endpoint() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}/v1", listener.local_addr().unwrap());
     let asked = Arc::new(Mutex::new(Vec::new()));
@@ -52,7 +52,8 @@ async fn endpoint() -> (String, Arc<Mutex<Vec<String>>>) {
                     .and_then(|all| all.iter().rev().find(|m| m["role"] == "user"))
                     .map(|m| m["content"].as_str().unwrap_or_default().to_string())
                     .unwrap_or_default();
-                seen.lock().unwrap().push(last.clone());
+                let model = request["model"].as_str().unwrap_or_default().to_string();
+                seen.lock().unwrap().push((model, last.clone()));
                 let body = serde_json::json!({
                     "choices": [{
                         "message": {"role": "assistant", "content": format!("echo: {last}")},
@@ -72,10 +73,19 @@ async fn endpoint() -> (String, Arc<Mutex<Vec<String>>>) {
     (address, asked)
 }
 
-async fn chat(folder: &Path) -> (Workspace, Started) {
+async fn chat(folder: &Path, endpoint: &str, model: &str) -> (Workspace, Started) {
     let mut lock = runtime::workspace::load_lock(folder, &Quiet).unwrap();
     lock.reasoning.stream = Some(false);
-    let options = SessionOptions::default();
+    let options = SessionOptions {
+        model_env: runtime::config::ModelEnv {
+            base_url: Some(endpoint.into()),
+            model: Some(model.into()),
+            api_key: Some("k".into()),
+            max_ctx: Some("32000".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let model = runtime::model::resolve(&lock, &options, &Quiet)
         .await
         .unwrap();
@@ -128,21 +138,15 @@ async fn two_folders_with_two_chats_each_run_in_one_process_without_crossing() {
     let root = tempfile::tempdir().unwrap();
     let (address, asked) = endpoint().await;
     // SAFETY: this file holds one test, so nothing else reads the environment meanwhile.
-    unsafe {
-        std::env::set_var("MEDHA_HOME", root.path().join("home"));
-        std::env::set_var("MEDHA_BASE_URL", &address);
-        std::env::set_var("MEDHA_MODEL", "fake");
-        std::env::set_var("MEDHA_API_KEY", "k");
-        std::env::set_var("MEDHA_MAX_CTX", "32000");
-    }
+    unsafe { std::env::set_var("MEDHA_HOME", root.path().join("home")) };
     let (a, b) = (root.path().join("a"), root.path().join("b"));
     std::fs::create_dir_all(&a).unwrap();
     std::fs::create_dir_all(&b).unwrap();
 
-    let (home_a, a1) = chat(&a).await;
-    let (_, a2) = chat(&a).await;
-    let (home_b, b1) = chat(&b).await;
-    let (_, b2) = chat(&b).await;
+    let (home_a, a1) = chat(&a, &address, "model-a1").await;
+    let (_, a2) = chat(&a, &address, "model-a2").await;
+    let (home_b, b1) = chat(&b, &address, "model-b1").await;
+    let (_, b2) = chat(&b, &address, "model-b2").await;
 
     let (ra1, ra2, rb1, rb2) = tokio::join!(
         say(&a1, "from a1"),
@@ -159,7 +163,19 @@ async fn two_folders_with_two_chats_each_run_in_one_process_without_crossing() {
             "echo: from b2"
         ]
     );
-    assert_eq!(asked.lock().unwrap().len(), 4, "one model request per chat");
+    let mut asked = asked.lock().unwrap().clone();
+    asked.sort();
+    let pair = |model: &str, text: &str| (model.to_string(), text.to_string());
+    assert_eq!(
+        asked,
+        [
+            pair("model-a1", "from a1"),
+            pair("model-a2", "from a2"),
+            pair("model-b1", "from b1"),
+            pair("model-b2", "from b2"),
+        ],
+        "each chat asked its own model, once"
+    );
 
     assert_ne!(home_a.state, home_b.state);
     let ids = |chat: &Started| -> Vec<_> {

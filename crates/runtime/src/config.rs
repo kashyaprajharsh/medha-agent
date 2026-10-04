@@ -803,34 +803,81 @@ fn with_config_lock<T>(path: &std::path::Path, operation: impl FnOnce() -> Resul
     operation()
 }
 
+/// The `MEDHA_*` model overrides, read once by whoever starts the chat.
+#[derive(Clone, Debug, Default)]
+pub struct ModelEnv {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub max_ctx: Option<String>,
+    pub protocol: Option<String>,
+    pub auth: Option<String>,
+    pub headers_json: Option<String>,
+    pub max_output_tokens: Option<String>,
+    pub token_counter: Option<String>,
+    pub token_accounting: Option<String>,
+    pub reasoning_support: Option<String>,
+    pub image_input: Option<String>,
+}
+
+impl ModelEnv {
+    pub fn from_process() -> Self {
+        Self {
+            base_url: first_env(&["MEDHA_BASE_URL"]),
+            model: first_env(&["MEDHA_MODEL"]),
+            api_key: first_env(&["MEDHA_API_KEY"]),
+            max_ctx: first_env(&["MEDHA_MAX_CTX"]),
+            protocol: first_env(&["MEDHA_PROTOCOL"]),
+            auth: first_env(&["MEDHA_AUTH"]),
+            headers_json: first_env(&["MEDHA_HEADERS_JSON"]),
+            max_output_tokens: first_env(&["MEDHA_MAX_OUTPUT_TOKENS"]),
+            token_counter: first_env(&["MEDHA_TOKEN_COUNTER"]),
+            token_accounting: first_env(&["MEDHA_TOKEN_ACCOUNTING"]),
+            reasoning_support: first_env(&["MEDHA_REASONING_SUPPORT"]),
+            image_input: first_env(&["MEDHA_IMAGE_INPUT"]),
+        }
+    }
+}
+
 /// Only `MEDHA_*` environment variables may override saved settings.
 pub fn resolve(
     cfg: Option<&Config>,
     flag_base_url: Option<String>,
     flag_model: Option<String>,
 ) -> Result<Option<Resolved>> {
-    resolve_inner(cfg, flag_base_url, flag_model, true)
+    resolve_with(cfg, flag_base_url, flag_model, &ModelEnv::from_process())
+}
+
+/// `resolve`, with the overrides handed in instead of read from the process.
+pub fn resolve_with(
+    cfg: Option<&Config>,
+    flag_base_url: Option<String>,
+    flag_model: Option<String>,
+    env: &ModelEnv,
+) -> Result<Option<Resolved>> {
+    resolve_inner(cfg, flag_base_url, flag_model, env, true)
 }
 
 fn resolve_inner(
     cfg: Option<&Config>,
     flag_base_url: Option<String>,
     flag_model: Option<String>,
+    env: &ModelEnv,
     allow_keychain: bool,
 ) -> Result<Option<Resolved>> {
     let has_override = flag_base_url.is_some()
         || flag_model.is_some()
-        || first_env(&["MEDHA_BASE_URL"]).is_some()
-        || first_env(&["MEDHA_MODEL"]).is_some();
+        || env.base_url.is_some()
+        || env.model.is_some();
     let (profile, configured) = cfg.and_then(|c| c.selected_model()).unzip();
     let (base_url, base_url_source) = pick_source(
         flag_base_url,
-        "MEDHA_BASE_URL",
+        env.base_url.clone(),
         configured.map(|p| p.base_url.clone()),
     );
     let (model, model_source) = pick_source(
         flag_model,
-        "MEDHA_MODEL",
+        env.model.clone(),
         configured.map(|p| p.model.clone()),
     );
     let (Some(base_url), Some(model)) = (base_url, model) else {
@@ -840,7 +887,7 @@ fn resolve_inner(
     let model_source = model_source.unwrap_or(Source::Config);
 
     // Avoid a macOS keychain prompt when the environment already supplies a key.
-    let env_key = first_env(&["MEDHA_API_KEY"]);
+    let env_key = env.api_key.clone();
     let file_key = if env_key.is_none() {
         file_load_key(&base_url)
     } else {
@@ -860,18 +907,24 @@ fn resolve_inner(
             .unwrap_or_default(),
     );
 
-    let max_ctx = first_env(&["MEDHA_MAX_CTX"])
-        .map(|value| parse_positive_u32("MEDHA_MAX_CTX", &value))
+    let max_ctx = env
+        .max_ctx
+        .as_deref()
+        .map(|value| parse_positive_u32("MEDHA_MAX_CTX", value))
         .transpose()?
         .or_else(|| configured.and_then(|p| p.max_ctx));
-    let protocol = first_env(&["MEDHA_PROTOCOL"])
-        .map(|value| parse_protocol(&value))
+    let protocol = env
+        .protocol
+        .as_deref()
+        .map(parse_protocol)
         .transpose()?
         .or_else(|| configured.map(|profile| profile.protocol))
         .unwrap_or_default();
     let configured_auth = configured.map(|profile| profile.auth).unwrap_or_default();
-    let auth = first_env(&["MEDHA_AUTH"])
-        .map(|value| parse_auth(&value))
+    let auth = env
+        .auth
+        .as_deref()
+        .map(parse_auth)
         .transpose()?
         .unwrap_or_else(|| {
             if configured_auth.requires_credential() || api_key.is_empty() {
@@ -880,32 +933,44 @@ fn resolve_inner(
                 default_auth(protocol)
             }
         });
-    let headers = first_env(&["MEDHA_HEADERS_JSON"])
-        .map(|value| parse_headers(&value))
+    let headers = env
+        .headers_json
+        .as_deref()
+        .map(parse_headers)
         .transpose()?
         .or_else(|| configured.map(|profile| profile.headers.clone()))
         .unwrap_or_default();
-    let max_output_tokens = first_env(&["MEDHA_MAX_OUTPUT_TOKENS"])
-        .map(|value| parse_positive_u64("MEDHA_MAX_OUTPUT_TOKENS", &value))
+    let max_output_tokens = env
+        .max_output_tokens
+        .as_deref()
+        .map(|value| parse_positive_u64("MEDHA_MAX_OUTPUT_TOKENS", value))
         .transpose()?
         .or_else(|| configured.and_then(|profile| profile.max_output_tokens));
-    let token_counter = first_env(&["MEDHA_TOKEN_COUNTER"])
-        .map(|value| parse_token_counter(&value))
+    let token_counter = env
+        .token_counter
+        .as_deref()
+        .map(parse_token_counter)
         .transpose()?
         .or_else(|| configured.map(|profile| profile.token_counter))
         .unwrap_or_default();
-    let token_accounting = first_env(&["MEDHA_TOKEN_ACCOUNTING"])
-        .map(|value| parse_token_accounting(&value))
+    let token_accounting = env
+        .token_accounting
+        .as_deref()
+        .map(parse_token_accounting)
         .transpose()?
         .or_else(|| configured.map(|profile| profile.token_accounting))
         .unwrap_or_default();
-    let reasoning = first_env(&["MEDHA_REASONING_SUPPORT"])
-        .map(|value| parse_reasoning_support(&value))
+    let reasoning = env
+        .reasoning_support
+        .as_deref()
+        .map(parse_reasoning_support)
         .transpose()?
         .or_else(|| configured.map(|profile| profile.reasoning))
         .unwrap_or_default();
-    let image_input = first_env(&["MEDHA_IMAGE_INPUT"])
-        .map(|value| parse_image_input(&value))
+    let image_input = env
+        .image_input
+        .as_deref()
+        .map(parse_image_input)
         .transpose()?
         .or_else(|| configured.map(|profile| profile.image_input))
         .unwrap_or_default();
@@ -950,13 +1015,13 @@ fn resolve_inner(
 
 fn pick_source(
     flag: Option<String>,
-    env_name: &str,
+    env: Option<String>,
     configured: Option<String>,
 ) -> (Option<String>, Option<Source>) {
     if let Some(v) = flag {
         return (Some(v), Some(Source::Flag));
     }
-    if let Some(v) = first_env(&[env_name]) {
+    if let Some(v) = env {
         return (Some(v), Some(Source::Env));
     }
     (configured, None)
@@ -1041,7 +1106,14 @@ pub fn pulse(
         _ => (None, None),
     };
 
-    let resolved = resolve_inner(cfg, flag_base_url, flag_model, false).map_err(|e| e.to_string());
+    let resolved = resolve_inner(
+        cfg,
+        flag_base_url,
+        flag_model,
+        &ModelEnv::from_process(),
+        false,
+    )
+    .map_err(|e| e.to_string());
     let checks = diagnose_checks(cfg, &resolved, &ignored_env);
 
     Pulse {

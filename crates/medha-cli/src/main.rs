@@ -32,7 +32,7 @@ use kernel::Provider;
 use kernel::{EventLog, Kernel, Message, Session};
 #[cfg(test)]
 use runtime::approvals::{approve_list_from, unknown_approvals};
-use runtime::budget::{apply_budget_env, env_number};
+use runtime::budget::env_number;
 #[cfg(test)]
 use runtime::reasoning::normalize_reasoning_on;
 pub(crate) use runtime::reasoning::reasoning_on_config;
@@ -833,7 +833,7 @@ async fn main() -> Result<()> {
     };
 
     // Invalid explicit limits must fail before provider discovery or startup effects.
-    apply_budget_env(kernel::Budget::default())?;
+    let budget_limits = runtime::budget::BudgetLimits::from_env()?;
     let parallel_override = env_number::<usize>("MEDHA_MAX_PARALLEL_TOOLS")?;
 
     if cli.setup && !std::io::stdin().is_terminal() {
@@ -905,6 +905,9 @@ async fn main() -> Result<()> {
             cli.prompt.join(" ")
         },
         attach: cli.attach.clone(),
+        model_env: config::ModelEnv::from_process(),
+        budget: budget_limits,
+        approve: std::env::var("MEDHA_APPROVE").ok(),
         first_run_setup: cli.setup,
         may_start_unconfigured: cli.setup
             || (!cli.acp

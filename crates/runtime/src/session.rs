@@ -1,7 +1,6 @@
 //! Builds one chat on an opened workspace: its sandbox, tools, agents, context and kernel.
 
-use crate::approvals::{approve_list, unknown_approvals};
-use crate::budget::apply_budget_env;
+use crate::approvals::{approve_list_from, unknown_approvals};
 use crate::model::Model;
 use crate::verify::CommandVerifier;
 use crate::{
@@ -621,15 +620,18 @@ pub async fn start(
         ));
     }
     let policy = Arc::new(
-        policy::DefaultPolicy::requiring_approval(approve_list(lock.policy.approve.clone()))
-            .with_workspace(workspace.root())
-            .with_scratch(
-                scratch
-                    .as_ref()
-                    .map_or(std::path::Path::new(""), |s| s.path()),
-            )
-            .with_memory_write_approval(&lock.memory.write_approval)
-            .with_jail(jail),
+        policy::DefaultPolicy::requiring_approval(approve_list_from(
+            lock.policy.approve.clone(),
+            options.approve.as_deref().unwrap_or_default(),
+        ))
+        .with_workspace(workspace.root())
+        .with_scratch(
+            scratch
+                .as_ref()
+                .map_or(std::path::Path::new(""), |s| s.path()),
+        )
+        .with_memory_write_approval(&lock.memory.write_approval)
+        .with_jail(jail),
     );
 
     let verifier: Arc<dyn kernel::Verifier> = match verify_cmd.clone() {
@@ -644,7 +646,7 @@ pub async fn start(
     };
 
     // Children inherit this already-resolved budget.
-    let base_budget = apply_budget_env(lock.budget.to_budget())?;
+    let base_budget = options.budget.apply(lock.budget.to_budget());
     let ui_config = lock.ui.clone();
 
     // models.dev prices are advisory for self-hosted routes.

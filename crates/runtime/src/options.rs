@@ -15,6 +15,9 @@ pub enum Resume {
 pub struct SessionOptions {
     pub model: Option<String>,
     pub base_url: Option<String>,
+    pub model_env: crate::config::ModelEnv,
+    pub budget: crate::budget::BudgetLimits,
+    pub approve: Option<String>,
     pub reasoning: Option<kernel::ReasoningConfig>,
     pub autonomy: Option<kernel::AutonomyLevel>,
     pub verify_command: Option<String>,

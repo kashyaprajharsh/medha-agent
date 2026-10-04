@@ -1,10 +1,6 @@
 //! Which tools ask before they run.
 
-pub fn approve_list(base: Vec<String>) -> Vec<String> {
-    approve_list_from(base, &std::env::var("MEDHA_APPROVE").unwrap_or_default())
-}
-
-/// Resolve approval aliases from an explicit value for deterministic tests.
+/// `raw` is the caller's override, as `MEDHA_APPROVE` spells it; empty means none.
 pub fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
     let parts: Vec<&str> = raw
         .split(',')

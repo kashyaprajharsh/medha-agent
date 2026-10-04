@@ -24,10 +24,11 @@ pub async fn resolve(
 ) -> Result<Model> {
     // Headless callers fail instead of hanging on first-run setup.
     let cfg = config::load()?;
-    let mut resolved = match config::resolve(
+    let mut resolved = match config::resolve_with(
         cfg.as_ref(),
         options.base_url.clone(),
         options.model.clone(),
+        &options.model_env,
     )? {
         Some(r) => r,
         None if options.may_start_unconfigured => config::Resolved {

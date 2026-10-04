@@ -71,6 +71,24 @@ test("budget and verification stops remain different from ordinary completion", 
   assert.equal(done.notice, undefined);
 });
 
+test("an approval settled in another window leaves this one", () => {
+  let state = startingLive();
+  for (const gate_id of [1, 2]) {
+    state = reduceLive(state, {
+      method: "approval",
+      params: { gate_id, action: "shell.exec" },
+    });
+  }
+  state = reduceLive(state, {
+    method: "approval.resolved",
+    params: { gate_id: 1, approved: true },
+  });
+  assert.deepEqual(
+    state.approvals.map((approval) => approval.gateId),
+    [2],
+  );
+});
+
 test("stopping pending work stops its spinner and releases human prompts", () => {
   let state = reduceLive(
     startingLive(),

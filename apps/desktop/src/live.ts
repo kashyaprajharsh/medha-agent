@@ -292,6 +292,14 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
           (question) => question.id !== params.question_id,
         ),
       };
+    // Settled from another window, or by the chat itself.
+    case "approval.resolved":
+      return {
+        ...state,
+        approvals: state.approvals.filter(
+          (approval) => approval.gateId !== Number(params.gate_id),
+        ),
+      };
     case "event":
       break;
     default:

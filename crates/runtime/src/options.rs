@@ -26,4 +26,6 @@ pub struct SessionOptions {
     pub prompt: String,
     pub attach: Vec<PathBuf>,
     pub first_run_setup: bool,
+    /// The surface can open model setup itself, so no saved model is not an error.
+    pub may_start_unconfigured: bool,
 }

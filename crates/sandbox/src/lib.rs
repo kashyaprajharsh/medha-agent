@@ -21,7 +21,7 @@ pub mod scratch;
 pub(crate) mod socket_filter;
 pub use exec::{
     BackendKind, BoundedCommandOutput, ExecBackend, ExecError, ExecOutput, ExecRequest, HomeScope,
-    HostBackend, NetPolicy, SandboxConfig, ShellOutcome, native_backend_available,
+    HostBackend, NetPolicy, SandboxConfig, ShellOutcome, StateAccess, native_backend_available,
     native_sandbox_supported, network_denial_signature, program_in_dir, program_on_path,
     run_command_bounded, run_command_bounded_with_input, run_shell_bounded, run_shell_bounded_with,
     select_backend,

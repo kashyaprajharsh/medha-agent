@@ -83,6 +83,20 @@ const APP_DATA_RELATIVE: &[&str] = &[
     "Bitwarden",
 ];
 
+/// The state folder `MEDHA_HOME` names, when it is set: as closed as `~/.medha` is.
+pub fn named_state_dir() -> Option<PathBuf> {
+    let named = std::env::var_os("MEDHA_HOME").filter(|value| !value.is_empty())?;
+    std::path::absolute(PathBuf::from(named)).ok()
+}
+
+/// The credential files of a state folder, wherever that folder is.
+pub fn state_secrets(state: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    CREDENTIAL_RELATIVE
+        .iter()
+        .filter_map(|relative| relative.strip_prefix(".medha/"))
+        .map(move |relative| state.join(relative))
+}
+
 /// Absolute protected roots for the current user.
 pub fn protected_paths() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = dirs::home_dir()
@@ -94,6 +108,9 @@ pub fn protected_paths() -> Vec<PathBuf> {
                 .map(move |relative| home.join(relative))
         })
         .collect();
+    if let Some(state) = named_state_dir() {
+        paths.extend(state_secrets(&state));
+    }
     if cfg!(windows) {
         for base in [dirs::data_local_dir(), dirs::data_dir()]
             .into_iter()
@@ -125,7 +142,14 @@ fn is_trust_file(path: &Path) -> bool {
     let named = path
         .file_name()
         .is_some_and(|name| name == "trust.lock" || name == "lock_trust.toml");
-    named && path.components().any(|part| part.as_os_str() == ".medha")
+    named
+        && (path.components().any(|part| part.as_os_str() == ".medha")
+            || named_state_dir().is_some_and(|state| {
+                [Some(lexical(&state)), state.canonicalize().ok()]
+                    .into_iter()
+                    .flatten()
+                    .any(|state| path.starts_with(fold(&state)))
+            }))
 }
 
 fn lexical(path: &Path) -> PathBuf {

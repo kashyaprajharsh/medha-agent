@@ -125,6 +125,17 @@ pub struct SandboxConfig {
     pub remote_dir: Option<String>,
     /// Native backend: whose private HOME its commands get.
     pub home: HomeScope,
+    /// Native backend: what the harness opens inside Medha's own state.
+    pub state: StateAccess,
+}
+
+/// Folders inside Medha's own state that the harness opens to a backend's
+/// commands: its cache, its installed servers, a writer's worktree. The rest of
+/// the state stays closed. Never taken from a lock file, a tool argument or an approval.
+#[derive(Debug, Clone, Default)]
+pub struct StateAccess {
+    pub read: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
 }
 
 /// Whose private HOME a jailed command gets. A chat takes its own, so chats in
@@ -173,6 +184,7 @@ impl Default for SandboxConfig {
             host: None,
             remote_dir: None,
             home: HomeScope::default(),
+            state: StateAccess::default(),
         }
     }
 }
@@ -194,6 +206,12 @@ pub trait ExecBackend: Send + Sync {
         Err(ExecError::Unavailable(
             "plugin isolation is unavailable".into(),
         ))
+    }
+
+    /// The same backend for a chat whose workspace Medha keeps inside its own
+    /// state, a writer's worktree: that one folder is opened and nothing else.
+    fn scoped_to(&self, _folder: &Path) -> Option<std::sync::Arc<dyn ExecBackend>> {
+        None
     }
 
     /// Run a command to completion (foreground). Default: build + supervise, so a
@@ -1778,17 +1796,74 @@ fn home_dir_from_env() -> Option<PathBuf> {
         .map(|path| path.canonicalize().unwrap_or(path))
 }
 
+/// Medha's own state: `~/.medha`, and the folder `MEDHA_HOME` names when it is set.
+fn state_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = home_dir_from_env()
+        .map(|home| home.join(".medha"))
+        .into_iter()
+        .collect();
+    if let Some(named) = permissions::named_state_dir() {
+        let named = named.canonicalize().unwrap_or(named);
+        if !dirs.contains(&named) {
+            dirs.push(named);
+        }
+    }
+    dirs
+}
+
 fn native_sensitive_paths() -> Vec<PathBuf> {
     let Some(home) = home_dir_from_env() else {
         return Vec::new();
     };
-    // Commands also lose all of Medha's state; file tools keep the skills and worktrees in it.
+    // Commands also lose all of Medha's state, wherever it is kept; what the
+    // harness opens inside it is a `StateAccess`, never an approval.
     permissions::CREDENTIAL_RELATIVE
         .iter()
-        .chain([".medha"].iter())
         .map(|relative| home.join(relative))
+        .chain(state_dirs())
         .chain(permissions::protected_paths())
         .collect()
+}
+
+/// A folder the harness may open inside Medha's state: one of its own, never
+/// the whole state, and never one that holds or lies inside a credential path.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn openable_state_folder(folder: &Path) -> Option<PathBuf> {
+    let folder = resolve_native_policy_path(folder)?;
+    let states: Vec<PathBuf> = state_dirs()
+        .iter()
+        .filter_map(|state| resolve_native_policy_path(state))
+        .collect();
+    let inside = states
+        .iter()
+        .any(|state| folder != *state && folder.starts_with(state));
+    let exposes = native_sensitive_paths()
+        .iter()
+        .filter_map(|secret| resolve_native_policy_path(secret))
+        .filter(|secret| !states.contains(secret))
+        .any(|secret| secret.starts_with(&folder) || folder.starts_with(&secret));
+    (inside && !exposes).then_some(folder)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl StateAccess {
+    fn checked(&self) -> Self {
+        let open = |folders: &[PathBuf]| {
+            folders
+                .iter()
+                .filter_map(|folder| openable_state_folder(folder))
+                .collect()
+        };
+        Self {
+            read: open(&self.read),
+            write: open(&self.write),
+        }
+    }
+
+    /// Everything opened for reading, which what is opened for writing also is.
+    fn readable(&self) -> impl Iterator<Item = &PathBuf> {
+        self.read.iter().chain(&self.write)
+    }
 }
 
 /// Resolve an absolute policy path through its deepest existing ancestor, so
@@ -1893,15 +1968,15 @@ impl PluginScope {
             let root = path
                 .canonicalize()
                 .map_err(|error| ExecError::Unavailable(error.to_string()))?;
-            let allowed = native_sensitive_paths().iter().all(|secret| {
-                let secret = resolve_native_policy_path(secret).unwrap_or_else(|| secret.clone());
+            let states = state_dirs();
+            let allowed = native_sensitive_paths().iter().all(|named| {
+                let secret = resolve_native_policy_path(named).unwrap_or_else(|| named.clone());
                 if !root.starts_with(&secret) && !secret.starts_with(&root) {
                     return true;
                 }
                 // Only one installed package or its private data, never the
                 // whole state directory, credentials, or another package.
-                secret.file_name().is_some_and(|name| name == ".medha")
-                    && root.parent() == Some(secret.join(directory).as_path())
+                states.contains(named) && root.parent() == Some(secret.join(directory).as_path())
             });
             if !root.is_dir() || !allowed {
                 return Err(ExecError::Unavailable(format!(
@@ -1924,13 +1999,10 @@ impl PluginScope {
 /// symlink cannot expose credentials or project history.
 #[cfg(target_os = "macos")]
 fn skill_read_exceptions(secret: &Path, approved: &ApprovedRoots) -> Vec<PathBuf> {
-    let Some(state) = home_dir_from_env().map(|home| home.join(".medha")) else {
-        return Vec::new();
-    };
-    if secret != state {
+    if !state_dirs().iter().any(|state| state == secret) {
         return Vec::new();
     }
-    let Some(state) = resolve_native_policy_path(&state) else {
+    let Some(state) = resolve_native_policy_path(secret) else {
         return Vec::new();
     };
     let skills = state.join("skills");
@@ -2200,6 +2272,7 @@ pub struct SeatbeltBackend {
     net_grant: NetworkGrant,
     home: std::sync::Arc<IsolatedHome>,
     plugin: Option<PluginScope>,
+    state: StateAccess,
 }
 
 #[cfg(target_os = "macos")]
@@ -2212,7 +2285,13 @@ impl SeatbeltBackend {
             net_grant: NetworkGrant::default(),
             home: IsolatedHome::shared(),
             plugin: None,
+            state: StateAccess::default(),
         }
+    }
+
+    pub fn with_state_access(mut self, access: &StateAccess) -> Self {
+        self.state = access.checked();
+        self
     }
 
     pub fn with_network_grant(mut self, net_grant: NetworkGrant) -> Self {
@@ -2266,6 +2345,7 @@ impl SeatbeltBackend {
         }
         readable.extend(native_toolchain_read_roots());
         readable.extend(self.extra_writable.iter().cloned());
+        readable.extend(self.state.readable().cloned());
         // Live user approvals: a write grant implies read, or editing under it
         // would be impossible. Sensitive-path denies appended later still win.
         readable.extend(self.approved.read_roots());
@@ -2291,6 +2371,7 @@ impl SeatbeltBackend {
             None => writable.push(ws),
         }
         writable.extend(self.extra_writable.iter().cloned());
+        writable.extend(self.state.write.iter().cloned());
         writable.extend(safe_extra_writable(&self.approved.write_roots()));
         writable.extend(safe_extra_writable(&req.write_roots));
         writable.sort();
@@ -2341,9 +2422,10 @@ impl SeatbeltBackend {
         p.push_str(")\n");
         // A workspace that is nested near HOME cannot accidentally broaden a
         // more-specific credential path through the workspace subpath rule.
+        let states = state_dirs();
         for secret in native_sensitive_paths() {
             let mut exceptions = skill_read_exceptions(&secret, &self.approved);
-            let writes: Vec<PathBuf> = self
+            let mut writes: Vec<PathBuf> = self
                 .plugin
                 .as_ref()
                 .map(|plugin| {
@@ -2351,6 +2433,12 @@ impl SeatbeltBackend {
                     vec![plugin.data.clone()]
                 })
                 .unwrap_or_default();
+            // What the harness opened inside the state stays open; its credentials are
+            // denied by their own entries, which no exception here covers.
+            if states.contains(&secret) {
+                exceptions.extend(self.state.readable().cloned());
+                writes.extend(self.state.write.iter().cloned());
+            }
             let resolved = resolve_native_policy_path(&secret).unwrap_or(secret);
             p.push_str(&sensitive_deny("file-read*", &resolved, &exceptions));
             p.push_str(&sensitive_deny("file-write*", &resolved, &writes));
@@ -2398,6 +2486,12 @@ impl ExecBackend for SeatbeltBackend {
         let mut scoped = self.clone();
         scoped.plugin = Some(PluginScope::new(package, data)?);
         scoped.build_command(req)
+    }
+
+    fn scoped_to(&self, folder: &Path) -> Option<std::sync::Arc<dyn ExecBackend>> {
+        let mut scoped = self.clone();
+        scoped.state.write.extend(openable_state_folder(folder));
+        Some(std::sync::Arc::new(scoped))
     }
 
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
@@ -2451,6 +2545,7 @@ pub struct LandlockBackend {
     net_grant: NetworkGrant,
     home: std::sync::Arc<IsolatedHome>,
     plugin: Option<PluginScope>,
+    state: StateAccess,
 }
 
 #[cfg(target_os = "linux")]
@@ -2463,7 +2558,13 @@ impl LandlockBackend {
             net_grant: NetworkGrant::default(),
             home: IsolatedHome::shared(),
             plugin: None,
+            state: StateAccess::default(),
         }
+    }
+
+    pub fn with_state_access(mut self, access: &StateAccess) -> Self {
+        self.state = access.checked();
+        self
     }
 
     pub fn with_network_grant(mut self, net_grant: NetworkGrant) -> Self {
@@ -2492,6 +2593,7 @@ impl LandlockBackend {
             None => v.push(ws),
         }
         v.extend(self.extra_writable.iter().cloned());
+        v.extend(self.state.write.iter().cloned());
         v.extend(safe_extra_writable(&self.approved.write_roots()));
         v.extend(safe_extra_writable(&req.write_roots));
         // Common shell redirections need a sink, but granting all of `/dev`
@@ -2550,11 +2652,16 @@ impl LandlockBackend {
         }
         paths.extend(native_toolchain_read_roots());
         paths.extend(self.extra_writable.iter().cloned());
+        paths.extend(self.state.readable().cloned());
         let secrets: Vec<PathBuf> = native_sensitive_paths()
             .iter()
             .filter_map(|path| resolve_native_policy_path(path))
             .collect();
-        let skills = home_dir_from_env().map(|home| home.join(".medha/skills"));
+        let skills: Vec<PathBuf> = state_dirs()
+            .iter()
+            .filter_map(|state| resolve_native_policy_path(state))
+            .map(|state| state.join("skills"))
+            .collect();
         for root in self
             .approved
             .read_roots()
@@ -2562,7 +2669,7 @@ impl LandlockBackend {
             .chain(self.approved.write_roots())
             .filter_map(|root| resolve_native_policy_path(&root))
         {
-            roots_around_secrets(&root, &secrets, skills.as_deref(), &mut paths);
+            roots_around_secrets(&root, &secrets, &skills, &mut paths);
         }
         paths.extend(safe_request_readable(&req.read_roots));
         paths.extend(safe_extra_writable(&req.write_roots));
@@ -2578,10 +2685,10 @@ impl LandlockBackend {
 fn roots_around_secrets(
     root: &Path,
     secrets: &[PathBuf],
-    skills: Option<&Path>,
+    skills: &[PathBuf],
     out: &mut Vec<PathBuf>,
 ) {
-    let shared = skills.is_some_and(|skills| root.starts_with(skills));
+    let shared = skills.iter().any(|skills| root.starts_with(skills));
     if !shared && secrets.iter().any(|secret| root.starts_with(secret)) {
         return;
     }
@@ -2686,6 +2793,12 @@ impl ExecBackend for LandlockBackend {
         let mut scoped = self.clone();
         scoped.plugin = Some(PluginScope::new(package, data)?);
         scoped.build_command(req)
+    }
+
+    fn scoped_to(&self, folder: &Path) -> Option<std::sync::Arc<dyn ExecBackend>> {
+        let mut scoped = self.clone();
+        scoped.state.write.extend(openable_state_folder(folder));
+        Some(std::sync::Arc::new(scoped))
     }
 
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
@@ -3143,7 +3256,8 @@ pub fn select_backend(
                     Arc::new(
                         SeatbeltBackend::new(cfg.net, _extra_writable, _approved)
                             .with_network_grant(net_grant)
-                            .with_home(&cfg.home),
+                            .with_home(&cfg.home)
+                            .with_state_access(&cfg.state),
                     )
                 } else {
                     Arc::new(HostBackend)
@@ -3155,7 +3269,8 @@ pub fn select_backend(
                     Arc::new(
                         LandlockBackend::new(cfg.net, _extra_writable, _approved)
                             .with_network_grant(net_grant)
-                            .with_home(&cfg.home),
+                            .with_home(&cfg.home)
+                            .with_state_access(&cfg.state),
                     )
                 } else {
                     Arc::new(HostBackend)
@@ -3354,8 +3469,9 @@ mod tests {
         ];
         let skills = home.join(".medha/skills");
         let mut granted = Vec::new();
-        roots_around_secrets(&home, &secrets, Some(&skills), &mut granted);
-        roots_around_secrets(&skills.join("pdf"), &secrets, Some(&skills), &mut granted);
+        let shared = std::slice::from_ref(&skills);
+        roots_around_secrets(&home, &secrets, shared, &mut granted);
+        roots_around_secrets(&skills.join("pdf"), &secrets, shared, &mut granted);
         granted.sort();
         assert_eq!(
             granted,

@@ -15,7 +15,9 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 mod protected;
-pub use protected::{CREDENTIAL_RELATIVE, is_protected, protected_paths};
+pub use protected::{
+    CREDENTIAL_RELATIVE, is_protected, named_state_dir, protected_paths, state_secrets,
+};
 
 #[derive(Debug, Error)]
 pub enum PermissionError {

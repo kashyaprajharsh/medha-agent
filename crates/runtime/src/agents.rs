@@ -309,6 +309,15 @@ impl WorktreeWorkspaces {
     pub fn registry_handle() -> RegistryHandle {
         Arc::new(Mutex::new(None))
     }
+
+    /// A worktree lies inside Medha's own state, which the jail closes; the
+    /// writer's commands get that one worktree and nothing else in there.
+    fn exec_in(&self, worktree: &Path) -> Arc<dyn sandbox::ExecBackend> {
+        self.template
+            .exec
+            .scoped_to(worktree)
+            .unwrap_or_else(|| Arc::clone(&self.template.exec))
+    }
 }
 
 #[async_trait::async_trait]
@@ -333,7 +342,7 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
             self.template.approved.clone(),
         )
         .map_err(|error| error.to_string())?
-        .with_exec_backend(Arc::clone(&self.template.exec))
+        .with_exec_backend(self.exec_in(worktree.path()))
         .with_network_grant(self.template.net_grant.clone())
         .map_err(|error| error.to_string())?
         .with_readable_roots(&self.template.readable)
@@ -358,7 +367,7 @@ impl orchestrator::Workspaces for WorktreeWorkspaces {
         // may hang or leave compiler jobs holding locks. Retain the output tail,
         // where build failures are normally reported.
         match sandbox::run_shell_bounded_with(
-            self.template.exec.as_ref(),
+            self.exec_in(root).as_ref(),
             &command,
             root,
             self.verify_timeout,

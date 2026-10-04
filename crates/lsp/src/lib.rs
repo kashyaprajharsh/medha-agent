@@ -1964,6 +1964,11 @@ impl LspClient {
                 NetPolicy::Deny
             },
             home: config.home.clone(),
+            // The servers Medha installed live inside its own state.
+            state: sandbox::StateAccess {
+                read: server_install_dir().into_iter().collect(),
+                write: Vec::new(),
+            },
             ..SandboxConfig::default()
         };
         // Language servers get no user-approved roots: an approval covers the

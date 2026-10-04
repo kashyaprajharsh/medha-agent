@@ -1975,7 +1975,7 @@ impl McpManager {
         let allow_network = server
             .allow_network
             .unwrap_or(self.inner.config.allow_network);
-        let sandbox_config = SandboxConfig {
+        let mut sandbox_config = SandboxConfig {
             backend: BackendKind::Native,
             net: if allow_network {
                 NetPolicy::Allow
@@ -1993,11 +1993,13 @@ impl McpManager {
         if let Some(dir) = &cache {
             let _ = std::fs::create_dir_all(dir);
         }
+        // That directory is inside Medha's own state, which is otherwise closed.
+        sandbox_config.state.write = cache.clone().into_iter().collect();
         // Servers get no user-approved roots: an approval covers the agent's
         // own commands, not a long-lived package-manager subprocess.
         let backend = select_backend(
             &sandbox_config,
-            cache.clone().into_iter().collect(),
+            Vec::new(),
             sandbox::ApprovedRoots::default(),
             sandbox::NetworkGrant::default(),
         );

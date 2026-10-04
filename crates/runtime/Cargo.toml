@@ -15,7 +15,10 @@ tools = { path = "../tools" }
 mcp = { path = "../mcp" }
 lockfile = { path = "../lockfile" }
 extensions = { path = "../extensions" }
+orchestrator = { path = "../orchestrator" }
+sandbox = { path = "../sandbox" }
 tokio.workspace = true
+tokio-util = { version = "0.7" }
 ulid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,8 +33,12 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 fd-lock = "4"
 tracing = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 store = { path = "../store" }
+test-support = { path = "../test-support" }
 tempfile = "3"
 tokio = { workspace = true, features = ["net", "io-util"] }
 

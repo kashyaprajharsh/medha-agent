@@ -13,7 +13,7 @@ use orchestrator::{AgentStatus, ChildOutcome, ChildRun, ChildRunner};
 
 /// Collect without acknowledging: delivery commits only after the parent turn
 /// durably accepts these messages. All surfaces use the same bound and trust.
-pub(crate) async fn collect_reports(
+pub async fn collect_reports(
     control: &orchestrator::AgentControl,
     session: ulid::Ulid,
     artifacts: &Arc<dyn kernel::ArtifactStore>,
@@ -68,13 +68,9 @@ impl AgentSink {
     /// Hand one step to whatever surface is watching. Dropped silently when
     /// nothing is: a headless run has nowhere to show a child's working-out, and
     /// that is not a failure.
-    fn show(&self, step: crate::tui_tea::AgentStep) {
-        if let Some(tx) = &self.route {
-            let _ = tx.send(crate::tui_tea::TuiEvent::AgentStep {
-                surface_session: self.surface_session,
-                path: self.path.clone(),
-                step,
-            });
+    fn show(&self, step: AgentStep) {
+        if let Some(watcher) = &self.route {
+            watcher.step(self.surface_session, &self.path, step);
         }
     }
 }
@@ -89,15 +85,15 @@ impl kernel::StreamSink for AgentSink {
     }
 
     fn text(&self, delta: &str) {
-        self.show(crate::tui_tea::AgentStep::Text(delta.to_string()));
+        self.show(AgentStep::Text(delta.to_string()));
     }
 
     fn reasoning(&self, delta: &str) {
-        self.show(crate::tui_tea::AgentStep::Reasoning(delta.to_string()));
+        self.show(AgentStep::Reasoning(delta.to_string()));
     }
 
     fn restarted(&self) {
-        self.show(crate::tui_tea::AgentStep::Restarted);
+        self.show(AgentStep::Restarted);
     }
 
     fn supports_restart(&self) -> bool {
@@ -105,15 +101,15 @@ impl kernel::StreamSink for AgentSink {
     }
 
     fn steered(&self, text: &str) {
-        self.show(crate::tui_tea::AgentStep::Steered(text.to_string()));
+        self.show(AgentStep::Steered(text.to_string()));
     }
 
     fn steers_returned(&self, texts: &[String]) {
-        self.show(crate::tui_tea::AgentStep::SteersReturned(texts.to_vec()));
+        self.show(AgentStep::SteersReturned(texts.to_vec()));
     }
 
     fn tool_result(&self, tool: &str, ok: bool, payload: &serde_json::Value) {
-        self.show(crate::tui_tea::AgentStep::ToolResult {
+        self.show(AgentStep::ToolResult {
             id: None,
             tool: tool.to_string(),
             ok,
@@ -123,7 +119,7 @@ impl kernel::StreamSink for AgentSink {
 
     fn tool_call(&self, tool: &str, args: &serde_json::Value) {
         self.progress.tool_dispatched();
-        self.show(crate::tui_tea::AgentStep::ToolCall {
+        self.show(AgentStep::ToolCall {
             id: None,
             tool: tool.to_string(),
             args: args.clone(),
@@ -132,14 +128,14 @@ impl kernel::StreamSink for AgentSink {
 
     fn tool_call_with_id(&self, id: &str, tool: &str, args: &serde_json::Value) {
         self.progress.tool_dispatched();
-        self.show(crate::tui_tea::AgentStep::ToolCall {
+        self.show(AgentStep::ToolCall {
             id: Some(id.into()),
             tool: tool.into(),
             args: args.clone(),
         });
     }
     fn tool_result_with_id(&self, id: &str, tool: &str, ok: bool, payload: &serde_json::Value) {
-        self.show(crate::tui_tea::AgentStep::ToolResult {
+        self.show(AgentStep::ToolResult {
             id: Some(id.into()),
             tool: tool.into(),
             ok,
@@ -150,8 +146,8 @@ impl kernel::StreamSink for AgentSink {
         self.progress.metered(u64::from(usage.total_tokens));
         // A child's prompt is billed like any other, so it belongs in the same
         // cache accounting; reporting only the parent measures a fraction of it.
-        if let Some(tx) = &self.route {
-            let _ = tx.send(crate::tui_tea::TuiEvent::Usage(*usage));
+        if let Some(watcher) = &self.route {
+            watcher.usage(usage);
         }
     }
 
@@ -977,12 +973,55 @@ impl kernel::HumanGate for AttributedGate {
     }
 }
 
+/// A step in a child agent's own transcript.
+///
+/// The same shapes the parent renders, kept as a separate type because a child's
+/// stream is routed rather than appended: it belongs to that agent's view, and
+/// three children streaming into one conversation is unreadable.
+#[derive(Debug, Clone)]
+pub enum AgentStep {
+    /// What this child was sent to do, shown first in its own view.
+    Task {
+        objective: String,
+        contract: Option<String>,
+    },
+    Text(String),
+    Reasoning(String),
+    ToolCall {
+        id: Option<String>,
+        tool: String,
+        args: serde_json::Value,
+    },
+    ToolResult {
+        id: Option<String>,
+        tool: String,
+        ok: bool,
+        payload: serde_json::Value,
+    },
+    /// A transient provider failure abandoned the trailing streamed attempt.
+    Restarted,
+    /// Optimistic local record while a steer waits for a turn boundary.
+    SteerQueued(String),
+    /// The queued text actually entered the child's canonical transcript.
+    Steered(String),
+    /// The child settled before these queued messages could be applied.
+    SteersReturned(Vec<String>),
+}
+
+/// Whoever is watching child agents work; a call must return without waiting on the viewer.
+pub trait AgentWatcher: Send + Sync {
+    fn step(
+        &self,
+        surface_session: Option<ulid::Ulid>,
+        path: &orchestrator::AgentPath,
+        step: AgentStep,
+    );
+    fn usage(&self, usage: &kernel::Usage);
+}
+
 /// Where children's streams are delivered. `None` when nobody is watching —
 /// the headless case, which costs a child nothing.
-///
-/// Unbounded on purpose: a bounded channel would let a slow surface stall a
-/// child mid-tool, and the viewer keeps only a bounded ring anyway.
-pub type AgentRoute = Option<tokio::sync::mpsc::UnboundedSender<crate::tui_tea::TuiEvent>>;
+pub type AgentRoute = Option<Arc<dyn AgentWatcher>>;
 
 pub struct KernelRunner<P: Provider, L: EventLog> {
     /// Weak to break the kernel/executor/control-plane ownership cycle.
@@ -1065,7 +1104,7 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         // A child's view opens with what it was asked to do, the way a session
         // opens with the message that started it. Without this, looking at an
         // agent shows working-out with no visible question behind it.
-        sink.show(crate::tui_tea::AgentStep::Task {
+        sink.show(AgentStep::Task {
             objective: run.spec.objective.clone(),
             contract: run.spec.contract.clone(),
         });
@@ -1183,16 +1222,33 @@ mod tests {
     use orchestrator::{Dispatch, Outbox};
     use ulid::Ulid;
 
+    pub(super) enum Seen {
+        Step(orchestrator::AgentPath, AgentStep),
+        Usage(kernel::Usage),
+    }
+
+    pub(super) struct Recorder(pub(super) std::sync::mpsc::Sender<Seen>);
+
+    impl AgentWatcher for Recorder {
+        fn step(&self, _: Option<Ulid>, path: &orchestrator::AgentPath, step: AgentStep) {
+            let _ = self.0.send(Seen::Step(path.clone(), step));
+        }
+
+        fn usage(&self, usage: &kernel::Usage) {
+            let _ = self.0.send(Seen::Usage(*usage));
+        }
+    }
+
     #[test]
     fn child_sink_routes_retry_and_steer_lifecycle_to_its_pane() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let (progress, _watch) = kernel::ProgressHandle::new();
         let path = orchestrator::AgentPath::root().child("worker").unwrap();
         let sink = AgentSink {
             path: path.clone(),
             surface_session: Some(ulid::Ulid::new()),
             progress,
-            route: Some(tx),
+            route: Some(Arc::new(Recorder(tx))),
         };
 
         kernel::StreamSink::restarted(&sink);
@@ -1201,25 +1257,15 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(crate::tui_tea::TuiEvent::AgentStep {
-                path: event_path,
-                step: crate::tui_tea::AgentStep::Restarted,
-                ..
-            }) if event_path == path
+            Ok(Seen::Step(event_path, AgentStep::Restarted)) if event_path == path
         ));
         assert!(matches!(
             rx.try_recv(),
-            Ok(crate::tui_tea::TuiEvent::AgentStep {
-                step: crate::tui_tea::AgentStep::Steered(text),
-                ..
-            }) if text == "use the tests"
+            Ok(Seen::Step(_, AgentStep::Steered(text))) if text == "use the tests"
         ));
         assert!(matches!(
             rx.try_recv(),
-            Ok(crate::tui_tea::TuiEvent::AgentStep {
-                step: crate::tui_tea::AgentStep::SteersReturned(texts),
-                ..
-            }) if texts == ["not applied"]
+            Ok(Seen::Step(_, AgentStep::SteersReturned(texts))) if texts == ["not applied"]
         ));
     }
 
@@ -1486,12 +1532,12 @@ mod child_prompt_tests {
 
     #[test]
     fn a_child_reports_its_usage_so_cache_accounting_covers_delegated_requests() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let sink = AgentSink {
             path: orchestrator::AgentPath::root().child("survey").unwrap(),
             surface_session: Some(ulid::Ulid::new()),
             progress: kernel::ProgressHandle::new().0,
-            route: Some(tx),
+            route: Some(Arc::new(super::tests::Recorder(tx))),
         };
         let usage = kernel::Usage {
             prompt_tokens: 10_000,
@@ -1500,7 +1546,7 @@ mod child_prompt_tests {
         };
         kernel::StreamSink::usage(&sink, &usage);
         match rx.try_recv().expect("a child's usage reaches the surface") {
-            crate::tui_tea::TuiEvent::Usage(seen) => {
+            super::tests::Seen::Usage(seen) => {
                 assert_eq!(seen.prompt_tokens, 10_000);
                 assert_eq!(seen.cached_prompt_tokens, Some(9_600));
             }

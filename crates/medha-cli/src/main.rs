@@ -4,7 +4,6 @@
 mod acp;
 mod acp_agents;
 mod acp_questions;
-mod agents;
 mod attachments;
 mod connectors;
 mod desktop_changes;
@@ -30,7 +29,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kernel::{EventLog, Kernel, Message, Provider, Session};
 use providers::OpenAiCompat;
-use runtime::{config, plugin_session, skill_judge, vision};
+use runtime::{agents, config, plugin_session, skill_judge, vision};
 use sandbox::WorkspaceSandbox;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
@@ -1854,7 +1853,9 @@ async fn main() -> Result<()> {
     }
     agent_runner.install(Arc::new(agents::KernelRunner::new(
         &kernel,
-        tui_channel.as_ref().map(|(tx, _)| tx.clone()),
+        tui_channel.as_ref().map(|(tx, _)| {
+            Arc::new(tui_tea::AgentWatch { tx: tx.clone() }) as Arc<dyn agents::AgentWatcher>
+        }),
     )));
 
     let configured_persona = model_profiles

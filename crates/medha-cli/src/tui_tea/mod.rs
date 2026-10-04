@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod agent_watch;
 mod attach;
 mod markdown;
 mod plugins;
@@ -26,6 +27,8 @@ mod spin;
 mod tty;
 mod update;
 mod view;
+pub(crate) use agent_watch::AgentWatch;
+pub(crate) use runtime::agents::AgentStep;
 use update::*;
 use view::*;
 
@@ -587,41 +590,6 @@ enum Item {
     /// served. Collapsed to one line by default and expanded with the same key
     /// as any other collapsed card.
     AgentsDone(Vec<AgentDoneRow>),
-}
-
-/// A step in a child agent's own transcript.
-///
-/// The same shapes the parent renders, kept as a separate type because a child's
-/// stream is routed rather than appended: it belongs to that agent's view, and
-/// three children streaming into one conversation is unreadable.
-#[derive(Debug, Clone)]
-pub(crate) enum AgentStep {
-    /// What this child was sent to do, shown first in its own view.
-    Task {
-        objective: String,
-        contract: Option<String>,
-    },
-    Text(String),
-    Reasoning(String),
-    ToolCall {
-        id: Option<String>,
-        tool: String,
-        args: serde_json::Value,
-    },
-    ToolResult {
-        id: Option<String>,
-        tool: String,
-        ok: bool,
-        payload: serde_json::Value,
-    },
-    /// A transient provider failure abandoned the trailing streamed attempt.
-    Restarted,
-    /// Optimistic local record while a steer waits for a turn boundary.
-    SteerQueued(String),
-    /// The queued text actually entered the child's canonical transcript.
-    Steered(String),
-    /// The child settled before these queued messages could be applied.
-    SteersReturned(Vec<String>),
 }
 
 /// One finished child, as its record reads afterwards.

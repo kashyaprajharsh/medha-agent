@@ -17,6 +17,7 @@ lockfile = { path = "../lockfile" }
 extensions = { path = "../extensions" }
 orchestrator = { path = "../orchestrator" }
 sandbox = { path = "../sandbox" }
+store = { path = "../store" }
 tokio.workspace = true
 tokio-util = { version = "0.7" }
 ulid.workspace = true
@@ -37,7 +38,6 @@ tracing = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
-store = { path = "../store" }
 test-support = { path = "../test-support" }
 tempfile = "3"
 tokio = { workspace = true, features = ["net", "io-util"] }

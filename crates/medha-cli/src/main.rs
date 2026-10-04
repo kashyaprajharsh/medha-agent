@@ -877,12 +877,7 @@ async fn main() -> Result<()> {
     }
 
     let lock_cwd = std::env::current_dir()?;
-    let lock = apply_lock_trust(
-        lockfile::MedhaLock::load_default()?,
-        &lock_cwd.join("medha.lock"),
-        &lock_cwd,
-        &config::state_dir(&lock_cwd)?,
-    );
+    let lock = runtime::workspace::load_lock(&lock_cwd, &Stderr)?;
     let chosen_autonomy = if cli.plan {
         Some(kernel::AutonomyLevel::Plan)
     } else if let Some(mode) = cli.mode {
@@ -1158,12 +1153,10 @@ async fn main() -> Result<()> {
         provider.set_streaming(stream);
     }
 
-    // Runtime state stays outside the repository.
-    let cwd = std::env::current_dir()?;
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    let state = config::state_dir(&cwd)?;
-    let medha_home = config::medha_home()?;
-    warn_legacy_state(&cwd, &state);
+    let workspace_home = runtime::Workspace::open(lock_cwd, &Stderr)?;
+    let cwd = workspace_home.root.clone();
+    let state = workspace_home.state.clone();
+    let medha_home = workspace_home.home.clone();
 
     // Never write logs over the TUI.
     let logs_dir = state.join("logs");
@@ -1179,17 +1172,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let db_path = state.join("events.db");
-    let log = Arc::new(store::SqliteLog::open_with_mutation_lock(
-        &db_path,
-        medha_home.join("mutations.db"),
-    )?);
-
-    // Preserve a damaged log for recovery without using it as trusted history.
-    log.verify()
-        .context("event log integrity check failed; refusing to start")?;
-
-    let artifacts = Arc::new(store::FileArtifactStore::open(state.join("artifacts"))?);
+    let runtime::workspace::Store { log, artifacts } = workspace_home.open_store()?;
 
     // A model with no image input is not a dead end when an auxiliary vision
     // profile is configured: the kernel has it describe the image instead.
@@ -2707,32 +2690,22 @@ fn run_trust_command(args: &[String]) -> anyhow::Result<()> {
 
 /// Ignore privilege a repository asked for until it is accepted for this
 /// workspace. `medha.lock` ships inside a checkout, so it is untrusted input.
+/// The terminal's notices go to stderr as they happen.
+struct Stderr;
+
+impl runtime::Notices for Stderr {
+    fn say(&self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
 fn apply_lock_trust(
     lock: lockfile::MedhaLock,
     lock_path: &std::path::Path,
     workspace: &std::path::Path,
     state: &std::path::Path,
 ) -> lockfile::MedhaLock {
-    let risky = lock.risky_settings();
-    if risky.is_empty() {
-        return lock;
-    }
-    let key = workspace.display().to_string();
-    let accepted = lockfile::AcceptedLocks::load(&state.join("lock_trust.toml"));
-    if accepted.allows(&key, &risky) {
-        return lock;
-    }
-    eprintln!(
-        "warning: ignoring {} privilege-relaxing setting(s) in {} — this file ships \
-         inside the repository and cannot grant itself authority:",
-        risky.len(),
-        lock_path.display()
-    );
-    for setting in &risky {
-        eprintln!("  · {setting}");
-    }
-    eprintln!("  run `medha trust` in this directory to accept them.");
-    lock.without_risky_settings()
+    runtime::workspace::apply_lock_trust(lock, lock_path, workspace, state, &Stderr)
 }
 
 struct CommandVerifier {
@@ -3066,32 +3039,7 @@ fn result_summary(tool: &str, p: &serde_json::Value) -> String {
 /// Detect legacy repository-local state without importing untrusted logs,
 /// artifacts, databases, or symlink targets into machine-local authority.
 fn warn_legacy_state(cwd: &std::path::Path, state: &std::path::Path) {
-    let legacy = cwd.join(".medha");
-    let runtime_entries = [
-        "events.db",
-        "events.db-wal",
-        "events.db-shm",
-        "artifacts",
-        "snapshots",
-        "logs",
-        "trust.lock",
-    ];
-    let found = runtime_entries
-        .iter()
-        // Detect dangling links without following repository-controlled paths.
-        .filter(|name| std::fs::symlink_metadata(legacy.join(name)).is_ok())
-        .copied()
-        .collect::<Vec<_>>();
-    if !found.is_empty() {
-        eprintln!(
-            "warning: ignored repository-local legacy runtime state in {} ({}) — \
-             automatic import is disabled because a checkout cannot authenticate \
-             event, artifact, log, or trust data; fresh machine-local state is in {}",
-            legacy.display(),
-            found.join(", "),
-            state.display()
-        );
-    }
+    runtime::workspace::warn_legacy_state(cwd, state, &Stderr);
 }
 
 fn print_sessions(log: &store::SqliteLog) -> Result<()> {

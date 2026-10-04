@@ -16,6 +16,7 @@ pub struct SessionOptions {
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub model_env: crate::config::ModelEnv,
+    pub search_env: crate::config::SearchEnv,
     pub budget: crate::budget::BudgetLimits,
     pub approve: Option<String>,
     pub reasoning: Option<kernel::ReasoningConfig>,

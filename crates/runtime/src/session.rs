@@ -70,7 +70,7 @@ pub async fn start(
             .map(|name| (name, configured))
     };
     let auxiliary_vision = configured_vision.and_then(|(name, configured)| {
-        match vision::connect(&configured, &name) {
+        match vision::connect(&configured, &name, options.model_env.api_key.as_deref()) {
             Ok(provider) => {
                 notices.say(&format!(
                     "auxiliary vision: '{name}' reads images this model cannot"
@@ -461,7 +461,8 @@ pub async fn start(
     registry.register_session_search(log.clone(), artifacts.clone());
     let search_handle = registry.search_handle();
     if let Ok(cfg_guard) = model_profiles.lock() {
-        *search_handle.lock().expect("search settings lock") = config::resolve_search(&cfg_guard);
+        *search_handle.lock().expect("search settings lock") =
+            config::resolve_search_with(&cfg_guard, options.search_env);
     }
     if let Ok(mut slot) = registry.clarify_handle().lock() {
         *slot = Some(surface.asker);
@@ -568,10 +569,15 @@ pub async fn start(
     };
     let (summary_provider, replay_summary) = match configured_compressor {
         Some((name, configured)) => {
-            let auxiliary = config::resolve_model(&configured, &name).and_then(|resolved| {
-                providers::OpenAiCompat::from_profile(resolved.provider, resolved.credential)
-                    .map_err(anyhow::Error::from)
-            });
+            let auxiliary =
+                config::resolve_model_as(&configured, &name, options.model_env.api_key.as_deref())
+                    .and_then(|resolved| {
+                        providers::OpenAiCompat::from_profile(
+                            resolved.provider,
+                            resolved.credential,
+                        )
+                        .map_err(anyhow::Error::from)
+                    });
             match auxiliary {
                 Ok(auxiliary) => (Arc::new(auxiliary), false),
                 Err(error) => {

@@ -906,6 +906,7 @@ async fn main() -> Result<()> {
         },
         attach: cli.attach.clone(),
         model_env: config::ModelEnv::from_process(),
+        search_env: config::SearchEnv::from_process(),
         budget: budget_limits,
         approve: std::env::var("MEDHA_APPROVE").ok(),
         first_run_setup: cli.setup,

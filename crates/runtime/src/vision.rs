@@ -104,8 +104,12 @@ impl kernel::VisionDescriber for AuxiliaryVision {
 }
 
 /// Build the auxiliary client from a saved profile and its stored credential.
-pub fn connect(config: &crate::config::Config, name: &str) -> Result<providers::OpenAiCompat> {
-    let resolved = crate::config::resolve_model(config, name)?;
+pub fn connect(
+    config: &crate::config::Config,
+    name: &str,
+    env_key: Option<&str>,
+) -> Result<providers::OpenAiCompat> {
+    let resolved = crate::config::resolve_model_as(config, name, env_key)?;
     Ok(providers::OpenAiCompat::from_profile(
         resolved.provider,
         resolved.credential,

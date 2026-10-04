@@ -406,14 +406,32 @@ pub fn search_cred_id(provider: tools::SearchProvider) -> Option<&'static str> {
     }
 }
 
-fn auto_detect_search_provider() -> tools::SearchProvider {
+/// Which web search services the caller's environment offers, read once.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SearchEnv {
+    pub tavily: bool,
+    pub brave: bool,
+    pub searxng: bool,
+}
+
+impl SearchEnv {
+    pub fn from_process() -> Self {
+        let has = |k: &str| std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty());
+        Self {
+            tavily: has("TAVILY_API_KEY"),
+            brave: has("BRAVE_API_KEY"),
+            searxng: has("MEDHA_SEARXNG_URL"),
+        }
+    }
+}
+
+fn auto_detect_search_provider(env: SearchEnv) -> tools::SearchProvider {
     use tools::SearchProvider as P;
-    let has = |k: &str| std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty());
-    if has("TAVILY_API_KEY") {
+    if env.tavily {
         P::Tavily
-    } else if has("BRAVE_API_KEY") {
+    } else if env.brave {
         P::Brave
-    } else if has("MEDHA_SEARXNG_URL") {
+    } else if env.searxng {
         P::Searxng
     } else {
         P::DuckDuckGo
@@ -421,9 +439,14 @@ fn auto_detect_search_provider() -> tools::SearchProvider {
 }
 
 pub fn resolve_search(cfg: &Config) -> tools::SearchSettings {
+    resolve_search_with(cfg, SearchEnv::from_process())
+}
+
+/// `resolve_search`, with what the environment offers handed in.
+pub fn resolve_search_with(cfg: &Config, env: SearchEnv) -> tools::SearchSettings {
     let provider = match cfg.search.provider.as_deref() {
         Some(p) => tools::SearchProvider::from_id(p),
-        None => auto_detect_search_provider(),
+        None => auto_detect_search_provider(env),
     };
     tools::SearchSettings {
         provider,
@@ -1524,19 +1547,29 @@ fn parse_image_input(value: &str) -> Result<kernel::ImageInputMode> {
 }
 
 pub fn resolve_model(cfg: &Config, name: &str) -> Result<Resolved> {
+    resolve_model_as(cfg, name, first_env(&["MEDHA_API_KEY"]).as_deref())
+}
+
+/// `resolve_model`, with the environment's key handed in instead of read from the process.
+pub fn resolve_model_as(cfg: &Config, name: &str, env_key: Option<&str>) -> Result<Resolved> {
     let provider = cfg
         .model_profile(name)
         .ok_or_else(|| anyhow::anyhow!("no saved model named '{name}'"))?;
     // Prefer MEDHA_API_KEY to avoid an unnecessary macOS keychain prompt.
     let api_key = normalize_api_key(
-        &first_env(&["MEDHA_API_KEY"])
+        &env_key
+            .map(str::to_owned)
             .or_else(|| load_key(&provider.base_url))
             .unwrap_or_default(),
     );
-    resolve_model_with_key(cfg, name, &api_key)
+    resolve_keyed(cfg, name, &api_key, env_key.is_some())
 }
 
 pub fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) -> Result<Resolved> {
+    resolve_keyed(cfg, name, api_key, first_env(&["MEDHA_API_KEY"]).is_some())
+}
+
+fn resolve_keyed(cfg: &Config, name: &str, api_key: &str, key_from_env: bool) -> Result<Resolved> {
     let provider = cfg
         .model_profile(name)
         .ok_or_else(|| anyhow::anyhow!("no saved model named '{name}'"))?;
@@ -1547,7 +1580,7 @@ pub fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) -> Result
             "model profile '{name}' requires a credential; choose 'Add or update an API key' in /model"
         );
     }
-    let credential_source = if first_env(&["MEDHA_API_KEY"]).is_some() {
+    let credential_source = if key_from_env {
         CredSource::Env
     } else if file_load_key(&provider.base_url).is_some() {
         CredSource::CredentialsFile

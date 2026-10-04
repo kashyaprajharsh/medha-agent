@@ -2255,8 +2255,6 @@ dependencies = [
  "async-trait",
  "dirs",
  "futures",
- "getrandom 0.3.4",
- "hmac",
  "libc",
  "oauth2",
  "reqwest 0.13.4",
@@ -2272,6 +2270,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "wire",
 ]
 
 [[package]]
@@ -5658,6 +5657,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "wire"
+version = "0.1.10"
+dependencies = [
+ "getrandom 0.3.4",
+ "hmac",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

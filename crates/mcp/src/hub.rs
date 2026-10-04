@@ -12,9 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
-};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{
@@ -22,8 +20,10 @@ use crate::{
     ServerStatus, TOOL_PREFIX, UrlSink,
 };
 
-const MAX_FRAME: usize = 16 * 1024 * 1024;
-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const ROLES: wire::Roles = wire::Roles {
+    host: "host",
+    guest: "chat",
+};
 
 /// Where a host listens: a socket path, or a pipe name on Windows.
 #[derive(Debug, Clone)]
@@ -149,58 +149,11 @@ type Writer = Box<dyn AsyncWrite + Unpin + Send>;
 type Pending = HashMap<u64, oneshot::Sender<Result<Value, WireError>>>;
 
 async fn send(writer: &Mutex<Option<Writer>>, frame: &Value) -> bool {
-    let mut line = frame.to_string();
-    line.push('\n');
     let mut guard = writer.lock().await;
     let Some(out) = guard.as_mut() else {
         return false;
     };
-    out.write_all(line.as_bytes()).await.is_ok() && out.flush().await.is_ok()
-}
-
-/// One frame, or `None` at end of stream or when a peer overruns the cap.
-async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Option<Value> {
-    let mut line = Vec::new();
-    let read = (&mut *reader)
-        .take(MAX_FRAME as u64 + 1)
-        .read_until(b'\n', &mut line)
-        .await
-        .ok()?;
-    if read == 0 || line.len() > MAX_FRAME {
-        return None;
-    }
-    serde_json::from_slice(&line).ok()
-}
-
-fn same_secret(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn nonce() -> Result<String, Error> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|error| Error::Protocol(error.to_string()))?;
-    Ok(hex(&bytes))
-}
-
-/// Each side proves it holds the token without sending it.
-fn proof(token: &str, role: &str, nonce: &str) -> String {
-    mac(token, &format!("{role}:{nonce}"))
-}
-
-fn mac(secret: &str, message: &str) -> String {
-    use hmac::{Hmac, Mac};
-    let mut mac =
-        Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
-    mac.update(message.as_bytes());
-    hex(&mac.finalize().into_bytes())
+    wire::write_frame(out, frame).await
 }
 
 /// A chat's attachment to the host: a mirror of the shared servers, kept
@@ -244,42 +197,27 @@ impl Link {
     }
 
     async fn open_now(self: Arc<Self>) -> Result<(), Error> {
-        let stream = connect(&self.endpoint.address).await?;
-        let (read, write) = tokio::io::split(stream);
+        let address = &self.endpoint.address;
+        let stream = wire::connect(address).await.map_err(|error| {
+            Error::Protocol(format!("no connection host at {address}: {error}"))
+        })?;
+        let (read, mut write) = tokio::io::split(stream);
         let mut reader = BufReader::new(read);
+        let reply = wire::greet(&mut reader, &mut write, &self.endpoint.token, ROLES)
+            .await
+            .map_err(|refusal| {
+                Error::Protocol(
+                    match refusal {
+                        wire::Refusal::Closed => "the connection host closed the channel",
+                        wire::Refusal::Silent => "the connection host did not answer",
+                        wire::Refusal::Unproven => {
+                            "the connection host could not prove it is Medha's"
+                        }
+                    }
+                    .into(),
+                )
+            })?;
         *self.writer.lock().await = Some(Box::new(write));
-        let closed = || Error::Protocol("the connection host closed the channel".into());
-        let silent = || Error::Protocol("the connection host did not answer".into());
-        // The host proves itself first: whatever took its address learns nothing.
-        let ours = nonce()?;
-        let hello = json!({"id": 0, "method": "hello", "params": {"nonce": ours}});
-        if !send(&self.writer, &hello).await {
-            return Err(closed());
-        }
-        let challenge = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader))
-            .await
-            .ok()
-            .flatten()
-            .ok_or_else(silent)?;
-        let offered = challenge["result"]["proof"].as_str().unwrap_or_default();
-        let theirs = challenge["result"]["nonce"].as_str().unwrap_or_default();
-        if theirs.len() != ours.len()
-            || !same_secret(offered, &proof(&self.endpoint.token, "host", &ours))
-        {
-            return Err(Error::Protocol(
-                "the connection host could not prove it is Medha's".into(),
-            ));
-        }
-        let answer = json!({"id": 1, "method": "prove",
-            "params": {"proof": proof(&self.endpoint.token, "chat", theirs)}});
-        if !send(&self.writer, &answer).await {
-            return Err(closed());
-        }
-        let reply = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader))
-            .await
-            .ok()
-            .flatten()
-            .ok_or_else(silent)?;
         let snapshot: Snapshot = serde_json::from_value(reply["result"].clone())
             .map_err(|_| Error::Protocol("the connection host refused this chat".into()))?;
         *self.mirror.write().expect("hub mirror lock") = snapshot;
@@ -292,7 +230,7 @@ impl Link {
         self: Arc<Self>,
         mut reader: BufReader<R>,
     ) {
-        while let Some(frame) = read_frame(&mut reader).await {
+        while let Some(frame) = wire::read_frame(&mut reader).await {
             if let Some(id) = frame.get("id").and_then(Value::as_u64) {
                 let waiter = self.pending.lock().expect("hub pending lock").remove(&id);
                 if let Some(waiter) = waiter {
@@ -522,36 +460,16 @@ pub async fn serve<S>(manager: McpManager, stream: S, token: Arc<str>, resolve: 
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let (read, write) = tokio::io::split(stream);
+    let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
+    let Some(admitted) = wire::admit(&mut reader, &mut write, &token, ROLES).await else {
+        return;
+    };
     let writer: Arc<Mutex<Option<Writer>>> = Arc::new(Mutex::new(Some(Box::new(write))));
-    let Ok(Some(hello)) = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader)).await else {
-        return;
-    };
-    let theirs = hello["params"]["nonce"].as_str().unwrap_or_default();
-    let Ok(ours) = nonce() else {
-        return;
-    };
-    if hello["method"] != "hello" || theirs.len() != ours.len() {
-        return;
-    }
-    let challenge = json!({"id": hello["id"],
-        "result": {"proof": proof(&token, "host", theirs), "nonce": ours}});
-    if !send(&writer, &challenge).await {
-        return;
-    }
-    let Ok(Some(answer)) = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader)).await
-    else {
-        return;
-    };
-    let offered = answer["params"]["proof"].as_str().unwrap_or_default();
-    if answer["method"] != "prove" || !same_secret(offered, &proof(&token, "chat", &ours)) {
-        return;
-    }
     let mut changes = manager.subscribe();
     if !send(
         &writer,
-        &json!({"id": answer["id"], "result": manager.snapshot().await}),
+        &json!({"id": admitted, "result": manager.snapshot().await}),
     )
     .await
     {
@@ -568,7 +486,7 @@ where
             }
         }
     });
-    while let Some(frame) = read_frame(&mut reader).await {
+    while let Some(frame) = wire::read_frame(&mut reader).await {
         let Ok(request) = serde_json::from_value::<Request>(frame) else {
             continue;
         };
@@ -653,7 +571,7 @@ pub async fn run_host(
     token: Arc<str>,
     resolve: Resolve,
 ) -> std::io::Result<()> {
-    listen(address, move |stream| {
+    wire::listen(address, move |stream| {
         tokio::spawn(serve(
             manager.clone(),
             stream,
@@ -662,59 +580,6 @@ pub async fn run_host(
         ));
     })
     .await
-}
-
-#[cfg(unix)]
-async fn connect(address: &str) -> Result<tokio::net::UnixStream, Error> {
-    tokio::net::UnixStream::connect(address)
-        .await
-        .map_err(|error| Error::Protocol(format!("no connection host at {address}: {error}")))
-}
-
-#[cfg(unix)]
-async fn listen(
-    address: &str,
-    mut accept: impl FnMut(tokio::net::UnixStream),
-) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let path = std::path::Path::new(address);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let _ = std::fs::remove_file(path);
-    let listener = tokio::net::UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    loop {
-        let (stream, _) = listener.accept().await?;
-        accept(stream);
-    }
-}
-
-#[cfg(windows)]
-async fn connect(address: &str) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, Error> {
-    tokio::net::windows::named_pipe::ClientOptions::new()
-        .open(address)
-        .map_err(|error| Error::Protocol(format!("no connection host at {address}: {error}")))
-}
-
-#[cfg(windows)]
-async fn listen(
-    address: &str,
-    mut accept: impl FnMut(tokio::net::windows::named_pipe::NamedPipeServer),
-) -> std::io::Result<()> {
-    use tokio::net::windows::named_pipe::ServerOptions;
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .reject_remote_clients(true)
-        .create(address)?;
-    loop {
-        server.connect().await?;
-        let next = ServerOptions::new()
-            .reject_remote_clients(true)
-            .create(address)?;
-        accept(std::mem::replace(&mut server, next));
-    }
 }
 
 #[cfg(test)]

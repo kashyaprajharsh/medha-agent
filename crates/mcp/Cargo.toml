@@ -34,8 +34,7 @@ futures.workspace = true
 async-trait = "0.1"
 sse-stream = "0.2"
 sha2 = "0.10"
-getrandom = "0.3"
-hmac = "0.12"
+wire = { path = "../wire" }
 
 [target.'cfg(unix)'.dependencies]
 # Process-group teardown: uvx/npx fork the real server, so killing the direct

@@ -7,6 +7,8 @@ use tokio::io::{AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf, dup
 /// A chat that says what it is told to, so routing can be checked without a model.
 struct Stub {
     opened: AtomicU64,
+    /// What a slow request waits for.
+    released: tokio::sync::Notify,
 }
 
 async fn say(output: &mut DuplexStream, frame: Value) {
@@ -50,6 +52,9 @@ impl Chats for Stub {
         if let Some(reason) = params["refuse"].as_str() {
             return Err(reason.into());
         }
+        if params["slow"] == true {
+            self.released.notified().await;
+        }
         let n = self.opened.fetch_add(1, Ordering::Relaxed);
         let session = match params["resume"].as_str() {
             Some(id) => id.to_string(),
@@ -69,12 +74,24 @@ impl Chats for Stub {
             }),
         })
     }
+
+    async fn about_folder(&self, request: &Value) -> Result<Value, String> {
+        match request["method"].as_str() {
+            Some("history") => Ok(json!({"of": request["folder"]})),
+            Some("install") => {
+                self.released.notified().await;
+                Ok(json!({"installed": request["params"]["what"]}))
+            }
+            _ => Err("unknown method".into()),
+        }
+    }
 }
 
 fn backend() -> Arc<Backend<Stub>> {
     Backend::new(
         Stub {
             opened: AtomicU64::new(1),
+            released: tokio::sync::Notify::new(),
         },
         "test",
     )
@@ -131,6 +148,18 @@ impl Tester {
             request["session"] = json!(session);
         }
         wire::write_frame(&mut self.writer, &request).await;
+        self.answer(id).await
+    }
+
+    /// Sends a request without waiting for its answer.
+    async fn post(&mut self, mut request: Value) -> u64 {
+        self.asked += 1;
+        request["id"] = json!(self.asked);
+        wire::write_frame(&mut self.writer, &request).await;
+        self.asked
+    }
+
+    async fn answer(&mut self, id: u64) -> Value {
         loop {
             let frame = self
                 .frame()
@@ -396,4 +425,40 @@ async fn a_chat_is_resumed_once_and_closed_by_whoever_is_attached() {
         hello["result"],
         json!({"backend": "test", "protocol": PROTOCOL})
     );
+}
+
+#[tokio::test]
+async fn a_slow_request_does_not_hold_up_the_client_that_sent_it() {
+    let backend = backend();
+    let mut client = connect(&backend);
+    let installing = client
+        .post(json!({"method": "install", "folder": "/w", "params": {"what": "a plugin"}}))
+        .await;
+    let creating = client
+        .post(json!({"method": "session.create", "params": {"slow": true}}))
+        .await;
+
+    let history = client
+        .post(json!({"method": "history", "folder": "/w"}))
+        .await;
+    assert_eq!(client.answer(history).await["result"], json!({"of": "/w"}));
+    let chat = client.open().await;
+    assert_eq!(
+        client.say(&chat, "meanwhile").await["result"]["said"],
+        "meanwhile"
+    );
+    let unknown = client
+        .post(json!({"method": "nonsense", "folder": "/w"}))
+        .await;
+    assert_eq!(
+        client.answer(unknown).await["error"]["message"],
+        "unknown method"
+    );
+
+    backend.chats.released.notify_waiters();
+    assert_eq!(
+        client.answer(installing).await["result"]["installed"],
+        "a plugin"
+    );
+    assert!(client.answer(creating).await["result"]["session"].is_string());
 }

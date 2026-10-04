@@ -38,6 +38,12 @@ pub struct Opened {
 #[async_trait::async_trait]
 pub trait Chats: Send + Sync + 'static {
     async fn open(&self, params: &Value) -> Result<Opened, String>;
+
+    /// A request about a folder, not a chat: its history, settings, extensions.
+    /// `request` is the client's whole frame, which names the folder.
+    async fn about_folder(&self, _request: &Value) -> Result<Value, String> {
+        Err("unknown method".into())
+    }
 }
 
 pub struct Backend<C> {

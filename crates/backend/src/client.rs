@@ -123,9 +123,21 @@ async fn handle<C: Chats>(
             .ok_or_else(|| (-32602, format!("{needed} needs a session")))?;
         backend.find(id)
     };
+    // These can take long, so the client's other requests are not held behind them.
+    let about_folder = named.is_none() && frame.get("folder").is_some();
+    if method == "session.create" || about_folder {
+        let (backend, me) = (Arc::clone(backend), me.clone());
+        tokio::spawn(async move {
+            let outcome = match about_folder {
+                true => backend.chats.about_folder(&frame).await.map_err(refused),
+                false => backend.create(&frame["params"]).await,
+            };
+            me.reply(id, outcome);
+        });
+        return;
+    }
     let outcome = match method.as_str() {
         "hello" => Ok(json!({ "backend": backend.version, "protocol": PROTOCOL })),
-        "session.create" => backend.create(&frame["params"]).await,
         "session.list" => Ok(backend.list()),
         "session.attach" => session("session.attach").map(|session| {
             attached.insert(session.id.clone());

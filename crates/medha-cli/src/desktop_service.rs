@@ -150,6 +150,29 @@ pub async fn run(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// One request about a folder, for a caller that already holds that folder's
+/// event log: the backend keeps one connection per folder and answers on it.
+pub(crate) async fn answer(
+    log: &store::SqliteLog,
+    workspace: &std::path::Path,
+    frame: &Value,
+) -> Result<Value, String> {
+    let text = |key: &str| frame[key].as_str().map(str::to_owned);
+    let request = Request {
+        id: 0,
+        method: text("method").unwrap_or_default(),
+        session_id: text("session_id"),
+        cursor: text("cursor"),
+        limit: frame["limit"].as_u64().map(|limit| limit as usize),
+        params: frame["params"].clone(),
+    };
+    let reply = handle(log, workspace, request).await;
+    match reply.error {
+        Some(error) => Err(error),
+        None => Ok(reply.result.unwrap_or(Value::Null)),
+    }
+}
+
 async fn handle(log: &store::SqliteLog, workspace: &std::path::Path, req: Request) -> Response {
     if req.method == "extensions.connectors" {
         return match super::config::load() {

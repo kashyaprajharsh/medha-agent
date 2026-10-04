@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use backend::{Chats, Opened};
 use runtime::session::{Choices, Start};
@@ -31,10 +31,12 @@ impl Collected {
     }
 }
 
-/// A folder's chats share its one opened workspace, and so its one event log.
+/// A folder's chats, and what is asked about the folder, share its one opened
+/// workspace and so its one event log. A folder stays open once it has been
+/// used: reopening would check its whole log again on every request.
 #[derive(Default)]
 pub(crate) struct ServeChats {
-    folders: Mutex<HashMap<PathBuf, Weak<Workspace>>>,
+    folders: Mutex<HashMap<PathBuf, Arc<Workspace>>>,
 }
 
 impl ServeChats {
@@ -43,12 +45,11 @@ impl ServeChats {
             .folders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        folders.retain(|_, held| held.strong_count() > 0);
-        if let Some(open) = folders.get(folder).and_then(Weak::upgrade) {
-            return Ok(open);
+        if let Some(open) = folders.get(folder) {
+            return Ok(Arc::clone(open));
         }
         let opened = Arc::new(Workspace::open(folder.to_path_buf(), notices)?);
-        folders.insert(folder.to_path_buf(), Arc::downgrade(&opened));
+        folders.insert(folder.to_path_buf(), Arc::clone(&opened));
         Ok(opened)
     }
 }
@@ -75,10 +76,8 @@ fn options(params: &Value) -> Result<SessionOptions, String> {
     })
 }
 
-fn folder(params: &Value) -> Result<PathBuf, String> {
-    let named = params["folder"]
-        .as_str()
-        .ok_or("session.create needs a folder")?;
+fn folder(named: &Value) -> Result<PathBuf, String> {
+    let named = named.as_str().ok_or("a folder must be named")?;
     let path = Path::new(named);
     if !path.is_absolute() {
         return Err("the folder must be an absolute path".into());
@@ -89,8 +88,18 @@ fn folder(params: &Value) -> Result<PathBuf, String> {
 
 #[async_trait::async_trait]
 impl Chats for ServeChats {
+    async fn about_folder(&self, request: &Value) -> Result<Value, String> {
+        let folder = folder(&request["folder"])?;
+        let failed = |error: anyhow::Error| format!("{error:#}");
+        let workspace = self
+            .workspace(&folder, &Collected::default())
+            .map_err(failed)?;
+        let store = workspace.open_store().map_err(failed)?;
+        crate::desktop_service::answer(&store.log, &folder, request).await
+    }
+
     async fn open(&self, params: &Value) -> Result<Opened, String> {
-        let folder = folder(params)?;
+        let folder = folder(&params["folder"])?;
         let options = options(params)?;
         let restore = params
             .get("settings")

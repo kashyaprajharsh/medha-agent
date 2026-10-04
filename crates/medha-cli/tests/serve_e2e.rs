@@ -153,6 +153,67 @@ impl Provider {
     }
 }
 
+/// The binary under test, with the home and the model every process here shares.
+fn medha(home: &Path, provider: &Provider) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_medha"));
+    command
+        .env("MEDHA_HOME", home)
+        .env("MEDHA_BASE_URL", &provider.url)
+        .env("MEDHA_MODEL", "test-model")
+        .env("MEDHA_API_KEY", SECRET)
+        .env("MEDHA_PROTOCOL", "open-ai-chat")
+        .env("MEDHA_TOKEN_ACCOUNTING", "adaptive");
+    command
+}
+
+/// `medha desktop-service`, the process the desktop asks about a folder today.
+struct Service {
+    child: Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl Service {
+    fn start(folder: &Path, home: &Path, provider: &Provider) -> Self {
+        let mut child = medha(home, provider)
+            .args(["desktop-service", "--workspace"])
+            .arg(folder)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = std::io::BufReader::new(child.stdout.take().unwrap());
+        Self {
+            child,
+            input,
+            output,
+        }
+    }
+
+    /// `request` holds the method and whatever else it takes; the answer is its result or its error text.
+    fn ask(&mut self, mut request: Value) -> Result<Value, String> {
+        use std::io::BufRead;
+        request["id"] = json!(1);
+        writeln!(self.input, "{request}").unwrap();
+        let mut line = String::new();
+        self.output.read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).expect("a reply from the service");
+        match reply["error"].as_str() {
+            Some(error) => Err(error.to_string()),
+            None => Ok(reply["result"].clone()),
+        }
+    }
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 struct Backend {
     child: Child,
     home: PathBuf,
@@ -160,14 +221,8 @@ struct Backend {
 
 impl Backend {
     fn start(home: &Path, provider: &Provider) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_medha"))
+        let child = medha(home, provider)
             .arg("serve")
-            .env("MEDHA_HOME", home)
-            .env("MEDHA_BASE_URL", &provider.url)
-            .env("MEDHA_MODEL", "test-model")
-            .env("MEDHA_API_KEY", SECRET)
-            .env("MEDHA_PROTOCOL", "open-ai-chat")
-            .env("MEDHA_TOKEN_ACCOUNTING", "adaptive")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -313,6 +368,26 @@ impl Client {
     async fn send(&mut self, session: &str, content: &str) -> Value {
         self.ask("message.send", Some(session), json!({"content": content}))
             .await
+    }
+
+    /// The same request the desktop service takes, asked of the backend about `folder`.
+    async fn about(&mut self, folder: &Path, mut request: Value) -> Result<Value, String> {
+        self.asked += 1;
+        let id = self.asked;
+        request["id"] = json!(id);
+        request["folder"] = json!(folder);
+        assert!(wire::write_frame(&mut self.writer, &request).await);
+        loop {
+            let frame = self.frame().await;
+            if frame["id"] != json!(id) {
+                self.events.push_back(frame);
+                continue;
+            }
+            return match frame["error"]["message"].as_str() {
+                Some(error) => Err(error.to_string()),
+                None => Ok(frame["result"].clone()),
+            };
+        }
     }
 }
 
@@ -559,4 +634,69 @@ async fn a_chat_outlives_the_backend_that_was_running_it() {
         asked.contains("remember the word heron") && asked.contains("what was the word"),
         "the resumed chat lost its history: {asked}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_backend_answers_about_a_folder_exactly_as_the_desktop_service_does() {
+    let world = World::new();
+    let folder = world.folder("w");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    client.send(&chat, "one turn of history").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let mut service = Service::start(&folder, &world.home(), &world.provider);
+
+    let profile = json!({"protocol": "open-ai-chat", "base_url": "http://127.0.0.1:9/v1",
+        "model": "saved-here", "auth": "none", "max_ctx": 32768});
+    let saved = json!({"method": "settings.model.save",
+        "params": {"name": "saved-here", "profile": profile, "default": true}});
+    client
+        .about(&folder, saved)
+        .await
+        .expect("the backend saves a setting");
+    let noted = json!({"method": "instructions.save",
+        "params": {"kind": "agents", "before": "", "content": "Written through the backend."}});
+    client
+        .about(&folder, noted)
+        .await
+        .expect("the backend saves instructions");
+    let written = std::fs::read_to_string(folder.join("AGENTS.md")).unwrap();
+    assert_eq!(written, "Written through the backend.");
+
+    let requests = [
+        json!({"method": "sessions.list"}),
+        json!({"method": "sessions.events", "session_id": chat}),
+        json!({"method": "sessions.events", "session_id": chat, "limit": 2}),
+        json!({"method": "sessions.events"}),
+        json!({"method": "sessions.changes", "session_id": chat}),
+        json!({"method": "usage.summary", "params": {"days": 7}}),
+        json!({"method": "library.sessions"}),
+        json!({"method": "settings.defaults"}),
+        json!({"method": "settings.list"}),
+        json!({"method": "settings.keys"}),
+        json!({"method": "settings.tools"}),
+        json!({"method": "instructions.list"}),
+        json!({"method": "extensions.list"}),
+        json!({"method": "extensions.hooks.list"}),
+        json!({"method": "extensions.marketplace.list"}),
+        json!({"method": "extensions.connectors"}),
+        json!({"method": "extensions.nonsense"}),
+        json!({"method": "nonsense"}),
+    ];
+    for request in requests {
+        let from_service = service.ask(request.clone());
+        let from_backend = client.about(&folder, request.clone()).await;
+        assert_eq!(from_backend, from_service, "{request}");
+    }
+    let page = json!({"method": "sessions.events", "session_id": chat, "limit": 2});
+    let page = client.about(&folder, page).await.unwrap();
+    let next = json!({"method": "sessions.events", "session_id": chat,
+        "cursor": page["next_cursor"]});
+    assert_eq!(client.about(&folder, next.clone()).await, service.ask(next));
+    let defaults = client
+        .about(&folder, json!({"method": "settings.defaults"}))
+        .await;
+    assert_eq!(defaults.unwrap()["profile"], "saved-here");
+    assert!(!client.heard.contains(SECRET), "a key reached a client");
 }

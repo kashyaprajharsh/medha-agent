@@ -526,6 +526,7 @@ impl SandboxLockConfig {
             pids: self.pids,
             host: self.host.clone(),
             remote_dir: self.remote_dir.clone(),
+            home: sandbox::HomeScope::default(),
         }
     }
 

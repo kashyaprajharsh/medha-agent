@@ -94,12 +94,14 @@ impl ProcessHookRunner {
     pub fn load(store: Store, workspace: &Path) -> Self {
         match store.discover() {
             Ok(discovery) => {
-                let mut runner = Self::new(store, &discovery, workspace);
+                let home = sandbox::HomeScope::default();
+                let mut runner = Self::new(store, &discovery, workspace, &home);
                 runner.diagnostics.splice(0..0, discovery.notices());
                 runner
             }
             Err(error) => {
-                let mut runner = Self::new(store, &Discovery::default(), workspace);
+                let home = sandbox::HomeScope::default();
+                let mut runner = Self::new(store, &Discovery::default(), workspace, &home);
                 runner.diagnostics.push(error.to_string());
                 runner
             }
@@ -107,12 +109,18 @@ impl ProcessHookRunner {
     }
 
     /// Builds the runner from a discovery the caller already reported.
-    pub fn new(store: Store, discovery: &Discovery, workspace: &Path) -> Self {
+    pub fn new(
+        store: Store,
+        discovery: &Discovery,
+        workspace: &Path,
+        home: &sandbox::HomeScope,
+    ) -> Self {
         let (hooks, diagnostics) = registrations(discovery);
         let backend = |net| {
             sandbox::select_backend(
                 &sandbox::SandboxConfig {
                     net,
+                    home: home.clone(),
                     ..sandbox::SandboxConfig::default()
                 },
                 Vec::new(),

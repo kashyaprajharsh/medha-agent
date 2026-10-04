@@ -454,6 +454,8 @@ pub struct Config {
     /// out-of-memory abort.
     pub max_frame_bytes: usize,
     pub allow_network: bool,
+    /// Whose private HOME the servers run in.
+    pub home: sandbox::HomeScope,
 }
 
 impl Default for Config {
@@ -498,6 +500,7 @@ impl Default for Config {
             max_text_chars: 16_000,
             max_open_documents: 64,
             allow_network: false,
+            home: sandbox::HomeScope::default(),
         }
     }
 }
@@ -1960,6 +1963,7 @@ impl LspClient {
             } else {
                 NetPolicy::Deny
             },
+            home: config.home.clone(),
             ..SandboxConfig::default()
         };
         // Language servers get no user-approved roots: an approval covers the

@@ -328,6 +328,8 @@ pub struct Config {
     pub tokens: Option<Arc<dyn TokenStore>>,
     /// Where last-known tool lists are kept; `None` starts every server empty.
     pub cache: Option<PathBuf>,
+    /// Whose private HOME local command servers run in.
+    pub home: sandbox::HomeScope,
 }
 
 impl Default for Config {
@@ -347,6 +349,7 @@ impl Default for Config {
             http_timeout: Duration::from_secs(60),
             tokens: None,
             cache: None,
+            home: sandbox::HomeScope::default(),
         }
     }
 }
@@ -1979,6 +1982,7 @@ impl McpManager {
             } else {
                 NetPolicy::Deny
             },
+            home: self.inner.config.home.clone(),
             ..SandboxConfig::default()
         };
         // Package-manager servers (uvx/npx) must write a cache. Rather than widen

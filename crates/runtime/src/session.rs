@@ -138,6 +138,8 @@ pub async fn start(
         std::fs::rename(&legacy_audit, &audit_path).ok();
     }
     let mut sbx_cfg = lock.sandbox.to_config();
+    // One per chat: its commands, language servers, local MCP servers and hooks.
+    sbx_cfg.home = sandbox::HomeScope::private();
     if let Some(backend) = options.sandbox {
         sbx_cfg.backend = backend;
     }
@@ -293,6 +295,7 @@ pub async fn start(
             write_timeout: std::time::Duration::from_millis(lock.lsp.write_timeout_ms),
             max_frame_bytes: lock.lsp.max_frame_bytes,
             allow_network: lock.lsp.allow_network,
+            home: sbx_cfg.home.clone(),
             ..lsp::Config::default()
         };
         for configured in &lock.lsp.servers {
@@ -387,6 +390,7 @@ pub async fn start(
             http_timeout: std::time::Duration::from_millis(lock.mcp.http_timeout_ms),
             tokens: Some(Arc::new(config::McpTokens)),
             cache: Some(medha_home.join("mcp-cache")),
+            home: sbx_cfg.home.clone(),
         };
         // With a shared host, the user's remote servers are the host's to run;
         // without one answering, this chat runs them as before.
@@ -696,7 +700,7 @@ pub async fn start(
         .max_parallel_tools
         .or(lock.budget.max_parallel_tools)
         .unwrap_or(kernel::DEFAULT_MAX_PARALLEL_TOOLS);
-    let hook_runner = session_plugins.hook_runner(&cwd);
+    let hook_runner = session_plugins.hook_runner(&cwd, &sbx_cfg.home);
     for diagnostic in session_plugins
         .warnings()
         .iter()

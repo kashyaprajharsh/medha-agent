@@ -138,8 +138,12 @@ impl SessionPlugins {
         servers
     }
 
-    pub fn hook_runner(&self, workspace: &Path) -> extensions::ProcessHookRunner {
-        extensions::ProcessHookRunner::new(self.store.clone(), &self.discovery, workspace)
+    pub fn hook_runner(
+        &self,
+        workspace: &Path,
+        home: &sandbox::HomeScope,
+    ) -> extensions::ProcessHookRunner {
+        extensions::ProcessHookRunner::new(self.store.clone(), &self.discovery, workspace, home)
     }
 
     pub fn warnings(&self) -> &[String] {

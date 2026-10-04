@@ -123,6 +123,40 @@ pub struct SandboxConfig {
     pub host: Option<String>,
     /// SSH backend: remote working directory to `cd` into before running.
     pub remote_dir: Option<String>,
+    /// Native backend: whose private HOME its commands get.
+    pub home: HomeScope,
+}
+
+/// Whose private HOME a jailed command gets. A chat takes its own, so chats in
+/// one process do not share one; the default is the one for the whole process.
+#[derive(Clone, Default)]
+pub struct HomeScope {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    own: Option<std::sync::Arc<std::sync::OnceLock<std::sync::Arc<IsolatedHome>>>>,
+}
+
+impl HomeScope {
+    /// Made at first use, removed with its last holder.
+    pub fn private() -> Self {
+        Self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            own: Some(Default::default()),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn home(&self) -> std::sync::Arc<IsolatedHome> {
+        match &self.own {
+            Some(own) => std::sync::Arc::clone(own.get_or_init(IsolatedHome::new)),
+            None => IsolatedHome::shared(),
+        }
+    }
+}
+
+impl std::fmt::Debug for HomeScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HomeScope")
+    }
 }
 
 impl Default for SandboxConfig {
@@ -138,6 +172,7 @@ impl Default for SandboxConfig {
             pids: None,
             host: None,
             remote_dir: None,
+            home: HomeScope::default(),
         }
     }
 }
@@ -2185,6 +2220,11 @@ impl SeatbeltBackend {
         self
     }
 
+    pub fn with_home(mut self, scope: &HomeScope) -> Self {
+        self.home = scope.home();
+        self
+    }
+
     /// Network policy for this run: a one-shot task-local grant or a live
     /// session/persistent grant opens it; otherwise the configured default.
     fn effective_net(&self, _req: &ExecRequest) -> NetPolicy {
@@ -2428,6 +2468,11 @@ impl LandlockBackend {
 
     pub fn with_network_grant(mut self, net_grant: NetworkGrant) -> Self {
         self.net_grant = net_grant;
+        self
+    }
+
+    pub fn with_home(mut self, scope: &HomeScope) -> Self {
+        self.home = scope.home();
         self
     }
 
@@ -3097,7 +3142,8 @@ pub fn select_backend(
                 if native_backend_available() {
                     Arc::new(
                         SeatbeltBackend::new(cfg.net, _extra_writable, _approved)
-                            .with_network_grant(net_grant),
+                            .with_network_grant(net_grant)
+                            .with_home(&cfg.home),
                     )
                 } else {
                     Arc::new(HostBackend)
@@ -3108,7 +3154,8 @@ pub fn select_backend(
                 if native_backend_available() {
                     Arc::new(
                         LandlockBackend::new(cfg.net, _extra_writable, _approved)
-                            .with_network_grant(net_grant),
+                            .with_network_grant(net_grant)
+                            .with_home(&cfg.home),
                     )
                 } else {
                     Arc::new(HostBackend)
@@ -3221,6 +3268,10 @@ fn landlock_supported() -> bool {
             .and_then(|r| r.create())
             .is_ok()
 }
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "home_scope_tests.rs"]
+mod home_scope_tests;
 
 #[cfg(test)]
 mod tests {

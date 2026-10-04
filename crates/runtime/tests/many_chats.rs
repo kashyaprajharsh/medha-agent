@@ -204,4 +204,23 @@ async fn two_folders_with_two_chats_each_run_in_one_process_without_crossing() {
     assert_eq!(ids(&a1), in_a, "folder a's log holds only its own chats");
     assert_eq!(ids(&b1), in_b, "folder b's log holds only its own chats");
     assert_ne!(a1.workspace.root(), b1.workspace.root());
+
+    if sandbox::native_backend_available() {
+        let mut homes = Vec::new();
+        for chat in [&a1, &a2, &b1, &b2] {
+            let script = r#"printf %s "$HOME""#.to_string();
+            let out = chat
+                .workspace
+                .exec("/bin/sh", &["-c".into(), script], Vec::new(), false)
+                .await
+                .unwrap();
+            homes.push(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        let distinct: std::collections::HashSet<_> = homes.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "each chat's commands get their own HOME: {homes:?}"
+        );
+    }
 }

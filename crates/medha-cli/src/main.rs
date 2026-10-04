@@ -883,24 +883,66 @@ async fn main() -> Result<()> {
         &lock_cwd,
         &config::state_dir(&lock_cwd)?,
     );
-    let autonomy = if cli.plan {
-        kernel::AutonomyLevel::Plan
+    let chosen_autonomy = if cli.plan {
+        Some(kernel::AutonomyLevel::Plan)
     } else if let Some(mode) = cli.mode {
-        mode
+        Some(mode)
     } else {
-        let mode = match std::env::var("MEDHA_MODE") {
-            Ok(mode) => mode,
-            Err(std::env::VarError::NotPresent) => lock.policy.autonomy.clone(),
+        match std::env::var("MEDHA_MODE") {
+            Ok(mode) => Some(kernel::AutonomyLevel::parse(&mode).map_err(anyhow::Error::msg)?),
+            Err(std::env::VarError::NotPresent) => None,
             Err(_) => anyhow::bail!("MEDHA_MODE must contain valid Unicode"),
-        };
-        kernel::AutonomyLevel::parse(&mode).map_err(anyhow::Error::msg)?
+        }
     };
-    let verify_cmd = match std::env::var("MEDHA_VERIFY") {
+    let autonomy = match chosen_autonomy {
+        Some(mode) => mode,
+        None => kernel::AutonomyLevel::parse(&lock.policy.autonomy).map_err(anyhow::Error::msg)?,
+    };
+    let chosen_verify = match std::env::var("MEDHA_VERIFY") {
         Ok(command) if !command.trim().is_empty() => Some(command),
-        Ok(_) | Err(std::env::VarError::NotPresent) => lock.verify.command.clone(),
+        Ok(_) | Err(std::env::VarError::NotPresent) => None,
         Err(_) => anyhow::bail!("MEDHA_VERIFY must contain valid Unicode"),
     };
-    let verify_required = cli.require_verify || lock.verify.required;
+    let options = runtime::SessionOptions {
+        model: cli.model.clone(),
+        base_url: cli.base_url.clone(),
+        reasoning: effort_override,
+        autonomy: chosen_autonomy,
+        verify_command: chosen_verify,
+        require_verify: cli.require_verify,
+        sandbox: if cli.no_sandbox {
+            Some(sandbox::BackendKind::Host)
+        } else {
+            match std::env::var("MEDHA_SANDBOX")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+            {
+                Some("host") | Some("off") | Some("none") => Some(sandbox::BackendKind::Host),
+                Some("native") | Some("on") => Some(sandbox::BackendKind::Native),
+                _ => None,
+            }
+        },
+        tools_preset: std::env::var("MEDHA_TOOLS").ok(),
+        max_parallel_tools: parallel_override,
+        resume: match (&cli.resume, cli.continue_) {
+            (Some(id), _) => runtime::Resume::Id(id.clone()),
+            (None, true) => runtime::Resume::Latest,
+            (None, false) => runtime::Resume::None,
+        },
+        prompt: if cli.prompt.is_empty() && !cli.attach.is_empty() {
+            "Describe the attached image(s).".to_string()
+        } else {
+            cli.prompt.join(" ")
+        },
+        attach: cli.attach.clone(),
+        first_run_setup: cli.setup,
+    };
+    let verify_cmd = options
+        .verify_command
+        .clone()
+        .or_else(|| lock.verify.command.clone());
+    let verify_required = options.require_verify || lock.verify.required;
     if verify_required && verify_cmd.is_none() {
         anyhow::bail!("required verification needs [verify].command in medha.lock or MEDHA_VERIFY");
     }
@@ -915,13 +957,16 @@ async fn main() -> Result<()> {
     let is_tty_early = std::io::stdin().is_terminal();
     let tui_possible = !cli.acp
         && !cli.plain
-        && cli.attach.is_empty()
-        && cli.prompt.join(" ").trim().is_empty()
+        && options.attach.is_empty()
+        && options.prompt.trim().is_empty()
         && is_tty_early;
-    let mut resolved = match config::resolve(cfg.as_ref(), cli.base_url.clone(), cli.model.clone())?
-    {
+    let mut resolved = match config::resolve(
+        cfg.as_ref(),
+        options.base_url.clone(),
+        options.model.clone(),
+    )? {
         Some(r) => r,
-        None if tui_possible || cli.setup => config::Resolved {
+        None if tui_possible || options.first_run_setup => config::Resolved {
             name: String::new(),
             provider: providers::ProviderProfile::openai_chat(
                 String::new(),
@@ -938,7 +983,7 @@ async fn main() -> Result<()> {
              or set MEDHA_BASE_URL / MEDHA_MODEL / MEDHA_API_KEY."
         ),
     };
-    let open_setup = cli.setup || resolved.provider.base_url.is_empty();
+    let open_setup = options.first_run_setup || resolved.provider.base_url.is_empty();
 
     // Resolve exact model capability metadata before constructing the provider.
     // A saved profile override wins over models.dev; unknown remains visible so
@@ -982,7 +1027,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    if !cli.attach.is_empty() {
+    if !options.attach.is_empty() {
         match resolved.provider.image_input {
             kernel::ImageInputMode::Text => {
                 eprintln!("image input mode is text; routing attachments through auxiliary vision")
@@ -1006,11 +1051,7 @@ async fn main() -> Result<()> {
             }
         }
     }
-    let prompt = if cli.prompt.is_empty() && !cli.attach.is_empty() {
-        "Describe the attached image(s).".to_string()
-    } else {
-        cli.prompt.join(" ")
-    };
+    let prompt = options.prompt.clone();
     let use_plain_repl = cli.plain;
 
     let model_name = resolved.provider.model.clone();
@@ -1094,12 +1135,13 @@ async fn main() -> Result<()> {
     };
     let provider = Arc::new(provider);
 
-    let reasoning = effort_override
+    let reasoning = options
+        .reasoning
         .clone()
         .unwrap_or(lock.reasoning.to_config().map_err(anyhow::Error::msg)?);
     let reasoning = normalize_reasoning_on(provider.as_ref(), reasoning);
     if let Err(error) = provider.set_reasoning(reasoning.clone()) {
-        if effort_override.is_some() {
+        if options.reasoning.is_some() {
             return Err(anyhow::anyhow!(
                 "reasoning setting was not applied: {error}"
             ));
@@ -1175,7 +1217,7 @@ async fn main() -> Result<()> {
 
     // `--attach` is explicit; a path written into the prompt attaches too, so
     // `medha "explain ./shot.png"` behaves the way it reads.
-    let mut attach_paths = cli.attach.clone();
+    let mut attach_paths = options.attach.clone();
     let scanned = attachments::refs::scan(&prompt, &cwd);
     for path in &scanned {
         if !attach_paths.contains(path) {
@@ -1207,10 +1249,10 @@ async fn main() -> Result<()> {
         .collect();
 
     // The active surface supplies the human gate; non-interactive runs deny.
-    let has_task = !cli.setup && !prompt.trim().is_empty();
+    let has_task = !options.first_run_setup && !prompt.trim().is_empty();
     let is_tty = std::io::stdin().is_terminal();
     let use_acp = cli.acp;
-    let use_tui = cli.setup || (!use_acp && is_tty && !has_task && !use_plain_repl);
+    let use_tui = options.first_run_setup || (!use_acp && is_tty && !has_task && !use_plain_repl);
 
     let tui_channel = if use_tui {
         Some(tui_tea::channel())
@@ -1250,6 +1292,13 @@ async fn main() -> Result<()> {
     } else {
         Arc::new(kernel::NoAsker)
     };
+    let surface = runtime::Surface {
+        gate,
+        asker,
+        agents: tui_channel.as_ref().map(|(tx, _)| {
+            Arc::new(tui_tea::AgentWatch { tx: tx.clone() }) as Arc<dyn agents::AgentWatcher>
+        }),
+    };
 
     let lock_path = cwd.join("medha.lock");
     // Machine-local grants never inherit authority from repository config.
@@ -1268,17 +1317,8 @@ async fn main() -> Result<()> {
         std::fs::rename(&legacy_audit, &audit_path).ok();
     }
     let mut sbx_cfg = lock.sandbox.to_config();
-    match std::env::var("MEDHA_SANDBOX")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        Some("host") | Some("off") | Some("none") => sbx_cfg.backend = sandbox::BackendKind::Host,
-        Some("native") | Some("on") => sbx_cfg.backend = sandbox::BackendKind::Native,
-        _ => {}
-    }
-    if cli.no_sandbox {
-        sbx_cfg.backend = sandbox::BackendKind::Host;
+    if let Some(backend) = options.sandbox {
+        sbx_cfg.backend = backend;
     }
     // Misconfigured optional backends fall back to native isolation.
     match sbx_cfg.backend {
@@ -1348,7 +1388,7 @@ async fn main() -> Result<()> {
     let sandbox_template = agents::SandboxTemplate {
         trust: trust_path.clone(),
         audit: audit_path.clone(),
-        gate: gate.clone(),
+        gate: surface.gate.clone(),
         exec: Arc::clone(&exec_backend),
         snapshots: state.join("snapshots"),
         readable: vec![config::user_skills_dir()?],
@@ -1359,7 +1399,7 @@ async fn main() -> Result<()> {
         cwd.clone(),
         trust_path,
         audit_path,
-        Some(gate.clone()),
+        Some(surface.gate.clone()),
         approved,
         medha_home.clone(),
     )?
@@ -1600,7 +1640,7 @@ async fn main() -> Result<()> {
         *search_handle.lock().expect("search settings lock") = config::resolve_search(&cfg_guard);
     }
     if let Ok(mut slot) = registry.clarify_handle().lock() {
-        *slot = Some(asker);
+        *slot = Some(surface.asker);
     }
     // Parent and writer worktrees use the same verifier command.
 
@@ -1677,7 +1717,10 @@ async fn main() -> Result<()> {
     // the boundary: children inherit from the narrowed executor, so a preset
     // cannot be widened by delegating.
     let preset = lockfile::ToolsConfig {
-        preset: std::env::var("MEDHA_TOOLS").unwrap_or(lock.tools.preset.clone()),
+        preset: options
+            .tools_preset
+            .clone()
+            .unwrap_or(lock.tools.preset.clone()),
     };
     preset.validate().map_err(anyhow::Error::msg)?;
     let executor: Arc<dyn kernel::Executor> = match preset.exposed() {
@@ -1816,7 +1859,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    let max_parallel_tools = parallel_override
+    let max_parallel_tools = options
+        .max_parallel_tools
         .or(lock.budget.max_parallel_tools)
         .unwrap_or(kernel::DEFAULT_MAX_PARALLEL_TOOLS);
     let hook_runner = session_plugins.hook_runner(&cwd);
@@ -1834,7 +1878,7 @@ async fn main() -> Result<()> {
         context_engine,
         artifacts,
         policy,
-        gate,
+        surface.gate,
         verifier,
     )
     .with_pricing(pricing)
@@ -1851,12 +1895,7 @@ async fn main() -> Result<()> {
     if let Ok(mut slot) = agent_parent.lock() {
         *slot = Some(Arc::downgrade(&kernel.executor));
     }
-    agent_runner.install(Arc::new(agents::KernelRunner::new(
-        &kernel,
-        tui_channel.as_ref().map(|(tx, _)| {
-            Arc::new(tui_tea::AgentWatch { tx: tx.clone() }) as Arc<dyn agents::AgentWatcher>
-        }),
-    )));
+    agent_runner.install(Arc::new(agents::KernelRunner::new(&kernel, surface.agents)));
 
     let configured_persona = model_profiles
         .lock()
@@ -1905,7 +1944,7 @@ async fn main() -> Result<()> {
         system.push_str(&skills_manifest);
     }
     // Resumed turns append to the original session.
-    let (mut session, resumed) = match resolve_resume(&log, &cli).await {
+    let (mut session, resumed) = match resolve_resume(&log, &options.resume).await {
         Ok(Some((id, msgs))) => {
             eprintln!("resumed session {id} ({} prior messages)", msgs.len());
             (
@@ -3080,21 +3119,19 @@ fn print_sessions(log: &store::SqliteLog) -> Result<()> {
 /// Rebuild the requested session, or return `None` for a fresh start.
 async fn resolve_resume(
     log: &store::SqliteLog,
-    cli: &Cli,
+    resume: &runtime::Resume,
 ) -> Result<Option<(ulid::Ulid, Vec<Message>)>> {
-    let id = if let Some(idstr) = &cli.resume {
-        ulid::Ulid::from_string(idstr.trim())
-            .map_err(|_| anyhow::anyhow!("invalid session id '{idstr}'"))?
-    } else if cli.continue_ {
-        match log.list_sessions()?.into_iter().next() {
+    let id = match resume {
+        runtime::Resume::Id(idstr) => ulid::Ulid::from_string(idstr.trim())
+            .map_err(|_| anyhow::anyhow!("invalid session id '{idstr}'"))?,
+        runtime::Resume::Latest => match log.list_sessions()?.into_iter().next() {
             Some(s) => s.id,
             None => {
                 eprintln!("no prior sessions to continue — starting fresh");
                 return Ok(None);
             }
-        }
-    } else {
-        return Ok(None);
+        },
+        runtime::Resume::None => return Ok(None),
     };
     let events = log.checked_events(id).await?;
     if events.is_empty() {

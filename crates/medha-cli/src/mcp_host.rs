@@ -8,24 +8,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::config;
 
-/// The token travels in the environment: other local processes can read argv.
-pub(crate) const ADDRESS_ENV: &str = "MEDHA_MCP_HOST";
-pub(crate) const TOKEN_ENV: &str = "MEDHA_MCP_HOST_TOKEN";
-
-pub(crate) fn endpoint() -> Option<mcp::hub::Endpoint> {
-    let address = std::env::var(ADDRESS_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())?;
-    let token = std::env::var(TOKEN_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())?;
-    Some(mcp::hub::Endpoint { address, token })
-}
-
-/// One needing approval stays per chat, so an approval never reaches other chats.
-pub(crate) fn is_shared(server: &config::McpServer) -> bool {
-    !server.url.is_empty() && server.command.is_empty() && server.trust == "trusted"
-}
+pub(crate) use runtime::mcp_shared::{TOKEN_ENV, endpoint, is_shared};
 
 /// The desktop discards the host's output, so a failure to start is kept here.
 pub async fn run(args: &[String]) -> anyhow::Result<()> {

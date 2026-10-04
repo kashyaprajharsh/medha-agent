@@ -29,23 +29,18 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kernel::{EventLog, Kernel, Message, Provider, Session};
 use providers::OpenAiCompat;
+#[cfg(test)]
+use runtime::approvals::approve_list_from;
+use runtime::approvals::{approve_list, unknown_approvals};
+use runtime::budget::{apply_budget_env, env_number};
+use runtime::reasoning::normalize_reasoning_on;
+pub(crate) use runtime::reasoning::reasoning_on_config;
+use runtime::verify::CommandVerifier;
 use runtime::{agents, config, plugin_session, skill_judge, vision};
 use sandbox::WorkspaceSandbox;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use tools::ToolRegistry;
-
-fn env_number<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
-    match std::env::var(name) {
-        Ok(value) => value
-            .trim()
-            .parse()
-            .map(Some)
-            .map_err(|_| anyhow::anyhow!("{name} must be a valid numeric limit")),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(_) => anyhow::bail!("{name} must contain valid Unicode"),
-    }
-}
 
 /// Apply environment overrides to one task's shared budget pool.
 pub(crate) fn task_budget(base: &kernel::Budget, slot: &kernel::BudgetHandle) -> kernel::Budget {
@@ -65,26 +60,6 @@ pub(crate) fn session_transcript(
     transcript.push(kernel::Message::system(system));
     transcript.extend(resumed);
     transcript
-}
-
-fn apply_budget_env(mut b: kernel::Budget) -> Result<kernel::Budget> {
-    if let Some(t) = env_number("MEDHA_MAX_TURNS")? {
-        b.max_turns = Some(t);
-    }
-    if let Some(t) = env_number("MEDHA_MAX_TOKENS")? {
-        b.max_tokens = Some(t);
-    }
-    if let Some(c) = env_number::<f64>("MEDHA_MAX_COST")? {
-        anyhow::ensure!(
-            c.is_finite() && c >= 0.0,
-            "MEDHA_MAX_COST must be finite and non-negative"
-        );
-        b.max_cost_usd = Some(c);
-    }
-    if let Some(w) = env_number("MEDHA_MAX_WALL")? {
-        b.max_wall_s = Some(w);
-    }
-    Ok(b)
 }
 
 /// On failure, the log includes work and admissions missing from the caller's
@@ -2599,63 +2574,6 @@ fn toml_table_to_json(table: &toml::Table) -> serde_json::Value {
     }
 }
 
-fn approve_list(base: Vec<String>) -> Vec<String> {
-    approve_list_from(base, &std::env::var("MEDHA_APPROVE").unwrap_or_default())
-}
-
-/// Resolve approval aliases from an explicit value for deterministic tests.
-fn approve_list_from(base: Vec<String>, raw: &str) -> Vec<String> {
-    let parts: Vec<&str> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if parts.contains(&"none") {
-        return Vec::new();
-    }
-
-    // Delegation is gated for irreversible token spend, not filesystem radius.
-    // One name covers both starting a child and giving one more work.
-    let mut out = base;
-    out.extend(["shell.exec", "agent.spawn"].map(String::from));
-    for part in parts {
-        match part {
-            "all" => out.extend(["write", "edit", "shell.exec"].map(String::from)),
-            "writes" => out.extend(["write", "edit"].map(String::from)),
-            "shell" => out.push("shell.exec".into()),
-            "agents" => out.push("agent.spawn".into()),
-            other => out.push(other.to_string()),
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// Names in `[policy].approve` that match no registered tool, in the order the
-/// lock file lists them.
-///
-/// The approve list is matched against a tool's name, so a name that is not a
-/// tool gates nothing — and says so nowhere. A tool that was renamed or folded
-/// into another leaves exactly that behind: `approve = ["fs.write"]` reads as a
-/// configured gate and behaves as no gate at all. Report it rather than resolve
-/// it, so the lock file gets corrected once instead of translated forever.
-fn unknown_approvals(
-    approve: &[String],
-    registered: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    approve
-        .iter()
-        .filter(|name| !registered.contains(*name))
-        .cloned()
-        .collect()
-}
-
-/// Keep the verifier's diagnostic tail bounded.
-const VERIFY_MAX_OUTPUT: usize = 8_192;
-
-/// Run the configured verification command after edits.
 /// `medha trust [--revoke]` — accept this workspace's `medha.lock` privilege.
 fn run_trust_command(args: &[String]) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
@@ -2706,56 +2624,6 @@ fn apply_lock_trust(
     state: &std::path::Path,
 ) -> lockfile::MedhaLock {
     runtime::workspace::apply_lock_trust(lock, lock_path, workspace, state, &Stderr)
-}
-
-struct CommandVerifier {
-    command: String,
-    required: bool,
-    dir: std::path::PathBuf,
-    limit: std::time::Duration,
-    exec: Arc<dyn sandbox::ExecBackend>,
-}
-
-#[async_trait::async_trait]
-impl kernel::Verifier for CommandVerifier {
-    fn required(&self) -> bool {
-        self.required
-    }
-
-    async fn check(
-        &self,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Option<kernel::VerifyReport> {
-        let out = match sandbox::run_shell_bounded_with(
-            self.exec.as_ref(),
-            &self.command,
-            &self.dir,
-            self.limit,
-            VERIFY_MAX_OUTPUT,
-            Some(cancel),
-        )
-        .await
-        {
-            Ok(out) => out,
-            // A configured verifier fails closed when it cannot start.
-            Err(error) => {
-                return Some(kernel::VerifyReport {
-                    ok: false,
-                    summary: format!("could not run `{}`", self.command),
-                    output: error.to_string(),
-                });
-            }
-        };
-        Some(kernel::VerifyReport {
-            ok: out.passed(),
-            summary: match (out.cancelled, out.timed_out) {
-                (true, _) => format!("`{}` cancelled", self.command),
-                (_, true) => format!("`{}` timed out", self.command),
-                _ => format!("`{}` exit {}", self.command, out.status.unwrap_or(-1)),
-            },
-            output: out.output,
-        })
-    }
 }
 
 /// Terminal approval prompt.
@@ -3299,41 +3167,6 @@ fn think_status<P: kernel::Provider>(provider: &P) -> String {
         "thinking: {enabled}  |  effort: {}",
         effort_label(cfg.effort)
     )
-}
-
-/// Enabling reasoning chooses a supported explicit level so Chat endpoints
-/// receive a usable request. Existing effort is preserved.
-fn normalize_reasoning_on<P: kernel::Provider>(
-    provider: &P,
-    config: kernel::ReasoningConfig,
-) -> kernel::ReasoningConfig {
-    if config.enabled == Some(true) && config.effort.is_none() {
-        reasoning_on_config(provider)
-    } else {
-        config
-    }
-}
-
-pub(crate) fn reasoning_on_config<P: kernel::Provider>(provider: &P) -> kernel::ReasoningConfig {
-    let levels = provider.reasoning_efforts();
-    let effort = provider
-        .reasoning()
-        .effort
-        .filter(|e| *e != kernel::ReasoningEffort::None)
-        .or_else(|| {
-            levels
-                .contains(&kernel::ReasoningEffort::Medium)
-                .then_some(kernel::ReasoningEffort::Medium)
-        })
-        .or_else(|| {
-            levels
-                .into_iter()
-                .find(|e| *e != kernel::ReasoningEffort::None)
-        });
-    kernel::ReasoningConfig {
-        enabled: Some(true),
-        effort,
-    }
 }
 
 pub(crate) fn apply_effort_command<P: kernel::Provider>(provider: &P, args: &str) -> String {

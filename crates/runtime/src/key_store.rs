@@ -104,7 +104,7 @@ fn relocate(
 
 /// Keep keys in the keychain or in the private file from now on, and move the
 /// saved ones there.
-pub(crate) fn move_keys(cfg: &Config, to_keychain: bool) -> Result<()> {
+pub fn move_keys(cfg: &Config, to_keychain: bool) -> Result<()> {
     anyhow::ensure!(
         !key_store_forced(),
         "MEDHA_CRED_STORE is set, so it decides where keys are kept"

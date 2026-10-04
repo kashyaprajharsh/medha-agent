@@ -2298,13 +2298,11 @@ dependencies = [
  "crossterm",
  "dirs",
  "extensions",
- "fd-lock",
  "flate2",
  "futures",
  "gate",
  "image",
  "kernel",
- "keyring",
  "libc",
  "lockfile",
  "lsp",
@@ -2317,6 +2315,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "reqwest 0.12.28",
+ "runtime",
  "rustyline",
  "sandbox",
  "serde",
@@ -3594,6 +3593,28 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "runtime"
+version = "0.1.10"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "fd-lock",
+ "kernel",
+ "keyring",
+ "lockfile",
+ "mcp",
+ "providers",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+ "tools",
+ "tracing",
+ "ulid",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 #[path = "key_store.rs"]
 mod key_store;
-pub(crate) use key_store::move_keys;
+pub use key_store::move_keys;
 
 const KEYRING_SERVICE: &str = "medha";
 
@@ -22,7 +22,7 @@ const PRESETS: &[(&str, &str)] = &[
     ("OpenAI", "https://api.openai.com/v1"),
 ];
 
-pub(crate) fn provider_presets() -> &'static [(&'static str, &'static str)] {
+pub fn provider_presets() -> &'static [(&'static str, &'static str)] {
     PRESETS
 }
 
@@ -325,7 +325,7 @@ impl Config {
         self.models.get(name)
     }
 
-    pub(crate) fn startup_model(&self) -> Option<&str> {
+    pub fn startup_model(&self) -> Option<&str> {
         self.default_model
             .as_deref()
             .filter(|n| self.models.contains_key(*n))
@@ -398,7 +398,7 @@ impl Config {
     }
 }
 
-pub(crate) fn search_cred_id(provider: tools::SearchProvider) -> Option<&'static str> {
+pub fn search_cred_id(provider: tools::SearchProvider) -> Option<&'static str> {
     match provider {
         tools::SearchProvider::Tavily => Some("search://tavily"),
         tools::SearchProvider::Brave => Some("search://brave"),
@@ -451,7 +451,7 @@ fn migrate_legacy_provider(cfg: &mut Config) -> bool {
     true
 }
 
-pub(crate) fn derive_profile_name(cfg: &Config, model_id: &str) -> String {
+pub fn derive_profile_name(cfg: &Config, model_id: &str) -> String {
     unique_profile_name(&cfg.models, &profile_name_from_model(model_id))
 }
 
@@ -723,7 +723,7 @@ pub fn save(cfg: &Config) -> Result<()> {
 
 /// Read/modify/write under the same config lock; concurrent desktop windows
 /// cannot overwrite a model or server saved by another window.
-pub(crate) fn edit(change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
+pub fn edit(change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
     let path = config_path()?;
     std::fs::create_dir_all(path.parent().expect("config parent"))?;
     with_config_lock(&path, || {
@@ -737,10 +737,10 @@ pub(crate) fn edit(change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()>
         write_config_file(&path, &toml::to_string_pretty(&cfg)?)
     })
 }
-pub(crate) fn key_present(id: &str) -> bool {
+pub fn key_present(id: &str) -> bool {
     load_key(id).is_some()
 }
-pub(crate) fn remove_key(id: &str) -> Result<()> {
+pub fn remove_key(id: &str) -> Result<()> {
     purge_credential(id);
     anyhow::ensure!(
         !key_present(id),
@@ -1464,7 +1464,7 @@ pub fn resolve_model(cfg: &Config, name: &str) -> Result<Resolved> {
     resolve_model_with_key(cfg, name, &api_key)
 }
 
-pub(crate) fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) -> Result<Resolved> {
+pub fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) -> Result<Resolved> {
     let provider = cfg
         .model_profile(name)
         .ok_or_else(|| anyhow::anyhow!("no saved model named '{name}'"))?;
@@ -1499,11 +1499,11 @@ fn first_env(names: &[&str]) -> Option<String> {
 }
 
 /// The environment decides where keys go, over the choice saved in Settings.
-pub(crate) fn key_store_forced() -> bool {
+pub fn key_store_forced() -> bool {
     std::env::var("MEDHA_CRED_STORE").is_ok_and(|v| !v.is_empty())
 }
 
-pub(crate) fn prefer_keychain() -> bool {
+pub fn prefer_keychain() -> bool {
     std::env::var("MEDHA_CRED_STORE")
         .ok()
         .filter(|v| !v.is_empty())
@@ -1674,7 +1674,7 @@ fn keychain_load_key(base_url: &str) -> Option<String> {
 }
 
 /// Secrets are stored outside `config.toml`.
-pub(crate) fn store_key(base_url: &str, key: &str) -> Result<()> {
+pub fn store_key(base_url: &str, key: &str) -> Result<()> {
     let key = normalize_api_key(key);
     if key.is_empty() {
         anyhow::bail!("API key cannot be empty");
@@ -1788,7 +1788,7 @@ pub fn remove_mcp_key(id: &str, server: &McpServer) -> Result<()> {
 }
 
 /// Where new keys are kept, in words.
-pub(crate) fn credential_store_label() -> &'static str {
+pub fn credential_store_label() -> &'static str {
     if prefer_keychain() {
         "your system keychain"
     } else {
@@ -1812,7 +1812,7 @@ pub fn resolve_mcp_server(id: &str, server: &McpServer) -> mcp::ServerConfig {
 
 /// For the shared host, which replaces a running server whose key changed: a key
 /// it could not read must not pass for one that was removed.
-pub(crate) fn read_mcp_server(id: &str, server: &McpServer) -> Result<mcp::ServerConfig> {
+pub fn read_mcp_server(id: &str, server: &McpServer) -> Result<mcp::ServerConfig> {
     // Only a server that sends a key can be held back by one that cannot be read.
     let key = if server.auth == "bearer" || !server.command.is_empty() {
         read_key(&mcp_key_id(id, server))?
@@ -1873,7 +1873,7 @@ fn normalize_api_key(value: &str) -> String {
 }
 
 /// Load a key from the configured credential layers, migrating legacy keychain data.
-pub(crate) fn load_key(base_url: &str) -> Option<String> {
+pub fn load_key(base_url: &str) -> Option<String> {
     // Avoid caching secrets that another Medha process may remove.
     with_credentials_lock(|| {
         Ok(if prefer_keychain() {

@@ -11,8 +11,10 @@ pub struct Workspace {
     pub root: PathBuf,
     pub state: PathBuf,
     pub home: PathBuf,
+    store: std::sync::Mutex<Option<Store>>,
 }
 
+#[derive(Clone)]
 pub struct Store {
     pub log: Arc<store::SqliteLog>,
     pub artifacts: Arc<store::FileArtifactStore>,
@@ -101,20 +103,30 @@ impl Workspace {
             root,
             state,
             home,
+            store: std::sync::Mutex::new(None),
         })
     }
 
-    /// A damaged log is kept for recovery and never used as trusted history.
+    /// Opened and checked once; every chat in this folder shares the one connection,
+    /// so a chat's write never makes another re-check the whole log.
     pub fn open_store(&self) -> Result<Store> {
+        let mut slot = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workspace store lock poisoned"))?;
+        if let Some(store) = slot.as_ref() {
+            return Ok(store.clone());
+        }
         let log = Arc::new(store::SqliteLog::open_with_mutation_lock(
             self.state.join("events.db"),
             self.home.join("mutations.db"),
         )?);
+        // A damaged log is kept for recovery and never used as trusted history.
         log.verify()
             .context("event log integrity check failed; refusing to start")?;
         let artifacts = Arc::new(store::FileArtifactStore::open(
             self.state.join("artifacts"),
         )?);
-        Ok(Store { log, artifacts })
+        Ok(slot.insert(Store { log, artifacts }).clone())
     }
 }

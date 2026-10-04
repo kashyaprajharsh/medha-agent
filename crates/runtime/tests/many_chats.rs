@@ -73,8 +73,15 @@ async fn endpoint() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
     (address, asked)
 }
 
-async fn chat(folder: &Path, endpoint: &str, model: &str) -> (Workspace, Started) {
-    let mut lock = runtime::workspace::load_lock(folder, &Quiet).unwrap();
+fn open(folder: &Path) -> Workspace {
+    std::fs::create_dir_all(folder).unwrap();
+    let workspace = Workspace::open(folder.to_path_buf(), &Quiet).unwrap();
+    std::fs::create_dir_all(workspace.state.join("logs")).unwrap();
+    workspace
+}
+
+async fn chat(workspace: &Workspace, endpoint: &str, model: &str) -> Started {
+    let mut lock = runtime::workspace::load_lock(&workspace.given, &Quiet).unwrap();
     lock.reasoning.stream = Some(false);
     let options = SessionOptions {
         model_env: runtime::config::ModelEnv {
@@ -89,13 +96,11 @@ async fn chat(folder: &Path, endpoint: &str, model: &str) -> (Workspace, Started
     let model = runtime::model::resolve(&lock, &options, &Quiet)
         .await
         .unwrap();
-    let workspace = Workspace::open(folder.to_path_buf(), &Quiet).unwrap();
-    std::fs::create_dir_all(workspace.state.join("logs")).unwrap();
-    let started = runtime::session::start(
+    runtime::session::start(
         Start {
             lock: &lock,
             options: &options,
-            workspace: &workspace,
+            workspace,
             model,
             autonomy: kernel::AutonomyLevel::Careful,
             verify_command: None,
@@ -110,8 +115,7 @@ async fn chat(folder: &Path, endpoint: &str, model: &str) -> (Workspace, Started
         },
     )
     .await
-    .unwrap();
-    (workspace, started)
+    .unwrap()
 }
 
 async fn say(chat: &Started, text: &str) -> String {
@@ -139,14 +143,18 @@ async fn two_folders_with_two_chats_each_run_in_one_process_without_crossing() {
     let (address, asked) = endpoint().await;
     // SAFETY: this file holds one test, so nothing else reads the environment meanwhile.
     unsafe { std::env::set_var("MEDHA_HOME", root.path().join("home")) };
-    let (a, b) = (root.path().join("a"), root.path().join("b"));
-    std::fs::create_dir_all(&a).unwrap();
-    std::fs::create_dir_all(&b).unwrap();
+    let home_a = open(&root.path().join("a"));
+    let home_b = open(&root.path().join("b"));
 
-    let (home_a, a1) = chat(&a, &address, "model-a1").await;
-    let (_, a2) = chat(&a, &address, "model-a2").await;
-    let (home_b, b1) = chat(&b, &address, "model-b1").await;
-    let (_, b2) = chat(&b, &address, "model-b2").await;
+    let a1 = chat(&home_a, &address, "model-a1").await;
+    let a2 = chat(&home_a, &address, "model-a2").await;
+    let b1 = chat(&home_b, &address, "model-b1").await;
+    let b2 = chat(&home_b, &address, "model-b2").await;
+    assert!(
+        Arc::ptr_eq(&a1.log, &a2.log) && Arc::ptr_eq(&b1.log, &b2.log),
+        "chats in one folder share its one log connection"
+    );
+    assert!(!Arc::ptr_eq(&a1.log, &b1.log));
 
     let (ra1, ra2, rb1, rb2) = tokio::join!(
         say(&a1, "from a1"),

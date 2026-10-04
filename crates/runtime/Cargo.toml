@@ -15,7 +15,10 @@ tools = { path = "../tools" }
 mcp = { path = "../mcp" }
 lockfile = { path = "../lockfile" }
 extensions = { path = "../extensions" }
+lsp = { path = "../lsp" }
+memory = { path = "../memory" }
 orchestrator = { path = "../orchestrator" }
+policy = { path = "../policy" }
 sandbox = { path = "../sandbox" }
 store = { path = "../store" }
 tokio.workspace = true
@@ -27,6 +30,7 @@ anyhow.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 toml = "0.8"
 sha2 = "0.10"
 dirs = "5"

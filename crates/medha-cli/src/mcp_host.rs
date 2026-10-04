@@ -8,7 +8,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::config;
 
-pub(crate) use runtime::mcp_shared::{TOKEN_ENV, endpoint, is_shared};
+pub(crate) use runtime::mcp_shared::{TOKEN_ENV, is_shared};
 
 /// The desktop discards the host's output, so a failure to start is kept here.
 pub async fn run(args: &[String]) -> anyhow::Result<()> {

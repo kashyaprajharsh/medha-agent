@@ -162,7 +162,9 @@ fn medha(home: &Path, provider: &Provider) -> Command {
         .env("MEDHA_MODEL", "test-model")
         .env("MEDHA_API_KEY", SECRET)
         .env("MEDHA_PROTOCOL", "open-ai-chat")
-        .env("MEDHA_TOKEN_ACCOUNTING", "adaptive");
+        .env("MEDHA_TOKEN_ACCOUNTING", "adaptive")
+        // Saved keys go to a file under the home, never to this machine's keychain.
+        .env("MEDHA_CRED_STORE", "file");
     command
 }
 
@@ -878,4 +880,103 @@ async fn chats_in_the_backend_share_one_connection_to_a_remote_mcp_server() {
         connections, 1,
         "each chat connected to the server for itself"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_that_save_keys_reach_out_or_install_behave_the_same_through_the_backend() {
+    let world = World::new();
+    let folder = world.folder("w");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let mut service = Service::start(&folder, &world.home(), &world.provider);
+    let endpoint = world.provider.url.clone();
+
+    // A model saved with its key through the backend: the key is kept and never shown.
+    let profile = json!({"protocol": "open-ai-chat", "base_url": endpoint, "model": "keyed",
+        "auth": "bearer", "max_ctx": 32768});
+    let save = json!({"method": "settings.model.save",
+        "params": {"name": "keyed", "profile": profile, "key": "sk-zz-model-key"}});
+    client
+        .about(&folder, save)
+        .await
+        .expect("a model is saved with its key");
+    let keys = json!({"method": "settings.keys"});
+    let held = client.about(&folder, keys.clone()).await;
+    assert_eq!(held, service.ask(keys.clone()));
+    assert!(held.unwrap().to_string().contains(r#""present":true"#));
+
+    // Replaced through the service, removed through the backend: one store, seen by both.
+    let key = json!({"group": "model", "id": endpoint, "key": "sk-zz-second-key"});
+    service
+        .ask(json!({"method": "settings.keys.set", "params": key}))
+        .expect("the service sets a key");
+    let gone =
+        json!({"method": "settings.keys.remove", "params": {"group": "model", "id": endpoint}});
+    client
+        .about(&folder, gone)
+        .await
+        .expect("the backend removes a key");
+    let held = client.about(&folder, keys.clone()).await;
+    assert_eq!(held, service.ask(keys));
+    assert!(!held.unwrap().to_string().contains(r#""present":true"#));
+
+    // Discovery reaches the model's endpoint from either.
+    let discover = json!({"method": "settings.model.discover", "params": {"profile": {
+        "protocol": "open-ai-chat", "base_url": endpoint, "model": "any", "auth": "none"}}});
+    let found = client.about(&folder, discover.clone()).await;
+    assert_eq!(found, service.ask(discover));
+    assert_eq!(found.unwrap()["models"][0]["id"], "test-model");
+
+    // An extension installed from a folder through the backend, removed through the service.
+    let package = world.root.path().join("package");
+    std::fs::create_dir_all(&package).unwrap();
+    let manifest = "schema_version = 1\nid = \"dev.medha.review\"\nname = \"Review helpers\"\n\
+        version = \"0.1.0\"\nmedha = \">=0.1.0, <0.2.0\"\n\n[[components]]\nkind = \"action\"\n\
+        id = \"review\"\ntitle = \"Review\"\ndescription = \"Review the selected change\"\n\
+        prompt = \"Review the selected change.\"\n";
+    std::fs::write(package.join("plugin.toml"), manifest).unwrap();
+    let install = json!({"method": "extensions.install", "params": {"source": package}});
+    let installed = client
+        .about(&folder, install)
+        .await
+        .expect("an extension is installed");
+    assert_eq!(installed["id"], "dev.medha.review");
+    for method in ["extensions.list", "extensions.doctor"] {
+        let request = json!({"method": method});
+        assert_eq!(
+            client.about(&folder, request.clone()).await,
+            service.ask(request),
+            "{method}"
+        );
+    }
+    let remove = json!({"method": "extensions.remove", "params": {"id": "dev.medha.review"}});
+    service
+        .ask(remove)
+        .expect("the service removes an extension");
+    let listed = client
+        .about(&folder, json!({"method": "extensions.list"}))
+        .await;
+    assert!(!listed.unwrap().to_string().contains("dev.medha.review"));
+
+    // What each refuses, it refuses in the same words.
+    let refused = [
+        json!({"method": "extensions.marketplace.add", "params": {"source": "/not/a/repository"}}),
+        json!({"method": "extensions.enable", "params": {"id": "nobody"}}),
+        json!({"method": "extensions.rollback", "params": {"id": "nobody"}}),
+        json!({"method": "extensions.remove", "params": {"id": "nobody"}}),
+        json!({"method": "settings.tools.save", "params": {"preset": "no-such-preset"}}),
+        json!({"method": "settings.mcp.save", "params": {"args": []}}),
+        json!({"method": "settings.mcp.remove", "params": {"id": "nobody"}}),
+        json!({"method": "settings.model.remove", "params": {"name": "nobody"}}),
+        json!({"method": "settings.keys.set", "params": {"group": "model", "id": "nobody", "key": "k"}}),
+        json!({"method": "extensions.hooks.remove", "params": {"event": "nothing", "file": "none"}}),
+    ];
+    for request in refused {
+        let from_backend = client.about(&folder, request.clone()).await;
+        assert!(from_backend.is_err(), "{request} was accepted");
+        assert_eq!(from_backend, service.ask(request.clone()), "{request}");
+    }
+    for key in [SECRET, "sk-zz-model-key", "sk-zz-second-key"] {
+        assert!(!client.heard.contains(key), "{key} reached a client");
+    }
 }

@@ -20,6 +20,7 @@ async fn chat(input: DuplexStream, mut output: DuplexStream) -> Result<(), Strin
     while let Some(frame) = wire::read_frame(&mut input).await {
         let (id, params) = (frame["id"].clone(), frame["params"].clone());
         match frame["method"].as_str() {
+            Some("hello") => say(&mut output, json!({"id": id, "result": "the chat's own"})).await,
             Some("say") => {
                 say(&mut output, json!({"method": "event", "params": params})).await;
                 say(
@@ -409,6 +410,9 @@ async fn a_chat_is_resumed_once_and_closed_by_whoever_is_attached() {
     client.ask("noise", Some("kept"), json!({})).await;
     assert_eq!(client.say("kept", "after").await["result"]["said"], "after");
     assert_eq!(client.event().await.1["params"]["text"], "after");
+    // A request that names a chat reaches the chat, even one the backend also answers.
+    let greeted = client.ask("hello", Some("kept"), json!({})).await;
+    assert_eq!(greeted["result"], "the chat's own");
 
     assert_eq!(
         client.ask("session.close", Some("kept"), json!({})).await["result"]["closing"],

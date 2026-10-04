@@ -214,6 +214,72 @@ impl Drop for Service {
     }
 }
 
+/// `medha --acp`, one chat in a process of its own, as the desktop runs it today.
+struct OwnProcess {
+    child: Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+    asked: u64,
+}
+
+impl OwnProcess {
+    fn start(folder: &Path, home: &Path, provider: &Provider) -> Self {
+        let mut child = medha(home, provider)
+            .arg("--acp")
+            .current_dir(folder)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut chat = Self {
+            child,
+            input,
+            output,
+            asked: 0,
+        };
+        while chat.frame()["method"] != "ready" {}
+        chat
+    }
+
+    fn frame(&mut self) -> Value {
+        use std::io::BufRead;
+        let mut line = String::new();
+        self.output.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).expect("a frame from the chat")
+    }
+
+    fn ask(&mut self, method: &str, params: Value) -> Value {
+        self.asked += 1;
+        let id = self.asked;
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        writeln!(self.input, "{request}").unwrap();
+        loop {
+            let frame = self.frame();
+            if frame["id"] == json!(id) {
+                return frame;
+            }
+        }
+    }
+}
+
+impl Drop for OwnProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// What a chat answered, whichever way it was reached: its result, or its error.
+fn outcome(reply: &Value) -> Value {
+    match reply.get("error") {
+        Some(error) => json!({"error": error["message"]}),
+        None => reply["result"].clone(),
+    }
+}
+
 struct Backend {
     child: Child,
     home: PathBuf,
@@ -699,4 +765,48 @@ async fn the_backend_answers_about_a_folder_exactly_as_the_desktop_service_does(
         .await;
     assert_eq!(defaults.unwrap()["profile"], "saved-here");
     assert!(!client.heard.contains(SECRET), "a key reached a client");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_in_the_backend_answers_its_own_requests_as_one_in_its_own_process_does() {
+    let world = World::new();
+    let folder = world.folder("w");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    let mut alone = OwnProcess::start(&folder, &world.home(), &world.provider);
+
+    let requests = [
+        ("hello", json!({})),
+        ("session.settings", json!({})),
+        ("session.configure", json!({"mode": "plan"})),
+        ("session.settings", json!({})),
+        ("session.configure", json!({"mode": "no-such-mode"})),
+        ("session.rewind.points", json!({})),
+        ("patch.list", json!({})),
+        (
+            "agent.control",
+            json!({"agent": "nobody", "action": "stop"}),
+        ),
+        ("memory.list", json!({})),
+        ("memory.provenance", json!({"id": "nothing"})),
+        ("tasks.list", json!({})),
+        ("extensions.catalog", json!({})),
+        ("extensions.reload", json!({})),
+        ("mcp.screens", json!({})),
+        ("mcp.disconnect", json!({"server": "none"})),
+        ("mcp.connect", json!({"server": "none"})),
+        (
+            "question.respond",
+            json!({"question_id": 1, "dismiss": true}),
+        ),
+        ("approval.respond", json!({"gate_id": 9, "approve": true})),
+        ("interrupt", json!({})),
+        ("no.such.method", json!({})),
+    ];
+    for (method, params) in requests {
+        let in_backend = outcome(&client.ask(method, Some(&chat), params.clone()).await);
+        let in_process = outcome(&alone.ask(method, params));
+        assert_eq!(in_backend, in_process, "{method}");
+    }
 }

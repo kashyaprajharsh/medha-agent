@@ -136,9 +136,12 @@ async fn handle<C: Chats>(
         });
         return;
     }
+    // A request that names a chat is the chat's, whatever it is called, unless it is about attaching.
     let outcome = match method.as_str() {
-        "hello" => Ok(json!({ "backend": backend.version, "protocol": PROTOCOL })),
-        "session.list" => Ok(backend.list()),
+        "hello" if named.is_none() => {
+            Ok(json!({ "backend": backend.version, "protocol": PROTOCOL }))
+        }
+        "session.list" if named.is_none() => Ok(backend.list()),
         "session.attach" => session("session.attach").map(|session| {
             attached.insert(session.id.clone());
             session.attach(me, frame["params"]["after"].as_u64())

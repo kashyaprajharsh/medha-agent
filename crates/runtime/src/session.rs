@@ -27,6 +27,46 @@ pub struct Start<'a> {
     pub notices: &'a dyn Notices,
 }
 
+/// What a chat's options and its folder's lock settle between them, before a model is chosen.
+pub struct Choices {
+    pub autonomy: kernel::AutonomyLevel,
+    pub verify_command: Option<String>,
+    pub verify_required: bool,
+    pub verify_timeout: std::time::Duration,
+}
+
+impl Choices {
+    pub fn of(lock: &lockfile::MedhaLock, options: &SessionOptions) -> Result<Self> {
+        let autonomy = match options.autonomy {
+            Some(mode) => mode,
+            None => {
+                kernel::AutonomyLevel::parse(&lock.policy.autonomy).map_err(anyhow::Error::msg)?
+            }
+        };
+        let verify_command = options
+            .verify_command
+            .clone()
+            .or_else(|| lock.verify.command.clone());
+        let verify_required = options.require_verify || lock.verify.required;
+        if verify_required && verify_command.is_none() {
+            anyhow::bail!(
+                "required verification needs [verify].command in medha.lock or MEDHA_VERIFY"
+            );
+        }
+        let verify_timeout = std::time::Duration::from_secs(
+            lock.verify
+                .timeout_s
+                .unwrap_or(lock.agents.verify_timeout_secs),
+        );
+        Ok(Self {
+            autonomy,
+            verify_command,
+            verify_required,
+            verify_timeout,
+        })
+    }
+}
+
 /// `surface` is asked once the prompt is settled, because a surface may depend on it.
 pub async fn start(
     input: Start<'_>,

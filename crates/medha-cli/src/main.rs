@@ -3,6 +3,7 @@
 
 mod acp;
 mod acp_agents;
+mod acp_chat;
 mod acp_questions;
 mod attachments;
 mod connectors;
@@ -863,10 +864,6 @@ async fn main() -> Result<()> {
             Err(_) => anyhow::bail!("MEDHA_MODE must contain valid Unicode"),
         }
     };
-    let autonomy = match chosen_autonomy {
-        Some(mode) => mode,
-        None => kernel::AutonomyLevel::parse(&lock.policy.autonomy).map_err(anyhow::Error::msg)?,
-    };
     let chosen_verify = match std::env::var("MEDHA_VERIFY") {
         Ok(command) if !command.trim().is_empty() => Some(command),
         Ok(_) | Err(std::env::VarError::NotPresent) => None,
@@ -917,19 +914,12 @@ async fn main() -> Result<()> {
                 && cli.prompt.join(" ").trim().is_empty()
                 && std::io::stdin().is_terminal()),
     };
-    let verify_cmd = options
-        .verify_command
-        .clone()
-        .or_else(|| lock.verify.command.clone());
-    let verify_required = options.require_verify || lock.verify.required;
-    if verify_required && verify_cmd.is_none() {
-        anyhow::bail!("required verification needs [verify].command in medha.lock or MEDHA_VERIFY");
-    }
-    let verify_timeout = std::time::Duration::from_secs(
-        lock.verify
-            .timeout_s
-            .unwrap_or(lock.agents.verify_timeout_secs),
-    );
+    let runtime::session::Choices {
+        autonomy,
+        verify_command: verify_cmd,
+        verify_required,
+        verify_timeout,
+    } = runtime::session::Choices::of(&lock, &options)?;
 
     let model = runtime::model::resolve(&lock, &options, &Stderr).await?;
     let use_plain_repl = cli.plain;
@@ -951,31 +941,36 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    if cli.acp {
+        let start = runtime::session::Start {
+            lock: &lock,
+            options: &options,
+            workspace: &workspace_home,
+            model,
+            autonomy,
+            verify_command: verify_cmd,
+            verify_required,
+            verify_timeout,
+            notices: &Stderr,
+        };
+        let (input, output) = (tokio::io::stdin(), tokio::io::stdout());
+        return acp_chat::run(start, input, output, acp::restore_from_env()).await;
+    }
+
     // Chosen while the session is built, once the prompt is settled; kept for the dispatch below.
     let (mut has_task, mut is_tty, mut use_tui) = (false, false, false);
-    let use_acp = cli.acp;
     let mut tui_channel = None;
-    let mut acp_bridge = None;
-    let pick_surface = |cwd: &std::path::Path, prompt: &str| {
+    let pick_surface = |_: &std::path::Path, prompt: &str| {
         // The active surface supplies the human gate; non-interactive runs deny.
         has_task = !options.first_run_setup && !prompt.trim().is_empty();
         is_tty = std::io::stdin().is_terminal();
-        use_tui = options.first_run_setup || (!use_acp && is_tty && !has_task && !use_plain_repl);
+        use_tui = options.first_run_setup || (is_tty && !has_task && !use_plain_repl);
 
         if use_tui {
             tui_channel = Some(tui_tea::channel());
         }
-        if use_acp {
-            acp_bridge = Some(acp::bridge(cwd.to_path_buf()));
-        }
 
-        let gate: Arc<dyn kernel::HumanGate> = if let Some(bridge) = &acp_bridge {
-            Arc::new(acp::AcpGate::new(
-                bridge.writer.clone(),
-                bridge.pending.clone(),
-                bridge.peer.clone(),
-            ))
-        } else if let Some((tx, _)) = &tui_channel {
+        let gate: Arc<dyn kernel::HumanGate> = if let Some((tx, _)) = &tui_channel {
             Arc::new(tui_tea::TuiGate { tx: tx.clone() })
         } else if is_tty {
             Arc::new(TerminalGate)
@@ -986,13 +981,6 @@ async fn main() -> Result<()> {
         // Each interactive surface supplies its question form.
         let asker: Arc<dyn kernel::Asker> = if let Some((tx, _)) = &tui_channel {
             Arc::new(tui_tea::TuiAsker { tx: tx.clone() })
-        } else if let Some(bridge) = &acp_bridge {
-            Arc::new(acp_questions::AcpAsker {
-                writer: Arc::clone(&bridge.writer),
-                pending: Arc::clone(&bridge.questions),
-                peer: bridge.peer.clone(),
-                next_id: std::sync::atomic::AtomicU64::new(1),
-            })
         } else {
             Arc::new(kernel::NoAsker)
         };
@@ -1050,9 +1038,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let mode = if use_acp {
-        "acp"
-    } else if use_tui {
+    let mode = if use_tui {
         "tui"
     } else if has_task {
         "headless"
@@ -1060,56 +1046,6 @@ async fn main() -> Result<()> {
         "repl"
     };
     tracing::info!(model = %model_name, mode, "medha session start");
-
-    if let Some(bridge) = acp_bridge {
-        let surface_result = acp::run(
-            kernel.clone(),
-            session,
-            system,
-            model_name,
-            base_budget.clone(),
-            Arc::clone(&agent_budget),
-            resumed,
-            bridge,
-            agent_control.clone(),
-            model_profiles,
-            active_profile,
-            desktop_extensions::Runtime {
-                store: session_plugins.store(),
-                skills: skill_store.clone(),
-                search: search_handle.clone(),
-                workspace: workspace.clone(),
-                memory: lock.memory.enabled.then(|| memory_store.clone()),
-                memory_budget: k3_budget_tokens,
-                memory_stale_days: stale_after_days,
-                mcp: mcp_manager.clone(),
-                configured_mcp: std::sync::Mutex::new(configured_mcp.clone()),
-                plugins: plugin_session::LivePlugins::new(
-                    session_plugins.store(),
-                    skill_store.clone(),
-                    mcp_manager.clone(),
-                    Box::new({
-                        let kernel = kernel.clone();
-                        move || kernel.reload_hooks()
-                    }),
-                    configured_mcp.clone(),
-                    plugin_mcp_ids,
-                ),
-            },
-        )
-        .await;
-        if let Some(control) = &agent_control {
-            control.shutdown().await;
-        }
-        if let Some(manager) = &lsp_manager {
-            manager.shutdown_all().await;
-        }
-        if let Some(manager) = &mcp_manager {
-            manager.shutdown().await;
-        }
-        surface_result?;
-        return Ok(());
-    }
 
     if !has_task {
         let surface_result = if let Some((tx, rx)) = tui_channel {

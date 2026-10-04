@@ -339,8 +339,18 @@ pub(crate) struct Bridge {
     writer_task: WriterTask,
 }
 
-pub(crate) fn bridge(workspace: PathBuf) -> Bridge {
-    bridge_with_output_in(tokio::io::stdout(), OUTBOUND_FRAMES, workspace)
+pub(crate) fn bridge_to<W>(output: W, workspace: PathBuf) -> Bridge
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    bridge_with_output_in(output, OUTBOUND_FRAMES, workspace)
+}
+
+/// The settings a chat that slept is restarted with.
+pub(crate) fn restore_from_env() -> Option<Value> {
+    std::env::var(RESTORE_ENV)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
 }
 
 #[cfg(test)]
@@ -764,8 +774,8 @@ enum TurnDone {
 const MAX_FRAME: u64 = 16 * 1024 * 1024;
 
 /// Retains partial input across cancellation; oversized frames disconnect.
-async fn read_frame(
-    stdin: &mut tokio::io::Take<BufReader<tokio::io::Stdin>>,
+async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+    stdin: &mut tokio::io::Take<BufReader<R>>,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<Option<String>> {
     let n = stdin.read_until(b'\n', buf).await?;
@@ -1400,7 +1410,7 @@ fn stopped_label(reason: &StopReason) -> Option<&'static str> {
 /// Mid-turn messages steer at the next boundary; cancellation lets in-flight
 /// tools settle through the kernel interrupt handle.
 #[allow(clippy::too_many_arguments)]
-pub async fn run<P, L>(
+pub async fn run<P, L, R>(
     kernel: Arc<Kernel<P, L>>,
     mut session: Session,
     system: String,
@@ -1413,10 +1423,14 @@ pub async fn run<P, L>(
     model_config: Arc<Mutex<crate::config::Config>>,
     mut active_profile: String,
     extensions: crate::desktop_extensions::Runtime,
+    input: R,
+    restore: Option<Value>,
+    notices: &dyn runtime::Notices,
 ) -> anyhow::Result<()>
 where
     P: crate::desktop_controls::ProfileProvider + 'static,
     L: EventLog + 'static,
+    R: tokio::io::AsyncRead + Unpin,
 {
     let Bridge {
         writer,
@@ -1439,10 +1453,7 @@ where
     // Connection changes are pushed to the window as they happen.
     let mut mcp_changes = extensions.mcp.as_ref().map(|manager| manager.subscribe());
     let mut prompt_reply: Option<Value> = None;
-    if let Some(saved) = std::env::var(RESTORE_ENV)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-    {
+    if let Some(saved) = restore {
         // Its start hooks already added their context to this conversation.
         if !resumed.is_empty() {
             kernel.continue_session(session.id);
@@ -1461,7 +1472,7 @@ where
             )
             .await
             {
-                eprintln!("note: could not restore {change}: {error}");
+                notices.say(&format!("note: could not restore {change}: {error}"));
             }
         }
     }
@@ -1478,7 +1489,7 @@ where
     let mut transcript = crate::session_transcript(system, resumed);
     // Frame reads are capped: `lines()` would buffer a single unterminated
     // "line" without bound, so a runaway peer could grow memory indefinitely.
-    let mut stdin = tokio::io::AsyncReadExt::take(BufReader::new(tokio::io::stdin()), MAX_FRAME);
+    let mut stdin = tokio::io::AsyncReadExt::take(BufReader::new(input), MAX_FRAME);
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut turns = JoinSet::new();
     let mut running = false;

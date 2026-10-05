@@ -288,11 +288,17 @@ pub(crate) async fn listing<L: EventLog>(
     now: f64,
 ) -> Value {
     let mut used = HashMap::new();
-    for session in log.sessions().await {
-        if now - session.last_ts <= 30.0 * 86_400.0 {
-            activity(&log.events(session.id).await, now, &mut used);
-        }
-    }
+    let recent: std::collections::HashSet<_> = log
+        .sessions()
+        .await
+        .into_iter()
+        .filter(|session| now - session.last_ts <= 30.0 * 86_400.0)
+        .map(|session| session.id)
+        .collect();
+    // Only the calls are read: loading each chat whole took longer the more Medha was used.
+    let mut calls = log.events_of_kind(EventKind::ToolEffectPrepared).await;
+    calls.retain(|call| recent.contains(&call.session_id));
+    activity(&calls, now, &mut used);
     let project = Project::scan(workspace);
     let rows: Vec<Value> = catalog()
         .iter()

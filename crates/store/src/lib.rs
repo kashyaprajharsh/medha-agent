@@ -827,6 +827,24 @@ impl SqliteLog {
         })
     }
 
+    fn kind_events(&self, kind: EventKind) -> Result<Vec<Event>, StoreError> {
+        self.with_verified_snapshot(false, |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                            prev_hash, hash, hash_version, ts
+                     FROM events WHERE kind = ?1 ORDER BY rowid ASC",
+                )
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            let rows = stmt
+                .query_map([kind.as_str()], chain_row)
+                .map_err(|error| StoreError::Db(error.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| StoreError::Db(error.to_string()))?;
+            decode_events(rows)
+        })
+    }
+
     /// Search text-bearing events. Interactive sessions rank ahead of
     /// automation, which remains searchable rather than disappearing.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SessionSearchHit>, StoreError> {
@@ -1205,6 +1223,12 @@ impl EventLog for SqliteLog {
     async fn sessions(&self) -> Vec<SessionMeta> {
         self.list_sessions_async().await.unwrap_or_default()
     }
+
+    async fn events_of_kind(&self, kind: EventKind) -> Vec<Event> {
+        self.run_store_task(move |log| log.kind_events(kind))
+            .await
+            .unwrap_or_default()
+    }
 }
 
 /// Set up a tiny dedicated database used only as a cross-process mutex.
@@ -1577,6 +1601,37 @@ mod tests {
         .unwrap();
         assert!(log.session_events(Ulid::new()).is_err());
         drop((writer, log));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_of_one_kind_are_exactly_those_a_walk_of_every_session_finds() {
+        let dir = std::env::temp_dir().join(format!("medha-kind-{}", Ulid::new()));
+        let log = SqliteLog::open(dir.join("events.db")).unwrap();
+        let mut said = Vec::new();
+        for _ in 0..3 {
+            let session = kernel::Session {
+                id: Ulid::new(),
+                done: false,
+                ..Default::default()
+            };
+            log.append(Event::user_message(&session, "ask"))
+                .await
+                .unwrap();
+            for text in ["one", "two"] {
+                let event = Event::model_text(&session, text);
+                said.push(log.append(event).await.unwrap().id);
+            }
+        }
+        let kind = Event::model_text(&kernel::Session::default(), "").kind;
+
+        let found: Vec<Ulid> = log
+            .events_of_kind(kind)
+            .await
+            .iter()
+            .map(|event| event.id)
+            .collect();
+        assert_eq!(found, said, "in the order they were written");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

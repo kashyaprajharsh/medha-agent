@@ -643,6 +643,17 @@ pub trait EventLog: Send + Sync {
         Ok(MutationLease::in_process())
     }
 
+    /// Every event of one kind, across sessions, oldest first. A durable backend
+    /// answers this without loading whole sessions.
+    async fn events_of_kind(&self, kind: EventKind) -> Vec<Event> {
+        let mut found = Vec::new();
+        for session in self.sessions().await {
+            let events = self.events(session.id).await;
+            found.extend(events.into_iter().filter(|event| event.kind == kind));
+        }
+        found
+    }
+
     /// Every session in the log, newest activity first — for the resume picker.
     /// Default: none (in-memory/ephemeral logs need not implement it).
     async fn sessions(&self) -> Vec<SessionMeta> {

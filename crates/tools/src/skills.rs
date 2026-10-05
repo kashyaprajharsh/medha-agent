@@ -1807,7 +1807,12 @@ impl Tool for SkillList {
         json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _args: &Value) -> Result<Value, ToolError> {
-        Ok(self.store.list(&self.catalog.current()))
+        let mut listed = self.store.list(&self.catalog.current());
+        // A skill the user switched off is theirs to see in settings, not the agent's to know of.
+        if let Some(skills) = listed["skills"].as_array_mut() {
+            skills.retain(|skill| skill["enabled"] != false);
+        }
+        Ok(listed)
     }
 }
 
@@ -2812,6 +2817,24 @@ mod tests {
         };
         let v = futures::executor::block_on(tool.execute(&json!({}))).unwrap();
         assert_eq!(v["skills"][0]["name"], "deploy-fly");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_skill_switched_off_is_not_told_to_the_agent_and_is_still_listed_for_settings() {
+        let root = tmp();
+        let proj = root.join("proj");
+        write_skill(&proj, "deploy-fly", DEPLOY);
+        let store = Arc::new(SkillStore::new(proj, Some(root.join("user"))));
+        store.set_enabled("deploy-fly", false).unwrap();
+        let tool = SkillList {
+            store: Arc::clone(&store),
+            catalog: fixed_catalog(&["shell.exec"]),
+        };
+        let told = futures::executor::block_on(tool.execute(&json!({}))).unwrap();
+        assert_eq!(told["skills"], json!([]), "the agent was told of it");
+        let settings = store.list(&tools(&["shell.exec"]));
+        assert_eq!(settings["skills"][0]["name"], "deploy-fly");
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use backend::{Chats, Opened};
 use runtime::session::{Choices, Start};
@@ -31,33 +32,71 @@ impl Collected {
     }
 }
 
+/// How long a folder nobody holds stays open: a window that keeps asking about
+/// it does not have its whole log checked again each time.
+const IDLE: Duration = Duration::from_secs(5 * 60);
+
+/// What is open per folder. A folder is held by whoever was handed it, a chat
+/// for as long as it runs; once nobody holds it and `idle` has passed it closes,
+/// so a backend that lives for days keeps only the folders in use.
+struct Kept<T> {
+    open: HashMap<PathBuf, (Arc<T>, Instant)>,
+    idle: Duration,
+}
+
+impl<T> Kept<T> {
+    fn new(idle: Duration) -> Self {
+        Self {
+            open: HashMap::new(),
+            idle,
+        }
+    }
+
+    fn get(
+        &mut self,
+        folder: &Path,
+        open: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<Arc<T>> {
+        let now = Instant::now();
+        let idle = self.idle;
+        self.open.retain(|_, (held, used)| {
+            let in_use = Arc::strong_count(held) > 1;
+            if in_use {
+                *used = now;
+            }
+            in_use || now.duration_since(*used) < idle
+        });
+        if let Some((held, used)) = self.open.get_mut(folder) {
+            *used = now;
+            return Ok(Arc::clone(held));
+        }
+        let opened = Arc::new(open()?);
+        self.open
+            .insert(folder.to_path_buf(), (Arc::clone(&opened), now));
+        Ok(opened)
+    }
+}
+
 /// A folder's chats, and what is asked about the folder, share its one opened
-/// workspace and so its one event log. A folder stays open once it has been
-/// used: reopening would check its whole log again on every request.
+/// workspace and so its one event log.
 pub(crate) struct ServeChats {
-    folders: Mutex<HashMap<PathBuf, Arc<Workspace>>>,
+    folders: Mutex<Kept<Workspace>>,
     mcp_host: mcp::hub::Endpoint,
 }
 
 impl ServeChats {
     pub(crate) fn new(mcp_host: mcp::hub::Endpoint) -> Self {
         Self {
-            folders: Mutex::default(),
+            folders: Mutex::new(Kept::new(IDLE)),
             mcp_host,
         }
     }
 
     fn workspace(&self, folder: &Path, notices: &dyn Notices) -> anyhow::Result<Arc<Workspace>> {
-        let mut folders = self
-            .folders
+        self.folders
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(open) = folders.get(folder) {
-            return Ok(Arc::clone(open));
-        }
-        let opened = Arc::new(Workspace::open(folder.to_path_buf(), notices)?);
-        folders.insert(folder.to_path_buf(), Arc::clone(&opened));
-        Ok(opened)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(folder, || Workspace::open(folder.to_path_buf(), notices))
     }
 }
 
@@ -188,3 +227,7 @@ impl Chats for ServeChats {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "serve_chats_tests.rs"]
+mod tests;

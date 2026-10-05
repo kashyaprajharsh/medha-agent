@@ -17,6 +17,9 @@ const ROLES: wire::Roles = wire::Roles {
     guest: "client",
 };
 
+/// Longer than the MCP manager gives a connection to close.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Where a client finds the backend: `address` names the channel, `token` opens it.
 pub(crate) fn directory(home: &Path) -> PathBuf {
     home.join("serve")
@@ -39,22 +42,64 @@ fn address(directory: &Path, channel: &str) -> String {
     format!(r"\\.\pipe\medha-serve-{channel}-{tag}")
 }
 
+/// The shared MCP host, running until the backend stops it.
+struct McpHost {
+    endpoint: mcp::hub::Endpoint,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl McpHost {
+    /// Closes the remote connections and gives the host's address back.
+    async fn stop(self) {
+        drop(self.stop);
+        let _ = tokio::time::timeout(STOP_GRACE, self.task).await;
+    }
+}
+
 /// The user's remote MCP servers connect once, here, and every chat attaches.
 /// A chat that finds no host answering runs its own, as it does without a backend.
-fn shared_mcp(directory: &Path) -> anyhow::Result<mcp::hub::Endpoint> {
+fn shared_mcp(directory: &Path) -> anyhow::Result<McpHost> {
     let endpoint = mcp::hub::Endpoint {
         address: address(directory, "mcp"),
         token: new_token()?,
     };
     let (address, token) = (endpoint.address.clone(), endpoint.token.as_str().into());
-    tokio::spawn(async move {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
         let changed = Arc::new(tokio::sync::Notify::new());
-        let stopped = std::future::pending();
+        let stopped = async move {
+            let _ = stopped.await;
+        };
         if let Err(error) = crate::mcp_host::run_shared(&address, token, changed, stopped).await {
             tracing::warn!("the shared MCP host stopped: {error:#}");
         }
     });
-    Ok(endpoint)
+    Ok(McpHost {
+        endpoint,
+        stop,
+        task,
+    })
+}
+
+/// Ctrl-C, or the signal a process is stopped with: both end the backend the same way.
+async fn asked_to_stop() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let (Ok(mut ended), Ok(mut hung_up)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = ended.recv() => {}
+                _ = hung_up.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn private(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -127,14 +172,18 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
 
     let token: Arc<str> = new_token()?.into();
     let address = address(&directory, "backend");
+    let listener =
+        wire::bind(&address).with_context(|| format!("could not listen on {address}"))?;
+    let mcp_host = shared_mcp(&directory)?;
+    let chats = ServeChats::new(mcp_host.endpoint.clone());
+    let backend = backend::Backend::new(chats, env!("CARGO_PKG_VERSION"));
+    // Written once the address is taken: a client that finds these is not refused.
     private(&directory.join("token"), &token)?;
     private(&directory.join("address"), &address)?;
-    let chats = ServeChats::new(shared_mcp(&directory)?);
-    let backend = backend::Backend::new(chats, env!("CARGO_PKG_VERSION"));
     tracing::info!(address = %address, "medha backend listening");
     println!("medha backend listening");
 
-    let serving = wire::listen(&address, {
+    let serving = listener.serve({
         let backend = Arc::clone(&backend);
         move |stream| {
             tokio::spawn(client(Arc::clone(&backend), stream, Arc::clone(&token)));
@@ -142,13 +191,14 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
     });
     let outcome = tokio::select! {
         served = serving => served.with_context(|| format!("could not listen on {address}")),
-        _ = tokio::signal::ctrl_c() => Ok(()),
+        () = asked_to_stop() => Ok(()),
     };
     for name in ["token", "address"] {
         let _ = std::fs::remove_file(directory.join(name));
     }
     #[cfg(unix)]
     let _ = std::fs::remove_file(&address);
+    mcp_host.stop().await;
     drop(lock);
     outcome
 }

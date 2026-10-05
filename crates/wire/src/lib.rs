@@ -145,11 +145,12 @@ pub async fn connect(address: &str) -> std::io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::connect(address).await
 }
 
+/// An address already taken: a guest that connects from now on is not refused.
 #[cfg(unix)]
-pub async fn listen(
-    address: &str,
-    mut accept: impl FnMut(tokio::net::UnixStream),
-) -> std::io::Result<()> {
+pub struct Listener(tokio::net::UnixListener);
+
+#[cfg(unix)]
+pub fn bind(address: &str) -> std::io::Result<Listener> {
     use std::os::unix::fs::PermissionsExt;
     let path = std::path::Path::new(address);
     if let Some(dir) = path.parent() {
@@ -159,10 +160,28 @@ pub async fn listen(
     let _ = std::fs::remove_file(path);
     let listener = tokio::net::UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    loop {
-        let (stream, _) = listener.accept().await?;
-        accept(stream);
+    Ok(Listener(listener))
+}
+
+#[cfg(unix)]
+impl Listener {
+    pub async fn serve(
+        self,
+        mut accept: impl FnMut(tokio::net::UnixStream),
+    ) -> std::io::Result<()> {
+        loop {
+            let (stream, _) = self.0.accept().await?;
+            accept(stream);
+        }
     }
+}
+
+#[cfg(unix)]
+pub async fn listen(
+    address: &str,
+    accept: impl FnMut(tokio::net::UnixStream),
+) -> std::io::Result<()> {
+    bind(address)?.serve(accept).await
 }
 
 #[cfg(windows)]
@@ -172,23 +191,48 @@ pub async fn connect(
     tokio::net::windows::named_pipe::ClientOptions::new().open(address)
 }
 
+/// An address already taken: a guest that connects from now on is not refused.
 #[cfg(windows)]
-pub async fn listen(
-    address: &str,
-    mut accept: impl FnMut(tokio::net::windows::named_pipe::NamedPipeServer),
-) -> std::io::Result<()> {
-    use tokio::net::windows::named_pipe::ServerOptions;
-    let mut server = ServerOptions::new()
+pub struct Listener {
+    address: String,
+    server: tokio::net::windows::named_pipe::NamedPipeServer,
+}
+
+#[cfg(windows)]
+pub fn bind(address: &str) -> std::io::Result<Listener> {
+    let server = tokio::net::windows::named_pipe::ServerOptions::new()
         .first_pipe_instance(true)
         .reject_remote_clients(true)
         .create(address)?;
-    loop {
-        server.connect().await?;
-        let next = ServerOptions::new()
-            .reject_remote_clients(true)
-            .create(address)?;
-        accept(std::mem::replace(&mut server, next));
+    Ok(Listener {
+        address: address.to_string(),
+        server,
+    })
+}
+
+#[cfg(windows)]
+impl Listener {
+    pub async fn serve(
+        mut self,
+        mut accept: impl FnMut(tokio::net::windows::named_pipe::NamedPipeServer),
+    ) -> std::io::Result<()> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        loop {
+            self.server.connect().await?;
+            let next = ServerOptions::new()
+                .reject_remote_clients(true)
+                .create(&self.address)?;
+            accept(std::mem::replace(&mut self.server, next));
+        }
     }
+}
+
+#[cfg(windows)]
+pub async fn listen(
+    address: &str,
+    accept: impl FnMut(tokio::net::windows::named_pipe::NamedPipeServer),
+) -> std::io::Result<()> {
+    bind(address)?.serve(accept).await
 }
 
 #[cfg(test)]

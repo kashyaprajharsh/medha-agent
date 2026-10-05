@@ -710,6 +710,44 @@ async fn a_chat_outlives_the_backend_that_was_running_it() {
     );
 }
 
+/// What a client reads to find a backend must not outlive the backend it names.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backend_told_to_stop_leaves_nothing_that_names_it() {
+    let world = World::new();
+    let mut backend = world.backend();
+    drop(backend.connect().await);
+    let deadline = Instant::now() + WAIT;
+    while !backend.file("mcp.sock").exists() {
+        assert!(Instant::now() < deadline, "the MCP host never listened");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let told = Command::new("kill")
+        .args(["-TERM", &backend.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(told.success());
+    let stopped = loop {
+        if let Some(status) = backend.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the backend ignored the signal");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        stopped.success(),
+        "the backend was killed, not stopped: {stopped}"
+    );
+
+    let mut left: Vec<String> = std::fs::read_dir(world.home().join("serve"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["lock"], "a stopped backend left its address behind");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_backend_answers_about_a_folder_exactly_as_the_desktop_service_does() {
     let world = World::new();

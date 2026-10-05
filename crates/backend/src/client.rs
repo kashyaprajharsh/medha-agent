@@ -2,15 +2,15 @@
 //! chats it has attached to. It may only speak to a chat it is attached to.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::KEPT_FRAMES;
+use crate::session::{KEPT_FRAMES, Session};
 use crate::{Backend, Chats, Failure, PROTOCOL, refused};
 
 /// Room for a full replay and then some; a client further behind than this is dropped.
@@ -81,13 +81,14 @@ where
     });
     let mut reader = BufReader::new(reader);
     let mut attached = HashSet::new();
+    let tied = Tied::default();
     loop {
         let frame = tokio::select! {
             () = me.dropped.cancelled() => break,
             frame = wire::read_frame(&mut reader) => frame,
         };
         let Some(frame) = frame else { break };
-        handle(backend, &me, &mut attached, frame).await;
+        handle(backend, &me, &mut attached, &tied, frame).await;
     }
     for id in attached {
         if let Ok(session) = backend.find(&id) {
@@ -96,13 +97,34 @@ where
     }
     // Chats may still hold this client for answers it will never read.
     me.dropped.cancel();
+    tied.close().await;
     let _ = writing.await;
+}
+
+/// Chats a client asked to end when it does, as a chat on a pipe ends with whoever held the pipe.
+#[derive(Clone, Default)]
+struct Tied(Arc<Mutex<Vec<Weak<Session>>>>);
+
+impl Tied {
+    fn add(&self, session: &Arc<Session>) {
+        let mut tied = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        tied.retain(|chat| chat.strong_count() > 0);
+        tied.push(Arc::downgrade(session));
+    }
+
+    async fn close(&self) {
+        let tied = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
+        for session in tied.iter().filter_map(Weak::upgrade) {
+            session.close().await;
+        }
+    }
 }
 
 async fn handle<C: Chats>(
     backend: &Arc<Backend<C>>,
     me: &Client,
     attached: &mut HashSet<String>,
+    tied: &Tied,
     mut frame: Value,
 ) {
     let id = frame.get("id").cloned();
@@ -126,12 +148,25 @@ async fn handle<C: Chats>(
     // These can take long, so the client's other requests are not held behind them.
     let about_folder = named.is_none() && frame.get("folder").is_some();
     if method == "session.create" || about_folder {
-        let (backend, me) = (Arc::clone(backend), me.clone());
+        let (backend, me, tied) = (Arc::clone(backend), me.clone(), tied.clone());
         tokio::spawn(async move {
             let outcome = match about_folder {
                 true => backend.chats.about_folder(&frame).await.map_err(refused),
                 false => backend.create(&frame["params"]).await,
             };
+            let made = outcome
+                .as_ref()
+                .ok()
+                .and_then(|made| made["session"].as_str());
+            if frame["params"]["ends_with_client"] == true
+                && let Some(session) = made.and_then(|id| backend.find(id).ok())
+            {
+                tied.add(&session);
+                // The client may have gone while its chat was starting.
+                if me.dropped.is_cancelled() {
+                    tied.close().await;
+                }
+            }
             me.reply(id, outcome);
         });
         return;

@@ -466,3 +466,46 @@ async fn a_slow_request_does_not_hold_up_the_client_that_sent_it() {
     );
     assert!(client.answer(creating).await["result"]["session"].is_string());
 }
+
+#[tokio::test]
+async fn a_chat_tied_to_its_client_ends_with_it_and_any_other_goes_on() {
+    let backend = backend();
+    let mut leaving = connect(&backend);
+    let mut watching = connect(&backend);
+    let tied = leaving
+        .ask("session.create", None, json!({"ends_with_client": true}))
+        .await["result"]["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let kept = leaving.open().await;
+    watching.attach(&tied, None).await;
+
+    drop(leaving);
+    assert_eq!(watching.event().await.1["method"], "session.ended");
+    until("the tied chat leaves the table", || backend.live() == 1).await;
+    watching.attach(&kept, None).await;
+    assert_eq!(
+        watching.say(&kept, "still here").await["result"]["said"],
+        "still here"
+    );
+}
+
+#[tokio::test]
+async fn a_client_gone_before_its_tied_chat_started_leaves_no_chat_behind() {
+    let backend = backend();
+    let mut client = connect(&backend);
+    client
+        .post(json!({"method": "session.create",
+            "params": {"slow": true, "ends_with_client": true}}))
+        .await;
+    drop(client);
+    // Give the backend time to see the client go before its chat starts.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    backend.chats.released.notify_waiters();
+    until("the chat starts", || {
+        backend.chats.opened.load(Ordering::Relaxed) == 2
+    })
+    .await;
+    until("the orphan ends", || backend.live() == 0).await;
+}

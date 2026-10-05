@@ -1,43 +1,22 @@
 //! Workspace routing is a desktop adapter, never a second agent runtime.
 //! Projects use their existing store. Personal chats each get their own folder
 //! and existing Medha store; the library combines their session lists.
-use crate::{live::LiveSessions, service::Service, terminal::Terminals};
+use crate::{backend::Backend, live::LiveSessions, terminal::Terminals};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 /// Seconds an empty chat folder is left alone before it counts as unused.
 const UNUSED_CHAT_GRACE: f64 = 600.0;
-const SERVICE_IDLE: Duration = Duration::from_secs(300);
-const SERVICE_SWEEP: Duration = Duration::from_secs(60);
 
 type Runtimes = Mutex<HashMap<PathBuf, Arc<Runtime>>>;
-
-/// Runs while the registry lives: idle services stop instead of piling up for every chat ever opened.
-fn rest_idle_services(runtimes: Weak<Runtimes>) {
-    loop {
-        std::thread::sleep(SERVICE_SWEEP);
-        let Some(runtimes) = runtimes.upgrade() else {
-            return;
-        };
-        let all: Vec<_> = runtimes
-            .lock()
-            .map(|runtimes| runtimes.values().cloned().collect())
-            .unwrap_or_default();
-        drop(runtimes);
-        for runtime in all {
-            runtime.rest(Instant::now());
-        }
-    }
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Workspace {
@@ -46,23 +25,6 @@ pub struct Workspace {
     pub path: PathBuf,
     pub personal: bool,
 }
-
-/// Requests that wait on git or the network. They run in a second service
-/// process: the backend answers one request at a time, and a slow clone must
-/// never hold up session history.
-pub(crate) const SLOW_REQUESTS: [&str; 11] = [
-    "usage.summary",
-    "library.usage",
-    "extensions.mcp.registry",
-    "extensions.install",
-    "extensions.update.preview",
-    "extensions.update.apply",
-    "extensions.skill.install",
-    "extensions.marketplace.add",
-    "extensions.marketplace.refresh",
-    "settings.model.discover",
-    "settings.model.context",
-];
 
 /// Requests that change the chat's own folder or its state, not the user's settings.
 const CHAT_WRITES: [&str; 15] = [
@@ -85,9 +47,6 @@ const CHAT_WRITES: [&str; 15] = [
 
 pub struct Runtime {
     pub path: PathBuf,
-    service: Mutex<Option<Service>>,
-    jobs: Mutex<Option<Service>>,
-    used: Mutex<Instant>,
     pub live: LiveSessions,
     pub terminals: Terminals,
 }
@@ -97,46 +56,11 @@ impl Runtime {
             live: LiveSessions::new(path.clone()),
             terminals: Terminals::new(path.clone()),
             path,
-            service: Mutex::new(None),
-            jobs: Mutex::new(None),
-            used: Mutex::new(Instant::now()),
         }
     }
-    fn with_service<T>(
-        &self,
-        slot: &Mutex<Option<Service>>,
-        call: impl FnOnce(&mut Service) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let mut service = slot.lock().map_err(|e| e.to_string())?;
-        if service.is_none() {
-            *service = Some(Service::start(&self.path)?);
-        }
-        let result = call(service.as_mut().unwrap());
-        // A backend that stopped is started again on the next request.
-        if result.as_ref().is_err_and(|error| {
-            error.contains("stopped unexpectedly") || error.starts_with("Backend request failed")
-        }) {
-            *service = None;
-        }
-        if let Ok(mut used) = self.used.lock() {
-            *used = Instant::now();
-        }
-        result
-    }
-    /// Stops service processes nobody has asked anything of lately; a request in
-    /// flight holds its slot, so it is never cut off. The next request starts one again.
-    fn rest(&self, now: Instant) {
-        let idle = self
-            .used
-            .lock()
-            .is_ok_and(|used| now.saturating_duration_since(*used) >= SERVICE_IDLE);
-        if idle {
-            for slot in [&self.service, &self.jobs] {
-                if let Ok(mut service) = slot.try_lock() {
-                    service.take();
-                }
-            }
-        }
+    /// Asked of the backend, which answers each request on its own: a slow one holds up no other.
+    fn ask(&self, request: Value) -> Result<Value, String> {
+        Backend::shared().connection()?.about(&self.path, request)
     }
     pub fn request(
         &self,
@@ -144,17 +68,10 @@ impl Runtime {
         session: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<Value, String> {
-        self.with_service(&self.service, |service| {
-            service.request(method, session, cursor)
-        })
+        self.ask(json!({ "method": method, "session_id": session, "cursor": cursor }))
     }
     pub fn request_params(&self, method: &str, params: Value) -> Result<Value, String> {
-        let slot = if SLOW_REQUESTS.contains(&method) {
-            &self.jobs
-        } else {
-            &self.service
-        };
-        self.with_service(slot, |service| service.request_params(method, params))
+        self.ask(json!({ "method": method, "params": params }))
     }
 }
 
@@ -162,7 +79,7 @@ pub struct Workspaces {
     data: PathBuf,
     initial: String,
     entries: Mutex<Vec<Workspace>>,
-    runtimes: Arc<Runtimes>,
+    runtimes: Runtimes,
     sessions: Mutex<HashMap<String, PathBuf>>,
     chats: Mutex<HashMap<String, PathBuf>>,
     /// Held while the app runs, so the next one to open knows it is not alone.
@@ -214,9 +131,6 @@ impl Workspaces {
                 personal: true,
             },
         );
-        let runtimes = Arc::new(Mutex::new(HashMap::new()));
-        let watched = Arc::downgrade(&runtimes);
-        std::thread::spawn(move || rest_idle_services(watched));
         let (running, alone) = mark_running(&data);
         let registry = Self {
             _running: running,
@@ -224,7 +138,7 @@ impl Workspaces {
             data,
             initial: "personal".into(),
             entries: Mutex::new(entries),
-            runtimes,
+            runtimes: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             chats: Mutex::new(HashMap::new()),
         };
@@ -530,28 +444,5 @@ mod tests {
             "a second app could delete a draft the first still has open"
         );
         std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn an_idle_service_stops_but_one_answering_a_request_is_kept() {
-        let runtime = Runtime::new(std::env::temp_dir());
-        *runtime.service.lock().unwrap() = Some(Service::stand_in());
-        *runtime.jobs.lock().unwrap() = Some(Service::stand_in());
-        runtime.rest(Instant::now());
-        assert!(
-            runtime.service.lock().unwrap().is_some(),
-            "a service in use was stopped"
-        );
-
-        let answering = runtime.jobs.lock().unwrap();
-        runtime.rest(Instant::now() + SERVICE_IDLE);
-        drop(answering);
-        assert!(
-            runtime.service.lock().unwrap().is_none(),
-            "an idle service kept running"
-        );
-        assert!(
-            runtime.jobs.lock().unwrap().is_some(),
-            "a request in flight was cut off"
-        );
     }
 }

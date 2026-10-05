@@ -1,19 +1,19 @@
-//! Live sessions: one `medha --acp` bridge per session, driven by the same
+//! Live sessions: each is a chat in the Medha backend, driven by the same
 //! kernel, config and credentials as the TUI. Frames are forwarded to the
 //! window as `medha-live` events, with raw tool arguments and output reshaped by
 //! `transcript-view` exactly as the read-only history reshapes them.
 
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, Once, Weak};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use transcript_view::Steps;
 
+use crate::backend::{Backend, Said};
 use crate::sleep::{self, Rest, Settled, Wake};
 
 const REQUESTS: [&str; 25] = [
@@ -43,7 +43,7 @@ const REQUESTS: [&str; 25] = [
     "session.rewind",
     "session.rewind.points",
 ];
-const STDERR_TAIL: usize = 12;
+const STOPPED: &str = "This session has stopped. Start a new session to continue.";
 const STREAM_INTERVAL: Duration = Duration::from_millis(32);
 const STREAM_BYTES: usize = 64 * 1024;
 
@@ -149,34 +149,15 @@ fn pump_stream(frames: Receiver<Value>, mut emit: impl FnMut(Value)) {
 }
 
 struct Live {
-    child: Child,
-    input: ChildStdin,
+    /// What the chat is asked, in the order it was asked. Dropping it closes the chat.
+    requests: Sender<Value>,
+    ended: Arc<AtomicBool>,
     next_id: u64,
     emit: Emit,
     rest: Arc<Rest>,
 }
 
 type Emit = Arc<dyn Fn(Value) + Send + Sync>;
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        let _ = writeln!(
-            self.input,
-            "{}",
-            json!({ "jsonrpc": "2.0", "id": 0, "method": "shutdown" })
-        );
-        let _ = self.input.flush();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 type Open = HashMap<String, Live>;
 
@@ -190,21 +171,19 @@ pub struct LiveSessions {
 struct Inner {
     workspace: PathBuf,
     open: Mutex<Open>,
-    backend: Option<PathBuf>,
-    env: Vec<(String, String)>,
+    backend: Arc<Backend>,
 }
 
 impl LiveSessions {
     pub fn new(workspace: PathBuf) -> Self {
-        Self::launching(workspace, None, Vec::new())
+        Self::on(workspace, Backend::shared())
     }
 
-    fn launching(workspace: PathBuf, backend: Option<PathBuf>, env: Vec<(String, String)>) -> Self {
+    fn on(workspace: PathBuf, backend: Arc<Backend>) -> Self {
         let inner = Arc::new(Inner {
             workspace,
             open: Mutex::new(HashMap::new()),
             backend,
-            env,
         });
         if let Ok(mut every) = EVERY.lock() {
             every.push(Arc::downgrade(&inner));
@@ -229,12 +208,10 @@ impl LiveSessions {
             return Err("invalid session id".into());
         }
         let mut open = self.inner.awake(key)?;
-        if let Some(live) = open.get_mut(key)
-            && matches!(live.child.try_wait(), Ok(None))
-        {
+        if open.get(key).is_some_and(|live| !live.has_ended()) {
             return Ok(());
         }
-        let live = self.inner.spawn(&emit, resume, None)?;
+        let live = self.inner.spawn(&emit, resume, None);
         open.insert(key.to_owned(), live);
         Ok(())
     }
@@ -245,14 +222,13 @@ impl LiveSessions {
         }
         let mut open = self.inner.awake(key)?;
         let live = open.get_mut(key).ok_or("this session is not live")?;
+        if live.has_ended() {
+            return Err(STOPPED.into());
+        }
         let id = live.next_id;
         live.next_id += 1;
         let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        writeln!(live.input, "{frame}")
-            .and_then(|()| live.input.flush())
-            .map_err(|_| {
-                "This session has stopped. Start a new session to continue.".to_string()
-            })?;
+        live.requests.send(frame).map_err(|_| STOPPED.to_string())?;
         Ok(id)
     }
 
@@ -306,13 +282,11 @@ impl Inner {
             return;
         };
         for (key, live) in open.iter_mut() {
-            if sleep::is_focused(key) || !matches!(live.child.try_wait(), Ok(None)) {
+            if sleep::is_focused(key) || live.has_ended() {
                 continue;
             }
             if let Some(ask) = live.rest.ask(now, sleep::GRACE)
-                && writeln!(live.input, "{ask}")
-                    .and_then(|()| live.input.flush())
-                    .is_err()
+                && live.requests.send(ask).is_err()
             {
                 live.rest.closed();
             }
@@ -338,120 +312,116 @@ impl Inner {
                 return Ok(open);
             };
             let (emit, next_id) = (Arc::clone(&live.emit), live.next_id);
-            let mut woken = self.spawn(&emit, wake.resume.as_deref(), Some(&wake))?;
+            let mut woken = self.spawn(&emit, wake.resume.as_deref(), Some(&wake));
             // Ids keep counting, so no answer is matched to an earlier request.
             woken.next_id = next_id;
-            if let Some(gone) = open.insert(key.to_owned(), woken) {
-                std::thread::spawn(move || drop(gone));
-            }
+            open.insert(key.to_owned(), woken);
             return Ok(open);
         }
     }
 
-    fn spawn(
-        &self,
-        emit: &Emit,
-        resume: Option<&str>,
-        wake: Option<&Wake>,
-    ) -> Result<Live, String> {
-        let backend = match &self.backend {
-            Some(backend) => backend.clone(),
-            None => crate::service::backend_executable()?,
-        };
-        let mut command = Command::new(backend);
-        command.arg("--acp").envs(self.env.iter().cloned());
-        if let Some((address, token)) = crate::mcp_host::env() {
-            command
-                .env("MEDHA_MCP_HOST", address)
-                .env("MEDHA_MCP_HOST_TOKEN", token);
-        }
-        if let Some(id) = resume {
-            command.arg("--resume").arg(id);
-        }
-        if let Some(wake) = wake {
-            let settings = wake.settings.clone().unwrap_or_else(|| json!({}));
-            command.env("MEDHA_ACP_SETTINGS", settings.to_string());
-        }
-        let mut child = command
-            .current_dir(&self.workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("Could not start Medha: {error}"))?;
-        let input = child.stdin.take().ok_or("Medha stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("Medha stdout unavailable")?;
-        let stderr = child.stderr.take().ok_or("Medha stderr unavailable")?;
-
-        let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
-        let sink = Arc::clone(&tail);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Ok(mut tail) = sink.lock() {
-                    if tail.len() == STDERR_TAIL {
-                        tail.pop_front();
-                    }
-                    tail.push_back(line);
-                }
-            }
-        });
-
+    /// Returns at once: the chat opens on a thread of its own, and what it is
+    /// asked meanwhile waits in order. A chat that cannot open says so as its exit.
+    fn spawn(&self, emit: &Emit, resume: Option<&str>, wake: Option<&Wake>) -> Live {
         let rest = Rest::new();
-        let emitter = Arc::clone(emit);
-        // A bounded pipe decouples blocking stdout reads from timed UI updates.
-        // It cannot build an unbounded backlog when the renderer is slower.
-        let (sender, frames) = sync_channel(64);
-        let reading = Arc::clone(&rest);
-        // A resumed chat is one the window knows; a fresh one brings a new session id.
-        let mut greeted = wake.is_none_or(|wake| wake.resume.is_none());
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+        let ended = Arc::new(AtomicBool::new(false));
+        let why = Arc::new(Mutex::new(String::new()));
+        let (sender, frames) = channel();
+        let hear: crate::backend::Hear = Arc::new({
+            let (rest, ended, why) = (Arc::clone(&rest), Arc::clone(&ended), Arc::clone(&why));
+            let sender = Mutex::new(Some(sender));
+            // A resumed chat is one the window knows; a fresh one brings a new session id.
+            let greeted = AtomicBool::new(wake.is_none_or(|wake| wake.resume.is_none()));
+            move |said| match said {
+                Said::Frame(frame) => {
+                    if rest.answer(&frame) {
+                        return;
+                    }
+                    if frame["method"] == "ready" && !greeted.swap(true, Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Ok(sender) = sender.lock()
+                        && let Some(sender) = sender.as_ref()
+                    {
+                        let _ = sender.send(frame);
+                    }
                 }
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if reading.answer(&frame) {
-                    continue;
-                }
-                if !greeted && frame["method"] == "ready" {
-                    greeted = true;
-                    continue;
-                }
-                if sender.send(frame).is_err() {
-                    break;
+                Said::Ended(reason) => {
+                    if let Ok(mut why) = why.lock() {
+                        *why = reason.unwrap_or_default();
+                    }
+                    ended.store(true, Ordering::Relaxed);
+                    if let Ok(mut sender) = sender.lock() {
+                        sender.take();
+                    }
                 }
             }
         });
-        let pumping = Arc::clone(&rest);
+
+        let (emitter, pumping, over) = (Arc::clone(emit), Arc::clone(&rest), Arc::clone(&ended));
         std::thread::spawn(move || {
             let mut segment = String::new();
             let mut steps = Steps::default();
             pump_stream(frames, |frame| {
                 emitter(render(sanitize(frame, &mut steps), &mut segment));
             });
+            over.store(true, Ordering::Relaxed);
             if pumping.closed() {
                 return;
             }
-            let stderr = tail
-                .lock()
-                .map(|tail| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
-                .unwrap_or_default();
+            let stderr = why.lock().map(|why| why.clone()).unwrap_or_default();
             emitter(json!({ "method": "exit", "params": { "stderr": stderr } }));
         });
 
-        Ok(Live {
-            child,
-            input,
+        let (requests, asked) = channel::<Value>();
+        let (backend, folder) = (Arc::clone(&self.backend), self.workspace.clone());
+        let resume = resume.map(str::to_owned);
+        let settings = wake.map(|wake| wake.settings.clone().unwrap_or_else(|| json!({})));
+        let (resting, over) = (Arc::clone(&rest), Arc::clone(&ended));
+        std::thread::spawn(move || {
+            let opened = backend.connection().and_then(|connection| {
+                let chat = connection.open_chat(
+                    &folder,
+                    resume.as_deref(),
+                    settings.as_ref(),
+                    Arc::clone(&hear),
+                )?;
+                Ok((connection, chat))
+            });
+            let (connection, chat) = match opened {
+                Ok(opened) => opened,
+                Err(error) => return hear(Said::Ended(Some(error))),
+            };
+            // Kept only by the connection from here, so the stream ends when the connection lets go.
+            drop(hear);
+            for frame in asked {
+                if connection.tell(&chat, frame).is_err() {
+                    return;
+                }
+            }
+            // A chat that is over, or has said it is going to sleep, is not told to stop.
+            let leaving = matches!(resting.current(), Some(Settled::Asleep(_)));
+            if over.load(Ordering::Relaxed) || leaving {
+                return;
+            }
+            let shutdown = json!({ "jsonrpc": "2.0", "id": 0, "method": "shutdown" });
+            let _ = connection.tell(&chat, shutdown);
+            let _ = connection.tell(&chat, json!({ "method": "session.close" }));
+        });
+
+        Live {
+            requests,
+            ended,
             next_id: 1,
             emit: Arc::clone(emit),
             rest,
-        })
+        }
+    }
+}
+
+impl Live {
+    fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
     }
 }
 

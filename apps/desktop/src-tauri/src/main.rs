@@ -1,10 +1,9 @@
+mod backend;
 mod files;
 mod git;
 mod kept;
 mod live;
-mod mcp_host;
 mod outputs;
-mod service;
 mod sleep;
 mod terminal;
 mod update;
@@ -451,15 +450,9 @@ async fn settings_request(
         session_id.as_deref(),
         &method,
     )?;
-    let shared = method.starts_with("settings.mcp.") || method.starts_with("settings.keys.");
-    let result =
-        tauri::async_runtime::spawn_blocking(move || runtime.request_params(&method, params))
-            .await
-            .map_err(|error| error.to_string())?;
-    if shared && result.is_ok() {
-        mcp_host::changed();
-    }
-    result
+    tauri::async_runtime::spawn_blocking(move || runtime.request_params(&method, params))
+        .await
+        .map_err(|error| error.to_string())?
 }
 #[tauri::command]
 async fn image_admit(request: tauri::ipc::Request<'_>) -> Result<Value, String> {

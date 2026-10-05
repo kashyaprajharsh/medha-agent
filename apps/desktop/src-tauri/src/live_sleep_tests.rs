@@ -323,6 +323,31 @@ fn what_is_asked_before_the_chat_has_opened_is_answered_in_the_order_asked() {
     assert_eq!(answered, asked);
 }
 
+/// The window's requests wait for their answers on the app's own runtime, more
+/// of them at once than it has threads.
+#[test]
+fn answers_arrive_while_every_thread_of_the_apps_runtime_waits_for_one() {
+    let Some(chat) = Chat::open("waits", "http://127.0.0.1:9/v1") else {
+        return;
+    };
+    let connection = chat.sessions.inner.backend.connection().unwrap();
+    let folder = chat.sessions.inner.workspace.clone();
+    let (answered, answers) = std::sync::mpsc::channel();
+    for _ in 0..64 {
+        let (connection, folder, answered) =
+            (Arc::clone(&connection), folder.clone(), answered.clone());
+        tauri::async_runtime::spawn(async move {
+            let _ = answered.send(connection.about(&folder, json!({ "method": "hello" })));
+        });
+    }
+    for _ in 0..64 {
+        let answer = answers
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a request waited for an answer nobody was left to read");
+        assert_eq!(answer.unwrap()["protocol_version"], 1);
+    }
+}
+
 #[test]
 fn a_backend_that_dies_stops_its_chats_and_the_next_one_resumes_them() {
     let (model, seen) = stand_in_model();

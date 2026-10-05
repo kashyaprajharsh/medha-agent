@@ -262,6 +262,21 @@ enum Refused {
     Incompatible,
 }
 
+/// The connection is read on a thread of its own. Whoever waits for an answer
+/// blocks, and some wait on the app's own runtime: read there, the answer could
+/// queue behind the very thread that is waiting for it.
+fn reading() -> &'static tokio::runtime::Runtime {
+    static READING: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    READING.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("medha-backend")
+            .enable_all()
+            .build()
+            .expect("a thread to read the backend on")
+    })
+}
+
 async fn join(address: String, token: String) -> Result<Arc<Connection>, Refused> {
     let stream = wire::connect(&address).await.map_err(|_| Refused::Absent)?;
     let (reading, mut writing) = tokio::io::split(stream);
@@ -358,7 +373,7 @@ impl Backend {
             return Err(Refused::Absent);
         };
         let (joined, outcome) = mpsc::sync_channel(1);
-        tauri::async_runtime::spawn(async move {
+        reading().spawn(async move {
             let _ = joined.send(join(address, token).await);
         });
         outcome.recv().unwrap_or(Err(Refused::Absent))

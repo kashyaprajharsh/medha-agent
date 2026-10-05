@@ -24,7 +24,7 @@ portable-pty = "0.9"
 base64 = "0.22"
 getrandom = "0.3"
 dirs = "6"
-tokio = { version = "1", features = ["rt", "io-util", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "net"] }
 media = { path = "../../../crates/media" }
 wire = { path = "../../../crates/wire" }
 transcript-view = { path = "../../../crates/transcript-view" }

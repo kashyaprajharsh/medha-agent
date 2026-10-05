@@ -1,27 +1,16 @@
-//! Local desktop bridge. One process is bound to one canonical workspace.
-//! Stdout carries only JSON replies. History reads and typed settings/extension
-//! actions share existing Medha stores; credential values never enter replies.
-//! Requests are newline-delimited JSON with an integer `id` and `method`:
-//! `hello`, `sessions.list`, or `sessions.events` (`session_id`, optional
-//! `cursor` and `limit`). Replies carry the same `id` plus `result` or `error`.
+//! What a window asks about a folder, answered by the backend: its history,
+//! and typed settings and extension actions. These share the existing Medha
+//! stores; credential values never enter replies. A request names a `method`,
+//! such as `sessions.list` or `sessions.events` (`session_id`, optional
+//! `cursor` and `limit`), and is answered with its result or its error.
 
-use anyhow::{Context, Result};
-use clap::Parser;
+use anyhow::Result;
 use kernel::{ContentPart, Event, EventKind, EventLog, ModelMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use ulid::Ulid;
-
-#[derive(Parser)]
-#[command(name = "medha desktop-service")]
-struct Args {
-    /// Workspace whose existing Medha sessions this process may read.
-    #[arg(long)]
-    workspace: PathBuf,
-}
 
 #[derive(Deserialize)]
 struct Request {
@@ -120,34 +109,6 @@ struct EventView {
 struct EventPage {
     events: Vec<EventView>,
     next_cursor: Option<String>,
-}
-
-pub async fn run(argv: &[String]) -> Result<()> {
-    let args = Args::try_parse_from(
-        std::iter::once("medha desktop-service").chain(argv.iter().map(String::as_str)),
-    )?;
-    let workspace = args
-        .workspace
-        .canonicalize()
-        .with_context(|| format!("opening workspace {}", args.workspace.display()))?;
-    anyhow::ensure!(workspace.is_dir(), "workspace must be a directory");
-    let state = super::config::state_dir(&workspace)?;
-    let log = store::SqliteLog::open(state.join("events.db"))?;
-
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut output = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await? {
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle(&log, &workspace, request).await,
-            Err(error) => Response::error(0, format!("invalid request: {error}")),
-        };
-        output
-            .write_all(serde_json::to_string(&response)?.as_bytes())
-            .await?;
-        output.write_all(b"\n").await?;
-        output.flush().await?;
-    }
-    Ok(())
 }
 
 /// One request about a folder, for a caller that already holds that folder's

@@ -1,76 +1,34 @@
-//! Exercise the desktop's real stdio forms against isolated Medha state.
+//! Exercise the desktop's real forms, as it asks the backend, against isolated Medha state.
 use serde_json::{Value, json};
-use std::{
-    io::{BufRead, BufReader, Write},
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{Receiver, channel},
-    time::Duration,
-};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[path = "common/backend.rs"]
+mod backend;
+
 struct Bridge {
-    child: Child,
-    input: ChildStdin,
-    replies: Receiver<Value>,
-    id: u64,
+    backend: backend::Backend,
+    workspace: PathBuf,
 }
 impl Bridge {
-    fn start(workspace: &std::path::Path, home: &std::path::Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_medha"))
-            .args(["desktop-service", "--workspace"])
-            .arg(workspace)
-            .env("MEDHA_HOME", home)
-            .env_remove("MEDHA_API_KEY")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let input = child.stdin.take().unwrap();
-        let output = child.stdout.take().unwrap();
-        let (tx, replies) = channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(output).lines() {
-                let Ok(line) = line else { break };
-                let Ok(value) = serde_json::from_str(&line) else {
-                    break;
-                };
-                if tx.send(value).is_err() {
-                    break;
-                }
-            }
-        });
+    fn start(workspace: &Path, home: &Path) -> Self {
         Self {
-            child,
-            input,
-            replies,
-            id: 0,
+            backend: backend::Backend::start(home, &[]),
+            workspace: workspace.to_path_buf(),
         }
     }
+    /// The reply as a form reads it: its result, or the error it shows.
     fn call(&mut self, method: &str, params: Value) -> Value {
-        self.id += 1;
-        writeln!(
-            self.input,
-            "{}",
-            json!({"id": self.id,"method":method,"params":params})
-        )
-        .unwrap();
-        self.input.flush().unwrap();
-        let response = self
-            .replies
-            .recv_timeout(Duration::from_secs(10))
-            .expect("desktop bridge reply");
-        assert_eq!(response["id"], self.id);
-        response
+        match self.backend.ask(&self.workspace, method, params) {
+            Ok(result) => json!({ "result": result }),
+            Err(error) => json!({ "error": error }),
+        }
     }
     fn ok(&mut self, method: &str, params: Value) -> Value {
         let reply = self.call(method, params);
-        assert!(reply.get("error").is_none(), "{reply}");
+        assert!(reply.get("error").is_none(), "{method}: {reply}");
         reply["result"].clone()
-    }
-}
-impl Drop for Bridge {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 #[test]

@@ -168,55 +168,7 @@ fn medha(home: &Path, provider: &Provider) -> Command {
     command
 }
 
-/// `medha desktop-service`, the process the desktop asks about a folder today.
-struct Service {
-    child: Child,
-    input: std::process::ChildStdin,
-    output: std::io::BufReader<std::process::ChildStdout>,
-}
-
-impl Service {
-    fn start(folder: &Path, home: &Path, provider: &Provider) -> Self {
-        let mut child = medha(home, provider)
-            .args(["desktop-service", "--workspace"])
-            .arg(folder)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let input = child.stdin.take().unwrap();
-        let output = std::io::BufReader::new(child.stdout.take().unwrap());
-        Self {
-            child,
-            input,
-            output,
-        }
-    }
-
-    /// `request` holds the method and whatever else it takes; the answer is its result or its error text.
-    fn ask(&mut self, mut request: Value) -> Result<Value, String> {
-        use std::io::BufRead;
-        request["id"] = json!(1);
-        writeln!(self.input, "{request}").unwrap();
-        let mut line = String::new();
-        self.output.read_line(&mut line).unwrap();
-        let reply: Value = serde_json::from_str(&line).expect("a reply from the service");
-        match reply["error"].as_str() {
-            Some(error) => Err(error.to_string()),
-            None => Ok(reply["result"].clone()),
-        }
-    }
-}
-
-impl Drop for Service {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// `medha --acp`, one chat in a process of its own, as the desktop runs it today.
+/// `medha --acp`, one chat in a process of its own, as an editor runs it.
 struct OwnProcess {
     child: Child,
     input: std::process::ChildStdin,
@@ -778,7 +730,7 @@ async fn a_backend_told_to_stop_leaves_nothing_that_names_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_backend_answers_about_a_folder_exactly_as_the_desktop_service_does() {
+async fn the_backend_answers_what_the_desktop_asks_about_a_folder() {
     let world = World::new();
     let folder = world.folder("w");
     let backend = world.backend();
@@ -786,7 +738,6 @@ async fn the_backend_answers_about_a_folder_exactly_as_the_desktop_service_does(
     let chat = client.open(&folder).await;
     client.send(&chat, "one turn of history").await;
     client.until(|frame| kind(frame, "turn.done")).await;
-    let mut service = Service::start(&folder, &world.home(), &world.provider);
 
     let profile = json!({"protocol": "open-ai-chat", "base_url": "http://127.0.0.1:9/v1",
         "model": "saved-here", "auth": "none", "max_ctx": 32768});
@@ -805,11 +756,9 @@ async fn the_backend_answers_about_a_folder_exactly_as_the_desktop_service_does(
     let written = std::fs::read_to_string(folder.join("AGENTS.md")).unwrap();
     assert_eq!(written, "Written through the backend.");
 
-    let requests = [
+    let answered = [
         json!({"method": "sessions.list"}),
         json!({"method": "sessions.events", "session_id": chat}),
-        json!({"method": "sessions.events", "session_id": chat, "limit": 2}),
-        json!({"method": "sessions.events"}),
         json!({"method": "sessions.changes", "session_id": chat}),
         json!({"method": "usage.summary", "params": {"days": 7}}),
         json!({"method": "library.sessions"}),
@@ -822,19 +771,31 @@ async fn the_backend_answers_about_a_folder_exactly_as_the_desktop_service_does(
         json!({"method": "extensions.hooks.list"}),
         json!({"method": "extensions.marketplace.list"}),
         json!({"method": "extensions.connectors"}),
+    ];
+    for request in answered {
+        let answer = client.about(&folder, request.clone()).await;
+        assert!(answer.is_ok(), "{request}: {answer:?}");
+    }
+    let refused = [
+        json!({"method": "sessions.events"}),
         json!({"method": "extensions.nonsense"}),
         json!({"method": "nonsense"}),
     ];
-    for request in requests {
-        let from_service = service.ask(request.clone());
-        let from_backend = client.about(&folder, request.clone()).await;
-        assert_eq!(from_backend, from_service, "{request}");
+    for request in refused {
+        let answer = client.about(&folder, request.clone()).await;
+        assert!(answer.is_err(), "{request}: {answer:?}");
     }
+    let listed = client
+        .about(&folder, json!({"method": "sessions.list"}))
+        .await
+        .unwrap();
+    assert!(listed.to_string().contains(&chat), "the chat is not listed");
     let page = json!({"method": "sessions.events", "session_id": chat, "limit": 2});
     let page = client.about(&folder, page).await.unwrap();
     let next = json!({"method": "sessions.events", "session_id": chat,
         "cursor": page["next_cursor"]});
-    assert_eq!(client.about(&folder, next.clone()).await, service.ask(next));
+    let next = client.about(&folder, next).await.unwrap();
+    assert_ne!(next, page, "the second page repeated the first");
     let defaults = client
         .about(&folder, json!({"method": "settings.defaults"}))
         .await;
@@ -985,12 +946,11 @@ async fn a_key_saved_through_the_backend_reaches_the_shared_mcp_host_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn requests_that_save_keys_reach_out_or_install_behave_the_same_through_the_backend() {
+async fn the_backend_saves_keys_reaches_out_and_installs_without_showing_a_key() {
     let world = World::new();
     let folder = world.folder("w");
     let backend = world.backend();
     let mut client = backend.connect().await;
-    let mut service = Service::start(&folder, &world.home(), &world.provider);
     let endpoint = world.provider.url.clone();
 
     // A model saved with its key through the backend: the key is kept and never shown.
@@ -1004,32 +964,33 @@ async fn requests_that_save_keys_reach_out_or_install_behave_the_same_through_th
         .expect("a model is saved with its key");
     let keys = json!({"method": "settings.keys"});
     let held = client.about(&folder, keys.clone()).await;
-    assert_eq!(held, service.ask(keys.clone()));
     assert!(held.unwrap().to_string().contains(r#""present":true"#));
 
-    // Replaced through the service, removed through the backend: one store, seen by both.
+    // Replaced, then removed.
     let key = json!({"group": "model", "id": endpoint, "key": "sk-zz-second-key"});
-    service
-        .ask(json!({"method": "settings.keys.set", "params": key}))
-        .expect("the service sets a key");
+    client
+        .about(
+            &folder,
+            json!({"method": "settings.keys.set", "params": key}),
+        )
+        .await
+        .expect("a key is replaced");
     let gone =
         json!({"method": "settings.keys.remove", "params": {"group": "model", "id": endpoint}});
     client
         .about(&folder, gone)
         .await
         .expect("the backend removes a key");
-    let held = client.about(&folder, keys.clone()).await;
-    assert_eq!(held, service.ask(keys));
+    let held = client.about(&folder, keys).await;
     assert!(!held.unwrap().to_string().contains(r#""present":true"#));
 
-    // Discovery reaches the model's endpoint from either.
+    // Discovery reaches the model's endpoint.
     let discover = json!({"method": "settings.model.discover", "params": {"profile": {
         "protocol": "open-ai-chat", "base_url": endpoint, "model": "any", "auth": "none"}}});
-    let found = client.about(&folder, discover.clone()).await;
-    assert_eq!(found, service.ask(discover));
+    let found = client.about(&folder, discover).await;
     assert_eq!(found.unwrap()["models"][0]["id"], "test-model");
 
-    // An extension installed from a folder through the backend, removed through the service.
+    // An extension installed from a folder, then removed.
     let package = world.root.path().join("package");
     std::fs::create_dir_all(&package).unwrap();
     let manifest = "schema_version = 1\nid = \"dev.medha.review\"\nname = \"Review helpers\"\n\
@@ -1043,24 +1004,25 @@ async fn requests_that_save_keys_reach_out_or_install_behave_the_same_through_th
         .await
         .expect("an extension is installed");
     assert_eq!(installed["id"], "dev.medha.review");
-    for method in ["extensions.list", "extensions.doctor"] {
-        let request = json!({"method": method});
-        assert_eq!(
-            client.about(&folder, request.clone()).await,
-            service.ask(request),
-            "{method}"
-        );
-    }
+    let listed = client
+        .about(&folder, json!({"method": "extensions.list"}))
+        .await;
+    assert!(listed.unwrap().to_string().contains("dev.medha.review"));
+    let checked = client
+        .about(&folder, json!({"method": "extensions.doctor"}))
+        .await;
+    assert!(checked.is_ok(), "{checked:?}");
     let remove = json!({"method": "extensions.remove", "params": {"id": "dev.medha.review"}});
-    service
-        .ask(remove)
-        .expect("the service removes an extension");
+    client
+        .about(&folder, remove)
+        .await
+        .expect("an extension is removed");
     let listed = client
         .about(&folder, json!({"method": "extensions.list"}))
         .await;
     assert!(!listed.unwrap().to_string().contains("dev.medha.review"));
 
-    // What each refuses, it refuses in the same words.
+    // What cannot be done is refused, not accepted quietly.
     let refused = [
         json!({"method": "extensions.marketplace.add", "params": {"source": "/not/a/repository"}}),
         json!({"method": "extensions.enable", "params": {"id": "nobody"}}),
@@ -1076,7 +1038,6 @@ async fn requests_that_save_keys_reach_out_or_install_behave_the_same_through_th
     for request in refused {
         let from_backend = client.about(&folder, request.clone()).await;
         assert!(from_backend.is_err(), "{request} was accepted");
-        assert_eq!(from_backend, service.ask(request.clone()), "{request}");
     }
     for key in [SECRET, "sk-zz-model-key", "sk-zz-second-key"] {
         assert!(!client.heard.contains(key), "{key} reached a client");

@@ -148,8 +148,8 @@ flowchart TB
     EXT -.->|"Lifecycle hooks"| CONTROL
 ```
 
-The desktop launches the same backend through `medha --acp` for live sessions;
-its `desktop-service` handles session/history and desktop control requests.
+The desktop joins one `medha serve` backend, or starts it. Live sessions run
+inside it, and it answers session/history and desktop control requests.
 `media` normalizes admitted images, and `transcript-view` formats desktop history
 and live tool steps. The `gate` crate below is the offline Eval Gate, distinct
 from the kernel's interactive `HumanGate`.

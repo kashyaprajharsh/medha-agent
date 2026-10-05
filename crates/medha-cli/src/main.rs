@@ -816,12 +816,6 @@ async fn main() -> Result<()> {
     if raw.get(1).map(|s| s == "trust").unwrap_or(false) {
         return run_trust_command(&raw[2..]);
     }
-    if raw.get(1).map(|s| s == "desktop-service").unwrap_or(false) {
-        return desktop_service::run(&raw[2..]).await;
-    }
-    if raw.get(1).map(|s| s == "mcp-host").unwrap_or(false) {
-        return mcp_host::run(&raw[2..]).await;
-    }
     if raw.get(1).map(|s| s == "serve").unwrap_or(false) {
         return serve::run(&raw[2..]).await;
     }

@@ -79,7 +79,7 @@ npm run tauri build -- --bundles app
 The native executable is `medha-desktop`. On macOS, `npm run link:command` links
 the built executable into `~/.local/bin`, refusing to replace an existing command.
 The built `Medha.app` also opens normally. The bundle includes the `medha` sidecar;
-`desktop-service` is an internal protocol, not a user-facing command.
+the app starts it as `medha serve`, which is internal, not a user-facing command.
 
 Preview bounds are 2 MiB for text and 24 MiB for binary files. Unsupported or
 larger files can open in their system app. DOCX previews prioritize reading;

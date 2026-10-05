@@ -1,54 +1,30 @@
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde_json::{Value, json};
 
-/// One `desktop-service` for the whole library, as the desktop runs it.
+#[path = "common/backend.rs"]
+mod backend;
+
+/// What the desktop asks about one folder, here the whole library.
 struct Library {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
+    backend: backend::Backend,
+    folder: PathBuf,
 }
 
 impl Library {
     fn start(library: &Path, home: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_medha"))
-            .args(["desktop-service", "--workspace"])
-            .arg(library)
-            .env("MEDHA_HOME", home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let input = child.stdin.take().unwrap();
-        let output = BufReader::new(child.stdout.take().unwrap());
         Self {
-            child,
-            input,
-            output,
+            backend: backend::Backend::start(home, &[]),
+            folder: library.to_path_buf(),
         }
     }
 
     fn call(&mut self, method: &str, params: Value) -> Value {
-        writeln!(
-            self.input,
-            "{}",
-            json!({"id": 1, "method": method, "params": params})
-        )
-        .unwrap();
-        let mut line = String::new();
-        self.output.read_line(&mut line).unwrap();
-        let reply: Value = serde_json::from_str(&line).unwrap();
-        assert!(reply["error"].is_null(), "{reply}");
-        reply["result"].clone()
-    }
-}
-
-impl Drop for Library {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.backend
+            .ask(&self.folder, method, params)
+            .unwrap_or_else(|error| panic!("{method}: {error}"))
     }
 }
 

@@ -710,6 +710,35 @@ async fn a_chat_outlives_the_backend_that_was_running_it() {
     );
 }
 
+/// An app started from the desktop hands its children a low limit on open files.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backend_started_with_few_open_files_allowed_still_holds_many_chats() {
+    let world = World::new();
+    std::fs::create_dir_all(world.home()).unwrap();
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", r#"ulimit -S -n 64; exec "$0" serve"#])
+        .arg(env!("CARGO_BIN_EXE_medha"));
+    for (key, value) in medha(&world.home(), &world.provider).get_envs() {
+        command.env(key, value.unwrap());
+    }
+    let backend = Backend {
+        child: command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        home: world.home(),
+    };
+    let mut client = backend.connect().await;
+    for n in 0..12 {
+        let made = client.create(&world.folder(&format!("w{n}")), None).await;
+        assert!(made["result"]["session"].is_string(), "chat {n}: {made}");
+    }
+}
+
 /// What a client reads to find a backend must not outlive the backend it names.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

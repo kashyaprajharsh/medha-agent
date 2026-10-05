@@ -144,7 +144,28 @@ where
     }
 }
 
+/// A chat holds about eleven open files. An app started from the desktop is
+/// allowed 256 at first, which is some twenty chats, so the backend takes what
+/// the system lets it have.
+#[cfg(unix)]
+fn allow_many_open_files() {
+    const WANTED: libc::rlim_t = 10_240;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid rlimit for both calls.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < WANTED {
+            limit.rlim_cur = WANTED.min(limit.rlim_max);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
 pub async fn run(_args: &[String]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    allow_many_open_files();
     let home = config::medha_home()?;
     let directory = directory(&home);
     std::fs::create_dir_all(&directory)

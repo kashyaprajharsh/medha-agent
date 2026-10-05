@@ -82,13 +82,15 @@ impl<T> Kept<T> {
 pub(crate) struct ServeChats {
     folders: Mutex<Kept<Workspace>>,
     mcp_host: mcp::hub::Endpoint,
+    mcp_changed: Arc<tokio::sync::Notify>,
 }
 
 impl ServeChats {
-    pub(crate) fn new(mcp_host: mcp::hub::Endpoint) -> Self {
+    pub(crate) fn new(mcp_host: mcp::hub::Endpoint, mcp_changed: Arc<tokio::sync::Notify>) -> Self {
         Self {
             folders: Mutex::new(Kept::new(IDLE)),
             mcp_host,
+            mcp_changed,
         }
     }
 
@@ -141,7 +143,15 @@ impl Chats for ServeChats {
             .workspace(&folder, &Collected::default())
             .map_err(failed)?;
         let store = workspace.open_store().map_err(failed)?;
-        crate::desktop_service::answer(&store.log, &folder, request).await
+        let answer = crate::desktop_service::answer(&store.log, &folder, request).await;
+        // A saved key leaves the config file as it was, so the host is told rather than left to notice.
+        let shared = request["method"].as_str().is_some_and(|method| {
+            method.starts_with("settings.mcp.") || method.starts_with("settings.keys.")
+        });
+        if shared && answer.is_ok() {
+            self.mcp_changed.notify_one();
+        }
+        answer
     }
 
     async fn open(&self, params: &Value) -> Result<Opened, String> {

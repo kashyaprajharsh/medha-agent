@@ -45,6 +45,8 @@ fn address(directory: &Path, channel: &str) -> String {
 /// The shared MCP host, running until the backend stops it.
 struct McpHost {
     endpoint: mcp::hub::Endpoint,
+    /// Told when a server or a key was saved, so the host follows at once.
+    changed: Arc<tokio::sync::Notify>,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -66,17 +68,22 @@ fn shared_mcp(directory: &Path) -> anyhow::Result<McpHost> {
     };
     let (address, token) = (endpoint.address.clone(), endpoint.token.as_str().into());
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(async move {
-        let changed = Arc::new(tokio::sync::Notify::new());
-        let stopped = async move {
-            let _ = stopped.await;
-        };
-        if let Err(error) = crate::mcp_host::run_shared(&address, token, changed, stopped).await {
-            tracing::warn!("the shared MCP host stopped: {error:#}");
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let task = tokio::spawn({
+        let changed = Arc::clone(&changed);
+        async move {
+            let stopped = async move {
+                let _ = stopped.await;
+            };
+            let served = crate::mcp_host::run_shared(&address, token, changed, stopped).await;
+            if let Err(error) = served {
+                tracing::warn!("the shared MCP host stopped: {error:#}");
+            }
         }
     });
     Ok(McpHost {
         endpoint,
+        changed,
         stop,
         task,
     })
@@ -175,7 +182,7 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
     let listener =
         wire::bind(&address).with_context(|| format!("could not listen on {address}"))?;
     let mcp_host = shared_mcp(&directory)?;
-    let chats = ServeChats::new(mcp_host.endpoint.clone());
+    let chats = ServeChats::new(mcp_host.endpoint.clone(), Arc::clone(&mcp_host.changed));
     let backend = backend::Backend::new(chats, env!("CARGO_PKG_VERSION"));
     // Written once the address is taken: a client that finds these is not refused.
     private(&directory.join("token"), &token)?;

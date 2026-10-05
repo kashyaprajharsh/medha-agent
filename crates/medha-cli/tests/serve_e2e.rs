@@ -923,6 +923,38 @@ async fn chats_in_the_backend_share_one_connection_to_a_remote_mcp_server() {
     );
 }
 
+/// Saving a key leaves the config file as it was: only being told makes the host use the new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_saved_through_the_backend_reaches_the_shared_mcp_host_at_once() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let world = World::new();
+    let (url, connected) = remote_mcp_server();
+    std::fs::create_dir_all(world.home()).unwrap();
+    let config = format!("[mcp.hosted]\nurl = \"{url}\"\ntrust = \"trusted\"\nauth = \"bearer\"\n");
+    std::fs::write(world.home().join("config.toml"), config).unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("w");
+
+    for (round, key) in ["sk-zz-first-mcp-key", "sk-zz-second-mcp-key"]
+        .into_iter()
+        .enumerate()
+    {
+        let before = connected.load(SeqCst);
+        let save = json!({"method": "settings.keys.set",
+            "params": {"group": "mcp", "id": "hosted", "key": key}});
+        client.about(&folder, save).await.expect("a key is saved");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while connected.load(SeqCst) == before {
+            assert!(
+                Instant::now() < deadline,
+                "key {round} was saved and the host went on with the old one"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requests_that_save_keys_reach_out_or_install_behave_the_same_through_the_backend() {
     let world = World::new();

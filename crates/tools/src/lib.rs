@@ -669,7 +669,10 @@ impl Tool for McpStatus {
         json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _args: &Value) -> Result<Value, ToolError> {
-        Ok(json!({ "servers": self.manager.status().await }))
+        // A server the user switched off is theirs to see in settings, not the agent's to know of.
+        let mut servers = self.manager.status().await;
+        servers.retain(|server| server.state != mcp::ServerState::Disabled);
+        Ok(json!({ "servers": servers }))
     }
 }
 
@@ -9479,3 +9482,7 @@ mod shell_approval_tests;
 #[cfg(test)]
 #[path = "image_view_tests.rs"]
 mod image_view_tests;
+
+#[cfg(test)]
+#[path = "mcp_status_tests.rs"]
+mod mcp_status_tests;

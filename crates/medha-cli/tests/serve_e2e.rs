@@ -364,6 +364,15 @@ impl Client {
         }
     }
 
+    /// The next frame in the order it arrived: one set aside while an answer
+    /// was awaited comes before anything still on the wire.
+    async fn next(&mut self) -> Value {
+        match self.events.pop_front() {
+            Some(frame) => frame,
+            None => self.frame().await,
+        }
+    }
+
     async fn frame(&mut self) -> Value {
         let frame = tokio::time::timeout(WAIT, wire::read_frame(&mut self.reader))
             .await
@@ -392,10 +401,7 @@ impl Client {
 
     /// The next frame a chat wrote, with its number.
     async fn event(&mut self) -> (u64, Value) {
-        let frame = match self.events.pop_front() {
-            Some(frame) => frame,
-            None => self.frame().await,
-        };
+        let frame = self.next().await;
         assert_eq!(frame["method"], "session.event", "{frame}");
         (
             frame["params"]["seq"].as_u64().unwrap(),
@@ -523,7 +529,7 @@ async fn ten_chats_in_one_process_answer_their_own_clients_and_leak_no_key() {
     let mut done = std::collections::HashSet::new();
     let mut replies = std::collections::HashMap::<String, String>::new();
     while done.len() < chats.len() {
-        let frame = client.frame().await;
+        let frame = client.next().await;
         let (chat, said) = (
             frame["params"]["session"].as_str(),
             &frame["params"]["frame"],
@@ -861,10 +867,7 @@ async fn chats_in_the_backend_share_one_connection_to_a_remote_mcp_server() {
     // Each chat is told the server is ready and offers its tool.
     let mut ready = std::collections::HashSet::new();
     while ready.len() < chats.len() {
-        let frame = match client.events.pop_front() {
-            Some(frame) => frame,
-            None => client.frame().await,
-        };
+        let frame = client.next().await;
         let said = &frame["params"]["frame"];
         let hosted = said["params"]["servers"]
             .as_array()

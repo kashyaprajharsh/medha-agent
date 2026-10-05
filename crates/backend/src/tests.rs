@@ -271,6 +271,23 @@ async fn a_client_cannot_speak_to_a_chat_it_has_not_attached_to() {
 }
 
 #[tokio::test]
+async fn attaching_to_a_chat_gives_no_way_into_a_later_chat_of_the_same_id() {
+    let backend = backend();
+    let (mut first, mut second) = (connect(&backend), connect(&backend));
+    let resume = json!({"resume": "kept"});
+    first.ask("session.create", None, resume.clone()).await;
+    first.attach("kept", None).await;
+    first.ask("session.close", Some("kept"), json!({})).await;
+    until("the closed chat leaves the table", || backend.live() == 0).await;
+
+    second.ask("session.create", None, resume).await;
+    let refused = first.say("kept", "still me").await;
+    assert_eq!(refused["error"]["message"], "attach to the session first");
+    let refused = first.ask("session.close", Some("kept"), json!({})).await;
+    assert_eq!(refused["error"]["message"], "attach to the session first");
+}
+
+#[tokio::test]
 async fn a_client_that_comes_back_with_its_cursor_misses_nothing() {
     let backend = backend();
     let mut first = connect(&backend);

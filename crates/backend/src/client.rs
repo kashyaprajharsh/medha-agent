@@ -187,7 +187,7 @@ async fn handle<C: Chats>(
             json!({ "detached": true })
         }),
         "session.close" => match session("session.close") {
-            Ok(session) if attached.contains(&session.id) => {
+            Ok(session) if session.heard_by(me.id) => {
                 session.close().await;
                 Ok(json!({ "closing": true }))
             }
@@ -195,7 +195,7 @@ async fn handle<C: Chats>(
             Err(error) => Err(error),
         },
         _ => match session("a request to a chat") {
-            Ok(session) if attached.contains(&session.id) => {
+            Ok(session) if session.heard_by(me.id) => {
                 match session.forward(me, frame).await {
                     // The chat answers; its answer is routed back to this client.
                     Ok(()) => return,

@@ -78,6 +78,11 @@ impl Session {
         self.stream().viewers.remove(&client);
     }
 
+    /// Asked of this chat itself: an earlier chat of the same id is another chat.
+    pub(crate) fn heard_by(&self, client: u64) -> bool {
+        self.stream().viewers.contains_key(&client)
+    }
+
     /// Hands a client's request to the chat under an id that cannot collide with another client's.
     pub(crate) async fn forward(&self, client: &Client, mut frame: Value) -> Result<(), String> {
         let mut given = None;

@@ -84,6 +84,8 @@ struct Chat {
     frames: Arc<Mutex<Vec<Value>>>,
     key: &'static str,
     root: PathBuf,
+    /// While set, the window draws nothing more: each frame it is given holds it up.
+    stuck: Arc<AtomicBool>,
     _alone: MutexGuard<'static, ()>,
 }
 
@@ -95,8 +97,13 @@ impl Chat {
     }
 
     fn emit(&self) -> Emit {
-        let sink = Arc::clone(&self.frames);
-        Arc::new(move |frame| sink.lock().unwrap().push(frame))
+        let (sink, stuck) = (Arc::clone(&self.frames), Arc::clone(&self.stuck));
+        Arc::new(move |frame| {
+            sink.lock().unwrap().push(frame);
+            while stuck.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
     }
 
     /// Asked to open, and returned before it has.
@@ -130,6 +137,7 @@ impl Chat {
             frames: Arc::default(),
             key,
             root,
+            stuck: Arc::default(),
             _alone: alone,
         };
         chat.sessions.open_to(chat.emit(), key, None).unwrap();
@@ -375,6 +383,100 @@ fn a_backend_that_dies_stops_its_chats_and_the_next_one_resumes_them() {
         after >= before + 2,
         "the resumed chat lost its history: {before} -> {after}"
     );
+}
+
+#[test]
+fn a_window_that_cannot_keep_up_stops_following_the_chat_and_holds_only_so_much() {
+    // The chat here says more than a window may hold, all at once.
+    let said = INBOX_FRAMES + 2000;
+    let address = crate::backend::tests::address();
+    let asked = crate::backend::tests::scripted_backend(&address, "token", Duration::ZERO, said);
+    let sessions = LiveSessions::on(
+        std::env::temp_dir(),
+        Backend::joined_to(address.clone(), "token"),
+    );
+    let (drawn, stuck) = (
+        Arc::<Mutex<Vec<Value>>>::default(),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let (sink, held) = (Arc::clone(&drawn), Arc::clone(&stuck));
+    let emit: Emit = Arc::new(move |frame| {
+        sink.lock().unwrap().push(frame);
+        while held.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    sessions.open_to(emit, "behind", None).unwrap();
+
+    let told_to_stop = |asked: &[Value]| {
+        asked
+            .iter()
+            .any(|frame| frame["method"] == "session.close" && frame["session"] == "late")
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !told_to_stop(&asked.lock().unwrap()) {
+        assert!(
+            Instant::now() < deadline,
+            "the chat nobody follows was left running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let refused = sessions.request("behind", "session.settings", json!({}));
+    assert_eq!(refused, Err(STOPPED.to_string()));
+
+    stuck.store(false, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exit = loop {
+        let exit = drawn
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|frame| frame["method"] == "exit")
+            .cloned();
+        if let Some(exit) = exit {
+            break exit;
+        }
+        assert!(Instant::now() < deadline, "the window was never told");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(exit["params"]["stderr"], FELL_BEHIND);
+    let held = drawn.lock().unwrap().len();
+    assert!(
+        held <= INBOX_FRAMES + 8,
+        "the window held {held} of {said} frames"
+    );
+    if let Some(folder) = std::path::Path::new(&address).parent() {
+        let _ = std::fs::remove_dir_all(folder);
+    }
+}
+
+#[test]
+fn a_chat_that_sleeps_keeps_no_thread_waiting_to_send_to_it() {
+    let (model, _) = stand_in_model();
+    let Some(chat) = Chat::open("idle", &model) else {
+        return;
+    };
+    chat.turn("first");
+    chat.sleep();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let open = chat.sessions.inner.open.lock().unwrap();
+        let asleep = open.get(chat.key).expect("the tab is still open");
+        // Its sender is told there is nobody listening once the thread that sent for it has gone.
+        if matches!(
+            asleep.requests.try_send(Value::Null),
+            Err(TrySendError::Disconnected(_))
+        ) {
+            break;
+        }
+        drop(open);
+        assert!(
+            Instant::now() < deadline,
+            "the sleeping chat kept its thread"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    chat.turn("second");
 }
 
 #[test]

@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
@@ -23,6 +24,11 @@ const AFTER_EXIT: Duration = Duration::from_secs(3);
 const LEAVING: Duration = Duration::from_secs(10);
 const STOPPED: &str = "Medha backend stopped unexpectedly";
 const QUIET: &str = "Medha did not answer in time. Try again.";
+pub(crate) const NOT_TAKING: &str =
+    "Medha has not taken what was already sent. Try again in a moment.";
+const UNSENT_BYTES: usize = 64 * 1024 * 1024;
+/// How many requests may be waiting for their answers at once, over every chat and folder.
+const UNANSWERED: usize = 1024;
 /// How long a quick answer is waited for, and one that may install, download or start a chat.
 const SOON: Duration = Duration::from_secs(60);
 const EVENTUALLY: Duration = Duration::from_secs(10 * 60);
@@ -82,6 +88,8 @@ impl Routes {
 
 pub(crate) struct Connection {
     lines: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Bytes handed to `lines` that the backend has not taken yet.
+    unsent: Arc<AtomicUsize>,
     routes: Mutex<Routes>,
 }
 
@@ -107,13 +115,29 @@ impl Connection {
         if routes.gone {
             return Err(STOPPED.into());
         }
-        if let Some(reply) = reply {
-            routes.next += 1;
-            frame["id"] = json!(routes.next);
-            routes.replies.insert(routes.next, reply);
+        // What the backend has yet to take is bounded. Only what stops or closes
+        // a chat goes regardless: those must arrive, and are a few bytes.
+        let stops = matches!(
+            frame["method"].as_str(),
+            Some("session.close" | "session.detach" | "shutdown" | "cancel" | "interrupt")
+        );
+        let id = routes.next + 1;
+        if reply.is_some() {
+            frame["id"] = json!(id);
         }
+        let line = format!("{frame}\n");
+        let unsent = self.unsent.load(Ordering::Relaxed) + line.len() > UNSENT_BYTES;
+        let unanswered = reply.is_some() && routes.replies.len() >= UNANSWERED;
+        if !stops && (unsent || unanswered) {
+            return Err(NOT_TAKING.into());
+        }
+        if let Some(reply) = reply {
+            routes.next = id;
+            routes.replies.insert(id, reply);
+        }
+        self.unsent.fetch_add(line.len(), Ordering::Relaxed);
         self.lines
-            .send(format!("{frame}\n"))
+            .send(line)
             .map(|()| routes.next)
             .map_err(|_| STOPPED.to_string())
     }
@@ -142,7 +166,7 @@ impl Connection {
         self.ask(request, EVENTUALLY)
     }
 
-    fn is_live(&self, session: &str) -> bool {
+    pub(crate) fn is_live(&self, session: &str) -> bool {
         self.ask(json!({ "method": "session.list" }), SOON)
             .is_ok_and(|listed| {
                 listed["sessions"]
@@ -348,8 +372,10 @@ async fn join(address: String, token: String) -> Result<Arc<Connection>, Refused
         return Err(Refused::Incompatible);
     }
     let (lines, mut queued) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let unsent = Arc::<AtomicUsize>::default();
     let connection = Arc::new(Connection {
         lines,
+        unsent: Arc::clone(&unsent),
         routes: Mutex::default(),
     });
     tokio::spawn(async move {
@@ -357,6 +383,7 @@ async fn join(address: String, token: String) -> Result<Arc<Connection>, Refused
             if writing.write_all(line.as_bytes()).await.is_err() || writing.flush().await.is_err() {
                 break;
             }
+            unsent.fetch_sub(line.len(), Ordering::Relaxed);
         }
     });
     tokio::spawn(read(Arc::clone(&connection), reader));
@@ -577,5 +604,24 @@ pub fn executable() -> Result<PathBuf, String> {
 }
 
 #[cfg(test)]
+impl Backend {
+    /// Joined to a backend a test runs itself, which this never starts or stops.
+    pub(crate) fn joined_to(address: String, token: &str) -> Arc<Self> {
+        let Ok(connection) = reading().block_on(join(address, token.into())) else {
+            panic!("the test's backend did not admit the client");
+        };
+        Arc::new(Self {
+            executable: None,
+            env: Vec::new(),
+            owned: true,
+            link: Mutex::new(Link {
+                connection: Some(connection),
+                started: None,
+            }),
+        })
+    }
+}
+
+#[cfg(test)]
 #[path = "backend_tests.rs"]
-mod tests;
+pub(crate) mod tests;

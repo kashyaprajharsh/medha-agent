@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-fn address() -> String {
+pub(crate) fn address() -> String {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let name = format!(
         "mq-{}-{}",
@@ -17,8 +17,15 @@ fn address() -> String {
     }
 }
 
-/// A backend that admits a client and then answers nothing but a chat's start, and that late.
-fn slow_backend(address: &str, token: &'static str, late: Duration) -> Arc<Mutex<Vec<Value>>> {
+/// A backend that admits a client and answers only what starts a chat: its
+/// start, after `late`, and its being attached to, followed by `events` frames
+/// the chat is made to have said. It keeps what it was asked.
+pub(crate) fn scripted_backend(
+    address: &str,
+    token: &'static str,
+    late: Duration,
+    events: usize,
+) -> Arc<Mutex<Vec<Value>>> {
     let asked: Arc<Mutex<Vec<Value>>> = Arc::default();
     let listener = reading().block_on(async { wire::bind(address) }).unwrap();
     let heard = Arc::clone(&asked);
@@ -39,6 +46,16 @@ fn slow_backend(address: &str, token: &'static str, late: Duration) -> Arc<Mutex
                     let started = json!({ "id": frame["id"], "result": { "session": "late" } });
                     wire::write_frame(&mut writing, &started).await;
                 }
+                if frame["method"] == "session.attach" && frame.get("id").is_some() {
+                    let attached = json!({ "id": frame["id"], "result": { "gap": false } });
+                    wire::write_frame(&mut writing, &attached).await;
+                    for seq in 1..=events {
+                        let said = json!({ "method": "note", "params": { "n": seq } });
+                        let event = json!({ "method": "session.event",
+                            "params": { "session": "late", "seq": seq, "frame": said } });
+                        wire::write_frame(&mut writing, &event).await;
+                    }
+                }
             }
         });
     }));
@@ -48,7 +65,7 @@ fn slow_backend(address: &str, token: &'static str, late: Duration) -> Arc<Mutex
 #[test]
 fn a_wait_on_a_quiet_backend_gives_up_and_a_chat_that_starts_late_is_told_to_stop() {
     let address = address();
-    let asked = slow_backend(&address, "token", Duration::from_millis(600));
+    let asked = scripted_backend(&address, "token", Duration::from_millis(600), 0);
     let joining = join(address.clone(), "token".into());
     let Ok(connection) = reading().block_on(joining) else {
         panic!("the backend did not admit the client");

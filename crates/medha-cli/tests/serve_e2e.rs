@@ -1313,6 +1313,45 @@ async fn a_deleted_config_takes_its_servers_away_from_the_shared_host() {
     while hosted(&client.next().await) != Some(false) {}
 }
 
+/// The window removes a server for the folder, the shared host lets go of it at
+/// once, and only then is each open chat told to look again. By then the server
+/// is nobody's to remove, which is what was asked for and no failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_told_to_look_again_after_its_server_was_removed_does_not_fail() {
+    let world = World::new();
+    let folder = world.folder("w");
+    let (url, _) = remote_mcp_server();
+    std::fs::create_dir_all(world.home()).unwrap();
+    let saved = format!("[mcp.hosted]\nurl = \"{url}\"\ntrust = \"trusted\"\n");
+    std::fs::write(world.home().join("config.toml"), saved).unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    let hosted = |frame: &Value| {
+        let said = &frame["params"]["frame"];
+        said["method"] == "mcp.status"
+            && said["params"]["servers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|server| server["server"] == "hosted" && server["state"] == "ready")
+    };
+    while !hosted(&client.next().await) {}
+
+    let remove = json!({"method": "settings.mcp.remove", "params": {"id": "hosted"}});
+    client
+        .about(&folder, remove)
+        .await
+        .expect("the server is removed");
+    // More than once: a first failure used to be met again on every later change.
+    for _ in 0..2 {
+        let looked = client
+            .ask("extensions.reload", Some(&chat), json!({}))
+            .await;
+        assert!(looked["result"]["warnings"].is_array(), "{looked}");
+    }
+}
+
 /// Saving a key leaves the config file as it was: only being told makes the host use the new one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_saved_through_the_backend_reaches_the_shared_mcp_host_at_once() {

@@ -42,21 +42,28 @@ impl Runtime {
             .lock()
             .map_err(|_| "MCP settings unavailable")?
             .clone();
+        // A server this could not stop is said so and tried again next time. It
+        // never stands in the way of the rest of what changed.
+        let mut left = Vec::new();
         if let Some(manager) = &self.mcp {
-            for id in &previous {
-                if !cfg.mcp.contains_key(id) {
-                    manager
-                        .remove_server(id)
-                        .await
-                        .map_err(|error| error.to_string())?;
+            for id in previous.iter().filter(|id| !cfg.mcp.contains_key(*id)) {
+                match manager.remove_server(id).await {
+                    // Whoever else follows the configuration may have taken it away already.
+                    Ok(()) | Err(mcp::Error::UnknownServer(_)) => {}
+                    Err(error) => left.push((id.clone(), error.to_string())),
                 }
             }
         }
         self.configured_mcp
             .lock()
             .map_err(|_| "MCP settings unavailable")?
-            .retain(|id| cfg.mcp.contains_key(id));
-        Ok(json!({"warnings": self.plugins.apply()}))
+            .retain(|id| cfg.mcp.contains_key(id) || left.iter().any(|(kept, _)| kept == id));
+        let mut warnings = self.plugins.apply();
+        warnings.extend(
+            left.iter()
+                .map(|(id, error)| format!("MCP server '{id}' is still running: {error}")),
+        );
+        Ok(json!({"warnings": warnings}))
     }
 }
 impl Runtime {

@@ -276,16 +276,24 @@ impl Connection {
             params["settings"] = settings.clone();
         }
         let deadline = Instant::now() + LEAVING;
+        let mut gone = 0;
         let made = loop {
             let create = json!({ "method": "session.create", "params": params });
             let error = match self.ask(create, EVENTUALLY) {
                 Ok(made) => break made,
                 Err(error) => error,
             };
+            let ours = leaving || resume.is_some_and(|id| self.routes().over.contains_key(id));
             if !resume.is_some_and(|id| self.is_live(id)) {
+                // One of this window's own, on its way out, can end between being
+                // refused and being looked for. Asked again, it starts.
+                gone += 1;
+                if ours && gone <= 2 {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
                 return Err(error);
             }
-            let ours = leaving || resume.is_some_and(|id| self.routes().over.contains_key(id));
             if !ours || Instant::now() >= deadline {
                 return Err(OPEN_ELSEWHERE.into());
             }

@@ -26,9 +26,20 @@ const STOPPED: &str = "Medha backend stopped unexpectedly";
 const QUIET: &str = "Medha did not answer in time. Try again.";
 pub(crate) const NOT_TAKING: &str =
     "Medha has not taken what was already sent. Try again in a moment.";
+pub(crate) const TOO_LARGE: &str =
+    "That is too much to send at once. Send fewer or smaller attachments.";
 const UNSENT_BYTES: usize = 64 * 1024 * 1024;
 /// How many requests may be waiting for their answers at once, over every chat and folder.
 const UNANSWERED: usize = 1024;
+/// What stops a chat or lets go of one must arrive when nothing else is taken,
+/// so it has a little room of its own past those limits, and no more than that.
+const STOP_BYTES: usize = 4 * 1024;
+const STOPS_UNSENT: usize = 1024 * 1024;
+const STOPS_UNANSWERED: usize = 64;
+/// How many chat starts whose wait was given up are still remembered, to stop them if they come.
+const LATE: usize = 64;
+/// What naming the chat and numbering the request add to a frame on its way out.
+pub(crate) const WRAPPER: usize = 128;
 /// How long a quick answer is waited for, and one that may install, download or start a chat.
 const SOON: Duration = Duration::from_secs(60);
 const EVENTUALLY: Duration = Duration::from_secs(10 * 60);
@@ -51,20 +62,22 @@ pub(crate) struct Chat {
 
 enum Reply {
     Wait(mpsc::SyncSender<Result<Value, String>>),
-    /// Nobody waits for this any more.
-    GivenUp,
     /// A chat's own request: the answer joins its frames under the id it used.
     Chat {
         session: String,
         opened: u64,
         id: Value,
+        since: Instant,
     },
 }
 
 #[derive(Default)]
 struct Routes {
     next: u64,
+    /// Requests somebody still waits on. One whose wait ended, or whose chat did, is not kept.
     replies: HashMap<u64, Reply>,
+    /// Chat starts nobody waits on any more.
+    late: HashMap<u64, Instant>,
     chats: HashMap<String, (u64, Hear)>,
     /// Chats of this window's own that it told to stop or heard end, until one is opened again.
     over: HashMap<String, Instant>,
@@ -76,6 +89,40 @@ impl Routes {
     fn is_over(&mut self, session: String) {
         self.over.retain(|_, since| since.elapsed() < LEAVING);
         self.over.insert(session, Instant::now());
+    }
+
+    /// A chat that is no longer heard takes its unanswered requests with it.
+    fn forget(&mut self, session: &str, opened: u64) -> Option<Hear> {
+        let (_, hear) = self.chats.remove(session).filter(|(n, _)| *n == opened)?;
+        self.replies.retain(|_, reply| {
+            !matches!(reply, Reply::Chat { session: of, opened: n, .. } if of == session && *n == opened)
+        });
+        Some(hear)
+    }
+
+    /// Whether every place for an unanswered request is taken. A chat's request
+    /// waits as long as anything asked of the backend may; when room is needed,
+    /// one older than `waited` gives its place up, and its answer has nobody.
+    fn is_full(&mut self, places: usize, waited: Duration) -> bool {
+        if self.replies.len() >= places {
+            self.replies.retain(
+                |_, reply| !matches!(reply, Reply::Chat { since, .. } if since.elapsed() >= waited),
+            );
+        }
+        self.replies.len() >= places
+    }
+
+    fn gave_up(&mut self, id: u64) {
+        if self.late.len() >= LATE
+            && let Some(oldest) = self
+                .late
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(id, _)| *id)
+        {
+            self.late.remove(&oldest);
+        }
+        self.late.insert(id, Instant::now());
     }
 
     fn hearing(&self, session: &str, opened: Option<u64>) -> Option<Hear> {
@@ -115,20 +162,27 @@ impl Connection {
         if routes.gone {
             return Err(STOPPED.into());
         }
-        // What the backend has yet to take is bounded. Only what stops or closes
-        // a chat goes regardless: those must arrive, and are a few bytes.
-        let stops = matches!(
-            frame["method"].as_str(),
-            Some("session.close" | "session.detach" | "shutdown" | "cancel" | "interrupt")
-        );
         let id = routes.next + 1;
         if reply.is_some() {
             frame["id"] = json!(id);
         }
+        // Measured as it leaves: a frame the backend could not read would end
+        // the connection, and with it every chat on it.
         let line = format!("{frame}\n");
-        let unsent = self.unsent.load(Ordering::Relaxed) + line.len() > UNSENT_BYTES;
-        let unanswered = reply.is_some() && routes.replies.len() >= UNANSWERED;
-        if !stops && (unsent || unanswered) {
+        if line.len() > wire::MAX_FRAME {
+            return Err(TOO_LARGE.into());
+        }
+        let stops = line.len() <= STOP_BYTES
+            && matches!(
+                frame["method"].as_str(),
+                Some("session.close" | "session.detach" | "shutdown" | "cancel" | "interrupt")
+            );
+        let (bytes, places) = match stops {
+            true => (UNSENT_BYTES + STOPS_UNSENT, UNANSWERED + STOPS_UNANSWERED),
+            false => (UNSENT_BYTES, UNANSWERED),
+        };
+        let unsent = self.unsent.load(Ordering::Relaxed) + line.len() > bytes;
+        if unsent || (reply.is_some() && routes.is_full(places, EVENTUALLY)) {
             return Err(NOT_TAKING.into());
         }
         if let Some(reply) = reply {
@@ -142,18 +196,29 @@ impl Connection {
             .map_err(|_| STOPPED.to_string())
     }
 
-    /// Nothing waits without end on a backend that has gone quiet. An answer that
-    /// comes after its wait was given up is still met, so a chat it started is not left running.
+    /// Whether a frame of this size would be taken now, without making it to find out.
+    pub(crate) fn has_room(&self, bytes: usize) -> bool {
+        let mut routes = self.routes();
+        let unsent = self.unsent.load(Ordering::Relaxed) + bytes > UNSENT_BYTES;
+        routes.gone || !(unsent || routes.is_full(UNANSWERED, EVENTUALLY))
+    }
+
+    /// Nothing waits without end on a backend that has gone quiet, and a wait
+    /// that was given up holds no place. Only a chat's start is remembered past
+    /// it, so a chat that starts after all is not left running.
     fn ask(&self, frame: Value, within: Duration) -> Result<Value, String> {
         let (answer, answered) = mpsc::sync_channel(1);
+        let starts = frame["method"] == "session.create";
         let id = self.post(&mut self.routes(), frame, Some(Reply::Wait(answer)))?;
         match answered.recv_timeout(within) {
             Ok(outcome) => outcome,
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(STOPPED.into()),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(waited) = self.routes().replies.get_mut(&id) {
-                    *waited = Reply::GivenUp;
+                let mut routes = self.routes();
+                if routes.replies.remove(&id).is_some() && starts {
+                    routes.gave_up(id);
                 }
+                drop(routes);
                 // It may have arrived in the moment the wait ran out.
                 answered.try_recv().unwrap_or_else(|_| Err(QUIET.into()))
             }
@@ -246,12 +311,25 @@ impl Connection {
             session: chat.session.clone(),
             opened: chat.opened,
             id,
+            since: Instant::now(),
         });
         if matches!(frame["method"].as_str(), Some("session.close" | "shutdown")) {
             routes.is_over(chat.session.clone());
         }
         frame["session"] = json!(chat.session);
         self.post(&mut routes, frame, reply).map(|_| ())
+    }
+
+    /// Stops hearing a chat without stopping it. Whoever else watches it goes
+    /// on; a chat that was this window's alone ends for want of anyone watching.
+    pub(crate) fn leave(&self, chat: &Chat) {
+        let mut routes = self.routes();
+        if routes.forget(&chat.session, chat.opened).is_none() {
+            return;
+        }
+        routes.is_over(chat.session.clone());
+        let detach = json!({ "method": "session.detach", "session": chat.session });
+        let _ = self.post(&mut routes, detach, None);
     }
 
     fn heard(&self, mut frame: Value) {
@@ -263,14 +341,15 @@ impl Connection {
             if said["method"] == "session.ended" {
                 let ended = {
                     let mut routes = self.routes();
-                    let ended = routes.chats.remove(&session);
+                    let opened = routes.chats.get(&session).map(|(opened, _)| *opened);
+                    let ended = opened.and_then(|opened| routes.forget(&session, opened));
                     if ended.is_some() {
                         routes.is_over(session);
                     }
                     ended
                 };
                 let reason = said["params"]["error"].as_str().map(str::to_owned);
-                if let Some((_, hear)) = ended {
+                if let Some(hear) = ended {
                     hear(Said::Ended(reason));
                 }
             } else {
@@ -284,7 +363,13 @@ impl Connection {
         let Some(id) = frame["id"].as_u64() else {
             return;
         };
-        let reply = self.routes().replies.remove(&id);
+        let (reply, late) = {
+            let mut routes = self.routes();
+            (
+                routes.replies.remove(&id),
+                routes.late.remove(&id).is_some(),
+            )
+        };
         match reply {
             Some(Reply::Wait(answer)) => {
                 let _ = answer.send(outcome(frame));
@@ -293,6 +378,7 @@ impl Connection {
                 session,
                 opened,
                 id,
+                ..
             }) => {
                 frame["id"] = id;
                 let hear = self.routes().hearing(&session, Some(opened));
@@ -301,7 +387,7 @@ impl Connection {
                 }
             }
             // A chat that started after its wait was given up has nobody; it is told to stop.
-            Some(Reply::GivenUp) => {
+            None if late => {
                 if let Some(session) = frame["result"]["session"].as_str() {
                     let mut routes = self.routes();
                     for method in ["session.attach", "session.close"] {
@@ -332,6 +418,23 @@ impl Connection {
             hear(Said::Ended(Some("The Medha backend stopped.".into())));
         }
     }
+}
+
+/// How many bytes a frame is as it leaves, found without writing it out.
+pub(crate) fn size(frame: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(1);
+    let _ = serde_json::to_writer(&mut count, frame);
+    count.0
 }
 
 async fn read(connection: Arc<Connection>, mut reader: impl AsyncBufRead + Unpin) {

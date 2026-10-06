@@ -51,6 +51,7 @@ const STREAM_BYTES: usize = 64 * 1024;
 const INBOX_FRAMES: usize = 8192;
 const INBOX_BYTES: usize = 32 * 1024 * 1024;
 const OUTBOX_FRAMES: usize = 256;
+const OUTBOX_BYTES: usize = 2 * wire::MAX_FRAME;
 const FELL_BEHIND: &str = "This window could not keep up with the chat and stopped following it. Open the chat again to continue.";
 const WAITING: &str = "This chat has too much waiting to be sent. Try again in a moment.";
 
@@ -154,8 +155,10 @@ fn pump_stream(frames: impl Incoming, mut emit: impl FnMut(Value)) {
 }
 
 struct Live {
-    /// What the chat is asked, in the order it was asked, and no more than a chat may have waiting.
-    requests: SyncSender<Value>,
+    /// What the chat is asked, in the order it was asked, each with its size as
+    /// it will leave, and no more than a chat may have waiting.
+    requests: SyncSender<(usize, Value)>,
+    unsent: Arc<AtomicUsize>,
     ended: Arc<AtomicBool>,
     /// Set when this is dropped, which closes the chat.
     closed: Arc<AtomicBool>,
@@ -235,13 +238,19 @@ impl LiveSessions {
         let id = live.next_id;
         live.next_id += 1;
         let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        live.requests
-            .try_send(frame)
-            .map_err(|refused| match refused {
-                TrySendError::Full(_) => WAITING.to_string(),
-                TrySendError::Disconnected(_) => STOPPED.to_string(),
-            })?;
-        Ok(id)
+        // Refused here, where whoever asked is told, and not after it has been queued.
+        let bytes = crate::backend::size(&frame) + crate::backend::WRAPPER;
+        if bytes > wire::MAX_FRAME {
+            return Err(crate::backend::TOO_LARGE.into());
+        }
+        let room = live.unsent.fetch_add(bytes, Ordering::Relaxed) + bytes <= OUTBOX_BYTES;
+        let refused = match room.then(|| live.requests.try_send((bytes, frame))) {
+            Some(Ok(())) => return Ok(id),
+            Some(Err(TrySendError::Disconnected(_))) => STOPPED,
+            Some(Err(TrySendError::Full(_))) | None => WAITING,
+        };
+        live.unsent.fetch_sub(bytes, Ordering::Relaxed);
+        Err(refused.into())
     }
 
     pub fn close(&self, key: &str) -> Result<(), String> {
@@ -298,7 +307,7 @@ impl Inner {
                 continue;
             }
             if let Some(ask) = live.rest.ask(now, sleep::GRACE)
-                && live.requests.try_send(ask).is_err()
+                && live.requests.try_send((0, ask)).is_err()
             {
                 live.rest.closed();
             }
@@ -340,8 +349,8 @@ impl Inner {
         let (behind, closed) = (Arc::<AtomicBool>::default(), Arc::<AtomicBool>::default());
         let why = Arc::new(Mutex::new(String::new()));
         let (sender, frames) = sync_channel(INBOX_FRAMES);
-        let waiting = Arc::<AtomicUsize>::default();
-        let (requests, asked) = sync_channel::<Value>(OUTBOX_FRAMES);
+        let (waiting, unsent) = (Arc::<AtomicUsize>::default(), Arc::<AtomicUsize>::default());
+        let (requests, asked) = sync_channel::<(usize, Value)>(OUTBOX_FRAMES);
         let hear: crate::backend::Hear = Arc::new({
             let (rest, ended, why) = (Arc::clone(&rest), Arc::clone(&ended), Arc::clone(&why));
             let (behind, waiting, nudge) =
@@ -361,7 +370,7 @@ impl Inner {
                 if let Ok(mut sender) = sender.lock() {
                     sender.take();
                 }
-                let _ = nudge.try_send(Value::Null);
+                let _ = nudge.try_send((0, Value::Null));
             };
             move |said| match said {
                 Said::Frame(frame) => {
@@ -410,7 +419,11 @@ impl Inner {
         // A chat woken from sleep resumes the one this window just let go to sleep.
         let waking = wake.is_some();
         let (resting, over) = (Arc::clone(&rest), Arc::clone(&ended));
-        let (behind, gone) = (Arc::clone(&behind), Arc::clone(&closed));
+        let (behind, gone, queued) = (
+            Arc::clone(&behind),
+            Arc::clone(&closed),
+            Arc::clone(&unsent),
+        );
         std::thread::spawn(move || {
             let opened = backend.connection().and_then(|connection| {
                 let chat = connection.open_chat(
@@ -429,32 +442,40 @@ impl Inner {
             // Kept only by the connection from here, so the stream ends when the connection lets go.
             drop(hear);
             // An empty frame only wakes this thread, to see that the chat is over or its tab closed.
-            for frame in asked {
+            for (bytes, frame) in asked {
+                queued.fetch_sub(bytes, Ordering::Relaxed);
                 if gone.load(Ordering::Relaxed) || over.load(Ordering::Relaxed) {
                     break;
                 }
                 if frame.is_null() {
                     continue;
                 }
-                // While the backend has not taken what it was sent, this waits. The
-                // chat's requests then pile up to their limit and the window is told.
+                // While the backend has not taken what it was sent, this waits, and
+                // makes the frame only once there is room for it. The chat's requests
+                // then pile up to their limit and the window is told.
                 loop {
-                    match connection.tell(&chat, frame.clone()) {
-                        Ok(()) => break,
-                        Err(refused) if refused == crate::backend::NOT_TAKING => {
-                            if gone.load(Ordering::Relaxed) || over.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(20));
+                    if connection.has_room(bytes) {
+                        match connection.tell(&chat, frame.clone()) {
+                            Ok(()) => break,
+                            Err(refused) if refused == crate::backend::NOT_TAKING => {}
+                            Err(refused) if refused == crate::backend::TOO_LARGE => break,
+                            Err(_) => return,
                         }
-                        Err(_) => return,
                     }
+                    if gone.load(Ordering::Relaxed) || over.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             }
+            // A window that stopped following a chat lets go of it and no more: the
+            // chat is not this window's to stop for whoever else is watching it.
+            if behind.load(Ordering::Relaxed) {
+                return connection.leave(&chat);
+            }
             // A chat that ended, or has said it is going to sleep, is not told to stop.
-            // One this window stopped following still runs, and is.
-            let ended = over.load(Ordering::Relaxed) && !behind.load(Ordering::Relaxed);
-            if ended || matches!(resting.current(), Some(Settled::Asleep(_))) {
+            if over.load(Ordering::Relaxed) || matches!(resting.current(), Some(Settled::Asleep(_)))
+            {
                 return;
             }
             let shutdown = json!({ "jsonrpc": "2.0", "id": 0, "method": "shutdown" });
@@ -464,6 +485,7 @@ impl Inner {
 
         Live {
             requests,
+            unsent,
             ended,
             closed,
             next_id: 1,
@@ -482,7 +504,7 @@ impl Live {
 impl Drop for Live {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Relaxed);
-        let _ = self.requests.try_send(Value::Null);
+        let _ = self.requests.try_send((0, Value::Null));
     }
 }
 

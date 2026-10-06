@@ -415,21 +415,28 @@ fn a_window_that_cannot_keep_up_stops_following_the_chat_and_holds_only_so_much(
     });
     sessions.open_to(emit, "behind", None).unwrap();
 
-    let told_to_stop = |asked: &[Value]| {
+    let told = |asked: &[Value], method: &str| {
         asked
             .iter()
-            .any(|frame| frame["method"] == "session.close" && frame["session"] == "late")
+            .any(|frame| frame["method"] == method && frame["session"] == "late")
     };
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !told_to_stop(&asked.lock().unwrap()) {
+    while !told(&asked.lock().unwrap(), "session.detach") {
         assert!(
             Instant::now() < deadline,
-            "the chat nobody follows was left running"
+            "the window went on being sent a chat it had stopped following"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
     let refused = sessions.request("behind", "session.settings", json!({}));
     assert_eq!(refused, Err(STOPPED.to_string()));
+    // Letting go is all it does: the chat is not this window's to stop for anyone else watching.
+    for stops in ["session.close", "shutdown"] {
+        assert!(
+            !told(&asked.lock().unwrap(), stops),
+            "a window that fell behind sent {stops} to a chat others may be watching"
+        );
+    }
 
     stuck.store(false, Ordering::Relaxed);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -461,6 +468,91 @@ fn a_window_that_cannot_keep_up_stops_following_the_chat_and_holds_only_so_much(
 }
 
 #[test]
+fn a_request_too_large_to_send_is_refused_where_it_was_asked_and_no_chat_is_lost() {
+    let (model, _) = stand_in_model();
+    let Some(chat) = Chat::open("large", &model) else {
+        return;
+    };
+    let beside: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let sink = Arc::clone(&beside);
+    let emit: Emit = Arc::new(move |frame| sink.lock().unwrap().push(frame));
+    chat.sessions.open_to(emit, "beside", None).unwrap();
+
+    // More than one frame may carry, as several attached images are once they are text.
+    let images = vec!["x".repeat(wire::MAX_FRAME / 2 + 1); 2];
+    let send = json!({ "content": "look", "images": images });
+    let refused = chat
+        .sessions
+        .request(chat.key, "message.send", send.clone());
+    assert_eq!(refused, Err(crate::backend::TOO_LARGE.to_string()));
+
+    // The connection itself refuses one too, whoever hands it over.
+    let connection = chat.sessions.inner.backend.connection().unwrap();
+    let workspace = &chat.sessions.inner.workspace;
+    let direct = connection
+        .open_chat(workspace, None, false, None, Arc::new(|_| {}))
+        .unwrap();
+    let frame = json!({ "id": 1, "method": "message.send", "params": send });
+    assert_eq!(
+        connection.tell(&direct, frame),
+        Err(crate::backend::TOO_LARGE.to_string())
+    );
+
+    let id = chat
+        .sessions
+        .request("beside", "session.settings", json!({}))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !beside.lock().unwrap().iter().any(|frame| frame["id"] == id) {
+        assert!(
+            Instant::now() < deadline,
+            "the chat beside it stopped answering"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    chat.turn("after");
+    let exits = |frames: &[Value]| frames.iter().any(|frame| frame["method"] == "exit");
+    assert!(!exits(&beside.lock().unwrap()) && !exits(&chat.frames.lock().unwrap()));
+}
+
+#[test]
+fn a_chat_holds_only_so_many_bytes_that_wait_to_be_sent() {
+    // This backend is slow to start a chat, so what the chat is asked meanwhile waits here.
+    let address = crate::backend::tests::address();
+    let slow = Duration::from_secs(120);
+    crate::backend::tests::scripted_backend(&address, "token", slow, 0);
+    let sessions = LiveSessions::on(
+        std::env::temp_dir(),
+        Backend::joined_to(address.clone(), "token"),
+    );
+    sessions.open_to(Arc::new(|_| {}), "piled", None).unwrap();
+
+    let each = OUTBOX_BYTES / 8;
+    let send = || json!({ "content": "x".repeat(each) });
+    let taken = (0..OUTBOX_FRAMES)
+        .take_while(|_| sessions.request("piled", "message.send", send()).is_ok())
+        .count();
+    assert!(
+        (1..8).contains(&taken),
+        "{taken} requests of {each} bytes were held"
+    );
+    let refused = sessions.request("piled", "message.send", send());
+    assert_eq!(refused, Err(WAITING.to_string()));
+    // Something small still fits beside them.
+    assert!(
+        sessions
+            .request("piled", "session.settings", json!({}))
+            .is_ok()
+    );
+    if let Some(folder) = std::path::Path::new(&address)
+        .parent()
+        .filter(|_| cfg!(unix))
+    {
+        let _ = std::fs::remove_dir_all(folder);
+    }
+}
+
+#[test]
 fn a_chat_that_sleeps_keeps_no_thread_waiting_to_send_to_it() {
     let (model, _) = stand_in_model();
     let Some(chat) = Chat::open("idle", &model) else {
@@ -474,7 +566,7 @@ fn a_chat_that_sleeps_keeps_no_thread_waiting_to_send_to_it() {
         let asleep = open.get(chat.key).expect("the tab is still open");
         // Its sender is told there is nobody listening once the thread that sent for it has gone.
         if matches!(
-            asleep.requests.try_send(Value::Null),
+            asleep.requests.try_send((0, Value::Null)),
             Err(TrySendError::Disconnected(_))
         ) {
             break;

@@ -62,14 +62,99 @@ pub(crate) fn scripted_backend(
     asked
 }
 
+fn joined(address: &str) -> Arc<Connection> {
+    let joining = join(address.to_owned(), "token".into());
+    let Ok(connection) = reading().block_on(joining) else {
+        panic!("the backend did not admit the client");
+    };
+    connection
+}
+
+fn forget(address: &str) {
+    if let Some(folder) = Path::new(address).parent().filter(|_| cfg!(unix)) {
+        let _ = std::fs::remove_dir_all(folder);
+    }
+}
+
+/// Waits until the backend has taken everything it was sent but `left` bytes.
+fn taken_but(connection: &Connection, left: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while connection.unsent.load(Ordering::Relaxed) != left {
+        assert!(Instant::now() < deadline, "the backend stopped reading");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_wait_that_ended_and_a_chat_that_ended_hold_no_place_among_the_unanswered() {
+    let address = address();
+    scripted_backend(&address, "token", Duration::ZERO, 0);
+    let connection = joined(&address);
+    let open = || {
+        connection
+            .open_chat(Path::new("."), None, false, None, Arc::new(|_| {}))
+            .expect("a request with nobody waiting for it still held a place")
+    };
+    let settings = |id: usize| json!({ "id": id, "method": "session.settings" });
+
+    // Nothing here answers these, and every wait for one runs out.
+    for _ in 0..UNANSWERED {
+        let unanswered = connection.ask(json!({ "method": "session.list" }), Duration::ZERO);
+        assert_eq!(unanswered, Err(QUIET.to_string()));
+    }
+    let chat = open();
+
+    for id in 0..UNANSWERED {
+        connection.tell(&chat, settings(id)).unwrap();
+    }
+    let full = connection.tell(&chat, settings(0));
+    assert_eq!(full, Err(NOT_TAKING.to_string()));
+    let ended = json!({ "method": "session.ended", "params": {} });
+    connection.heard(json!({ "method": "session.event",
+        "params": { "session": "late", "seq": 1, "frame": ended } }));
+    let again = open();
+
+    // A request whose answer never comes gives its place up once it has waited as long as any may.
+    for id in 0..UNANSWERED {
+        connection.tell(&again, settings(id)).unwrap();
+    }
+    assert!(!connection.routes().is_full(UNANSWERED, Duration::ZERO));
+    forget(&address);
+}
+
+#[test]
+fn what_stops_a_chat_has_room_of_its_own_and_only_so_much() {
+    let address = address();
+    scripted_backend(&address, "token", Duration::ZERO, 0);
+    let connection = joined(&address);
+    let chat = connection
+        .open_chat(Path::new("."), None, false, None, Arc::new(|_| {}))
+        .unwrap();
+    let refused = Err(NOT_TAKING.to_string());
+    let cancel = || json!({ "method": "cancel" });
+
+    // As it is when the backend has stopped taking what it is sent.
+    taken_but(&connection, 0);
+    connection.unsent.store(UNSENT_BYTES, Ordering::Relaxed);
+    let settings = json!({ "method": "session.settings" });
+    assert_eq!(connection.tell(&chat, settings), refused);
+    connection.tell(&chat, cancel()).unwrap();
+    taken_but(&connection, UNSENT_BYTES);
+    // One made large is no longer something that only stops a chat.
+    let padded = json!({ "method": "cancel", "params": { "why": "x".repeat(STOP_BYTES) } });
+    assert_eq!(connection.tell(&chat, padded), refused);
+    connection
+        .unsent
+        .store(UNSENT_BYTES + STOPS_UNSENT, Ordering::Relaxed);
+    assert_eq!(connection.tell(&chat, cancel()), refused);
+    forget(&address);
+}
+
 #[test]
 fn a_wait_on_a_quiet_backend_gives_up_and_a_chat_that_starts_late_is_told_to_stop() {
     let address = address();
     let asked = scripted_backend(&address, "token", Duration::from_millis(600), 0);
-    let joining = join(address.clone(), "token".into());
-    let Ok(connection) = reading().block_on(joining) else {
-        panic!("the backend did not admit the client");
-    };
+    let connection = joined(&address);
 
     let unanswered = connection.ask(
         json!({ "method": "session.list" }),
@@ -93,7 +178,5 @@ fn a_wait_on_a_quiet_backend_gives_up_and_a_chat_that_starts_late_is_told_to_sto
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    if let Some(folder) = Path::new(&address).parent().filter(|_| cfg!(unix)) {
-        let _ = std::fs::remove_dir_all(folder);
-    }
+    forget(&address);
 }

@@ -57,6 +57,7 @@ fn an_unreported_cache_bucket_does_not_become_zero() {
         let event = TurnEvent::Usage {
             prompt_tokens: 10,
             total_tokens: 20,
+            completion_tokens: Some(10),
             cached_prompt_tokens: cached,
         };
         let decoded: TurnEvent =

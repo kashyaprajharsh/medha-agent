@@ -22,6 +22,7 @@ pub(crate) struct AcpAsker {
 struct Guard {
     pending: Questions,
     id: u64,
+    writer: Arc<Writer>,
 }
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -29,6 +30,12 @@ impl Drop for Guard {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&self.id);
+        self.writer.notify_params(
+            "question.answered",
+            &protocol::QuestionAnswered {
+                question_id: self.id,
+            },
+        );
     }
 }
 
@@ -40,12 +47,23 @@ impl kernel::Asker for AcpAsker {
             return None;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let view = questions.iter().map(|question| json!({
-            "prompt": question.prompt, "header": question.header, "multi_select": question.multi_select,
-            "options": question.options.iter().map(|option| json!({
-                "label": option.label, "description": option.description, "recommended": option.recommended,
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>();
+        let view = questions
+            .iter()
+            .map(|question| protocol::Question {
+                prompt: question.prompt.clone(),
+                header: question.header.clone(),
+                multi_select: question.multi_select,
+                options: question
+                    .options
+                    .iter()
+                    .map(|option| protocol::QuestionOption {
+                        label: option.label.clone(),
+                        description: option.description.clone(),
+                        recommended: option.recommended,
+                    })
+                    .collect(),
+            })
+            .collect();
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
@@ -54,11 +72,15 @@ impl kernel::Asker for AcpAsker {
         let _guard = Guard {
             pending: Arc::clone(&self.pending),
             id,
+            writer: Arc::clone(&self.writer),
         };
-        if !self
-            .writer
-            .notify("question", json!({"question_id":id, "questions":view}))
-        {
+        if !self.writer.notify_params(
+            "question",
+            &protocol::QuestionPrompt {
+                question_id: id,
+                questions: view,
+            },
+        ) {
             return None;
         }
         rx.await.ok().flatten()

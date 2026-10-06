@@ -41,6 +41,7 @@ pub fn is_control(method: &str) -> bool {
     matches!(
         method,
         "cancel"
+            | "turn.abort"
             | "interrupt"
             | "approval.respond"
             | "question.respond"

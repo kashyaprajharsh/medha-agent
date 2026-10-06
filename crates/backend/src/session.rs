@@ -42,7 +42,7 @@ pub(crate) struct Session {
     closing: CancellationToken,
     tied: AtomicBool,
     stream: Mutex<Stream>,
-    cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    control: Option<crate::Control>,
 }
 
 /// Writes to the chat one request at a time, what is urgent before what is
@@ -97,7 +97,7 @@ impl Session {
         id: String,
         about: Value,
         input: Input,
-        cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        control: Option<crate::Control>,
     ) -> Arc<Self> {
         let (asked, queued) = mpsc::channel(INPUT_FRAMES);
         let (urgent, ahead) = mpsc::channel(URGENT_FRAMES);
@@ -113,7 +113,7 @@ impl Session {
             closing,
             tied: AtomicBool::new(false),
             stream: Mutex::default(),
-            cancel,
+            control,
         })
     }
 
@@ -134,7 +134,15 @@ impl Session {
     }
 
     pub(crate) fn cancel_turn(&self) -> bool {
-        self.cancel.as_ref().is_some_and(|cancel| cancel())
+        self.control
+            .as_ref()
+            .is_some_and(|control| control(crate::TurnAction::Cancel))
+    }
+
+    pub(crate) fn abort_turn(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|control| control(crate::TurnAction::Abort))
     }
 
     /// Replay and subscription happen under one lock, so nothing is missed or repeated.

@@ -7,6 +7,48 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Sends child steps through the same bounded writer as the parent. The
+/// editor dialect keeps its standard notifications; Medha viewers get the
+/// complete child stream, including reasoning and returned steering text.
+pub(crate) struct Watch {
+    pub writer: Arc<crate::acp::Writer>,
+    pub peer: crate::acp::Peer,
+}
+
+impl runtime::agents::AgentWatcher for Watch {
+    fn step(
+        &self,
+        surface_session: Option<ulid::Ulid>,
+        path: &AgentPath,
+        step: protocol::AgentStep,
+    ) {
+        if !self.peer.is_acp() {
+            self.writer.notify_params(
+                "agent.step",
+                &protocol::AgentEvent {
+                    surface_session: surface_session.map(|id| id.to_string()),
+                    path: path.as_str().to_owned(),
+                    step,
+                },
+            );
+        }
+    }
+
+    fn usage(&self, usage: &kernel::Usage) {
+        if !self.peer.is_acp() {
+            self.writer.notify_params(
+                "event",
+                &protocol::TurnEvent::Usage {
+                    prompt_tokens: usage.prompt_tokens,
+                    total_tokens: usage.total_tokens,
+                    completion_tokens: Some(usage.completion_tokens),
+                    cached_prompt_tokens: usage.cached_prompt_tokens,
+                },
+            );
+        }
+    }
+}
+
 pub(crate) struct Roster {
     control: Arc<AgentControl>,
     since_ms: u64,

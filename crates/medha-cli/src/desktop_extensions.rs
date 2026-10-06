@@ -7,6 +7,7 @@ pub(crate) struct Runtime {
     pub store: extensions::Store,
     pub skills: Arc<tools::SkillStore>,
     pub search: tools::SearchHandle,
+    pub search_env: runtime::config::SearchEnv,
     pub workspace: Arc<sandbox::WorkspaceSandbox>,
     pub memory: Option<Arc<memory::MemoryProjection>>,
     pub memory_budget: u32,
@@ -36,7 +37,8 @@ impl Runtime {
         *self
             .search
             .lock()
-            .map_err(|_| "Search settings unavailable")? = crate::config::resolve_search(&cfg);
+            .map_err(|_| "Search settings unavailable")? =
+            crate::config::resolve_search_with(&cfg, self.search_env.clone());
         let previous = self
             .configured_mcp
             .lock()

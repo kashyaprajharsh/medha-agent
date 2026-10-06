@@ -3420,15 +3420,16 @@ impl SearchProvider {
 }
 
 /// User-chosen web-search configuration, shared live between the TUI (writer)
-/// and the `web.*` tools (readers) via [`SearchHandle`]. Any `None` secret
-/// falls back to the matching env var, so pre-existing env-based setups keep
-/// working untouched.
+/// and the `web.*` tools (readers) via [`SearchHandle`]. Runtime-created settings
+/// capture their caller's environment once; legacy standalone tool users can
+/// still opt into process environment fallback with the default settings.
 #[derive(Debug, Clone, Default)]
 pub struct SearchSettings {
     pub provider: SearchProvider,
     pub tavily_key: Option<String>,
     pub brave_key: Option<String>,
     pub searxng_url: Option<String>,
+    pub captured: bool,
 }
 
 /// Shared, mutable search settings. Cloned into each web tool and into the TUI
@@ -3438,15 +3439,26 @@ pub type SearchHandle = Arc<Mutex<SearchSettings>>;
 impl SearchSettings {
     /// Tavily key — explicit value first, else `TAVILY_API_KEY`.
     fn tavily_key(&self) -> Option<String> {
-        resolve_secret(self.tavily_key.as_deref(), "TAVILY_API_KEY")
+        self.secret(self.tavily_key.as_deref(), "TAVILY_API_KEY")
     }
     /// Brave key — explicit value first, else `BRAVE_API_KEY`.
     fn brave_key(&self) -> Option<String> {
-        resolve_secret(self.brave_key.as_deref(), "BRAVE_API_KEY")
+        self.secret(self.brave_key.as_deref(), "BRAVE_API_KEY")
     }
     /// SearXNG base URL — explicit value first, else `MEDHA_SEARXNG_URL`.
     fn searxng_url(&self) -> Option<String> {
-        resolve_secret(self.searxng_url.as_deref(), "MEDHA_SEARXNG_URL")
+        self.secret(self.searxng_url.as_deref(), "MEDHA_SEARXNG_URL")
+    }
+
+    fn secret(&self, value: Option<&str>, env: &str) -> Option<String> {
+        if self.captured {
+            value
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        } else {
+            resolve_secret(value, env)
+        }
     }
 }
 
@@ -6681,6 +6693,22 @@ impl Tool for UpdatePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_search_never_falls_back_to_the_daemon_environment() {
+        let settings = SearchSettings {
+            captured: true,
+            ..Default::default()
+        };
+        // PATH always exists in normal execution; even a known non-empty
+        // process value must not be used once the caller was captured.
+        assert!(settings.secret(None, "PATH").is_none());
+        assert!(settings.secret(Some(" "), "PATH").is_none());
+        assert_eq!(
+            settings.secret(Some(" caller-key "), "PATH").as_deref(),
+            Some("caller-key")
+        );
+    }
 
     /// Scan source with the outline rules the same way the tool does.
     fn scan_outline(path: &str, src: &str) -> Vec<(String, String, usize)> {

@@ -22,6 +22,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (lock, notices) = (start.lock, start.notices);
+    let search_env = start.options.search_env.clone();
     let mut bridge = None;
     let Started {
         kernel,
@@ -64,7 +65,10 @@ where
                 peer: made.peer.clone(),
                 next_id: std::sync::atomic::AtomicU64::new(1),
             }),
-            agents: None,
+            agents: Some(Arc::new(crate::acp_agents::Watch {
+                writer: Arc::clone(&made.writer),
+                peer: made.peer.clone(),
+            })),
         };
         bridge = Some(made);
         surface
@@ -89,6 +93,7 @@ where
             store: session_plugins.store(),
             skills: skill_store.clone(),
             search: search_handle.clone(),
+            search_env,
             workspace: workspace.clone(),
             memory: lock.memory.enabled.then(|| memory_store.clone()),
             memory_budget: k3_budget_tokens,

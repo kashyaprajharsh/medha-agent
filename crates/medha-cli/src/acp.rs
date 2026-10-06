@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -125,7 +125,7 @@ impl Writer {
         self.notify_params(method, &params)
     }
 
-    fn notify_params<T: serde::Serialize>(&self, method: &str, params: &T) -> bool {
+    pub(crate) fn notify_params<T: serde::Serialize>(&self, method: &str, params: &T) -> bool {
         #[derive(serde::Serialize)]
         struct Notification<'a, T> {
             jsonrpc: &'static str,
@@ -388,11 +388,83 @@ impl Peer {
     }
 }
 
-pub(crate) type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<kernel::Approval>>>>;
+enum GateAnswer {
+    Action(oneshot::Sender<kernel::Approval>),
+    Access(oneshot::Sender<kernel::NetworkDecision>),
+}
 
-fn lock_pending(
-    pending: &Pending,
-) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<kernel::Approval>>> {
+pub(crate) struct PendingGate {
+    answer: GateAnswer,
+    escalated: bool,
+}
+
+impl From<oneshot::Sender<kernel::Approval>> for PendingGate {
+    fn from(answer: oneshot::Sender<kernel::Approval>) -> Self {
+        Self {
+            answer: GateAnswer::Action(answer),
+            escalated: false,
+        }
+    }
+}
+
+impl PendingGate {
+    fn send(self, approval: kernel::Approval) -> Result<(), ()> {
+        let approval = if self.escalated && approval == kernel::Approval::Always {
+            kernel::Approval::Deny
+        } else {
+            approval
+        };
+        match self.answer {
+            GateAnswer::Action(answer) => answer.send(approval).map_err(|_| ()),
+            GateAnswer::Access(answer) => answer
+                .send(match approval {
+                    kernel::Approval::Once => kernel::NetworkDecision::Once,
+                    kernel::Approval::Always => kernel::NetworkDecision::Persistent,
+                    kernel::Approval::Deny => kernel::NetworkDecision::Deny,
+                })
+                .map_err(|_| ()),
+        }
+    }
+
+    fn permits(&self, decision: protocol::ApprovalDecision) -> bool {
+        use protocol::ApprovalDecision as D;
+        if self.escalated && matches!(decision, D::Always | D::Session | D::Persistent) {
+            return false;
+        }
+        match self.answer {
+            GateAnswer::Action(_) => matches!(decision, D::Approve | D::Once | D::Always | D::Deny),
+            GateAnswer::Access(_) => matches!(
+                decision,
+                D::Approve | D::Once | D::Session | D::Persistent | D::Deny
+            ),
+        }
+    }
+
+    fn respond(self, decision: protocol::ApprovalDecision) -> Result<(), ()> {
+        use protocol::ApprovalDecision as D;
+        match self.answer {
+            GateAnswer::Action(answer) => answer
+                .send(match decision {
+                    D::Approve | D::Once => kernel::Approval::Once,
+                    D::Always => kernel::Approval::Always,
+                    _ => kernel::Approval::Deny,
+                })
+                .map_err(|_| ()),
+            GateAnswer::Access(answer) => answer
+                .send(match decision {
+                    D::Approve | D::Once => kernel::NetworkDecision::Once,
+                    D::Session => kernel::NetworkDecision::Session,
+                    D::Persistent => kernel::NetworkDecision::Persistent,
+                    _ => kernel::NetworkDecision::Deny,
+                })
+                .map_err(|_| ()),
+        }
+    }
+}
+
+pub(crate) type Pending = Arc<Mutex<HashMap<u64, PendingGate>>>;
+
+fn lock_pending(pending: &Pending) -> std::sync::MutexGuard<'_, HashMap<u64, PendingGate>> {
     pending
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -432,8 +504,15 @@ pub(crate) struct Bridge {
 /// sign-in/screen operation in the RPC reader, or for a full input pipe.
 #[derive(Default)]
 pub(crate) struct TurnControl {
-    active: Mutex<Option<kernel::InterruptHandle>>,
+    active: Mutex<Option<ActiveTurn>>,
     gates: Mutex<Option<(Pending, crate::acp_questions::Questions)>>,
+}
+
+struct ActiveTurn {
+    interrupt: kernel::InterruptHandle,
+    task: tokio::task::AbortHandle,
+    aborted_at: Option<Instant>,
+    slow_reported: bool,
 }
 
 impl TurnControl {
@@ -443,7 +522,7 @@ impl TurnControl {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cancelled = active.as_ref().is_some_and(|handle| {
-            handle.cancel_turn();
+            handle.interrupt.cancel_turn();
             true
         });
         drop(active);
@@ -459,11 +538,58 @@ impl TurnControl {
         cancelled || denied
     }
 
-    fn attend(&self, handle: Option<kernel::InterruptHandle>) {
+    /// A force stop requests abortion, but does not release turn ownership.
+    /// The serving loop joins the owner and repairs its transcript before
+    /// publishing the settlement barrier to every viewer.
+    pub(crate) fn abort(&self) -> bool {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(turn) = active.as_mut().filter(|turn| !turn.task.is_finished()) else {
+            return false;
+        };
+        turn.interrupt.cancel_turn();
+        turn.aborted_at.get_or_insert_with(Instant::now);
+        turn.task.abort();
+        drop(active);
+        self.cancel();
+        true
+    }
+
+    fn own(&self, interrupt: kernel::InterruptHandle, task: tokio::task::AbortHandle) {
         *self
             .active
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = handle;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ActiveTurn {
+            interrupt,
+            task,
+            aborted_at: None,
+            slow_reported: false,
+        });
+    }
+
+    fn finish(&self) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some_and(|turn| turn.aborted_at.is_some())
+    }
+
+    fn report_slow_abort(&self) -> bool {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.as_mut().is_some_and(|turn| {
+            let slow = !turn.slow_reported
+                && turn
+                    .aborted_at
+                    .is_some_and(|at| at.elapsed() >= TURN_ABORT_GRACE);
+            turn.slow_reported |= slow;
+            slow
+        })
     }
 }
 
@@ -610,11 +736,23 @@ pub(crate) fn acp_gate_id_from(value: &Value) -> Option<u64> {
 struct PendingGuard {
     pending: Pending,
     gate_id: u64,
+    writer: Arc<Writer>,
+    medha: bool,
+    approved: bool,
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         lock_pending(&self.pending).remove(&self.gate_id);
+        if self.medha {
+            self.writer.notify_params(
+                "approval.resolved",
+                &protocol::ApprovalResolved {
+                    gate_id: self.gate_id,
+                    approved: self.approved,
+                },
+            );
+        }
     }
 }
 
@@ -637,17 +775,38 @@ impl kernel::HumanGate for AcpGate {
         }
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        lock_pending(&self.pending).insert(gate_id, tx);
-        let _guard = PendingGuard {
+        lock_pending(&self.pending).insert(
+            gate_id,
+            PendingGate {
+                answer: GateAnswer::Action(tx),
+                escalated,
+            },
+        );
+        let mut guard = PendingGuard {
             pending: Arc::clone(&self.pending),
             gate_id,
+            writer: Arc::clone(&self.writer),
+            medha: !self.peer.is_acp(),
+            approved: false,
         };
         let sent = if self.peer.is_acp() {
             self.request_acp_permission(gate_id, action, detail, escalated)
         } else {
-            self.writer.notify(
+            let mut choices = vec![protocol::ApprovalDecision::Once];
+            if !escalated {
+                choices.push(protocol::ApprovalDecision::Always);
+            }
+            choices.push(protocol::ApprovalDecision::Deny);
+            self.writer.notify_params(
                 "approval",
-                json!({ "gate_id": gate_id, "action": action, "detail": detail, "escalated": escalated }),
+                &protocol::ApprovalPrompt {
+                    gate_id,
+                    action: action.to_owned(),
+                    detail: detail.map(str::to_owned),
+                    escalated,
+                    kind: protocol::ApprovalKind::Action,
+                    choices,
+                },
             )
         };
         if !sent {
@@ -659,13 +818,8 @@ impl kernel::HumanGate for AcpGate {
             result = rx => result.unwrap_or(kernel::Approval::Deny),
             _ = self.writer.cancelled() => kernel::Approval::Deny,
         };
-        // A chat can have several clients; the ones that did not answer learn it is settled.
-        if !self.peer.is_acp() {
-            self.writer.notify(
-                "approval.resolved",
-                json!({ "gate_id": gate_id, "approved": approval.approved() }),
-            );
-        }
+        // The guard settles every viewer even if this future is cancelled.
+        guard.approved = approval.approved();
         if approval == kernel::Approval::Always && !escalated {
             self.always
                 .lock()
@@ -674,6 +828,106 @@ impl kernel::HumanGate for AcpGate {
         }
         approval
     }
+
+    async fn confirm_network(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        self.access("grant network access and retry", detail, escalated)
+            .await
+    }
+
+    async fn confirm_access(
+        &self,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        self.access(
+            &format!("command access: {}", detail.unwrap_or_default()),
+            detail,
+            escalated,
+        )
+        .await
+    }
+}
+
+impl AcpGate {
+    async fn access(
+        &self,
+        action: &str,
+        detail: Option<&str>,
+        escalated: bool,
+    ) -> kernel::NetworkDecision {
+        if self.peer.is_acp() {
+            return match kernel::HumanGate::confirm(self, action, detail, escalated).await {
+                kernel::Approval::Once => kernel::NetworkDecision::Once,
+                kernel::Approval::Always if !escalated => kernel::NetworkDecision::Persistent,
+                kernel::Approval::Always => kernel::NetworkDecision::Once,
+                kernel::Approval::Deny => kernel::NetworkDecision::Deny,
+            };
+        }
+        let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = oneshot::channel();
+        lock_pending(&self.pending).insert(
+            gate_id,
+            PendingGate {
+                answer: GateAnswer::Access(answer),
+                escalated,
+            },
+        );
+        let mut guard = PendingGuard {
+            pending: Arc::clone(&self.pending),
+            gate_id,
+            writer: Arc::clone(&self.writer),
+            medha: true,
+            approved: false,
+        };
+        let mut choices = vec![protocol::ApprovalDecision::Once];
+        if !escalated {
+            choices.extend([
+                protocol::ApprovalDecision::Session,
+                protocol::ApprovalDecision::Persistent,
+            ]);
+        }
+        choices.push(protocol::ApprovalDecision::Deny);
+        if !self.writer.notify_params(
+            "approval",
+            &protocol::ApprovalPrompt {
+                gate_id,
+                action: action.to_owned(),
+                detail: detail.map(str::to_owned),
+                escalated,
+                kind: protocol::ApprovalKind::Access,
+                choices,
+            },
+        ) {
+            return kernel::NetworkDecision::Deny;
+        }
+        let decision = tokio::select! {
+            answer = answered => answer.unwrap_or(kernel::NetworkDecision::Deny),
+            _ = self.writer.cancelled() => kernel::NetworkDecision::Deny,
+        };
+        guard.approved = decision != kernel::NetworkDecision::Deny;
+        decision
+    }
+}
+
+fn respond_gate(
+    pending: &Pending,
+    gate_id: u64,
+    decision: protocol::ApprovalDecision,
+) -> Result<(), &'static str> {
+    let mut pending = lock_pending(pending);
+    let gate = pending.get(&gate_id).ok_or("approval is not pending")?;
+    if !gate.permits(decision) {
+        return Err("that decision is not offered for this approval");
+    }
+    pending
+        .remove(&gate_id)
+        .expect("checked while holding the gate lock")
+        .respond(decision)
+        .map_err(|_| "approval is no longer waiting")
 }
 
 fn deny_pending(pending: &Pending) -> usize {
@@ -881,6 +1135,7 @@ impl kernel::StreamSink for AcpSink {
         self.writer.turn_event(protocol::TurnEvent::Usage {
             prompt_tokens: usage.prompt_tokens,
             total_tokens: usage.total_tokens,
+            completion_tokens: Some(usage.completion_tokens),
             cached_prompt_tokens: usage.cached_prompt_tokens,
         });
     }
@@ -1485,12 +1740,11 @@ fn dispatch_rpc(
             let gate_id = params.get("gate_id").and_then(Value::as_u64);
             let decision = match (
                 params.get("approve").and_then(Value::as_bool),
-                params.get("decision").and_then(Value::as_str),
+                params.get("decision"),
             ) {
-                (Some(true), _) => Some(kernel::Approval::Once),
-                (Some(false), _) => Some(kernel::Approval::Deny),
-                (None, Some("approve")) => Some(kernel::Approval::Once),
-                (None, Some("deny")) => Some(kernel::Approval::Deny),
+                (Some(true), None) => Some(protocol::ApprovalDecision::Approve),
+                (Some(false), None) => Some(protocol::ApprovalDecision::Deny),
+                (None, Some(decision)) => serde_json::from_value(decision.clone()).ok(),
                 _ => None,
             };
             let (Some(gate_id), Some(approval)) = (gate_id, decision) else {
@@ -1498,16 +1752,13 @@ fn dispatch_rpc(
                     writer,
                     &id,
                     -32602,
-                    "gate_id and an approve/deny decision are required",
+                    "gate_id and one valid approval decision are required",
                 );
                 return RpcAction::None;
             };
-            let sender = lock_pending(pending).remove(&gate_id);
-            if let Some(sender) = sender {
-                let _ = sender.send(approval);
-                rpc_result(writer, &id, json!({ "accepted": true }));
-            } else {
-                rpc_error(writer, &id, -32001, "approval is not pending");
+            match respond_gate(pending, gate_id, approval) {
+                Ok(()) => rpc_result(writer, &id, json!({ "accepted": true })),
+                Err(error) => rpc_error(writer, &id, -32001, error),
             }
             RpcAction::None
         }
@@ -1724,7 +1975,6 @@ where
                     control.attend(handle.clone());
                 }
                 interrupt = Some(handle);
-                control.attend(interrupt.clone());
                 let kernel = kernel.clone();
                 let session = session.clone();
                 let budget = crate::task_budget(&base_budget, &agent_budget);
@@ -1734,7 +1984,7 @@ where
                     unread: unread.clone(),
                 };
                 let agents = agents.clone();
-                turns.spawn(async move {
+                let owner = turns.spawn(async move {
                     match kernel
                         .run_session(&session, messages, budget, &sink, Some(queue))
                         .await
@@ -1748,6 +1998,7 @@ where
                         Err(error) => TurnDone::Err(error.to_string()),
                     }
                 });
+                control.own(interrupt.as_ref().expect("a running turn").clone(), owner);
             }
         }
         tokio::select! {
@@ -1817,12 +2068,15 @@ where
                             Ok(value) => {
                                 if matches!(method, "session.settings" | "session.configure") { writer.notify("settings", value.clone()); }
                                 if method == "session.rewind" { writer.notify("session.rewound", json!({ "session": value["session"], "code_only": value["code_only"] })); roster = agents.clone().map(crate::acp_agents::Roster::new); }
-                                if method == "question.respond" { writer.notify("question.answered", json!({ "question_id": params["question_id"] })); }
                                 rpc_result(&writer, &id, value);
                             }
                             Err(error) => rpc_error(&writer, &id, -32001, error),
                         }
                         if asleep { break; }
+                        continue;
+                    }
+                    if method == "turn.abort" {
+                        rpc_result(&writer, &request.get("id").cloned(), json!({"accepted": control.abort()}));
                         continue;
                     }
                     if matches!(method, "cancel" | "interrupt" | "shutdown" | "exit") { crate::acp_questions::clear(&questions); }
@@ -1863,7 +2117,7 @@ where
             joined = turns.join_next(), if running => {
                 running = false;
                 interrupt = None;
-                control.attend(None);
+                let force_aborted = control.finish();
                 // No approval belongs past the turn that requested it. This
                 // also releases a gate whose task ended with an error before
                 // consuming its response.
@@ -1874,11 +2128,20 @@ where
                 let reply = prompt_reply.take();
                 // Unread messages run next after a normal finish; after a stop they go back.
                 let left = take_unread(&unread);
-                let completed = matches!(&joined, Some(Ok(TurnDone::Ok(_, reason))) if *reason != StopReason::Interrupted);
+                let completed = !force_aborted && matches!(&joined, Some(Ok(TurnDone::Ok(_, reason))) if *reason != StopReason::Interrupted);
                 let carried = if completed { left } else {
                     if !left.is_empty() { writer.event("message.returned", json!({ "contents": left })); }
                     Vec::new()
                 };
+                if force_aborted {
+                    let (message, history) = crate::failed_turn_history(kernel.log.as_ref(), &session, &transcript, "force-stopped".into()).await;
+                    if let Some(history) = history { transcript = history; }
+                    if message != "force-stopped" { writer.event("notice", json!({"text": message})); }
+                    if let Some(id) = reply { writer.respond(id, json!({"stopReason": "cancelled"})); }
+                    else { writer.event("turn.cancelled", json!({})); }
+                    writer.notify_params("event", &protocol::TurnEvent::AbortSettled);
+                    continue;
+                }
                 match joined {
                     Some(Ok(TurnDone::Ok(updated, reason))) => {
                         transcript = updated;
@@ -1927,7 +2190,8 @@ where
             Some(owner) = report_rx.recv(), if agents.is_some() => {
                 if owner.is_none() || owner == Some(session.id) { reports_ready = true; }
             }
-            _ = roster_tick.tick(), if roster.is_some() => {
+            _ = roster_tick.tick(), if roster.is_some() || running => {
+                if control.report_slow_abort() { writer.notify_params("event", &protocol::TurnEvent::AbortSlow); }
                 if let Some(update) = roster.as_mut().and_then(crate::acp_agents::Roster::changed) {
                     writer.notify("agents", update);
                 }
@@ -1942,7 +2206,7 @@ where
     }
 
     settle_turn(&mut interrupt, &pending, &mut turns, TURN_SHUTDOWN_GRACE).await;
-    control.attend(None);
+    control.finish();
     deny_pending(&pending);
     crate::acp_questions::clear(&questions);
     // A sleeping chat has not ended; it wakes on the next message.
@@ -2179,7 +2443,7 @@ mod tests {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (writer, mut rx) = capture_writer(8);
         let (tx, mut answered) = oneshot::channel();
-        lock_pending(&pending).insert(7, tx);
+        lock_pending(&pending).insert(7, tx.into());
 
         dispatch_rpc(
             json!({"jsonrpc": "2.0", "id": acp_gate_request_id(7),
@@ -2195,7 +2459,7 @@ mod tests {
         assert!(lock_pending(&pending).is_empty());
 
         let (tx, mut cancelled) = oneshot::channel();
-        lock_pending(&pending).insert(8, tx);
+        lock_pending(&pending).insert(8, tx.into());
         dispatch_rpc(
             json!({"jsonrpc": "2.0", "id": acp_gate_request_id(8),
                    "result": {"outcome": {"outcome": "cancelled"}}}),
@@ -2709,7 +2973,7 @@ mod tests {
 
         let pending = empty_pending();
         let (approval_tx, mut approval_rx) = oneshot::channel();
-        lock_pending(&pending).insert(41, approval_tx);
+        lock_pending(&pending).insert(41, approval_tx.into());
         let (_, values) = request(
             json!({"jsonrpc": "2.0", "id": 5, "method": "approval.respond", "params": {"gate_id": 41, "approve": true}}),
             true,
@@ -2723,7 +2987,7 @@ mod tests {
             let (handle, queue) = kernel::InterruptQueue::pair();
             let pending = empty_pending();
             let (approval_tx, mut approval_rx) = oneshot::channel();
-            lock_pending(&pending).insert(id, approval_tx);
+            lock_pending(&pending).insert(id, approval_tx.into());
             let (_, values) = request(
                 json!({"jsonrpc": "2.0", "id": id, "method": method}),
                 true,
@@ -2740,7 +3004,7 @@ mod tests {
             let (handle, queue) = kernel::InterruptQueue::pair();
             let pending = empty_pending();
             let (approval_tx, mut approval_rx) = oneshot::channel();
-            lock_pending(&pending).insert(id, approval_tx);
+            lock_pending(&pending).insert(id, approval_tx.into());
             let (action, values) = request(
                 json!({"jsonrpc": "2.0", "id": id, "method": method}),
                 true,
@@ -2809,7 +3073,7 @@ mod tests {
         let (writer, mut rx) = capture_writer(32);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (approval_tx, mut approval_rx) = oneshot::channel();
-        lock_pending(&pending).insert(7, approval_tx);
+        lock_pending(&pending).insert(7, approval_tx.into());
         let (handle, _queue) = kernel::InterruptQueue::pair();
 
         for message in [
@@ -2886,6 +3150,10 @@ mod tests {
             lock_pending(&pending).is_empty(),
             "dropped approval future leaked its map entry"
         );
+        let settled = captured_values(&mut rx);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0]["method"], "approval.resolved");
+        assert_eq!(settled[0]["params"]["approved"], false);
 
         let disconnected_gate = Arc::clone(&gate);
         let disconnected =
@@ -2898,11 +3166,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_access_preserves_every_tui_grant_tier_and_settles_all_viewers() {
+        use kernel::NetworkDecision as N;
+        let (writer, mut output) = capture_writer(32);
+        let pending: Pending = Arc::default();
+        let gate = Arc::new(AcpGate::new(
+            Arc::clone(&writer),
+            Arc::clone(&pending),
+            Peer::new(),
+        ));
+        for (choice, expected) in [
+            ("once", N::Once),
+            ("session", N::Session),
+            ("persistent", N::Persistent),
+            ("deny", N::Deny),
+        ] {
+            let asking = Arc::clone(&gate);
+            let asked =
+                tokio::spawn(
+                    async move { asking.confirm_access(Some("read /reviewed"), false).await },
+                );
+            let frame = tokio::time::timeout(Duration::from_secs(1), output.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let Outbound::Frame(frame) = frame else {
+                panic!("expected an approval")
+            };
+            let frame: Value = serde_json::from_slice(&frame).unwrap();
+            let prompt: protocol::ApprovalPrompt =
+                serde_json::from_value(frame["params"].clone()).unwrap();
+            assert!(matches!(prompt.kind, protocol::ApprovalKind::Access));
+            assert_eq!(
+                frame["params"]["choices"],
+                json!(["once", "session", "persistent", "deny"])
+            );
+            dispatch_rpc(
+                json!({"jsonrpc": "2.0", "id": 90, "method": "approval.respond",
+                "params": {"gate_id": prompt.gate_id, "decision": choice}}),
+                "model",
+                true,
+                None,
+                &pending,
+                &writer,
+                &Peer::new(),
+            );
+            assert_eq!(asked.await.unwrap(), expected);
+            let replies = captured_values(&mut output);
+            assert!(
+                replies
+                    .iter()
+                    .any(|reply| reply["id"] == 90 && reply["result"]["accepted"] == true)
+            );
+            let settled: Vec<_> = replies
+                .iter()
+                .filter(|reply| reply["method"] == "approval.resolved")
+                .collect();
+            assert_eq!(settled.len(), 1);
+            assert_eq!(settled[0]["params"]["gate_id"], prompt.gate_id);
+            assert_eq!(settled[0]["params"]["approved"], expected != N::Deny);
+            assert!(lock_pending(&pending).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn escalated_access_refuses_remembering_without_consuming_the_prompt() {
+        let (writer, mut output) = capture_writer(16);
+        let pending: Pending = Arc::default();
+        let gate = Arc::new(AcpGate::new(
+            Arc::clone(&writer),
+            Arc::clone(&pending),
+            Peer::new(),
+        ));
+        let asked =
+            tokio::spawn(async move { gate.confirm_access(Some("outside sandbox"), true).await });
+        let frame = output.recv().await.unwrap();
+        let Outbound::Frame(frame) = frame else {
+            panic!("expected an approval")
+        };
+        let frame: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(frame["params"]["choices"], json!(["once", "deny"]));
+        let id = frame["params"]["gate_id"].as_u64().unwrap();
+        for decision in [
+            protocol::ApprovalDecision::Session,
+            protocol::ApprovalDecision::Persistent,
+            protocol::ApprovalDecision::Always,
+        ] {
+            assert!(respond_gate(&pending, id, decision).is_err());
+            assert_eq!(lock_pending(&pending).len(), 1);
+        }
+        respond_gate(&pending, id, protocol::ApprovalDecision::Once).unwrap();
+        assert_eq!(asked.await.unwrap(), kernel::NetworkDecision::Once);
+        assert!(lock_pending(&pending).is_empty());
+        assert_eq!(
+            captured_values(&mut output)
+                .iter()
+                .filter(|frame| frame["method"] == "approval.resolved")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_question_settles_the_form_once_and_releases_its_response() {
+        let (writer, mut output) = capture_writer(8);
+        let pending: crate::acp_questions::Questions = Arc::default();
+        let asker = crate::acp_questions::AcpAsker {
+            writer,
+            pending: Arc::clone(&pending),
+            peer: Peer::new(),
+            next_id: AtomicU64::new(1),
+        };
+        let asked = tokio::spawn(async move { kernel::Asker::ask(&asker, vec![]).await });
+        let prompt = output.recv().await.unwrap();
+        let Outbound::Frame(prompt) = prompt else {
+            panic!("expected a question")
+        };
+        let prompt: Value = serde_json::from_slice(&prompt).unwrap();
+        assert_eq!(prompt["method"], "question");
+        asked.abort();
+        let _ = asked.await;
+        assert!(pending.lock().unwrap().is_empty());
+        let settled = captured_values(&mut output);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0]["method"], "question.answered");
+        assert_eq!(
+            settled[0]["params"]["question_id"],
+            prompt["params"]["question_id"]
+        );
+    }
+
+    #[tokio::test]
     async fn protocol_error_and_shutdown_drain_pending_approvals() {
         let (writer, mut rx) = capture_writer(8);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (malformed_tx, mut malformed_rx) = oneshot::channel();
-        lock_pending(&pending).insert(1, malformed_tx);
+        lock_pending(&pending).insert(1, malformed_tx.into());
         dispatch_line(
             "{broken",
             "model",
@@ -2917,7 +3316,7 @@ mod tests {
         captured_values(&mut rx);
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-        lock_pending(&pending).insert(2, shutdown_tx);
+        lock_pending(&pending).insert(2, shutdown_tx.into());
         let (handle, queue) = kernel::InterruptQueue::pair();
         assert_eq!(
             dispatch_rpc(
@@ -2941,8 +3340,8 @@ mod tests {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (first_tx, mut first_rx) = oneshot::channel();
         let (second_tx, mut second_rx) = oneshot::channel();
-        lock_pending(&pending).insert(1, first_tx);
-        lock_pending(&pending).insert(2, second_tx);
+        lock_pending(&pending).insert(1, first_tx.into());
+        lock_pending(&pending).insert(2, second_tx.into());
 
         assert_eq!(deny_pending(&pending), 2);
         assert_eq!(first_rx.try_recv(), Ok(Approval::Deny));
@@ -2957,7 +3356,7 @@ mod tests {
         let mut interrupt = Some(handle);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (approval_tx, approval_rx) = oneshot::channel();
-        lock_pending(&pending).insert(99, approval_tx);
+        lock_pending(&pending).insert(99, approval_tx.into());
         let (settled_tx, settled_rx) = oneshot::channel();
         let mut turns = JoinSet::new();
         turns.spawn(async move {
@@ -2979,17 +3378,114 @@ mod tests {
     async fn backend_control_cancels_the_turn_and_denies_its_gate_without_rpc_input() {
         let control = TurnControl::default();
         let (handle, queue) = kernel::InterruptQueue::pair();
-        control.attend(Some(handle));
+        let owned = tokio::spawn(std::future::pending::<()>());
+        control.own(handle, owned.abort_handle());
         let pending: Pending = Arc::default();
         let (answer, answered) = oneshot::channel();
-        lock_pending(&pending).insert(5, answer);
+        lock_pending(&pending).insert(5, answer.into());
         *control.gates.lock().unwrap() = Some((pending.clone(), Default::default()));
         assert!(control.cancel());
         assert!(queue.token().is_cancelled());
         assert_eq!(answered.await.unwrap(), Approval::Deny);
         assert!(lock_pending(&pending).is_empty());
-        control.attend(None);
+        control.finish();
+        owned.abort();
+        let _ = owned.await;
         assert!(!control.cancel());
+    }
+
+    #[tokio::test]
+    async fn force_abort_retains_ownership_until_the_owner_is_joined() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let control = TurnControl::default();
+        let (handle, queue) = kernel::InterruptQueue::pair();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let (ready, waiting) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        waiting.await.unwrap();
+        control.own(handle, task.abort_handle());
+        assert!(control.abort());
+        assert!(queue.token().is_cancelled());
+        assert!(control.active.lock().unwrap().is_some());
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(control.finish());
+        assert!(!control.finish());
+        assert!(!control.abort());
+    }
+
+    #[test]
+    fn child_streams_keep_parent_identity_tool_ids_and_returned_text() {
+        use runtime::agents::AgentWatcher;
+        let (writer, mut output) = capture_writer(32);
+        let peer = Peer::new();
+        let watch = crate::acp_agents::Watch {
+            writer,
+            peer: peer.clone(),
+        };
+        let session = ulid::Ulid::new();
+        let path = orchestrator::AgentPath::root().child("reviewer").unwrap();
+        for step in [
+            protocol::AgentStep::Task {
+                objective: "review".into(),
+                contract: Some("read-only".into()),
+            },
+            protocol::AgentStep::Reasoning("inspect".into()),
+            protocol::AgentStep::Text("found".into()),
+            protocol::AgentStep::ToolCall {
+                id: Some("call-7".into()),
+                tool: "read".into(),
+                args: json!({"path": "src"}),
+            },
+            protocol::AgentStep::ToolResult {
+                id: Some("call-7".into()),
+                tool: "read".into(),
+                ok: false,
+                payload: json!({"error": "missing"}),
+            },
+            protocol::AgentStep::Restarted,
+            protocol::AgentStep::SteerQueued("check".into()),
+            protocol::AgentStep::Steered("check".into()),
+            protocol::AgentStep::SteersReturned(vec!["keep me".into()]),
+        ] {
+            watch.step(Some(session), &path, step);
+        }
+        watch.usage(&kernel::Usage {
+            prompt_tokens: 11,
+            total_tokens: 23,
+            cached_prompt_tokens: None,
+            ..kernel::Usage::default()
+        });
+        let frames = captured_values(&mut output);
+        assert_eq!(frames.len(), 10);
+        for frame in &frames[..9] {
+            assert_eq!(frame["method"], "agent.step");
+            let event: protocol::AgentEvent =
+                serde_json::from_value(frame["params"].clone()).unwrap();
+            assert_eq!(event.surface_session, Some(session.to_string()));
+            assert_eq!(event.path, path.as_str());
+        }
+        assert_eq!(frames[4]["params"]["step"]["data"]["id"], "call-7");
+        assert_eq!(frames[8]["params"]["step"]["data"], json!(["keep me"]));
+        assert_eq!(frames[9]["params"]["total_tokens"], 23);
+        peer.select_acp();
+        watch.step(
+            Some(session),
+            &path,
+            protocol::AgentStep::Text("private child".into()),
+        );
+        watch.usage(&kernel::Usage::default());
+        assert!(captured_values(&mut output).is_empty());
     }
 
     #[test]

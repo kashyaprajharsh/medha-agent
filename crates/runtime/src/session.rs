@@ -545,7 +545,7 @@ pub async fn start(
     let search_handle = registry.search_handle();
     if let Ok(cfg_guard) = model_profiles.lock() {
         *search_handle.lock().expect("search settings lock") =
-            config::resolve_search_with(&cfg_guard, options.search_env);
+            config::resolve_search_with(&cfg_guard, options.search_env.clone());
     }
     if let Ok(mut slot) = registry.clarify_handle().lock() {
         *slot = Some(surface.asker);

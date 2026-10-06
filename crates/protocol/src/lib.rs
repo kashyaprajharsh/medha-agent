@@ -145,8 +145,114 @@ pub struct CreateSession {
     pub reasoning: Option<Effort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<RestoreSettings>,
+    /// Resolved choices of this caller. Unlike legacy desktop requests, these
+    /// do not inherit the daemon starter's environment. Secrets are ephemeral.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<StartupOptions>,
 }
 command!(CreateSession, "session.create", Service, LiveSession);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Sandbox {
+    Host,
+    Native,
+    Container,
+    Ssh,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReasoningChoice {
+    pub enabled: Option<bool>,
+    pub effort: Option<Effort>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Resume {
+    #[default]
+    None,
+    Latest,
+    Id(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct BudgetLimits {
+    pub max_turns: Option<u32>,
+    pub max_tokens: Option<u64>,
+    pub max_cost_usd: Option<f64>,
+    pub max_wall_s: Option<u64>,
+}
+
+/// Only explicit model overrides cross the authenticated local connection;
+/// arbitrary environment variables never do. Debug output redacts secrets.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOverrides {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub max_ctx: Option<String>,
+    pub protocol: Option<String>,
+    pub auth: Option<String>,
+    pub headers_json: Option<String>,
+    pub max_output_tokens: Option<String>,
+    pub token_counter: Option<String>,
+    pub token_accounting: Option<String>,
+    pub reasoning_support: Option<String>,
+    pub image_input: Option<String>,
+}
+
+impl std::fmt::Debug for ModelOverrides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelOverrides")
+            .field("model", &self.model)
+            .field("credentials", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchOverrides {
+    pub tavily: Option<String>,
+    pub brave: Option<String>,
+    pub searxng: Option<String>,
+}
+
+impl std::fmt::Debug for SearchOverrides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SearchOverrides { credentials: [redacted] }")
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupOptions {
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub model_env: ModelOverrides,
+    #[serde(default)]
+    pub search_env: SearchOverrides,
+    #[serde(default)]
+    pub budget: BudgetLimits,
+    pub approve: Option<String>,
+    pub reasoning: Option<ReasoningChoice>,
+    pub mode: Option<Mode>,
+    pub verify_command: Option<String>,
+    #[serde(default)]
+    pub require_verify: bool,
+    pub sandbox: Option<Sandbox>,
+    pub tools_preset: Option<String>,
+    pub max_parallel_tools: Option<usize>,
+    #[serde(default)]
+    pub resume: Resume,
+    #[serde(default)]
+    pub first_run_setup: bool,
+    #[serde(default)]
+    pub may_start_unconfigured: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatAbout {
@@ -283,13 +389,41 @@ pub struct Accepted {
     pub accepted: bool,
 }
 
-/// The existing permission contract. Additional access-grant tiers must be
-/// negotiated explicitly before a new client presents them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalDecision {
     Approve,
+    Once,
+    Always,
+    Session,
+    Persistent,
     Deny,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalKind {
+    #[default]
+    Action,
+    Access,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalPrompt {
+    pub gate_id: u64,
+    pub action: String,
+    pub detail: Option<String>,
+    pub escalated: bool,
+    #[serde(default)]
+    pub kind: ApprovalKind,
+    #[serde(default)]
+    pub choices: Vec<ApprovalDecision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalResolved {
+    pub gate_id: u64,
+    pub approved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +432,7 @@ pub struct AnswerApproval {
     pub decision: ApprovalDecision,
 }
 command!(AnswerApproval, "approval.respond", Chat, Accepted);
+empty_command!(AbortTurn, "turn.abort", Chat, Accepted);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Answer {
@@ -315,6 +450,66 @@ pub struct AnswerQuestion {
     pub answers: Vec<Answer>,
 }
 command!(AnswerQuestion, "question.respond", Chat, Accepted);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+    pub recommended: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Question {
+    pub prompt: String,
+    pub header: String,
+    pub multi_select: bool,
+    pub options: Vec<QuestionOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionPrompt {
+    pub question_id: u64,
+    pub questions: Vec<Question>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionAnswered {
+    pub question_id: u64,
+}
+
+/// Child presentation data is shared independently of the agent executor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum AgentStep {
+    Task {
+        objective: String,
+        contract: Option<String>,
+    },
+    Text(String),
+    Reasoning(String),
+    ToolCall {
+        id: Option<String>,
+        tool: String,
+        args: Value,
+    },
+    ToolResult {
+        id: Option<String>,
+        tool: String,
+        ok: bool,
+        payload: Value,
+    },
+    Restarted,
+    SteerQueued(String),
+    Steered(String),
+    SteersReturned(Vec<String>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub surface_session: Option<String>,
+    pub path: String,
+    pub step: AgentStep,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -369,6 +564,8 @@ pub enum TurnEvent {
     Usage {
         prompt_tokens: u32,
         total_tokens: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_tokens: Option<u32>,
         cached_prompt_tokens: Option<u32>,
     },
     #[serde(rename = "cost")]
@@ -404,6 +601,10 @@ pub enum TurnEvent {
     Done { stopped: Option<String> },
     #[serde(rename = "turn.cancelled")]
     Cancelled,
+    #[serde(rename = "turn.abort_settled")]
+    AbortSettled,
+    #[serde(rename = "turn.abort_slow")]
+    AbortSlow,
     #[serde(rename = "turn.continued")]
     Continued { stopped: String },
     #[serde(rename = "turn.error")]

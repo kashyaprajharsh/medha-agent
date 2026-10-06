@@ -394,6 +394,7 @@ impl Connection {
             model: None,
             mode: None,
             reasoning: None,
+            startup: None,
             settings: settings
                 .map(|settings| serde_json::from_value(settings.clone()))
                 .transpose()

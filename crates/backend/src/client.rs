@@ -267,6 +267,11 @@ async fn handle<C: Chats>(
             Ok(_) => Err(refused("attach to the session first")),
             Err(error) => Err(error),
         },
+        "turn.abort" => match session("turn.abort") {
+            Ok(session) if session.heard_by(me.id) => Ok(json!({"accepted": session.abort_turn()})),
+            Ok(_) => Err(refused("attach to the session first")),
+            Err(error) => Err(error),
+        },
         _ => match session("a request to a chat") {
             Ok(session) if session.heard_by(me.id) => {
                 match session.forward(me, frame) {

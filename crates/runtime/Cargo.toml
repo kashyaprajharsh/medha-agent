@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 kernel.workspace = true
+protocol = { package = "medha-protocol", path = "../protocol" }
 providers.workspace = true
 context.workspace = true
 media.workspace = true

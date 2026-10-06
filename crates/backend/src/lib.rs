@@ -25,6 +25,13 @@ pub type Input = Box<dyn AsyncWrite + Send + Unpin>;
 pub type Output = Box<dyn AsyncRead + Send + Unpin>;
 pub type Done = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
+#[derive(Clone, Copy)]
+pub enum TurnAction {
+    Cancel,
+    Abort,
+}
+pub type Control = Arc<dyn Fn(TurnAction) -> bool + Send + Sync>;
+
 /// A chat that has started and is ready for its first frame.
 pub struct Opened {
     /// The id it is resumed by, so it survives a restart of the backend.
@@ -36,7 +43,7 @@ pub struct Opened {
     pub done: Done,
     /// A current-turn cancellation path independent of a congested input pipe.
     /// `true` means it reached a turn or pending human gate immediately.
-    pub cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub control: Option<Control>,
 }
 
 /// Starts chats. `params` is what the client sent with `session.create`.
@@ -262,7 +269,7 @@ impl<C: Chats> Backend<C> {
             if table.contains_key(&opened.session) {
                 return Err(refused("this chat is already live; attach to it"));
             }
-            let session = Session::new(opened.session, opened.about, opened.input, opened.cancel);
+            let session = Session::new(opened.session, opened.about, opened.input, opened.control);
             table.insert(session.id.clone(), session.clone());
             session
         };

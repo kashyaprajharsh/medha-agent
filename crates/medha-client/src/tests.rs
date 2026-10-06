@@ -369,6 +369,7 @@ async fn typed_async_commands_validate_scope_and_decode_the_backend_answer() {
                 mode: None,
                 reasoning: None,
                 settings: None,
+                startup: None,
             },
         )
         .await

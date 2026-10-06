@@ -407,31 +407,31 @@ pub fn search_cred_id(provider: tools::SearchProvider) -> Option<&'static str> {
 }
 
 /// Which web search services the caller's environment offers, read once.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SearchEnv {
-    pub tavily: bool,
-    pub brave: bool,
-    pub searxng: bool,
+    pub tavily: Option<String>,
+    pub brave: Option<String>,
+    pub searxng: Option<String>,
 }
 
 impl SearchEnv {
     pub fn from_process() -> Self {
-        let has = |k: &str| std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty());
+        let value = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Self {
-            tavily: has("TAVILY_API_KEY"),
-            brave: has("BRAVE_API_KEY"),
-            searxng: has("MEDHA_SEARXNG_URL"),
+            tavily: value("TAVILY_API_KEY"),
+            brave: value("BRAVE_API_KEY"),
+            searxng: value("MEDHA_SEARXNG_URL"),
         }
     }
 }
 
-fn auto_detect_search_provider(env: SearchEnv) -> tools::SearchProvider {
+fn auto_detect_search_provider(env: &SearchEnv) -> tools::SearchProvider {
     use tools::SearchProvider as P;
-    if env.tavily {
+    if env.tavily.is_some() {
         P::Tavily
-    } else if env.brave {
+    } else if env.brave.is_some() {
         P::Brave
-    } else if env.searxng {
+    } else if env.searxng.is_some() {
         P::Searxng
     } else {
         P::DuckDuckGo
@@ -446,13 +446,14 @@ pub fn resolve_search(cfg: &Config) -> tools::SearchSettings {
 pub fn resolve_search_with(cfg: &Config, env: SearchEnv) -> tools::SearchSettings {
     let provider = match cfg.search.provider.as_deref() {
         Some(p) => tools::SearchProvider::from_id(p),
-        None => auto_detect_search_provider(env),
+        None => auto_detect_search_provider(&env),
     };
     tools::SearchSettings {
         provider,
-        tavily_key: load_key("search://tavily"),
-        brave_key: load_key("search://brave"),
-        searxng_url: cfg.search.searxng_url.clone(),
+        tavily_key: load_key("search://tavily").or(env.tavily),
+        brave_key: load_key("search://brave").or(env.brave),
+        searxng_url: cfg.search.searxng_url.clone().or(env.searxng),
+        captured: true,
     }
 }
 

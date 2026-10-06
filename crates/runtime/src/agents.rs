@@ -987,35 +987,7 @@ impl kernel::HumanGate for AttributedGate {
 /// The same shapes the parent renders, kept as a separate type because a child's
 /// stream is routed rather than appended: it belongs to that agent's view, and
 /// three children streaming into one conversation is unreadable.
-#[derive(Debug, Clone)]
-pub enum AgentStep {
-    /// What this child was sent to do, shown first in its own view.
-    Task {
-        objective: String,
-        contract: Option<String>,
-    },
-    Text(String),
-    Reasoning(String),
-    ToolCall {
-        id: Option<String>,
-        tool: String,
-        args: serde_json::Value,
-    },
-    ToolResult {
-        id: Option<String>,
-        tool: String,
-        ok: bool,
-        payload: serde_json::Value,
-    },
-    /// A transient provider failure abandoned the trailing streamed attempt.
-    Restarted,
-    /// Optimistic local record while a steer waits for a turn boundary.
-    SteerQueued(String),
-    /// The queued text actually entered the child's canonical transcript.
-    Steered(String),
-    /// The child settled before these queued messages could be applied.
-    SteersReturned(Vec<String>),
-}
+pub use protocol::AgentStep;
 
 /// Whoever is watching child agents work; a call must return without waiting on the viewer.
 pub trait AgentWatcher: Send + Sync {

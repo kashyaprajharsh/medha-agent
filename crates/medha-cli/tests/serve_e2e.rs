@@ -1695,6 +1695,96 @@ async fn a_deleted_config_takes_its_servers_away_from_the_shared_host() {
     while hosted(&later.next().await) != Some(false) {}
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolved_terminal_startup_wins_over_the_daemons_unrelated_environment() {
+    let world = World::new();
+    let backend = world.backend_in(&[
+        ("MEDHA_MODE", "invalid-daemon-mode"),
+        ("MEDHA_TOOLS", "invalid-daemon-tools"),
+    ]);
+    let mut client = backend.connect().await;
+    let startup = protocol::StartupOptions {
+        mode: Some(protocol::Mode::Plan),
+        tools_preset: Some("minimal".into()),
+        model_env: protocol::ModelOverrides {
+            base_url: Some(world.provider.url.clone()),
+            model: Some("test-model".into()),
+            api_key: Some("caller-secret".into()),
+            protocol: Some("open-ai-chat".into()),
+            token_accounting: Some("adaptive".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let made = client
+        .ask(
+            "session.create",
+            None,
+            json!({"folder": world.folder("caller"), "startup": startup}),
+        )
+        .await;
+    let chat = made["result"]["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{made}"))
+        .to_owned();
+    client
+        .ask("session.attach", Some(&chat), json!({"after": 0}))
+        .await;
+    let settings = client.ask("session.settings", Some(&chat), json!({})).await;
+    assert_eq!(settings["result"]["mode"], "plan");
+    assert!(!settings.to_string().contains("caller-secret"));
+    client.send(&chat, "what may you use").await;
+    assert!(!offered(&world.provider.seen.recv_timeout(WAIT).unwrap()).is_empty());
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let rejected = client
+        .ask(
+            "session.create",
+            None,
+            json!({"folder": world.folder("conflict"), "startup": {}, "mode": "plan"}),
+        )
+        .await;
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("either")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_force_stop_settles_all_viewers_before_another_turn_runs() {
+    let world = World::new();
+    let backend = world.backend();
+    let (mut first, mut second) = (backend.connect().await, backend.connect().await);
+    let chat = first.open(&world.folder("force-stop")).await;
+    second.ask("session.attach", Some(&chat), json!({})).await;
+    first.send(&chat, "HOLD the answer").await;
+    world.provider.asked();
+    let stopped = second.ask("turn.abort", Some(&chat), json!({})).await;
+    assert_eq!(stopped["result"]["accepted"], true, "{stopped}");
+    for viewer in [&mut first, &mut second] {
+        viewer
+            .until(|frame| kind(frame, "turn.abort_settled"))
+            .await;
+    }
+    // Release only this test's held provider request; no old owner may resume
+    // its output into the next turn.
+    world.provider.release.send(()).unwrap();
+    first.send(&chat, "a fresh turn").await;
+    assert!(world.provider.asked().contains("a fresh turn"));
+    let mut text = String::new();
+    loop {
+        let (_, frame) = first
+            .until(|frame| kind(frame, "model.text") || kind(frame, "turn.done"))
+            .await;
+        if kind(&frame, "turn.done") {
+            break;
+        }
+        text.push_str(frame["params"]["delta"].as_str().unwrap());
+    }
+    assert_eq!(text, "echo: a fresh turn");
+}
+
 /// The window removes a server for the folder, the shared host lets go of it at
 /// once, and only then is each open chat told to look again. By then the server
 /// is nobody's to remove, which is what was asked for and no failure.

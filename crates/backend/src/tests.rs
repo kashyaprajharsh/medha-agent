@@ -92,8 +92,7 @@ impl Chats for Stub {
                 task.await
                     .unwrap_or_else(|_| Err("the chat stopped unexpectedly".into()))
             }),
-            cancel: (params["out_of_band"] == true)
-                .then(|| Arc::new(|| true) as Arc<dyn Fn() -> bool + Send + Sync>),
+            control: (params["out_of_band"] == true).then(|| Arc::new(|_| true) as crate::Control),
         })
     }
 

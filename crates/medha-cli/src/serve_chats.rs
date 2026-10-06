@@ -244,9 +244,21 @@ impl ServeChats {
 
 /// What a client may choose for a chat, laid over what the backend's own
 /// environment asks of every chat, as a flag is laid over it in a terminal.
-/// Keys are never a client's to choose: the backend reads those from its
-/// environment and the saved configuration.
+/// A terminal supplies resolved options, including ephemeral credential
+/// overrides over this authenticated per-user channel. Legacy desktop calls
+/// retain the daemon's environment defaults. Neither path saves overrides.
 fn options(params: &Value) -> Result<SessionOptions, String> {
+    if let Some(startup) = params.get("startup").filter(|s| !s.is_null()) {
+        if ["model", "mode", "reasoning", "resume"]
+            .iter()
+            .any(|key| params.get(key).is_some_and(|v| !v.is_null()))
+        {
+            return Err("choose either resolved startup options or legacy chat choices".into());
+        }
+        let chosen = serde_json::from_value::<protocol::StartupOptions>(startup.clone())
+            .map_err(|_| "invalid chat startup options".to_string())?;
+        return SessionOptions::from_startup(chosen).map_err(|error| format!("{error:#}"));
+    }
     let text = |key: &str| params[key].as_str().map(str::to_owned);
     let autonomy = text("mode")
         .map(|mode| kernel::AutonomyLevel::parse(&mode))
@@ -400,7 +412,10 @@ impl Chats for ServeChats {
             input: Box::new(to_chat),
             output: Box::new(std::io::Cursor::new(said).chain(output)),
             done: Box::pin(async move { ended(chat.await) }),
-            cancel: Some(Arc::new(move || control.cancel())),
+            control: Some(Arc::new(move |action| match action {
+                backend::TurnAction::Cancel => control.cancel(),
+                backend::TurnAction::Abort => control.abort(),
+            })),
         })
     }
 }

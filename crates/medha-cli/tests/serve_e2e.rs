@@ -163,6 +163,8 @@ fn medha(home: &Path, provider: &Provider) -> Command {
         .env("MEDHA_API_KEY", SECRET)
         .env("MEDHA_PROTOCOL", "open-ai-chat")
         .env("MEDHA_TOKEN_ACCOUNTING", "adaptive")
+        // These tests read the log, so what is written there is theirs to say.
+        .env("RUST_LOG", "info")
         // Saved keys go to a file under the home, never to this machine's keychain.
         .env("MEDHA_CRED_STORE", "file");
     command
@@ -1037,6 +1039,41 @@ async fn a_chat_in_the_backend_obeys_the_environment_as_one_in_its_own_process_d
         .await;
     let settings = outcome(&client.ask("session.settings", Some(&own), json!({})).await);
     assert_eq!(settings["mode"], "careful", "{settings}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_setting_that_makes_no_sense_stops_only_what_would_have_used_it() {
+    let env = [("MEDHA_MODE", "no-such-mode")];
+    let world = World::new();
+    let folder = world.folder("w");
+    let backend = world.backend_in(&env);
+    let mut client = backend.connect().await;
+
+    let left_to_it = client.create(&folder, None).await;
+    let refused = left_to_it["error"]["message"].as_str().unwrap_or_default();
+    assert!(refused.contains("no-such-mode"), "{left_to_it}");
+
+    let chosen = json!({"folder": folder, "mode": "plan"});
+    let made = client.ask("session.create", None, chosen).await;
+    let chat = made["result"]["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a chat that chose its own mode was refused: {made}"))
+        .to_string();
+    client
+        .ask("session.attach", Some(&chat), json!({"after": 0}))
+        .await;
+    let settings = outcome(&client.ask("session.settings", Some(&chat), json!({})).await);
+    assert_eq!(settings["mode"], "plan", "{settings}");
+
+    // Listing the chats of a folder starts none, so it reads nothing a chat would.
+    let listing = medha(&world.home(), &world.provider)
+        .arg("--sessions")
+        .envs(env)
+        .current_dir(&folder)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&listing.stderr);
+    assert!(listing.status.success(), "{said}");
 }
 
 /// A remote MCP server with one tool, counting how many times a client connected to it.

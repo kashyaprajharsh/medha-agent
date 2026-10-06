@@ -820,8 +820,6 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    // An invalid setting in the environment must fail before provider discovery or startup effects.
-    let process = runtime::SessionOptions::from_process()?;
 
     if cli.setup && !std::io::stdin().is_terminal() {
         anyhow::bail!("--setup opens the interactive TUI and needs a terminal");
@@ -837,22 +835,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let lock_cwd = std::env::current_dir()?;
-    let lock = runtime::workspace::load_lock(&lock_cwd, &Stderr)?;
-    // A flag wins over the environment, which `process` already holds.
-    let chosen_autonomy = if cli.plan {
+    // A flag wins over the environment. An invalid setting there, for anything no flag
+    // chose, must fail before provider discovery or startup effects.
+    let flagged_mode = if cli.plan {
         Some(kernel::AutonomyLevel::Plan)
     } else {
-        cli.mode.or(process.autonomy)
+        cli.mode
     };
+    let process =
+        runtime::SessionOptions::from_process(flagged_mode, cli.reasoning_effort.clone())?;
+    let lock_cwd = std::env::current_dir()?;
+    let lock = runtime::workspace::load_lock(&lock_cwd, &Stderr)?;
     let options = runtime::SessionOptions {
         model: cli.model.clone(),
         base_url: cli.base_url.clone(),
-        reasoning: cli
-            .reasoning_effort
-            .clone()
-            .or_else(|| process.reasoning.clone()),
-        autonomy: chosen_autonomy,
         require_verify: cli.require_verify,
         sandbox: if cli.no_sandbox {
             Some(sandbox::BackendKind::Host)

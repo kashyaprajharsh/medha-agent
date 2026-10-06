@@ -215,7 +215,6 @@ impl ServeChats {
 /// Keys are never a client's to choose: the backend reads those from its
 /// environment and the saved configuration.
 fn options(params: &Value) -> Result<SessionOptions, String> {
-    let process = SessionOptions::from_process().map_err(|error| format!("{error:#}"))?;
     let text = |key: &str| params[key].as_str().map(str::to_owned);
     let autonomy = text("mode")
         .map(|mode| kernel::AutonomyLevel::parse(&mode))
@@ -223,10 +222,10 @@ fn options(params: &Value) -> Result<SessionOptions, String> {
     let reasoning = text("reasoning")
         .map(|effort| kernel::ReasoningConfig::from_effort_text(&effort))
         .transpose()?;
+    let process =
+        SessionOptions::from_process(autonomy, reasoning).map_err(|error| format!("{error:#}"))?;
     Ok(SessionOptions {
         model: text("model"),
-        reasoning: reasoning.or_else(|| process.reasoning.clone()),
-        autonomy: autonomy.or(process.autonomy),
         resume: text("resume").map_or(Resume::None, Resume::Id),
         ..process
     })

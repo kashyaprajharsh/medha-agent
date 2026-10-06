@@ -22,7 +22,7 @@ fn everything_the_environment_asks_of_a_chat_is_in_the_options_every_surface_sta
     ] {
         set(name, value);
     }
-    let asked = SessionOptions::from_process().unwrap();
+    let asked = SessionOptions::from_process(None, None).unwrap();
     assert_eq!(asked.autonomy, Some(kernel::AutonomyLevel::Plan));
     assert_eq!(asked.verify_command.as_deref(), Some("cargo test"));
     assert_eq!(asked.sandbox, Some(sandbox::BackendKind::Host));
@@ -34,7 +34,16 @@ fn everything_the_environment_asks_of_a_chat_is_in_the_options_every_surface_sta
 
     // An empty command asks for no check, and a mode that does not exist is refused, not ignored.
     set("MEDHA_VERIFY", "  ");
-    assert_eq!(SessionOptions::from_process().unwrap().verify_command, None);
+    let unchecked = SessionOptions::from_process(None, None).unwrap();
+    assert_eq!(unchecked.verify_command, None);
     set("MEDHA_MODE", "no-such-mode");
-    assert!(SessionOptions::from_process().is_err());
+    set("MEDHA_REASONING_EFFORT", "no-such-effort");
+    assert!(SessionOptions::from_process(None, None).is_err());
+
+    // What the caller chose is used as it is, whatever the environment says in its place.
+    let careful = Some(kernel::AutonomyLevel::Careful);
+    let chosen = SessionOptions::from_process(careful, asked.reasoning.clone()).unwrap();
+    assert_eq!(chosen.autonomy, careful);
+    assert_eq!(chosen.reasoning, asked.reasoning);
+    assert!(SessionOptions::from_process(careful, None).is_err());
 }

@@ -19,19 +19,30 @@ fn env_text(name: &str) -> anyhow::Result<Option<String>> {
 }
 
 impl SessionOptions {
-    /// What this process's environment asks of every chat it starts. Whoever
-    /// starts a chat, a terminal or the backend, begins here and lays its own
-    /// explicit choices over it: a flag or a client's request wins over the
-    /// environment, and the environment wins over `medha.lock`.
-    pub fn from_process() -> anyhow::Result<Self> {
-        let reasoning = env_text("MEDHA_REASONING_EFFORT")?
-            .map(|effort| kernel::ReasoningConfig::from_effort_text(&effort))
-            .transpose()
-            .map_err(anyhow::Error::msg)?;
-        let autonomy = env_text("MEDHA_MODE")?
-            .map(|mode| kernel::AutonomyLevel::parse(&mode))
-            .transpose()
-            .map_err(anyhow::Error::msg)?;
+    /// What one chat starts from: what its caller chose, and for the rest what
+    /// this process's environment asks of every chat. A terminal's flag or a
+    /// client's request wins over the environment, and the environment wins
+    /// over `medha.lock`. What the caller chose is never read from the
+    /// environment at all, so a value there that makes no sense cannot stand
+    /// in the way of a choice that does.
+    pub fn from_process(
+        mode: Option<kernel::AutonomyLevel>,
+        reasoning: Option<kernel::ReasoningConfig>,
+    ) -> anyhow::Result<Self> {
+        let reasoning = match reasoning {
+            Some(chosen) => Some(chosen),
+            None => env_text("MEDHA_REASONING_EFFORT")?
+                .map(|effort| kernel::ReasoningConfig::from_effort_text(&effort))
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
+        };
+        let autonomy = match mode {
+            Some(chosen) => Some(chosen),
+            None => env_text("MEDHA_MODE")?
+                .map(|mode| kernel::AutonomyLevel::parse(&mode))
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
+        };
         let sandbox = match std::env::var("MEDHA_SANDBOX")
             .ok()
             .as_deref()

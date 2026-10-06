@@ -80,25 +80,47 @@ where
         }
     });
     let mut reader = BufReader::new(reader);
-    let mut attached = HashSet::new();
-    let tied = Tied::default();
+    let mut leaving = Leaving {
+        backend: Arc::clone(backend),
+        me: me.clone(),
+        attached: HashSet::new(),
+        tied: Tied::default(),
+    };
     loop {
         let frame = tokio::select! {
             () = me.dropped.cancelled() => break,
             frame = wire::read_frame(&mut reader) => frame,
         };
         let Some(frame) = frame else { break };
-        handle(backend, &me, &mut attached, &tied, frame).await;
+        let tied = leaving.tied.clone();
+        handle(backend, &me, &mut leaving.attached, &tied, frame).await;
     }
-    for id in attached {
-        if let Ok(session) = backend.find(&id) {
-            session.detach(me.id);
+    drop(leaving);
+    let _ = writing.await;
+}
+
+/// What a client leaves behind is cleared however its serving ends, a request that panics included.
+struct Leaving<C: Chats> {
+    backend: Arc<Backend<C>>,
+    me: Client,
+    attached: HashSet<String>,
+    tied: Tied,
+}
+
+impl<C: Chats> Drop for Leaving<C> {
+    fn drop(&mut self) {
+        for id in self.attached.drain() {
+            if let Ok(session) = self.backend.find(&id) {
+                session.detach(self.me.id);
+            }
+        }
+        // Chats may still hold this client for answers it will never read.
+        self.me.dropped.cancel();
+        let tied = self.tied.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { tied.close().await });
         }
     }
-    // Chats may still hold this client for answers it will never read.
-    me.dropped.cancel();
-    tied.close().await;
-    let _ = writing.await;
 }
 
 /// Chats a client asked to end when it does, as a chat on a pipe ends with whoever held the pipe.

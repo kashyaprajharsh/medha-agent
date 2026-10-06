@@ -64,7 +64,7 @@ impl Session {
         let after = after.unwrap_or(stream.seq);
         let oldest = stream.kept.front().map_or(stream.seq + 1, |(seq, _)| *seq);
         // Events older than what is kept, or a cursor from before a restart.
-        let gap = after + 1 < oldest || after > stream.seq;
+        let gap = after.saturating_add(1) < oldest || after > stream.seq;
         let mut replayed = 0;
         for (_, line) in stream.kept.iter().filter(|(seq, _)| *seq > after) {
             client.send(line.clone());

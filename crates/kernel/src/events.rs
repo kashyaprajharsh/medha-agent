@@ -651,6 +651,7 @@ pub trait EventLog: Send + Sync {
             let events = self.events(session.id).await;
             found.extend(events.into_iter().filter(|event| event.kind == kind));
         }
+        found.sort_by(|a, b| a.ts.total_cmp(&b.ts).then(a.id.cmp(&b.id)));
         found
     }
 

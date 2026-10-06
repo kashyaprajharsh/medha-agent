@@ -346,6 +346,25 @@ async fn a_cursor_older_than_what_is_kept_is_told_so() {
 }
 
 #[tokio::test]
+async fn a_cursor_no_chat_could_have_reached_is_a_gap_and_harms_nobody() {
+    let backend = backend();
+    let mut client = connect(&backend);
+    let session = client.open().await;
+    client.say(&session, "one").await;
+
+    for ahead in [u64::MAX, u64::MAX - 1, 2] {
+        let attached = client.attach(&session, Some(ahead)).await;
+        assert_eq!(attached["gap"], true, "after {ahead}: {attached}");
+        assert_eq!(attached["replayed"], 0);
+    }
+    assert_eq!(client.attach(&session, Some(1)).await["gap"], false);
+    assert_eq!(
+        client.say(&session, "still served").await["result"]["said"],
+        "still served"
+    );
+}
+
+#[tokio::test]
 async fn a_chat_that_dies_tells_its_clients_and_the_others_keep_running() {
     let backend = backend();
     let mut client = connect(&backend);

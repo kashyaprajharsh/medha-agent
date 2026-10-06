@@ -214,6 +214,26 @@ fn instruction_path(workspace: &Path, kind: &str) -> Result<std::path::PathBuf> 
         _ => bail!("Unknown instructions file"),
     }
 }
+/// One writer at a time per file, across every Medha process. Checking that the
+/// file is still what the editor loaded, and the write that check allows, are
+/// then one step: of two saves made from the same text, one is told it changed.
+fn one_writer<T>(target: &Path, write: impl FnOnce() -> Result<T>) -> Result<T> {
+    use sha2::{Digest, Sha256};
+    let locks = config::medha_home()?.join("locks");
+    std::fs::create_dir_all(&locks)?;
+    let named: String = Sha256::digest(target.as_os_str().as_encoded_bytes())
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(locks.join(format!("{named}.lock")))?;
+    lock.lock()?;
+    write()
+}
+
 fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> {
     match method {
         "settings.list" => Ok(settings(&config::load()?.unwrap_or_default())),
@@ -457,19 +477,21 @@ fn handle_sync(method: &str, params: &Value, workspace: &Path) -> Result<Value> 
             let before = params["before"]
                 .as_str()
                 .ok_or_else(|| anyhow!("Original instructions are required"))?;
-            let current = match std::fs::read_to_string(&path) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(error) => return Err(error.into()),
-            };
-            if current != before {
-                bail!("Instructions changed elsewhere. Reload before saving.");
-            }
-            let temporary = path.with_extension(format!("tmp-{}", ulid::Ulid::new()));
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            std::fs::write(&temporary, content)?;
-            std::fs::rename(&temporary, &path)?;
-            Ok(json!({"saved": true}))
+            one_writer(&path, || {
+                let current = match std::fs::read_to_string(&path) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(error) => return Err(error.into()),
+                };
+                if current != before {
+                    bail!("Instructions changed elsewhere. Reload before saving.");
+                }
+                let temporary = path.with_extension(format!("tmp-{}", ulid::Ulid::new()));
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::write(&temporary, content)?;
+                std::fs::rename(&temporary, &path)?;
+                Ok(json!({"saved": true}))
+            })
         }
         "extensions.list" => {
             let store = plugin_store(workspace)?;

@@ -32,6 +32,43 @@ impl Bridge {
     }
 }
 #[test]
+fn of_several_saves_made_from_the_same_text_one_is_kept_and_the_rest_are_told() {
+    let root = tempfile::tempdir().unwrap();
+    let (workspace, home) = (root.path().join("project"), root.path().join("home"));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let _backend = backend::Backend::start(&home, &[]);
+
+    for round in 0..5 {
+        let before = std::fs::read_to_string(workspace.join("MEDHA.md")).unwrap_or_default();
+        let together = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let editors: Vec<_> = (0..4)
+            .map(|editor| {
+                let (workspace, before, together) =
+                    (workspace.clone(), before.clone(), together.clone());
+                let mut client = backend::Backend::join(&home);
+                std::thread::spawn(move || {
+                    let content = format!("round {round}, editor {editor}");
+                    let save = json!({"kind": "project", "before": before, "content": content});
+                    together.wait();
+                    client
+                        .ask(&workspace, "instructions.save", save)
+                        .map(|_| content)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = editors
+            .into_iter()
+            .map(|editor| editor.join().unwrap())
+            .collect();
+        let kept: Vec<_> = outcomes.iter().flatten().collect();
+        assert_eq!(kept.len(), 1, "round {round}: {outcomes:?}");
+        let written = std::fs::read_to_string(workspace.join("MEDHA.md")).unwrap();
+        assert_eq!(&written, kept[0], "the file is not the save that was kept");
+    }
+}
+
+#[test]
 fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("project");

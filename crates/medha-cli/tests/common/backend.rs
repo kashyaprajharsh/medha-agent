@@ -13,10 +13,10 @@ const ROLES: wire::Roles = wire::Roles {
 };
 
 pub struct Backend {
-    child: Child,
+    child: Option<Child>,
     runtime: tokio::runtime::Runtime,
-    reader: BufReader<Box<dyn AsyncRead + Unpin>>,
-    writer: Box<dyn AsyncWrite + Unpin>,
+    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
     asked: u64,
 }
 
@@ -34,6 +34,14 @@ impl Backend {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        let mut joined = Self::join(home);
+        joined.child = Some(child);
+        joined
+    }
+
+    /// One more client of the backend that runs, or is starting, for `home`.
+    #[allow(dead_code)]
+    pub fn join(home: &Path) -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -46,9 +54,9 @@ impl Backend {
                     && let Ok(stream) = wire::connect(&address).await
                 {
                     let (read, write) = tokio::io::split(stream);
-                    let mut reader: BufReader<Box<dyn AsyncRead + Unpin>> =
+                    let mut reader: BufReader<Box<dyn AsyncRead + Unpin + Send>> =
                         BufReader::new(Box::new(read));
-                    let mut writer: Box<dyn AsyncWrite + Unpin> = Box::new(write);
+                    let mut writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(write);
                     wire::greet(&mut reader, &mut writer, &token, ROLES)
                         .await
                         .expect("the backend did not admit a client holding its token");
@@ -59,7 +67,7 @@ impl Backend {
             }
         });
         Self {
-            child,
+            child: None,
             runtime,
             reader,
             writer,
@@ -96,7 +104,9 @@ impl Backend {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }

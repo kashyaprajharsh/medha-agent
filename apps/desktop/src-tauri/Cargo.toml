@@ -27,8 +27,12 @@ dirs = "6"
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "net"] }
 media = { path = "../../../crates/media" }
 wire = { path = "../../../crates/wire" }
+medha-client = { path = "../../../crates/medha-client" }
 transcript-view = { path = "../../../crates/transcript-view" }
 tauri-plugin-updater = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+medha-client = { path = "../../../crates/medha-client", features = ["test-support"] }

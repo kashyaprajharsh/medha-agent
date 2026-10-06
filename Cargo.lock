@@ -858,7 +858,16 @@ version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
 dependencies = [
- "dirs-sys",
+ "dirs-sys 0.4.1",
+]
+
+[[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys 0.5.0",
 ]
 
 [[package]]
@@ -869,8 +878,20 @@ checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users",
+ "redox_users 0.4.6",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users 0.5.3",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2181,7 +2202,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 name = "lsp"
 version = "0.1.10"
 dependencies = [
- "dirs",
+ "dirs 5.0.1",
  "fd-lock",
  "futures",
  "libc",
@@ -2265,7 +2286,7 @@ name = "mcp"
 version = "0.1.10"
 dependencies = [
  "async-trait",
- "dirs",
+ "dirs 5.0.1",
  "futures",
  "libc",
  "oauth2",
@@ -2308,7 +2329,7 @@ dependencies = [
  "clap",
  "context",
  "crossterm",
- "dirs",
+ "dirs 5.0.1",
  "extensions",
  "flate2",
  "futures",
@@ -2320,6 +2341,7 @@ dependencies = [
  "lockfile",
  "lsp",
  "mcp",
+ "medha-client",
  "media",
  "memory",
  "orchestrator",
@@ -2351,6 +2373,17 @@ dependencies = [
  "unicode-width 0.2.0",
  "url",
  "windows-sys 0.60.2",
+ "wire",
+]
+
+[[package]]
+name = "medha-client"
+version = "0.1.10"
+dependencies = [
+ "dirs 6.0.0",
+ "libc",
+ "serde_json",
+ "tokio",
  "wire",
 ]
 
@@ -2791,7 +2824,7 @@ name = "permissions"
 version = "0.1.10"
 dependencies = [
  "async-trait",
- "dirs",
+ "dirs 5.0.1",
  "fd-lock",
  "kernel",
  "serde",
@@ -3114,7 +3147,7 @@ version = "0.1.10"
 dependencies = [
  "async-stream",
  "async-trait",
- "dirs",
+ "dirs 5.0.1",
  "futures",
  "kernel",
  "reqwest 0.12.28",
@@ -3458,6 +3491,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_users"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60dc65c0ff1a7ae1294b0c67b9f14baf70b644404010370171787bfac1038fc0"
+dependencies = [
+ "libredox",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3618,7 +3661,7 @@ dependencies = [
  "base64",
  "chrono",
  "context",
- "dirs",
+ "dirs 5.0.1",
  "extensions",
  "fd-lock",
  "futures",

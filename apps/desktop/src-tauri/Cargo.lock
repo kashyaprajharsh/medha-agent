@@ -2045,6 +2045,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "medha-client"
+version = "0.1.10"
+dependencies = [
+ "dirs",
+ "libc",
+ "serde_json",
+ "tokio",
+ "wire",
+]
+
+[[package]]
 name = "medha-desktop"
 version = "0.1.10"
 dependencies = [
@@ -2052,6 +2063,7 @@ dependencies = [
  "dirs",
  "getrandom 0.3.4",
  "libc",
+ "medha-client",
  "media",
  "portable-pty",
  "rfd",

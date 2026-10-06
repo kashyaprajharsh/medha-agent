@@ -4,6 +4,12 @@ use std::sync::mpsc::{Receiver, channel};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+// GAP-007: immediate PTY teardown can stall macOS's terminal subsystem. These
+// functional tests must not make one another's live shell miss its deadline.
+// This isolates the tests; it does not fix the recorded teardown latency.
+#[cfg(unix)]
+static SHELL_TEST: Mutex<()> = Mutex::new(());
+
 #[test]
 fn rejects_invalid_dimensions_keys_and_oversized_input() {
     let terminals = Terminals::new(PathBuf::from("."));
@@ -70,6 +76,9 @@ fn until(rx: &Receiver<Value>, needle: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn real_shell_has_a_tty_workspace_unicode_resize_and_interrupts() {
+    let _alone = SHELL_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let workspace = std::env::temp_dir().canonicalize().unwrap();
     let terminals = Terminals::new(workspace.clone());
     let rx = shell(&terminals, "interactive");
@@ -87,7 +96,22 @@ fn real_shell_has_a_tty_workspace_unicode_resize_and_interrupts() {
         .unwrap();
     let output = until(&rx, "__TTY__\r\n");
     assert!(output.contains(workspace.to_str().unwrap()), "{output}");
+    // Output precedes the shell's job/terminal restoration. Its next prompt
+    // establishes that the previous foreground job has settled before resize.
+    if !output
+        .rsplit_once("__TTY__\r\n")
+        .unwrap()
+        .1
+        .contains("__PROMPT__ ")
+    {
+        until(&rx, "__PROMPT__ ");
+    }
     terminals.resize("interactive", 97, 31).unwrap();
+    {
+        let open = terminals.open.lock().unwrap();
+        let actual = open.get("interactive").unwrap().master.get_size().unwrap();
+        assert_eq!((actual.cols, actual.rows), (97, 31));
+    }
     terminals
         .write("interactive", "stty size; printf 'नमस्ते\\n__RESIZED__\\n'\r")
         .unwrap();
@@ -121,6 +145,9 @@ fn real_shell_has_a_tty_workspace_unicode_resize_and_interrupts() {
 #[cfg(unix)]
 #[test]
 fn closing_a_tab_releases_its_shell_and_rejects_further_input() {
+    let _alone = SHELL_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let terminals = Terminals::new(std::env::temp_dir());
     let rx = shell(&terminals, "closing");
     terminals.close("closing").unwrap();

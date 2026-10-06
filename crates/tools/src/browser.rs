@@ -129,6 +129,11 @@ pub(crate) fn browser_args(
         format!("--window-size={},{}", size.0, size.1),
         format!("--screenshot={}", out.display()),
     ];
+    // Windows CI has no hardware graphics session. Software rendering keeps
+    // the renderer sandbox and avoids depending on its GPU driver/session.
+    #[cfg(windows)]
+    args.push("--disable-gpu".into());
+    args.extend(["--enable-logging=stderr".into(), "--log-level=1".into()]);
     let own = page_host
         .and_then(|host| host.rsplit_once(':'))
         .map(|(name, _)| name);

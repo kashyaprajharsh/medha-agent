@@ -147,6 +147,7 @@ jobs:
       - name: Test
         env:
           MEDHA_REQUIRE_NATIVE_SANDBOX: ${{ runner.os != 'Windows' && '1' || '' }}
+          MEDHA_REQUIRE_BROWSER: "1"
         run: cargo test --workspace --all-targets --no-fail-fast
 
   # The desktop app has its own dependency graph: a window in TypeScript and a

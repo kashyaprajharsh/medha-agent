@@ -25,6 +25,29 @@ fn stop_browser(mut child: std::process::Child) {
     let _ = child.wait();
 }
 
+fn browser_log(base: &Path) -> std::process::Stdio {
+    std::fs::File::create(base.join("browser.stderr.log"))
+        .unwrap()
+        .into()
+}
+
+fn browser_failure(base: &Path, browser: &Path) -> String {
+    format!(
+        "browser {}: {}",
+        browser.display(),
+        std::fs::read_to_string(base.join("browser.stderr.log")).unwrap_or_default()
+    )
+}
+
+fn installed_browser() -> Option<PathBuf> {
+    let browser = find_browser();
+    assert!(
+        browser.is_some() || std::env::var("MEDHA_REQUIRE_BROWSER").as_deref() != Ok("1"),
+        "this job requires real browser coverage; install a Chromium-family browser or set MEDHA_BROWSER"
+    );
+    browser
+}
+
 fn get(server: &PageServer, path: &str, host: &str) -> String {
     let port = server.host.rsplit_once(':').unwrap().1;
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
@@ -154,7 +177,7 @@ fn without_a_grant_every_connection_but_the_page_server_is_dead() {
 /// Real browser: the page renders offline and reaches no other address, loopback included.
 #[test]
 fn a_real_render_shows_the_page_and_reaches_nothing_else() {
-    let Some(browser) = find_browser() else {
+    let Some(browser) = installed_browser() else {
         return;
     };
     let base = scratch("render");
@@ -187,7 +210,7 @@ fn a_real_render_shows_the_page_and_reaches_nothing_else() {
             false,
         ))
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(browser_log(base.path()))
         .spawn()
         .unwrap();
     let started = Instant::now();
@@ -200,7 +223,12 @@ fn a_real_render_shows_the_page_and_reaches_nothing_else() {
         spy.accept().is_err(),
         "a page rendered without network reached another local port"
     );
-    let png = std::fs::read(&out).expect("the page must render");
+    let png = std::fs::read(&out).unwrap_or_else(|error| {
+        panic!(
+            "the page must render: {error}; {}",
+            browser_failure(base.path(), &browser)
+        )
+    });
     let shot = image::load_from_memory(&png).unwrap().to_rgb8();
     let corner = shot.get_pixel(4, shot.height() - 4).0;
     assert_eq!(
@@ -213,7 +241,7 @@ fn a_real_render_shows_the_page_and_reaches_nothing_else() {
 /// With network on, another localhost service a page reaches never sees the token.
 #[test]
 fn another_local_service_never_receives_the_page_credential() {
-    let Some(browser) = find_browser() else {
+    let Some(browser) = installed_browser() else {
         return;
     };
     let base = scratch("leak");
@@ -241,7 +269,7 @@ fn another_local_service_never_receives_the_page_credential() {
             true,
         ))
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(browser_log(base.path()))
         .spawn()
         .unwrap();
     let mut seen = Vec::new();
@@ -265,7 +293,11 @@ fn another_local_service_never_receives_the_page_credential() {
         std::thread::sleep(Duration::from_millis(100));
     }
     stop_browser(child);
-    assert!(!seen.is_empty(), "the page never reached the other service");
+    assert!(
+        !seen.is_empty(),
+        "the page never reached the other service; {}",
+        browser_failure(base.path(), &browser)
+    );
     for request in &seen {
         assert!(
             !request.to_lowercase().contains(&token),
@@ -342,7 +374,7 @@ impl kernel::ArtifactStore for MemArtifacts {
 /// `read` with `render: true` returns the picture; an ungranted URL never starts a browser.
 #[tokio::test]
 async fn read_render_returns_the_page_as_an_image_and_refuses_ungranted_urls() {
-    let Some(browser) = find_browser() else {
+    let Some(browser) = installed_browser() else {
         return;
     };
     let base = scratch("read");

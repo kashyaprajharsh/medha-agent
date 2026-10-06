@@ -15,6 +15,16 @@ pub const CAPABILITIES: &[&str] = &[
     "session-lease",
     "priority-controls",
     "history-omissions",
+    "safe-abandon",
+    "replay-stream",
+    "terminal-controls",
+];
+pub const CLIENT_CAPABILITIES: &[&str] = &[
+    "lifecycle",
+    "session-lease",
+    "priority-controls",
+    "history-omissions",
+    "safe-abandon",
 ];
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
@@ -49,6 +59,7 @@ pub fn is_control(method: &str) -> bool {
             | "exit"
             | "session.close"
             | "session.detach"
+            | "session.abandon"
             | "session.attach"
             | "agent.control"
     )
@@ -106,6 +117,12 @@ fn nonce() -> Option<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).ok()?;
     Some(hex(&bytes))
+}
+
+/// A stream incarnation must change across process restarts and durable-id
+/// reuse; sequence numbers alone cannot identify it.
+pub fn stream_id() -> Option<String> {
+    nonce()
 }
 
 /// Each side proves it holds the token without sending it.

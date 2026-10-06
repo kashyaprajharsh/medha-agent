@@ -644,7 +644,7 @@ fn closing_a_chat_never_reaches_a_later_chat_resumed_under_its_id() {
         let frames = Arc::clone(frames);
         Arc::new(move |said| {
             let frame = match said {
-                Said::Frame(frame) => frame,
+                Said::Frame(frame) | Said::Event { frame, .. } => frame,
                 Said::Ended(_) => json!({ "method": "ended" }),
             };
             frames.lock().unwrap().push(frame);

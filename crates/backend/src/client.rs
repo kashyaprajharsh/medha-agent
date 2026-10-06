@@ -150,25 +150,55 @@ impl<C: Chats> Drop for Leaving<C> {
     }
 }
 
-/// Chats a client started tied: each ends once nobody watches it. This is the
-/// client's list of them, for the one case the chat cannot see for itself: its
-/// starter going before anyone watched it at all.
+/// Starts belong to their creating client until abandoned or disconnected.
+/// Only chats tied to viewers end on disconnect; independently owned jobs
+/// retain their lifetime. Every start can be abandoned while unwatched.
 #[derive(Clone, Default)]
-struct Tied(Arc<Mutex<Vec<Weak<Session>>>>);
+struct Tied(Arc<Mutex<Vec<Started>>>);
+
+struct Started {
+    chat: Weak<Session>,
+    tied: bool,
+}
 
 impl Tied {
-    fn add(&self, session: &Arc<Session>) {
-        session.tie();
+    fn add(&self, session: &Arc<Session>, tied_to_viewers: bool) {
+        if tied_to_viewers {
+            session.tie();
+        }
         let mut tied = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        tied.retain(|chat| chat.strong_count() > 0);
-        tied.push(Arc::downgrade(session));
+        tied.retain(|start| start.chat.strong_count() > 0);
+        tied.push(Started {
+            chat: Arc::downgrade(session),
+            tied: tied_to_viewers,
+        });
     }
 
     fn close(&self) {
         let tied = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
-        for session in tied.iter().filter_map(Weak::upgrade) {
+        for session in tied
+            .iter()
+            .filter(|start| start.tied)
+            .filter_map(|start| start.chat.upgrade())
+        {
             session.close_if_unwatched();
         }
+    }
+
+    /// A late start is this creator's to retire only while nobody follows it.
+    /// The pointer check prevents reuse of its durable id granting authority
+    /// over a later incarnation started by another client.
+    fn abandon(&self, session: &Arc<Session>) -> Result<Value, String> {
+        let created = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !created.iter().any(|start| {
+            start
+                .chat
+                .upgrade()
+                .is_some_and(|own| Arc::ptr_eq(&own, session))
+        }) {
+            return Err("only the client that created this chat can abandon its start".into());
+        }
+        Ok(json!({"abandoned": session.close_if_unwatched()}))
     }
 }
 
@@ -218,10 +248,8 @@ async fn handle<C: Chats>(
                 .as_ref()
                 .ok()
                 .and_then(|made| made["session"].as_str());
-            if frame["params"]["ends_with_client"] == true
-                && let Some(session) = made.and_then(|id| backend.find(id).ok())
-            {
-                tied.add(&session);
+            if let Some(session) = made.and_then(|id| backend.find(id).ok()) {
+                tied.add(&session, frame["params"]["ends_with_client"] == true);
                 // The client may have gone while its chat was starting.
                 if me.dropped.is_cancelled() {
                     tied.close();
@@ -239,10 +267,20 @@ async fn handle<C: Chats>(
             backend.upgrade(frame["params"]["build"].as_str())
         }
         "session.list" if named.is_none() => Ok(backend.list()),
-        "session.attach" => session("session.attach").map(|session| {
+        "session.attach" => session("session.attach").and_then(|session| {
+            let result = session
+                .attach(
+                    me,
+                    frame["params"]["after"].as_u64(),
+                    frame["params"]["stream"].as_str(),
+                )
+                .map_err(refused)?;
             attached.insert(session.id.clone());
-            session.attach(me, frame["params"]["after"].as_u64())
+            Ok(result)
         }),
+        "session.abandon" => {
+            session("session.abandon").and_then(|session| tied.abandon(&session).map_err(refused))
+        }
         "session.detach" => session("session.detach").map(|session| {
             attached.remove(&session.id);
             session.detach(me.id);

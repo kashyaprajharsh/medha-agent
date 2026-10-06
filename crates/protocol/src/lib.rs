@@ -268,6 +268,8 @@ pub struct ChatAbout {
 pub struct LiveSession {
     pub session: String,
     #[serde(default)]
+    pub stream: Option<String>,
+    #[serde(default)]
     pub about: Option<ChatAbout>,
     #[serde(default)]
     pub head: u64,
@@ -281,19 +283,29 @@ pub struct SessionList {
 }
 empty_command!(ListSessions, "session.list", Service, SessionList);
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Attach {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 command!(Attach, "session.attach", Chat, Attached);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attached {
     pub session: String,
+    #[serde(default)]
+    pub stream: Option<String>,
     pub head: u64,
     pub replayed: usize,
     pub gap: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cursor {
+    pub stream: String,
+    pub after: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -372,7 +372,7 @@ impl Inner {
                 nudge.close();
             };
             move |said| match said {
-                Said::Frame(frame) => {
+                Said::Frame(frame) | Said::Event { frame, .. } => {
                     if rest.answer(&frame) {
                         return;
                     }

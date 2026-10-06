@@ -285,6 +285,104 @@ async fn until(what: &str, mut holds: impl FnMut() -> bool) {
 }
 
 #[tokio::test]
+async fn abandoning_a_start_is_creator_only_and_preserves_another_viewer() {
+    let backend = backend();
+    let (mut creator, mut viewer) = (connect(&backend), connect(&backend));
+    let made = creator.ask("session.create", None, json!({})).await;
+    let id = made["result"]["session"].as_str().unwrap();
+    assert!(
+        viewer
+            .ask("session.abandon", Some(id), json!({}))
+            .await
+            .get("error")
+            .is_some()
+    );
+    viewer.attach(id, None).await;
+    assert_eq!(
+        creator.ask("session.abandon", Some(id), json!({})).await["result"]["abandoned"],
+        false
+    );
+    assert_eq!(
+        viewer.say(id, "still here").await["result"]["said"],
+        "still here"
+    );
+    viewer.ask("session.detach", Some(id), json!({})).await;
+    // Independently owned chats also permit explicit abandonment of an
+    // unwatched start, but do not end just because their starter disconnects.
+    assert_eq!(
+        creator.ask("session.abandon", Some(id), json!({})).await["result"]["abandoned"],
+        true
+    );
+    until("abandoned start ends", || backend.live() == 0).await;
+}
+
+#[tokio::test]
+async fn an_old_creator_cannot_abandon_a_later_incarnation() {
+    let backend = backend();
+    let (mut first, mut second) = (connect(&backend), connect(&backend));
+    first
+        .ask("session.create", None, json!({"resume": "same"}))
+        .await;
+    first.attach("same", None).await;
+    first.ask("session.close", Some("same"), json!({})).await;
+    until("first incarnation ends", || backend.live() == 0).await;
+    second
+        .ask("session.create", None, json!({"resume": "same"}))
+        .await;
+    assert!(
+        first
+            .ask("session.abandon", Some("same"), json!({}))
+            .await
+            .get("error")
+            .is_some()
+    );
+    second.attach("same", None).await;
+    assert_eq!(second.say("same", "later").await["result"]["said"], "later");
+}
+
+#[tokio::test]
+async fn replay_cursors_identify_the_incarnation_even_when_the_heads_match() {
+    let backend = backend();
+    let (mut first, mut second) = (connect(&backend), connect(&backend));
+    let first_made = first
+        .ask("session.create", None, json!({"resume": "same"}))
+        .await;
+    let old = first_made["result"]["stream"].clone();
+    first.attach("same", None).await;
+    first.say("same", "old").await;
+    first.ask("session.close", Some("same"), json!({})).await;
+    until("first incarnation ends", || backend.live() == 0).await;
+    let second_made = second
+        .ask("session.create", None, json!({"resume": "same"}))
+        .await;
+    let current = second_made["result"]["stream"].clone();
+    assert_ne!(old, current);
+    second.attach("same", None).await;
+    second.say("same", "new").await;
+    let mut returning = connect(&backend);
+    let attached = returning
+        .ask(
+            "session.attach",
+            Some("same"),
+            json!({"after": 1, "stream": old}),
+        )
+        .await;
+    assert_eq!(attached["result"]["gap"], true);
+    assert_eq!(attached["result"]["replayed"], 0);
+    assert_eq!(attached["result"]["stream"], current);
+    let replay = returning
+        .ask(
+            "session.attach",
+            Some("same"),
+            json!({"after": 0, "stream": current}),
+        )
+        .await;
+    assert_eq!(replay["result"]["gap"], false);
+    assert_eq!(replay["result"]["replayed"], 1);
+    assert_eq!(returning.event().await.1["params"]["text"], "new");
+}
+
+#[tokio::test]
 async fn two_clients_on_one_chat_see_one_stream_and_each_gets_only_its_own_answer() {
     let backend = backend();
     let (mut first, mut second) = (connect(&backend), connect(&backend));

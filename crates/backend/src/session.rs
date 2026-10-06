@@ -33,6 +33,7 @@ const URGENT_BYTES: usize = 64 * 1024;
 
 pub(crate) struct Session {
     pub(crate) id: String,
+    incarnation: String,
     about: Value,
     /// What the chat is asked, in the order it was asked.
     input: mpsc::Sender<String>,
@@ -95,6 +96,7 @@ struct Stream {
 impl Session {
     pub(crate) fn new(
         id: String,
+        incarnation: String,
         about: Value,
         input: Input,
         control: Option<crate::Control>,
@@ -106,6 +108,7 @@ impl Session {
         tokio::spawn(feeding);
         Arc::new(Self {
             id,
+            incarnation,
             about,
             input: asked,
             urgent,
@@ -127,6 +130,7 @@ impl Session {
         let stream = self.stream();
         json!({
             "session": self.id,
+            "stream": self.incarnation,
             "about": self.about,
             "head": stream.seq,
             "clients": stream.viewers.len(),
@@ -146,26 +150,42 @@ impl Session {
     }
 
     /// Replay and subscription happen under one lock, so nothing is missed or repeated.
-    pub(crate) fn attach(&self, client: &Client, after: Option<u64>) -> Value {
+    pub(crate) fn attach(
+        &self,
+        client: &Client,
+        after: Option<u64>,
+        incarnation: Option<&str>,
+    ) -> Result<Value, String> {
         let mut stream = self.stream();
-        let after = after.unwrap_or(stream.seq);
-        let oldest = stream.kept.front().map_or(stream.seq + 1, |(seq, _)| *seq);
+        if self.closing.is_cancelled() {
+            return Err("this chat is ending".into());
+        }
+        let replaced = incarnation.is_some_and(|expected| expected != self.incarnation);
+        let after = if replaced {
+            stream.seq
+        } else {
+            after.unwrap_or(stream.seq)
+        };
+        let oldest = stream
+            .kept
+            .front()
+            .map_or(stream.seq.saturating_add(1), |(seq, _)| *seq);
         // Events older than what is kept, or a cursor from before a restart.
-        let gap = after.saturating_add(1) < oldest || after > stream.seq;
+        let gap = replaced || after.saturating_add(1) < oldest || after > stream.seq;
         let mut replayed = 0;
         for (_, line) in stream.kept.iter().filter(|(seq, _)| *seq > after) {
             client.send(line.clone());
             replayed += 1;
         }
         stream.viewers.insert(client.id, client.clone());
-        json!({ "session": self.id, "head": stream.seq, "replayed": replayed, "gap": gap })
+        Ok(
+            json!({ "session": self.id, "stream": self.incarnation, "head": stream.seq, "replayed": replayed, "gap": gap }),
+        )
     }
 
     pub(crate) fn detach(&self, client: u64) {
-        let unwatched = {
-            let mut stream = self.stream();
-            stream.viewers.remove(&client).is_some() && stream.viewers.is_empty()
-        };
+        let mut stream = self.stream();
+        let unwatched = stream.viewers.remove(&client).is_some() && stream.viewers.is_empty();
         if unwatched && self.tied.load(Ordering::Relaxed) {
             self.close();
         }
@@ -178,9 +198,13 @@ impl Session {
     }
 
     /// For a tied chat whose starter has gone: one nobody ever watched ends now.
-    pub(crate) fn close_if_unwatched(&self) {
-        if self.stream().viewers.is_empty() {
+    pub(crate) fn close_if_unwatched(&self) -> bool {
+        let stream = self.stream();
+        if stream.viewers.is_empty() {
             self.close();
+            true
+        } else {
+            false
         }
     }
 
@@ -314,7 +338,7 @@ impl Session {
         let event = line(&json!({
             "jsonrpc": "2.0",
             "method": "session.event",
-            "params": { "session": self.id, "seq": seq, "frame": frame },
+            "params": { "session": self.id, "stream": self.incarnation, "seq": seq, "frame": frame },
         }));
         stream.kept_bytes += event.len();
         stream.kept.push_back((seq, event.clone()));

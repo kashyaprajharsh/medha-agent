@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
 
+mod view;
+pub use view::{View, ViewLimits};
+
 const ROLES: wire::Roles = wire::Roles {
     host: "backend",
     guest: "client",
@@ -44,16 +47,29 @@ pub const OPEN_ELSEWHERE: &str =
 
 /// What a chat is told: a frame it wrote or was answered with, or that it is over.
 pub enum Said {
+    /// An RPC reply is not part of the replay stream.
     Frame(Value),
+    Event {
+        stream: Option<String>,
+        seq: u64,
+        frame: Value,
+    },
     Ended(Option<String>),
 }
 
 pub type Hear = Arc<dyn Fn(Said) + Send + Sync>;
 
 /// A chat as it was opened here. One resumed later under the same id is another chat.
+#[derive(Clone)]
 pub struct Chat {
     session: String,
     opened: u64,
+}
+
+impl Chat {
+    pub fn id(&self) -> &str {
+        &self.session
+    }
 }
 
 enum Reply {
@@ -178,6 +194,25 @@ impl Drop for Pending<'_> {
     }
 }
 
+/// An attach/create future owns its partially opened viewer until it returns.
+/// Cancellation cannot leave an attachment or a newly created chat orphaned.
+struct Opening<'a> {
+    connection: &'a Connection,
+    chat: Option<Chat>,
+    created: bool,
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        if let Some(chat) = self.chat.take() {
+            self.connection.leave(&chat);
+            if self.created {
+                self.connection.close_late(&json!({"session": chat.id()}));
+            }
+        }
+    }
+}
+
 fn outcome(mut frame: Value) -> Result<Value, String> {
     match frame["error"]["message"].as_str() {
         Some(error) => Err(error.to_owned()),
@@ -274,13 +309,26 @@ impl Connection {
     }
 
     async fn ask_async(&self, frame: Value, within: Duration) -> Result<Value, String> {
+        self.ask_async_for(frame, within, None).await
+    }
+
+    async fn ask_async_for(
+        &self,
+        frame: Value,
+        within: Duration,
+        chat: Option<&Chat>,
+    ) -> Result<Value, String> {
         let starts = frame["method"] == "session.create";
         let (answer, answered) = tokio::sync::oneshot::channel();
-        let id = self.post(
-            &mut self.routes(),
-            frame,
-            Some(Reply::Async { answer, starts }),
-        )?;
+        let id = {
+            let mut routes = self.routes();
+            if let Some(chat) = chat
+                && routes.hearing(chat.id(), Some(chat.opened)).is_none()
+            {
+                return Err(STOPPED.into());
+            }
+            self.post(&mut routes, frame, Some(Reply::Async { answer, starts }))?
+        };
         let mut pending = Pending {
             connection: self,
             id,
@@ -357,6 +405,94 @@ impl Connection {
         self.decoded::<T>(self.request(Self::frame(scope, params)?).await?)
     }
 
+    /// Validating and registering under one lock prevents a stale viewer from
+    /// sending a control command into a later incarnation of the same id.
+    pub async fn call_chat<T: protocol::Command>(
+        &self,
+        chat: &Chat,
+        params: &T,
+    ) -> Result<T::Output, String> {
+        let frame = Self::frame(protocol::Scope::Chat(chat.id()), params)?;
+        let within = if wire::slow_request(T::METHOD) {
+            EVENTUALLY
+        } else {
+            SOON
+        };
+        self.decoded::<T>(self.ask_async_for(frame, within, Some(chat)).await?)
+    }
+
+    fn listen(&self, session: String, hear: Hear) -> Result<Chat, String> {
+        let mut routes = self.routes();
+        if routes.gone {
+            return Err(STOPPED.into());
+        }
+        if routes.chats.contains_key(&session) {
+            return Err("This connection already watches that chat".into());
+        }
+        routes.next += 1;
+        let opened = routes.next;
+        routes.chats.insert(session.clone(), (opened, hear));
+        routes.over.remove(&session);
+        Ok(Chat { session, opened })
+    }
+
+    pub async fn attach_chat(
+        &self,
+        session: String,
+        cursor: Option<protocol::Cursor>,
+        hear: Hear,
+    ) -> Result<(Chat, protocol::Attached), String> {
+        let chat = self.listen(session, hear)?;
+        let mut opening = Opening {
+            connection: self,
+            chat: Some(chat),
+            created: false,
+        };
+        let params = protocol::Attach {
+            after: cursor.as_ref().map(|c| c.after),
+            stream: cursor.map(|c| c.stream),
+        };
+        let attached = self
+            .call_chat(opening.chat.as_ref().expect("opening viewer"), &params)
+            .await?;
+        Ok((opening.chat.take().expect("opened viewer"), attached))
+    }
+
+    pub async fn create_chat(
+        &self,
+        params: &protocol::CreateSession,
+        hear: Hear,
+    ) -> Result<(Chat, protocol::LiveSession, protocol::Attached), String> {
+        let made = self.call_async(protocol::Scope::Service, params).await?;
+        let chat = match self.listen(made.session.clone(), hear) {
+            Ok(chat) => chat,
+            Err(error) => {
+                self.close_late(&json!({"session": made.session}));
+                return Err(error);
+            }
+        };
+        let mut opening = Opening {
+            connection: self,
+            chat: Some(chat),
+            created: true,
+        };
+        let attached = self
+            .call_chat(
+                opening.chat.as_ref().expect("opening chat"),
+                &protocol::Attach {
+                    after: Some(0),
+                    stream: made.stream.clone(),
+                },
+            )
+            .await?;
+        if attached.session != made.session
+            || made.stream.is_some() && attached.stream != made.stream
+        {
+            return Err("The chat ended while it was opening. Try again.".into());
+        }
+        Ok((opening.chat.take().expect("opened chat"), made, attached))
+    }
+
     /// One question about a folder: its history, settings or extensions.
     pub fn about(&self, folder: &Path, mut request: Value) -> Result<Value, String> {
         let waited = if wire::slow_request(request["method"].as_str().unwrap_or_default()) {
@@ -423,23 +559,31 @@ impl Connection {
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let session = made.session;
-        let opened = {
-            let mut routes = self.routes();
-            routes.next += 1;
-            let opened = routes.next;
-            routes.chats.insert(session.clone(), (opened, hear));
-            routes.over.remove(&session);
-            opened
+        let chat = match self.listen(made.session.clone(), hear) {
+            Ok(chat) => chat,
+            Err(error) => {
+                self.close_late(&json!({"session": made.session}));
+                return Err(error);
+            }
         };
-        if let Err(error) = self.call(
-            protocol::Scope::Chat(&session),
-            &protocol::Attach { after: Some(0) },
-        ) {
-            self.routes().chats.remove(&session);
-            return Err(error);
+        let mut opening = Opening {
+            connection: self,
+            chat: Some(chat),
+            created: true,
+        };
+        let attached = self.call(
+            protocol::Scope::Chat(&made.session),
+            &protocol::Attach {
+                after: Some(0),
+                stream: made.stream.clone(),
+            },
+        )?;
+        if attached.session != made.session
+            || made.stream.is_some() && attached.stream != made.stream
+        {
+            return Err("The chat ended while it was opening. Try again.".into());
         }
-        Ok(Chat { session, opened })
+        Ok(opening.chat.take().expect("opened chat"))
     }
 
     /// A chat's own request; one with an id is answered among the chat's frames.
@@ -479,6 +623,10 @@ impl Connection {
             let Some(session) = frame["params"]["session"].as_str().map(str::to_owned) else {
                 return;
             };
+            let Some(seq) = frame["params"]["seq"].as_u64() else {
+                return;
+            };
+            let stream = frame["params"]["stream"].as_str().map(str::to_owned);
             let said = frame["params"]["frame"].take();
             if said["method"] == "session.ended" {
                 let ended = {
@@ -497,7 +645,11 @@ impl Connection {
             } else {
                 let hear = self.routes().hearing(&session, None);
                 if let Some(hear) = hear {
-                    hear(Said::Frame(said));
+                    hear(Said::Event {
+                        stream,
+                        seq,
+                        frame: said,
+                    });
                 }
             }
             return;
@@ -560,13 +712,11 @@ impl Connection {
     fn close_late(&self, made: &Value) {
         if let Some(session) = made["session"].as_str() {
             let mut routes = self.routes();
-            for method in ["session.attach", "session.close"] {
-                let _ = self.post(
-                    &mut routes,
-                    json!({ "method": method, "session": session }),
-                    None,
-                );
-            }
+            let _ = self.post(
+                &mut routes,
+                json!({ "method": "session.abandon", "session": session }),
+                None,
+            );
         }
     }
 
@@ -667,13 +817,21 @@ enum Fit {
 /// everything this build relies on, whatever build it is. It is asked to give
 /// way only when it cannot. `stale` adds: or when it is merely another build,
 /// which is how a build under development replaces the one left running before it.
+#[cfg(test)]
 fn fit(welcome: &Value, stale: bool) -> Fit {
+    fit_for(welcome, stale, &[])
+}
+
+fn fit_for(welcome: &Value, stale: bool, required: &[&str]) -> Fit {
     let offers = |capability: &str| {
         welcome["capabilities"]
             .as_array()
             .is_some_and(|all| all.iter().any(|one| one == capability))
     };
-    let lacking = wire::CAPABILITIES.iter().any(|needed| !offers(needed));
+    let lacking = wire::CLIENT_CAPABILITIES
+        .iter()
+        .chain(required)
+        .any(|needed| !offers(needed));
     let other = stale && welcome["build"] != wire::BUILD_ID;
     match (lacking, other) {
         (false, false) => Fit::Join,
@@ -684,7 +842,17 @@ fn fit(welcome: &Value, stale: bool) -> Fit {
 
 /// `fresh` says a backend was started for this very attempt: whatever build
 /// answers then is the one there is to use.
+#[cfg(any(test, feature = "test-support"))]
 async fn join(address: String, token: String, fresh: bool) -> Result<Arc<Connection>, Refused> {
+    join_for(address, token, fresh, &[]).await
+}
+
+async fn join_for(
+    address: String,
+    token: String,
+    fresh: bool,
+    required: &[&str],
+) -> Result<Arc<Connection>, Refused> {
     let stream = wire::connect(&address).await.map_err(|_| Refused::Absent)?;
     let (reading, mut writing) = tokio::io::split(stream);
     let mut reader = BufReader::new(reading);
@@ -695,7 +863,7 @@ async fn join(address: String, token: String, fresh: bool) -> Result<Arc<Connect
     if welcome["protocol"] != PROTOCOL {
         return Err(Refused::Incompatible);
     }
-    match fit(welcome, cfg!(debug_assertions) && !fresh) {
+    match fit_for(welcome, cfg!(debug_assertions) && !fresh, required) {
         Fit::Join => {}
         Fit::Legacy => return Err(Refused::Legacy),
         Fit::GiveWay { needed } => {
@@ -784,6 +952,7 @@ pub struct Backend {
     env: Vec<(String, String)>,
     /// One started for a test is stopped with it; the app's own is left for whoever comes next.
     owned: bool,
+    required: &'static [&'static str],
     link: Mutex<Link>,
 }
 
@@ -796,9 +965,27 @@ impl Backend {
                 find,
                 env: Vec::new(),
                 owned: false,
+                required: &[],
                 link: Mutex::default(),
             })
         }))
+    }
+
+    /// A frontend declares the application features it actually uses in
+    /// addition to the common transport requirements. A compatible backend
+    /// lacking them must give way safely or refuse startup while it has work.
+    pub fn for_surface(
+        find: fn() -> Result<PathBuf, String>,
+        required: &'static [&'static str],
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            find,
+            executable: None,
+            env: vec![],
+            owned: false,
+            required,
+            link: Mutex::default(),
+        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -808,6 +995,7 @@ impl Backend {
             find: || Err("an isolated backend needs an executable".into()),
             env,
             owned: true,
+            required: &[],
             link: Mutex::default(),
         })
     }
@@ -845,10 +1033,14 @@ impl Backend {
             return Err(Refused::Absent);
         };
         let (joined, outcome) = mpsc::sync_channel(1);
+        let required = self.required;
         reading().spawn(async move {
-            let result = tokio::time::timeout(wire::STARTUP_GRACE, join(address, token, fresh))
-                .await
-                .unwrap_or(Err(Refused::Absent));
+            let result = tokio::time::timeout(
+                wire::STARTUP_GRACE,
+                join_for(address, token, fresh, required),
+            )
+            .await
+            .unwrap_or(Err(Refused::Absent));
             let _ = joined.send(result);
         });
         outcome
@@ -993,6 +1185,7 @@ impl Backend {
         Arc::new(Self {
             executable: None,
             find: || Err("a joined backend cannot be started".into()),
+            required: &[],
             env: Vec::new(),
             owned: true,
             link: Mutex::new(Link {

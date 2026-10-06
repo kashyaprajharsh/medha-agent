@@ -53,6 +53,89 @@ fn a_backend_of_another_build_is_joined_when_it_can_do_all_this_one_needs() {
     forget(&unusable);
 }
 
+#[test]
+fn each_surface_requires_its_own_features_without_requiring_an_identical_build() {
+    let desktop = json!({"build": "different", "capabilities": wire::CLIENT_CAPABILITIES});
+    assert_eq!(fit_for(&desktop, false, &[]), Fit::Join);
+    assert_eq!(
+        fit_for(&desktop, false, &["terminal-controls", "replay-stream"]),
+        Fit::GiveWay { needed: true }
+    );
+    let terminal = json!({"build": "different", "capabilities": wire::CAPABILITIES});
+    assert_eq!(
+        fit_for(&terminal, false, &["terminal-controls", "replay-stream"]),
+        Fit::Join
+    );
+}
+
+#[tokio::test]
+async fn an_old_chat_handle_cannot_send_an_async_request_to_its_replacement() {
+    let (lines, mut queued) = tokio::sync::mpsc::unbounded_channel();
+    let (controls, _urgent) = tokio::sync::mpsc::unbounded_channel();
+    let connection = Connection {
+        lines,
+        controls,
+        unsent: Arc::default(),
+        routes: Mutex::default(),
+        stop: tokio::sync::watch::channel(false).0,
+    };
+    let first = connection.listen("same".into(), Arc::new(|_| {})).unwrap();
+    connection.routes().forget("same", first.opened);
+    let _second = connection.listen("same".into(), Arc::new(|_| {})).unwrap();
+    let refused = connection.call_chat(&first, &protocol::Cancel {}).await;
+    assert_eq!(refused.unwrap_err(), STOPPED);
+    assert!(queued.try_recv().is_err());
+    assert!(connection.routes().replies.is_empty());
+    assert_eq!(connection.unsent.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn cancelling_after_create_while_attach_waits_detaches_and_abandons_in_order() {
+    let (lines, mut queued) = tokio::sync::mpsc::unbounded_channel();
+    let (controls, mut urgent) = tokio::sync::mpsc::unbounded_channel();
+    let connection = Connection {
+        lines,
+        controls,
+        unsent: Arc::default(),
+        routes: Mutex::default(),
+        stop: tokio::sync::watch::channel(false).0,
+    };
+    let params = protocol::CreateSession {
+        folder: PathBuf::from("."),
+        ends_with_client: true,
+        resume: None,
+        model: None,
+        mode: None,
+        reasoning: None,
+        settings: None,
+        startup: None,
+    };
+    let mut opening = Box::pin(connection.create_chat(&params, Arc::new(|_| {})));
+    poll_fn(|cx| {
+        assert!(opening.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let create: Value = serde_json::from_str(&queued.try_recv().unwrap()).unwrap();
+    connection.heard(json!({"id": create["id"], "result": {"session": "new", "stream": "first"}}));
+    poll_fn(|cx| {
+        assert!(opening.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let attach: Value = serde_json::from_str(&urgent.try_recv().unwrap()).unwrap();
+    assert_eq!(attach["method"], "session.attach");
+    assert_eq!(connection.routes().chats.len(), 1);
+    drop(opening);
+    assert!(connection.routes().replies.is_empty());
+    assert!(connection.routes().chats.is_empty());
+    let detach: Value = serde_json::from_str(&urgent.try_recv().unwrap()).unwrap();
+    let abandon: Value = serde_json::from_str(&urgent.try_recv().unwrap()).unwrap();
+    assert_eq!(detach["method"], "session.detach");
+    assert_eq!(abandon["method"], "session.abandon");
+    assert!(urgent.try_recv().is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn an_exited_starter_is_retried_after_the_singleton_is_released() {
@@ -204,7 +287,7 @@ fn a_wait_on_a_quiet_backend_gives_up_and_a_chat_that_starts_late_is_told_to_sto
     let stopped = |asked: &[Value]| {
         asked
             .iter()
-            .any(|frame| frame["method"] == "session.close" && frame["session"] == "late")
+            .any(|frame| frame["method"] == "session.abandon" && frame["session"] == "late")
     };
     while !stopped(&asked.lock().unwrap()) {
         assert!(
@@ -226,8 +309,8 @@ async fn wait_for_close(asked: &Mutex<Vec<Value>>) {
             .filter(|frame| frame["session"] == "late")
             .filter_map(|frame| frame["method"].as_str().map(str::to_owned))
             .collect();
-        if methods.iter().any(|method| method == "session.close") {
-            assert_eq!(methods, ["session.attach", "session.close"]);
+        if methods.iter().any(|method| method == "session.abandon") {
+            assert_eq!(methods, ["session.abandon"]);
             return;
         }
         assert!(

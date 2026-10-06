@@ -262,6 +262,8 @@ impl<C: Chats> Backend<C> {
             Some(id) => Some(self.claim(id)?),
             None => None,
         };
+        let incarnation =
+            wire::stream_id().ok_or_else(|| refused("could not identify the new chat stream"))?;
         let opened = self.chats.open(params).await.map_err(refused)?;
         let session = {
             let mut table = self.table();
@@ -269,7 +271,13 @@ impl<C: Chats> Backend<C> {
             if table.contains_key(&opened.session) {
                 return Err(refused("this chat is already live; attach to it"));
             }
-            let session = Session::new(opened.session, opened.about, opened.input, opened.control);
+            let session = Session::new(
+                opened.session,
+                incarnation,
+                opened.about,
+                opened.input,
+                opened.control,
+            );
             table.insert(session.id.clone(), session.clone());
             session
         };

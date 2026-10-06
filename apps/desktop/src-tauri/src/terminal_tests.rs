@@ -121,6 +121,7 @@ fn real_shell_has_a_tty_workspace_unicode_resize_and_interrupts() {
 #[cfg(unix)]
 #[test]
 fn closing_a_tab_releases_its_shell_and_rejects_further_input() {
+    let began = Instant::now();
     let terminals = Terminals::new(std::env::temp_dir());
     let rx = shell(&terminals, "closing");
     terminals.close("closing").unwrap();
@@ -130,4 +131,9 @@ fn closing_a_tab_releases_its_shell_and_rejects_further_input() {
             break;
         }
     }
+    assert!(
+        began.elapsed() < Duration::from_secs(4),
+        "terminal close stalled: {:?}",
+        began.elapsed()
+    );
 }

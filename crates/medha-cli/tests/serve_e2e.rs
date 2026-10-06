@@ -854,6 +854,52 @@ async fn a_chat_in_the_backend_answers_its_own_requests_as_one_in_its_own_proces
     }
 }
 
+/// Saving a key waits on a lock another program may hold. While it waits, the
+/// backend still serves its other clients, its chats and other folder requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_waiting_on_a_held_lock_hold_up_nobody_else() {
+    let world = World::new();
+    let folder = world.folder("w");
+    // Two threads serve everyone, so more than two waiters would once have taken them all.
+    let backend = world.backend_in(&[("TOKIO_WORKER_THREADS", "2")]);
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    let mut other = backend.connect().await;
+
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(world.home().join("credentials.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let mut waiting = Vec::new();
+    for id in 9001..9005 {
+        let save = json!({"id": id, "folder": folder, "method": "settings.keys.set",
+            "params": {"group": "search", "id": "tavily", "key": "sk-zz-waits"}});
+        assert!(wire::write_frame(&mut client.writer, &save).await);
+        waiting.push(id);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let hello = other.ask("hello", None, json!({})).await;
+    assert_eq!(hello["result"]["protocol"], 1);
+    let settings = client.ask("session.settings", Some(&chat), json!({})).await;
+    assert!(settings.get("result").is_some(), "{settings}");
+    let listed = other
+        .about(&folder, json!({"method": "sessions.list"}))
+        .await;
+    assert!(listed.is_ok(), "{listed:?}");
+
+    held.unlock().unwrap();
+    while !waiting.is_empty() {
+        let frame = client.next().await;
+        if let Some(id) = frame["id"].as_u64() {
+            assert!(frame.get("result").is_some(), "{frame}");
+            waiting.retain(|waited| *waited != id);
+        }
+    }
+}
+
 /// The names of the tools one model request offered, in order.
 fn offered(request: &Value) -> Vec<String> {
     let mut names: Vec<String> = request["tools"]

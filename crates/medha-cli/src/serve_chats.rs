@@ -78,25 +78,76 @@ impl<T> Kept<T> {
 /// A folder's chats, and what is asked about the folder, share its one opened
 /// workspace and so its one event log.
 pub(crate) struct ServeChats {
-    folders: Mutex<Kept<Workspace>>,
+    folders: Arc<Mutex<Kept<Workspace>>>,
     mcp_host: mcp::hub::Endpoint,
     mcp_changed: Arc<tokio::sync::Notify>,
+    requests: Lane,
+    starts: Lane,
+}
+
+const BUSY: &str = "Medha is busy with other requests. Try again in a moment.";
+
+/// Work that may wait on a lock, the keychain or the disk runs on threads of
+/// its own, a few at a time, so it never takes the threads every chat and
+/// client is served on. A bounded number wait their turn; past that a request
+/// is refused at once, not left to pile up.
+struct Lane {
+    running: Arc<tokio::sync::Semaphore>,
+    waiting: std::sync::atomic::AtomicUsize,
+    room: usize,
+}
+
+impl Lane {
+    fn new(at_once: usize, room: usize) -> Self {
+        Self {
+            running: Arc::new(tokio::sync::Semaphore::new(at_once)),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            room,
+        }
+    }
+
+    async fn admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        use std::sync::atomic::Ordering;
+        if self.waiting.fetch_add(1, Ordering::Relaxed) >= self.room {
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
+            return Err(BUSY.into());
+        }
+        let admitted = Arc::clone(&self.running).acquire_owned().await;
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        admitted.map_err(|_| BUSY.to_string())
+    }
+}
+
+/// Runs what may block away from the threads that serve everyone.
+async fn apart<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| "the request stopped unexpectedly".to_string())?
+}
+
+fn opened(
+    folders: &Mutex<Kept<Workspace>>,
+    folder: &Path,
+    notices: &dyn Notices,
+) -> Result<Arc<Workspace>, String> {
+    folders
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(folder, || Workspace::open(folder.to_path_buf(), notices))
+        .map_err(|error| format!("{error:#}"))
 }
 
 impl ServeChats {
     pub(crate) fn new(mcp_host: mcp::hub::Endpoint, mcp_changed: Arc<tokio::sync::Notify>) -> Self {
         Self {
-            folders: Mutex::new(Kept::new(IDLE)),
+            folders: Arc::new(Mutex::new(Kept::new(IDLE))),
             mcp_host,
             mcp_changed,
+            requests: Lane::new(8, 64),
+            starts: Lane::new(4, 32),
         }
-    }
-
-    fn workspace(&self, folder: &Path, notices: &dyn Notices) -> anyhow::Result<Arc<Workspace>> {
-        self.folders
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(folder, || Workspace::open(folder.to_path_buf(), notices))
     }
 }
 
@@ -135,13 +186,18 @@ fn folder(named: &Value) -> Result<PathBuf, String> {
 #[async_trait::async_trait]
 impl Chats for ServeChats {
     async fn about_folder(&self, request: &Value) -> Result<Value, String> {
-        let folder = folder(&request["folder"])?;
-        let failed = |error: anyhow::Error| format!("{error:#}");
-        let workspace = self
-            .workspace(&folder, &Collected::default())
-            .map_err(failed)?;
-        let store = workspace.open_store().map_err(failed)?;
-        let answer = crate::desktop_service::answer(&store.log, &folder, request).await;
+        let _admitted = self.requests.admit().await?;
+        let (folders, asked) = (Arc::clone(&self.folders), request.clone());
+        let serving = tokio::runtime::Handle::current();
+        let answer = apart(move || {
+            let folder = folder(&asked["folder"])?;
+            let workspace = opened(&folders, &folder, &Collected::default())?;
+            let store = workspace
+                .open_store()
+                .map_err(|error| format!("{error:#}"))?;
+            serving.block_on(crate::desktop_service::answer(&store.log, &folder, &asked))
+        })
+        .await;
         // A saved key leaves the config file as it was, so the host is told rather than left to notice.
         let shared = request["method"].as_str().is_some_and(|method| {
             method.starts_with("settings.mcp.") || method.starts_with("settings.keys.")
@@ -153,25 +209,36 @@ impl Chats for ServeChats {
     }
 
     async fn open(&self, params: &Value) -> Result<Opened, String> {
-        let folder = folder(&params["folder"])?;
-        let mut options = options(params)?;
-        options.mcp_host = Some(self.mcp_host.clone());
+        // Held until the chat is ready, so only a few chats start at once.
+        let _admitted = self.starts.admit().await?;
         let restore = params
             .get("settings")
             .filter(|saved| saved.is_object())
             .cloned();
         let notices = Arc::new(Collected::default());
-        let workspace = self
-            .workspace(&folder, notices.as_ref())
-            .map_err(|error| format!("{error:#}"))?;
+        let (folders, asked, host) = (
+            Arc::clone(&self.folders),
+            params.clone(),
+            self.mcp_host.clone(),
+        );
+        let noted = Arc::clone(&notices);
+        let (folder, options, workspace, lock, choices) = apart(move || {
+            let failed = |error: anyhow::Error| format!("{error:#}");
+            let folder = folder(&asked["folder"])?;
+            let mut options = options(&asked)?;
+            options.mcp_host = Some(host);
+            let workspace = opened(&folders, &folder, noted.as_ref())?;
+            let lock = runtime::workspace::load_lock(&folder, noted.as_ref()).map_err(failed)?;
+            let choices = Choices::of(&lock, &options).map_err(failed)?;
+            Ok((folder, options, workspace, lock, choices))
+        })
+        .await?;
 
         let (to_chat, chat_input) = tokio::io::duplex(64 * 1024);
         let (chat_output, from_chat) = tokio::io::duplex(256 * 1024);
         let mut chat = tokio::spawn({
-            let (notices, folder) = (Arc::clone(&notices), folder.clone());
+            let notices = Arc::clone(&notices);
             async move {
-                let lock = runtime::workspace::load_lock(&folder, notices.as_ref())?;
-                let choices = Choices::of(&lock, &options)?;
                 let model = runtime::model::resolve(&lock, &options, notices.as_ref()).await?;
                 let start = Start {
                     lock: &lock,

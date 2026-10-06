@@ -217,19 +217,33 @@ fn instruction_path(workspace: &Path, kind: &str) -> Result<std::path::PathBuf> 
 /// One writer at a time per file, across every Medha process. Checking that the
 /// file is still what the editor loaded, and the write that check allows, are
 /// then one step: of two saves made from the same text, one is told it changed.
+///
+/// The lock belongs to the file's own folder, not to whoever is saving: two
+/// Medhas with different homes, or reaching the folder by different names,
+/// still take the same one. Other programs writing the file do not take it.
 fn one_writer<T>(target: &Path, write: impl FnOnce() -> Result<T>) -> Result<T> {
-    use sha2::{Digest, Sha256};
-    let locks = config::medha_home()?.join("locks");
-    std::fs::create_dir_all(&locks)?;
-    let named: String = Sha256::digest(target.as_os_str().as_encoded_bytes())
-        .iter()
-        .take(12)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(locks.join(format!("{named}.lock")))?;
+    let folder = target
+        .parent()
+        .ok_or_else(|| anyhow!("Instructions need a folder to be saved in"))?;
+    std::fs::create_dir_all(folder)?;
+    #[cfg(unix)]
+    let lock = std::fs::File::open(folder)?;
+    // A folder cannot be opened to be locked there, so the lock is a file named after it.
+    #[cfg(not(unix))]
+    let lock = {
+        use sha2::{Digest, Sha256};
+        let named: String = Sha256::digest(folder.canonicalize()?.as_os_str().as_encoded_bytes())
+            .iter()
+            .take(12)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let locks = std::env::temp_dir().join("medha-locks");
+        std::fs::create_dir_all(&locks)?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(locks.join(format!("{named}.lock")))?
+    };
     lock.lock()?;
     write()
 }

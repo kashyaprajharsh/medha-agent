@@ -34,10 +34,14 @@ impl Bridge {
 #[test]
 fn of_several_saves_made_from_the_same_text_one_is_kept_and_the_rest_are_told() {
     let root = tempfile::tempdir().unwrap();
-    let (workspace, home) = (root.path().join("project"), root.path().join("home"));
+    let workspace = root.path().join("project");
     std::fs::create_dir_all(&workspace).unwrap();
     let workspace = workspace.canonicalize().unwrap();
-    let _backend = backend::Backend::start(&home, &[]);
+    // Two Medhas with homes of their own edit the one project.
+    let homes = [root.path().join("home-a"), root.path().join("home-b")];
+    let _backends = homes
+        .each_ref()
+        .map(|home| backend::Backend::start(home, &[]));
 
     for round in 0..5 {
         let before = std::fs::read_to_string(workspace.join("MEDHA.md")).unwrap_or_default();
@@ -46,7 +50,7 @@ fn of_several_saves_made_from_the_same_text_one_is_kept_and_the_rest_are_told() 
             .map(|editor| {
                 let (workspace, before, together) =
                     (workspace.clone(), before.clone(), together.clone());
-                let mut client = backend::Backend::join(&home);
+                let mut client = backend::Backend::join(&homes[editor % 2]);
                 std::thread::spawn(move || {
                     let content = format!("round {round}, editor {editor}");
                     let save = json!({"kind": "project", "before": before, "content": content});

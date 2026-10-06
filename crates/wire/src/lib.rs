@@ -150,14 +150,62 @@ pub async fn connect(address: &str) -> std::io::Result<tokio::net::UnixStream> {
 pub struct Listener(tokio::net::UnixListener);
 
 #[cfg(unix)]
+fn refused(why: &str, path: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("{}: {why}", path.display()),
+    )
+}
+
+/// Makes `dir` a folder that is this user's alone. One that is already there
+/// is taken only if it is a real folder this user owns: a link, or anything
+/// someone else put in its place, is refused and left exactly as it was.
+#[cfg(unix)]
+pub fn private_folder(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if let Some(above) = dir.parent() {
+        std::fs::create_dir_all(above)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let found = std::fs::symlink_metadata(dir)?;
+    if !found.file_type().is_dir() {
+        return Err(refused("not a folder of its own", dir));
+    }
+    // SAFETY: `geteuid` only reads this process's identity.
+    if found.uid() != unsafe { libc::geteuid() } {
+        return Err(refused("a folder someone else owns", dir));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Clears what an earlier listener left at `path`: this user's own socket and nothing else.
+#[cfg(unix)]
+fn clear_own_socket(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let found = match std::fs::symlink_metadata(path) {
+        Ok(found) => found,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    // SAFETY: `geteuid` only reads this process's identity.
+    if !found.file_type().is_socket() || found.uid() != unsafe { libc::geteuid() } {
+        return Err(refused("in the way, and not this user's own socket", path));
+    }
+    std::fs::remove_file(path)
+}
+
+#[cfg(unix)]
 pub fn bind(address: &str) -> std::io::Result<Listener> {
     use std::os::unix::fs::PermissionsExt;
     let path = std::path::Path::new(address);
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        private_folder(dir)?;
     }
-    let _ = std::fs::remove_file(path);
+    clear_own_socket(path)?;
     let listener = tokio::net::UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(Listener(listener))

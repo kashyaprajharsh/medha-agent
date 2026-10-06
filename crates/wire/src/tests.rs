@@ -115,6 +115,59 @@ async fn a_proof_seen_on_one_connection_does_not_open_another() {
     assert_eq!(host.await.unwrap(), None, "a replayed proof was accepted");
 }
 
+#[cfg(unix)]
+fn scratch(name: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("wire-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    root.canonicalize().unwrap()
+}
+
+/// A socket may have to live under a folder others can write in, so nothing already there is trusted.
+#[cfg(unix)]
+#[tokio::test]
+async fn listening_touches_nothing_that_is_not_this_users_own_folder_and_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch("planted");
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    // A link planted where the socket's folder should be leads to someone's own folder.
+    let theirs = root.join("theirs");
+    std::fs::create_dir(&theirs).unwrap();
+    std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(theirs.join("s.sock"), "their file").unwrap();
+    std::os::unix::fs::symlink(&theirs, root.join("link")).unwrap();
+    let through_link = root.join("link").join("s.sock");
+    assert!(bind(through_link.to_str().unwrap()).is_err());
+    assert_eq!(
+        mode(&theirs),
+        0o755,
+        "a folder reached through a link was changed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(theirs.join("s.sock")).unwrap(),
+        "their file"
+    );
+
+    // A file that is not a socket, where the socket should be, is left alone.
+    let own = root.join("own");
+    std::fs::create_dir(&own).unwrap();
+    std::fs::write(own.join("s.sock"), "a file").unwrap();
+    assert!(bind(own.join("s.sock").to_str().unwrap()).is_err());
+    assert_eq!(
+        std::fs::read_to_string(own.join("s.sock")).unwrap(),
+        "a file"
+    );
+
+    // This user's own folder is made private, and its own stale socket gives way.
+    let fresh = root.join("fresh").join("s.sock");
+    drop(bind(fresh.to_str().unwrap()).unwrap());
+    assert_eq!(mode(fresh.parent().unwrap()), 0o700);
+    drop(bind(fresh.to_str().unwrap()).expect("a stale socket of its own was in the way"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn a_host_that_cannot_prove_itself_is_sent_no_proof() {
     let ((mut gr, mut gw), (mut hr, mut hw)) = channel();

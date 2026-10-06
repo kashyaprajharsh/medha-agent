@@ -6,6 +6,9 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "container_lifecycle.rs"]
+mod container_lifecycle;
+
 /// A command to execute: argv + working directory + environment policy.
 #[derive(Debug, Clone)]
 pub struct ExecRequest {
@@ -111,6 +114,9 @@ pub enum BackendKind {
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     pub backend: BackendKind,
+    /// Require daemon-owned command containment. Native process groups cannot
+    /// contain a helper that creates a new session and reparents itself.
+    pub strict_cleanup: bool,
     pub net: NetPolicy,
     /// Container backend: image to run (required for `Container`).
     pub image: Option<String>,
@@ -176,6 +182,7 @@ impl Default for SandboxConfig {
         // closed. Projects that genuinely need downloads opt in explicitly.
         Self {
             backend: BackendKind::Native,
+            strict_cleanup: false,
             net: NetPolicy::Deny,
             image: None,
             runtime: None,
@@ -194,6 +201,32 @@ pub trait ExecBackend: Send + Sync {
     /// Build the fully jail-configured command without spawning it, so isolation
     /// is applied in one place for both foreground and background runs.
     fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError>;
+
+    /// Own the workload, including any daemon-side resources. Callers must use
+    /// this instead of supervising only a container runtime's client process.
+    fn spawn_owned(
+        &self,
+        req: &ExecRequest,
+        working_dir: Option<&Path>,
+        limits: CaptureLimits,
+    ) -> Result<BgProc, ExecError> {
+        let mut command = self.build_command(req)?;
+        if let Some(dir) = working_dir {
+            command.current_dir(dir);
+        }
+        spawn_background_with_limits(
+            command,
+            limits.stdout,
+            limits.stderr,
+            limits.aggregate,
+            self.denies_network(req),
+            None,
+        )
+    }
+
+    fn requires_strict_cleanup(&self) -> bool {
+        false
+    }
 
     /// Run an enabled plugin with host-validated package/data paths. Unlike a
     /// shell command, its working directory does not imply write permission.
@@ -217,7 +250,16 @@ pub trait ExecBackend: Send + Sync {
     /// Run a command to completion (foreground). Default: build + supervise, so a
     /// timeout/cancel tears down the whole process group (see [`GroupReaper`]).
     async fn run(&self, req: ExecRequest) -> Result<ExecOutput, ExecError> {
-        spawn_and_wait(self.build_command(&req)?).await
+        let process = self.spawn_owned(&req, None, CaptureLimits::standard())?;
+        process.wait().await;
+        let (stdout, stderr, stdout_truncated, stderr_truncated) = process.raw_snapshot();
+        Ok(ExecOutput {
+            status: process.exit_code(),
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        })
     }
     /// Short human-readable label for logs / UX (`"host"`, `"native"`, …).
     fn label(&self) -> &str;
@@ -595,8 +637,8 @@ pub async fn run_shell_bounded_with(
         read_roots: Vec::new(),
         write_roots: Vec::new(),
     };
-    let cmd = backend.build_command(&request)?;
-    run_command_bounded(cmd, limit, max_output, cancel).await
+    let process = backend.spawn_owned(&request, None, CaptureLimits::combined(max_output))?;
+    finish_bounded(process, limit, max_output, cancel).await
 }
 
 /// An interpreter that can run a command line on Windows.
@@ -766,6 +808,15 @@ pub async fn run_command_bounded(
     // process runs; it is never an after-the-fact truncation.
     let process =
         spawn_background_with_limits(cmd, max_output, max_output, max_output, false, None)?;
+    finish_bounded(process, limit, max_output, cancel).await
+}
+
+async fn finish_bounded(
+    process: BgProc,
+    limit: std::time::Duration,
+    max_output: usize,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<ShellOutcome, ExecError> {
     let ended = wait_bounded(&process, limit, cancel).await;
 
     if ended.is_err() {
@@ -1040,6 +1091,31 @@ impl CapturePair {
 
 type SharedCapture = std::sync::Arc<std::sync::Mutex<CapturePair>>;
 
+#[derive(Clone, Copy)]
+pub struct CaptureLimits {
+    stdout: usize,
+    stderr: usize,
+    aggregate: usize,
+}
+
+impl CaptureLimits {
+    pub fn standard() -> Self {
+        Self {
+            stdout: EXEC_STDOUT_CAP,
+            stderr: EXEC_STDERR_CAP,
+            aggregate: EXEC_AGGREGATE_CAP,
+        }
+    }
+
+    fn combined(bytes: usize) -> Self {
+        Self {
+            stdout: bytes,
+            stderr: bytes,
+            aggregate: bytes,
+        }
+    }
+}
+
 /// An owned command task: output streams into rolling buffers and the whole
 /// process group can be killed. Foreground runs use it too, so cancellation has
 /// a synchronous kill handle before the future is dropped.
@@ -1051,6 +1127,8 @@ pub struct BgProc {
     /// Set by the seccomp watcher the instant this command tried to reach an IP
     /// address under a net-denying jail. `None` where no such watcher exists.
     net_flag: Option<std::sync::Arc<AtomicBool>>,
+    /// Container lifecycle cancellation, independent of the attached client.
+    owned_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl BgProc {
@@ -1130,7 +1208,9 @@ impl BgProc {
     }
     /// SIGKILL the whole process group.
     pub fn kill(&self) {
-        if let Some(pid) = self.pid {
+        if let Some(cancel) = &self.owned_cancel {
+            cancel.cancel();
+        } else if let Some(pid) = self.pid {
             quiesce_process_tree(pid);
         }
     }
@@ -1375,12 +1455,32 @@ fn quiesce_process_tree(pid: u32) {
 /// supervisor. Completion means: leader exit observed, process group quiesced
 /// while its id was still pinned, leader reaped, and both pipe pumps joined.
 fn spawn_background_with_limits(
+    cmd: tokio::process::Command,
+    stdout_cap: usize,
+    stderr_cap: usize,
+    aggregate_cap: usize,
+    watch_network: bool,
+    input: Option<Vec<u8>>,
+) -> Result<BgProc, ExecError> {
+    spawn_background_captured(
+        cmd,
+        stdout_cap,
+        stderr_cap,
+        aggregate_cap,
+        watch_network,
+        input,
+        None,
+    )
+}
+
+fn spawn_background_captured(
     mut cmd: tokio::process::Command,
     stdout_cap: usize,
     stderr_cap: usize,
     aggregate_cap: usize,
     watch_network: bool,
     input: Option<Vec<u8>>,
+    shared_capture: Option<SharedCapture>,
 ) -> Result<BgProc, ExecError> {
     use std::sync::{Arc, Mutex};
     configure_for_spawn(&mut cmd, false, input.is_some());
@@ -1410,12 +1510,14 @@ fn spawn_background_with_limits(
     let input_pipe = child.stdin.take();
     let out_pipe = child.stdout.take();
     let err_pipe = child.stderr.take();
-    let capture: SharedCapture = Arc::new(Mutex::new(CapturePair::new(
-        stdout_cap,
-        stderr_cap,
-        aggregate_cap,
-        watch_network,
-    )));
+    let capture: SharedCapture = shared_capture.unwrap_or_else(|| {
+        Arc::new(Mutex::new(CapturePair::new(
+            stdout_cap,
+            stderr_cap,
+            aggregate_cap,
+            watch_network,
+        )))
+    });
     let code = Arc::new(Mutex::new(None));
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
     let stop_pumps = Arc::new(AtomicBool::new(false));
@@ -1568,6 +1670,7 @@ fn spawn_background_with_limits(
         done_rx,
         code,
         net_flag,
+        owned_cancel: None,
     })
 }
 
@@ -1586,24 +1689,6 @@ pub fn spawn_background(
         watch_network,
         None,
     )
-}
-
-/// Spawn, supervise, and capture a foreground command using fixed-memory
-/// rolling tails. Dropping this future drops its `BgProc`, which immediately
-/// signals the group; the detached owner still reaps and joins every resource.
-async fn spawn_and_wait(cmd: tokio::process::Command) -> Result<ExecOutput, ExecError> {
-    // Foreground: the complete output is checked post-hoc, so live detection
-    // would only duplicate work already bounded by this call's own deadline.
-    let process = spawn_background(cmd, false)?;
-    process.wait().await;
-    let (stdout, stderr, stdout_truncated, stderr_truncated) = process.raw_snapshot();
-    Ok(ExecOutput {
-        status: process.exit_code(),
-        stdout,
-        stderr,
-        stdout_truncated,
-        stderr_truncated,
-    })
 }
 
 /// Runs commands directly on the host with no OS isolation.
@@ -2949,6 +3034,7 @@ fn detect_container_runtime(configured: &Option<String>) -> String {
 /// Opt-in heavy tier: each command runs in a throwaway `docker`/`podman`
 /// container, workspace bind-mounted at `/workspace`, capabilities dropped. The
 /// host environment is not forwarded, so injected API keys never enter it.
+#[derive(Clone)]
 pub struct ContainerBackend {
     runtime: String,
     image: String,
@@ -3027,12 +3113,16 @@ impl ContainerBackend {
 
     /// Options shared by interactive `run` and hermetic `create`.
     fn isolation_argv(&self, req: &ExecRequest) -> Vec<String> {
+        self.isolation_argv_at(req, "/workspace")
+    }
+
+    fn isolation_argv_at(&self, req: &ExecRequest, directory: &str) -> Vec<String> {
         let ws = req.cwd.canonicalize().unwrap_or_else(|_| req.cwd.clone());
         let mut a = vec![
             "-v".into(),
             format!("{}:/workspace", ws.display()),
             "-w".into(),
-            "/workspace".into(),
+            directory.into(),
             "--cap-drop".into(),
             "ALL".into(),
             "--security-opt".into(),
@@ -3050,19 +3140,6 @@ impl ContainerBackend {
             a.push("--pids-limit".into());
             a.push(p.to_string());
         }
-        a
-    }
-
-    /// Build the interactive `run …` argv. Pure, for testing.
-    fn build_run_argv(&self, req: &ExecRequest) -> Vec<String> {
-        debug_assert!(!self.hermetic);
-        let mut a = vec!["run".into(), "--rm".into()];
-        a.extend(self.isolation_argv(req));
-        // Host env is intentionally NOT forwarded (no `--env`): API keys stay on
-        // the host and never reach the containerized command.
-        a.push(self.image.clone());
-        a.push(req.program.clone());
-        a.extend(req.args.iter().cloned());
         a
     }
 
@@ -3133,25 +3210,61 @@ impl ContainerBackend {
         command.args(self.build_start_argv());
         Ok(command)
     }
+
+    fn build_owned_create_command(
+        &self,
+        req: &ExecRequest,
+        name: &str,
+        directory: &str,
+    ) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.runtime);
+        command
+            .arg("create")
+            .args(self.isolation_argv_at(req, directory))
+            .args([
+                "--pull",
+                "never",
+                "--no-healthcheck",
+                "--name",
+                name,
+                "--entrypoint",
+                &req.program,
+                &self.image,
+            ])
+            .args(&req.args);
+        command
+    }
 }
 
 #[async_trait]
 impl ExecBackend for ContainerBackend {
-    fn build_command(&self, req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
+    fn build_command(&self, _req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
         if self.hermetic {
-            // Returning `create` here would be dangerously ambiguous: generic
-            // callers would treat its zero exit as the check having run. Gate
-            // must explicitly own both lifecycle phases and cleanup.
             return Err(ExecError::Unavailable(
                 "hermetic containers require the explicit create/start lifecycle".into(),
             ));
         }
-        let argv = self.build_run_argv(req);
-        // The runtime CLIENT runs with our host env (it needs PATH/DOCKER_HOST);
-        // the containerized command gets none of it (see build_run_argv).
-        let mut cmd = tokio::process::Command::new(&self.runtime);
-        cmd.args(&argv);
-        Ok(cmd)
+        Err(ExecError::Unavailable(
+            "containers require an owned create/start/remove lifecycle; use spawn_owned".into(),
+        ))
+    }
+
+    fn spawn_owned(
+        &self,
+        req: &ExecRequest,
+        working_dir: Option<&Path>,
+        limits: CaptureLimits,
+    ) -> Result<BgProc, ExecError> {
+        if self.hermetic {
+            return Err(ExecError::Unavailable(
+                "hermetic checks require their explicit Gate lifecycle".into(),
+            ));
+        }
+        container_lifecycle::spawn(self.clone(), req.clone(), working_dir, limits)
+    }
+
+    fn requires_strict_cleanup(&self) -> bool {
+        true
     }
     fn label(&self) -> &str {
         "container"
@@ -3247,6 +3360,11 @@ pub fn select_backend(
     net_grant: NetworkGrant,
 ) -> std::sync::Arc<dyn ExecBackend> {
     use std::sync::Arc;
+    if cfg.strict_cleanup && cfg.backend != BackendKind::Container {
+        return Arc::new(UnavailableBackend(
+            "strict cleanup requires the container backend",
+        ));
+    }
     match cfg.backend {
         BackendKind::Host => Arc::new(HostBackend),
         BackendKind::Native => {
@@ -3293,7 +3411,7 @@ pub fn select_backend(
                 )
                 .with_network_grant(net_grant),
             ),
-            _ => Arc::new(HostBackend), // no image → CLI warns and shouldn't reach here
+            _ => Arc::new(UnavailableBackend("container execution requires an image")),
         },
         BackendKind::Ssh => match cfg.host.as_deref() {
             Some(host) if !host.is_empty() => {
@@ -3301,6 +3419,21 @@ pub fn select_backend(
             }
             _ => Arc::new(HostBackend),
         },
+    }
+}
+
+struct UnavailableBackend(&'static str);
+
+#[async_trait]
+impl ExecBackend for UnavailableBackend {
+    fn build_command(&self, _req: &ExecRequest) -> Result<tokio::process::Command, ExecError> {
+        Err(ExecError::Unavailable(self.0.into()))
+    }
+    fn requires_strict_cleanup(&self) -> bool {
+        true
+    }
+    fn label(&self) -> &str {
+        "unavailable"
     }
 }
 
@@ -4509,10 +4642,13 @@ mod tests {
         let mut r = req("sh", &["-c", "echo hi"], std::env::temp_dir());
         r.env = vec![("TAVILY_API_KEY".into(), "supersecret".into())];
         r.clear_env = true;
-        let argv = be.build_run_argv(&r);
+        let argv = owned_create_argv(&be, &r);
         let joined = argv.join(" ");
 
-        assert!(argv.contains(&"--rm".to_string()));
+        assert_eq!(argv[0], "create");
+        assert!(joined.contains("--name medha-command-test"));
+        assert!(joined.contains("--pull never") && joined.contains("--no-healthcheck"));
+        assert!(joined.contains("--entrypoint sh"));
         assert!(joined.contains(":/workspace") && joined.contains("-w /workspace"));
         assert!(joined.contains("--cap-drop ALL") && joined.contains("no-new-privileges"));
         assert!(
@@ -4524,10 +4660,43 @@ mod tests {
         assert!(!joined.contains("TAVILY_API_KEY") && !joined.contains("supersecret"));
         // The command follows the image, in order.
         let img = argv.iter().position(|a| a == "alpine").unwrap();
-        assert_eq!(
-            &argv[img + 1..],
-            &["sh".to_string(), "-c".to_string(), "echo hi".to_string()]
-        );
+        assert_eq!(&argv[img + 1..], &["-c".to_string(), "echo hi".to_string()]);
+    }
+
+    fn owned_create_argv(backend: &ContainerBackend, request: &ExecRequest) -> Vec<String> {
+        backend
+            .build_owned_create_command(request, "medha-command-test", "/workspace")
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn strict_cleanup_and_missing_container_images_never_fall_back_to_host() {
+        for config in [
+            SandboxConfig {
+                strict_cleanup: true,
+                ..SandboxConfig::default()
+            },
+            SandboxConfig {
+                backend: BackendKind::Container,
+                ..SandboxConfig::default()
+            },
+        ] {
+            let backend = select_backend(
+                &config,
+                vec![],
+                ApprovedRoots::default(),
+                NetworkGrant::default(),
+            );
+            assert_eq!(backend.label(), "unavailable");
+            assert!(
+                backend
+                    .build_command(&req("sh", &["-c", "true"], std::env::temp_dir()))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -4751,12 +4920,16 @@ mod tests {
         .with_network_grant(grant.clone());
         let r = req("sh", &["-c", "true"], std::env::temp_dir());
         assert!(
-            be.build_run_argv(&r).join(" ").contains("--network none"),
+            owned_create_argv(&be, &r)
+                .join(" ")
+                .contains("--network none"),
             "net=deny with no grant denies the network"
         );
         grant.grant();
         assert!(
-            !be.build_run_argv(&r).join(" ").contains("--network none"),
+            !owned_create_argv(&be, &r)
+                .join(" ")
+                .contains("--network none"),
             "a session grant opens the container network"
         );
         assert!(!be.denies_network(&r), "granted → no longer denies network");
@@ -5004,7 +5177,7 @@ mod tests {
     #[test]
     fn container_argv_allows_network_by_default() {
         let be = ContainerBackend::new("podman".into(), "img".into(), NetPolicy::Allow, None, None);
-        let argv = be.build_run_argv(&req("sh", &["-c", "true"], std::env::temp_dir()));
+        let argv = owned_create_argv(&be, &req("sh", &["-c", "true"], std::env::temp_dir()));
         assert!(
             !argv.join(" ").contains("--network"),
             "net=allow leaves networking default"

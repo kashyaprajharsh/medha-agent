@@ -1684,14 +1684,16 @@ impl<'a> ExecInvocation<'a> {
     }
 
     pub fn spawn_background(&self) -> Result<crate::exec::BgProc, ExecError> {
-        let watch_network = self.backend().denies_network(&self.request);
-        let mut cmd = self.backend().build_command(&self.request)?;
-        if let Some(dir) = &self.working_dir {
-            // Build the profile against the original workspace, then set only
-            // the child's working directory. A read grant must not imply writes.
-            cmd.current_dir(dir);
+        if self.outside_sandbox && self.sandbox.exec.requires_strict_cleanup() {
+            return Err(ExecError::Unavailable(
+                "strict cleanup cannot run a command outside its container".into(),
+            ));
         }
-        crate::exec::spawn_background(cmd, watch_network)
+        self.backend().spawn_owned(
+            &self.request,
+            self.working_dir.as_deref(),
+            exec::CaptureLimits::standard(),
+        )
     }
 
     pub fn with_working_dir(mut self, dir: PathBuf) -> Self {
@@ -1983,6 +1985,11 @@ impl WorkspaceSandbox {
         &self,
         requested: &kernel::ExecutionAccess,
     ) -> Result<kernel::ExecutionAccess, String> {
+        if requested.outside_sandbox && self.exec.requires_strict_cleanup() {
+            return Err(
+                "strict cleanup requires this command to remain inside its container".into(),
+            );
+        }
         let mut missing = kernel::ExecutionAccess {
             network: requested.network && self.denies_network(),
             outside_sandbox: requested.outside_sandbox

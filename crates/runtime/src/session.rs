@@ -183,20 +183,23 @@ pub async fn start(
     if let Some(backend) = options.sandbox {
         sbx_cfg.backend = backend;
     }
-    // Misconfigured optional backends fall back to native isolation.
+    if sbx_cfg.strict_cleanup && sbx_cfg.backend != sandbox::BackendKind::Container {
+        anyhow::bail!(
+            "[sandbox].strict_cleanup requires backend=container and a locally available image"
+        );
+    }
+    // A selected container must never silently become weaker native isolation.
     match sbx_cfg.backend {
         sandbox::BackendKind::Container => {
             let runtime = sbx_cfg.runtime.clone().unwrap_or_else(|| "docker".into());
             if sbx_cfg.image.as_deref().unwrap_or("").is_empty() {
-                notices.say(
-                    "warning: [sandbox] backend=container needs an `image` — falling back to the native jail.",
+                anyhow::bail!(
+                    "[sandbox] backend=container requires an image; command execution will not fall back to native"
                 );
-                sbx_cfg.backend = sandbox::BackendKind::Native;
             } else if !sandbox::program_on_path(&runtime) {
-                notices.say(&format!(
-                    "warning: container runtime '{runtime}' not found on PATH — falling back to the native jail."
-                ));
-                sbx_cfg.backend = sandbox::BackendKind::Native;
+                anyhow::bail!(
+                    "container runtime '{runtime}' is not available; command execution will not fall back to native"
+                );
             }
         }
         sandbox::BackendKind::Ssh => {

@@ -395,6 +395,9 @@ pub struct SandboxLockConfig {
     /// no OS isolation; `"container"` = throwaway docker/podman container (opt-in
     /// heavy tier); `"ssh"` = run on a remote host.
     pub backend: String,
+    /// Fail closed unless commands use owned containers. Native cleanup cannot
+    /// stop deliberately reparented helpers in a different process session.
+    pub strict_cleanup: bool,
     /// `"deny"` (default; blocks exfiltration) or explicit `"allow"` for
     /// projects whose confined commands genuinely need downloads.
     pub network: String,
@@ -419,6 +422,7 @@ impl Default for SandboxLockConfig {
         // platforms without a native backend (the CLI warns when it does).
         Self {
             backend: "native".into(),
+            strict_cleanup: false,
             network: "deny".into(),
             extra_writable: Vec::new(),
             image: None,
@@ -519,6 +523,7 @@ impl SandboxLockConfig {
                 });
         sandbox::SandboxConfig {
             backend,
+            strict_cleanup: self.strict_cleanup,
             net,
             image: self.image.clone(),
             runtime,

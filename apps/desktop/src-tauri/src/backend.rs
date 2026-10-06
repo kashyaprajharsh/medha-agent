@@ -22,6 +22,8 @@ const AFTER_EXIT: Duration = Duration::from_secs(3);
 /// How long a chat that is ending is waited for before it is resumed.
 const LEAVING: Duration = Duration::from_secs(10);
 const STOPPED: &str = "Medha backend stopped unexpectedly";
+pub(crate) const OPEN_ELSEWHERE: &str =
+    "This chat is open in another Medha window. Close it there to continue it here.";
 
 /// What a chat is told: a frame it wrote or was answered with, or that it is over.
 pub(crate) enum Said {
@@ -52,10 +54,18 @@ struct Routes {
     next: u64,
     replies: HashMap<u64, Reply>,
     chats: HashMap<String, (u64, Hear)>,
+    /// Chats of this window's own that it told to stop or heard end, until one is opened again.
+    over: HashMap<String, Instant>,
     gone: bool,
 }
 
 impl Routes {
+    /// Kept only while the backend may still be letting the chat go.
+    fn is_over(&mut self, session: String) {
+        self.over.retain(|_, since| since.elapsed() < LEAVING);
+        self.over.insert(session, Instant::now());
+    }
+
     fn hearing(&self, session: &str, opened: Option<u64>) -> Option<Hear> {
         self.chats
             .get(session)
@@ -126,10 +136,15 @@ impl Connection {
 
     /// Starts a chat, or resumes one, and hears everything it says from its
     /// first frame. The chat ends with this connection, as one on a pipe did.
+    ///
+    /// `leaving` says the chat being resumed is this window's own and already
+    /// on its way out, because it slept or was just closed: its end is waited
+    /// for. A chat that is live for any other reason is someone's, and is left alone.
     pub(crate) fn open_chat(
         &self,
         folder: &Path,
         resume: Option<&str>,
+        leaving: bool,
         settings: Option<&Value>,
         hear: Hear,
     ) -> Result<Chat, String> {
@@ -146,12 +161,13 @@ impl Connection {
                 Ok(made) => break made,
                 Err(error) => error,
             };
-            // The chat may still be leaving: one that just slept, or one left by a window that crashed.
-            let Some(id) = resume.filter(|id| Instant::now() < deadline && self.is_live(id)) else {
+            if !resume.is_some_and(|id| self.is_live(id)) {
                 return Err(error);
-            };
-            let _ = self.ask(json!({ "method": "session.attach", "session": id, "params": {} }));
-            let _ = self.ask(json!({ "method": "session.close", "session": id }));
+            }
+            let ours = leaving || resume.is_some_and(|id| self.routes().over.contains_key(id));
+            if !ours || Instant::now() >= deadline {
+                return Err(OPEN_ELSEWHERE.into());
+            }
             std::thread::sleep(Duration::from_millis(25));
         };
         let session = made["session"]
@@ -163,6 +179,7 @@ impl Connection {
             routes.next += 1;
             let opened = routes.next;
             routes.chats.insert(session.clone(), (opened, hear));
+            routes.over.remove(&session);
             opened
         };
         let attach =
@@ -186,6 +203,9 @@ impl Connection {
             opened: chat.opened,
             id,
         });
+        if matches!(frame["method"].as_str(), Some("session.close" | "shutdown")) {
+            routes.is_over(chat.session.clone());
+        }
         frame["session"] = json!(chat.session);
         self.post(&mut routes, frame, reply)
     }
@@ -197,7 +217,14 @@ impl Connection {
             };
             let said = frame["params"]["frame"].take();
             if said["method"] == "session.ended" {
-                let ended = self.routes().chats.remove(&session);
+                let ended = {
+                    let mut routes = self.routes();
+                    let ended = routes.chats.remove(&session);
+                    if ended.is_some() {
+                        routes.is_over(session);
+                    }
+                    ended
+                };
                 let reason = said["params"]["error"].as_str().map(str::to_owned);
                 if let Some((_, hear)) = ended {
                     hear(Said::Ended(reason));

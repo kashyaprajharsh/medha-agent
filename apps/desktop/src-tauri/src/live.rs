@@ -377,12 +377,15 @@ impl Inner {
         let (backend, folder) = (Arc::clone(&self.backend), self.workspace.clone());
         let resume = resume.map(str::to_owned);
         let settings = wake.map(|wake| wake.settings.clone().unwrap_or_else(|| json!({})));
+        // A chat woken from sleep resumes the one this window just let go to sleep.
+        let waking = wake.is_some();
         let (resting, over) = (Arc::clone(&rest), Arc::clone(&ended));
         std::thread::spawn(move || {
             let opened = backend.connection().and_then(|connection| {
                 let chat = connection.open_chat(
                     &folder,
                     resume.as_deref(),
+                    waking,
                     settings.as_ref(),
                     Arc::clone(&hear),
                 )?;

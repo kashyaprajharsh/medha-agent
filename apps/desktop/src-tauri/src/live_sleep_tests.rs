@@ -378,6 +378,52 @@ fn a_backend_that_dies_stops_its_chats_and_the_next_one_resumes_them() {
 }
 
 #[test]
+fn opening_a_chat_that_is_live_in_another_window_is_refused_and_leaves_it_running() {
+    let (model, _) = stand_in_model();
+    let Some(chat) = Chat::open("shared", &model) else {
+        return;
+    };
+    chat.turn("first");
+    let ready = chat.wait("the greeting", |frame| frame["method"] == "ready");
+    let session = ready["params"]["session"].as_str().unwrap().to_owned();
+
+    let second: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let sink = Arc::clone(&second);
+    chat.sessions
+        .open_to(
+            Arc::new(move |frame| sink.lock().unwrap().push(frame)),
+            "second",
+            Some(&session),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let refused = loop {
+        let exit = second
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|frame| frame["method"] == "exit")
+            .cloned();
+        if let Some(exit) = exit {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second window was never told"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(refused["params"]["stderr"], crate::backend::OPEN_ELSEWHERE);
+
+    chat.turn("second");
+    assert_eq!(
+        chat.count(|frame| frame["method"] == "exit"),
+        0,
+        "the first window's chat was stopped"
+    );
+}
+
+#[test]
 fn closing_a_chat_never_reaches_a_later_chat_resumed_under_its_id() {
     let (model, _) = stand_in_model();
     let Some(chat) = Chat::open("later", &model) else {
@@ -403,13 +449,13 @@ fn closing_a_chat_never_reaches_a_later_chat_resumed_under_its_id() {
     let (earlier, later) = (Arc::default(), Arc::default());
     let workspace = &chat.sessions.inner.workspace;
     let first = connection
-        .open_chat(workspace, Some(&session), None, heard(&earlier))
+        .open_chat(workspace, Some(&session), false, None, heard(&earlier))
         .unwrap();
     connection
         .tell(&first, json!({ "method": "session.close" }))
         .unwrap();
     let second = connection
-        .open_chat(workspace, Some(&session), None, heard(&later))
+        .open_chat(workspace, Some(&session), false, None, heard(&later))
         .unwrap();
 
     let shutdown = json!({ "id": 0, "method": "shutdown" });

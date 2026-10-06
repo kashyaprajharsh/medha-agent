@@ -662,8 +662,10 @@ async fn mcp_shutdown_waits_for_blocked_owned_work_and_keeps_the_singleton() {
     );
     let mut client = backend.connect().await;
     let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .create(true)
-        .append(true)
+        .truncate(false)
         .open(world.home().join("credentials.lock"))
         .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
@@ -1130,8 +1132,10 @@ async fn a_backend_told_to_stop_gives_way_to_another_only_once_its_own_work_is_o
     let mut backend = world.backend();
     let mut client = backend.connect().await;
     let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .create(true)
-        .append(true)
+        .truncate(false)
         .open(world.home().join("credentials.lock"))
         .unwrap();
     held.lock().unwrap();
@@ -1324,8 +1328,10 @@ async fn chats_waiting_on_a_held_lock_as_they_start_hold_up_nobody_else() {
     let mut other = backend.connect().await;
 
     let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .create(true)
-        .append(true)
+        .truncate(false)
         .open(world.home().join("credentials.lock"))
         .unwrap();
     held.lock().unwrap();
@@ -1372,8 +1378,10 @@ async fn requests_waiting_on_a_held_lock_hold_up_nobody_else() {
     let mut other = backend.connect().await;
 
     let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .create(true)
-        .append(true)
+        .truncate(false)
         .open(world.home().join("credentials.lock"))
         .unwrap();
     held.lock().unwrap();
@@ -1434,8 +1442,10 @@ async fn waits_on_a_held_lock_by_the_mcp_host_and_by_running_chats_hold_up_nobod
     let mut other = backend.connect().await;
 
     let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .create(true)
-        .append(true)
+        .truncate(false)
         .open(world.home().join("credentials.lock"))
         .unwrap();
     held.lock().unwrap();

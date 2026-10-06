@@ -244,9 +244,12 @@ fn one_writer<T>(target: &Path, write: impl FnOnce() -> Result<T>) -> Result<T> 
             .join("Medha")
             .join("instruction-locks");
         std::fs::create_dir_all(&locks)?;
+        // Opened to be read and written: Windows refuses a lock on a file opened only to add to.
         std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
             .create(true)
-            .append(true)
+            .truncate(false)
             .open(locks.join(format!("{named}.lock")))?
     };
     lock.lock()?;

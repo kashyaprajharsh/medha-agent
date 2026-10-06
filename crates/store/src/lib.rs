@@ -1670,6 +1670,7 @@ mod tests {
                 "shell.exec"
             ]
         );
+        drop(log);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -22,6 +22,10 @@ const AFTER_EXIT: Duration = Duration::from_secs(3);
 /// How long a chat that is ending is waited for before it is resumed.
 const LEAVING: Duration = Duration::from_secs(10);
 const STOPPED: &str = "Medha backend stopped unexpectedly";
+const QUIET: &str = "Medha did not answer in time. Try again.";
+/// How long a quick answer is waited for, and one that may install, download or start a chat.
+const SOON: Duration = Duration::from_secs(60);
+const EVENTUALLY: Duration = Duration::from_secs(10 * 60);
 pub(crate) const OPEN_ELSEWHERE: &str =
     "This chat is open in another Medha window. Close it there to continue it here.";
 
@@ -41,6 +45,8 @@ pub(crate) struct Chat {
 
 enum Reply {
     Wait(mpsc::SyncSender<Result<Value, String>>),
+    /// Nobody waits for this any more.
+    GivenUp,
     /// A chat's own request: the answer joins its frames under the id it used.
     Chat {
         session: String,
@@ -97,7 +103,7 @@ impl Connection {
         routes: &mut Routes,
         mut frame: Value,
         reply: Option<Reply>,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         if routes.gone {
             return Err(STOPPED.into());
         }
@@ -108,23 +114,36 @@ impl Connection {
         }
         self.lines
             .send(format!("{frame}\n"))
+            .map(|()| routes.next)
             .map_err(|_| STOPPED.to_string())
     }
 
-    fn ask(&self, frame: Value) -> Result<Value, String> {
+    /// Nothing waits without end on a backend that has gone quiet. An answer that
+    /// comes after its wait was given up is still met, so a chat it started is not left running.
+    fn ask(&self, frame: Value, within: Duration) -> Result<Value, String> {
         let (answer, answered) = mpsc::sync_channel(1);
-        self.post(&mut self.routes(), frame, Some(Reply::Wait(answer)))?;
-        answered.recv().unwrap_or_else(|_| Err(STOPPED.into()))
+        let id = self.post(&mut self.routes(), frame, Some(Reply::Wait(answer)))?;
+        match answered.recv_timeout(within) {
+            Ok(outcome) => outcome,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(STOPPED.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(waited) = self.routes().replies.get_mut(&id) {
+                    *waited = Reply::GivenUp;
+                }
+                // It may have arrived in the moment the wait ran out.
+                answered.try_recv().unwrap_or_else(|_| Err(QUIET.into()))
+            }
+        }
     }
 
     /// One question about a folder: its history, settings or extensions.
     pub(crate) fn about(&self, folder: &Path, mut request: Value) -> Result<Value, String> {
         request["folder"] = json!(folder);
-        self.ask(request)
+        self.ask(request, EVENTUALLY)
     }
 
     fn is_live(&self, session: &str) -> bool {
-        self.ask(json!({ "method": "session.list" }))
+        self.ask(json!({ "method": "session.list" }), SOON)
             .is_ok_and(|listed| {
                 listed["sessions"]
                     .as_array()
@@ -157,7 +176,8 @@ impl Connection {
         }
         let deadline = Instant::now() + LEAVING;
         let made = loop {
-            let error = match self.ask(json!({ "method": "session.create", "params": params })) {
+            let create = json!({ "method": "session.create", "params": params });
+            let error = match self.ask(create, EVENTUALLY) {
                 Ok(made) => break made,
                 Err(error) => error,
             };
@@ -184,7 +204,7 @@ impl Connection {
         };
         let attach =
             json!({ "method": "session.attach", "session": session, "params": { "after": 0 } });
-        if let Err(error) = self.ask(attach) {
+        if let Err(error) = self.ask(attach, SOON) {
             self.routes().chats.remove(&session);
             return Err(error);
         }
@@ -207,7 +227,7 @@ impl Connection {
             routes.is_over(chat.session.clone());
         }
         frame["session"] = json!(chat.session);
-        self.post(&mut routes, frame, reply)
+        self.post(&mut routes, frame, reply).map(|_| ())
     }
 
     fn heard(&self, mut frame: Value) {
@@ -254,6 +274,19 @@ impl Connection {
                 let hear = self.routes().hearing(&session, Some(opened));
                 if let Some(hear) = hear {
                     hear(Said::Frame(frame));
+                }
+            }
+            // A chat that started after its wait was given up has nobody; it is told to stop.
+            Some(Reply::GivenUp) => {
+                if let Some(session) = frame["result"]["session"].as_str() {
+                    let mut routes = self.routes();
+                    for method in ["session.attach", "session.close"] {
+                        let _ = self.post(
+                            &mut routes,
+                            json!({ "method": method, "session": session }),
+                            None,
+                        );
+                    }
                 }
             }
             None => {}
@@ -542,3 +575,7 @@ pub fn executable() -> Result<PathBuf, String> {
         .then_some(binary)
         .ok_or_else(|| "Medha backend is missing. Run npm run prepare:backend.".into())
 }
+
+#[cfg(test)]
+#[path = "backend_tests.rs"]
+mod tests;

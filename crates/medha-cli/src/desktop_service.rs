@@ -101,6 +101,9 @@ struct EventView {
     /// A screen the tool's server offers for this result, and what it draws.
     #[serde(skip_serializing_if = "Option::is_none")]
     screen: Option<Value>,
+    /// Structured parts retained in the log but omitted from this bounded view.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    omitted: Vec<&'static str>,
 }
 
 /// What one page of history may take on the wire, and so the most one event on it may.
@@ -141,6 +144,12 @@ impl EventView {
                 &mut self.summary,
                 &mut self.output,
                 &mut self.detail,
+                &mut self.target,
+                &mut self.file_path,
+                &mut self.verb,
+                &mut self.status,
+                &mut self.tool_id,
+                &mut self.child_id,
             ];
             for text in text.into_iter().flatten() {
                 if text.len() > keep + CUT.len() {
@@ -150,15 +159,23 @@ impl EventView {
                 }
             }
             // A plan, or what a tool's screen draws, is of no use in part.
-            for value in [&mut self.plan, &mut self.screen] {
+            for (name, value) in [("plan", &mut self.plan), ("screen", &mut self.screen)] {
                 if value
                     .as_ref()
                     .is_some_and(|value| value.to_string().len() > keep)
                 {
                     *value = None;
+                    self.omitted.push(name);
+                }
+            }
+            if !self.omitted.is_empty() {
+                let output = self.output.get_or_insert_with(String::new);
+                if !output.ends_with(CUT) {
+                    output.push_str(CUT);
                 }
             }
             if keep == 0 {
+                let bytes = self.bytes();
                 return (self, bytes);
             }
             keep /= 2;

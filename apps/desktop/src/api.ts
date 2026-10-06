@@ -39,6 +39,8 @@ export type HistoryEvent = {
   detail?: string;
   duration_ms?: number;
   screen?: ToolScreen;
+  /** Structured values remain stored but were omitted to keep this page bounded. */
+  omitted?: ("plan" | "screen")[];
 };
 
 export type EventPage = { events: HistoryEvent[]; next_cursor: string | null };

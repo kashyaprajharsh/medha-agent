@@ -267,6 +267,40 @@ fn a_page_of_history_is_bounded_in_bytes_and_the_next_takes_up_where_it_stopped(
 }
 
 #[test]
+fn oversized_structured_history_is_explicitly_marked_without_destroying_the_source() {
+    for field in ["screen", "plan"] {
+        let original = json!({"data": "x".repeat(PAGE_BYTES + 1)});
+        let mut event = EventView {
+            output: Some("short result".into()),
+            ..Default::default()
+        };
+        if field == "screen" {
+            event.screen = Some(original.clone());
+        } else {
+            event.plan = Some(original.clone());
+        }
+        let (fitted, bytes) = event.fitted();
+        assert!(bytes <= PAGE_BYTES);
+        let wire = serde_json::to_value(fitted).unwrap();
+        assert!(wire.get(field).is_none());
+        assert!(
+            wire["omitted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == field)
+        );
+        assert!(
+            wire["output"]
+                .as_str()
+                .unwrap()
+                .contains("Too large to show in full")
+        );
+        assert_eq!(original["data"].as_str().unwrap().len(), PAGE_BYTES + 1);
+    }
+}
+
+#[test]
 fn history_that_grows_as_it_is_written_still_fits_and_an_event_too_large_alone_is_cut() {
     let session = Session::new();
     // A control character is stored as one byte and written as six.

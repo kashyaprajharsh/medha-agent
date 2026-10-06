@@ -11,6 +11,7 @@ export type SubagentRun = {
 };
 
 export type Block =
+  | { kind: "notice"; id: string; text: string; ts: number }
   | {
       kind: "user" | "handoff" | "assistant";
       id: string;
@@ -64,6 +65,10 @@ export function toBlocks(events: HistoryEvent[]): Block[] {
   const blocks: Block[] = [];
   const steps = new Map<string, Step>();
   for (const event of events) {
+    if (event.omitted?.length) {
+      blocks.push({ kind: "notice", id: `${event.id}-omitted`, ts: event.ts,
+        text: `This saved ${event.omitted.join(" and ")} is too large to display in history.` });
+    }
     switch (event.kind) {
       case "tool_call": {
         if (event.plan) {

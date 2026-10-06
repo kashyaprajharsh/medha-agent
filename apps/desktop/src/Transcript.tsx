@@ -112,6 +112,8 @@ export const Transcript = memo(function Transcript({
             <time>{clock(block.ts)}</time>
           </div>
         );
+      case "notice":
+        return <div className="prose plain" role="status">{block.text}</div>;
       case "assistant":
         // The backend escapes all model text and keeps only web and mail links.
         return block.html ? (

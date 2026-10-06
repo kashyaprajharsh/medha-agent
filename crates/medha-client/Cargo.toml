@@ -11,6 +11,7 @@ test-support = []
 
 [dependencies]
 serde_json.workspace = true
+protocol = { package = "medha-protocol", path = "../protocol" }
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
 wire = { path = "../wire" }
 dirs = "6"

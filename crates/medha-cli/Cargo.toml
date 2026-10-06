@@ -29,6 +29,7 @@ gate = { path = "../gate" }
 runtime = { path = "../runtime" }
 backend = { path = "../backend" }
 medha-client = { path = "../medha-client" }
+protocol = { package = "medha-protocol", path = "../protocol" }
 wire = { path = "../wire" }
 getrandom = "0.3"
 tokio = { workspace = true, features = ["process", "io-std", "io-util", "signal"] }

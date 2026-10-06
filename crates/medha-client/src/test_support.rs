@@ -65,7 +65,9 @@ pub fn scripted(
                     wire::write_frame(&mut writing, &started).await;
                 }
                 if frame["method"] == "session.attach" && frame.get("id").is_some() {
-                    let attached = json!({ "id": frame["id"], "result": { "gap": false } });
+                    let attached = json!({ "id": frame["id"], "result": {
+                        "session": "late", "head": events, "replayed": events, "gap": false,
+                    } });
                     wire::write_frame(&mut writing, &attached).await;
                     for seq in 1..=events {
                         let said = json!({ "method": "note", "params": { "n": seq } });

@@ -17,18 +17,41 @@ impl ProfileProvider for providers::OpenAiCompat {
 }
 
 pub(crate) fn profiles(cfg: &config::Config) -> Value {
-    json!(
-        cfg.model_profiles()
-            .into_iter()
-            .map(|profile| json!({
-                "name": profile.name,
-                "model": profile.provider.model,
-                "protocol": profile.provider.protocol,
-                "default": profile.is_default,
-                "reasoning_support": profile.provider.reasoning.as_str(),
-            }))
-            .collect::<Vec<_>>()
-    )
+    json!(profile_views(cfg))
+}
+
+fn profile_views(cfg: &config::Config) -> Vec<protocol::Profile> {
+    cfg.model_profiles()
+        .into_iter()
+        .map(|profile| protocol::Profile {
+            name: profile.name,
+            model: profile.provider.model,
+            protocol: profile.provider.protocol.as_str().to_owned(),
+            default: profile.is_default,
+            reasoning_support: support(profile.provider.reasoning),
+        })
+        .collect()
+}
+
+fn support(support: kernel::ReasoningSupport) -> protocol::ReasoningSupport {
+    match support {
+        kernel::ReasoningSupport::Unknown => protocol::ReasoningSupport::Unverified,
+        kernel::ReasoningSupport::Unsupported => protocol::ReasoningSupport::Unsupported,
+        kernel::ReasoningSupport::Effort => protocol::ReasoningSupport::Effort,
+    }
+}
+
+fn effort(effort: kernel::ReasoningEffort) -> protocol::Effort {
+    match effort {
+        kernel::ReasoningEffort::None => protocol::Effort::None,
+        kernel::ReasoningEffort::Minimal => protocol::Effort::Minimal,
+        kernel::ReasoningEffort::Low => protocol::Effort::Low,
+        kernel::ReasoningEffort::Medium => protocol::Effort::Medium,
+        kernel::ReasoningEffort::High => protocol::Effort::High,
+        kernel::ReasoningEffort::XHigh => protocol::Effort::XHigh,
+        kernel::ReasoningEffort::Max => protocol::Effort::Max,
+        kernel::ReasoningEffort::Ultra => protocol::Effort::Ultra,
+    }
 }
 
 pub(crate) fn settings<P: Provider>(
@@ -39,14 +62,40 @@ pub(crate) fn settings<P: Provider>(
     cfg: &config::Config,
 ) -> Value {
     let reasoning = provider.reasoning();
-    json!({
-        "profiles": profiles(cfg), "profile": active, "model": model,
-        "mode": session.autonomy.as_str(),
-        "reasoning": reasoning.enabled.map_or("auto", |on| if on { "on" } else { "off" }),
-        "effort": reasoning.effort.map_or("auto", |effort| effort.as_str()),
-        "efforts": provider.reasoning_efforts().iter().map(|effort| effort.as_str()).collect::<Vec<_>>(),
-        "reasoning_support": provider.reasoning_support().as_str(),
-        "streaming": provider.streaming(), "context_limit": provider.context_window(),
+    json!(protocol::Settings {
+        profiles: profile_views(cfg),
+        profile: active.to_owned(),
+        model: model.to_owned(),
+        mode: match session.autonomy {
+            kernel::AutonomyLevel::Plan => protocol::Mode::Plan,
+            kernel::AutonomyLevel::Careful => protocol::Mode::Careful,
+            kernel::AutonomyLevel::Normal => protocol::Mode::Normal,
+            kernel::AutonomyLevel::Yolo => protocol::Mode::Yolo,
+        },
+        reasoning: match reasoning.enabled {
+            None => protocol::Reasoning::Auto,
+            Some(true) => protocol::Reasoning::On,
+            Some(false) => protocol::Reasoning::Off,
+        },
+        effort: reasoning.effort.map_or(protocol::Effort::Auto, effort),
+        efforts: provider
+            .reasoning_efforts()
+            .into_iter()
+            .map(effort)
+            .collect(),
+        reasoning_support: support(provider.reasoning_support()),
+        streaming: provider.streaming(),
+        context_limit: provider.context_window(),
+        protocol: Some(provider.protocol().as_str().to_owned()),
+        image_input: Some(provider.image_input_mode().as_str().to_owned()),
+        image_support: Some(
+            match provider.image_support() {
+                kernel::ImageSupport::Supported => "supported",
+                kernel::ImageSupport::Unsupported => "unsupported",
+                kernel::ImageSupport::Unknown => "unknown",
+            }
+            .to_owned()
+        ),
     })
 }
 

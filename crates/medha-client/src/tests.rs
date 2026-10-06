@@ -347,3 +347,40 @@ async fn a_closed_writer_releases_the_bytes_and_reply_slot_before_returning() {
         assert!(connection.routes().replies.is_empty());
     }
 }
+
+#[tokio::test]
+async fn typed_async_commands_validate_scope_and_decode_the_backend_answer() {
+    let (address, _, connection) = async_peer(Duration::ZERO).await;
+    let wrong = connection
+        .call_async(protocol::Scope::Service, &protocol::Cancel {})
+        .await;
+    assert_eq!(wrong.unwrap_err(), "the command has the wrong scope");
+    assert_eq!(connection.unsent.load(Ordering::Relaxed), 0);
+    assert!(connection.routes().replies.is_empty());
+
+    let made = connection
+        .call_async(
+            protocol::Scope::Service,
+            &protocol::CreateSession {
+                folder: PathBuf::from("."),
+                ends_with_client: true,
+                resume: None,
+                model: None,
+                mode: None,
+                reasoning: None,
+                settings: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(made.session, "late");
+    let invalid = connection
+        .decoded::<protocol::GetSettings>(json!({"secret": "never echo this"}))
+        .unwrap_err();
+    assert_eq!(
+        invalid,
+        "Medha returned an invalid answer to session.settings"
+    );
+    connection.lost();
+    forget(&address);
+}

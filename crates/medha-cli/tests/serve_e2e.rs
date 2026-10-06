@@ -564,7 +564,9 @@ async fn upgrade_refuses_active_work_and_an_idle_upgrade_exits() {
             .get("result")
             .is_some()
     );
-    client.ask("session.close", Some(&session), json!({})).await;
+    let closing = client.ask("session.close", Some(&session), json!({})).await;
+    let closing: protocol::Closing = serde_json::from_value(closing["result"].clone()).unwrap();
+    assert!(closing.closing);
     let deadline = Instant::now() + Duration::from_secs(4);
     while !client.ask("session.list", None, json!({})).await["result"]["sessions"]
         .as_array()
@@ -1521,6 +1523,11 @@ async fn a_chat_in_the_backend_obeys_the_environment_as_one_in_its_own_process_d
 
     let in_backend = outcome(&client.ask("session.settings", Some(&chat), json!({})).await);
     assert_eq!(in_backend["mode"], "plan", "{in_backend}");
+    let typed: protocol::Settings = serde_json::from_value(in_backend.clone()).unwrap();
+    assert_eq!(typed.mode, protocol::Mode::Plan);
+    assert_eq!(typed.protocol.as_deref(), Some("open-ai-chat"));
+    assert!(typed.image_input.is_some());
+    assert!(typed.image_support.is_some());
     assert_eq!(
         in_backend,
         outcome(&alone.ask("session.settings", json!({})))

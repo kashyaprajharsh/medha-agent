@@ -311,6 +311,52 @@ impl Connection {
         self.ask_async(frame, within).await
     }
 
+    fn frame<T: protocol::Command>(
+        scope: protocol::Scope<'_>,
+        params: &T,
+    ) -> Result<Value, String> {
+        let frame = protocol::Call::new(scope, params).map_err(str::to_owned)?;
+        serde_json::to_value(frame).map_err(|_| "The request could not be encoded".into())
+    }
+
+    fn decoded<T: protocol::Command>(&self, value: Value) -> Result<T::Output, String> {
+        let created = (T::METHOD == "session.create")
+            .then(|| value["session"].as_str().map(str::to_owned))
+            .flatten();
+        match serde_json::from_value(value) {
+            Ok(output) => Ok(output),
+            Err(_) => {
+                if let Some(session) = created {
+                    self.close_late(&json!({"session": session}));
+                }
+                // Invalid payloads can include secrets or very large values.
+                // Report the contract failure without echoing their contents.
+                Err(format!("Medha returned an invalid answer to {}", T::METHOD))
+            }
+        }
+    }
+
+    pub fn call<T: protocol::Command>(
+        &self,
+        scope: protocol::Scope<'_>,
+        params: &T,
+    ) -> Result<T::Output, String> {
+        let within = if wire::slow_request(T::METHOD) {
+            EVENTUALLY
+        } else {
+            SOON
+        };
+        self.decoded::<T>(self.ask(Self::frame(scope, params)?, within)?)
+    }
+
+    pub async fn call_async<T: protocol::Command>(
+        &self,
+        scope: protocol::Scope<'_>,
+        params: &T,
+    ) -> Result<T::Output, String> {
+        self.decoded::<T>(self.request(Self::frame(scope, params)?).await?)
+    }
+
     /// One question about a folder: its history, settings or extensions.
     pub fn about(&self, folder: &Path, mut request: Value) -> Result<Value, String> {
         let waited = if wire::slow_request(request["method"].as_str().unwrap_or_default()) {
@@ -323,14 +369,8 @@ impl Connection {
     }
 
     pub fn is_live(&self, session: &str) -> bool {
-        self.ask(json!({ "method": "session.list" }), SOON)
-            .is_ok_and(|listed| {
-                listed["sessions"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|live| live["session"] == session)
-            })
+        self.call(protocol::Scope::Service, &protocol::ListSessions {})
+            .is_ok_and(|listed| listed.sessions.iter().any(|live| live.session == session))
     }
 
     /// Starts a chat, or resumes one, and hears everything it says from its
@@ -347,18 +387,22 @@ impl Connection {
         settings: Option<&Value>,
         hear: Hear,
     ) -> Result<Chat, String> {
-        let mut params = json!({ "folder": folder, "ends_with_client": true });
-        if let Some(id) = resume {
-            params["resume"] = json!(id);
-        }
-        if let Some(settings) = settings {
-            params["settings"] = settings.clone();
-        }
+        let params = protocol::CreateSession {
+            folder: folder.to_path_buf(),
+            ends_with_client: true,
+            resume: resume.map(str::to_owned),
+            model: None,
+            mode: None,
+            reasoning: None,
+            settings: settings
+                .map(|settings| serde_json::from_value(settings.clone()))
+                .transpose()
+                .map_err(|_| "The saved chat settings are invalid")?,
+        };
         let deadline = Instant::now() + LEAVING;
         let mut gone = 0;
         let made = loop {
-            let create = json!({ "method": "session.create", "params": params });
-            let error = match self.ask(create, EVENTUALLY) {
+            let error = match self.call(protocol::Scope::Service, &params) {
                 Ok(made) => break made,
                 Err(error) => error,
             };
@@ -378,10 +422,7 @@ impl Connection {
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let session = made["session"]
-            .as_str()
-            .ok_or("Medha backend did not name the chat")?
-            .to_owned();
+        let session = made.session;
         let opened = {
             let mut routes = self.routes();
             routes.next += 1;
@@ -390,9 +431,10 @@ impl Connection {
             routes.over.remove(&session);
             opened
         };
-        let attach =
-            json!({ "method": "session.attach", "session": session, "params": { "after": 0 } });
-        if let Err(error) = self.ask(attach, SOON) {
+        if let Err(error) = self.call(
+            protocol::Scope::Chat(&session),
+            &protocol::Attach { after: Some(0) },
+        ) {
             self.routes().chats.remove(&session);
             return Err(error);
         }

@@ -90,6 +90,10 @@ impl Writer {
                 "error": {"code": -32001, "message": "The chat's answer is too large."}}))
             .expect("a JSON value can be serialized");
         }
+        self.enqueue(frame)
+    }
+
+    fn enqueue(&self, mut frame: Vec<u8>) -> bool {
         frame.push(b'\n');
         let frame_len = frame.len();
         if frame_len > MAX_OUTBOUND_FRAME {
@@ -118,7 +122,32 @@ impl Writer {
 
     /// Emit a JSON-RPC notification (no id, no response expected).
     pub fn notify(&self, method: &str, params: Value) -> bool {
-        self.write_value(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+        self.notify_params(method, &params)
+    }
+
+    fn notify_params<T: serde::Serialize>(&self, method: &str, params: &T) -> bool {
+        #[derive(serde::Serialize)]
+        struct Notification<'a, T> {
+            jsonrpc: &'static str,
+            method: &'a str,
+            params: &'a T,
+        }
+        if self.cancelled.is_cancelled() {
+            return false;
+        }
+        // Serialize directly: typed tool payloads must not be cloned again
+        // into an intermediate JSON value merely to add the envelope.
+        match serde_json::to_vec(&Notification {
+            jsonrpc: "2.0",
+            method,
+            params,
+        }) {
+            Ok(frame) => self.enqueue(frame),
+            Err(_) => {
+                self.fail("Could not encode the chat's output.");
+                false
+            }
+        }
     }
 
     fn event(&self, kind: &str, mut params: Value) -> bool {
@@ -126,6 +155,10 @@ impl Writer {
             m.insert("kind".into(), json!(kind));
         }
         self.notify("event", params)
+    }
+
+    fn turn_event(&self, event: protocol::TurnEvent) -> bool {
+        self.notify_params("event", &event)
     }
 
     fn respond(&self, id: Value, result: Value) -> bool {
@@ -678,12 +711,14 @@ fn acp_tool_kind(tool: &str) -> &'static str {
 impl kernel::StreamSink for AcpSink {
     fn phase(&self, phase: kernel::progress::Phase) {
         if !self.peer.is_acp() && phase == kernel::progress::Phase::Generating {
-            self.writer.event("model.waiting", json!({}));
+            self.writer.turn_event(protocol::TurnEvent::Waiting);
         }
     }
     fn notice(&self, text: &str) {
         if !self.peer.is_acp() {
-            self.writer.event("notice", json!({ "text": text }));
+            self.writer.turn_event(protocol::TurnEvent::Notice {
+                text: text.to_owned(),
+            });
         }
     }
     fn text(&self, delta: &str) {
@@ -697,7 +732,9 @@ impl kernel::StreamSink for AcpSink {
             );
             return;
         }
-        self.writer.event("model.text", json!({ "delta": delta }));
+        self.writer.turn_event(protocol::TurnEvent::Text {
+            delta: delta.to_owned(),
+        });
     }
     fn reasoning(&self, delta: &str) {
         if self.peer.is_acp() {
@@ -710,8 +747,25 @@ impl kernel::StreamSink for AcpSink {
             );
             return;
         }
-        self.writer
-            .event("model.reasoning", json!({ "delta": delta }));
+        self.writer.turn_event(protocol::TurnEvent::Reasoning {
+            delta: delta.to_owned(),
+        });
+    }
+    fn tool_started(&self, tool: &str, target: Option<&str>) {
+        if !self.peer.is_acp() {
+            self.writer.turn_event(protocol::TurnEvent::ToolStarted {
+                tool: tool.to_owned(),
+                target: target.map(str::to_owned),
+            });
+        }
+    }
+    fn cost(&self, total_usd: f64, indicative: bool) {
+        if !self.peer.is_acp() {
+            self.writer.turn_event(protocol::TurnEvent::Cost {
+                total_usd,
+                indicative,
+            });
+        }
     }
     fn tool_call(&self, tool: &str, args: &Value) {
         if self.peer.is_acp() {
@@ -728,8 +782,11 @@ impl kernel::StreamSink for AcpSink {
             );
             return;
         }
-        self.writer
-            .event("tool.call", json!({ "tool": tool, "args": args }));
+        self.writer.turn_event(protocol::TurnEvent::ToolCall {
+            id: None,
+            tool: tool.to_owned(),
+            args: args.clone(),
+        });
     }
     fn tool_call_with_id(&self, id: &str, tool: &str, args: &Value) {
         if self.peer.is_acp() {
@@ -746,8 +803,11 @@ impl kernel::StreamSink for AcpSink {
             );
             return;
         }
-        self.writer
-            .event("tool.call", json!({ "id": id, "tool": tool, "args": args }));
+        self.writer.turn_event(protocol::TurnEvent::ToolCall {
+            id: Some(id.to_owned()),
+            tool: tool.to_owned(),
+            args: args.clone(),
+        });
     }
     fn tool_result(&self, tool: &str, ok: bool, payload: &Value) {
         if self.peer.is_acp() {
@@ -766,10 +826,12 @@ impl kernel::StreamSink for AcpSink {
             );
             return;
         }
-        self.writer.event(
-            "tool.observation",
-            json!({ "tool": tool, "ok": ok, "payload": payload }),
-        );
+        self.writer.turn_event(protocol::TurnEvent::ToolResult {
+            id: None,
+            tool: tool.to_owned(),
+            ok,
+            payload: payload.clone(),
+        });
     }
     fn tool_result_with_id(&self, id: &str, tool: &str, ok: bool, payload: &Value) {
         if self.peer.is_acp() {
@@ -788,86 +850,104 @@ impl kernel::StreamSink for AcpSink {
             );
             return;
         }
-        self.writer.event(
-            "tool.observation",
-            json!({ "id": id, "tool": tool, "ok": ok, "payload": payload }),
-        );
+        self.writer.turn_event(protocol::TurnEvent::ToolResult {
+            id: Some(id.to_owned()),
+            tool: tool.to_owned(),
+            ok,
+            payload: payload.clone(),
+        });
     }
     fn tool_input(&self, id: &str, tool: &str, delta: &str) {
         // Only a server's tool can have a screen to draw this on, and only
         // Medha's own window draws one. Everything else is told at the call.
         if !self.peer.is_acp() && mcp::McpManager::is_mcp_tool(tool) {
-            self.writer.event(
-                "tool.input",
-                json!({ "id": id, "tool": tool, "delta": delta }),
-            );
+            self.writer.turn_event(protocol::TurnEvent::ToolInput {
+                id: id.to_owned(),
+                tool: tool.to_owned(),
+                delta: delta.to_owned(),
+            });
         }
     }
     fn tool_screen(&self, id: &str, screen: &Value) {
         // Only Medha's own window draws screens; another editor gets the text result.
         if !self.peer.is_acp() {
-            self.writer
-                .event("tool.screen", json!({ "id": id, "screen": screen }));
+            self.writer.turn_event(protocol::TurnEvent::ToolScreen {
+                id: id.to_owned(),
+                screen: screen.clone(),
+            });
         }
     }
     fn usage(&self, usage: &kernel::Usage) {
-        self.writer.event(
-            "usage",
-            json!({
-                "prompt_tokens": usage.prompt_tokens,
-                "total_tokens": usage.total_tokens,
-                // Omitted rather than zeroed when the route does not report it:
-                // an editor must be able to tell "no cache" from "not measured".
-                "cached_prompt_tokens": usage.cached_prompt_tokens,
-            }),
-        );
+        self.writer.turn_event(protocol::TurnEvent::Usage {
+            prompt_tokens: usage.prompt_tokens,
+            total_tokens: usage.total_tokens,
+            cached_prompt_tokens: usage.cached_prompt_tokens,
+        });
     }
     fn context_pressure(&self, pressure: kernel::ContextPressure) {
-        self.writer.event(
-            "context_pressure",
-            json!({
-                "input_tokens": pressure.input_tokens,
-                "input_limit": pressure.input_limit,
-                "usable_input_tokens": pressure.usable_input_tokens,
-                "quality": pressure.quality,
-                "percent": pressure.percent(),
-            }),
-        );
+        self.writer
+            .turn_event(protocol::TurnEvent::ContextPressure {
+                input_tokens: pressure.input_tokens,
+                input_limit: pressure.input_limit,
+                usable_input_tokens: pressure.usable_input_tokens,
+                quality: match pressure.quality {
+                    kernel::TokenCountQuality::Authoritative => {
+                        protocol::CountQuality::Authoritative
+                    }
+                    kernel::TokenCountQuality::ProviderEstimate => {
+                        protocol::CountQuality::ProviderEstimate
+                    }
+                    kernel::TokenCountQuality::LocalEstimate => {
+                        protocol::CountQuality::LocalEstimate
+                    }
+                },
+                percent: pressure.percent(),
+            });
     }
     fn verify(&self, ok: bool, summary: &str) {
-        self.writer
-            .event("verify", json!({ "ok": ok, "summary": summary }));
+        self.writer.turn_event(protocol::TurnEvent::Verify {
+            ok,
+            summary: summary.to_owned(),
+        });
     }
     fn compacting(&self, active: bool) {
-        self.writer.event("compacting", json!({ "active": active }));
+        self.writer
+            .turn_event(protocol::TurnEvent::Compacting { active });
     }
     fn compaction(&self, before: u32, after: u32, summarized: bool, summary: Option<&str>) {
-        self.writer.event(
-            "compaction",
-            json!({ "before": before, "after": after, "summarized": summarized, "summary": summary }),
-        );
+        self.writer.turn_event(protocol::TurnEvent::Compaction {
+            before,
+            after,
+            summarized,
+            summary: summary.map(str::to_owned),
+        });
     }
     fn steered(&self, text: &str) {
         settle_unread(&self.unread, text);
-        self.writer
-            .event("message.steered", json!({ "content": text }));
+        self.writer.turn_event(protocol::TurnEvent::Steered {
+            content: text.to_owned(),
+        });
     }
     fn steers_returned(&self, texts: &[String]) {
         // Ledgered messages are routed by the run loop once the turn ends.
-        let others: Vec<&String> = {
+        let others: Vec<String> = {
             let unread = self
                 .unread
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            texts.iter().filter(|text| !unread.contains(text)).collect()
+            texts
+                .iter()
+                .filter(|text| !unread.contains(text))
+                .cloned()
+                .collect()
         };
         if !others.is_empty() {
             self.writer
-                .event("message.returned", json!({ "contents": others }));
+                .turn_event(protocol::TurnEvent::Returned { contents: others });
         }
     }
     fn restarted(&self) {
-        self.writer.event("model.restarted", json!({}));
+        self.writer.turn_event(protocol::TurnEvent::Restarted);
     }
     fn supports_restart(&self) -> bool {
         true
@@ -2249,6 +2329,83 @@ mod tests {
         sink.peer.select_acp();
         sink.phase(kernel::progress::Phase::Generating);
         sink.notice("retry");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn turn_callbacks_preserve_the_typed_stream_contract_and_tui_progress() {
+        use kernel::StreamSink;
+        let (writer, mut rx) = capture_writer(32);
+        let sink = AcpSink {
+            writer,
+            peer: Peer::new(),
+            unread: Unread::default(),
+        };
+        sink.phase(kernel::Phase::Generating);
+        sink.notice("image described by the vision model");
+        sink.text("answer");
+        sink.reasoning("thinking");
+        sink.tool_started("read", Some("file.rs"));
+        sink.tool_call_with_id("call", "read", &json!({"path": "file.rs"}));
+        sink.tool_result_with_id("call", "read", true, &json!({"text": "contents"}));
+        sink.usage(&kernel::Usage {
+            prompt_tokens: 12,
+            total_tokens: 15,
+            ..Default::default()
+        });
+        sink.cost(0.25, true);
+        sink.context_pressure(kernel::ContextPressure::new(
+            12,
+            Some(100),
+            kernel::TokenCountQuality::LocalEstimate,
+        ));
+        sink.verify(false, "check failed");
+        sink.compacting(true);
+        sink.compaction(100, 50, true, Some("summary"));
+        sink.steered("next question");
+        sink.steers_returned(&["unused text".to_owned()]);
+        sink.restarted();
+
+        let frames = captured_values(&mut rx);
+        assert_eq!(frames.len(), 16);
+        let decoded: Vec<protocol::TurnEvent> = frames
+            .into_iter()
+            .map(|frame| {
+                assert_eq!(frame["jsonrpc"], "2.0");
+                assert_eq!(frame["method"], "event");
+                serde_json::from_value(frame["params"].clone()).unwrap()
+            })
+            .collect();
+        assert!(
+            !decoded
+                .iter()
+                .any(|event| matches!(event, protocol::TurnEvent::Unknown))
+        );
+        assert!(
+            matches!(&decoded[4], protocol::TurnEvent::ToolStarted { tool, target: Some(target) } if tool == "read" && target == "file.rs")
+        );
+        assert!(
+            matches!(&decoded[6], protocol::TurnEvent::ToolResult { id: Some(id), payload, .. } if id == "call" && payload["text"] == "contents")
+        );
+        assert!(matches!(
+            decoded[7],
+            protocol::TurnEvent::Usage {
+                cached_prompt_tokens: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decoded[8],
+            protocol::TurnEvent::Cost {
+                total_usd: 0.25,
+                indicative: true
+            }
+        ));
+
+        // These new Medha callbacks do not extend the editor's ACP dialect.
+        sink.peer.select_acp();
+        sink.tool_started("read", None);
+        sink.cost(0.50, true);
         assert!(rx.try_recv().is_err());
     }
 

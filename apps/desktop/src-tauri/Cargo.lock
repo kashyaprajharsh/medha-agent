@@ -2050,6 +2050,7 @@ version = "0.1.10"
 dependencies = [
  "dirs",
  "libc",
+ "medha-protocol",
  "serde_json",
  "tokio",
  "wire",
@@ -2086,6 +2087,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "url",
+]
+
+[[package]]
+name = "medha-protocol"
+version = "0.1.10"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

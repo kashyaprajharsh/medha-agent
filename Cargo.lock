@@ -2342,6 +2342,7 @@ dependencies = [
  "lsp",
  "mcp",
  "medha-client",
+ "medha-protocol",
  "media",
  "memory",
  "orchestrator",
@@ -2382,6 +2383,7 @@ version = "0.1.10"
 dependencies = [
  "dirs 6.0.0",
  "libc",
+ "medha-protocol",
  "serde_json",
  "tokio",
  "wire",
@@ -2396,6 +2398,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "url",
+]
+
+[[package]]
+name = "medha-protocol"
+version = "0.1.10"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

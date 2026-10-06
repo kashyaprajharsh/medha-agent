@@ -177,9 +177,10 @@ struct OwnProcess {
 }
 
 impl OwnProcess {
-    fn start(folder: &Path, home: &Path, provider: &Provider) -> Self {
+    fn start(folder: &Path, home: &Path, provider: &Provider, env: &[(&str, &str)]) -> Self {
         let mut child = medha(home, provider)
             .arg("--acp")
+            .envs(env.iter().copied())
             .current_dir(folder)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -240,9 +241,10 @@ struct Backend {
 }
 
 impl Backend {
-    fn start(home: &Path, provider: &Provider) -> Self {
+    fn start(home: &Path, provider: &Provider, env: &[(&str, &str)]) -> Self {
         let child = medha(home, provider)
             .arg("serve")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -445,8 +447,13 @@ impl World {
     }
 
     fn backend(&self) -> Backend {
+        self.backend_in(&[])
+    }
+
+    /// A backend whose own environment asks something of every chat it starts.
+    fn backend_in(&self, env: &[(&str, &str)]) -> Backend {
         std::fs::create_dir_all(self.home()).unwrap();
-        Backend::start(&self.home(), &self.provider)
+        Backend::start(&self.home(), &self.provider, env)
     }
 }
 
@@ -810,7 +817,7 @@ async fn a_chat_in_the_backend_answers_its_own_requests_as_one_in_its_own_proces
     let backend = world.backend();
     let mut client = backend.connect().await;
     let chat = client.open(&folder).await;
-    let mut alone = OwnProcess::start(&folder, &world.home(), &world.provider);
+    let mut alone = OwnProcess::start(&folder, &world.home(), &world.provider, &[]);
 
     let requests = [
         ("hello", json!({})),
@@ -845,6 +852,58 @@ async fn a_chat_in_the_backend_answers_its_own_requests_as_one_in_its_own_proces
         let in_process = outcome(&alone.ask(method, params));
         assert_eq!(in_backend, in_process, "{method}");
     }
+}
+
+/// The names of the tools one model request offered, in order.
+fn offered(request: &Value) -> Vec<String> {
+    let mut names: Vec<String> = request["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_in_the_backend_obeys_the_environment_as_one_in_its_own_process_does() {
+    let env = [
+        ("MEDHA_MODE", "plan"),
+        ("MEDHA_TOOLS", "minimal"),
+        ("MEDHA_MAX_PARALLEL_TOOLS", "1"),
+    ];
+    let world = World::new();
+    let folder = world.folder("w");
+    let backend = world.backend_in(&env);
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    let mut alone = OwnProcess::start(&folder, &world.home(), &world.provider, &env);
+
+    let in_backend = outcome(&client.ask("session.settings", Some(&chat), json!({})).await);
+    assert_eq!(in_backend["mode"], "plan", "{in_backend}");
+    assert_eq!(
+        in_backend,
+        outcome(&alone.ask("session.settings", json!({})))
+    );
+
+    client.send(&chat, "what may you use").await;
+    let from_backend = offered(&world.provider.seen.recv_timeout(WAIT).unwrap());
+    client.until(|frame| kind(frame, "turn.done")).await;
+    alone.ask("message.send", json!({"content": "what may you use"}));
+    let from_process = offered(&world.provider.seen.recv_timeout(WAIT).unwrap());
+    assert!(!from_backend.is_empty(), "the model was offered no tools");
+    assert_eq!(from_backend, from_process, "the tools offered differ");
+
+    // What a client chooses for its chat wins over the environment, as a flag does.
+    let chosen = json!({"folder": world.folder("chosen"), "mode": "careful"});
+    let made = client.ask("session.create", None, chosen).await;
+    let own = made["result"]["session"].as_str().unwrap().to_string();
+    client
+        .ask("session.attach", Some(&own), json!({"after": 0}))
+        .await;
+    let settings = outcome(&client.ask("session.settings", Some(&own), json!({})).await);
+    assert_eq!(settings["mode"], "careful", "{settings}");
 }
 
 /// A remote MCP server with one tool, counting how many times a client connected to it.

@@ -10,6 +10,53 @@ pub enum Resume {
     Id(String),
 }
 
+fn env_text(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => anyhow::bail!("{name} must contain valid Unicode"),
+    }
+}
+
+impl SessionOptions {
+    /// What this process's environment asks of every chat it starts. Whoever
+    /// starts a chat, a terminal or the backend, begins here and lays its own
+    /// explicit choices over it: a flag or a client's request wins over the
+    /// environment, and the environment wins over `medha.lock`.
+    pub fn from_process() -> anyhow::Result<Self> {
+        let reasoning = env_text("MEDHA_REASONING_EFFORT")?
+            .map(|effort| kernel::ReasoningConfig::from_effort_text(&effort))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        let autonomy = env_text("MEDHA_MODE")?
+            .map(|mode| kernel::AutonomyLevel::parse(&mode))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        let sandbox = match std::env::var("MEDHA_SANDBOX")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("host" | "off" | "none") => Some(sandbox::BackendKind::Host),
+            Some("native" | "on") => Some(sandbox::BackendKind::Native),
+            _ => None,
+        };
+        Ok(Self {
+            reasoning,
+            autonomy,
+            verify_command: env_text("MEDHA_VERIFY")?.filter(|command| !command.trim().is_empty()),
+            sandbox,
+            tools_preset: std::env::var("MEDHA_TOOLS").ok(),
+            max_parallel_tools: crate::budget::env_number("MEDHA_MAX_PARALLEL_TOOLS")?,
+            approve: std::env::var("MEDHA_APPROVE").ok(),
+            model_env: crate::config::ModelEnv::from_process(),
+            search_env: crate::config::SearchEnv::from_process(),
+            budget: crate::budget::BudgetLimits::from_env()?,
+            ..Self::default()
+        })
+    }
+}
+
 /// `None` means the caller left it to `medha.lock` or the saved profile.
 #[derive(Clone, Default)]
 pub struct SessionOptions {

@@ -35,7 +35,6 @@ use kernel::Provider;
 use kernel::{EventLog, Kernel, Message, Session};
 #[cfg(test)]
 use runtime::approvals::{approve_list_from, unknown_approvals};
-use runtime::budget::env_number;
 #[cfg(test)]
 use runtime::reasoning::normalize_reasoning_on;
 pub(crate) use runtime::reasoning::reasoning_on_config;
@@ -821,20 +820,8 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    let effort_override = match cli.reasoning_effort.clone() {
-        Some(config) => Some(config),
-        None => match std::env::var("MEDHA_REASONING_EFFORT") {
-            Ok(value) => Some(
-                kernel::ReasoningConfig::from_effort_text(&value).map_err(anyhow::Error::msg)?,
-            ),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(_) => anyhow::bail!("MEDHA_REASONING_EFFORT must contain valid Unicode"),
-        },
-    };
-
-    // Invalid explicit limits must fail before provider discovery or startup effects.
-    let budget_limits = runtime::budget::BudgetLimits::from_env()?;
-    let parallel_override = env_number::<usize>("MEDHA_MAX_PARALLEL_TOOLS")?;
+    // An invalid setting in the environment must fail before provider discovery or startup effects.
+    let process = runtime::SessionOptions::from_process()?;
 
     if cli.setup && !std::io::stdin().is_terminal() {
         anyhow::bail!("--setup opens the interactive TUI and needs a terminal");
@@ -852,44 +839,26 @@ async fn main() -> Result<()> {
 
     let lock_cwd = std::env::current_dir()?;
     let lock = runtime::workspace::load_lock(&lock_cwd, &Stderr)?;
+    // A flag wins over the environment, which `process` already holds.
     let chosen_autonomy = if cli.plan {
         Some(kernel::AutonomyLevel::Plan)
-    } else if let Some(mode) = cli.mode {
-        Some(mode)
     } else {
-        match std::env::var("MEDHA_MODE") {
-            Ok(mode) => Some(kernel::AutonomyLevel::parse(&mode).map_err(anyhow::Error::msg)?),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(_) => anyhow::bail!("MEDHA_MODE must contain valid Unicode"),
-        }
-    };
-    let chosen_verify = match std::env::var("MEDHA_VERIFY") {
-        Ok(command) if !command.trim().is_empty() => Some(command),
-        Ok(_) | Err(std::env::VarError::NotPresent) => None,
-        Err(_) => anyhow::bail!("MEDHA_VERIFY must contain valid Unicode"),
+        cli.mode.or(process.autonomy)
     };
     let options = runtime::SessionOptions {
         model: cli.model.clone(),
         base_url: cli.base_url.clone(),
-        reasoning: effort_override,
+        reasoning: cli
+            .reasoning_effort
+            .clone()
+            .or_else(|| process.reasoning.clone()),
         autonomy: chosen_autonomy,
-        verify_command: chosen_verify,
         require_verify: cli.require_verify,
         sandbox: if cli.no_sandbox {
             Some(sandbox::BackendKind::Host)
         } else {
-            match std::env::var("MEDHA_SANDBOX")
-                .ok()
-                .as_deref()
-                .map(str::trim)
-            {
-                Some("host") | Some("off") | Some("none") => Some(sandbox::BackendKind::Host),
-                Some("native") | Some("on") => Some(sandbox::BackendKind::Native),
-                _ => None,
-            }
+            process.sandbox
         },
-        tools_preset: std::env::var("MEDHA_TOOLS").ok(),
-        max_parallel_tools: parallel_override,
         resume: match (&cli.resume, cli.continue_) {
             (Some(id), _) => runtime::Resume::Id(id.clone()),
             (None, true) => runtime::Resume::Latest,
@@ -901,10 +870,6 @@ async fn main() -> Result<()> {
             cli.prompt.join(" ")
         },
         attach: cli.attach.clone(),
-        model_env: config::ModelEnv::from_process(),
-        search_env: config::SearchEnv::from_process(),
-        budget: budget_limits,
-        approve: std::env::var("MEDHA_APPROVE").ok(),
         mcp_host: runtime::mcp_shared::endpoint(),
         first_run_setup: cli.setup,
         may_start_unconfigured: cli.setup
@@ -913,6 +878,7 @@ async fn main() -> Result<()> {
                 && cli.attach.is_empty()
                 && cli.prompt.join(" ").trim().is_empty()
                 && std::io::stdin().is_terminal()),
+        ..process
     };
     let runtime::session::Choices {
         autonomy,

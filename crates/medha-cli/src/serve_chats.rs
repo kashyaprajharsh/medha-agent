@@ -12,8 +12,6 @@ use runtime::{Notices, Resume, SessionOptions, Workspace};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::config;
-
 /// Start-up notices have no terminal to go to; the client that asked gets them.
 #[derive(Default)]
 struct Collected(Mutex<Vec<String>>);
@@ -102,9 +100,12 @@ impl ServeChats {
     }
 }
 
-/// What a client may choose for a chat. Keys are never among them: the backend
-/// reads those from its own environment and the saved configuration.
+/// What a client may choose for a chat, laid over what the backend's own
+/// environment asks of every chat, as a flag is laid over it in a terminal.
+/// Keys are never a client's to choose: the backend reads those from its
+/// environment and the saved configuration.
 fn options(params: &Value) -> Result<SessionOptions, String> {
+    let process = SessionOptions::from_process().map_err(|error| format!("{error:#}"))?;
     let text = |key: &str| params[key].as_str().map(str::to_owned);
     let autonomy = text("mode")
         .map(|mode| kernel::AutonomyLevel::parse(&mode))
@@ -114,13 +115,10 @@ fn options(params: &Value) -> Result<SessionOptions, String> {
         .transpose()?;
     Ok(SessionOptions {
         model: text("model"),
-        reasoning,
-        autonomy,
+        reasoning: reasoning.or_else(|| process.reasoning.clone()),
+        autonomy: autonomy.or(process.autonomy),
         resume: text("resume").map_or(Resume::None, Resume::Id),
-        model_env: config::ModelEnv::from_process(),
-        search_env: config::SearchEnv::from_process(),
-        budget: runtime::budget::BudgetLimits::from_env().map_err(|error| format!("{error:#}"))?,
-        ..Default::default()
+        ..process
     })
 }
 

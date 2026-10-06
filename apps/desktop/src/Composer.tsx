@@ -452,7 +452,7 @@ export function Composer(props: Props) {
             className="icon-btn"
             onClick={() => chooser.current?.click()}
             disabled={busy || props.running}
-            title="Attach images · paste or drag images here"
+            title="Attach images · paste or drag here · message and processed images share a 16 MiB send limit"
             aria-label="Attach images"
           >
             <Icon name="clip" />

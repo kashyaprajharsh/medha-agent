@@ -7,6 +7,7 @@ import {
   useState,
 } from "react";
 import { type Attachment, type SessionChange } from "./api";
+import { messageRequest } from "./messageRequest";
 import {
   reduceLive,
   recordSent,
@@ -103,6 +104,19 @@ export function useLive() {
       text: string,
       attachments: Attachment[] = [],
     ) => {
+      // Reject before opening a chat or optimistically recording an unsent
+      // message. The composer keeps the text and attachments for correction.
+      let params;
+      try {
+        params = messageRequest(text, attachments);
+      } catch (cause) {
+        patch(key, (state) => ({
+          ...state,
+          status: latest.current[key]?.status ?? "idle",
+          error: String(cause),
+        }));
+        throw cause;
+      }
       const message = {
         kind: "user" as const,
         id: crypto.randomUUID(),
@@ -132,10 +146,7 @@ export function useLive() {
       }));
       try {
         await ensureOpen(key, resume);
-        await api.liveCall(key, "message.send", {
-          content: text,
-          images: attachments.map(({ mime, data }) => ({ mime, data })),
-        });
+        await api.liveCall(key, "message.send", params);
       } catch (cause) {
         patch(key, (state) => ({
           ...state,

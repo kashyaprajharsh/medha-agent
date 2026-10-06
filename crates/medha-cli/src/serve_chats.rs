@@ -194,10 +194,10 @@ impl ServeChats {
             let mut tick = tokio::time::interval(SWEEP);
             while let Some(folders) = swept.upgrade() {
                 tick.tick().await;
-                folders
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .sweep(Instant::now());
+                // Never waited for here: whoever holds it is opening a folder, and sweeps as it does.
+                if let Ok(mut folders) = folders.try_lock() {
+                    folders.sweep(Instant::now());
+                }
             }
         });
         Self {

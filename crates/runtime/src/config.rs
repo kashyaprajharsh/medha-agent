@@ -1726,7 +1726,21 @@ fn credentials_lock() -> &'static std::sync::Mutex<()> {
 }
 
 /// The lock uses a stable sibling because publication replaces the data inode.
+///
+/// Another process may hold it, and the keychain behind it may wait on the
+/// person, for as long as either likes. A thread that runs other tasks as well
+/// hands those to another thread first, so the wait is this caller's alone.
 fn with_credentials_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    let shares_its_thread = Handle::try_current()
+        .is_ok_and(|runtime| runtime.runtime_flavor() == RuntimeFlavor::MultiThread);
+    match shares_its_thread {
+        true => tokio::task::block_in_place(|| holding_credentials_lock(operation)),
+        false => holding_credentials_lock(operation),
+    }
+}
+
+fn holding_credentials_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
     let _process = credentials_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("credential lock is poisoned"))?;

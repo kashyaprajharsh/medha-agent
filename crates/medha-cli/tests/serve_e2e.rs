@@ -989,6 +989,84 @@ async fn requests_waiting_on_a_held_lock_hold_up_nobody_else() {
     }
 }
 
+/// The shared MCP host reads keys as it follows the configuration, and a
+/// running chat reads one when its model is changed. Each waits on that lock
+/// on a thread that others are served on; none of them may keep it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn waits_on_a_held_lock_by_the_mcp_host_and_by_running_chats_hold_up_nobody_else() {
+    let world = World::new();
+    let folder = world.folder("w");
+    // One thread serves every client and the MCP host as well.
+    let serving = [("TOKIO_WORKER_THREADS", "1"), ("MEDHA_API_KEY", "")];
+    let backend = world.backend_in(&serving);
+    let mut client = backend.connect().await;
+    let profile = json!({"protocol": "open-ai-chat", "base_url": world.provider.url,
+        "model": "test-model", "auth": "bearer", "max_ctx": 32768});
+    let save = json!({"method": "settings.model.save",
+        "params": {"name": "saved", "profile": profile, "default": true, "key": SECRET}});
+    client
+        .about(&folder, save)
+        .await
+        .expect("a model is saved with its key");
+    // As many chats as there are threads for chats to run on, and one beside them.
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let mut changing = Vec::new();
+    for _ in 0..threads.max(4) {
+        changing.push(client.open(&folder).await);
+    }
+    let beside = client.open(&folder).await;
+    let mut other = backend.connect().await;
+
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(world.home().join("credentials.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let config = world.home().join("config.toml");
+    let mut servers = std::fs::read_to_string(&config).unwrap();
+    for n in 0..2 {
+        let url = format!("http://127.0.0.1:9/mcp{n}");
+        servers += &format!("\n[mcp.held{n}]\nurl = \"{url}\"\ntrust = \"trusted\"\n");
+    }
+    servers +=
+        "\n[mcp.keyed]\nurl = \"http://127.0.0.1:9/k\"\ntrust = \"trusted\"\nauth = \"bearer\"\n";
+    std::fs::write(&config, servers).unwrap();
+    let mut waiting = Vec::new();
+    for (n, chat) in changing.iter().enumerate() {
+        let id = 9300 + n as u64;
+        let change = json!({"jsonrpc": "2.0", "id": id, "method": "session.configure",
+            "session": chat, "params": {"profile": "saved"}});
+        assert!(wire::write_frame(&mut client.writer, &change).await);
+        waiting.push(id);
+    }
+    // Longer than the host goes between looks at the configuration.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let hello = other.ask("hello", None, json!({})).await;
+    assert_eq!(hello["result"]["protocol"], 1);
+    let tasks = client.ask("tasks.list", Some(&beside), json!({})).await;
+    assert!(tasks.get("result").is_some(), "{tasks}");
+    let early: Vec<&Value> = client
+        .events
+        .iter()
+        .filter(|frame| !frame["id"].is_null())
+        .collect();
+    assert!(
+        early.is_empty(),
+        "a change of model did not wait for the key: {early:?}"
+    );
+
+    held.unlock().unwrap();
+    while !waiting.is_empty() {
+        let frame = client.next().await;
+        if let Some(id) = frame["id"].as_u64() {
+            assert!(frame.get("result").is_some(), "{frame}");
+            waiting.retain(|waited| *waited != id);
+        }
+    }
+}
+
 /// The names of the tools one model request offered, in order.
 fn offered(request: &Value) -> Vec<String> {
     let mut names: Vec<String> = request["tools"]

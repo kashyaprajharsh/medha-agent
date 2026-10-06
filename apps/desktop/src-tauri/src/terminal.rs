@@ -4,90 +4,37 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 type OpenTerminals = Arc<Mutex<HashMap<String, Terminal>>>;
 type Output = Box<dyn Read + Send>;
 
-#[derive(Default)]
-struct Reaped {
-    done: Mutex<bool>,
-    changed: Condvar,
-}
-
-impl Reaped {
-    fn finish(&self) {
-        *self
-            .done
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        self.changed.notify_all();
-    }
-
-    fn wait(&self) {
-        let mut done = self
-            .done
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*done {
-            done = self
-                .changed
-                .wait(done)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-}
-
 struct Terminal {
-    master: Option<Box<dyn MasterPty + Send>>,
+    master: Box<dyn MasterPty + Send>,
     input: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Option<Box<dyn Child + Send + Sync>>,
     generation: Arc<()>,
-    reaped: Arc<Reaped>,
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // Keep every master-side PTY handle alive until the shell is
-            // reaped. Closing one while it is exiting stalls macOS teardown.
-            let master = self.master.take();
-            let input = Arc::clone(&self.input);
-            let reaped = Arc::clone(&self.reaped);
+            #[cfg(unix)]
+            let foreground = self.master.process_group_leader();
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            #[cfg(unix)]
+            if let Some(group) = foreground.filter(|group| *group > 1) {
+                // PTY foreground jobs may have their own process group.
+                unsafe {
+                    libc::kill(-group, libc::SIGHUP);
+                }
+            }
+            // Signal before window destruction returns; reap off the UI thread.
+            let _ = child.kill();
             std::thread::spawn(move || {
-                if !matches!(child.try_wait(), Ok(Some(_))) {
-                    #[cfg(unix)]
-                    {
-                        // portable-pty's kill sends SIGHUP first. A shell
-                        // still acquiring its controlling terminal can stall
-                        // in that exit path on macOS. Stop the owned, unreaped
-                        // shell directly, then wait before touching PTY state.
-                        if let Some(pid) = child.process_id() {
-                            unsafe {
-                                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                            }
-                        } else {
-                            let _ = child.kill();
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    let _ = child.kill();
-                }
                 let _ = child.wait();
-                #[cfg(unix)]
-                if let Some(group) = master
-                    .as_ref()
-                    .and_then(|master| master.process_group_leader())
-                    .filter(|group| *group > 1 && Some(*group as u32) != child.process_id())
-                {
-                    // A remaining foreground job belongs to this terminal.
-                    unsafe {
-                        libc::kill(-group, libc::SIGHUP);
-                    }
-                }
-                reaped.finish();
-                drop(input);
-                drop(master);
             });
         }
     }
@@ -145,7 +92,6 @@ impl Terminals {
         }
         let (terminal, mut reader) = spawn(command, size)?;
         let generation = Arc::clone(&terminal.generation);
-        let reaped = Arc::clone(&terminal.reaped);
         open.insert(key.to_owned(), terminal);
         let terminals = Arc::downgrade(&self.open);
         let key = key.to_owned();
@@ -170,19 +116,10 @@ impl Terminals {
                     None
                 }
             });
-            let code = terminal.and_then(|mut terminal| {
-                // EOF can arrive before the shell has been reaped. Keep the
-                // terminal (and its PTY handles) here until wait completes,
-                // just as the explicit-close path does.
-                let status = terminal.child.as_mut()?.wait().ok();
-                terminal.child.take();
-                reaped.finish();
-                status.map(|status| status.exit_code())
-            });
-            // This clone of the master must also survive an explicit close
-            // until the teardown worker has reaped the shell.
-            reaped.wait();
-            drop(reader);
+            let code = terminal
+                .and_then(|mut terminal| terminal.child.take())
+                .and_then(|mut child| child.wait().ok())
+                .map(|status| status.exit_code());
             emit(json!({ "kind": "exit", "code": code }));
         });
         Ok(())
@@ -213,8 +150,6 @@ impl Terminals {
         open.get(key)
             .ok_or("This terminal has exited")?
             .master
-            .as_ref()
-            .ok_or("This terminal has exited")?
             .resize(size)
             .map_err(|error| format!("Could not resize terminal: {error}"))
     }
@@ -261,11 +196,10 @@ fn spawn(command: CommandBuilder, size: PtySize) -> Result<(Terminal, Output), S
     drop(pair.slave);
     Ok((
         Terminal {
-            master: Some(pair.master),
+            master: pair.master,
             input: Arc::new(Mutex::new(input)),
             child: Some(child),
             generation: Arc::new(()),
-            reaped: Arc::default(),
         },
         reader,
     ))

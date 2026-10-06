@@ -239,26 +239,57 @@ fn reasoning_is_shown_with_how_long_it_took() {
     assert_eq!(page.events[1].duration_ms, Some(7500));
 }
 
+/// Every page of a history in turn, each checked to be no more than a page may be on the wire.
+fn pages(events: &[Event]) -> Vec<Vec<EventView>> {
+    let (mut pages, mut cursor) = (Vec::new(), None::<String>);
+    loop {
+        let page = page_events(events, cursor.as_deref(), None).unwrap();
+        let bytes = serde_json::to_string(&page).unwrap().len();
+        assert!(bytes <= PAGE_BYTES + 1024, "a page of {bytes} bytes");
+        assert!(!page.events.is_empty(), "a page with nothing on it");
+        pages.push(page.events);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return pages,
+        }
+    }
+}
+
 #[test]
 fn a_page_of_history_is_bounded_in_bytes_and_the_next_takes_up_where_it_stopped() {
     let session = Session::new();
     let long = "x".repeat(PAGE_BYTES / 3);
     let events: Vec<Event> = (0..8).map(|_| Event::model_text(&session, &long)).collect();
-    let (mut shown, mut pages, mut cursor) = (0, 0, None::<String>);
-    loop {
-        let page = page_events(&events, cursor.as_deref(), None).unwrap();
-        let bytes = serde_json::to_string(&page).unwrap().len();
-        assert!(bytes < wire::MAX_FRAME / 2, "a page of {bytes} bytes");
-        assert!(!page.events.is_empty(), "a page with nothing on it");
-        shown += page.events.len();
-        pages += 1;
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
+    let pages = pages(&events);
+    let shown: usize = pages.iter().map(Vec::len).sum();
     assert_eq!(shown, events.len(), "an event was lost between pages");
-    assert!(pages > 1, "everything went out as one page");
+    assert!(pages.len() > 1, "everything went out as one page");
+}
+
+#[test]
+fn history_that_grows_as_it_is_written_still_fits_and_an_event_too_large_alone_is_cut() {
+    let session = Session::new();
+    // A control character is stored as one byte and written as six.
+    let grows = "\u{1}".repeat(200_000);
+    let mut events: Vec<Event> = (0..20)
+        .map(|_| Event::model_text(&session, &grows))
+        .collect();
+    events.push(Event::model_text(&session, &"\u{1}".repeat(PAGE_BYTES)));
+
+    let shown: Vec<EventView> = pages(&events).into_iter().flatten().collect();
+    assert_eq!(shown.len(), events.len(), "an event was lost between pages");
+    let (whole, large) = shown.split_at(20);
+    assert!(
+        whole
+            .iter()
+            .all(|event| event.text.as_ref() == Some(&grows))
+    );
+    let cut = large[0].text.as_deref().unwrap();
+    assert!(
+        cut.ends_with(CUT) && cut.starts_with('\u{1}'),
+        "{}",
+        cut.len()
+    );
 }
 
 #[test]

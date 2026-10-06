@@ -103,28 +103,66 @@ struct EventView {
     screen: Option<Value>,
 }
 
-/// A quarter of what one frame may carry, since text can grow fourfold or more when written as JSON.
+/// What one page of history may take on the wire, and so the most one event on it may.
 const PAGE_BYTES: usize = wire::MAX_FRAME / 4;
+const CUT: &str = "\n\n[Too large to show in full. The rest is left out.]";
 
 impl EventView {
-    /// Roughly what this takes on the wire: its text, and a little for the rest.
-    fn weight(&self) -> usize {
-        let text = [
-            &self.text,
-            &self.input,
-            &self.summary,
-            &self.output,
-            &self.detail,
-        ];
-        let values = [&self.plan, &self.screen];
-        256 + text
-            .iter()
-            .map(|field| field.as_ref().map_or(0, String::len))
-            .sum::<usize>()
-            + values
-                .iter()
-                .map(|field| field.as_ref().map_or(0, |value| value.to_string().len()))
-                .sum::<usize>()
+    /// What this takes on the wire, as it is written and not as it is stored:
+    /// text can take six times its length once it is JSON.
+    fn bytes(&self) -> usize {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(1);
+        let _ = serde_json::to_writer(&mut count, self);
+        count.0
+    }
+
+    /// With its size. An event too large for a page of its own is shown with
+    /// its long parts cut short, and says so where it was cut.
+    fn fitted(mut self) -> (Self, usize) {
+        let mut keep = PAGE_BYTES / 8;
+        loop {
+            let bytes = self.bytes();
+            if bytes <= PAGE_BYTES {
+                return (self, bytes);
+            }
+            let text = [
+                &mut self.text,
+                &mut self.input,
+                &mut self.summary,
+                &mut self.output,
+                &mut self.detail,
+            ];
+            for text in text.into_iter().flatten() {
+                if text.len() > keep + CUT.len() {
+                    let end = (0..=keep).rev().find(|end| text.is_char_boundary(*end));
+                    text.truncate(end.unwrap_or(0));
+                    text.push_str(CUT);
+                }
+            }
+            // A plan, or what a tool's screen draws, is of no use in part.
+            for value in [&mut self.plan, &mut self.screen] {
+                if value
+                    .as_ref()
+                    .is_some_and(|value| value.to_string().len() > keep)
+                {
+                    *value = None;
+                }
+            }
+            if keep == 0 {
+                return (self, bytes);
+            }
+            keep /= 2;
+        }
     }
 }
 
@@ -518,14 +556,14 @@ fn page_events(
         }
         _ => None,
     };
-    // A page is bounded in bytes as well as in events. Its first event always
-    // fits, so a page is never left empty by its size.
+    // A page is bounded in bytes as well as in events. No event is larger than
+    // a page, so a page is never left empty by its size, nor made too large by one event.
     let (mut visible, mut bytes, mut end) = (Vec::new(), 0, end);
     for (offset, event) in events[start..end].iter().enumerate() {
-        let Some(shown) = view(offset, event) else {
+        let Some((shown, size)) = view(offset, event).map(EventView::fitted) else {
             continue;
         };
-        bytes += shown.weight();
+        bytes += size;
         if bytes > PAGE_BYTES && !visible.is_empty() {
             end = start + offset;
             break;

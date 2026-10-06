@@ -71,8 +71,6 @@ struct EventView {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    html: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     tool_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
@@ -103,6 +101,31 @@ struct EventView {
     /// A screen the tool's server offers for this result, and what it draws.
     #[serde(skip_serializing_if = "Option::is_none")]
     screen: Option<Value>,
+}
+
+/// A quarter of what one frame may carry, since text can grow fourfold or more when written as JSON.
+const PAGE_BYTES: usize = wire::MAX_FRAME / 4;
+
+impl EventView {
+    /// Roughly what this takes on the wire: its text, and a little for the rest.
+    fn weight(&self) -> usize {
+        let text = [
+            &self.text,
+            &self.input,
+            &self.summary,
+            &self.output,
+            &self.detail,
+        ];
+        let values = [&self.plan, &self.screen];
+        256 + text
+            .iter()
+            .map(|field| field.as_ref().map_or(0, String::len))
+            .sum::<usize>()
+            + values
+                .iter()
+                .map(|field| field.as_ref().map_or(0, |value| value.to_string().len()))
+                .sum::<usize>()
+    }
 }
 
 #[derive(Serialize)]
@@ -413,93 +436,102 @@ fn page_events(
     for event in &events[..start] {
         tool_view(&mut steps, event);
     }
-    let visible = events[start..end]
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, event)| match event.kind {
-            EventKind::ModelReasoning => {
-                let text = event.payload.get("text")?.as_str()?.trim().to_owned();
-                let since = (start + offset)
-                    .checked_sub(1)
-                    .map(|previous| events[previous].ts);
-                (!text.is_empty()).then(|| EventView {
-                    duration_ms: since.map(|since| ((event.ts - since).max(0.0) * 1000.0) as u64),
-                    ..event_view(event, "reasoning", text)
-                })
+    let mut view = |offset: usize, event: &Event| match event.kind {
+        EventKind::ModelReasoning => {
+            let text = event.payload.get("text")?.as_str()?.trim().to_owned();
+            let since = (start + offset)
+                .checked_sub(1)
+                .map(|previous| events[previous].ts);
+            (!text.is_empty()).then(|| EventView {
+                duration_ms: since.map(|since| ((event.ts - since).max(0.0) * 1000.0) as u64),
+                ..event_view(event, "reasoning", text)
+            })
+        }
+        EventKind::UserMessage => {
+            text_before_canonical = false;
+            if let Some((ok, summary, output)) = verifier_result(event) {
+                return Some(EventView {
+                    status: Some(if ok { "passed" } else { "failed" }.into()),
+                    output: (!output.is_empty()).then_some(output),
+                    ..event_view(event, "verification", summary)
+                });
             }
-            EventKind::UserMessage => {
-                text_before_canonical = false;
-                if let Some((ok, summary, output)) = verifier_result(event) {
-                    return Some(EventView {
-                        status: Some(if ok { "passed" } else { "failed" }.into()),
-                        output: (!output.is_empty()).then_some(output),
-                        ..event_view(event, "verification", summary)
-                    });
-                }
-                let kind = if handoffs.contains(&event.id) {
-                    "handoff"
-                } else if event.is_from_person() {
-                    "user"
-                } else {
-                    return None;
-                };
-                Some(event_view(
-                    event,
-                    kind,
-                    event.payload.get("text")?.as_str()?.to_owned(),
-                ))
+            let kind = if handoffs.contains(&event.id) {
+                "handoff"
+            } else if event.is_from_person() {
+                "user"
+            } else {
+                return None;
+            };
+            Some(event_view(
+                event,
+                kind,
+                event.payload.get("text")?.as_str()?.to_owned(),
+            ))
+        }
+        EventKind::ModelText => {
+            text_before_canonical = true;
+            Some(event_view(
+                event,
+                "assistant",
+                event.payload.get("text")?.as_str()?.to_owned(),
+            ))
+        }
+        EventKind::ModelMessage => {
+            let skip = text_before_canonical;
+            text_before_canonical = false;
+            if skip {
+                None
+            } else {
+                let message: ModelMessage = serde_json::from_value(event.payload.clone()).ok()?;
+                let text = message
+                    .parts
+                    .into_iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text(text) => Some(text.text),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                (!text.is_empty()).then(|| event_view(event, "assistant", text))
             }
-            EventKind::ModelText => {
-                text_before_canonical = true;
-                Some(event_view(
-                    event,
-                    "assistant",
-                    event.payload.get("text")?.as_str()?.to_owned(),
-                ))
-            }
-            EventKind::ModelMessage => {
-                let skip = text_before_canonical;
-                text_before_canonical = false;
-                if skip {
-                    None
-                } else {
-                    let message: ModelMessage =
-                        serde_json::from_value(event.payload.clone()).ok()?;
-                    let text = message
-                        .parts
-                        .into_iter()
-                        .filter_map(|part| match part {
-                            ContentPart::Text(text) => Some(text.text),
-                            _ => None,
-                        })
-                        .collect::<String>();
-                    (!text.is_empty()).then(|| event_view(event, "assistant", text))
-                }
-            }
-            EventKind::ModelIntent | EventKind::ToolObs => tool_view(&mut steps, event),
-            EventKind::AgentSpawned => {
-                let child = event.payload.get("child")?.as_str()?.to_owned();
-                let agent = event.payload.get("agent").and_then(Value::as_str);
-                let outcome = event
+        }
+        EventKind::ModelIntent | EventKind::ToolObs => tool_view(&mut steps, event),
+        EventKind::AgentSpawned => {
+            let child = event.payload.get("child")?.as_str()?.to_owned();
+            let agent = event.payload.get("agent").and_then(Value::as_str);
+            let outcome = event
+                .payload
+                .get("dispatch")
+                .and_then(Value::as_str)
+                .and_then(|dispatch| outcomes.get(dispatch));
+            Some(EventView {
+                child_id: Some(child),
+                detail: event
                     .payload
-                    .get("dispatch")
+                    .get("objective")
                     .and_then(Value::as_str)
-                    .and_then(|dispatch| outcomes.get(dispatch));
-                Some(EventView {
-                    child_id: Some(child),
-                    detail: event
-                        .payload
-                        .get("objective")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    status: outcome.map(|(status, _)| status.clone()),
-                    duration_ms: outcome.and_then(|(_, duration)| *duration),
-                    ..event_view(event, "subagent", agent.unwrap_or("sub-agent").to_owned())
-                })
-            }
-            _ => None,
-        })
-        .collect();
+                    .map(str::to_owned),
+                status: outcome.map(|(status, _)| status.clone()),
+                duration_ms: outcome.and_then(|(_, duration)| *duration),
+                ..event_view(event, "subagent", agent.unwrap_or("sub-agent").to_owned())
+            })
+        }
+        _ => None,
+    };
+    // A page is bounded in bytes as well as in events. Its first event always
+    // fits, so a page is never left empty by its size.
+    let (mut visible, mut bytes, mut end) = (Vec::new(), 0, end);
+    for (offset, event) in events[start..end].iter().enumerate() {
+        let Some(shown) = view(offset, event) else {
+            continue;
+        };
+        bytes += shown.weight();
+        if bytes > PAGE_BYTES && !visible.is_empty() {
+            end = start + offset;
+            break;
+        }
+        visible.push(shown);
+    }
     Ok(EventPage {
         events: visible,
         next_cursor: (end < events.len()).then(|| events[end - 1].id.to_string()),
@@ -511,7 +543,6 @@ fn event_view(event: &Event, kind: &'static str, text: String) -> EventView {
         id: event.id.to_string(),
         kind,
         ts: event.ts,
-        html: (kind == "assistant" && !text.is_empty()).then(|| transcript_view::to_html(&text)),
         text: (!text.is_empty()).then_some(text),
         ..EventView::default()
     }

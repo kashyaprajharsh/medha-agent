@@ -121,7 +121,9 @@ async fn session_events(
         .workspaces
         .resolve(&workspace_id, None, Some(&session_id))?;
     tauri::async_runtime::spawn_blocking(move || {
-        runtime.request("sessions.events", Some(&session_id), cursor.as_deref())
+        runtime
+            .request("sessions.events", Some(&session_id), cursor.as_deref())
+            .map(live::render_history)
     })
     .await
     .map_err(|error| error.to_string())?

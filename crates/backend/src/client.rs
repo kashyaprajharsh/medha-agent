@@ -2,7 +2,7 @@
 //! chats it has attached to. It may only speak to a chat it is attached to.
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use serde_json::{Value, json};
@@ -16,32 +16,43 @@ use crate::{Backend, Chats, Failure, PROTOCOL, refused};
 /// Room for a full replay and then some; a client further behind than this is dropped.
 const QUEUE: usize = KEPT_FRAMES + 1024;
 
+/// What may wait for one client, in bytes: a full replay, the largest answer, and room beside them.
+pub(crate) const QUEUED_BYTES: usize = 4 * wire::MAX_FRAME;
+
 #[derive(Clone)]
 pub(crate) struct Client {
     pub(crate) id: u64,
     out: mpsc::Sender<Arc<str>>,
+    waiting: Arc<AtomicUsize>,
     dropped: CancellationToken,
 }
 
 impl Client {
-    /// Never waits: a client that cannot keep up is disconnected, and may come back with its cursor.
+    /// Never waits: a client that cannot keep up, by frames or by bytes, is
+    /// disconnected, and may come back with its cursor.
     pub(crate) fn send(&self, line: Arc<str>) -> bool {
-        let sent = self.out.try_send(line).is_ok();
+        let bytes = line.len();
+        let within = self.waiting.fetch_add(bytes, Ordering::Relaxed) + bytes <= QUEUED_BYTES;
+        let sent = within && self.out.try_send(line).is_ok();
         if !sent {
+            self.waiting.fetch_sub(bytes, Ordering::Relaxed);
             self.dropped.cancel();
         }
         sent
     }
 
+    /// An answer no client could read is refused in a few words, not sent to break its connection.
     fn reply(&self, id: Option<Value>, outcome: Result<Value, Failure>) {
         let Some(id) = id else { return };
+        let failed = |(code, message): Failure| json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } });
         let frame = match outcome {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err((code, message)) => {
-                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-            }
+            Err(failure) => failed(failure),
         };
         let mut line = frame.to_string();
+        if line.len() >= wire::MAX_FRAME {
+            line = failed(refused("the answer is too large to send at once")).to_string();
+        }
         line.push('\n');
         self.send(line.into());
     }
@@ -57,13 +68,15 @@ where
     let me = Client {
         id: backend.clients.fetch_add(1, Ordering::Relaxed),
         out,
+        waiting: Arc::default(),
         dropped: CancellationToken::new(),
     };
     let writing = tokio::spawn({
-        let dropped = me.dropped.clone();
+        let (dropped, waiting) = (me.dropped.clone(), Arc::clone(&me.waiting));
         async move {
             let writes = async {
                 while let Some(line) = queued.recv().await {
+                    waiting.fetch_sub(line.len(), Ordering::Relaxed);
                     if writer.write_all(line.as_bytes()).await.is_err()
                         || writer.flush().await.is_err()
                     {

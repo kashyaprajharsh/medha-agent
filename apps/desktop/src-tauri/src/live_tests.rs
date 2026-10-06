@@ -134,6 +134,20 @@ fn desktop_controls_do_not_expose_arbitrary_tool_dispatch() {
 }
 
 #[test]
+fn history_shows_what_the_assistant_said_as_markdown_and_nothing_else() {
+    let page = render_history(json!({ "next_cursor": "c", "events": [
+        { "kind": "user", "text": "**mine**" },
+        { "kind": "assistant", "text": "**bold** <img src=x onerror=alert(1)>" },
+        { "kind": "reasoning", "text": "*thinking*" },
+    ]}));
+    let html = page["events"][1]["html"].as_str().unwrap();
+    assert!(html.contains("<strong>bold</strong>") && !html.contains("<img"));
+    assert!(page["events"][0].get("html").is_none());
+    assert!(page["events"][2].get("html").is_none());
+    assert_eq!(page["next_cursor"], "c");
+}
+
+#[test]
 fn streamed_html_escapes_model_markup() {
     let mut segment = String::new();
     let frame = render(text("<img src=x onerror=alert(1)>"), &mut segment);

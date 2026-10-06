@@ -237,7 +237,28 @@ fn reasoning_is_shown_with_how_long_it_took() {
     assert_eq!(kinds(&page), ["user", "reasoning"]);
     assert_eq!(page.events[1].text.as_deref(), Some("The user said hii."));
     assert_eq!(page.events[1].duration_ms, Some(7500));
-    assert_eq!(page.events[1].html, None);
+}
+
+#[test]
+fn a_page_of_history_is_bounded_in_bytes_and_the_next_takes_up_where_it_stopped() {
+    let session = Session::new();
+    let long = "x".repeat(PAGE_BYTES / 3);
+    let events: Vec<Event> = (0..8).map(|_| Event::model_text(&session, &long)).collect();
+    let (mut shown, mut pages, mut cursor) = (0, 0, None::<String>);
+    loop {
+        let page = page_events(&events, cursor.as_deref(), None).unwrap();
+        let bytes = serde_json::to_string(&page).unwrap().len();
+        assert!(bytes < wire::MAX_FRAME / 2, "a page of {bytes} bytes");
+        assert!(!page.events.is_empty(), "a page with nothing on it");
+        shown += page.events.len();
+        pages += 1;
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(shown, events.len(), "an event was lost between pages");
+    assert!(pages > 1, "everything went out as one page");
 }
 
 #[test]

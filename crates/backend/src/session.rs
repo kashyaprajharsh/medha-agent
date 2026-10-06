@@ -13,6 +13,8 @@ use crate::{Done, Input, Output};
 /// What a returning client can be replayed; older events are gone.
 pub(crate) const KEPT_FRAMES: usize = 4096;
 const KEPT_BYTES: usize = 8 * 1024 * 1024;
+/// The largest frame a chat may say: what a client can read, less what it is wrapped in.
+pub(crate) const CHAT_FRAME: usize = wire::MAX_FRAME - 1024;
 
 pub(crate) struct Session {
     pub(crate) id: String,
@@ -121,13 +123,25 @@ impl Session {
     pub(crate) async fn pump(&self, output: Output, done: Done) {
         let mut reader = BufReader::new(output);
         let mut line = Vec::new();
-        loop {
+        'chat: loop {
             line.clear();
-            let limited = (&mut reader).take(wire::MAX_FRAME as u64 + 1);
+            let limited = (&mut reader).take(CHAT_FRAME as u64 + 1);
             tokio::pin!(limited);
             match limited.read_until(b'\n', &mut line).await {
-                Ok(read) if read > 0 && line.len() <= wire::MAX_FRAME => {}
+                Ok(read) if read > 0 => {}
                 _ => break,
+            }
+            // No client could read a frame this large. The rest of it is passed over and the chat goes on.
+            if line.len() > CHAT_FRAME {
+                while !line.ends_with(b"\n") {
+                    line.clear();
+                    let rest = (&mut reader).take(64 * 1024);
+                    tokio::pin!(rest);
+                    if !matches!(rest.read_until(b'\n', &mut line).await, Ok(read) if read > 0) {
+                        break 'chat;
+                    }
+                }
+                continue;
             }
             // A line that is not a frame is skipped: stopping here would leave the chat blocked.
             if let Ok(frame) = serde_json::from_slice(&line) {

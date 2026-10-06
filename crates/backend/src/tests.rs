@@ -30,8 +30,10 @@ async fn chat(input: DuplexStream, mut output: DuplexStream) -> Result<(), Strin
                 .await;
             }
             Some("burst") => {
+                let pad = "x".repeat(params["bytes"].as_u64().unwrap_or(0) as usize);
                 for n in 0..params["count"].as_u64().unwrap() {
-                    say(&mut output, json!({"method": "event", "params": {"n": n}})).await;
+                    let event = json!({"method": "event", "params": {"n": n, "pad": pad}});
+                    say(&mut output, event).await;
                 }
                 say(&mut output, json!({"id": id, "result": {}})).await;
             }
@@ -79,6 +81,7 @@ impl Chats for Stub {
     async fn about_folder(&self, request: &Value) -> Result<Value, String> {
         match request["method"].as_str() {
             Some("history") => Ok(json!({"of": request["folder"]})),
+            Some("everything") => Ok(json!("x".repeat(wire::MAX_FRAME))),
             Some("install") => {
                 self.released.notified().await;
                 Ok(json!({"installed": request["params"]["what"]}))
@@ -414,6 +417,56 @@ async fn a_client_too_slow_to_keep_up_is_dropped_and_the_chat_goes_on() {
 
     // What was already on its way is still readable; then the connection ends.
     while stalled.frame().await.is_some() {}
+}
+
+#[tokio::test]
+async fn a_client_holding_too_many_bytes_unread_is_dropped_and_the_chat_goes_on() {
+    let backend = backend();
+    let mut stalled = connect_with(&backend, 1024);
+    let session = stalled.open().await;
+    // Far fewer frames than a client may queue, and more bytes than it may.
+    let frame = 2 * 1024 * 1024;
+    let count = crate::client::QUEUED_BYTES / frame + 8;
+    stalled
+        .post(json!({"method": "burst", "session": session,
+            "params": {"count": count, "bytes": frame}}))
+        .await;
+
+    let mut other = connect(&backend);
+    for _ in 0..500 {
+        let listed = other.ask("session.list", None, json!({})).await;
+        if listed["result"]["sessions"][0]["clients"] == 0 {
+            other.attach(&session, None).await;
+            let said = other.say(&session, "on we go").await;
+            assert_eq!(said["result"]["said"], "on we go");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("a client holding more than it may was never dropped");
+}
+
+#[tokio::test]
+async fn an_answer_or_a_frame_too_large_to_read_breaks_no_connection_and_no_chat() {
+    let backend = backend();
+    let mut client = connect_with(&backend, 64 * 1024 * 1024);
+    let refused = client
+        .post(json!({"method": "everything", "folder": "/w"}))
+        .await;
+    let refused = client.answer(refused).await;
+    assert_eq!(
+        refused["error"]["message"],
+        "the answer is too large to send at once"
+    );
+
+    let session = client.open().await;
+    let burst = json!({"count": 1, "bytes": wire::MAX_FRAME});
+    client.ask("burst", Some(&session), burst).await;
+    assert_eq!(
+        client.say(&session, "after").await["result"]["said"],
+        "after"
+    );
+    assert_eq!(client.event().await.1["params"]["text"], "after");
 }
 
 #[tokio::test]

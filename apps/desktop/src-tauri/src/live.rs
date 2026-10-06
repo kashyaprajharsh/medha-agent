@@ -507,6 +507,19 @@ fn render(mut frame: Value, segment: &mut String) -> Value {
     frame
 }
 
+/// History arrives as text. What the assistant said is Markdown, rendered here
+/// as live text is, so the backend sends each reply once and not twice.
+pub(crate) fn render_history(mut page: Value) -> Value {
+    for event in page["events"].as_array_mut().into_iter().flatten() {
+        if event["kind"] == "assistant"
+            && let Some(text) = event["text"].as_str()
+        {
+            event["html"] = Value::String(transcript_view::to_html(text));
+        }
+    }
+    page
+}
+
 pub(crate) fn is_token(key: &str) -> bool {
     (1..=64).contains(&key.len())
         && key

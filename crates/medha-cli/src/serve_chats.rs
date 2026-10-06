@@ -164,6 +164,12 @@ impl Lane {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.running.available_permits() == self.at_once
     }
+
+    fn status(&self) -> Value {
+        json!({"active": self.at_once - self.running.available_permits(),
+            "waiting": self.waiting.load(std::sync::atomic::Ordering::Relaxed),
+            "active_limit": self.at_once, "waiting_limit": self.room})
+    }
 }
 
 /// Chats run on threads of their own. A chat reads keys, config and files as
@@ -269,6 +275,15 @@ fn folder(named: &Value) -> Result<PathBuf, String> {
 
 #[async_trait::async_trait]
 impl Chats for ServeChats {
+    fn resources(&self) -> Value {
+        let folders = self.folders.try_lock().ok().map(|folders| {
+            json!({"open": folders.open.len(), "idle": folders.open.values()
+                .filter(|(held, _)| Arc::strong_count(held) == 1).count(), "idle_limit": UNHELD})
+        });
+        json!({"folders": folders, "folder_requests": self.requests.status(),
+            "chat_starts": self.starts.status()})
+    }
+
     async fn about_folder(&self, request: &Value) -> Result<Value, String> {
         let _admitted = self.requests.admit().await?;
         let (folders, asked) = (Arc::clone(&self.folders), request.clone());
@@ -320,8 +335,10 @@ impl Chats for ServeChats {
 
         let (to_chat, chat_input) = tokio::io::duplex(64 * 1024);
         let (chat_output, from_chat) = tokio::io::duplex(256 * 1024);
+        let control = Arc::<crate::acp::TurnControl>::default();
         let mut chat = chats().spawn({
             let notices = Arc::clone(&notices);
+            let control = Arc::clone(&control);
             async move {
                 let model = runtime::model::resolve(&lock, &options, notices.as_ref()).await?;
                 let start = Start {
@@ -335,7 +352,7 @@ impl Chats for ServeChats {
                     verify_timeout: choices.verify_timeout,
                     notices: notices.as_ref(),
                 };
-                crate::acp_chat::run(start, chat_input, chat_output, restore).await
+                crate::acp_chat::run(start, chat_input, chat_output, restore, Some(control)).await
             }
         });
         let ended = |outcome: Result<anyhow::Result<()>, tokio::task::JoinError>| match outcome {
@@ -383,6 +400,7 @@ impl Chats for ServeChats {
             input: Box::new(to_chat),
             output: Box::new(std::io::Cursor::new(said).chain(output)),
             done: Box::pin(async move { ended(chat.await) }),
+            cancel: Some(Arc::new(move || control.cancel())),
         })
     }
 }

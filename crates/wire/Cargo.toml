@@ -12,6 +12,9 @@ sha2 = "0.10"
 getrandom = "0.3"
 hmac = "0.12"
 
+[build-dependencies]
+sha2 = "0.10"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

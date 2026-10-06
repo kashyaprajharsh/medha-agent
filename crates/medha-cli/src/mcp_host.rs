@@ -30,11 +30,12 @@ pub(crate) async fn run_shared(
             ..mcp::Config::default()
         },
     );
-    tokio::spawn({
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn({
         let manager = manager.clone();
         async move { manager.connect_startup().await }
     });
-    tokio::spawn(follow_config(manager.clone(), changed));
+    tasks.spawn(follow_config(manager.clone(), changed));
     let resolve: mcp::hub::Resolve = Arc::new(|id: &str| {
         let Some(cfg) = config::load().ok().flatten() else {
             return Ok(None);
@@ -46,16 +47,16 @@ pub(crate) async fn run_shared(
             .transpose()
             .map_err(|error| format!("{error:#}"))
     });
-    tokio::select! {
-        served = mcp::hub::run_host(manager.clone(), address, token, resolve) => {
-            served.with_context(|| format!("could not listen on {address}"))?;
-        }
-        () = stopped => {}
-    }
+    let served = mcp::hub::run_host_until(manager.clone(), address, token, resolve, stopped).await;
+    // Abort is cooperative: block_in_place work must finish before its task can
+    // join. The backend's outer grace retains ownership and exits the process
+    // if that cannot happen. Never detach unfinished credential work.
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
     manager.shutdown().await;
     #[cfg(unix)]
     let _ = std::fs::remove_file(address);
-    Ok(())
+    served.with_context(|| format!("could not listen on {address}"))
 }
 
 /// The host runs what the config says: a server removed, switched off or edited

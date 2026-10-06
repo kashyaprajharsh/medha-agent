@@ -18,7 +18,8 @@ const ROLES: wire::Roles = wire::Roles {
 };
 
 /// Longer than the MCP manager gives a connection to close.
-const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const STOP_GRACE: std::time::Duration = wire::SHUTDOWN_GRACE;
+const IDLE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Where a client finds the backend: `address` names the channel, `token` opens it.
 pub(crate) fn directory(home: &Path) -> PathBuf {
@@ -42,7 +43,9 @@ fn address(directory: &Path, channel: &str) -> String {
     let place = if beside.as_os_str().len() < SOCKET_PATH {
         beside
     } else {
-        std::env::temp_dir()
+        // TMPDIR itself can be deeply nested. This user-owned private folder
+        // under the system's short temporary root has a bounded socket path.
+        std::path::PathBuf::from("/tmp")
             .join(format!("medha-{}", tag(directory)))
             .join(format!("{channel}.sock"))
     };
@@ -68,7 +71,10 @@ impl McpHost {
     /// Closes the remote connections and gives the host's address back. Says whether it had finished in time.
     async fn stop(self) -> bool {
         drop(self.stop);
-        tokio::time::timeout(STOP_GRACE, self.task).await.is_ok()
+        matches!(
+            tokio::time::timeout(STOP_GRACE, self.task).await,
+            Ok(Ok(()))
+        )
     }
 }
 
@@ -146,12 +152,14 @@ where
 {
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
-    let Some(admitted) = wire::admit(&mut reader, &mut write, &token, ROLES).await else {
+    let admitted = tokio::select! {
+        () = backend.stopping() => return,
+        admitted = wire::admit(&mut reader, &mut write, &token, ROLES) => admitted,
+    };
+    let Some(admitted) = admitted else {
         return;
     };
-    let welcome = json!({ "id": admitted, "result": {
-        "backend": env!("CARGO_PKG_VERSION"), "protocol": backend::PROTOCOL,
-    }});
+    let welcome = json!({ "id": admitted, "result": backend.identity() });
     if wire::write_frame(&mut write, &welcome).await {
         backend.serve(reader, write).await;
     }
@@ -179,15 +187,27 @@ fn allow_many_open_files() {
 pub async fn run(_args: &[String]) -> anyhow::Result<()> {
     #[cfg(unix)]
     allow_many_open_files();
+    let positive = |name: &str, default: u64| -> anyhow::Result<u64> {
+        let value = std::env::var(name)
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .with_context(|| format!("{name} must be a positive integer"))?
+            .unwrap_or(default);
+        anyhow::ensure!(value > 0, "{name} must be a positive integer");
+        Ok(value)
+    };
+    let idle =
+        std::time::Duration::from_secs(positive("MEDHA_SERVE_IDLE_SECONDS", IDLE.as_secs())?);
+    let max_chats = usize::try_from(positive("MEDHA_SERVE_MAX_CHATS", 64)?)
+        .context("MEDHA_SERVE_MAX_CHATS is too large")?;
     let home = config::medha_home()?;
     let directory = directory(&home);
+    #[cfg(unix)]
+    wire::private_folder(&directory)?;
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-    }
     // Held for life: a second backend would take the first one's address from under it.
     let lock = std::fs::OpenOptions::new()
         .write(true)
@@ -224,23 +244,45 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
         wire::bind(&address).with_context(|| format!("could not listen on {address}"))?;
     let mcp_host = shared_mcp(&directory)?;
     let chats = ServeChats::new(mcp_host.endpoint.clone(), Arc::clone(&mcp_host.changed));
-    let backend = backend::Backend::new(chats, env!("CARGO_PKG_VERSION"));
+    let backend = backend::Backend::with_chat_limit(chats, env!("CARGO_PKG_VERSION"), max_chats);
     // Written once the address is taken: a client that finds these is not refused.
     private(&directory.join("token"), &token)?;
     private(&directory.join("address"), &address)?;
     tracing::info!(address = %address, "medha backend listening");
     println!("medha backend listening");
 
+    let clients = tokio_util::task::TaskTracker::new();
+    let guests = Arc::new(tokio::sync::Semaphore::new(128));
     let serving = listener.serve({
         let backend = Arc::clone(&backend);
+        let clients = clients.clone();
         move |stream| {
-            tokio::spawn(client(Arc::clone(&backend), stream, Arc::clone(&token)));
+            if let Ok(guest) = Arc::clone(&guests).try_acquire_owned() {
+                let serving = client(Arc::clone(&backend), stream, Arc::clone(&token));
+                clients.spawn(async move {
+                    let _guest = guest;
+                    serving.await;
+                });
+            }
         }
     });
+    let expiry = async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            tick.tick().await;
+            if backend.stop_if_idle(idle) {
+                break;
+            }
+        }
+    };
     let outcome = tokio::select! {
         served = serving => served.with_context(|| format!("could not listen on {address}")),
         () = asked_to_stop() => Ok(()),
+        () = backend.stopping() => Ok(()),
+        () = expiry => Ok(()),
     };
+    backend.begin_stop();
+    clients.close();
     for name in ["token", "address"] {
         let _ = std::fs::remove_file(directory.join(name));
     }
@@ -250,10 +292,11 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
     // Nothing new begins; every chat is told to finish, and what was already
     // begun is given a moment to.
     let finishing = async {
-        while !(backend.chats().has_stopped() && backend.live() == 0) {
+        while !(backend.chats().has_stopped() && backend.is_drained()) {
             backend.close_all();
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        clients.wait().await;
     };
     let (finished, host_finished) =
         tokio::join!(tokio::time::timeout(STOP_GRACE, finishing), mcp_host.stop());
@@ -268,6 +311,9 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
         }
         std::process::exit(i32::from(outcome.is_err()));
     }
-    drop(lock);
+    // Ownership lasts through root runtime teardown too: no replacement may
+    // overlap a late blocking task not yet released by Tokio. The OS closes
+    // this single descriptor when the serving process exits.
+    std::mem::forget(lock);
     outcome
 }

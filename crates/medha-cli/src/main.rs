@@ -916,7 +916,7 @@ async fn main() -> Result<()> {
             notices: &Stderr,
         };
         let (input, output) = (tokio::io::stdin(), tokio::io::stdout());
-        return acp_chat::run(start, input, output, acp::restore_from_env()).await;
+        return acp_chat::run(start, input, output, acp::restore_from_env(), None).await;
     }
 
     // Chosen while the session is built, once the prompt is settled; kept for the dispatch below.

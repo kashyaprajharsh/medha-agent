@@ -37,7 +37,8 @@ pub(crate) fn scripted_backend(
             let Some(id) = wire::admit(&mut reader, &mut writing, token, ROLES).await else {
                 return;
             };
-            let welcome = json!({ "id": id, "result": { "protocol": PROTOCOL } });
+            let welcome = json!({ "id": id, "result": { "protocol": PROTOCOL,
+                "build": wire::BUILD_ID, "capabilities": wire::CAPABILITIES } });
             wire::write_frame(&mut writing, &welcome).await;
             while let Some(frame) = wire::read_frame(&mut reader).await {
                 heard.lock().unwrap().push(frame.clone());
@@ -70,6 +71,63 @@ fn joined(address: &str) -> Arc<Connection> {
     connection
 }
 
+#[cfg(unix)]
+#[test]
+fn an_exited_starter_is_retried_after_the_singleton_is_released() {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug/medha");
+    if !binary.is_file() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "build the backend before desktop tests"
+        );
+        return;
+    }
+    let address = address();
+    let root = Path::new(&address).parent().unwrap();
+    std::fs::create_dir_all(root).unwrap();
+    let script = root.join("starter");
+    std::fs::write(&script, "#!/bin/sh\nif mkdir \"$MEDHA_HOME/first-attempt\" 2>/dev/null; then exit 1; fi\nexec \"$MEDHA_TEST_BACKEND\" \"$@\"\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = Backend::owned(
+        script,
+        vec![
+            ("MEDHA_HOME".into(), root.display().to_string()),
+            ("MEDHA_TEST_BACKEND".into(), binary.display().to_string()),
+            ("MEDHA_CRED_STORE".into(), "file".into()),
+        ],
+    );
+    let outcome = backend
+        .connection()
+        .and_then(|connection| connection.ask(json!({"method": "hello"}), SOON));
+    backend.stop();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(outcome.is_ok(), "{outcome:?}");
+}
+
+pub(crate) fn exhaust_ordinary_replies(connection: &Arc<Connection>) {
+    let (session, opened) = {
+        let routes = connection.routes();
+        let (session, (opened, _)) = routes.chats.iter().next().unwrap();
+        (session.clone(), *opened)
+    };
+    for id in 0..UNANSWERED {
+        connection
+            .tell(
+                &Chat {
+                    session: session.clone(),
+                    opened,
+                },
+                json!({"id": id, "method": "session.settings"}),
+            )
+            .unwrap();
+    }
+}
+
+pub(crate) fn disconnect(connection: &Arc<Connection>) {
+    connection.lost();
+}
+
 fn forget(address: &str) {
     if let Some(folder) = Path::new(address).parent().filter(|_| cfg!(unix)) {
         let _ = std::fs::remove_dir_all(folder);
@@ -83,6 +141,39 @@ fn taken_but(connection: &Connection, left: usize) {
         assert!(Instant::now() < deadline, "the backend stopped reading");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn leaving_an_old_incarnation_preserves_the_current_viewer_and_requests() {
+    let (lines, _queued) = tokio::sync::mpsc::unbounded_channel();
+    let (controls, _urgent) = tokio::sync::mpsc::unbounded_channel();
+    let connection = Connection {
+        lines,
+        controls,
+        unsent: Arc::default(),
+        routes: Mutex::default(),
+        stop: tokio::sync::watch::channel(false).0,
+    };
+    let current = Chat {
+        session: "same".into(),
+        opened: 2,
+    };
+    connection
+        .routes()
+        .chats
+        .insert(current.session.clone(), (2, Arc::new(|_| {})));
+    connection
+        .tell(&current, json!({"id": 1, "method": "session.settings"}))
+        .unwrap();
+    connection.leave(&Chat {
+        session: "same".into(),
+        opened: 1,
+    });
+    assert!(connection.routes().hearing("same", Some(2)).is_some());
+    assert_eq!(connection.routes().replies.len(), 1);
+    connection
+        .tell(&current, json!({"method": "cancel"}))
+        .unwrap();
 }
 
 #[test]

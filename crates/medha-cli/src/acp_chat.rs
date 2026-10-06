@@ -15,6 +15,7 @@ pub(crate) async fn run<R, W>(
     input: R,
     output: W,
     restore: Option<Value>,
+    control: Option<Arc<acp::TurnControl>>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -47,7 +48,10 @@ where
         scratch: _scratch,
         ..
     } = runtime::session::start(start, |cwd, _| {
-        let made = acp::bridge_to(output, cwd.to_path_buf());
+        let mut made = acp::bridge_to(output, cwd.to_path_buf());
+        if let Some(control) = control {
+            made.control = control;
+        }
         let surface = runtime::Surface {
             gate: Arc::new(acp::AcpGate::new(
                 made.writer.clone(),

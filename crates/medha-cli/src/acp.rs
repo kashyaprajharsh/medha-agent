@@ -11,12 +11,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 const OUTBOUND_FRAMES: usize = 256;
-const MAX_OUTBOUND_FRAME: usize = 16 * 1024 * 1024;
+// Leave room for the backend's session-event envelope.
+const MAX_OUTBOUND_FRAME: usize = wire::MAX_FRAME - 1024;
 const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const TURN_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -36,35 +37,80 @@ pub struct Writer {
     tx: mpsc::Sender<Outbound>,
     queued_bytes: Arc<AtomicUsize>,
     cancelled: CancellationToken,
+    progress: Arc<Notify>,
+    failure: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl Writer {
+    fn fail(&self, reason: &'static str) {
+        let mut failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        failure.get_or_insert(reason);
+        self.cancelled.cancel();
+    }
+
+    /// Synchronous stream callbacks cannot wait, but incoming RPCs can. Leave
+    /// headroom for their notifications and reply instead of ending a healthy
+    /// chat when a fast reader supplies a burst of small requests.
+    async fn wait_for_room(&self) {
+        let spare = 8.min(self.tx.max_capacity().div_ceil(2));
+        loop {
+            let changed = self.progress.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.cancelled.is_cancelled()
+                || (self.tx.capacity() >= spare
+                    && self.queued_bytes.load(Ordering::Acquire)
+                        <= MAX_QUEUED_BYTES - MAX_OUTBOUND_FRAME)
+            {
+                return;
+            }
+            tokio::select! {
+                _ = self.cancelled.cancelled() => return,
+                _ = changed => {}
+            }
+        }
+    }
+
     fn write_value(&self, value: &Value) -> bool {
         if self.cancelled.is_cancelled() {
             return false;
         }
         let Ok(mut frame) = serde_json::to_vec(value) else {
-            self.cancelled.cancel();
+            self.fail("Could not encode the chat's output.");
             return false;
         };
+        if frame.len() + 1 > MAX_OUTBOUND_FRAME
+            && let Some(id) = value.get("id")
+            && (value.get("result").is_some() || value.get("error").is_some())
+        {
+            frame = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": id,
+                "error": {"code": -32001, "message": "The chat's answer is too large."}}))
+            .expect("a JSON value can be serialized");
+        }
         frame.push(b'\n');
         let frame_len = frame.len();
-        if frame_len > MAX_OUTBOUND_FRAME
-            || self
-                .queued_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                    queued
-                        .checked_add(frame_len)
-                        .filter(|total| *total <= MAX_QUEUED_BYTES)
-                })
-                .is_err()
+        if frame_len > MAX_OUTBOUND_FRAME {
+            self.fail("The chat's output exceeded the frame limit.");
+            return false;
+        }
+        if self
+            .queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued
+                    .checked_add(frame_len)
+                    .filter(|total| *total <= MAX_QUEUED_BYTES)
+            })
+            .is_err()
         {
-            self.cancelled.cancel();
+            self.fail("The chat's output queue is full; its viewer could not keep up.");
             return false;
         }
         if self.tx.try_send(Outbound::Frame(frame)).is_err() {
             self.queued_bytes.fetch_sub(frame_len, Ordering::AcqRel);
-            self.cancelled.cancel();
+            self.fail("The chat's output queue is full or disconnected.");
             return false;
         }
         true
@@ -104,6 +150,8 @@ async fn writer_loop<W>(
     mut rx: mpsc::Receiver<Outbound>,
     queued_bytes: Arc<AtomicUsize>,
     cancelled: CancellationToken,
+    progress: Arc<Notify>,
+    failure: Arc<Mutex<Option<&'static str>>>,
 ) where
     W: AsyncWrite + Unpin,
 {
@@ -130,7 +178,14 @@ async fn writer_loop<W>(
                     Err(error) => Err(error),
                 };
                 queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                progress.notify_waiters();
                 if result.is_err() {
+                    if !cancelled.is_cancelled() {
+                        failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_or_insert("The chat's output connection failed.");
+                    }
                     cancelled.cancel();
                     break;
                 }
@@ -336,7 +391,47 @@ pub(crate) struct Bridge {
     pub(crate) pending: Pending,
     pub(crate) peer: Peer,
     pub(crate) questions: crate::acp_questions::Questions,
+    pub(crate) control: Arc<TurnControl>,
     writer_task: WriterTask,
+}
+
+/// The backend can cancel the current turn without waiting for an unrelated
+/// sign-in/screen operation in the RPC reader, or for a full input pipe.
+#[derive(Default)]
+pub(crate) struct TurnControl {
+    active: Mutex<Option<kernel::InterruptHandle>>,
+    gates: Mutex<Option<(Pending, crate::acp_questions::Questions)>>,
+}
+
+impl TurnControl {
+    pub(crate) fn cancel(&self) -> bool {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cancelled = active.as_ref().is_some_and(|handle| {
+            handle.cancel_turn();
+            true
+        });
+        drop(active);
+        let gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let denied = gates.is_some_and(|(pending, questions)| {
+            crate::acp_questions::clear(&questions);
+            deny_pending(&pending) > 0
+        });
+        cancelled || denied
+    }
+
+    fn attend(&self, handle: Option<kernel::InterruptHandle>) {
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = handle;
+    }
 }
 
 pub(crate) fn bridge_to<W>(output: W, workspace: PathBuf) -> Bridge
@@ -369,21 +464,28 @@ where
     let (tx, rx) = mpsc::channel(capacity.max(1));
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let cancelled = CancellationToken::new();
+    let progress = Arc::new(Notify::new());
+    let failure = Arc::new(Mutex::new(None));
     let handle = tokio::spawn(writer_loop(
         output,
         rx,
         Arc::clone(&queued_bytes),
         cancelled.clone(),
+        Arc::clone(&progress),
+        Arc::clone(&failure),
     ));
     Bridge {
         writer: Arc::new(Writer {
             tx,
             queued_bytes,
             cancelled: cancelled.clone(),
+            progress,
+            failure,
         }),
         pending: Arc::new(Mutex::new(HashMap::new())),
         peer: Peer::for_workspace(workspace),
         questions: Default::default(),
+        control: Arc::default(),
         writer_task: WriterTask {
             handle: Some(handle),
             cancelled,
@@ -1444,8 +1546,14 @@ where
         pending,
         peer,
         questions,
+        control,
         writer_task,
     } = bridge;
+    *control
+        .gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((Arc::clone(&pending), Arc::clone(&questions)));
     let (report_tx, mut report_rx) = mpsc::unbounded_channel();
     if let Some(control) = &agents
         && let Ok(mut slot) = control.notifier_handle().lock()
@@ -1530,6 +1638,7 @@ where
                     control.attend(handle.clone());
                 }
                 interrupt = Some(handle);
+                control.attend(interrupt.clone());
                 let kernel = kernel.clone();
                 let session = session.clone();
                 let budget = crate::task_budget(&base_budget, &agent_budget);
@@ -1556,7 +1665,10 @@ where
             }
         }
         tokio::select! {
-            line = read_frame(&mut stdin, &mut frame_buf) => {
+            line = async {
+                writer.wait_for_room().await;
+                read_frame(&mut stdin, &mut frame_buf).await
+            } => {
                 let Ok(Some(line)) = line else { break }; // stdin closed / oversized frame → exit
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -1665,6 +1777,7 @@ where
             joined = turns.join_next(), if running => {
                 running = false;
                 interrupt = None;
+                control.attend(None);
                 // No approval belongs past the turn that requested it. This
                 // also releases a gate whose task ended with an error before
                 // consuming its response.
@@ -1743,6 +1856,7 @@ where
     }
 
     settle_turn(&mut interrupt, &pending, &mut turns, TURN_SHUTDOWN_GRACE).await;
+    control.attend(None);
     deny_pending(&pending);
     crate::acp_questions::clear(&questions);
     // A sleeping chat has not ended; it wakes on the next message.
@@ -1756,6 +1870,13 @@ where
             .await;
     }
     writer_task.finish(&writer).await;
+    if let Some(reason) = *writer
+        .failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        anyhow::bail!(reason);
+    }
     Ok(())
 }
 
@@ -1774,6 +1895,8 @@ mod tests {
                 tx,
                 queued_bytes: Arc::new(AtomicUsize::new(0)),
                 cancelled: CancellationToken::new(),
+                progress: Arc::new(Notify::new()),
+                failure: Arc::new(Mutex::new(None)),
             }),
             rx,
         )
@@ -2689,6 +2812,46 @@ mod tests {
         assert!(turns.is_empty());
     }
 
+    #[tokio::test]
+    async fn backend_control_cancels_the_turn_and_denies_its_gate_without_rpc_input() {
+        let control = TurnControl::default();
+        let (handle, queue) = kernel::InterruptQueue::pair();
+        control.attend(Some(handle));
+        let pending: Pending = Arc::default();
+        let (answer, answered) = oneshot::channel();
+        lock_pending(&pending).insert(5, answer);
+        *control.gates.lock().unwrap() = Some((pending.clone(), Default::default()));
+        assert!(control.cancel());
+        assert!(queue.token().is_cancelled());
+        assert_eq!(answered.await.unwrap(), Approval::Deny);
+        assert!(lock_pending(&pending).is_empty());
+        control.attend(None);
+        assert!(!control.cancel());
+    }
+
+    #[test]
+    fn oversized_result_and_error_replies_are_bounded_and_keep_their_id() {
+        let (writer, mut rx) = capture_writer(4);
+        let huge = "x".repeat(MAX_OUTBOUND_FRAME);
+        assert!(writer.respond(json!(7), json!(huge)));
+        assert!(writer.error(json!(8), -32000, huge));
+        let values = captured_values(&mut rx);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value["id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [7, 8]
+        );
+        assert!(values.iter().all(|value| {
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("too large")
+        }));
+        assert!(!writer.cancelled.is_cancelled());
+    }
+
     struct BrokenOutput;
 
     impl AsyncWrite for BrokenOutput {
@@ -2718,6 +2881,7 @@ mod tests {
             questions: _,
             peer: _,
             writer_task: blocked_task,
+            control: _,
         } = bridge_with_output(blocked_output, 2);
 
         let heartbeat = tokio::spawn(async {
@@ -2751,6 +2915,7 @@ mod tests {
             questions: _,
             peer: _,
             writer_task: healthy_task,
+            control: _,
         } = bridge_with_output(healthy_output, 2);
         assert!(healthy_writer.notify("healthy", json!({"ok": true})));
         healthy_task.finish(&healthy_writer).await;
@@ -2770,6 +2935,7 @@ mod tests {
             questions: _,
             peer: _,
             writer_task,
+            control: _,
         } = bridge_with_output(BrokenOutput, 2);
         assert!(writer.notify("event", json!({"delta": "x"})));
         tokio::time::timeout(Duration::from_millis(250), writer.cancelled())

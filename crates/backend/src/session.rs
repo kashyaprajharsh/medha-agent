@@ -42,6 +42,7 @@ pub(crate) struct Session {
     closing: CancellationToken,
     tied: AtomicBool,
     stream: Mutex<Stream>,
+    cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Writes to the chat one request at a time, what is urgent before what is
@@ -92,7 +93,12 @@ struct Stream {
 }
 
 impl Session {
-    pub(crate) fn new(id: String, about: Value, input: Input) -> Arc<Self> {
+    pub(crate) fn new(
+        id: String,
+        about: Value,
+        input: Input,
+        cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Arc<Self> {
         let (asked, queued) = mpsc::channel(INPUT_FRAMES);
         let (urgent, ahead) = mpsc::channel(URGENT_FRAMES);
         let (waiting, closing) = (Arc::<AtomicUsize>::default(), CancellationToken::new());
@@ -107,6 +113,7 @@ impl Session {
             closing,
             tied: AtomicBool::new(false),
             stream: Mutex::default(),
+            cancel,
         })
     }
 
@@ -124,6 +131,10 @@ impl Session {
             "head": stream.seq,
             "clients": stream.viewers.len(),
         })
+    }
+
+    pub(crate) fn cancel_turn(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|cancel| cancel())
     }
 
     /// Replay and subscription happen under one lock, so nothing is missed or repeated.
@@ -182,17 +193,7 @@ impl Session {
         if self.closing.is_cancelled() {
             return Err("this chat has ended".into());
         }
-        let ahead = matches!(
-            frame["method"].as_str(),
-            Some(
-                "cancel"
-                    | "interrupt"
-                    | "approval.respond"
-                    | "question.respond"
-                    | "shutdown"
-                    | "exit"
-            )
-        );
+        let ahead = frame["method"].as_str().is_some_and(wire::is_control);
         let mut given = None;
         if let Some(asked) = frame.get("id").cloned() {
             let mut stream = self.stream();
@@ -233,6 +234,7 @@ impl Session {
 
     /// Reaches a chat even when it has stopped reading what it is asked.
     pub(crate) fn close(&self) {
+        self.cancel_turn();
         self.closing.cancel();
     }
 
@@ -242,7 +244,10 @@ impl Session {
         let mut line = Vec::new();
         'chat: loop {
             line.clear();
-            let limited = (&mut reader).take(CHAT_FRAME as u64 + 1);
+            // Read the whole valid ACP frame before looking for its id: JSON
+            // fields may appear in any order, including error before id. The
+            // smaller CHAT_FRAME limit still leaves room for the event envelope.
+            let limited = (&mut reader).take(wire::MAX_FRAME as u64 + 1);
             tokio::pin!(limited);
             match limited.read_until(b'\n', &mut line).await {
                 Ok(read) if read > 0 => {}

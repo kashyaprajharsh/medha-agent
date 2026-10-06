@@ -19,7 +19,6 @@ const PROTOCOL: u64 = 1;
 /// The system may check a new binary before it runs, which holds a first start up.
 const START: Duration = Duration::from_secs(30);
 /// How long a start that has already exited is still given to be found running.
-const AFTER_EXIT: Duration = Duration::from_secs(3);
 /// How long a chat that is ending is waited for before it is resumed.
 const LEAVING: Duration = Duration::from_secs(10);
 const STOPPED: &str = "Medha backend stopped unexpectedly";
@@ -33,7 +32,7 @@ const UNSENT_BYTES: usize = 64 * 1024 * 1024;
 const UNANSWERED: usize = 1024;
 /// What stops a chat or lets go of one must arrive when nothing else is taken,
 /// so it has a little room of its own past those limits, and no more than that.
-const STOP_BYTES: usize = 4 * 1024;
+const STOP_BYTES: usize = wire::CONTROL_FRAME_BYTES;
 const STOPS_UNSENT: usize = 1024 * 1024;
 const STOPS_UNANSWERED: usize = 64;
 /// How many chat starts whose wait was given up are still remembered, to stop them if they come.
@@ -93,7 +92,10 @@ impl Routes {
 
     /// A chat that is no longer heard takes its unanswered requests with it.
     fn forget(&mut self, session: &str, opened: u64) -> Option<Hear> {
-        let (_, hear) = self.chats.remove(session).filter(|(n, _)| *n == opened)?;
+        if !self.chats.get(session).is_some_and(|(n, _)| *n == opened) {
+            return None;
+        }
+        let (_, hear) = self.chats.remove(session)?;
         self.replies.retain(|_, reply| {
             !matches!(reply, Reply::Chat { session: of, opened: n, .. } if of == session && *n == opened)
         });
@@ -135,9 +137,11 @@ impl Routes {
 
 pub(crate) struct Connection {
     lines: tokio::sync::mpsc::UnboundedSender<String>,
+    controls: tokio::sync::mpsc::UnboundedSender<String>,
     /// Bytes handed to `lines` that the backend has not taken yet.
     unsent: Arc<AtomicUsize>,
     routes: Mutex<Routes>,
+    stop: tokio::sync::watch::Sender<bool>,
 }
 
 fn outcome(mut frame: Value) -> Result<Value, String> {
@@ -172,11 +176,8 @@ impl Connection {
         if line.len() > wire::MAX_FRAME {
             return Err(TOO_LARGE.into());
         }
-        let stops = line.len() <= STOP_BYTES
-            && matches!(
-                frame["method"].as_str(),
-                Some("session.close" | "session.detach" | "shutdown" | "cancel" | "interrupt")
-            );
+        let stops =
+            line.len() <= STOP_BYTES && frame["method"].as_str().is_some_and(wire::is_control);
         let (bytes, places) = match stops {
             true => (UNSENT_BYTES + STOPS_UNSENT, UNANSWERED + STOPS_UNANSWERED),
             false => (UNSENT_BYTES, UNANSWERED),
@@ -190,17 +191,23 @@ impl Connection {
             routes.replies.insert(id, reply);
         }
         self.unsent.fetch_add(line.len(), Ordering::Relaxed);
-        self.lines
+        let sender = if stops { &self.controls } else { &self.lines };
+        sender
             .send(line)
             .map(|()| routes.next)
             .map_err(|_| STOPPED.to_string())
     }
 
     /// Whether a frame of this size would be taken now, without making it to find out.
-    pub(crate) fn has_room(&self, bytes: usize) -> bool {
+    pub(crate) fn has_room(&self, bytes: usize, method: &str) -> bool {
         let mut routes = self.routes();
-        let unsent = self.unsent.load(Ordering::Relaxed) + bytes > UNSENT_BYTES;
-        routes.gone || !(unsent || routes.is_full(UNANSWERED, EVENTUALLY))
+        let (budget, places) = if bytes <= STOP_BYTES && wire::is_control(method) {
+            (UNSENT_BYTES + STOPS_UNSENT, UNANSWERED + STOPS_UNANSWERED)
+        } else {
+            (UNSENT_BYTES, UNANSWERED)
+        };
+        let unsent = self.unsent.load(Ordering::Relaxed) + bytes > budget;
+        routes.gone || !(unsent || routes.is_full(places, EVENTUALLY))
     }
 
     /// Nothing waits without end on a backend that has gone quiet, and a wait
@@ -227,8 +234,13 @@ impl Connection {
 
     /// One question about a folder: its history, settings or extensions.
     pub(crate) fn about(&self, folder: &Path, mut request: Value) -> Result<Value, String> {
+        let waited = if wire::slow_request(request["method"].as_str().unwrap_or_default()) {
+            EVENTUALLY
+        } else {
+            SOON
+        };
         request["folder"] = json!(folder);
-        self.ask(request, EVENTUALLY)
+        self.ask(request, waited)
     }
 
     pub(crate) fn is_live(&self, session: &str) -> bool {
@@ -405,6 +417,7 @@ impl Connection {
 
     /// Whoever waits for an answer is released, and every chat is told it is over.
     fn lost(&self) {
+        self.stop.send_replace(true);
         let (replies, chats) = {
             let mut routes = self.routes();
             routes.gone = true;
@@ -437,16 +450,33 @@ pub(crate) fn size(frame: &Value) -> usize {
     count.0
 }
 
-async fn read(connection: Arc<Connection>, mut reader: impl AsyncBufRead + Unpin) {
-    while let Some(frame) = wire::read_frame(&mut reader).await {
+async fn read(
+    connection: std::sync::Weak<Connection>,
+    mut reader: impl AsyncBufRead + Unpin,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let frame = tokio::select! {
+            _ = stop.changed() => break,
+            frame = wire::read_frame(&mut reader) => frame,
+        };
+        let Some(frame) = frame else { break };
+        let Some(connection) = connection.upgrade() else {
+            break;
+        };
         connection.heard(frame);
     }
-    connection.lost();
+    if let Some(connection) = connection.upgrade() {
+        connection.lost();
+    }
 }
 
 enum Refused {
     Absent,
     Incompatible,
+    Upgrading,
+    Busy(String),
+    Legacy,
 }
 
 /// The connection is read on a thread of its own. Whoever waits for an answer
@@ -474,22 +504,61 @@ async fn join(address: String, token: String) -> Result<Arc<Connection>, Refused
     if welcome["result"]["protocol"] != PROTOCOL {
         return Err(Refused::Incompatible);
     }
+    if welcome["result"]["build"] != wire::BUILD_ID {
+        if !welcome["result"]["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == "lifecycle"))
+        {
+            return Err(Refused::Legacy);
+        }
+        let upgrade = json!({"id": 2, "method": "backend.prepare_upgrade", "params": {"build": welcome["result"]["build"]}});
+        if !wire::write_frame(&mut writing, &upgrade).await {
+            return Err(Refused::Absent);
+        }
+        // EOF is also an acknowledgement: the idle backend can finish before
+        // its last reply is flushed. Active work is refused before shutdown.
+        if let Some(reply) =
+            tokio::time::timeout(Duration::from_secs(2), wire::read_frame(&mut reader))
+                .await
+                .ok()
+                .flatten()
+            && let Some(error) = reply["error"]["message"].as_str()
+        {
+            return Err(Refused::Busy(error.to_owned()));
+        }
+        return Err(Refused::Upgrading);
+    }
     let (lines, mut queued) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (controls, mut urgent) = tokio::sync::mpsc::unbounded_channel::<String>();
     let unsent = Arc::<AtomicUsize>::default();
+    let (stop, mut writer_stop) = tokio::sync::watch::channel(false);
+    let reader_stop = writer_stop.clone();
     let connection = Arc::new(Connection {
         lines,
+        controls,
         unsent: Arc::clone(&unsent),
         routes: Mutex::default(),
+        stop,
     });
     tokio::spawn(async move {
-        while let Some(line) = queued.recv().await {
-            if writing.write_all(line.as_bytes()).await.is_err() || writing.flush().await.is_err() {
+        loop {
+            let line = tokio::select! {
+                biased;
+                _ = writer_stop.changed() => break,
+                Some(line) = urgent.recv() => line,
+                line = queued.recv() => match line { Some(line) => line, None => break },
+            };
+            let written = async {
+                writing.write_all(line.as_bytes()).await.is_ok() && writing.flush().await.is_ok()
+            };
+            if !tokio::select! { _ = writer_stop.changed() => false, written = written => written }
+            {
                 break;
             }
             unsent.fetch_sub(line.len(), Ordering::Relaxed);
         }
     });
-    tokio::spawn(read(Arc::clone(&connection), reader));
+    tokio::spawn(read(Arc::downgrade(&connection), reader, reader_stop));
     Ok(connection)
 }
 
@@ -497,6 +566,23 @@ async fn join(address: String, token: String) -> Result<Arc<Connection>, Refused
 struct Link {
     connection: Option<Arc<Connection>>,
     started: Option<Child>,
+}
+
+/// Reap the exact child we started on every return path. A failed connection
+/// attempt does not authorize killing a daemon that another client may use.
+struct Starting(Option<Child>, bool);
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            if self.1 {
+                let _ = child.kill();
+                let _ = child.wait();
+            } else {
+                drop(std::thread::spawn(move || child.wait()));
+            }
+        }
+    }
 }
 
 pub(crate) struct Backend {
@@ -564,9 +650,14 @@ impl Backend {
         };
         let (joined, outcome) = mpsc::sync_channel(1);
         reading().spawn(async move {
-            let _ = joined.send(join(address, token).await);
+            let result = tokio::time::timeout(wire::STARTUP_GRACE, join(address, token))
+                .await
+                .unwrap_or(Err(Refused::Absent));
+            let _ = joined.send(result);
         });
-        outcome.recv().unwrap_or(Err(Refused::Absent))
+        outcome
+            .recv_timeout(wire::STARTUP_GRACE + Duration::from_secs(1))
+            .unwrap_or(Err(Refused::Absent))
     }
 
     fn start(&self) -> Result<Child, String> {
@@ -598,25 +689,35 @@ impl Backend {
             return Ok(Arc::clone(live));
         }
         let directory = self.directory()?;
-        let mut started: Option<Child> = None;
+        let mut started = Starting(None, self.owned);
+        let mut attempts = 0;
         let mut exited: Option<Instant> = None;
         let deadline = Instant::now() + START;
         let connection = loop {
             match self.reach(&directory) {
                 Ok(connection) => break connection,
                 Err(Refused::Incompatible) => return Err(incompatible()),
+                Err(Refused::Legacy) => return Err("This backend predates safe upgrades. Close its chats and stop that older backend before starting this build.".into()),
+                Err(Refused::Busy(error)) => return Err(error),
+                Err(Refused::Upgrading) => {}
                 Err(Refused::Absent) => {}
             }
-            match started.as_mut() {
-                None => started = Some(self.start()?),
+            match started.0.as_mut() {
+                None if attempts < 3 && owner_available(&directory) => {
+                    started.0 = Some(self.start()?);
+                    attempts += 1;
+                }
+                None => {}
                 // One that lost the race to start exits at once; the winner is found on the next look.
                 Some(child) => {
-                    if exited.is_none() && matches!(child.try_wait(), Ok(Some(_))) {
-                        exited = Some(Instant::now());
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        exited.get_or_insert_with(Instant::now);
+                        started.0.take(); // try_wait reaped it; a released singleton may now be retried.
                     }
                 }
             }
-            let gave_up = exited.is_some_and(|at| at.elapsed() >= AFTER_EXIT);
+            let gave_up =
+                attempts >= 3 && exited.is_some_and(|at| at.elapsed() >= wire::STARTUP_GRACE);
             if gave_up || Instant::now() >= deadline {
                 return Err(
                     "Could not start Medha backend. See the serve log in Medha's logs folder."
@@ -625,14 +726,20 @@ impl Backend {
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        match started {
-            Some(child) if self.owned => link.started = Some(child),
-            // Waited for so that it does not linger as a finished process.
-            Some(mut child) => drop(std::thread::spawn(move || child.wait())),
-            None => {}
+        if self.owned {
+            link.started = started.0.take();
         }
         link.connection = Some(Arc::clone(&connection));
         Ok(connection)
+    }
+}
+
+/// A backend that is starting or draining keeps its singleton. Wait for it
+/// instead of launching a child that loses the lock and is never retried.
+fn owner_available(directory: &Path) -> bool {
+    match std::fs::File::open(directory.join("lock")) {
+        Ok(lock) => lock.try_lock().is_ok(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 

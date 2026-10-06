@@ -15,6 +15,8 @@ use transcript_view::Steps;
 
 use crate::backend::{Backend, Said};
 use crate::sleep::{self, Rest, Settled, Wake};
+#[path = "request_queue.rs"]
+mod request_queue;
 
 const REQUESTS: [&str; 25] = [
     "mcp.signin",
@@ -157,8 +159,7 @@ fn pump_stream(frames: impl Incoming, mut emit: impl FnMut(Value)) {
 struct Live {
     /// What the chat is asked, in the order it was asked, each with its size as
     /// it will leave, and no more than a chat may have waiting.
-    requests: SyncSender<(usize, Value)>,
-    unsent: Arc<AtomicUsize>,
+    requests: request_queue::Requests,
     ended: Arc<AtomicBool>,
     /// Set when this is dropped, which closes the chat.
     closed: Arc<AtomicBool>,
@@ -243,13 +244,11 @@ impl LiveSessions {
         if bytes > wire::MAX_FRAME {
             return Err(crate::backend::TOO_LARGE.into());
         }
-        let room = live.unsent.fetch_add(bytes, Ordering::Relaxed) + bytes <= OUTBOX_BYTES;
-        let refused = match room.then(|| live.requests.try_send((bytes, frame))) {
-            Some(Ok(())) => return Ok(id),
-            Some(Err(TrySendError::Disconnected(_))) => STOPPED,
-            Some(Err(TrySendError::Full(_))) | None => WAITING,
+        let refused = match live.requests.try_send((bytes, frame)) {
+            Ok(()) => return Ok(id),
+            Err(TrySendError::Disconnected(_)) => STOPPED,
+            Err(TrySendError::Full(_)) => WAITING,
         };
-        live.unsent.fetch_sub(bytes, Ordering::Relaxed);
         Err(refused.into())
     }
 
@@ -349,8 +348,8 @@ impl Inner {
         let (behind, closed) = (Arc::<AtomicBool>::default(), Arc::<AtomicBool>::default());
         let why = Arc::new(Mutex::new(String::new()));
         let (sender, frames) = sync_channel(INBOX_FRAMES);
-        let (waiting, unsent) = (Arc::<AtomicUsize>::default(), Arc::<AtomicUsize>::default());
-        let (requests, asked) = sync_channel::<(usize, Value)>(OUTBOX_FRAMES);
+        let waiting = Arc::<AtomicUsize>::default();
+        let (requests, asked) = request_queue::channel();
         let hear: crate::backend::Hear = Arc::new({
             let (rest, ended, why) = (Arc::clone(&rest), Arc::clone(&ended), Arc::clone(&why));
             let (behind, waiting, nudge) =
@@ -370,7 +369,7 @@ impl Inner {
                 if let Ok(mut sender) = sender.lock() {
                     sender.take();
                 }
-                let _ = nudge.try_send((0, Value::Null));
+                nudge.close();
             };
             move |said| match said {
                 Said::Frame(frame) => {
@@ -419,11 +418,7 @@ impl Inner {
         // A chat woken from sleep resumes the one this window just let go to sleep.
         let waking = wake.is_some();
         let (resting, over) = (Arc::clone(&rest), Arc::clone(&ended));
-        let (behind, gone, queued) = (
-            Arc::clone(&behind),
-            Arc::clone(&closed),
-            Arc::clone(&unsent),
-        );
+        let (behind, gone) = (Arc::clone(&behind), Arc::clone(&closed));
         std::thread::spawn(move || {
             let opened = backend.connection().and_then(|connection| {
                 let chat = connection.open_chat(
@@ -441,32 +436,28 @@ impl Inner {
             };
             // Kept only by the connection from here, so the stream ends when the connection lets go.
             drop(hear);
-            // An empty frame only wakes this thread, to see that the chat is over or its tab closed.
-            for (bytes, frame) in asked {
-                queued.fetch_sub(bytes, Ordering::Relaxed);
+            while let Some(request) = asked.next() {
                 if gone.load(Ordering::Relaxed) || over.load(Ordering::Relaxed) {
                     break;
                 }
-                if frame.is_null() {
-                    continue;
-                }
-                // While the backend has not taken what it was sent, this waits, and
-                // makes the frame only once there is room for it. The chat's requests
-                // then pile up to their limit and the window is told.
-                loop {
-                    if connection.has_room(bytes) {
-                        match connection.tell(&chat, frame.clone()) {
-                            Ok(()) => break,
-                            Err(refused) if refused == crate::backend::NOT_TAKING => {}
-                            Err(refused) if refused == crate::backend::TOO_LARGE => break,
-                            Err(_) => return,
+                // Failed ordinary admission keeps its reservation; the next
+                // dispatch can select a control instead of waiting behind it.
+                let method = request.frame["method"].as_str().unwrap_or_default();
+                if connection.has_room(request.bytes, method) {
+                    match connection.tell(&chat, request.frame.clone()) {
+                        Ok(()) => {
+                            asked.complete(request);
+                            continue;
                         }
+                        Err(refused) if refused == crate::backend::NOT_TAKING => {}
+                        Err(refused) if refused == crate::backend::TOO_LARGE => {
+                            asked.complete(request);
+                            continue;
+                        }
+                        Err(_) => return,
                     }
-                    if gone.load(Ordering::Relaxed) || over.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
                 }
+                asked.retry(request);
             }
             // A window that stopped following a chat lets go of it and no more: the
             // chat is not this window's to stop for whoever else is watching it.
@@ -485,7 +476,6 @@ impl Inner {
 
         Live {
             requests,
-            unsent,
             ended,
             closed,
             next_id: 1,
@@ -504,7 +494,7 @@ impl Live {
 impl Drop for Live {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Relaxed);
-        let _ = self.requests.try_send((0, Value::Null));
+        self.requests.close();
     }
 }
 

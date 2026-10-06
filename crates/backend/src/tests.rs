@@ -52,6 +52,12 @@ async fn chat(input: DuplexStream, mut output: DuplexStream) -> Result<(), Strin
                 let answer = json!({"id": id, "result": "x".repeat(wire::MAX_FRAME)});
                 say(&mut output, answer).await;
             }
+            Some("huge_error") => {
+                // serde emits error before id; the id is beyond the retained CHAT_FRAME prefix.
+                let answer = json!({"id": id, "error": {"code": -32000, "message": "x".repeat(wire::MAX_FRAME - 512)}});
+                assert!(answer.to_string().len() < wire::MAX_FRAME);
+                say(&mut output, answer).await;
+            }
             Some("break") => return Err("it broke".into()),
             Some("panic") => panic!("the chat panicked"),
             _ => {}
@@ -86,6 +92,8 @@ impl Chats for Stub {
                 task.await
                     .unwrap_or_else(|_| Err("the chat stopped unexpectedly".into()))
             }),
+            cancel: (params["out_of_band"] == true)
+                .then(|| Arc::new(|| true) as Arc<dyn Fn() -> bool + Send + Sync>),
         })
     }
 
@@ -110,6 +118,55 @@ fn backend() -> Arc<Backend<Stub>> {
         },
         "test",
     )
+}
+
+#[tokio::test]
+async fn chat_capacity_counts_starts_and_reports_explicit_overload() {
+    let backend = Backend::with_chat_limit(
+        Stub {
+            opened: AtomicU64::new(1),
+            released: tokio::sync::Notify::new(),
+        },
+        "test",
+        1,
+    );
+    let mut first = connect(&backend);
+    let mut second = connect(&backend);
+    let starting = first
+        .post(json!({"method": "session.create", "params": {"slow": true}}))
+        .await;
+    until("start admission", || {
+        backend.status()["starting_chats"] == 1
+    })
+    .await;
+    let refused = second.ask("session.create", None, json!({})).await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("active-chat limit")
+    );
+    assert!(
+        second
+            .ask("hello", None, json!({}))
+            .await
+            .get("result")
+            .is_some()
+    );
+    backend.chats.released.notify_one();
+    let made = first.answer(starting).await;
+    let id = made["result"]["session"].as_str().unwrap();
+    assert_eq!(backend.live(), 1);
+    first.attach(id, None).await;
+    first.ask("session.close", Some(id), json!({})).await;
+    until("capacity released", || backend.live() == 0).await;
+    assert!(
+        second
+            .ask("session.create", None, json!({}))
+            .await
+            .get("result")
+            .is_some()
+    );
 }
 
 struct Tester {
@@ -479,6 +536,16 @@ async fn an_answer_or_a_frame_too_large_to_read_breaks_no_connection_and_no_chat
         huge["error"]["message"],
         "the answer is too large to send at once"
     );
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.ask("huge_error", Some(&session), json!({})),
+    )
+    .await
+    .expect("an oversized error was left unanswered");
+    assert_eq!(
+        error["error"]["message"],
+        "the answer is too large to send at once"
+    );
     assert_eq!(
         client.say(&session, "after").await["result"]["said"],
         "after"
@@ -637,10 +704,7 @@ async fn a_chat_is_resumed_once_and_closed_by_whoever_is_attached() {
     );
     until("the closed chat leaves the table", || backend.live() == 0).await;
     let hello = client.ask("hello", None, json!({})).await;
-    assert_eq!(
-        hello["result"],
-        json!({"backend": "test", "protocol": PROTOCOL})
-    );
+    assert_eq!(hello["result"], backend.identity());
 }
 
 #[tokio::test]
@@ -677,6 +741,41 @@ async fn a_slow_request_does_not_hold_up_the_client_that_sent_it() {
         "a plugin"
     );
     assert!(client.answer(creating).await["result"]["session"].is_string());
+}
+
+#[tokio::test]
+async fn cancellation_reaches_a_turn_without_waiting_for_its_unread_input_pipe() {
+    let backend = backend();
+    let mut client = connect(&backend);
+    let created = client
+        .ask("session.create", None, json!({"out_of_band": true}))
+        .await;
+    let session = created["result"]["session"].as_str().unwrap().to_owned();
+    let not_attached = client.ask("cancel", Some(&session), json!({})).await;
+    assert!(not_attached.get("error").is_some());
+    client
+        .ask("session.attach", Some(&session), json!({}))
+        .await;
+    client
+        .ask("stall", Some(&session), json!({"ms": 1000}))
+        .await;
+    client
+        .post(json!({"session": session, "method": "say", "params": {"text": "x".repeat(100_000)}}))
+        .await;
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(300),
+        client.ask("cancel", Some(&session), json!({})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled["result"]["cancelled"], true);
+    assert!(
+        client
+            .ask("hello", None, json!({}))
+            .await
+            .get("result")
+            .is_some()
+    );
 }
 
 #[tokio::test]

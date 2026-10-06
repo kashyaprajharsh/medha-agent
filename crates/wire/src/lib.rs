@@ -8,6 +8,50 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+pub const BUILD_ID: &str = env!("MEDHA_BACKEND_BUILD");
+/// These capabilities are negotiated in addition to the transport version.
+pub const CAPABILITIES: &[&str] = &[
+    "lifecycle",
+    "session-lease",
+    "priority-controls",
+    "history-omissions",
+];
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
+
+/// Long downloads/authentication have a longer response wait; ordinary folder
+/// reads use the same quick deadline as chat controls.
+pub fn slow_request(method: &str) -> bool {
+    matches!(
+        method,
+        "session.create"
+            | "settings.model.discover"
+            | "settings.model.context"
+            | "extensions.install"
+            | "extensions.skill.install"
+            | "extensions.mcp.registry"
+            | "mcp.signin"
+            | "mcp.connect"
+            | "connectors.connect"
+    )
+}
+/// Small controls get bounded reserved admission at every dispatch layer.
+pub const CONTROL_FRAME_BYTES: usize = 64 * 1024;
+pub fn is_control(method: &str) -> bool {
+    matches!(
+        method,
+        "cancel"
+            | "interrupt"
+            | "approval.respond"
+            | "question.respond"
+            | "shutdown"
+            | "exit"
+            | "session.close"
+            | "session.detach"
+            | "session.attach"
+            | "agent.control"
+    )
+}
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The names each side signs under, so one side's proof is no use as the other's.

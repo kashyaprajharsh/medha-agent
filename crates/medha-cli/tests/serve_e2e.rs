@@ -432,6 +432,287 @@ fn kind(frame: &Value, wanted: &str) -> bool {
     frame["params"]["kind"] == wanted
 }
 
+/// A healthy reader must not lose its chat merely because requests arrive
+/// faster than synchronous notifications can be written to the chat pipe.
+#[tokio::test]
+async fn settings_burst_is_backpressured_and_keeps_the_chat_alive() {
+    let world = World::new();
+    let backend = Backend::start(&world.home(), &world.provider, &[]);
+    let mut client = backend.connect().await;
+    let session = client.open(&world.folder("burst")).await;
+    let first = client.asked + 1;
+    let count = 3000;
+    let writer = &mut client.writer;
+    let reader = &mut client.reader;
+    let sending = async {
+        for id in first..first + count {
+            let frame = json!({"jsonrpc": "2.0", "id": id, "session": session,
+                "method": "session.settings", "params": {}});
+            assert!(wire::write_frame(writer, &frame).await);
+        }
+    };
+    let receiving = async {
+        let mut replies = std::collections::HashSet::new();
+        while replies.len() < count as usize {
+            let frame = wire::read_frame(reader).await.unwrap();
+            assert_ne!(
+                frame["method"], "session.ended",
+                "chat ended during burst: {frame}"
+            );
+            if let Some(id) = frame["id"]
+                .as_u64()
+                .filter(|id| (first..first + count).contains(id))
+            {
+                assert!(replies.insert(id), "duplicate reply for {id}");
+                // Bounded admission may refuse a request, but cannot lose it.
+                assert!(frame.get("result").is_some() || frame.get("error").is_some());
+            }
+        }
+    };
+    tokio::time::timeout(WAIT, async {
+        tokio::join!(sending, receiving);
+    })
+    .await
+    .expect("the burst lost a reply");
+    client.asked += count;
+    assert!(
+        client
+            .ask("session.settings", Some(&session), json!({}))
+            .await
+            .get("result")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn idle_exit_waits_for_clients_and_recovers_a_stale_address() {
+    let world = World::new();
+    let mut backend = Backend::start(
+        &world.home(),
+        &world.provider,
+        &[("MEDHA_SERVE_IDLE_SECONDS", "1")],
+    );
+    let mut client = backend.connect().await;
+    let hello = client.ask("hello", None, json!({})).await;
+    assert_eq!(hello["result"]["build"], wire::BUILD_ID);
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == "lifecycle")
+    );
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert!(
+        backend.child.try_wait().unwrap().is_none(),
+        "connected clients keep the backend alive"
+    );
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        if let Some(status) = backend.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "idle backend did not exit");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!backend.file("address").exists());
+    // A crash can leave both discovery files and a socket behind. Only the
+    // singleton holder clears/replaces them before publishing new discovery.
+    let next = Backend::start(&world.home(), &world.provider, &[]);
+    let mut next = next;
+    let _ = next.connect().await;
+    next.child.kill().unwrap();
+    next.child.wait().unwrap();
+    assert!(next.file("address").exists());
+    let replacement = Backend::start(&world.home(), &world.provider, &[]);
+    let mut client = replacement.connect().await;
+    assert!(
+        client
+            .ask("hello", None, json!({}))
+            .await
+            .get("result")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn upgrade_refuses_active_work_and_an_idle_upgrade_exits() {
+    let world = World::new();
+    let mut backend = Backend::start(&world.home(), &world.provider, &[]);
+    let mut client = backend.connect().await;
+    let session = client.open(&world.folder("upgrade")).await;
+    let reply = client
+        .ask(
+            "backend.prepare_upgrade",
+            None,
+            json!({"build": wire::BUILD_ID}),
+        )
+        .await;
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("active"),
+        "{reply}"
+    );
+    assert!(
+        client
+            .ask("session.settings", Some(&session), json!({}))
+            .await
+            .get("result")
+            .is_some()
+    );
+    client.ask("session.close", Some(&session), json!({})).await;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while !client.ask("session.list", None, json!({})).await["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let frame = json!({"id": 999, "method": "backend.prepare_upgrade", "params": {"build": wire::BUILD_ID}});
+    assert!(wire::write_frame(&mut client.writer, &frame).await);
+    let reply = tokio::time::timeout(Duration::from_secs(2), wire::read_frame(&mut client.reader))
+        .await
+        .unwrap();
+    if let Some(reply) = reply {
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while backend.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "upgrade failed to exit");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn cli_and_backend_cannot_own_the_same_chat_and_a_crash_releases_ownership() {
+    let world = World::new();
+    let folder = world.folder("lease");
+    let backend = Backend::start(&world.home(), &world.provider, &[]);
+    let mut client = backend.connect().await;
+    let session = client.open(&folder).await;
+    client.send(&session, "seed the lease history").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let refused = medha(&world.home(), &world.provider)
+        .args(["--acp", "--resume", &session])
+        .current_dir(&folder)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("already open"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    client.ask("session.close", Some(&session), json!({})).await;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while !client.ask("session.list", None, json!({})).await["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // The other direction uses the same direct runtime the TUI builds on.
+    let mut child = medha(&world.home(), &world.provider)
+        .args(["--acp", "--resume", &session])
+        .current_dir(&folder)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut own = OwnProcess {
+        input: child.stdin.take().unwrap(),
+        output: std::io::BufReader::new(child.stdout.take().unwrap()),
+        child,
+        asked: 0,
+    };
+    while own.frame()["method"] != "ready" {}
+    let refused = client.create(&folder, Some(&session)).await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already open"),
+        "{refused}"
+    );
+    own.child.kill().unwrap();
+    own.child.wait().unwrap();
+    let resumed = client.create(&folder, Some(&session)).await;
+    assert_eq!(resumed["result"]["session"], session, "{resumed}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_shutdown_waits_for_blocked_owned_work_and_keeps_the_singleton() {
+    use std::os::fd::AsRawFd;
+    let world = World::new();
+    let mut backend = Backend::start(
+        &world.home(),
+        &world.provider,
+        &[("TOKIO_WORKER_THREADS", "1")],
+    );
+    let mut client = backend.connect().await;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(world.home().join("credentials.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    std::fs::write(
+        world.home().join("config.toml"),
+        "[mcp.blocked]\nurl=\"http://127.0.0.1:9/mcp\"\ntrust=\"trusted\"\nauth=\"bearer\"\n",
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        client
+            .ask("hello", None, json!({}))
+            .await
+            .get("result")
+            .is_some()
+    );
+    unsafe {
+        libc::kill(backend.child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        backend.child.try_wait().unwrap().is_none(),
+        "the blocked watcher must remain accounted for"
+    );
+    let replacement = medha(&world.home(), &world.provider)
+        .arg("serve")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !replacement.status.success(),
+        "a replacement acquired ownership while the old work was still alive"
+    );
+    assert!(String::from_utf8_lossy(&replacement.stderr).contains("already running"));
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Some(status) = backend.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "MCP shutdown left the process alive past the hard drain bound"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(lock);
+}
+
 struct World {
     root: tempfile::TempDir,
     provider: Provider,
@@ -718,13 +999,23 @@ async fn a_backend_whose_home_is_too_deep_for_a_socket_is_still_reached() {
     let world = World::new();
     let home = world.root.path().join("d".repeat(120)).join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let backend = Backend::start(&home, &world.provider, &[]);
+    let temporary = world.root.path().join("t".repeat(120));
+    std::fs::create_dir_all(&temporary).unwrap();
+    let temporary = temporary.display().to_string();
+    let backend = Backend::start(&home, &world.provider, &[("TMPDIR", &temporary)]);
     let mut client = backend.connect().await;
     let hello = client.ask("hello", None, json!({})).await;
     assert_eq!(hello["result"]["protocol"], 1);
     let chat = client.open(&world.folder("w")).await;
     let settings = client.ask("session.settings", Some(&chat), json!({})).await;
     assert!(settings.get("result").is_some(), "{settings}");
+    let status = client.ask("backend.status", None, json!({})).await;
+    assert_eq!(status["result"]["chats"], 1);
+    assert_eq!(status["result"]["resources"]["folders"]["open"], 1);
+    assert_eq!(
+        status["result"]["resources"]["folder_requests"]["active_limit"],
+        8
+    );
 }
 
 /// What a client reads to find a backend must not outlive the backend it names.

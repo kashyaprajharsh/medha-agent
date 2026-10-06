@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     CallOutput, Catalog, Error, McpManager, McpToolSpec, Screen, ServerConfig, ServerState,
@@ -460,47 +461,106 @@ pub async fn serve<S>(manager: McpManager, stream: S, token: Arc<str>, resolve: 
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
+    let tasks = TaskTracker::new();
+    let stop = CancellationToken::new();
+    serve_tracked(
+        manager,
+        stream,
+        token,
+        resolve,
+        tasks.clone(),
+        stop.clone(),
+        Arc::new(tokio::sync::Semaphore::new(16)),
+    )
+    .await;
+    stop.cancel();
+    tasks.close();
+    tasks.wait().await;
+}
+
+async fn serve_tracked<S>(
+    manager: McpManager,
+    stream: S,
+    token: Arc<str>,
+    resolve: Resolve,
+    tasks: TaskTracker,
+    stop: CancellationToken,
+    admission: Arc<tokio::sync::Semaphore>,
+) where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
-    let Some(admitted) = wire::admit(&mut reader, &mut write, &token, ROLES).await else {
+    let Some(Some(admitted)) = stop
+        .run_until_cancelled(wire::admit(&mut reader, &mut write, &token, ROLES))
+        .await
+    else {
         return;
     };
     let writer: Arc<Mutex<Option<Writer>>> = Arc::new(Mutex::new(Some(Box::new(write))));
     let mut changes = manager.subscribe();
-    if !send(
-        &writer,
-        &json!({"id": admitted, "result": manager.snapshot().await}),
-    )
-    .await
+    if stop
+        .run_until_cancelled(send(
+            &writer,
+            &json!({"id": admitted, "result": manager.snapshot().await}),
+        ))
+        .await
+        != Some(true)
     {
         return;
     }
-    let pusher = tokio::spawn({
+    let pusher = tasks.spawn({
         let (manager, writer) = (manager.clone(), Arc::clone(&writer));
+        let stop = stop.clone();
         async move {
-            while changes.changed().await.is_ok() {
+            while matches!(
+                stop.run_until_cancelled(changes.changed()).await,
+                Some(Ok(()))
+            ) {
                 let frame = json!({"method": "state", "params": manager.snapshot().await});
-                if !send(&writer, &frame).await {
+                if stop.run_until_cancelled(send(&writer, &frame)).await != Some(true) {
                     return;
                 }
             }
         }
     });
-    while let Some(frame) = wire::read_frame(&mut reader).await {
+    while let Some(Some(frame)) = stop
+        .run_until_cancelled(wire::read_frame(&mut reader))
+        .await
+    {
         let Ok(request) = serde_json::from_value::<Request>(frame) else {
             continue;
         };
+        let permit = match Arc::clone(&admission).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let reply = json!({"id": request.id, "error": WireError::Other { message: "The MCP host is busy. Try again in a moment.".into() }});
+                if stop.run_until_cancelled(send(&writer, &reply)).await != Some(true) {
+                    break;
+                }
+                continue;
+            }
+        };
         let (manager, writer, resolve) =
             (manager.clone(), Arc::clone(&writer), Arc::clone(&resolve));
-        tokio::spawn(async move {
+        let stop = stop.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
             let id = request.id;
-            let frame = match handle(&manager, request, &writer, &resolve).await {
+            let Some(outcome) = stop
+                .run_until_cancelled(handle(&manager, request, &writer, &resolve))
+                .await
+            else {
+                return;
+            };
+            let frame = match outcome {
                 Ok(result) => json!({"id": id, "result": result}),
                 Err(error) => json!({"id": id, "error": error}),
             };
-            send(&writer, &frame).await;
+            stop.run_until_cancelled(send(&writer, &frame)).await;
         });
     }
+    stop.cancel();
     pusher.abort();
 }
 
@@ -543,19 +603,27 @@ async fn handle(
         }
         "authorize" => {
             let (sink, mut links) = mpsc::unbounded_channel::<String>();
-            let relay = tokio::spawn({
-                let (writer, server) = (Arc::clone(writer), server.clone());
-                async move {
-                    while let Some(url) = links.recv().await {
-                        let frame =
-                            json!({"method": "auth_url", "params": {"server": server, "url": url}});
-                        send(&writer, &frame).await;
+            let outcome = {
+                let authorizing = manager.authorize(&server, &sink);
+                tokio::pin!(authorizing);
+                loop {
+                    tokio::select! {
+                        outcome = &mut authorizing => break outcome,
+                        Some(url) = links.recv() => {
+                            let frame = json!({"method": "auth_url", "params": {"server": server, "url": url}});
+                            send(writer, &frame).await;
+                        }
                     }
                 }
-            });
-            let outcome = manager.authorize(&server, &sink).await;
+            };
             drop(sink);
-            let _ = relay.await;
+            while let Ok(url) = links.try_recv() {
+                send(
+                    writer,
+                    &json!({"method": "auth_url", "params": {"server": server, "url": url}}),
+                )
+                .await;
+            }
             Ok(status(outcome?))
         }
         _ => Err(WireError::Other {
@@ -571,15 +639,51 @@ pub async fn run_host(
     token: Arc<str>,
     resolve: Resolve,
 ) -> std::io::Result<()> {
-    wire::listen(address, move |stream| {
-        tokio::spawn(serve(
+    run_host_until(manager, address, token, resolve, std::future::pending()).await
+}
+
+/// Stops admission and joins every guest/request before returning. Blocking
+/// credential resolution remains tracked until it really finishes.
+pub async fn run_host_until(
+    manager: McpManager,
+    address: &str,
+    token: Arc<str>,
+    resolve: Resolve,
+    stopped: impl Future<Output = ()>,
+) -> std::io::Result<()> {
+    let tasks = TaskTracker::new();
+    let stop = CancellationToken::new();
+    let clients = tasks.clone();
+    let ending = stop.clone();
+    let admission = Arc::new(tokio::sync::Semaphore::new(16));
+    let guests = Arc::new(tokio::sync::Semaphore::new(128));
+    let serving = wire::listen(address, move |stream| {
+        let Ok(guest) = Arc::clone(&guests).try_acquire_owned() else {
+            return;
+        };
+        let child = ending.child_token();
+        let serving = serve_tracked(
             manager.clone(),
             stream,
             Arc::clone(&token),
             Arc::clone(&resolve),
-        ));
-    })
-    .await
+            clients.clone(),
+            child,
+            Arc::clone(&admission),
+        );
+        clients.spawn(async move {
+            let _guest = guest;
+            serving.await;
+        });
+    });
+    let result = tokio::select! {
+        result = serving => result,
+        () = stopped => Ok(()),
+    };
+    stop.cancel();
+    tasks.close();
+    tasks.wait().await;
+    result
 }
 
 #[cfg(test)]

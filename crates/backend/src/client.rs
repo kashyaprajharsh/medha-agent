@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::{KEPT_FRAMES, Session};
-use crate::{Backend, Chats, Failure, PROTOCOL, refused};
+use crate::{Backend, Chats, Failure, refused};
 
 /// Room for a full replay and then some; a client further behind than this is dropped.
 const QUEUE: usize = KEPT_FRAMES + 1024;
@@ -77,10 +77,10 @@ where
         async move {
             let writes = async {
                 while let Some(line) = queued.recv().await {
+                    let sent = writer.write_all(line.as_bytes()).await.is_ok()
+                        && writer.flush().await.is_ok();
                     waiting.fetch_sub(line.len(), Ordering::Relaxed);
-                    if writer.write_all(line.as_bytes()).await.is_err()
-                        || writer.flush().await.is_err()
-                    {
+                    if !sent {
                         break;
                     }
                 }
@@ -100,8 +100,15 @@ where
         attached: HashSet::new(),
         tied: Tied::default(),
     };
+    backend
+        .activity
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clients
+        .insert(me.id, Arc::clone(&me.waiting));
     loop {
         let frame = tokio::select! {
+            () = backend.stopping() => break,
             () = me.dropped.cancelled() => break,
             frame = wire::read_frame(&mut reader) => frame,
         };
@@ -123,6 +130,15 @@ struct Leaving<C: Chats> {
 
 impl<C: Chats> Drop for Leaving<C> {
     fn drop(&mut self) {
+        {
+            let mut activity = self
+                .backend
+                .activity
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            activity.clients.remove(&self.me.id);
+            activity.last_busy = std::time::Instant::now();
+        }
         for id in self.attached.drain() {
             if let Ok(session) = self.backend.find(&id) {
                 session.detach(self.me.id);
@@ -184,8 +200,16 @@ async fn handle<C: Chats>(
     // These can take long, so the client's other requests are not held behind them.
     let about_folder = named.is_none() && frame.get("folder").is_some();
     if method == "session.create" || about_folder {
+        let work = match backend.admit_work() {
+            Ok(work) => work,
+            Err(error) => {
+                me.reply(id, Err(error));
+                return;
+            }
+        };
         let (backend, me, tied) = (Arc::clone(backend), me.clone(), tied.clone());
         tokio::spawn(async move {
+            let _work = work;
             let outcome = match about_folder {
                 true => backend.chats.about_folder(&frame).await.map_err(refused),
                 false => backend.create(&frame["params"]).await,
@@ -209,8 +233,10 @@ async fn handle<C: Chats>(
     }
     // A request that names a chat is the chat's, whatever it is called, unless it is about attaching.
     let outcome = match method.as_str() {
-        "hello" if named.is_none() => {
-            Ok(json!({ "backend": backend.version, "protocol": PROTOCOL }))
+        "hello" if named.is_none() => Ok(backend.identity()),
+        "backend.status" if named.is_none() => Ok(backend.status()),
+        "backend.prepare_upgrade" if named.is_none() => {
+            backend.upgrade(frame["params"]["build"].as_str())
         }
         "session.list" if named.is_none() => Ok(backend.list()),
         "session.attach" => session("session.attach").map(|session| {
@@ -227,6 +253,17 @@ async fn handle<C: Chats>(
                 session.close();
                 Ok(json!({ "closing": true }))
             }
+            Ok(_) => Err(refused("attach to the session first")),
+            Err(error) => Err(error),
+        },
+        "cancel" | "interrupt" => match session("a request to a chat") {
+            Ok(session) if session.heard_by(me.id) && session.cancel_turn() => {
+                Ok(json!({"cancelled": true}))
+            }
+            Ok(session) if session.heard_by(me.id) => match session.forward(me, frame) {
+                Ok(()) => return,
+                Err(error) => Err(refused(error)),
+            },
             Ok(_) => Err(refused("attach to the session first")),
             Err(error) => Err(error),
         },

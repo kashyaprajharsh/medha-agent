@@ -686,3 +686,68 @@ fn closing_a_chat_never_reaches_a_later_chat_resumed_under_its_id() {
             .any(|frame| frame["method"] == "ended")
     );
 }
+#[test]
+fn controls_pass_a_full_outbox_and_exhausted_ordinary_reply_slots() {
+    let address = crate::backend::tests::address();
+    let asked = crate::backend::tests::scripted_backend(&address, "token", Duration::ZERO, 0);
+    let backend = Backend::joined_to(address.clone(), "token");
+    let sessions = LiveSessions::on(std::env::temp_dir(), backend.clone());
+    sessions.open_to(Arc::new(|_| {}), "control", None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !asked
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| frame["method"] == "session.attach")
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let connection = backend.connection().unwrap();
+    crate::backend::tests::exhaust_ordinary_replies(&connection);
+    let mut full = false;
+    for _ in 0..OUTBOX_FRAMES + 2 {
+        if sessions
+            .request("control", "session.settings", json!({}))
+            .is_err()
+        {
+            full = true;
+            break;
+        }
+    }
+    assert!(
+        full,
+        "ordinary outbox admission must stay bounded during retries"
+    );
+    let controls = [
+        "cancel",
+        "approval.respond",
+        "question.respond",
+        "agent.control",
+    ];
+    for method in controls {
+        sessions.request("control", method, json!({})).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !controls.iter().all(|method| {
+        asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame["method"] == *method)
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "a control could not pass ordinary congestion"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    crate::backend::tests::disconnect(&connection);
+    sessions.close("control").unwrap();
+    if let Some(folder) = std::path::Path::new(&address)
+        .parent()
+        .filter(|_| cfg!(unix))
+    {
+        let _ = std::fs::remove_dir_all(folder);
+    }
+}

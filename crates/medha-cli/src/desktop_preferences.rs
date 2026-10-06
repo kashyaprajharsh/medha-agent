@@ -237,7 +237,12 @@ fn one_writer<T>(target: &Path, write: impl FnOnce() -> Result<T>) -> Result<T> 
             .take(12)
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let locks = std::env::temp_dir().join("medha-locks");
+        // User-local application data is shared across MEDHA_HOME and TEMP
+        // choices. A temporary root is not a cross-process lock identity.
+        let locks = dirs::data_local_dir()
+            .ok_or_else(|| anyhow!("Could not find local application data for the save lock"))?
+            .join("Medha")
+            .join("instruction-locks");
         std::fs::create_dir_all(&locks)?;
         std::fs::OpenOptions::new()
             .create(true)

@@ -637,6 +637,6 @@ pub(crate) fn is_ulid(id: &str) -> bool {
 #[path = "live_tests.rs"]
 mod tests;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "live_sleep_tests.rs"]
 mod sleep_tests;

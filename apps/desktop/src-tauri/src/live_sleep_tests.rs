@@ -108,9 +108,16 @@ impl Chat {
 
     /// Asked to open, and returned before it has.
     fn start(key: &'static str, model: &str) -> Option<Self> {
-        let backend =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug/medha");
+        let name = if cfg!(windows) { "medha.exe" } else { "medha" };
+        let backend = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/debug")
+            .join(name);
         if !backend.is_file() {
+            // Where the checks are the gate, a missing program must not pass for a passing test.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "the backend was not built before the desktop tests ran"
+            );
             eprintln!("skipped: build medha first (cargo build -p medha-cli)");
             return None;
         }
@@ -445,7 +452,10 @@ fn a_window_that_cannot_keep_up_stops_following_the_chat_and_holds_only_so_much(
         held <= INBOX_FRAMES + 8,
         "the window held {held} of {said} frames"
     );
-    if let Some(folder) = std::path::Path::new(&address).parent() {
+    if let Some(folder) = std::path::Path::new(&address)
+        .parent()
+        .filter(|_| cfg!(unix))
+    {
         let _ = std::fs::remove_dir_all(folder);
     }
 }

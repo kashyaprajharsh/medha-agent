@@ -106,6 +106,9 @@ pub(crate) struct ServeChats {
 }
 
 const BUSY: &str = "Medha is busy with other requests. Try again in a moment.";
+/// How many folder requests are answered at once, and how many chats start at once.
+const ANSWERING: usize = 8;
+const STARTING: usize = 4;
 
 /// Work that may wait on a lock, the keychain or the disk runs on threads of
 /// its own, a few at a time, so it never takes the threads every chat and
@@ -136,6 +139,24 @@ impl Lane {
         self.waiting.fetch_sub(1, Ordering::Relaxed);
         admitted.map_err(|_| BUSY.to_string())
     }
+}
+
+/// Chats run on threads of their own. A chat reads keys, config and files as
+/// it works, and any of those may wait on a lock or the keychain; that wait
+/// must never take a thread a client is served on. There are more of these
+/// threads than chats that may be starting at once, so chats waiting to start
+/// do not hold up the chats that are running.
+fn chats() -> &'static tokio::runtime::Runtime {
+    static CHATS: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    CHATS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(cores.max(2 * STARTING))
+            .thread_name("medha-chat")
+            .enable_all()
+            .build()
+            .expect("threads for chats to run on")
+    })
 }
 
 /// Runs what may block away from the threads that serve everyone.
@@ -177,8 +198,8 @@ impl ServeChats {
             folders,
             mcp_host,
             mcp_changed,
-            requests: Lane::new(8, 64),
-            starts: Lane::new(4, 32),
+            requests: Lane::new(ANSWERING, 64),
+            starts: Lane::new(STARTING, 32),
         }
     }
 }
@@ -268,7 +289,7 @@ impl Chats for ServeChats {
 
         let (to_chat, chat_input) = tokio::io::duplex(64 * 1024);
         let (chat_output, from_chat) = tokio::io::duplex(256 * 1024);
-        let mut chat = tokio::spawn({
+        let mut chat = chats().spawn({
             let notices = Arc::clone(&notices);
             async move {
                 let model = runtime::model::resolve(&lock, &options, notices.as_ref()).await?;

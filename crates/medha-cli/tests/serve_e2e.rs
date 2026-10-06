@@ -241,10 +241,17 @@ struct Backend {
 }
 
 impl Backend {
+    /// A name given no value is taken out of the backend's environment.
     fn start(home: &Path, provider: &Provider, env: &[(&str, &str)]) -> Self {
-        let child = medha(home, provider)
+        let mut command = medha(home, provider);
+        for (name, value) in env {
+            match value.is_empty() {
+                true => command.env_remove(name),
+                false => command.env(name, value),
+            };
+        }
+        let child = command
             .arg("serve")
-            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -871,6 +878,66 @@ async fn a_chat_in_the_backend_answers_its_own_requests_as_one_in_its_own_proces
         let in_backend = outcome(&client.ask(method, Some(&chat), params.clone()).await);
         let in_process = outcome(&alone.ask(method, params));
         assert_eq!(in_backend, in_process, "{method}");
+    }
+}
+
+/// A chat reads its saved key as it starts, and that waits on the same lock.
+/// Chats starting together must not take the threads every client is served on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chats_waiting_on_a_held_lock_as_they_start_hold_up_nobody_else() {
+    let world = World::new();
+    let folder = world.folder("w");
+    let serving = [("TOKIO_WORKER_THREADS", "2"), ("MEDHA_API_KEY", "")];
+    let backend = world.backend_in(&serving);
+    let mut client = backend.connect().await;
+    let profile = json!({"protocol": "open-ai-chat", "base_url": world.provider.url,
+        "model": "test-model", "auth": "bearer", "max_ctx": 32768});
+    let save = json!({"method": "settings.model.save",
+        "params": {"name": "saved", "profile": profile, "default": true, "key": SECRET}});
+    client
+        .about(&folder, save)
+        .await
+        .expect("a model is saved with its key");
+    // The saved key is what a chat here runs on.
+    let chat = client.open(&folder).await;
+    client.send(&chat, "does the saved key work").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    world.provider.asked();
+    let mut other = backend.connect().await;
+
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(world.home().join("credentials.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let mut starting = Vec::new();
+    for id in 9201..9204 {
+        let create = json!({"id": id, "method": "session.create",
+            "params": {"folder": world.folder(&format!("w{id}"))}});
+        assert!(wire::write_frame(&mut client.writer, &create).await);
+        starting.push(id);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let hello = other.ask("hello", None, json!({})).await;
+    assert_eq!(hello["result"]["protocol"], 1);
+    let listed = other.ask("session.list", None, json!({})).await;
+    assert_eq!(
+        listed["result"]["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "a chat started without reading its key: {listed}"
+    );
+    let tasks = client.ask("tasks.list", Some(&chat), json!({})).await;
+    assert!(tasks.get("result").is_some(), "{tasks}");
+
+    held.unlock().unwrap();
+    while !starting.is_empty() {
+        let frame = client.next().await;
+        if let Some(id) = frame["id"].as_u64() {
+            assert!(frame["result"]["session"].is_string(), "{frame}");
+            starting.retain(|waited| *waited != id);
+        }
     }
 }
 

@@ -246,7 +246,8 @@ fn another_local_service_never_receives_the_page_credential() {
         .unwrap();
     let mut seen = Vec::new();
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(15) && seen.len() < 2 {
+    // As long as a render is given below: a busy machine can take most of that to open the page.
+    while started.elapsed() < Duration::from_secs(30) && seen.len() < 2 {
         if let Ok((mut stream, _)) = spy.accept() {
             stream.set_nonblocking(false).unwrap();
             stream

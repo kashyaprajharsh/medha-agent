@@ -106,9 +106,15 @@ pub(crate) struct ServeChats {
 }
 
 const BUSY: &str = "Medha is busy with other requests. Try again in a moment.";
-/// How many folder requests are answered at once, and how many chats start at once.
+/// How many folder requests are answered at once. Measured, the number changes
+/// nothing about how fast a burst is answered; it is how many may be stuck on
+/// a lock before the rest of them wait.
 const ANSWERING: usize = 8;
-const STARTING: usize = 4;
+/// How many chats start at once. Measured with 24 chats asked for together:
+/// they were all ready in the same 1.4s whether one, two or four started at a
+/// time, while the memory kept afterwards rose with it (128, 169, 250 MB).
+/// Two, so that one chat slow to start does not hold up every other.
+const STARTING: usize = 2;
 
 /// Work that may wait on a lock, the keychain or the disk runs on threads of
 /// its own, a few at a time, so it never takes the threads every chat and

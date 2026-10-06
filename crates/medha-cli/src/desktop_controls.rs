@@ -101,6 +101,7 @@ pub(crate) fn settings<P: Provider>(
 
 enum Change {
     Profile(String),
+    SavedProfile(String),
     Mode(kernel::AutonomyLevel),
     Reasoning(kernel::ReasoningConfig),
     Streaming(bool),
@@ -171,16 +172,25 @@ pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
     model: &mut String,
     active: &mut String,
     cfg: &Arc<Mutex<config::Config>>,
+    model_env: &config::ModelEnv,
     running: bool,
     agents: Option<&Arc<orchestrator::AgentControl>>,
 ) -> Option<Result<Value, String>> {
     if !matches!(
         method,
-        "session.settings" | "session.configure" | "agent.control" | "patch.list" | "patch.apply"
+        "session.settings"
+            | "session.configure"
+            | "session.profile.saved"
+            | "agent.control"
+            | "patch.list"
+            | "patch.apply"
     ) {
         return None;
     }
-    if matches!(method, "session.settings" | "session.configure") {
+    if matches!(
+        method,
+        "session.settings" | "session.configure" | "session.profile.saved"
+    ) {
         match config::load() {
             Ok(Some(saved)) => match cfg.lock() {
                 Ok(mut current) => *current = saved,
@@ -203,7 +213,7 @@ pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
                         &cfg,
                     ))
                 }
-                "session.configure" => {
+                "session.configure" | "session.profile.saved" => {
                     if running
                         || agents.is_some_and(|control| !control.active().is_empty())
                         || !kernel.executor.background_tasks().is_empty()
@@ -217,13 +227,30 @@ pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
                     } else {
                         kernel.provider.reasoning()
                     };
-                    match change(params, reasoning)? {
-                        Change::Profile(name) => {
+                    let requested = if method == "session.profile.saved" {
+                        let request: protocol::ActivateSavedProfile =
+                            serde_json::from_value(params.clone())
+                                .map_err(|_| "Invalid saved profile request")?;
+                        Change::SavedProfile(request.profile)
+                    } else {
+                        change(params, reasoning)?
+                    };
+                    let stored_key = matches!(&requested, Change::SavedProfile(_));
+                    match requested {
+                        Change::Profile(name) | Change::SavedProfile(name) => {
                             let resolved = {
                                 let cfg =
                                     cfg.lock().map_err(|_| "model configuration unavailable")?;
-                                config::resolve_model(&cfg, &name)
-                                    .map_err(|error| error.to_string())?
+                                config::resolve_model_as(
+                                    &cfg,
+                                    &name,
+                                    if stored_key {
+                                        None
+                                    } else {
+                                        model_env.api_key.as_deref()
+                                    },
+                                )
+                                .map_err(|error| error.to_string())?
                             };
                             kernel.provider.switch_profile(&resolved)?;
                             *model = resolved.provider.model;

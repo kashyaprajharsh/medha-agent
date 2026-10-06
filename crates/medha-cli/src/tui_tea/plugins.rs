@@ -8,8 +8,7 @@ use crossterm::event::KeyCode;
 use extensions::{Activation, ExtensionComponent, Grant, ListedPlugin, Scope, Store};
 use tokio::sync::mpsc::UnboundedSender;
 
-#[path = "plugins_commands.rs"]
-pub(super) mod commands;
+pub(super) use crate::application_commands as commands;
 #[path = "plugins_hooks.rs"]
 mod hooks;
 #[path = "plugins_jobs.rs"]

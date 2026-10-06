@@ -1,4 +1,4 @@
-//! Enabled plugin actions as `/` commands. Running one sends its prompt as the
+//! Enabled application actions as `/` commands. Running one sends its prompt as the
 //! user's message; the model never sees the list.
 
 use extensions::Store;
@@ -11,8 +11,8 @@ const ARGUMENTS: &str = "$ARGUMENTS";
 pub(crate) struct PluginCommand {
     pub(crate) name: String,
     pub(crate) description: String,
-    action_id: String,
-    prompt: String,
+    pub(crate) action_id: String,
+    pub(crate) prompt: String,
 }
 
 /// Keep short names when unique; qualify collisions with the full plugin id.

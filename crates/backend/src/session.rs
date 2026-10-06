@@ -84,6 +84,7 @@ async fn feed(
 
 #[derive(Default)]
 struct Stream {
+    conversation: Option<String>,
     seq: u64,
     kept: VecDeque<(u64, Arc<str>)>,
     kept_bytes: usize,
@@ -136,6 +137,7 @@ impl Session {
         let stream = self.stream();
         json!({
             "session": self.id,
+            "conversation": stream.conversation.as_deref().unwrap_or(&self.id),
             "stream": self.incarnation,
             "about": self.about,
             "head": stream.seq,
@@ -353,6 +355,11 @@ impl Session {
 
     fn publish(&self, frame: Value) {
         let mut stream = self.stream();
+        if frame["method"] == "session.rewound"
+            && let Some(conversation) = frame["params"]["session"].as_str()
+        {
+            stream.conversation = Some(conversation.to_owned());
+        }
         stream.seq += 1;
         let seq = stream.seq;
         let event = line(&json!({

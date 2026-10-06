@@ -30,8 +30,10 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
                 .find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok())
                 .unwrap_or(0);
             if request.len() >= end + 4 + length {
-                let line = headers.lines().next().unwrap_or_default().to_string();
-                return Some((line, request[end + 4..end + 4 + length].to_vec()));
+                return Some((
+                    headers.to_string(),
+                    request[end + 4..end + 4 + length].to_vec(),
+                ));
             }
         }
     }
@@ -81,7 +83,14 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
         let models = r#"{"data":[{"id":"test-model","context_length":128000}]}"#;
         return respond(&mut stream, "application/json", models);
     }
-    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let mut body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    // Test-only request evidence; never part of the model response or Medha's
+    // event log. All credentials used by this server are dummy values.
+    body["_test_authorization"] = json!(
+        line.lines()
+            .find_map(|header| header.strip_prefix("authorization:"))
+            .map(str::trim)
+    );
     let asked = last_user(&body);
     let ran = body["messages"]
         .as_array()
@@ -810,6 +819,176 @@ async fn mcp_shutdown_waits_for_blocked_owned_work_and_keeps_the_singleton() {
 struct World {
     root: tempfile::TempDir,
     provider: Provider,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_application_resources_preserve_credentials_and_reject_stale_grants() {
+    use protocol::{ChangeResource, ReadResource, ResourceResult};
+    let world = World::new();
+    let folder = world.folder("typed-features");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let change = ChangeResource::SaveModel(protocol::ModelDraft {
+        name: Some("saved".into()),
+        protocol: protocol::ModelProtocol::OpenAiChat,
+        base_url: world.provider.url.clone(),
+        model: "test-model".into(),
+        context_limit: Some(128000),
+        key: Some(protocol::Secret("sk-zz-saved".into())),
+    });
+    let reply = client
+        .about(
+            &folder,
+            json!({"method":"application.resources.change", "params":change}),
+        )
+        .await
+        .unwrap();
+    let saved: ResourceResult = serde_json::from_value(reply).unwrap();
+    assert!(
+        matches!(saved, ResourceResult::ModelSaved { catalogue, .. } if catalogue.profiles.iter().any(|profile| profile.name == "saved" && profile.key_present && profile.requires_key))
+    );
+
+    let startup = protocol::StartupOptions {
+        model: Some("saved".into()),
+        model_env: protocol::ModelOverrides {
+            api_key: Some("sk-zz-client".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let made = client
+        .ask(
+            "session.create",
+            None,
+            json!({"folder":folder,"startup":startup}),
+        )
+        .await;
+    let chat = made["result"]["session"]
+        .as_str()
+        .expect("chat starts")
+        .to_owned();
+    client
+        .ask("session.attach", Some(&chat), json!({"after":0}))
+        .await;
+    let bootstrap = client
+        .ask(
+            "session.inspect",
+            Some(&chat),
+            json!(protocol::SessionRead::Bootstrap),
+        )
+        .await;
+    let decoded: protocol::SessionResult =
+        serde_json::from_value(bootstrap["result"].clone()).unwrap();
+    assert!(
+        matches!(decoded, protocol::SessionResult::Bootstrap(protocol::Bootstrap { tools, .. }) if tools.iter().any(|tool| tool.name == "shell.exec" && !tool.icon.is_empty()))
+    );
+
+    // Switching a saved profile keeps this caller's override, even though the
+    // daemon was started with a different dummy API key.
+    let switched = client
+        .ask(
+            "session.configure",
+            Some(&chat),
+            json!(protocol::Configure::Profile("saved".into())),
+        )
+        .await;
+    assert!(switched.get("result").is_some(), "{switched}");
+    client.send(&chat, "caller key").await;
+    let request = world.provider.seen.recv_timeout(WAIT).unwrap();
+    assert_eq!(request["_test_authorization"], "bearer sk-zz-client");
+    client.until(|frame| kind(frame, "turn.done")).await;
+
+    let activated = client
+        .ask(
+            "session.profile.saved",
+            Some(&chat),
+            json!(protocol::ActivateSavedProfile {
+                profile: "saved".into()
+            }),
+        )
+        .await;
+    assert!(activated.get("result").is_some(), "{activated}");
+    client.send(&chat, "saved key").await;
+    let request = world.provider.seen.recv_timeout(WAIT).unwrap();
+    assert_eq!(request["_test_authorization"], "bearer sk-zz-saved");
+    client.until(|frame| kind(frame, "turn.done")).await;
+
+    // A local source is resolved in the caller's folder, not the daemon CWD.
+    let package = folder.join("package");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("plugin.toml"), "schema_version = 1\nid = \"dev.medha.typed\"\nname = \"Typed\"\nversion = \"0.1.0\"\nmedha = \">=0.1.0, <0.2.0\"\n[[components]]\nkind = \"action\"\nid = \"review\"\ntitle = \"Review\"\ndescription = \"Review\"\nprompt = \"Review $ARGUMENTS\"\n").unwrap();
+    let installed = client.about(&folder, json!({"method":"application.resources.change", "params":ChangeResource::InstallPlugin { source: "./package".into() }})).await.unwrap();
+    assert!(
+        matches!(serde_json::from_value::<ResourceResult>(installed).unwrap(), ResourceResult::PluginInstalled { id } if id == "dev.medha.typed")
+    );
+    let listed = client
+        .ask(
+            "session.resources",
+            Some(&chat),
+            json!(protocol::ChatResource(ReadResource::Plugins)),
+        )
+        .await;
+    let ResourceResult::Plugins(list) = serde_json::from_value(listed["result"].clone()).unwrap()
+    else {
+        panic!("{listed}")
+    };
+    let plugin = list
+        .plugins
+        .iter()
+        .find(|plugin| plugin.id == "dev.medha.typed")
+        .unwrap();
+    let enable = |hash: String| ChangeResource::EnablePlugin {
+        id: plugin.id.clone(),
+        scope: plugin.scope,
+        hash,
+        grant: plugin.grant.clone().unwrap(),
+    };
+    assert!(
+        client
+            .about(
+                &folder,
+                json!({"method":"application.resources.change", "params":enable("stale".into())})
+            )
+            .await
+            .is_err()
+    );
+    client
+        .about(
+            &folder,
+            json!({"method":"application.resources.change", "params":enable(plugin.hash.clone())}),
+        )
+        .await
+        .unwrap();
+    client
+        .ask("extensions.reload", Some(&chat), json!({}))
+        .await;
+    let expanded = client
+        .ask(
+            "application.command.expand",
+            Some(&chat),
+            json!(protocol::ExpandCommand {
+                typed: "/review changes".into()
+            }),
+        )
+        .await;
+    let expanded: protocol::ExpandedCommand =
+        serde_json::from_value(expanded["result"].clone()).unwrap();
+    assert_eq!(expanded.prompt, "Review changes");
+    client.about(&folder, json!({"method":"application.resources.change", "params":ChangeResource::DisablePlugin { id: plugin.id.clone(), scope: plugin.scope }})).await.unwrap();
+    client
+        .ask("extensions.reload", Some(&chat), json!({}))
+        .await;
+    let refused = client
+        .ask(
+            "application.command.expand",
+            Some(&chat),
+            json!({"typed":"/review changes"}),
+        )
+        .await;
+    assert!(refused.get("error").is_some());
+    for key in [SECRET, "sk-zz-client", "sk-zz-saved"] {
+        assert!(!client.heard.contains(key), "credential reached a viewer");
+    }
 }
 
 impl World {

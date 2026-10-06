@@ -182,7 +182,7 @@ fn settings(cfg: &config::Config) -> Value {
     let mcp: Vec<Value> = cfg.mcp.iter().map(|(id, server)| { use sha2::{Digest, Sha256}; let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(server).expect("MCP definition"))); json!({ "id": id, "hash": hash, "url": server.url, "command": redact_command(&server.command), "executable": server.command.first(), "disabled": server.disabled, "auth": server.auth, "trust": server.trust, "key_present": config::mcp_key_present(id, server), "signed_in": config::mcp_signed_in(id, server), "env_names": server.env.keys().collect::<Vec<_>>(), "allow_tools": server.allow_tools, "deny_tools": server.deny_tools, "network": server.network, "parallel": server.parallel_calls }) }).collect();
     let provider = cfg.search_provider();
     // Keep protocol availability and wire values identical to the TUI picker.
-    let protocols: Vec<Value> = crate::tui_tea::MODEL_PROTOCOLS
+    let protocols: Vec<Value> = crate::application_catalog::MODEL_PROTOCOLS
         .iter()
         .map(|(label, available, protocol)| {
             let auth = providers::AuthKind::for_protocol(*protocol).as_str();

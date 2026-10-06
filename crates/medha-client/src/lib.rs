@@ -350,8 +350,7 @@ impl Connection {
     /// Cancellation and deadlines release the pending slot; a late chat start
     /// is retired using the same ownership rule as a blocking request.
     pub async fn request(&self, frame: Value) -> Result<Value, String> {
-        let method = frame["method"].as_str().unwrap_or_default();
-        let within = if method == "session.create" || wire::slow_request(method) {
+        let within = if wire::slow_frame(&frame) {
             EVENTUALLY
         } else {
             SOON
@@ -389,12 +388,13 @@ impl Connection {
         scope: protocol::Scope<'_>,
         params: &T,
     ) -> Result<T::Output, String> {
-        let within = if wire::slow_request(T::METHOD) {
+        let frame = Self::frame(scope, params)?;
+        let within = if wire::slow_frame(&frame) {
             EVENTUALLY
         } else {
             SOON
         };
-        self.decoded::<T>(self.ask(Self::frame(scope, params)?, within)?)
+        self.decoded::<T>(self.ask(frame, within)?)
     }
 
     pub async fn call_async<T: protocol::Command>(
@@ -413,7 +413,7 @@ impl Connection {
         params: &T,
     ) -> Result<T::Output, String> {
         let frame = Self::frame(protocol::Scope::Chat(chat.id()), params)?;
-        let within = if wire::slow_request(T::METHOD) {
+        let within = if wire::slow_frame(&frame) {
             EVENTUALLY
         } else {
             SOON
@@ -495,7 +495,7 @@ impl Connection {
 
     /// One question about a folder: its history, settings or extensions.
     pub fn about(&self, folder: &Path, mut request: Value) -> Result<Value, String> {
-        let waited = if wire::slow_request(request["method"].as_str().unwrap_or_default()) {
+        let waited = if wire::slow_frame(&request) {
             EVENTUALLY
         } else {
             SOON

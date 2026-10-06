@@ -29,6 +29,12 @@ pub(crate) fn size(value: &impl Serialize) -> usize {
     count.0
 }
 
+pub(crate) fn history(messages: &[kernel::Message]) -> (Vec<Item>, u64) {
+    let mut presentation = Presentation::default();
+    presentation.seed_history(messages);
+    (presentation.rows.snapshot(), presentation.rows.omitted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +428,11 @@ impl Presentation {
         }
         self.conversation = conversation;
         self.settings = Some(settings);
+        self.seed_history(messages);
+        self.revision += 1;
+    }
+
+    fn seed_history(&mut self, messages: &[kernel::Message]) {
         self.rows = Rows::default();
         self.metrics.context_pressure = None;
         let mut tools = BTreeMap::new();
@@ -478,7 +489,6 @@ impl Presentation {
                 _ => {}
             }
         }
-        self.revision += 1;
     }
 
     fn event(&mut self, event: TurnEvent) {

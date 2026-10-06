@@ -92,3 +92,41 @@ fn old_settings_preserve_unknown_image_capabilities() {
     assert!(settings.image_support.is_none());
     assert_eq!(settings.reasoning_support, ReasoningSupport::Unverified);
 }
+
+#[test]
+fn resource_commands_refuse_invented_actions_and_redact_secret_debugging() {
+    for wrong in [
+        json!({"action":"execute","data":{"shell":"touch bad"}}),
+        json!({"action":"remove_model","data":{"name":"x","extra":true}}),
+        json!({"action":"search","data":{"provider":"wrong","key":"secret","url":null}}),
+    ] {
+        assert!(serde_json::from_value::<ChangeResource>(wrong).is_err());
+    }
+    assert!(
+        serde_json::from_value::<SessionRead>(json!({"query":"lsp","args":{"op":"execute"}}))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<McpCommand>(
+            json!({"operation":"credential", "data":{"id":"x","key":"k","header":"made-up"}})
+        )
+        .is_err()
+    );
+    let secret = McpCommand::Add {
+        definition: Secret("server https://example.test --key sk-private".into()),
+    };
+    assert!(!format!("{secret:?}").contains("sk-private"));
+    let key = ChangeResource::UpdateModelKey {
+        name: "saved".into(),
+        key: Secret("sk-private".into()),
+    };
+    assert!(!format!("{key:?}").contains("sk-private"));
+    assert!(Call::new(Scope::Service, &ReadResource::Models).is_err());
+    assert!(
+        Call::new(
+            Scope::Folder(Path::new(".")),
+            &ChatResource(ReadResource::Skills)
+        )
+        .is_err()
+    );
+}

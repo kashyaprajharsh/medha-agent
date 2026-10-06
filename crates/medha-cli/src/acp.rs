@@ -2049,6 +2049,7 @@ where
                 &mut model,
                 &mut active_profile,
                 &model_config,
+                &extensions.model_env,
                 false,
                 agents.as_ref(),
             )
@@ -2178,7 +2179,9 @@ where
                         } else if let Some(id) = request.get("id") { writer.presentation(id.clone()); }
                         continue;
                     }
-                    let result = if method == "question.respond" {
+                    let result = if let Some(result) = crate::application_session::handle(&kernel, &session, &mut transcript, &extensions, method, params.clone(), running, &writer, agents.as_ref()).await {
+                        Some(result)
+                    } else if method == "question.respond" {
                         Some(crate::acp_questions::respond(&questions, &params))
                     } else if method == "session.rewind.points" {
                         Some(crate::desktop_rewind::points(&kernel, &session, extensions.workspace.root()).await)
@@ -2215,19 +2218,19 @@ where
                         asleep = !running && agents.as_ref().is_none_or(|control| control.active().is_empty() && control.cached_unmerged() == 0) && kernel.executor.background_tasks().is_empty();
                         if asleep {
                             let resumable = !kernel.log.events(session.id).await.is_empty();
-                            let settings = crate::desktop_controls::handle("session.settings", &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, running, agents.as_ref()).await.and_then(Result::ok);
+                            let settings = crate::desktop_controls::handle("session.settings", &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, &extensions.model_env, running, agents.as_ref()).await.and_then(Result::ok);
                             Some(Ok(json!({ "slept": true, "session": resumable.then(|| session.id.to_string()), "settings": settings })))
                         } else {
                             Some(Ok(json!({ "slept": false })))
                         }
                     } else {
-                        crate::desktop_controls::handle(method, &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, running, agents.as_ref()).await
+                        crate::desktop_controls::handle(method, &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, &extensions.model_env, running, agents.as_ref()).await
                     };
                     if let Some(result) = result {
                         let id = request.get("id").cloned();
                         match result {
                             Ok(value) => {
-                                if matches!(method, "session.settings" | "session.configure") { writer.notify("settings", value.clone()); }
+                                if matches!(method, "session.settings" | "session.configure" | "session.profile.saved") { writer.notify("settings", value.clone()); }
                                 if method == "session.rewind" {
                                     if value["code_only"] != true { writer.reset_presentation(kernel.provider.as_ref(), &session, &transcript, &active_profile, &model, &model_config); }
                                     writer.notify("session.rewound", json!({ "session": value["session"], "code_only": value["code_only"] })); roster = agents.clone().map(crate::acp_agents::Roster::new);

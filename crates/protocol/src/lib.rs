@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 
 mod presentation;
 pub use presentation::*;
+mod resources;
+pub use resources::*;
+mod session_features;
+pub use session_features::*;
 
 pub trait Command: Serialize + DeserializeOwned {
     const METHOD: &'static str;
@@ -270,6 +274,8 @@ pub struct ChatAbout {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSession {
     pub session: String,
+    #[serde(default)]
+    pub conversation: Option<String>,
     #[serde(default)]
     pub stream: Option<String>,
     #[serde(default)]

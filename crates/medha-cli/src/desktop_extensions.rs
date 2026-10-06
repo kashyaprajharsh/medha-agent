@@ -8,6 +8,10 @@ pub(crate) struct Runtime {
     pub skills: Arc<tools::SkillStore>,
     pub search: tools::SearchHandle,
     pub search_env: runtime::config::SearchEnv,
+    pub model_env: runtime::config::ModelEnv,
+    pub flag_model: Option<String>,
+    pub flag_base_url: Option<String>,
+    pub ui: lockfile::UiConfig,
     pub workspace: Arc<sandbox::WorkspaceSandbox>,
     pub memory: Option<Arc<memory::MemoryProjection>>,
     pub memory_budget: u32,
@@ -20,7 +24,7 @@ impl Runtime {
         let specs = kernel.executor.specs();
         let known = specs.iter().map(|spec| spec.name.clone()).collect();
         let mut result = self.skills.list(&known);
-        result["tools"] = json!(specs.iter().map(|spec| json!({"name": spec.name, "description": spec.description, "category": spec.category, "radius": spec.blast_radius})).collect::<Vec<_>>());
+        result["tools"] = json!(specs.iter().map(|spec| json!({"name": spec.name, "description": spec.description, "icon": spec.icon, "category": spec.category, "radius": spec.blast_radius})).collect::<Vec<_>>());
         result["plugins"] = crate::desktop_preferences::plugins(&self.store)
             .unwrap_or_else(|error| json!({"notices": [error.to_string()]}));
         result["mcp"] = if let Some(manager) = &self.mcp {

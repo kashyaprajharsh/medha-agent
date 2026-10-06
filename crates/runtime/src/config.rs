@@ -1119,6 +1119,28 @@ pub fn pulse(
     let medha_env = scan_prefixed(&["MEDHA_"]);
     let ignored_env = scan_prefixed(IGNORED_ENV_PREFIXES);
 
+    pulse_with(
+        cfg,
+        flag_base_url,
+        flag_model,
+        project,
+        &ModelEnv::from_process(),
+        medha_env,
+        ignored_env,
+    )
+}
+
+/// Diagnostics for an explicitly captured caller. Secret values are never
+/// rendered; environment names are supplied by that caller, not the daemon.
+pub fn pulse_with(
+    cfg: Option<&Config>,
+    flag_base_url: Option<String>,
+    flag_model: Option<String>,
+    project: Option<&std::path::Path>,
+    model_env: &ModelEnv,
+    medha_env: Vec<String>,
+    ignored_env: Vec<String>,
+) -> Pulse {
     let (project_lock, lock_executor) = match project.map(|folder| folder.join("medha.lock")) {
         Some(p) if p.exists() => {
             let executor = lockfile::MedhaLock::load(&p)
@@ -1130,14 +1152,8 @@ pub fn pulse(
         _ => (None, None),
     };
 
-    let resolved = resolve_inner(
-        cfg,
-        flag_base_url,
-        flag_model,
-        &ModelEnv::from_process(),
-        false,
-    )
-    .map_err(|e| e.to_string());
+    let resolved =
+        resolve_inner(cfg, flag_base_url, flag_model, model_env, false).map_err(|e| e.to_string());
     let checks = diagnose_checks(cfg, &resolved, &ignored_env);
 
     Pulse {

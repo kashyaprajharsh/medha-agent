@@ -20,6 +20,9 @@ pub const CAPABILITIES: &[&str] = &[
     "terminal-controls",
     "presentation-snapshot",
     "turn-intent",
+    "application-resources",
+    "session-inspection",
+    "live-conversation",
 ];
 pub const CLIENT_CAPABILITIES: &[&str] = &[
     "lifecycle",
@@ -45,7 +48,28 @@ pub fn slow_request(method: &str) -> bool {
             | "mcp.signin"
             | "mcp.connect"
             | "connectors.connect"
+            | "application.resources.change"
+            | "application.models.discover"
+            | "application.command.expand"
     )
+}
+
+/// Parametrized application commands retain the deadline of the work they
+/// perform rather than granting every status read a ten-minute wait.
+pub fn slow_frame(frame: &serde_json::Value) -> bool {
+    match frame["method"].as_str().unwrap_or_default() {
+        "application.resources" | "session.resources" => matches!(
+            frame["params"]["resource"].as_str(),
+            Some("skill_search" | "skill_updates")
+        ),
+        "session.mcp" => !matches!(
+            frame["params"]["operation"].as_str(),
+            Some("list" | "connectors" | "expose" | "disable" | "remove")
+        ),
+        "session.change" => frame["params"]["action"] == "apply_patch",
+        "agent.control" => frame["params"]["action"] == "followup",
+        method => slow_request(method),
+    }
 }
 /// Small controls get bounded reserved admission at every dispatch layer.
 pub const CONTROL_FRAME_BYTES: usize = 64 * 1024;

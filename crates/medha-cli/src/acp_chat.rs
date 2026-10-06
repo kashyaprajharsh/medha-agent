@@ -23,6 +23,9 @@ where
 {
     let (lock, notices) = (start.lock, start.notices);
     let search_env = start.options.search_env.clone();
+    let model_env = start.options.model_env.clone();
+    let flag_model = start.options.model.clone();
+    let flag_base_url = start.options.base_url.clone();
     let mut bridge = None;
     let Started {
         kernel,
@@ -40,6 +43,7 @@ where
         memory_store,
         k3_budget_tokens,
         stale_after_days,
+        ui_config,
         search_handle,
         lsp_manager,
         mcp_manager,
@@ -95,6 +99,10 @@ where
             skills: skill_store.clone(),
             search: search_handle.clone(),
             search_env,
+            model_env,
+            flag_model,
+            flag_base_url,
+            ui: ui_config,
             workspace: workspace.clone(),
             memory: lock.memory.enabled.then(|| memory_store.clone()),
             memory_budget: k3_budget_tokens,

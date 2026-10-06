@@ -213,6 +213,14 @@ pub(crate) async fn answer(
 }
 
 async fn handle(log: &store::SqliteLog, workspace: &std::path::Path, req: Request) -> Response {
+    if let Some(result) =
+        crate::application_resources::folder(log, workspace, &req.method, req.params.clone()).await
+    {
+        return match result {
+            Ok(value) => Response::ok(req.id, value),
+            Err(error) => Response::error(req.id, error),
+        };
+    }
     if req.method == "extensions.connectors" {
         return match super::config::load() {
             Ok(cfg) => {

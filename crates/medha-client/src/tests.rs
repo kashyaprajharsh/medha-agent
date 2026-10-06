@@ -1,5 +1,7 @@
 use super::test_support::*;
 use super::*;
+use std::future::{Future, poll_fn};
+use std::task::Poll;
 
 fn joined(address: &str) -> Arc<Connection> {
     let joining = join(address.to_owned(), "token".into(), false);
@@ -212,4 +214,136 @@ fn a_wait_on_a_quiet_backend_gives_up_and_a_chat_that_starts_late_is_told_to_sto
         std::thread::sleep(Duration::from_millis(20));
     }
     forget(&address);
+}
+
+async fn wait_for_close(asked: &Mutex<Vec<Value>>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let methods: Vec<String> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame["session"] == "late")
+            .filter_map(|frame| frame["method"].as_str().map(str::to_owned))
+            .collect();
+        if methods.iter().any(|method| method == "session.close") {
+            assert_eq!(methods, ["session.attach", "session.close"]);
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an abandoned chat was left running"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn async_peer(late: Duration) -> (String, Arc<Mutex<Vec<Value>>>, Arc<Connection>) {
+    tokio::task::spawn_blocking(move || {
+        let address = address();
+        let asked = scripted_backend(&address, "token", late, 0);
+        let connection = joined(&address);
+        (address, asked, connection)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cancelling_an_async_start_frees_its_slot_and_retires_the_late_chat() {
+    let (address, asked, connection) = async_peer(Duration::from_millis(100)).await;
+    let mut request = Box::pin(connection.request(json!({"method": "session.create"})));
+    poll_fn(|cx| {
+        assert!(request.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(connection.routes().replies.len(), 1);
+    drop(request);
+    assert!(connection.routes().replies.is_empty());
+    wait_for_close(&asked).await;
+    connection.lost();
+    forget(&address);
+}
+
+#[tokio::test]
+async fn cancelling_after_a_start_reply_arrives_still_retires_the_chat() {
+    let (address, asked, connection) = async_peer(Duration::from_millis(50)).await;
+    let mut request = Box::pin(connection.request(json!({"method": "session.create"})));
+    poll_fn(|cx| {
+        assert!(request.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    // Leave the request unpolled while the reader delivers the reply to its
+    // oneshot. Cancellation must handle this ownership-transfer boundary too.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !connection.routes().replies.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(request);
+    wait_for_close(&asked).await;
+    connection.lost();
+    forget(&address);
+}
+
+#[tokio::test]
+async fn an_async_deadline_frees_the_slot_and_retires_a_late_start() {
+    let (address, asked, connection) = async_peer(Duration::from_millis(100)).await;
+    let outcome = connection
+        .ask_async(
+            json!({"method": "session.create"}),
+            Duration::from_millis(10),
+        )
+        .await;
+    assert_eq!(outcome, Err(QUIET.to_owned()));
+    assert!(connection.routes().replies.is_empty());
+    wait_for_close(&asked).await;
+    connection.lost();
+    forget(&address);
+}
+
+#[tokio::test]
+async fn cancelled_async_reads_do_not_exhaust_the_request_limit() {
+    let (address, _, connection) = async_peer(Duration::ZERO).await;
+    for _ in 0..UNANSWERED + 1 {
+        let mut request = Box::pin(connection.request(json!({"method": "session.list"})));
+        poll_fn(|cx| {
+            assert!(request.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(request);
+    }
+    assert!(connection.routes().replies.is_empty());
+    assert!(connection.routes().late.is_empty());
+    let outcome = connection
+        .request(json!({"method": "session.create"}))
+        .await;
+    assert_eq!(outcome.unwrap()["session"], "late");
+    connection.lost();
+    forget(&address);
+}
+
+#[tokio::test]
+async fn a_closed_writer_releases_the_bytes_and_reply_slot_before_returning() {
+    let (lines, queued) = tokio::sync::mpsc::unbounded_channel();
+    let (controls, urgent) = tokio::sync::mpsc::unbounded_channel();
+    drop((queued, urgent));
+    let connection = Connection {
+        lines,
+        controls,
+        unsent: Arc::default(),
+        routes: Mutex::default(),
+        stop: tokio::sync::watch::channel(false).0,
+    };
+    for method in ["session.create", "session.close"] {
+        let outcome = connection.request(json!({"method": method})).await;
+        assert_eq!(outcome, Err(STOPPED.to_owned()));
+        assert_eq!(connection.unsent.load(Ordering::Relaxed), 0);
+        assert!(connection.routes().replies.is_empty());
+    }
 }

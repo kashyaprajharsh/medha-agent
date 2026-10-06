@@ -57,7 +57,14 @@ pub struct Chat {
 }
 
 enum Reply {
-    Wait(mpsc::SyncSender<Result<Value, String>>),
+    Wait {
+        answer: mpsc::SyncSender<Result<Value, String>>,
+        starts: bool,
+    },
+    Async {
+        answer: tokio::sync::oneshot::Sender<Result<Value, String>>,
+        starts: bool,
+    },
     /// A chat's own request: the answer joins its frames under the id it used.
     Chat {
         session: String,
@@ -141,6 +148,36 @@ pub struct Connection {
     stop: tokio::sync::watch::Sender<bool>,
 }
 
+/// Dropping an async request releases its slot without leaving a native thread
+/// waiting. Closing the receiver first covers a reply racing that drop.
+struct Pending<'a> {
+    connection: &'a Connection,
+    id: u64,
+    starts: bool,
+    answer: tokio::sync::oneshot::Receiver<Result<Value, String>>,
+    completed: bool,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.answer.close();
+        let arrived = self.answer.try_recv().ok();
+        let mut routes = self.connection.routes();
+        if routes.replies.remove(&self.id).is_some() && self.starts {
+            routes.gave_up(self.id);
+        }
+        drop(routes);
+        if self.starts
+            && let Some(Ok(made)) = arrived
+        {
+            self.connection.close_late(&made);
+        }
+    }
+}
+
 fn outcome(mut frame: Value) -> Result<Value, String> {
     match frame["error"]["message"].as_str() {
         Some(error) => Err(error.to_owned()),
@@ -187,12 +224,15 @@ impl Connection {
             routes.next = id;
             routes.replies.insert(id, reply);
         }
-        self.unsent.fetch_add(line.len(), Ordering::Relaxed);
+        let length = line.len();
+        self.unsent.fetch_add(length, Ordering::Relaxed);
         let sender = if stops { &self.controls } else { &self.lines };
-        sender
-            .send(line)
-            .map(|()| routes.next)
-            .map_err(|_| STOPPED.to_string())
+        if sender.send(line).is_err() {
+            self.unsent.fetch_sub(length, Ordering::Relaxed);
+            routes.replies.remove(&id);
+            return Err(STOPPED.into());
+        }
+        Ok(routes.next)
     }
 
     /// Whether a frame of this size would be taken now, without making it to find out.
@@ -213,7 +253,11 @@ impl Connection {
     fn ask(&self, frame: Value, within: Duration) -> Result<Value, String> {
         let (answer, answered) = mpsc::sync_channel(1);
         let starts = frame["method"] == "session.create";
-        let id = self.post(&mut self.routes(), frame, Some(Reply::Wait(answer)))?;
+        let id = self.post(
+            &mut self.routes(),
+            frame,
+            Some(Reply::Wait { answer, starts }),
+        )?;
         match answered.recv_timeout(within) {
             Ok(outcome) => outcome,
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(STOPPED.into()),
@@ -227,6 +271,44 @@ impl Connection {
                 answered.try_recv().unwrap_or_else(|_| Err(QUIET.into()))
             }
         }
+    }
+
+    async fn ask_async(&self, frame: Value, within: Duration) -> Result<Value, String> {
+        let starts = frame["method"] == "session.create";
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let id = self.post(
+            &mut self.routes(),
+            frame,
+            Some(Reply::Async { answer, starts }),
+        )?;
+        let mut pending = Pending {
+            connection: self,
+            id,
+            starts,
+            answer: answered,
+            completed: false,
+        };
+        match tokio::time::timeout(within, &mut pending.answer).await {
+            Ok(Ok(outcome)) => {
+                pending.completed = true;
+                outcome
+            }
+            Ok(Err(_)) => Err(STOPPED.into()),
+            Err(_) => Err(QUIET.into()),
+        }
+    }
+
+    /// An async frontend never blocks its event loop while a reply is pending.
+    /// Cancellation and deadlines release the pending slot; a late chat start
+    /// is retired using the same ownership rule as a blocking request.
+    pub async fn request(&self, frame: Value) -> Result<Value, String> {
+        let method = frame["method"].as_str().unwrap_or_default();
+        let within = if method == "session.create" || wire::slow_request(method) {
+            EVENTUALLY
+        } else {
+            SOON
+        };
+        self.ask_async(frame, within).await
     }
 
     /// One question about a folder: its history, settings or extensions.
@@ -382,14 +464,35 @@ impl Connection {
         };
         let (reply, late) = {
             let mut routes = self.routes();
-            (
-                routes.replies.remove(&id),
-                routes.late.remove(&id).is_some(),
-            )
+            let reply = routes.replies.remove(&id);
+            let late = routes.late.remove(&id).is_some();
+            match reply {
+                Some(Reply::Wait { answer, starts }) => {
+                    // There is exactly one send to this capacity-one channel,
+                    // so it cannot wait for room. Publish under the same lock
+                    // as timeout cleanup: a timed-out caller must either find
+                    // its reply or leave a late-start marker, without a gap
+                    // between removing the route and delivering the result.
+                    let abandoned = answer.send(outcome(frame));
+                    drop(routes);
+                    if let Err(mpsc::SendError(Ok(made))) = abandoned
+                        && starts
+                    {
+                        self.close_late(&made);
+                    }
+                    return;
+                }
+                reply => (reply, late),
+            }
         };
         match reply {
-            Some(Reply::Wait(answer)) => {
-                let _ = answer.send(outcome(frame));
+            Some(Reply::Wait { .. }) => unreachable!("blocking replies are published above"),
+            Some(Reply::Async { answer, starts }) => {
+                if let Err(Ok(made)) = answer.send(outcome(frame))
+                    && starts
+                {
+                    self.close_late(&made);
+                }
             }
             Some(Reply::Chat {
                 session,
@@ -405,18 +508,22 @@ impl Connection {
             }
             // A chat that started after its wait was given up has nobody; it is told to stop.
             None if late => {
-                if let Some(session) = frame["result"]["session"].as_str() {
-                    let mut routes = self.routes();
-                    for method in ["session.attach", "session.close"] {
-                        let _ = self.post(
-                            &mut routes,
-                            json!({ "method": method, "session": session }),
-                            None,
-                        );
-                    }
-                }
+                self.close_late(&frame["result"]);
             }
             None => {}
+        }
+    }
+
+    fn close_late(&self, made: &Value) {
+        if let Some(session) = made["session"].as_str() {
+            let mut routes = self.routes();
+            for method in ["session.attach", "session.close"] {
+                let _ = self.post(
+                    &mut routes,
+                    json!({ "method": method, "session": session }),
+                    None,
+                );
+            }
         }
     }
 

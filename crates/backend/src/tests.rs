@@ -58,6 +58,19 @@ async fn chat(input: DuplexStream, mut output: DuplexStream) -> Result<(), Strin
                 assert!(answer.to_string().len() < wire::MAX_FRAME);
                 say(&mut output, answer).await;
             }
+            Some("session.presentation") => {
+                say(&mut output, json!({"method": "event", "params": {"kind": "model.text", "delta": "covered"}})).await;
+                say(
+                    &mut output,
+                    json!({"id": id, "result": {"items": ["covered"]}}),
+                )
+                .await;
+                say(
+                    &mut output,
+                    json!({"method": "event", "params": {"kind": "model.text", "delta": "later"}}),
+                )
+                .await;
+            }
             Some("break") => return Err("it broke".into()),
             Some("panic") => panic!("the chat panicked"),
             _ => {}
@@ -380,6 +393,24 @@ async fn replay_cursors_identify_the_incarnation_even_when_the_heads_match() {
     assert_eq!(replay["result"]["gap"], false);
     assert_eq!(replay["result"]["replayed"], 1);
     assert_eq!(returning.event().await.1["params"]["text"], "new");
+}
+
+#[tokio::test]
+async fn a_presentation_snapshot_covers_only_preceding_output_in_the_same_incarnation() {
+    let backend = backend();
+    let mut viewer = connect(&backend);
+    let id = viewer.open().await;
+    let snapshot = viewer
+        .ask("session.presentation", Some(&id), json!({}))
+        .await;
+    let covered = viewer.event().await;
+    let later = viewer.event().await;
+    assert_eq!(covered.1["params"]["delta"], "covered");
+    assert_eq!(later.1["params"]["delta"], "later");
+    assert_eq!(snapshot["result"]["cursor"]["after"], covered.0);
+    assert!(later.0 > covered.0);
+    let summary = backend.find(&id).unwrap().summary();
+    assert_eq!(snapshot["result"]["cursor"]["stream"], summary["stream"]);
 }
 
 #[tokio::test]

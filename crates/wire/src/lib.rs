@@ -18,6 +18,8 @@ pub const CAPABILITIES: &[&str] = &[
     "safe-abandon",
     "replay-stream",
     "terminal-controls",
+    "presentation-snapshot",
+    "turn-intent",
 ];
 pub const CLIENT_CAPABILITIES: &[&str] = &[
     "lifecycle",

@@ -39,9 +39,18 @@ pub struct Writer {
     cancelled: CancellationToken,
     progress: Arc<Notify>,
     failure: Arc<Mutex<Option<&'static str>>>,
+    presentation: Mutex<crate::chat_presentation::Presentation>,
+    presentation_enabled: AtomicBool,
 }
 
 impl Writer {
+    pub(crate) fn enable_presentation(&self) {
+        self.presentation_enabled.store(true, Ordering::Release);
+    }
+
+    fn presents(&self) -> bool {
+        self.presentation_enabled.load(Ordering::Acquire)
+    }
     fn fail(&self, reason: &'static str) {
         let mut failure = self
             .failure
@@ -142,7 +151,36 @@ impl Writer {
             method,
             params,
         }) {
-            Ok(frame) => self.enqueue(frame),
+            Ok(frame) => {
+                if !self.presents() {
+                    return self.enqueue(frame);
+                }
+                // Projection mutation and enqueue share an ordering barrier.
+                // A snapshot cannot include text whose notification is still
+                // waiting to be enqueued behind the snapshot's own reply.
+                let mut presentation = self
+                    .presentation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if matches!(
+                    method,
+                    "event"
+                        | "settings"
+                        | "approval"
+                        | "approval.resolved"
+                        | "question"
+                        | "question.answered"
+                        | "agent.step"
+                ) {
+                    let mut value: Value =
+                        serde_json::from_slice(&frame).expect("just serialized notification");
+                    if let Err(reason) = presentation.observe(method, value["params"].take()) {
+                        self.fail(reason);
+                        return false;
+                    }
+                }
+                self.enqueue(frame)
+            }
             Err(_) => {
                 self.fail("Could not encode the chat's output.");
                 false
@@ -163,6 +201,57 @@ impl Writer {
 
     fn respond(&self, id: Value, result: Value) -> bool {
         self.write_value(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    }
+
+    fn seed_presentation(&self, session: &Session, transcript: &[Message], settings: Value) {
+        if !self.presents() {
+            return;
+        }
+        let Ok(settings) = serde_json::from_value(settings) else {
+            return;
+        };
+        let mut presentation = self
+            .presentation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        presentation.seed(session.id.to_string(), transcript, settings);
+        let revision = presentation.revision();
+        // This reset is part of the same output order as the new baseline.
+        self.write_value(&json!({"jsonrpc": "2.0", "method": "event", "params": {"kind": "presentation.reset", "revision": revision}}));
+    }
+
+    fn presentation(&self, id: Value) {
+        let presentation = self
+            .presentation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.respond(
+            id,
+            serde_json::to_value(presentation.snapshot())
+                .expect("presentation snapshot serializes"),
+        );
+    }
+
+    fn reset_presentation<P: kernel::Provider>(
+        &self,
+        provider: &P,
+        session: &Session,
+        transcript: &[Message],
+        active: &str,
+        model: &str,
+        profiles: &Arc<Mutex<crate::config::Config>>,
+    ) {
+        if !self.presents() {
+            return;
+        }
+        let cfg = profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.seed_presentation(
+            session,
+            transcript,
+            crate::desktop_controls::settings(provider, session, active, model, &cfg),
+        );
     }
 
     fn error(&self, id: Value, code: i32, message: impl Into<String>) -> bool {
@@ -491,6 +580,51 @@ fn settle_unread(unread: &Unread, text: &str) {
     }
 }
 
+fn admit_steer(unread: &Unread, handle: Option<&kernel::InterruptHandle>, content: &str) -> bool {
+    let mut unread = unread
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if unread.len() >= 128
+        || crate::chat_presentation::size(&content)
+            > (2 * 1024 * 1024usize)
+                .saturating_sub(unread.iter().map(crate::chat_presentation::size).sum())
+    {
+        return false;
+    }
+    // The sink may run immediately after send. Hold the ledger lock across
+    // admission so it cannot settle text before the accepted copy is recorded.
+    unread.push(content.to_owned());
+    if handle.is_some_and(|handle| handle.steer(content)) {
+        true
+    } else {
+        unread.pop();
+        false
+    }
+}
+
+fn validate_send_intent(
+    params: &Value,
+    running: bool,
+    turn: u64,
+    cancelling: bool,
+) -> Result<(), &'static str> {
+    let Some(intent) = params.get("intent") else {
+        return Ok(());
+    };
+    match serde_json::from_value::<protocol::SendIntent>(intent.clone()) {
+        Ok(protocol::SendIntent::Start) if !running => Ok(()),
+        Ok(protocol::SendIntent::Steer { turn: target })
+            if running && !cancelling && target == turn =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(
+            "The turn changed or is stopping. Your message was not accepted; keep it and send again deliberately.",
+        ),
+        Err(_) => Err("A valid message intent is required."),
+    }
+}
+
 pub(crate) struct Bridge {
     pub(crate) writer: Arc<Writer>,
     pub(crate) pending: Pending,
@@ -640,6 +774,8 @@ where
             cancelled: cancelled.clone(),
             progress,
             failure,
+            presentation: Mutex::default(),
+            presentation_enabled: AtomicBool::new(false),
         }),
         pending: Arc::new(Mutex::new(HashMap::new())),
         peer: Peer::for_workspace(workspace),
@@ -1251,21 +1387,13 @@ enum RpcAction {
         reply_to: Option<Value>,
         admission_reply_to: Option<Value>,
     },
-    /// A desktop message for the running turn, already acknowledged.
-    Steer(String),
+    /// Admission is acknowledged only after the owned queue accepts it.
+    Steer {
+        content: String,
+        reply_to: Option<Value>,
+        acp: bool,
+    },
     Shutdown,
-}
-
-impl RpcAction {
-    #[cfg(test)]
-    fn turn(content: String) -> Self {
-        Self::StartTurn {
-            content,
-            images: Vec::new(),
-            reply_to: None,
-            admission_reply_to: None,
-        }
-    }
 }
 
 fn desktop_images(value: Option<&Value>) -> Result<Vec<AcpImage>, String> {
@@ -1573,6 +1701,15 @@ fn dispatch_rpc(
         // A peer that names a protocolVersion is an ACP client; everything else
         // is a caller of Medha's original bridge, which keeps working unchanged.
         "initialize" if params.get("protocolVersion").is_some() => {
+            if writer.presents() {
+                rpc_error(
+                    writer,
+                    &id,
+                    -32602,
+                    "ACP initialization belongs to the editor bridge; backend chats use the application protocol.",
+                );
+                return RpcAction::None;
+            }
             peer.select_acp();
             rpc_result(
                 writer,
@@ -1649,9 +1786,12 @@ fn dispatch_rpc(
                         -32000,
                         "images cannot be added to a turn that is already running",
                     );
-                } else if let Some(handle) = interrupt {
-                    handle.steer(prompt.text);
-                    rpc_result(writer, &id, json!({ "stopReason": "end_turn" }));
+                } else if interrupt.is_some() {
+                    return RpcAction::Steer {
+                        content: prompt.text,
+                        reply_to: id,
+                        acp: true,
+                    };
                 } else {
                     rpc_error(writer, &id, -32000, "a turn is already running");
                 }
@@ -1718,21 +1858,17 @@ fn dispatch_rpc(
                     rpc_error(writer, &id, -32000, "a turn is already running");
                     return RpcAction::None;
                 }
-                writer.event("message.queued", json!({}));
-                rpc_result(writer, &id, json!({ "accepted": true, "steered": true }));
-                RpcAction::Steer(content)
+                RpcAction::Steer {
+                    content,
+                    reply_to: id,
+                    acp: false,
+                }
             } else {
-                let admission_reply_to = if images.is_empty() {
-                    rpc_result(writer, &id, json!({ "accepted": true, "steered": false }));
-                    None
-                } else {
-                    id
-                };
                 RpcAction::StartTurn {
                     content,
                     images,
                     reply_to: None,
-                    admission_reply_to,
+                    admission_reply_to: id,
                 }
             }
         }
@@ -1939,6 +2075,14 @@ where
     }
 
     let mut transcript = crate::session_transcript(system, resumed);
+    writer.reset_presentation(
+        kernel.provider.as_ref(),
+        &session,
+        &transcript,
+        &active_profile,
+        &model,
+        &model_config,
+    );
     // Frame reads are capped: `lines()` would buffer a single unterminated
     // "line" without bound, so a runaway peer could grow memory indefinitely.
     let mut stdin = tokio::io::AsyncReadExt::take(BufReader::new(input), MAX_FRAME);
@@ -1951,6 +2095,7 @@ where
     let mut reports_ready = true; // Also collect reports retained across restart.
     let mut turn_requested = false;
     let mut asleep = false;
+    let mut turn_number = 0u64;
     loop {
         if !running && (turn_requested || reports_ready) {
             reports_ready = false;
@@ -1970,6 +2115,10 @@ where
             if turn_requested || !taken.is_empty() {
                 turn_requested = false;
                 running = true;
+                turn_number += 1;
+                if writer.presents() {
+                    writer.turn_event(protocol::TurnEvent::Started { turn: turn_number });
+                }
                 let (handle, queue) = kernel::InterruptQueue::pair();
                 if let Some(control) = &agents {
                     control.attend(handle.clone());
@@ -2017,6 +2166,18 @@ where
                     && !peer.is_acp()
                 {
                     let params = request.get("params").cloned().unwrap_or(Value::Null);
+                    if method == "message.send" && let Err(error) = validate_send_intent(&params, running, turn_number, interrupt.as_ref().is_some_and(|handle| handle.cancel_requested())) {
+                        rpc_error(&writer, &request.get("id").cloned(), -32002, error);
+                        continue;
+                    }
+                    if method == "session.presentation" {
+                        if !writer.presents() {
+                            rpc_error(&writer, &request.get("id").cloned(), -32601, "Presentation recovery is available on the application backend.");
+                        } else if serde_json::from_value::<protocol::GetPresentation>(params).is_err() {
+                            rpc_error(&writer, &request.get("id").cloned(), -32602, "Invalid presentation request.");
+                        } else if let Some(id) = request.get("id") { writer.presentation(id.clone()); }
+                        continue;
+                    }
                     let result = if method == "question.respond" {
                         Some(crate::acp_questions::respond(&questions, &params))
                     } else if method == "session.rewind.points" {
@@ -2067,7 +2228,10 @@ where
                         match result {
                             Ok(value) => {
                                 if matches!(method, "session.settings" | "session.configure") { writer.notify("settings", value.clone()); }
-                                if method == "session.rewind" { writer.notify("session.rewound", json!({ "session": value["session"], "code_only": value["code_only"] })); roster = agents.clone().map(crate::acp_agents::Roster::new); }
+                                if method == "session.rewind" {
+                                    if value["code_only"] != true { writer.reset_presentation(kernel.provider.as_ref(), &session, &transcript, &active_profile, &model, &model_config); }
+                                    writer.notify("session.rewound", json!({ "session": value["session"], "code_only": value["code_only"] })); roster = agents.clone().map(crate::acp_agents::Roster::new);
+                                }
                                 rpc_result(&writer, &id, value);
                             }
                             Err(error) => rpc_error(&writer, &id, -32001, error),
@@ -2084,12 +2248,13 @@ where
                 match dispatch_line(trimmed, &model, running, interrupt.as_ref(), &pending, &writer, &peer) {
                     RpcAction::None => {}
                     RpcAction::Shutdown => break,
-                    RpcAction::Steer(content) => {
-                        // Ledger first: the kernel may read the steer immediately.
-                        unread.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(content.clone());
-                        if let Some(handle) = &interrupt {
-                            handle.steer(content);
+                    RpcAction::Steer { content, reply_to, acp } => {
+                        if !admit_steer(&unread, interrupt.as_ref(), &content) {
+                            rpc_error(&writer, &reply_to, -32002, "The turn ended, is stopping, or its message queue is full. Your message was not accepted.");
+                            continue;
                         }
+                        if !acp { writer.turn_event(protocol::TurnEvent::Queued { content: Some(content) }); }
+                        rpc_result(&writer, &reply_to, if acp { json!({"stopReason": "end_turn"}) } else { json!({"accepted": true, "steered": true, "turn": turn_number}) });
                     }
                     RpcAction::StartTurn { content, images, reply_to, admission_reply_to } => {
                         prompt_reply = reply_to;
@@ -2108,9 +2273,10 @@ where
                                 continue;
                             }
                         }
-                        if let Some(id) = admission_reply_to { rpc_result(&writer, &Some(id), json!({ "accepted": true, "steered": false })); }
                         transcript.push(prompt);
+                        if writer.presents() { writer.turn_event(protocol::TurnEvent::User { content: transcript.last().expect("accepted prompt").content.clone() }); }
                         turn_requested = true;
+                        if let Some(id) = admission_reply_to { rpc_result(&writer, &Some(id), json!({ "accepted": true, "steered": false, "turn": turn_number.saturating_add(1) })); }
                     }
                 }
             }
@@ -2135,7 +2301,7 @@ where
                 };
                 if force_aborted {
                     let (message, history) = crate::failed_turn_history(kernel.log.as_ref(), &session, &transcript, "force-stopped".into()).await;
-                    if let Some(history) = history { transcript = history; }
+                    if let Some(history) = history { transcript = history; writer.reset_presentation(kernel.provider.as_ref(), &session, &transcript, &active_profile, &model, &model_config); }
                     if message != "force-stopped" { writer.event("notice", json!({"text": message})); }
                     if let Some(id) = reply { writer.respond(id, json!({"stopReason": "cancelled"})); }
                     else { writer.event("turn.cancelled", json!({})); }
@@ -2160,7 +2326,7 @@ where
                     }
                     Some(Ok(TurnDone::Err(e))) => {
                         let (e, history) = crate::failed_turn_history(kernel.log.as_ref(), &session, &transcript, e).await;
-                        if let Some(history) = history { transcript = history; }
+                        if let Some(history) = history { transcript = history; writer.reset_presentation(kernel.provider.as_ref(), &session, &transcript, &active_profile, &model, &model_config); }
                         match reply {
                             Some(id) => { writer.error(id, -32000, e); }
                             None => { writer.event("turn.error", json!({ "message": e })); }
@@ -2169,7 +2335,7 @@ where
                     Some(Err(error)) => {
                         let message = format!("turn task failed: {error}");
                         let (message, history) = crate::failed_turn_history(kernel.log.as_ref(), &session, &transcript, message).await;
-                        if let Some(history) = history { transcript = history; }
+                        if let Some(history) = history { transcript = history; writer.reset_presentation(kernel.provider.as_ref(), &session, &transcript, &active_profile, &model, &model_config); }
                         match reply {
                             Some(id) => { writer.error(id, -32000, message); }
                             None => { writer.event("turn.error", json!({ "message": message })); }
@@ -2247,6 +2413,8 @@ mod tests {
                 cancelled: CancellationToken::new(),
                 progress: Arc::new(Notify::new()),
                 failure: Arc::new(Mutex::new(None)),
+                presentation: Mutex::default(),
+                presentation_enabled: AtomicBool::new(false),
             }),
             rx,
         )
@@ -2959,17 +3127,26 @@ mod tests {
             None,
             &empty_pending(),
         );
-        assert_eq!(action, RpcAction::turn("hello".into()));
-        assert_exactly_one_response(&values, json!(3));
+        assert!(
+            matches!(action, RpcAction::StartTurn { admission_reply_to: Some(id), .. } if id == json!(3))
+        );
+        assert!(
+            values.is_empty(),
+            "admission must wait until the prompt is retained"
+        );
 
         let (steer, _queue) = kernel::InterruptQueue::pair();
-        let (_, values) = request(
+        let (action, values) = request(
             json!({"jsonrpc": "2.0", "id": 4, "method": "message.send", "params": {"content": "change course"}}),
             true,
             Some(&steer),
             &empty_pending(),
         );
-        assert_exactly_one_response(&values, json!(4));
+        assert!(matches!(action, RpcAction::Steer { reply_to: Some(id), .. } if id == json!(4)));
+        assert!(
+            values.is_empty(),
+            "admission must wait for the owned interrupt queue"
+        );
 
         let pending = empty_pending();
         let (approval_tx, mut approval_rx) = oneshot::channel();
@@ -3016,6 +3193,33 @@ mod tests {
             assert_eq!(approval_rx.try_recv(), Ok(Approval::Deny));
             assert_exactly_one_response(&values, json!(id));
         }
+    }
+
+    #[test]
+    fn steer_admission_never_acknowledges_a_closed_or_full_queue() {
+        let unread = Unread::default();
+        let (handle, mut queue) = kernel::InterruptQueue::pair();
+        for _ in 0..128 {
+            assert!(admit_steer(&unread, Some(&handle), "same"));
+        }
+        assert!(!admit_steer(&unread, Some(&handle), "refused"));
+        assert_eq!(take_unread(&unread).len(), 128);
+        assert_eq!(queue.drain_steers().len(), 128);
+        drop(queue);
+        assert!(!admit_steer(&unread, Some(&handle), "after end"));
+        assert!(take_unread(&unread).is_empty());
+    }
+
+    #[test]
+    fn a_delayed_steer_cannot_start_a_new_turn_or_cross_a_cancel_boundary() {
+        let intent = json!({"intent": {"kind": "steer", "turn": 7}});
+        assert!(validate_send_intent(&intent, true, 7, false).is_ok());
+        assert!(validate_send_intent(&intent, false, 7, false).is_err());
+        assert!(validate_send_intent(&intent, true, 8, false).is_err());
+        assert!(validate_send_intent(&intent, true, 7, true).is_err());
+        assert!(
+            validate_send_intent(&json!({"intent": {"kind": "start"}}), true, 7, false).is_err()
+        );
     }
 
     #[test]

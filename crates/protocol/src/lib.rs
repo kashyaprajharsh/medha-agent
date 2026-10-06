@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+mod presentation;
+pub use presentation::*;
+
 pub trait Command: Serialize + DeserializeOwned {
     const METHOD: &'static str;
     const SCOPE: ScopeKind;
@@ -380,13 +383,25 @@ pub struct SendMessage {
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<Image>,
+    /// Explicit intent prevents a delayed steer from starting another turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<SendIntent>,
 }
 command!(SendMessage, "message.send", Chat, MessageAccepted);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SendIntent {
+    Start,
+    Steer { turn: u64 },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageAccepted {
     pub accepted: bool,
     pub steered: bool,
+    #[serde(default)]
+    pub turn: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,6 +551,12 @@ pub enum CountQuality {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum TurnEvent {
+    #[serde(rename = "turn.started")]
+    Started { turn: u64 },
+    #[serde(rename = "presentation.reset")]
+    PresentationReset { revision: u64 },
+    #[serde(rename = "message.accepted")]
+    User { content: String },
     #[serde(rename = "model.waiting")]
     Waiting,
     #[serde(rename = "notice")]
@@ -602,7 +623,10 @@ pub enum TurnEvent {
         summary: Option<String>,
     },
     #[serde(rename = "message.queued")]
-    Queued,
+    Queued {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
     #[serde(rename = "message.steered")]
     Steered { content: String },
     #[serde(rename = "message.returned")]

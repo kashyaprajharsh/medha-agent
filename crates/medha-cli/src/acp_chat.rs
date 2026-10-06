@@ -51,6 +51,7 @@ where
     } = runtime::session::start(start, |cwd, _| {
         let mut made = acp::bridge_to(output, cwd.to_path_buf());
         if let Some(control) = control {
+            made.writer.enable_presentation();
             made.control = control;
         }
         let surface = runtime::Surface {

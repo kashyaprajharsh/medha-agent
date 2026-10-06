@@ -6,6 +6,7 @@ mod acp_agents;
 mod acp_chat;
 mod acp_questions;
 mod attachments;
+mod chat_presentation;
 mod connectors;
 mod desktop_changes;
 mod desktop_controls;

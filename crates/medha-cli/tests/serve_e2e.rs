@@ -432,6 +432,96 @@ fn kind(frame: &Value, wanted: &str) -> bool {
     frame["params"]["kind"] == wanted
 }
 
+#[tokio::test]
+async fn a_live_snapshot_covers_its_events_and_a_delayed_steer_never_becomes_a_new_turn() {
+    let world = World::new();
+    let backend = Backend::start(&world.home(), &world.provider, &[]);
+    let mut client = backend.connect().await;
+    let session = client.open(&world.folder("presentation")).await;
+    let admitted = client
+        .ask(
+            "message.send",
+            Some(&session),
+            json!({"content": "HOLD snapshot", "intent": {"kind": "start"}}),
+        )
+        .await;
+    assert_eq!(admitted["result"]["turn"], 1);
+    assert!(world.provider.asked().contains("HOLD snapshot"));
+    let first = client
+        .ask("session.presentation", Some(&session), json!({}))
+        .await;
+    let snapshot: protocol::PresentationSnapshot =
+        serde_json::from_value(first["result"].clone()).unwrap();
+    assert!(snapshot.running);
+    assert_eq!(snapshot.turn, 1);
+    assert_eq!(snapshot.conversation, session);
+    assert_eq!(snapshot.items.iter().filter(|item| matches!(item, protocol::PresentationItem::User { text } if text == "HOLD snapshot")).count(), 1);
+    let cursor = snapshot.cursor.unwrap();
+    assert!(cursor.after > 0);
+
+    let mut viewer = backend.connect().await;
+    let attached = viewer
+        .ask(
+            "session.attach",
+            Some(&session),
+            json!({"stream": cursor.stream, "after": cursor.after}),
+        )
+        .await;
+    assert_eq!(attached["result"]["gap"], false);
+    assert_eq!(attached["result"]["replayed"], 0);
+    let dialect = viewer
+        .ask("initialize", Some(&session), json!({"protocolVersion": 1}))
+        .await;
+    assert!(dialect.get("error").is_some());
+    let stale = viewer
+        .ask(
+            "message.send",
+            Some(&session),
+            json!({"content": "stale", "intent": {"kind": "steer", "turn": 0}}),
+        )
+        .await;
+    assert!(stale.get("error").is_some());
+    let queued = viewer
+        .ask(
+            "message.send",
+            Some(&session),
+            json!({"content": "keep this text", "intent": {"kind": "steer", "turn": 1}}),
+        )
+        .await;
+    assert_eq!(queued["result"]["steered"], true);
+    let waiting = viewer
+        .ask("session.presentation", Some(&session), json!({}))
+        .await;
+    assert_eq!(
+        waiting["result"]["pending_steers"],
+        json!(["keep this text"])
+    );
+    viewer.ask("cancel", Some(&session), json!({})).await;
+    client.until(|frame| kind(frame, "message.returned")).await;
+    client.until(|frame| kind(frame, "turn.cancelled")).await;
+    let late = viewer
+        .ask(
+            "message.send",
+            Some(&session),
+            json!({"content": "never auto restart", "intent": {"kind": "steer", "turn": 1}}),
+        )
+        .await;
+    assert!(late.get("error").is_some());
+    assert!(
+        world
+            .provider
+            .seen
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    let settled = viewer
+        .ask("session.presentation", Some(&session), json!({}))
+        .await;
+    assert_eq!(settled["result"]["running"], false);
+    assert_eq!(settled["result"]["pending_steers"], json!([]));
+    world.provider.release.send(()).unwrap();
+}
+
 /// A healthy reader must not lose its chat merely because requests arrive
 /// faster than synchronous notifications can be written to the chat pipe.
 #[tokio::test]
@@ -857,7 +947,7 @@ async fn a_message_sent_mid_turn_is_steered_whichever_client_sends_it() {
     let steered = second.send(&chat, "and this, from the other window").await;
     assert_eq!(
         steered["result"],
-        json!({"accepted": true, "steered": true})
+        json!({"accepted": true, "steered": true, "turn": 1})
     );
     let image = json!({"content": "look", "images": [{"path": "/nowhere.png"}]});
     let refused = second.ask("message.send", Some(&chat), image).await;

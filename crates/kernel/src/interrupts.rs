@@ -12,9 +12,10 @@
 //! Steers that never reached a boundary when a cancel lands are handed back to
 //! the surface via `StreamSink::steers_returned` — typed text must not vanish.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// What a surface can ask of a running session.
@@ -34,38 +35,60 @@ pub enum Interrupt {
 /// that took from it would be stealing the loop's input.
 pub type Activity = watch::Receiver<u64>;
 
+const MAX_STEERS: usize = 128;
+const MAX_STEER_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Default)]
+struct Pending {
+    steers: VecDeque<(String, crate::types::TrustLabel)>,
+    bytes: usize,
+    closed: bool,
+}
+
 /// Cloneable sender held by the surface (TUI / ACP / gateway later).
 #[derive(Clone)]
 pub struct InterruptHandle {
-    tx: mpsc::UnboundedSender<Interrupt>,
+    pending: Arc<Mutex<Pending>>,
     cancel: CancellationToken,
     activity: Arc<watch::Sender<u64>>,
 }
 
 impl InterruptHandle {
-    pub fn steer(&self, text: impl Into<String>) {
-        let _ = self.steer_labelled(text, crate::types::TrustLabel::User);
+    pub fn steer(&self, text: impl Into<String>) -> bool {
+        self.steer_labelled(text, crate::types::TrustLabel::User)
     }
 
     /// Queue text that did not come from the operator, carrying its label so a
     /// consequential action derived from it escalates the same way a direct
     /// observation would.
     pub fn steer_labelled(&self, text: impl Into<String>, trust: crate::types::TrustLabel) -> bool {
-        if self.tx.send(Interrupt::Steer(text.into(), trust)).is_err() {
+        let text = text.into();
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.closed
+            || self.cancel.is_cancelled()
+            || pending.steers.len() >= MAX_STEERS
+            || text.len() > MAX_STEER_BYTES.saturating_sub(pending.bytes)
+        {
             return false;
         }
+        pending.bytes += text.len();
+        pending.steers.push_back((text, trust));
         // After the send, never before: a watcher woken by the count must find
         // the text already queued behind it.
-        self.activity.send_modify(|count| *count += 1);
+        self.activity
+            .send_modify(|count| *count = count.saturating_add(1));
         true
     }
 
     /// Request a graceful stop. Also trips the cancellation token so the
     /// kernel's in-flight waits (stream, tool dispatch) wake immediately.
     pub fn cancel_turn(&self) {
-        let _ = self.tx.send(Interrupt::CancelTurn);
         self.cancel.cancel();
-        self.activity.send_modify(|count| *count += 1);
+        self.activity
+            .send_modify(|count| *count = count.saturating_add(1));
     }
 
     /// Watch for anything queued against this session.
@@ -76,11 +99,15 @@ impl InterruptHandle {
     pub fn activity(&self) -> Activity {
         self.activity.subscribe()
     }
+
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
 }
 
 /// Kernel-side receiver; one per `run_session` call.
 pub struct InterruptQueue {
-    rx: mpsc::UnboundedReceiver<Interrupt>,
+    pending: Arc<Mutex<Pending>>,
     cancel: CancellationToken,
     activity: Arc<watch::Sender<u64>>,
 }
@@ -96,16 +123,16 @@ impl InterruptQueue {
     /// say. Tripping it then routes through the loop's own settle path, so the
     /// run ends by returning rather than by having its future dropped.
     pub fn rooted(cancel: CancellationToken) -> (InterruptHandle, InterruptQueue) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(Pending::default()));
         let activity = Arc::new(watch::Sender::new(0));
         (
             InterruptHandle {
-                tx,
+                pending: Arc::clone(&pending),
                 cancel: cancel.clone(),
                 activity: Arc::clone(&activity),
             },
             InterruptQueue {
-                rx,
+                pending,
                 cancel,
                 activity,
             },
@@ -132,13 +159,24 @@ impl InterruptQueue {
     /// Take every queued steer message, in send order. `CancelTurn` entries
     /// carry no payload (the token is the signal) and are simply consumed.
     pub fn drain_steers(&mut self) -> Vec<(String, crate::types::TrustLabel)> {
-        let mut out = Vec::new();
-        while let Ok(i) = self.rx.try_recv() {
-            if let Interrupt::Steer(text, trust) = i {
-                out.push((text, trust));
-            }
-        }
-        out
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.bytes = 0;
+        pending.steers.drain(..).collect()
+    }
+}
+
+impl Drop for InterruptQueue {
+    fn drop(&mut self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.closed = true;
+        pending.steers.clear();
+        pending.bytes = 0;
     }
 }
 
@@ -185,6 +223,24 @@ mod tests {
             queue.drain_steers(),
             vec![("narrow it".to_string(), crate::types::TrustLabel::User)]
         );
+    }
+
+    #[test]
+    fn overload_is_refused_and_cancellation_never_waits_for_a_slot() {
+        let (handle, mut queue) = InterruptQueue::pair();
+        for _ in 0..MAX_STEERS {
+            assert!(handle.steer("kept"));
+        }
+        assert!(!handle.steer("refused"));
+        assert_eq!(queue.drain_steers().len(), MAX_STEERS);
+        assert!(handle.steer("x".repeat(MAX_STEER_BYTES)));
+        assert!(!handle.steer("one byte too many"));
+        handle.cancel_turn();
+        assert!(queue.cancel_requested());
+        assert!(!handle.steer("after stop"));
+        assert_eq!(queue.drain_steers().len(), 1);
+        drop(queue);
+        assert!(!handle.steer("after end"));
     }
 
     #[tokio::test]

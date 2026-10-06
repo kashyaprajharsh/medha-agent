@@ -89,8 +89,14 @@ struct Stream {
     kept_bytes: usize,
     viewers: HashMap<u64, Client>,
     /// Requests forwarded to the chat: the id it was given, who asked, and their own id.
-    asked: HashMap<String, (Client, Value)>,
+    asked: HashMap<String, Requested>,
     asks: u64,
+}
+
+struct Requested {
+    client: Client,
+    id: Value,
+    presentation: bool,
 }
 
 impl Session {
@@ -231,7 +237,14 @@ impl Session {
             let mut stream = self.stream();
             stream.asks += 1;
             let id = format!("b{}", stream.asks);
-            stream.asked.insert(id.clone(), (client.clone(), asked));
+            stream.asked.insert(
+                id.clone(),
+                Requested {
+                    client: client.clone(),
+                    id: asked,
+                    presentation: frame["method"] == "session.presentation",
+                },
+            );
             frame["id"] = json!(id);
             given = Some(id);
         }
@@ -289,7 +302,7 @@ impl Session {
             // rest of it is passed over, and the chat goes on.
             if line.len() > CHAT_FRAME {
                 let asked = answered(&line).and_then(|given| self.stream().asked.remove(&given));
-                if let Some((client, id)) = asked {
+                if let Some(Requested { client, id, .. }) = asked {
                     client.reply(Some(id), Err(crate::refused(crate::client::TOO_LARGE)));
                 }
                 while !line.ends_with(b"\n") {
@@ -321,10 +334,17 @@ impl Session {
         let given = frame.get("id").and_then(Value::as_str).map(str::to_owned);
         match (answers, given) {
             (true, Some(given)) => {
-                let asked = self.stream().asked.remove(&given);
-                if let Some((client, id)) = asked {
-                    frame["id"] = id;
-                    client.send(line(&frame));
+                let mut stream = self.stream();
+                if let Some(asked) = stream.asked.remove(&given) {
+                    if asked.presentation && frame["result"].is_object() {
+                        // The chat enqueues this snapshot under the same lock
+                        // as its projection updates. Its preceding output has
+                        // now been published; subsequent events are not covered.
+                        frame["result"]["cursor"] =
+                            json!({ "stream": self.incarnation, "after": stream.seq });
+                    }
+                    frame["id"] = asked.id;
+                    asked.client.send(line(&frame));
                 }
             }
             _ => self.publish(frame),

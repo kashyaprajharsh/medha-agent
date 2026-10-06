@@ -33,6 +33,9 @@ impl Collected {
 /// How long a folder nobody holds stays open: a window that keeps asking about
 /// it does not have its whole log checked again each time.
 const IDLE: Duration = Duration::from_secs(5 * 60);
+/// How many folders nobody holds stay open at most, however lately they were used.
+const UNHELD: usize = 16;
+const SWEEP: Duration = Duration::from_secs(60);
 
 /// What is open per folder. A folder is held by whoever was handed it, a chat
 /// for as long as it runs; once nobody holds it and `idle` has passed it closes,
@@ -50,12 +53,10 @@ impl<T> Kept<T> {
         }
     }
 
-    fn get(
-        &mut self,
-        folder: &Path,
-        open: impl FnOnce() -> anyhow::Result<T>,
-    ) -> anyhow::Result<Arc<T>> {
-        let now = Instant::now();
+    /// Closes what nobody holds and nobody has used lately, and all but the
+    /// most recently used few of what nobody holds. Run on every use and on a
+    /// timer, so a backend with nothing to do still lets go.
+    fn sweep(&mut self, now: Instant) {
         let idle = self.idle;
         self.open.retain(|_, (held, used)| {
             let in_use = Arc::strong_count(held) > 1;
@@ -64,6 +65,25 @@ impl<T> Kept<T> {
             }
             in_use || now.duration_since(*used) < idle
         });
+        let mut unheld: Vec<(Instant, PathBuf)> = self
+            .open
+            .iter()
+            .filter(|(_, (held, _))| Arc::strong_count(held) == 1)
+            .map(|(folder, (_, used))| (*used, folder.clone()))
+            .collect();
+        unheld.sort();
+        for (_, folder) in unheld.iter().rev().skip(UNHELD) {
+            self.open.remove(folder);
+        }
+    }
+
+    fn get(
+        &mut self,
+        folder: &Path,
+        open: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<Arc<T>> {
+        let now = Instant::now();
+        self.sweep(now);
         if let Some((held, used)) = self.open.get_mut(folder) {
             *used = now;
             return Ok(Arc::clone(held));
@@ -141,8 +161,20 @@ fn opened(
 
 impl ServeChats {
     pub(crate) fn new(mcp_host: mcp::hub::Endpoint, mcp_changed: Arc<tokio::sync::Notify>) -> Self {
+        let folders = Arc::new(Mutex::new(Kept::new(IDLE)));
+        let swept = Arc::downgrade(&folders);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SWEEP);
+            while let Some(folders) = swept.upgrade() {
+                tick.tick().await;
+                folders
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .sweep(Instant::now());
+            }
+        });
         Self {
-            folders: Arc::new(Mutex::new(Kept::new(IDLE))),
+            folders,
             mcp_host,
             mcp_changed,
             requests: Lane::new(8, 64),

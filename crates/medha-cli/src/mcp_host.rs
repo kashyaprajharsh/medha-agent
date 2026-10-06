@@ -71,20 +71,22 @@ async fn follow_config(manager: mcp::McpManager, changed: Arc<tokio::sync::Notif
             _ = tick.tick() => false,
             () = changed.notified() => true,
         };
+        // No time means no file, which is a state to follow like any other.
         let modified = config::config_path()
             .ok()
             .and_then(|path| std::fs::metadata(path).ok())
             .and_then(|meta| meta.modified().ok());
-        if !told && (modified.is_none() || modified == seen) {
+        if !told && seen == Some(modified) {
             continue;
         }
-        if let Ok(Some(cfg)) = config::load() {
-            let (servers, held) = shared(&cfg);
-            manager.reconcile(servers, &held).await;
-            // A key still unreadable is tried again on the next tick.
-            if held.is_empty() {
-                seen = modified;
-            }
+        // A file that is gone names no servers. One that cannot be read says
+        // nothing, so what runs is kept and it is read again on the next tick.
+        let Ok(cfg) = config::load() else { continue };
+        let (servers, held) = shared(&cfg.unwrap_or_default());
+        manager.reconcile(servers, &held).await;
+        // A key still unreadable is tried again on the next tick.
+        if held.is_empty() {
+            seen = Some(modified);
         }
     }
 }

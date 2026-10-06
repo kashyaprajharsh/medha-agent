@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use kernel::{Event, EventKind, EventLog};
+use kernel::EventLog;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -261,21 +261,17 @@ pub(crate) struct Activity {
 
 /// Calls that ran, per server. The kernel writes an effect marker only once a
 /// call is authorized, and every MCP call needs the user's approval.
-pub(crate) fn activity(events: &[Event], now: f64, tally: &mut HashMap<String, Activity>) {
-    for event in events
-        .iter()
-        .filter(|event| event.kind == EventKind::ToolEffectPrepared)
-    {
-        let Some((server, _)) = event.payload["tool"]
-            .as_str()
-            .and_then(|tool| tool.strip_prefix(mcp::TOOL_PREFIX))
+pub(crate) fn activity(calls: &[(String, f64)], now: f64, tally: &mut HashMap<String, Activity>) {
+    for (tool, ran) in calls {
+        let Some((server, _)) = tool
+            .strip_prefix(mcp::TOOL_PREFIX)
             .and_then(|rest| rest.split_once("__"))
         else {
             continue;
         };
         let seen = tally.entry(server.to_owned()).or_default();
-        seen.last_used = seen.last_used.max(event.ts);
-        if now - event.ts <= 7.0 * 86_400.0 {
+        seen.last_used = seen.last_used.max(*ran);
+        if now - ran <= 7.0 * 86_400.0 {
             seen.this_week += 1;
         }
     }
@@ -288,16 +284,9 @@ pub(crate) async fn listing<L: EventLog>(
     now: f64,
 ) -> Value {
     let mut used = HashMap::new();
-    let recent: std::collections::HashSet<_> = log
-        .sessions()
-        .await
-        .into_iter()
-        .filter(|session| now - session.last_ts <= 30.0 * 86_400.0)
-        .map(|session| session.id)
-        .collect();
-    // Only the calls are read: loading each chat whole took longer the more Medha was used.
-    let mut calls = log.events_of_kind(EventKind::ToolEffectPrepared).await;
-    calls.retain(|call| recent.contains(&call.session_id));
+    // Only the calls made in chats used this month are read, and of each only
+    // its tool and time: loading chats whole took longer the more Medha was used.
+    let calls = log.tool_calls_since(now - 30.0 * 86_400.0).await;
     activity(&calls, now, &mut used);
     let project = Project::scan(workspace);
     let rows: Vec<Value> = catalog()

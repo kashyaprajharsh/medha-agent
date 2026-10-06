@@ -621,6 +621,15 @@ impl MutationLease {
     }
 }
 
+/// The calls among `events` that ran: a tool's effect is recorded only once the call is allowed.
+pub fn tool_calls(events: &[Event]) -> Vec<(String, f64)> {
+    events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolEffectPrepared)
+        .filter_map(|event| Some((event.payload["tool"].as_str()?.to_owned(), event.ts)))
+        .collect()
+}
+
 /// The log interface. Append computes the hash chain; replay/projection read it.
 #[async_trait]
 pub trait EventLog: Send + Sync {
@@ -643,15 +652,16 @@ pub trait EventLog: Send + Sync {
         Ok(MutationLease::in_process())
     }
 
-    /// Every event of one kind, across sessions, oldest first. A durable backend
-    /// answers this without loading whole sessions.
-    async fn events_of_kind(&self, kind: EventKind) -> Vec<Event> {
+    /// The tool calls that ran, as each tool's name and when, in sessions used
+    /// at or after `since`. A durable backend answers this without loading the
+    /// sessions or what the calls carried.
+    async fn tool_calls_since(&self, since: f64) -> Vec<(String, f64)> {
         let mut found = Vec::new();
         for session in self.sessions().await {
-            let events = self.events(session.id).await;
-            found.extend(events.into_iter().filter(|event| event.kind == kind));
+            if session.last_ts >= since {
+                found.extend(tool_calls(&self.events(session.id).await));
+            }
         }
-        found.sort_by(|a, b| a.ts.total_cmp(&b.ts).then(a.id.cmp(&b.id)));
         found
     }
 

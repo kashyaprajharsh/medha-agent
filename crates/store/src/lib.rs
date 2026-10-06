@@ -827,21 +827,31 @@ impl SqliteLog {
         })
     }
 
-    fn kind_events(&self, kind: EventKind) -> Result<Vec<Event>, StoreError> {
+    /// Only the tool's name and the time are read, and only in sessions used
+    /// since `since`: what the calls carried, and older sessions, stay on disk.
+    fn calls_since(&self, since: f64) -> Result<Vec<(String, f64)>, StoreError> {
         self.with_verified_snapshot(false, |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
-                            prev_hash, hash, hash_version, ts
-                     FROM events WHERE kind = ?1 ORDER BY rowid ASC",
+                    "SELECT json_extract(payload, '$.tool'), ts FROM events
+                     WHERE kind = ?1 AND session_id IN (
+                         SELECT session_id FROM events
+                         GROUP BY session_id HAVING MAX(ts) >= ?2)
+                     ORDER BY rowid ASC",
                 )
                 .map_err(|error| StoreError::Db(error.to_string()))?;
+            let prepared = EventKind::ToolEffectPrepared.as_str();
             let rows = stmt
-                .query_map([kind.as_str()], chain_row)
+                .query_map(rusqlite::params![prepared, since], |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, f64>(1)?))
+                })
                 .map_err(|error| StoreError::Db(error.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| StoreError::Db(error.to_string()))?;
-            decode_events(rows)
+            Ok(rows
+                .into_iter()
+                .filter_map(|(tool, ts)| Some((tool?, ts)))
+                .collect())
         })
     }
 
@@ -1224,8 +1234,8 @@ impl EventLog for SqliteLog {
         self.list_sessions_async().await.unwrap_or_default()
     }
 
-    async fn events_of_kind(&self, kind: EventKind) -> Vec<Event> {
-        self.run_store_task(move |log| log.kind_events(kind))
+    async fn tool_calls_since(&self, since: f64) -> Vec<(String, f64)> {
+        self.run_store_task(move |log| log.calls_since(since))
             .await
             .unwrap_or_default()
     }
@@ -1605,33 +1615,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_of_one_kind_are_exactly_those_a_walk_of_every_session_finds() {
-        let dir = std::env::temp_dir().join(format!("medha-kind-{}", Ulid::new()));
+    async fn the_calls_that_ran_in_sessions_used_lately_are_those_a_walk_of_them_finds() {
+        let dir = std::env::temp_dir().join(format!("medha-calls-{}", Ulid::new()));
         let log = SqliteLog::open(dir.join("events.db")).unwrap();
-        let mut said = Vec::new();
-        for _ in 0..3 {
-            let session = kernel::Session {
-                id: Ulid::new(),
-                done: false,
-                ..Default::default()
+        let session = || kernel::Session {
+            id: Ulid::new(),
+            done: false,
+            ..Default::default()
+        };
+        let (stale, lately) = (session(), session());
+        let ran = |session: &kernel::Session, tool: &str, at: f64| {
+            let intent = kernel::ToolIntent {
+                id: "c".into(),
+                tool: tool.into(),
+                args: serde_json::json!({ "carried": "x".repeat(4096) }),
             };
-            log.append(Event::user_message(&session, "ask"))
-                .await
-                .unwrap();
-            for text in ["one", "two"] {
-                let event = Event::model_text(&session, text);
-                said.push(log.append(event).await.unwrap().id);
+            let mut event = Event::tool_effect_prepared(session, &intent, "state:*");
+            event.ts = at;
+            event
+        };
+        let mut asked = Event::model_intent(
+            &lately,
+            &kernel::ToolIntent {
+                id: "d".into(),
+                tool: "mcp__linear__never_ran".into(),
+                args: serde_json::json!({}),
+            },
+        );
+        asked.ts = 900.0;
+        for event in [
+            ran(&stale, "mcp__linear__long_ago", 100.0),
+            ran(&lately, "mcp__linear__early_in_a_long_chat", 50.0),
+            asked,
+            ran(&lately, "mcp__linear__create_issue", 1000.0),
+            ran(&lately, "shell.exec", 1000.0),
+        ] {
+            log.append(event).await.unwrap();
+        }
+
+        let found = log.tool_calls_since(500.0).await;
+        let mut walked = Vec::new();
+        for session in log.sessions().await {
+            if session.last_ts >= 500.0 {
+                walked.extend(kernel::events::tool_calls(&log.events(session.id).await));
             }
         }
-        let kind = Event::model_text(&kernel::Session::default(), "").kind;
-
-        let found: Vec<Ulid> = log
-            .events_of_kind(kind)
-            .await
-            .iter()
-            .map(|event| event.id)
-            .collect();
-        assert_eq!(found, said, "in the order they were written");
+        assert_eq!(found, walked);
+        let named: Vec<&str> = found.iter().map(|(tool, _)| tool.as_str()).collect();
+        assert_eq!(
+            named,
+            [
+                "mcp__linear__early_in_a_long_chat",
+                "mcp__linear__create_issue",
+                "shell.exec"
+            ]
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

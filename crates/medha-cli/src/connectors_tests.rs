@@ -1,4 +1,5 @@
 use super::*;
+use kernel::Event;
 
 #[test]
 fn every_file_in_the_folder_ships_and_parses() {
@@ -176,7 +177,7 @@ fn activity_counts_only_calls_that_ran_for_that_server_this_week() {
         asked_but_never_ran,
     ];
     let mut tally = HashMap::new();
-    activity(&events, now, &mut tally);
+    activity(&kernel::events::tool_calls(&events), now, &mut tally);
     assert_eq!(tally["linear"].this_week, 2);
     assert_eq!(tally["linear"].last_used, now - 86_400.0);
     assert_eq!(tally["linear-2"].this_week, 1);

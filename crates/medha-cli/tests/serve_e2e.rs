@@ -535,7 +535,11 @@ async fn ten_chats_in_one_process_answer_their_own_clients_and_leak_no_key() {
     assert_eq!(late.event().await.1["method"], "ready");
     late.until(|frame| kind(frame, "turn.done")).await;
 
-    let log = std::fs::read_to_string(world.home().join("logs").join("serve.log")).unwrap();
+    let log: String = std::fs::read_dir(world.home().join("logs"))
+        .unwrap()
+        .map(|file| std::fs::read_to_string(file.unwrap().path()).unwrap())
+        .collect();
+    assert!(log.contains("medha session start"), "the log was not found");
     for (what, text) in [
         ("a client", &client.heard),
         ("a late client", &late.heard),
@@ -696,6 +700,22 @@ async fn a_backend_started_with_few_open_files_allowed_still_holds_many_chats() 
         let made = client.create(&world.folder(&format!("w{n}")), None).await;
         assert!(made["result"]["session"].is_string(), "chat {n}: {made}");
     }
+}
+
+/// A socket's path may be only about a hundred bytes; a home may be far deeper.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backend_whose_home_is_too_deep_for_a_socket_is_still_reached() {
+    let world = World::new();
+    let home = world.root.path().join("d".repeat(120)).join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let backend = Backend::start(&home, &world.provider, &[]);
+    let mut client = backend.connect().await;
+    let hello = client.ask("hello", None, json!({})).await;
+    assert_eq!(hello["result"]["protocol"], 1);
+    let chat = client.open(&world.folder("w")).await;
+    let settings = client.ask("session.settings", Some(&chat), json!({})).await;
+    assert!(settings.get("result").is_some(), "{settings}");
 }
 
 /// What a client reads to find a backend must not outlive the backend it names.
@@ -1016,6 +1036,37 @@ async fn chats_in_the_backend_share_one_connection_to_a_remote_mcp_server() {
         connections, 1,
         "each chat connected to the server for itself"
     );
+}
+
+/// A config file that is deleted names no servers; that is followed like any other change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_config_takes_its_servers_away_from_the_shared_host() {
+    let world = World::new();
+    let (url, _) = remote_mcp_server();
+    std::fs::create_dir_all(world.home()).unwrap();
+    let config = world.home().join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[mcp.hosted]\nurl = \"{url}\"\ntrust = \"trusted\"\n"),
+    )
+    .unwrap();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    client.open(&world.folder("w")).await;
+    let hosted = |frame: &Value| {
+        let said = &frame["params"]["frame"];
+        (said["method"] == "mcp.status").then(|| {
+            said["params"]["servers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|server| server["server"] == "hosted" && server["state"] == "ready")
+        })
+    };
+    while hosted(&client.next().await) != Some(true) {}
+
+    std::fs::remove_file(&config).unwrap();
+    while hosted(&client.next().await) != Some(false) {}
 }
 
 /// Saving a key leaves the config file as it was: only being told makes the host use the new one.

@@ -516,7 +516,8 @@ impl Backend {
             let gave_up = exited.is_some_and(|at| at.elapsed() >= AFTER_EXIT);
             if gave_up || Instant::now() >= deadline {
                 return Err(
-                    "Could not start Medha backend. See logs/serve.log in Medha's folder.".into(),
+                    "Could not start Medha backend. See the serve log in Medha's logs folder."
+                        .into(),
                 );
             }
             std::thread::sleep(Duration::from_millis(50));

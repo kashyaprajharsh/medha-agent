@@ -25,21 +25,34 @@ pub(crate) fn directory(home: &Path) -> PathBuf {
     home.join("serve")
 }
 
+/// Names this user's own serve folder in a few characters.
+fn tag(directory: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(directory.to_string_lossy().as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A socket's path may be only about a hundred bytes. One that would be longer
+/// beside the token, under a deep home, goes in a short private folder; the
+/// `address` file says where, so a client never works the path out for itself.
 #[cfg(unix)]
 fn address(directory: &Path, channel: &str) -> String {
-    directory
-        .join(format!("{channel}.sock"))
-        .display()
-        .to_string()
+    const SOCKET_PATH: usize = 100;
+    let beside = directory.join(format!("{channel}.sock"));
+    let place = if beside.as_os_str().len() < SOCKET_PATH {
+        beside
+    } else {
+        std::env::temp_dir()
+            .join(format!("medha-{}", tag(directory)))
+            .join(format!("{channel}.sock"))
+    };
+    place.display().to_string()
 }
 
 /// Pipe names are machine-wide, so the name is taken from this user's own folder.
 #[cfg(windows)]
 fn address(directory: &Path, channel: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(directory.to_string_lossy().as_bytes());
-    let tag: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    format!(r"\\.\pipe\medha-serve-{channel}-{tag}")
+    format!(r"\\.\pipe\medha-serve-{channel}-{}", tag(directory))
 }
 
 /// The shared MCP host, running until the backend stops it.
@@ -187,8 +200,15 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
 
     let logs = home.join("logs");
     std::fs::create_dir_all(&logs).ok();
-    let (log_writer, _log_guard) =
-        tracing_appender::non_blocking(tracing_appender::rolling::never(&logs, "serve.log"));
+    // A backend lives for days: its log is a file a day, and the last week of them is kept.
+    let daily = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("serve")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(&logs)
+        .context("could not open the backend's log")?;
+    let (log_writer, _log_guard) = tracing_appender::non_blocking(daily);
     tracing_subscriber::fmt()
         .with_writer(log_writer)
         .with_ansi(false)

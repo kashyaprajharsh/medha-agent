@@ -26,22 +26,39 @@ pub(crate) fn scripted_backend(
     late: Duration,
     events: usize,
 ) -> Arc<Mutex<Vec<Value>>> {
+    let this = json!({ "build": wire::BUILD_ID, "capabilities": wire::CAPABILITIES });
+    scripted(address, token, late, events, this)
+}
+
+/// One that says of itself what `identity` says, and has work in hand: asked
+/// to give way to another build, it refuses.
+fn scripted(
+    address: &str,
+    token: &'static str,
+    late: Duration,
+    events: usize,
+    mut identity: Value,
+) -> Arc<Mutex<Vec<Value>>> {
+    identity["protocol"] = json!(PROTOCOL);
     let asked: Arc<Mutex<Vec<Value>>> = Arc::default();
     let listener = reading().block_on(async { wire::bind(address) }).unwrap();
     let heard = Arc::clone(&asked);
     reading().spawn(listener.serve(move |stream| {
-        let heard = Arc::clone(&heard);
+        let (heard, identity) = (Arc::clone(&heard), identity.clone());
         tokio::spawn(async move {
             let (reading, mut writing) = tokio::io::split(stream);
             let mut reader = BufReader::new(reading);
             let Some(id) = wire::admit(&mut reader, &mut writing, token, ROLES).await else {
                 return;
             };
-            let welcome = json!({ "id": id, "result": { "protocol": PROTOCOL,
-                "build": wire::BUILD_ID, "capabilities": wire::CAPABILITIES } });
+            let welcome = json!({ "id": id, "result": identity });
             wire::write_frame(&mut writing, &welcome).await;
             while let Some(frame) = wire::read_frame(&mut reader).await {
                 heard.lock().unwrap().push(frame.clone());
+                if frame["method"] == "backend.prepare_upgrade" {
+                    let busy = json!({ "id": frame["id"], "error": { "message": "in use" } });
+                    wire::write_frame(&mut writing, &busy).await;
+                }
                 if frame["method"] == "session.create" {
                     tokio::time::sleep(late).await;
                     let started = json!({ "id": frame["id"], "result": { "session": "late" } });
@@ -64,11 +81,53 @@ pub(crate) fn scripted_backend(
 }
 
 fn joined(address: &str) -> Arc<Connection> {
-    let joining = join(address.to_owned(), "token".into());
+    let joining = join(address.to_owned(), "token".into(), false);
     let Ok(connection) = reading().block_on(joining) else {
         panic!("the backend did not admit the client");
     };
     connection
+}
+
+/// The terminal and the desktop are installed apart and are seldom one build.
+/// Each must be able to use the backend the other started.
+#[test]
+fn a_backend_of_another_build_is_joined_when_it_can_do_all_this_one_needs() {
+    let another =
+        |capabilities: &[&str]| json!({ "build": "another", "capabilities": capabilities });
+    let newer: Vec<&str> = wire::CAPABILITIES
+        .iter()
+        .copied()
+        .chain(["later"])
+        .collect();
+    let older = &wire::CAPABILITIES[..1];
+    assert_eq!(fit(&another(wire::CAPABILITIES), false), Fit::Join);
+    assert_eq!(fit(&another(&newer), false), Fit::Join);
+    assert_eq!(fit(&another(older), false), Fit::GiveWay { needed: true });
+    assert_eq!(fit(&another(&[]), false), Fit::Legacy);
+    // A build under development also asks one left over from before it to give way.
+    let stale = fit(&another(wire::CAPABILITIES), true);
+    assert_eq!(stale, Fit::GiveWay { needed: false });
+    let same = json!({ "build": wire::BUILD_ID, "capabilities": wire::CAPABILITIES });
+    assert_eq!(fit(&same, true), Fit::Join);
+
+    // One with work in hand does not give way. It is joined if it can be used, and refused only if it cannot.
+    let (usable, unusable) = (address(), address());
+    scripted(
+        &usable,
+        "token",
+        Duration::ZERO,
+        0,
+        another(wire::CAPABILITIES),
+    );
+    scripted(&unusable, "token", Duration::ZERO, 0, another(older));
+    let connection = joined(&usable);
+    connection
+        .open_chat(Path::new("."), None, false, None, Arc::new(|_| {}))
+        .expect("a backend that was joined did not answer");
+    let refused = reading().block_on(join(unusable.clone(), "token".into(), false));
+    assert!(matches!(refused, Err(Refused::Busy(why)) if why == "in use"));
+    forget(&usable);
+    forget(&unusable);
 }
 
 #[cfg(unix)]

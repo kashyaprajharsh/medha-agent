@@ -494,39 +494,77 @@ fn reading() -> &'static tokio::runtime::Runtime {
     })
 }
 
-async fn join(address: String, token: String) -> Result<Arc<Connection>, Refused> {
+/// What a backend that answered is to this client.
+#[derive(Debug, PartialEq)]
+enum Fit {
+    Join,
+    /// It is asked to give way to this build. `needed` says it cannot be used
+    /// as it is; otherwise it is only asked, and joined if it has work in hand.
+    GiveWay {
+        needed: bool,
+    },
+    /// It cannot do what this client needs, and is too old to be asked to give way.
+    Legacy,
+}
+
+/// A backend is another client's as much as this one's, and theirs may be a
+/// different build. So it is joined whenever it speaks this protocol and can do
+/// everything this build relies on, whatever build it is. It is asked to give
+/// way only when it cannot. `stale` adds: or when it is merely another build,
+/// which is how a build under development replaces the one left running before it.
+fn fit(welcome: &Value, stale: bool) -> Fit {
+    let offers = |capability: &str| {
+        welcome["capabilities"]
+            .as_array()
+            .is_some_and(|all| all.iter().any(|one| one == capability))
+    };
+    let lacking = wire::CAPABILITIES.iter().any(|needed| !offers(needed));
+    let other = stale && welcome["build"] != wire::BUILD_ID;
+    match (lacking, other) {
+        (false, false) => Fit::Join,
+        _ if !offers("lifecycle") => Fit::Legacy,
+        (needed, _) => Fit::GiveWay { needed },
+    }
+}
+
+/// `fresh` says a backend was started for this very attempt: whatever build
+/// answers then is the one there is to use.
+async fn join(address: String, token: String, fresh: bool) -> Result<Arc<Connection>, Refused> {
     let stream = wire::connect(&address).await.map_err(|_| Refused::Absent)?;
     let (reading, mut writing) = tokio::io::split(stream);
     let mut reader = BufReader::new(reading);
     let welcome = wire::greet(&mut reader, &mut writing, &token, ROLES)
         .await
         .map_err(|_| Refused::Absent)?;
-    if welcome["result"]["protocol"] != PROTOCOL {
+    let welcome = &welcome["result"];
+    if welcome["protocol"] != PROTOCOL {
         return Err(Refused::Incompatible);
     }
-    if welcome["result"]["build"] != wire::BUILD_ID {
-        if !welcome["result"]["capabilities"]
-            .as_array()
-            .is_some_and(|caps| caps.iter().any(|cap| cap == "lifecycle"))
-        {
-            return Err(Refused::Legacy);
-        }
-        let upgrade = json!({"id": 2, "method": "backend.prepare_upgrade", "params": {"build": welcome["result"]["build"]}});
-        if !wire::write_frame(&mut writing, &upgrade).await {
-            return Err(Refused::Absent);
-        }
-        // EOF is also an acknowledgement: the idle backend can finish before
-        // its last reply is flushed. Active work is refused before shutdown.
-        if let Some(reply) =
-            tokio::time::timeout(Duration::from_secs(2), wire::read_frame(&mut reader))
+    match fit(welcome, cfg!(debug_assertions) && !fresh) {
+        Fit::Join => {}
+        Fit::Legacy => return Err(Refused::Legacy),
+        Fit::GiveWay { needed } => {
+            let upgrade = json!({"id": 2, "method": "backend.prepare_upgrade",
+                "params": {"build": welcome["build"]}});
+            if !wire::write_frame(&mut writing, &upgrade).await {
+                return Err(Refused::Absent);
+            }
+            // EOF is also an acknowledgement: the idle backend can finish before
+            // its last reply is flushed. Active work is refused before shutdown.
+            let reply = tokio::time::timeout(Duration::from_secs(2), wire::read_frame(&mut reader))
                 .await
                 .ok()
-                .flatten()
-            && let Some(error) = reply["error"]["message"].as_str()
-        {
-            return Err(Refused::Busy(error.to_owned()));
+                .flatten();
+            match reply
+                .as_ref()
+                .and_then(|reply| reply["error"]["message"].as_str())
+            {
+                Some(busy) if needed => return Err(Refused::Busy(busy.to_owned())),
+                // It has work in hand and can do all this build needs: it is joined as it is.
+                Some(_) => {}
+                None => return Err(Refused::Upgrading),
+            }
         }
-        return Err(Refused::Upgrading);
     }
     let (lines, mut queued) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (controls, mut urgent) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -643,14 +681,14 @@ impl Backend {
         Ok(home.join("serve"))
     }
 
-    fn reach(&self, directory: &Path) -> Result<Arc<Connection>, Refused> {
+    fn reach(&self, directory: &Path, fresh: bool) -> Result<Arc<Connection>, Refused> {
         let read = |name: &str| std::fs::read_to_string(directory.join(name));
         let (Ok(address), Ok(token)) = (read("address"), read("token")) else {
             return Err(Refused::Absent);
         };
         let (joined, outcome) = mpsc::sync_channel(1);
         reading().spawn(async move {
-            let result = tokio::time::timeout(wire::STARTUP_GRACE, join(address, token))
+            let result = tokio::time::timeout(wire::STARTUP_GRACE, join(address, token, fresh))
                 .await
                 .unwrap_or(Err(Refused::Absent));
             let _ = joined.send(result);
@@ -694,7 +732,7 @@ impl Backend {
         let mut exited: Option<Instant> = None;
         let deadline = Instant::now() + START;
         let connection = loop {
-            match self.reach(&directory) {
+            match self.reach(&directory, attempts > 0) {
                 Ok(connection) => break connection,
                 Err(Refused::Incompatible) => return Err(incompatible()),
                 Err(Refused::Legacy) => return Err("This backend predates safe upgrades. Close its chats and stop that older backend before starting this build.".into()),
@@ -818,7 +856,7 @@ pub fn executable() -> Result<PathBuf, String> {
 impl Backend {
     /// Joined to a backend a test runs itself, which this never starts or stops.
     pub(crate) fn joined_to(address: String, token: &str) -> Arc<Self> {
-        let Ok(connection) = reading().block_on(join(address, token.into())) else {
+        let Ok(connection) = reading().block_on(join(address, token.into(), false)) else {
             panic!("the test's backend did not admit the client");
         };
         Arc::new(Self {

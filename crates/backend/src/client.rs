@@ -129,10 +129,7 @@ impl<C: Chats> Drop for Leaving<C> {
         }
         // Chats may still hold this client for answers it will never read.
         self.me.dropped.cancel();
-        let tied = self.tied.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move { tied.close().await });
-        }
+        self.tied.close();
     }
 }
 
@@ -147,10 +144,10 @@ impl Tied {
         tied.push(Arc::downgrade(session));
     }
 
-    async fn close(&self) {
+    fn close(&self) {
         let tied = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
         for session in tied.iter().filter_map(Weak::upgrade) {
-            session.close().await;
+            session.close();
         }
     }
 }
@@ -199,7 +196,7 @@ async fn handle<C: Chats>(
                 tied.add(&session);
                 // The client may have gone while its chat was starting.
                 if me.dropped.is_cancelled() {
-                    tied.close().await;
+                    tied.close();
                 }
             }
             me.reply(id, outcome);
@@ -223,7 +220,7 @@ async fn handle<C: Chats>(
         }),
         "session.close" => match session("session.close") {
             Ok(session) if session.heard_by(me.id) => {
-                session.close().await;
+                session.close();
                 Ok(json!({ "closing": true }))
             }
             Ok(_) => Err(refused("attach to the session first")),
@@ -231,7 +228,7 @@ async fn handle<C: Chats>(
         },
         _ => match session("a request to a chat") {
             Ok(session) if session.heard_by(me.id) => {
-                match session.forward(me, frame).await {
+                match session.forward(me, frame) {
                     // The chat answers; its answer is routed back to this client.
                     Ok(()) => return,
                     Err(error) => Err(refused(error)),

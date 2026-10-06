@@ -2,10 +2,13 @@
 //! recent part kept for a client that comes back, and answers routed to whoever asked.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
 use crate::{Done, Input, Output};
@@ -16,11 +19,48 @@ const KEPT_BYTES: usize = 8 * 1024 * 1024;
 /// The largest frame a chat may say: what a client can read, less what it is wrapped in.
 pub(crate) const CHAT_FRAME: usize = wire::MAX_FRAME - 1024;
 
+/// How much may wait to be read by one chat. A chat that is not reading fills
+/// this and is refused more; it never holds up the client that asked.
+pub(crate) const INPUT_FRAMES: usize = 256;
+const INPUT_BYTES: usize = 2 * wire::MAX_FRAME;
+const BUSY: &str = "this chat has not read what it was already sent; try again in a moment";
+
 pub(crate) struct Session {
     pub(crate) id: String,
     about: Value,
-    input: tokio::sync::Mutex<Option<Input>>,
+    /// What the chat is asked, in the order it was asked.
+    input: mpsc::Sender<String>,
+    waiting: Arc<AtomicUsize>,
+    closing: CancellationToken,
     stream: Mutex<Stream>,
+}
+
+/// Writes to the chat one request at a time. Dropping its input, when it is told
+/// to close or the chat stops taking any, is how a chat is asked to finish.
+async fn feed(
+    mut input: Input,
+    mut asked: mpsc::Receiver<String>,
+    waiting: Arc<AtomicUsize>,
+    closing: CancellationToken,
+) {
+    loop {
+        let line = tokio::select! {
+            () = closing.cancelled() => break,
+            line = asked.recv() => line,
+        };
+        let Some(line) = line else { break };
+        waiting.fetch_sub(line.len(), Ordering::Relaxed);
+        let written =
+            async { input.write_all(line.as_bytes()).await.is_ok() && input.flush().await.is_ok() };
+        let written = tokio::select! {
+            () = closing.cancelled() => break,
+            written = written => written,
+        };
+        if !written {
+            break;
+        }
+    }
+    closing.cancel();
 }
 
 #[derive(Default)]
@@ -36,10 +76,15 @@ struct Stream {
 
 impl Session {
     pub(crate) fn new(id: String, about: Value, input: Input) -> Arc<Self> {
+        let (asked, queued) = mpsc::channel(INPUT_FRAMES);
+        let (waiting, closing) = (Arc::<AtomicUsize>::default(), CancellationToken::new());
+        tokio::spawn(feed(input, queued, Arc::clone(&waiting), closing.clone()));
         Arc::new(Self {
             id,
             about,
-            input: tokio::sync::Mutex::new(Some(input)),
+            input: asked,
+            waiting,
+            closing,
             stream: Mutex::default(),
         })
     }
@@ -86,7 +131,13 @@ impl Session {
     }
 
     /// Hands a client's request to the chat under an id that cannot collide with another client's.
-    pub(crate) async fn forward(&self, client: &Client, mut frame: Value) -> Result<(), String> {
+    ///
+    /// Never waits on the chat: the request joins what the chat has yet to read,
+    /// or is refused when that is full, so the client's other requests go on.
+    pub(crate) fn forward(&self, client: &Client, mut frame: Value) -> Result<(), String> {
+        if self.closing.is_cancelled() {
+            return Err("this chat has ended".into());
+        }
         let mut given = None;
         if let Some(asked) = frame.get("id").cloned() {
             let mut stream = self.stream();
@@ -98,25 +149,23 @@ impl Session {
         }
         let mut line = frame.to_string();
         line.push('\n');
-        let mut input = self.input.lock().await;
-        let sent = match input.as_mut() {
-            Some(pipe) => {
-                pipe.write_all(line.as_bytes()).await.is_ok() && pipe.flush().await.is_ok()
-            }
-            None => false,
+        let bytes = line.len();
+        let room = self.waiting.fetch_add(bytes, Ordering::Relaxed) + bytes <= INPUT_BYTES;
+        let refused = match room.then(|| self.input.try_send(line)) {
+            Some(Ok(())) => return Ok(()),
+            Some(Err(mpsc::error::TrySendError::Closed(_))) => "this chat has ended",
+            Some(Err(mpsc::error::TrySendError::Full(_))) | None => BUSY,
         };
-        if !sent {
-            if let Some(id) = given {
-                self.stream().asked.remove(&id);
-            }
-            return Err("this chat has ended".into());
+        self.waiting.fetch_sub(bytes, Ordering::Relaxed);
+        if let Some(id) = given {
+            self.stream().asked.remove(&id);
         }
-        Ok(())
+        Err(refused.into())
     }
 
-    /// Closing its input is how a chat is asked to finish.
-    pub(crate) async fn close(&self) {
-        self.input.lock().await.take();
+    /// Reaches a chat even when it has stopped reading what it is asked.
+    pub(crate) fn close(&self) {
+        self.closing.cancel();
     }
 
     /// Reads what the chat says until it ends, then tells whoever is still attached.
@@ -149,7 +198,7 @@ impl Session {
             }
         }
         // Whatever ended the reading, the chat is told to finish before it is waited for.
-        self.close().await;
+        self.close();
         let error = match done.await {
             Ok(()) => Value::Null,
             Err(error) => json!(error),

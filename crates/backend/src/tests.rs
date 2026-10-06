@@ -41,6 +41,11 @@ async fn chat(input: DuplexStream, mut output: DuplexStream) -> Result<(), Strin
                 output.write_all(b"not a frame\n").await.unwrap();
                 say(&mut output, json!({"id": id, "result": {}})).await;
             }
+            // Stops reading what it is asked, as a chat does while it waits on something else.
+            Some("stall") => {
+                say(&mut output, json!({"id": id, "result": "stalled"})).await;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
             Some("break") => return Err("it broke".into()),
             Some("panic") => panic!("the chat panicked"),
             _ => {}
@@ -467,6 +472,55 @@ async fn an_answer_or_a_frame_too_large_to_read_breaks_no_connection_and_no_chat
         "after"
     );
     assert_eq!(client.event().await.1["params"]["text"], "after");
+}
+
+#[tokio::test]
+async fn a_chat_that_stops_reading_holds_up_nothing_else_and_can_still_be_closed() {
+    let backend = backend();
+    let mut client = connect(&backend);
+    let (stalled, healthy) = (client.open().await, client.open().await);
+    assert_eq!(
+        client.ask("stall", Some(&stalled), json!({})).await["result"],
+        "stalled"
+    );
+
+    // More than the chat's pipe holds, so writing to it cannot finish.
+    let large = json!({"text": "x".repeat(200 * 1024)});
+    for _ in 0..3 {
+        client
+            .post(json!({"method": "say", "session": stalled, "params": large}))
+            .await;
+    }
+    let hello = client.ask("hello", None, json!({})).await;
+    assert_eq!(hello["result"]["protocol"], PROTOCOL);
+    assert_eq!(
+        client.say(&healthy, "unaffected").await["result"]["said"],
+        "unaffected"
+    );
+    let history = client
+        .post(json!({"method": "history", "folder": "/w"}))
+        .await;
+    assert_eq!(client.answer(history).await["result"], json!({"of": "/w"}));
+
+    // What it has not read is bounded, and one request more is refused at once.
+    for _ in 0..(session::INPUT_FRAMES + 8) {
+        client
+            .post(json!({"method": "say", "session": stalled, "params": {"text": "one more"}}))
+            .await;
+    }
+    let refused = loop {
+        let frame = client.frame().await.expect("the connection was dropped");
+        if frame.get("error").is_some() {
+            break frame;
+        }
+    };
+    let why = refused["error"]["message"].as_str().unwrap();
+    assert!(why.contains("has not read"), "{why}");
+
+    let closing = client.ask("session.close", Some(&stalled), json!({})).await;
+    assert_eq!(closing["result"]["closing"], true);
+    let after = client.say(&stalled, "after it was closed").await;
+    assert_eq!(after["error"]["message"], "this chat has ended");
 }
 
 #[tokio::test]

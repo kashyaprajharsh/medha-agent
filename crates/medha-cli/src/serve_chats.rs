@@ -106,6 +106,7 @@ pub(crate) struct ServeChats {
 }
 
 const BUSY: &str = "Medha is busy with other requests. Try again in a moment.";
+const STOPPING: &str = "Medha is stopping. Try again in a moment.";
 /// How many folder requests are answered at once. Measured, the number changes
 /// nothing about how fast a burst is answered; it is how many may be stuck on
 /// a lock before the rest of them wait.
@@ -122,28 +123,46 @@ const STARTING: usize = 2;
 /// is refused at once, not left to pile up.
 struct Lane {
     running: Arc<tokio::sync::Semaphore>,
+    at_once: usize,
     waiting: std::sync::atomic::AtomicUsize,
     room: usize,
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 impl Lane {
     fn new(at_once: usize, room: usize) -> Self {
         Self {
             running: Arc::new(tokio::sync::Semaphore::new(at_once)),
+            at_once,
             waiting: std::sync::atomic::AtomicUsize::new(0),
             room,
+            stopping: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     async fn admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
         use std::sync::atomic::Ordering;
+        if self.stopping.load(Ordering::Relaxed) {
+            return Err(STOPPING.into());
+        }
         if self.waiting.fetch_add(1, Ordering::Relaxed) >= self.room {
             self.waiting.fetch_sub(1, Ordering::Relaxed);
             return Err(BUSY.into());
         }
         let admitted = Arc::clone(&self.running).acquire_owned().await;
         self.waiting.fetch_sub(1, Ordering::Relaxed);
+        // One that waited its turn while the backend was told to stop does not begin.
+        if self.stopping.load(Ordering::Relaxed) {
+            return Err(STOPPING.into());
+        }
         admitted.map_err(|_| BUSY.to_string())
+    }
+
+    /// Admits nothing more, and says whether all it had admitted has finished.
+    fn has_stopped(&self) -> bool {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.running.available_permits() == self.at_once
     }
 }
 
@@ -207,6 +226,13 @@ impl ServeChats {
             requests: Lane::new(ANSWERING, 64),
             starts: Lane::new(STARTING, 32),
         }
+    }
+
+    /// Begins nothing more, and says whether every request and chat start it had begun is over.
+    pub(crate) fn has_stopped(&self) -> bool {
+        // Both are told, whatever the first answers.
+        let (requests, starts) = (self.requests.has_stopped(), self.starts.has_stopped());
+        requests && starts
     }
 }
 

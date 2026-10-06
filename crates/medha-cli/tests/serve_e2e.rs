@@ -765,6 +765,68 @@ async fn a_backend_told_to_stop_leaves_nothing_that_names_it() {
     assert_eq!(left, ["lock"], "a stopped backend left its address behind");
 }
 
+/// A backend told to stop may have work it cannot stop: a save waiting on a
+/// lock another program holds. Until that work is gone no other backend may
+/// take its place, and it must not be done after one has.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backend_told_to_stop_gives_way_to_another_only_once_its_own_work_is_over() {
+    let world = World::new();
+    let folder = world.folder("w");
+    let mut backend = world.backend();
+    let mut client = backend.connect().await;
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(world.home().join("credentials.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let save = json!({"id": 9401, "folder": folder, "method": "settings.keys.set",
+        "params": {"group": "search", "id": "tavily", "key": "sk-zz-never-saved"}});
+    assert!(wire::write_frame(&mut client.writer, &save).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let told = Command::new("kill")
+        .args(["-TERM", &backend.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(told.success());
+    let deadline = Instant::now() + WAIT;
+    while backend.file("address").exists() {
+        assert!(Instant::now() < deadline, "the backend ignored the signal");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // It is still here, waiting on its save, and so nothing takes its place.
+    assert!(backend.child.try_wait().unwrap().is_none());
+    let second = medha(&world.home(), &world.provider)
+        .arg("serve")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        !second.status.success() && said.contains("already running"),
+        "another backend started beside one still at work: {said}"
+    );
+
+    // It does not wait for ever: it goes, and the save it could not finish goes with it.
+    while backend.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the backend never stopped");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    held.unlock().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let saved = std::fs::read_to_string(world.home().join("credentials.toml")).unwrap_or_default();
+    assert!(
+        !saved.contains("sk-zz-never-saved"),
+        "a backend that had stopped went on to save a key"
+    );
+    let next = world.backend();
+    let hello = next.connect().await.ask("hello", None, json!({})).await;
+    assert_eq!(hello["result"]["protocol"], 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_backend_answers_what_the_desktop_asks_about_a_folder() {
     let world = World::new();

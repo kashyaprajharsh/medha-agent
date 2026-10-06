@@ -85,6 +85,19 @@ impl<C: Chats> Backend<C> {
         self.table().len()
     }
 
+    pub fn chats(&self) -> &C {
+        &self.chats
+    }
+
+    /// Tells every chat to finish, as a backend that is stopping does. Each is
+    /// gone from `live` once it has.
+    pub fn close_all(&self) {
+        let sessions: Vec<Arc<Session>> = self.table().values().cloned().collect();
+        for session in sessions {
+            session.close();
+        }
+    }
+
     fn table(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Session>>> {
         self.sessions
             .lock()

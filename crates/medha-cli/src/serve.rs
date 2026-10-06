@@ -65,10 +65,10 @@ struct McpHost {
 }
 
 impl McpHost {
-    /// Closes the remote connections and gives the host's address back.
-    async fn stop(self) {
+    /// Closes the remote connections and gives the host's address back. Says whether it had finished in time.
+    async fn stop(self) -> bool {
         drop(self.stop);
-        let _ = tokio::time::timeout(STOP_GRACE, self.task).await;
+        tokio::time::timeout(STOP_GRACE, self.task).await.is_ok()
     }
 }
 
@@ -208,7 +208,7 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
         .max_log_files(7)
         .build(&logs)
         .context("could not open the backend's log")?;
-    let (log_writer, _log_guard) = tracing_appender::non_blocking(daily);
+    let (log_writer, log_guard) = tracing_appender::non_blocking(daily);
     tracing_subscriber::fmt()
         .with_writer(log_writer)
         .with_ansi(false)
@@ -246,7 +246,28 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
     }
     #[cfg(unix)]
     let _ = std::fs::remove_file(&address);
-    mcp_host.stop().await;
+
+    // Nothing new begins; every chat is told to finish, and what was already
+    // begun is given a moment to.
+    let finishing = async {
+        while !(backend.chats().has_stopped() && backend.live() == 0) {
+            backend.close_all();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let (finished, host_finished) =
+        tokio::join!(tokio::time::timeout(STOP_GRACE, finishing), mcp_host.stop());
+    if finished.is_err() || !host_finished {
+        // Work waiting on a lock or on the keychain cannot be told to stop, and
+        // may yet write. The lock is not given up while it could: it goes with
+        // this process, so the backend that comes next never runs beside it.
+        tracing::warn!("stopped with work that would not finish");
+        drop(log_guard);
+        if let Err(error) = &outcome {
+            eprintln!("Error: {error:#}");
+        }
+        std::process::exit(i32::from(outcome.is_err()));
+    }
     drop(lock);
     outcome
 }

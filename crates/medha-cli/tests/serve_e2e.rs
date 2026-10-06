@@ -992,6 +992,48 @@ async fn a_backend_started_with_few_open_files_allowed_still_holds_many_chats() 
     }
 }
 
+/// With no short folder of its own, a backend says so. It does not turn to a
+/// folder every user shares, where whoever came first could keep it from starting.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_backend_with_nowhere_of_its_own_for_a_socket_says_so_and_uses_no_shared_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new();
+    let home = world.root.path().join("d".repeat(120)).join("home");
+    let temporary = world.root.path().join("t".repeat(120));
+    let shared = world.folder("s");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&temporary).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+    // No folder for the session's sockets at all, and then one that anyone may write in.
+    for session in [None, Some(&shared)] {
+        let mut serve = medha(&home, &world.provider);
+        serve.arg("serve").env("TMPDIR", &temporary);
+        match session {
+            Some(shared) => serve.env("XDG_RUNTIME_DIR", shared),
+            None => serve.env_remove("XDG_RUNTIME_DIR"),
+        };
+        let mut child = serve
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + WAIT;
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let started = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let said = child.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&said.stderr);
+        assert!(!started, "a backend started with nowhere of its own");
+        assert!(said.contains("too long for a local socket"), "{said}");
+        assert!(!home.join("serve/address").exists());
+    }
+}
+
 /// A socket's path may be only about a hundred bytes; a home may be far deeper.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1002,10 +1044,31 @@ async fn a_backend_whose_home_is_too_deep_for_a_socket_is_still_reached() {
     let temporary = world.root.path().join("t".repeat(120));
     std::fs::create_dir_all(&temporary).unwrap();
     let temporary = temporary.display().to_string();
-    let backend = Backend::start(&home, &world.provider, &[("TMPDIR", &temporary)]);
+    // Linux keeps a session's sockets in a folder of the user's own. macOS has
+    // none, and is asked for the user's temporary folder whatever TMPDIR says.
+    // As the system makes that folder: nobody else may write in it.
+    let session = world.folder("run");
+    std::fs::set_permissions(
+        &session,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let session = session.display().to_string();
+    let own = if cfg!(target_os = "macos") {
+        ""
+    } else {
+        &session
+    };
+    let env = [("TMPDIR", temporary.as_str()), ("XDG_RUNTIME_DIR", own)];
+    let backend = Backend::start(&home, &world.provider, &env);
     let mut client = backend.connect().await;
     let hello = client.ask("hello", None, json!({})).await;
     assert_eq!(hello["result"]["protocol"], 1);
+    let address = std::fs::read_to_string(backend.file("address")).unwrap();
+    assert!(
+        !address.starts_with("/tmp/medha-") && !address.starts_with("/private/tmp/medha-"),
+        "the socket is in a folder every user shares: {address}"
+    );
     let chat = client.open(&world.folder("w")).await;
     let settings = client.ask("session.settings", Some(&chat), json!({})).await;
     assert!(settings.get("result").is_some(), "{settings}");

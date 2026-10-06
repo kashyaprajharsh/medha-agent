@@ -33,29 +33,81 @@ fn tag(directory: &Path) -> String {
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-/// A socket's path may be only about a hundred bytes. One that would be longer
-/// beside the token, under a deep home, goes in a short private folder; the
-/// `address` file says where, so a client never works the path out for itself.
+/// A socket's path may be only about a hundred bytes.
 #[cfg(unix)]
-fn address(directory: &Path, channel: &str) -> String {
-    const SOCKET_PATH: usize = 100;
-    let beside = directory.join(format!("{channel}.sock"));
-    let place = if beside.as_os_str().len() < SOCKET_PATH {
-        beside
-    } else {
-        // TMPDIR itself can be deeply nested. This user-owned private folder
-        // under the system's short temporary root has a bounded socket path.
-        std::path::PathBuf::from("/tmp")
-            .join(format!("medha-{}", tag(directory)))
-            .join(format!("{channel}.sock"))
+const SOCKET_PATH: usize = 100;
+#[cfg(unix)]
+const NOWHERE_SHORT: &str = "The path to Medha's home is too long for a local socket, and no shorter folder of your own was found. Set MEDHA_HOME to a shorter path, or TMPDIR to a short folder that only you can write in.";
+
+/// A socket that would have too long a path beside the token, under a deep
+/// home, goes in a short folder that is this user's alone; the `address` file
+/// says where, so a client never works the path out for itself. It never goes
+/// where others can write: whoever made its folder there first could keep the
+/// backend from starting.
+#[cfg(unix)]
+fn address(directory: &Path, channel: &str) -> anyhow::Result<String> {
+    let name = format!("{channel}.sock");
+    let own = format!("medha-{}", tag(directory));
+    let elsewhere = own_roots()
+        .into_iter()
+        .filter(|root| is_only_mine(root))
+        .map(|root| root.join(&own).join(&name));
+    std::iter::once(directory.join(&name))
+        .chain(elsewhere)
+        .find(|place| place.as_os_str().len() < SOCKET_PATH)
+        .map(|place| place.display().to_string())
+        .ok_or_else(|| anyhow::anyhow!(NOWHERE_SHORT))
+}
+
+/// Where the system keeps what is this user's alone, the most fitting first.
+#[cfg(unix)]
+fn own_roots() -> Vec<PathBuf> {
+    // Where a login session's sockets belong, on systems that have such a place.
+    let session = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let mut roots: Vec<PathBuf> = session.into_iter().collect();
+    roots.push(std::env::temp_dir());
+    // What `TMPDIR` names may itself be deep; the system's own answer is not.
+    #[cfg(target_os = "macos")]
+    roots.extend(user_temp());
+    roots
+}
+
+#[cfg(target_os = "macos")]
+fn user_temp() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut named = [0u8; 1024];
+    // SAFETY: `named` is writable for the length given.
+    let length = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            named.as_mut_ptr().cast(),
+            named.len(),
+        )
     };
-    place.display().to_string()
+    // The length counts the byte that ends the name.
+    (2..=named.len())
+        .contains(&length)
+        .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&named[..length - 1])))
+}
+
+/// A folder of this user's that nobody else may write in.
+#[cfg(unix)]
+fn is_only_mine(folder: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    folder.is_absolute()
+        && std::fs::metadata(folder).is_ok_and(|found| {
+            // SAFETY: `geteuid` only reads this process's own identity.
+            found.is_dir() && found.uid() == unsafe { libc::geteuid() } && found.mode() & 0o022 == 0
+        })
 }
 
 /// Pipe names are machine-wide, so the name is taken from this user's own folder.
 #[cfg(windows)]
-fn address(directory: &Path, channel: &str) -> String {
-    format!(r"\\.\pipe\medha-serve-{channel}-{}", tag(directory))
+fn address(directory: &Path, channel: &str) -> anyhow::Result<String> {
+    Ok(format!(
+        r"\\.\pipe\medha-serve-{channel}-{}",
+        tag(directory)
+    ))
 }
 
 /// The shared MCP host, running until the backend stops it.
@@ -82,7 +134,7 @@ impl McpHost {
 /// A chat that finds no host answering runs its own, as it does without a backend.
 fn shared_mcp(directory: &Path) -> anyhow::Result<McpHost> {
     let endpoint = mcp::hub::Endpoint {
-        address: address(directory, "mcp"),
+        address: address(directory, "mcp")?,
         token: new_token()?,
     };
     let (address, token) = (endpoint.address.clone(), endpoint.token.as_str().into());
@@ -239,7 +291,7 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
         .init();
 
     let token: Arc<str> = new_token()?.into();
-    let address = address(&directory, "backend");
+    let address = address(&directory, "backend")?;
     let listener =
         wire::bind(&address).with_context(|| format!("could not listen on {address}"))?;
     let mcp_host = shared_mcp(&directory)?;
@@ -317,3 +369,7 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
     std::mem::forget(lock);
     outcome
 }
+
+#[cfg(all(test, unix))]
+#[path = "serve_tests.rs"]
+mod tests;

@@ -676,11 +676,28 @@ pub trait EventLog: Send + Sync {
     /// This is what makes rewind non-destructive. `at_event` is a cut *before* it.
     /// The default impl rebuilds via [`Self::events`] + [`Self::append`].
     async fn fork(&self, session: Ulid, at_event: Ulid) -> Result<Ulid, KernelError> {
+        let new_id = Ulid::new();
+        self.fork_as(session, at_event, new_id).await?;
+        Ok(new_id)
+    }
+
+    /// The caller reserves this fresh id before publishing its first event.
+    /// Event contents and hash construction are identical to `fork`.
+    async fn fork_as(
+        &self,
+        session: Ulid,
+        at_event: Ulid,
+        new_id: Ulid,
+    ) -> Result<(), KernelError> {
+        if new_id == session || !self.checked_events(new_id).await?.is_empty() {
+            return Err(KernelError::Log(
+                "a fork needs a fresh conversation id".into(),
+            ));
+        }
         let events = self.checked_events(session).await?;
         let idx = cut_index(&events, at_event).ok_or_else(|| {
             KernelError::Log(format!("event {at_event} not in session {session}"))
         })?;
-        let new_id = Ulid::new();
         // Fresh timestamps keep the branch visible in newest-first session
         // lists; the increment preserves intra-fork order.
         let forked_at = now_ts();
@@ -695,7 +712,7 @@ pub trait EventLog: Send + Sync {
             };
             self.append(clone).await?;
         }
-        Ok(new_id)
+        Ok(())
     }
 }
 

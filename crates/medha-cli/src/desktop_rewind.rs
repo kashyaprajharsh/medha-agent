@@ -78,16 +78,17 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
     if agents.is_some_and(|control| !control.adopt(session.id)) {
         return Err("An agent is still starting. Rewind was not applied.".into());
     }
-    let new_id = if scope != "code" {
-        Some(
-            kernel
-                .log
-                .fork(session.id, at)
-                .await
-                .map_err(|e| e.to_string())?,
-        )
+    let (new_id, claim) = if scope != "code" {
+        let id = Ulid::new();
+        let claim = kernel.reserve_session(id)?;
+        kernel
+            .log
+            .fork_as(session.id, at, id)
+            .await
+            .map_err(|error| error.to_string())?;
+        (Some(id), claim)
     } else {
-        None
+        (None, None)
     };
     let mut restored = 0;
     if scope != "conversation" {
@@ -132,6 +133,7 @@ pub(crate) async fn rewind<P: Provider, L: EventLog>(
         transcript.clear();
         transcript.push(system);
         transcript.extend(kernel::project_messages(&events[..index]));
+        kernel.adopt_session(claim);
         session.id = id;
         session.done = false;
     }

@@ -423,6 +423,36 @@ pub enum StopReason {
 #[path = "hook_points.rs"]
 mod hook_points;
 
+/// Application-level ownership, independent of the kernel's storage adapter.
+pub trait SessionOwner: Send + Sync {
+    fn reserve(&self, session: ulid::Ulid) -> Result<SessionClaim, String>;
+    fn adopt(&self, claim: SessionClaim);
+}
+
+/// Holds a reservation while an asynchronous replay or fork is prepared.
+#[derive(Clone)]
+pub struct SessionClaim {
+    pub session: ulid::Ulid,
+    _guard: Arc<dyn Send + Sync>,
+}
+
+impl SessionClaim {
+    pub fn new(session: ulid::Ulid, guard: Arc<dyn Send + Sync>) -> Self {
+        Self {
+            session,
+            _guard: guard,
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionClaim")
+            .field("session", &self.session)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct Kernel<P: Provider, L: EventLog> {
     pub provider: Arc<P>,
     pub log: Arc<L>,
@@ -458,6 +488,8 @@ pub struct Kernel<P: Provider, L: EventLog> {
     /// Derived for a sub-agent: agent start/stop hooks describe it instead of
     /// session and prompt hooks.
     sub_agent: bool,
+    /// Ownership outlives the tool graph and adapters' destructured startup data.
+    session_owner: Option<Arc<dyn SessionOwner>>,
 }
 
 /// Tool-result payloads larger than this spill to the artifact store and are
@@ -555,6 +587,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             settle_grace: TOOL_SETTLE_GRACE,
             started_sessions: Arc::default(),
             sub_agent: false,
+            session_owner: None,
         }
     }
 
@@ -588,6 +621,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             settle_grace: self.settle_grace,
             started_sessions: Arc::clone(&self.started_sessions),
             sub_agent: true,
+            session_owner: self.session_owner.clone(),
         }
     }
 
@@ -658,6 +692,28 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     pub fn with_hooks(mut self, hooks: Arc<dyn crate::hooks::HookRunner>) -> Self {
         self.hooks = hooks;
         self
+    }
+
+    pub fn with_session_owner(mut self, owner: Arc<dyn SessionOwner>) -> Self {
+        self.session_owner = Some(owner);
+        self
+    }
+
+    pub fn session_owner(&self) -> Option<Arc<dyn SessionOwner>> {
+        self.session_owner.clone()
+    }
+
+    pub fn reserve_session(&self, session: ulid::Ulid) -> Result<Option<SessionClaim>, String> {
+        self.session_owner
+            .as_ref()
+            .map(|owner| owner.reserve(session))
+            .transpose()
+    }
+
+    pub fn adopt_session(&self, claim: Option<SessionClaim>) {
+        if let (Some(owner), Some(claim)) = (&self.session_owner, claim) {
+            owner.adopt(claim);
+        }
     }
 
     /// Override the post-cancel tool settle window (tests use a short one).
@@ -1069,6 +1125,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         sink: &dyn StreamSink,
         interrupts: Option<crate::interrupts::InterruptQueue>,
     ) -> Result<(Vec<Message>, StopReason), KernelError> {
+        // A turn always keeps its own reservation, even if a surface switches
+        // the idle conversation owner later. Refuse before writing any event.
+        let _claim = self.reserve_session(session.id).map_err(KernelError::Log)?;
         let outcome = self
             .run_session_inner(session, messages, budget, sink, interrupts)
             .await;

@@ -1,4 +1,4 @@
-//! Credential stores (keys, tokens, browser profiles, keychains) no route or grant opens.
+//! Credential and coordination stores no route or grant opens.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -34,8 +34,9 @@ pub const CREDENTIAL_RELATIVE: &[&str] = &[
     ".cargo/credentials.toml",
     ".medha/credentials.toml",
     ".medha/credentials.lock",
-    // What admits a client to the backend; a chat that read it could drive every chat.
-    ".medha/serve/token",
+    // The token admits clients, and unlinking the singleton lock would allow
+    // two backends to own the same state. Protect the whole control directory.
+    ".medha/serve",
 ];
 
 /// Beneath the home directory on every platform.
@@ -81,6 +82,7 @@ const APP_DATA_RELATIVE: &[&str] = &[
     "Mozilla/Firefox",
     "1Password",
     "Bitwarden",
+    "Medha/instruction-locks",
 ];
 
 /// The state folder `MEDHA_HOME` names, when it is set: as closed as `~/.medha` is.
@@ -134,15 +136,19 @@ pub fn is_protected(path: &Path) -> bool {
             .collect()
     });
     let path = fold(&lexical(path));
-    roots.iter().any(|root| path.starts_with(root)) || is_trust_file(&path)
+    roots.iter().any(|root| path.starts_with(root)) || is_state_control(&path)
 }
 
-/// Medha's own grants; a file tool that could write them would approve itself.
-fn is_trust_file(path: &Path) -> bool {
-    let named = path
+/// Medha's own grants and leases. An agent that could unlink a held lease
+/// could let another process lock a different inode for the same conversation.
+fn is_state_control(path: &Path) -> bool {
+    let grants = path
         .file_name()
         .is_some_and(|name| name == "trust.lock" || name == "lock_trust.toml");
-    named
+    let leases = path
+        .components()
+        .any(|part| part.as_os_str() == "session-leases");
+    (grants || leases)
         && (path.components().any(|part| part.as_os_str() == ".medha")
             || named_state_dir().is_some_and(|state| {
                 [Some(lexical(&state)), state.canonicalize().ok()]
@@ -171,5 +177,29 @@ fn fold(path: &Path) -> PathBuf {
         PathBuf::from(path.to_string_lossy().to_lowercase())
     } else {
         path.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordination_files_are_closed_without_closing_workspace_data() {
+        let home = dirs::home_dir().unwrap();
+        assert!(is_protected(&home.join(".medha/serve/lock")));
+        assert!(is_protected(&home.join(".medha/serve/address")));
+        assert!(is_protected(
+            &home.join(".medha/projects/folder/session-leases/chat.lock")
+        ));
+        assert!(is_protected(
+            &home.join(".medha/projects/folder/session-leases")
+        ));
+        assert!(!is_protected(
+            &home.join(".medha/projects/folder/events.db")
+        ));
+        assert!(!is_protected(
+            &home.join("project/session-leases/chat.lock")
+        ));
     }
 }

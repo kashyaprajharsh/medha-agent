@@ -455,7 +455,17 @@ pub(crate) enum TuiEvent {
     /// `/usage` finished reading the log.
     UsageReport(String),
     /// A past session's events were replayed into a transcript; swap to it.
-    Resumed(ulid::Ulid, Vec<Message>, Vec<kernel::Event>),
+    Resumed(
+        ulid::Ulid,
+        Vec<Message>,
+        Vec<kernel::Event>,
+        Option<kernel::SessionClaim>,
+    ),
+    ResumeFailed {
+        source: ulid::Ulid,
+        target: ulid::Ulid,
+        error: String,
+    },
     /// `/rewind` completed loading this session's rewind points from the log.
     RewindPointsLoaded(Vec<RewindPoint>),
     MemoryProvenance(Box<memory::MemoryEntry>, Option<kernel::Event>),
@@ -477,6 +487,7 @@ pub(crate) enum TuiEvent {
         rolled: usize,
         scope: RewindScope,
         prefill: Option<(String, Vec<crate::attachments::Attachment>)>,
+        claim: Option<kernel::SessionClaim>,
     },
     RewindFailed {
         source: ulid::Ulid,
@@ -1943,6 +1954,7 @@ struct Model {
     /// An asynchronous resume/rewind owns the session boundary until its
     /// terminal event. Composer submissions and other boundaries wait.
     session_op: Option<SessionOp>,
+    session_owner: Option<Arc<dyn kernel::SessionOwner>>,
     /// Detached follow-up admissions not yet visible in the active roster.
     pending_agent_launches: usize,
     /// User messages accepted by a child but not yet reported as applied or
@@ -2295,6 +2307,7 @@ impl Model {
             autonomy: kernel::AutonomyLevel::Careful,
             running: false,
             session_op: None,
+            session_owner: None,
             pending_agent_launches: 0,
             pending_agent_steers: 0,
             agent_report_deferred: false,
@@ -3271,6 +3284,7 @@ where
     plugins::refresh_commands(&mut model);
     model.apply_plugins = Some(Arc::new(move || live_plugins.apply()));
     model.agents = agents;
+    model.session_owner = kernel.session_owner();
     model.autonomy = session.autonomy;
     model.streaming = kernel.provider.streaming();
     // First run (nothing configured) or explicit `medha --setup`: open the

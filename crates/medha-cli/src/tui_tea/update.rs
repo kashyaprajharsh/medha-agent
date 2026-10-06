@@ -1363,11 +1363,35 @@ pub(super) fn handle_key<P, L>(
                         target: id,
                     });
                     let log = kernel.log.clone();
+                    let owner = kernel.session_owner();
+                    let source = session.id;
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        let events = log.events(id).await;
+                        let claim = match owner.as_ref().map(|owner| owner.reserve(id)).transpose()
+                        {
+                            Ok(claim) => claim,
+                            Err(error) => {
+                                let _ = tx.send(TuiEvent::ResumeFailed {
+                                    source,
+                                    target: id,
+                                    error,
+                                });
+                                return;
+                            }
+                        };
+                        let events = match log.checked_events(id).await {
+                            Ok(events) => events,
+                            Err(error) => {
+                                let _ = tx.send(TuiEvent::ResumeFailed {
+                                    source,
+                                    target: id,
+                                    error: error.to_string(),
+                                });
+                                return;
+                            }
+                        };
                         let msgs = kernel::project_messages(&events);
-                        let _ = tx.send(TuiEvent::Resumed(id, msgs, events));
+                        let _ = tx.send(TuiEvent::Resumed(id, msgs, events, claim));
                     });
                     model.picker = None;
                     model.push_notice(format!("(loading session {id} …)"));
@@ -2837,7 +2861,19 @@ pub(super) fn handle_agent_event(
         }
         // A past session's events were replayed — swap session id, rebuild the
         // transcript (keeping the system message at [0]), and repaint the items.
-        TuiEvent::Resumed(id, msgs, memory_events) => {
+        TuiEvent::ResumeFailed {
+            source,
+            target,
+            error,
+        } => {
+            if session.id == source
+                && model.session_op == Some(SessionOp::Resume { source, target })
+            {
+                model.session_op = None;
+                model.push_notice(format!("could not resume: {error}"));
+            }
+        }
+        TuiEvent::Resumed(id, msgs, memory_events, claim) => {
             let expected = matches!(
                 model.session_op,
                 Some(SessionOp::Resume { source, target })
@@ -2856,7 +2892,7 @@ pub(super) fn handle_agent_event(
                 );
                 return;
             }
-            if !adopt_session(model, id) {
+            if !adopt_session(model, id, claim) {
                 model.push_notice("(resume dropped — agent admission crossed the boundary)");
                 return;
             }
@@ -3035,6 +3071,7 @@ pub(super) fn handle_agent_event(
             rolled,
             scope,
             prefill,
+            claim,
         } => {
             if !matches!(model.session_op, Some(SessionOp::Rewind { source: expected }) if expected == source)
                 || session.id != source
@@ -3057,7 +3094,7 @@ pub(super) fn handle_agent_event(
                 }
             };
             if let Some(id) = new_id {
-                if !adopt_session(model, id) {
+                if !adopt_session(model, id, claim) {
                     model.push_notice(
                         "rewind finished, but an agent admission prevented switching branches",
                     );
@@ -4984,6 +5021,7 @@ fn spawn_rewind<L: EventLog + 'static>(
 ) {
     let log = kernel.log.clone();
     let artifacts = kernel.artifacts.clone();
+    let owner = kernel.session_owner();
     let tx = tx.clone();
     tokio::spawn(async move {
         // Keep planning, file restoration, and any conversation fork inside
@@ -5025,7 +5063,7 @@ fn spawn_rewind<L: EventLog + 'static>(
 
         // Conversation rewind: fork before the prompt (non-destructive), replay
         // the kept history, and prefill the prompt for editing/re-sending.
-        let (new_id, msgs, memory_events, prefill) = if scope.touches_conversation() {
+        let (new_id, msgs, memory_events, prefill, claim) = if scope.touches_conversation() {
             let selected = &events[idx];
             let text = selected
                 .payload
@@ -5059,8 +5097,23 @@ fn spawn_rewind<L: EventLog + 'static>(
                     return;
                 }
             };
-            let new_id = match log.fork(session_id, at_event).await {
-                Ok(id) => id,
+            let new_id = ulid::Ulid::new();
+            let claim = match owner
+                .as_ref()
+                .map(|owner| owner.reserve(new_id))
+                .transpose()
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    let _ = tx.send(TuiEvent::RewindFailed {
+                        source: session_id,
+                        error,
+                    });
+                    return;
+                }
+            };
+            match log.fork_as(session_id, at_event, new_id).await {
+                Ok(()) => {}
                 Err(error) => {
                     let _ = tx.send(TuiEvent::RewindFailed {
                         source: session_id,
@@ -5076,9 +5129,10 @@ fn spawn_rewind<L: EventLog + 'static>(
                 kernel::project_messages(&events[..idx]),
                 memory_events,
                 prefill,
+                claim,
             )
         } else {
-            (None, Vec::new(), Vec::new(), None)
+            (None, Vec::new(), Vec::new(), None, None)
         };
         let _ = tx.send(TuiEvent::Rewound {
             source: session_id,
@@ -5088,6 +5142,7 @@ fn spawn_rewind<L: EventLog + 'static>(
             rolled,
             scope,
             prefill,
+            claim,
         });
     });
 }
@@ -5548,12 +5603,38 @@ fn handle_reasoning_picker_key<P: kernel::Provider>(
 }
 
 /// Re-points shared agent control to the session now owned by the surface.
-fn adopt_session(model: &Model, session: ulid::Ulid) -> bool {
-    if let Some(control) = &model.agents {
-        control.adopt(session)
-    } else {
-        true
+fn adopt_session(
+    model: &mut Model,
+    session: ulid::Ulid,
+    claim: Option<kernel::SessionClaim>,
+) -> bool {
+    let claim = match claim
+        .map(Ok)
+        .or_else(|| {
+            model
+                .session_owner
+                .as_ref()
+                .map(|owner| owner.reserve(session))
+        })
+        .transpose()
+    {
+        Ok(claim) => claim,
+        Err(error) => {
+            model.push_notice(format!("could not change conversation: {error}"));
+            return false;
+        }
+    };
+    if model
+        .agents
+        .as_ref()
+        .is_some_and(|control| !control.adopt(session))
+    {
+        return false;
     }
+    if let (Some(owner), Some(claim)) = (&model.session_owner, claim) {
+        owner.adopt(claim);
+    }
+    true
 }
 
 /// Clears projected conversation and starts a fresh event-log session while idle.
@@ -5571,7 +5652,7 @@ fn do_clear(model: &mut Model, session: &mut Session, transcript: &mut Vec<Messa
         return;
     }
     let next = Session::new();
-    if !adopt_session(model, next.id) {
+    if !adopt_session(model, next.id, None) {
         model.push_notice("an agent admission is still starting — clear was not applied");
         return;
     }
@@ -9050,6 +9131,33 @@ mod agent_pane_tests {
         assert_eq!(session.id, source);
         assert_eq!(transcript.len(), 2);
         assert_eq!(m.session_op, Some(SessionOp::Resume { source, target }));
+    }
+
+    #[test]
+    fn clear_and_resume_switch_ownership_without_replacing_a_busy_conversation() {
+        use runtime::lease::{Ownership, SessionLease};
+        let (mut model, _workspace) = model();
+        let state = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        let source = session.id;
+        model.session_owner = Some(Arc::new(Ownership::new(
+            state.path().to_path_buf(),
+            SessionLease::acquire(state.path(), source).unwrap(),
+        )));
+        let mut transcript = vec![Message::system("S"), Message::user("keep")];
+        do_clear(&mut model, &mut session, &mut transcript);
+        assert_ne!(session.id, source);
+        assert!(SessionLease::acquire(state.path(), session.id).is_err());
+        drop(SessionLease::acquire(state.path(), source).unwrap());
+
+        let target = ulid::Ulid::new();
+        let busy = SessionLease::acquire(state.path(), target).unwrap();
+        assert!(!adopt_session(&mut model, target, None));
+        assert!(SessionLease::acquire(state.path(), session.id).is_err());
+        drop(busy);
+        assert!(adopt_session(&mut model, target, None));
+        assert!(SessionLease::acquire(state.path(), target).is_err());
+        assert!(SessionLease::acquire(state.path(), session.id).is_ok());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Builds one chat on an opened workspace: its sandbox, tools, agents, context and kernel.
 
 use crate::approvals::{approve_list_from, unknown_approvals};
+use crate::lease::{Ownership, SessionLease};
 use crate::model::Model;
 use crate::verify::CommandVerifier;
 use crate::{
@@ -97,6 +98,41 @@ pub async fn start(
     let medha_home = workspace_home.home.clone();
     let logs_dir = state.join("logs");
     let crate::workspace::Store { log, artifacts } = workspace_home.open_store()?;
+
+    // Acquire ownership before loading a resume snapshot or doing session
+    // setup. An ownership failure must never become a silent fresh chat.
+    let (mut session, resumed, lease) =
+        match resolve_resume(&log, &state, &options.resume, notices).await {
+            Ok(Some((id, messages, lease))) => {
+                notices.say(&format!(
+                    "resumed session {id} ({} prior messages)",
+                    messages.len()
+                ));
+                (
+                    Session {
+                        id,
+                        done: false,
+                        autonomy: kernel::AutonomyLevel::Careful,
+                    },
+                    messages,
+                    lease,
+                )
+            }
+            Ok(None) => {
+                let session = Session::new();
+                let lease = SessionLease::acquire(&state, session.id)?;
+                (session, Vec::new(), lease)
+            }
+            Err(error) if error.is::<LeaseFailure>() => return Err(error),
+            Err(error) => {
+                notices.say(&format!(
+                    "resume failed: {error} — starting a fresh session"
+                ));
+                let session = Session::new();
+                let lease = SessionLease::acquire(&state, session.id)?;
+                (session, Vec::new(), lease)
+            }
+        };
 
     // A model with no image input is not a dead end when an auxiliary vision
     // profile is configured: the kernel has it describe the image instead.
@@ -763,7 +799,8 @@ pub async fn start(
     )
     .with_pricing(pricing)
     .with_max_parallel_tools(max_parallel_tools)
-    .with_hooks(Arc::new(hook_runner));
+    .with_hooks(Arc::new(hook_runner))
+    .with_session_owner(Arc::new(Ownership::new(state.clone(), lease)));
     if let Some(auxiliary) = auxiliary_vision {
         kernel = kernel.with_vision(auxiliary);
     }
@@ -775,7 +812,9 @@ pub async fn start(
     if let Ok(mut slot) = agent_parent.lock() {
         *slot = Some(Arc::downgrade(&kernel.executor));
     }
-    agent_runner.install(Arc::new(agents::KernelRunner::new(&kernel, surface.agents)));
+    agent_runner.install(Arc::new(
+        agents::KernelRunner::new(&kernel, surface.agents).with_lease_directory(state.clone()),
+    ));
 
     let configured_persona = model_profiles
         .lock()
@@ -823,28 +862,6 @@ pub async fn start(
         system.push_str("\n\n");
         system.push_str(&skills_manifest);
     }
-    // Resumed turns append to the original session.
-    let (mut session, resumed) = match resolve_resume(&log, &options.resume, notices).await {
-        Ok(Some((id, msgs))) => {
-            notices.say(&format!(
-                "resumed session {id} ({} prior messages)",
-                msgs.len()
-            ));
-            (
-                Session {
-                    id,
-                    done: false,
-                    autonomy: kernel::AutonomyLevel::Careful,
-                },
-                msgs,
-            )
-        }
-        Ok(None) => (Session::new(), Vec::new()),
-        Err(e) => {
-            notices.say(&format!("resume failed: {e} — starting a fresh session"));
-            (Session::new(), Vec::new())
-        }
-    };
     if let Ok(mut slot) = agent_session.lock() {
         *slot = Some(session.id);
     }
@@ -988,9 +1005,10 @@ pub struct Started {
 
 async fn resolve_resume(
     log: &store::SqliteLog,
+    state: &Path,
     resume: &Resume,
     notices: &dyn Notices,
-) -> Result<Option<(ulid::Ulid, Vec<Message>)>> {
+) -> Result<Option<(ulid::Ulid, Vec<Message>, SessionLease)>> {
     let id = match resume {
         Resume::Id(idstr) => ulid::Ulid::from_string(idstr.trim())
             .map_err(|_| anyhow::anyhow!("invalid session id '{idstr}'"))?,
@@ -1003,12 +1021,24 @@ async fn resolve_resume(
         },
         Resume::None => return Ok(None),
     };
+    let lease = SessionLease::acquire(state, id).map_err(|error| error.context(LeaseFailure))?;
     let events = log.checked_events(id).await?;
     if events.is_empty() {
         anyhow::bail!("session {id} has no events (not found)");
     }
-    Ok(Some((id, kernel::project_messages(&events))))
+    Ok(Some((id, kernel::project_messages(&events), lease)))
 }
+
+#[derive(Debug)]
+struct LeaseFailure;
+
+impl std::fmt::Display for LeaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("could not take ownership of the conversation")
+    }
+}
+
+impl std::error::Error for LeaseFailure {}
 
 fn toml_table_to_json(table: &toml::Table) -> serde_json::Value {
     if table.is_empty() {

@@ -5,6 +5,7 @@ pub mod approvals;
 pub mod attachments;
 pub mod budget;
 pub mod config;
+pub mod lease;
 pub mod mcp_shared;
 pub mod model;
 pub mod notices;

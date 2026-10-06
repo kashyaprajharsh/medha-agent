@@ -1036,6 +1036,7 @@ pub struct KernelRunner<P: Provider, L: EventLog> {
     /// Weak to break the kernel/executor/control-plane ownership cycle.
     kernel: std::sync::Weak<Kernel<P, L>>,
     route: AgentRoute,
+    lease_directory: Option<PathBuf>,
 }
 
 impl<P: Provider, L: EventLog> KernelRunner<P, L> {
@@ -1043,7 +1044,13 @@ impl<P: Provider, L: EventLog> KernelRunner<P, L> {
         Self {
             kernel: Arc::downgrade(kernel),
             route,
+            lease_directory: None,
         }
+    }
+
+    pub fn with_lease_directory(mut self, state: PathBuf) -> Self {
+        self.lease_directory = Some(state);
+        self
     }
 }
 
@@ -1056,7 +1063,7 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
         // Derived, not rebuilt: pricing, tool parallelism and progressive
         // context are inherited, so a child meters real cost against the tree's
         // shared ceiling and behaves like the session that spawned it.
-        let child = kernel
+        let mut child = kernel
             .derive(
                 Arc::clone(&run.executor),
                 // Its own: token accounting, the compaction latches and the last
@@ -1078,6 +1085,13 @@ impl<P: Provider + 'static, L: EventLog + 'static> ChildRunner for KernelRunner<
             // worktree, so inheriting that verifier both checks the wrong tree
             // and runs the build twice.
             .with_verifier(Arc::new(kernel::NoVerify));
+
+        if let Some(state) = &self.lease_directory {
+            let lease = crate::lease::SessionLease::acquire(state, run.session)
+                .map_err(|error| format!("{error:#}"))?;
+            child = child
+                .with_session_owner(Arc::new(crate::lease::Ownership::new(state.clone(), lease)));
+        }
 
         let session = Session {
             id: run.session,

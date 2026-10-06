@@ -1680,6 +1680,12 @@ where
             "caps": { "cards": ["approval", "diff"] },
         }),
     );
+    // A server may already be ready before this chat subscribes. Publish its
+    // initial snapshot after subscribing so startup and future changes are
+    // both observable, regardless of which finishes first.
+    if let Some(manager) = &extensions.mcp {
+        writer.notify("mcp.status", json!({ "servers": manager.status().await }));
+    }
 
     let mut transcript = crate::session_transcript(system, resumed);
     // Frame reads are capped: `lines()` would buffer a single unterminated

@@ -1680,8 +1680,19 @@ async fn a_deleted_config_takes_its_servers_away_from_the_shared_host() {
     };
     while hosted(&client.next().await) != Some(true) {}
 
+    // The host is already ready when a later chat starts. It must see that
+    // state even if no server changes after its subscription.
+    let mut later = backend.connect().await;
+    later.open(&world.folder("later-viewer")).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while hosted(&later.next().await) != Some(true) {}
+    })
+    .await
+    .expect("a chat missed the already-ready MCP snapshot");
+
     std::fs::remove_file(&config).unwrap();
     while hosted(&client.next().await) != Some(false) {}
+    while hosted(&later.next().await) != Some(false) {}
 }
 
 /// The window removes a server for the folder, the shared host lets go of it at

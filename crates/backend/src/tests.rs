@@ -611,27 +611,53 @@ async fn a_slow_request_does_not_hold_up_the_client_that_sent_it() {
 }
 
 #[tokio::test]
-async fn a_chat_tied_to_its_client_ends_with_it_and_any_other_goes_on() {
+async fn a_tied_chat_ends_with_the_last_client_watching_it_and_any_other_goes_on() {
     let backend = backend();
-    let mut leaving = connect(&backend);
+    let mut starter = connect(&backend);
     let mut watching = connect(&backend);
-    let tied = leaving
+    let tied = starter
         .ask("session.create", None, json!({"ends_with_client": true}))
         .await["result"]["session"]
         .as_str()
         .unwrap()
         .to_string();
-    let kept = leaving.open().await;
+    starter.attach(&tied, None).await;
+    let kept = starter.open().await;
     watching.attach(&tied, None).await;
 
-    drop(leaving);
-    assert_eq!(watching.event().await.1["method"], "session.ended");
-    until("the tied chat leaves the table", || backend.live() == 1).await;
+    // Whoever started it going does not end it while another client watches.
+    drop(starter);
+    assert_eq!(
+        watching.say(&tied, "still watched").await["result"]["said"],
+        "still watched"
+    );
+    assert_eq!(backend.live(), 2);
+
+    watching.ask("session.detach", Some(&tied), json!({})).await;
+    until("the tied chat ends with its last viewer", || {
+        backend.live() == 1
+    })
+    .await;
     watching.attach(&kept, None).await;
     assert_eq!(
         watching.say(&kept, "still here").await["result"]["said"],
         "still here"
     );
+}
+
+#[tokio::test]
+async fn a_tied_chat_whose_only_client_goes_ends_with_it() {
+    let backend = backend();
+    let mut only = connect(&backend);
+    let made = json!({"ends_with_client": true});
+    let tied = only.ask("session.create", None, made).await["result"]["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    only.attach(&tied, None).await;
+    assert_eq!(only.say(&tied, "here").await["result"]["said"], "here");
+    drop(only);
+    until("the tied chat ends with its client", || backend.live() == 0).await;
 }
 
 #[tokio::test]

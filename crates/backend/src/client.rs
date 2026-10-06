@@ -133,12 +133,15 @@ impl<C: Chats> Drop for Leaving<C> {
     }
 }
 
-/// Chats a client asked to end when it does, as a chat on a pipe ends with whoever held the pipe.
+/// Chats a client started tied: each ends once nobody watches it. This is the
+/// client's list of them, for the one case the chat cannot see for itself: its
+/// starter going before anyone watched it at all.
 #[derive(Clone, Default)]
 struct Tied(Arc<Mutex<Vec<Weak<Session>>>>);
 
 impl Tied {
     fn add(&self, session: &Arc<Session>) {
+        session.tie();
         let mut tied = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         tied.retain(|chat| chat.strong_count() > 0);
         tied.push(Arc::downgrade(session));
@@ -147,7 +150,7 @@ impl Tied {
     fn close(&self) {
         let tied = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
         for session in tied.iter().filter_map(Weak::upgrade) {
-            session.close();
+            session.close_if_unwatched();
         }
     }
 }

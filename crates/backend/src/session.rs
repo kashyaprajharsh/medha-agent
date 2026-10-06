@@ -2,7 +2,7 @@
 //! recent part kept for a client that comes back, and answers routed to whoever asked.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -32,6 +32,7 @@ pub(crate) struct Session {
     input: mpsc::Sender<String>,
     waiting: Arc<AtomicUsize>,
     closing: CancellationToken,
+    tied: AtomicBool,
     stream: Mutex<Stream>,
 }
 
@@ -85,6 +86,7 @@ impl Session {
             input: asked,
             waiting,
             closing,
+            tied: AtomicBool::new(false),
             stream: Mutex::default(),
         })
     }
@@ -122,7 +124,26 @@ impl Session {
     }
 
     pub(crate) fn detach(&self, client: u64) {
-        self.stream().viewers.remove(&client);
+        let unwatched = {
+            let mut stream = self.stream();
+            stream.viewers.remove(&client).is_some() && stream.viewers.is_empty()
+        };
+        if unwatched && self.tied.load(Ordering::Relaxed) {
+            self.close();
+        }
+    }
+
+    /// Makes this a chat that ends once nobody is left watching it: with its
+    /// last client, not with whichever client happened to start it.
+    pub(crate) fn tie(&self) {
+        self.tied.store(true, Ordering::Relaxed);
+    }
+
+    /// For a tied chat whose starter has gone: one nobody ever watched ends now.
+    pub(crate) fn close_if_unwatched(&self) {
+        if self.stream().viewers.is_empty() {
+            self.close();
+        }
     }
 
     /// Asked of this chat itself: an earlier chat of the same id is another chat.
@@ -238,9 +259,16 @@ impl Session {
                 None => break,
             }
         }
+        let watched = stream.viewers.len();
         stream
             .viewers
             .retain(|_, viewer| viewer.send(event.clone()));
+        // A client dropped for falling behind has left like any other.
+        let unwatched = watched > 0 && stream.viewers.is_empty();
+        drop(stream);
+        if unwatched && self.tied.load(Ordering::Relaxed) {
+            self.close();
+        }
     }
 }
 

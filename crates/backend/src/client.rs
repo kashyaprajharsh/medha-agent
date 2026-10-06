@@ -18,6 +18,7 @@ const QUEUE: usize = KEPT_FRAMES + 1024;
 
 /// What may wait for one client, in bytes: a full replay, the largest answer, and room beside them.
 pub(crate) const QUEUED_BYTES: usize = 4 * wire::MAX_FRAME;
+pub(crate) const TOO_LARGE: &str = "the answer is too large to send at once";
 
 #[derive(Clone)]
 pub(crate) struct Client {
@@ -42,7 +43,7 @@ impl Client {
     }
 
     /// An answer no client could read is refused in a few words, not sent to break its connection.
-    fn reply(&self, id: Option<Value>, outcome: Result<Value, Failure>) {
+    pub(crate) fn reply(&self, id: Option<Value>, outcome: Result<Value, Failure>) {
         let Some(id) = id else { return };
         let failed = |(code, message): Failure| json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } });
         let frame = match outcome {
@@ -51,7 +52,7 @@ impl Client {
         };
         let mut line = frame.to_string();
         if line.len() >= wire::MAX_FRAME {
-            line = failed(refused("the answer is too large to send at once")).to_string();
+            line = failed(refused(TOO_LARGE)).to_string();
         }
         line.push('\n');
         self.send(line.into());

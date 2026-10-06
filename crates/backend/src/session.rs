@@ -24,33 +24,49 @@ pub(crate) const CHAT_FRAME: usize = wire::MAX_FRAME - 1024;
 pub(crate) const INPUT_FRAMES: usize = 256;
 const INPUT_BYTES: usize = 2 * wire::MAX_FRAME;
 const BUSY: &str = "this chat has not read what it was already sent; try again in a moment";
+const TOO_LARGE: &str = "this is too large to send to a chat at once";
+
+/// What stops a turn, or answers something the chat itself asked, has a little
+/// room of its own, so a chat with everything else waiting can still be told.
+pub(crate) const URGENT_FRAMES: usize = 32;
+const URGENT_BYTES: usize = 64 * 1024;
 
 pub(crate) struct Session {
     pub(crate) id: String,
     about: Value,
     /// What the chat is asked, in the order it was asked.
     input: mpsc::Sender<String>,
+    /// What it is told ahead of that.
+    urgent: mpsc::Sender<String>,
     waiting: Arc<AtomicUsize>,
     closing: CancellationToken,
     tied: AtomicBool,
     stream: Mutex<Stream>,
 }
 
-/// Writes to the chat one request at a time. Dropping its input, when it is told
-/// to close or the chat stops taking any, is how a chat is asked to finish.
+/// Writes to the chat one request at a time, what is urgent before what is
+/// waiting. Dropping its input, when it is told to close or the chat stops
+/// taking any, is how a chat is asked to finish.
 async fn feed(
     mut input: Input,
     mut asked: mpsc::Receiver<String>,
+    mut urgent: mpsc::Receiver<String>,
     waiting: Arc<AtomicUsize>,
     closing: CancellationToken,
 ) {
     loop {
         let line = tokio::select! {
+            biased;
             () = closing.cancelled() => break,
-            line = asked.recv() => line,
+            Some(line) = urgent.recv() => line,
+            line = asked.recv() => match line {
+                Some(line) => {
+                    waiting.fetch_sub(line.len(), Ordering::Relaxed);
+                    line
+                }
+                None => break,
+            },
         };
-        let Some(line) = line else { break };
-        waiting.fetch_sub(line.len(), Ordering::Relaxed);
         let written =
             async { input.write_all(line.as_bytes()).await.is_ok() && input.flush().await.is_ok() };
         let written = tokio::select! {
@@ -78,12 +94,15 @@ struct Stream {
 impl Session {
     pub(crate) fn new(id: String, about: Value, input: Input) -> Arc<Self> {
         let (asked, queued) = mpsc::channel(INPUT_FRAMES);
+        let (urgent, ahead) = mpsc::channel(URGENT_FRAMES);
         let (waiting, closing) = (Arc::<AtomicUsize>::default(), CancellationToken::new());
-        tokio::spawn(feed(input, queued, Arc::clone(&waiting), closing.clone()));
+        let feeding = feed(input, queued, ahead, Arc::clone(&waiting), closing.clone());
+        tokio::spawn(feeding);
         Arc::new(Self {
             id,
             about,
             input: asked,
+            urgent,
             waiting,
             closing,
             tied: AtomicBool::new(false),
@@ -155,10 +174,25 @@ impl Session {
     ///
     /// Never waits on the chat: the request joins what the chat has yet to read,
     /// or is refused when that is full, so the client's other requests go on.
+    ///
+    /// What stops a turn or answers the chat's own question is read before
+    /// requests still waiting, in the order those were sent. A chat reads it
+    /// when it next reads anything: only closing reaches one that has stopped reading.
     pub(crate) fn forward(&self, client: &Client, mut frame: Value) -> Result<(), String> {
         if self.closing.is_cancelled() {
             return Err("this chat has ended".into());
         }
+        let ahead = matches!(
+            frame["method"].as_str(),
+            Some(
+                "cancel"
+                    | "interrupt"
+                    | "approval.respond"
+                    | "question.respond"
+                    | "shutdown"
+                    | "exit"
+            )
+        );
         let mut given = None;
         if let Some(asked) = frame.get("id").cloned() {
             let mut stream = self.stream();
@@ -171,13 +205,26 @@ impl Session {
         let mut line = frame.to_string();
         line.push('\n');
         let bytes = line.len();
-        let room = self.waiting.fetch_add(bytes, Ordering::Relaxed) + bytes <= INPUT_BYTES;
-        let refused = match room.then(|| self.input.try_send(line)) {
-            Some(Ok(())) => return Ok(()),
-            Some(Err(mpsc::error::TrySendError::Closed(_))) => "this chat has ended",
-            Some(Err(mpsc::error::TrySendError::Full(_))) | None => BUSY,
+        let sent = if bytes > wire::MAX_FRAME {
+            Err(TOO_LARGE)
+        } else if ahead && bytes <= URGENT_BYTES {
+            self.urgent.try_send(line).map_err(|refused| match refused {
+                mpsc::error::TrySendError::Closed(_) => "this chat has ended",
+                mpsc::error::TrySendError::Full(_) => BUSY,
+            })
+        } else {
+            let room = self.waiting.fetch_add(bytes, Ordering::Relaxed) + bytes <= INPUT_BYTES;
+            let sent = match room.then(|| self.input.try_send(line)) {
+                Some(Ok(())) => Ok(()),
+                Some(Err(mpsc::error::TrySendError::Closed(_))) => Err("this chat has ended"),
+                Some(Err(mpsc::error::TrySendError::Full(_))) | None => Err(BUSY),
+            };
+            if sent.is_err() {
+                self.waiting.fetch_sub(bytes, Ordering::Relaxed);
+            }
+            sent
         };
-        self.waiting.fetch_sub(bytes, Ordering::Relaxed);
+        let Err(refused) = sent else { return Ok(()) };
         if let Some(id) = given {
             self.stream().asked.remove(&id);
         }
@@ -201,8 +248,13 @@ impl Session {
                 Ok(read) if read > 0 => {}
                 _ => break,
             }
-            // No client could read a frame this large. The rest of it is passed over and the chat goes on.
+            // No client could read a frame this large. Whoever it answers is told so, the
+            // rest of it is passed over, and the chat goes on.
             if line.len() > CHAT_FRAME {
+                let asked = answered(&line).and_then(|given| self.stream().asked.remove(&given));
+                if let Some((client, id)) = asked {
+                    client.reply(Some(id), Err(crate::refused(crate::client::TOO_LARGE)));
+                }
                 while !line.ends_with(b"\n") {
                     line.clear();
                     let rest = (&mut reader).take(64 * 1024);
@@ -270,6 +322,36 @@ impl Session {
             self.close();
         }
     }
+}
+
+/// The id a frame carries, read from the start of one too large to read whole.
+fn answered(start: &[u8]) -> Option<String> {
+    struct Id<'a>(&'a mut Option<String>);
+    impl<'de> serde::de::Visitor<'de> for Id<'_> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a frame")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut frame: A) -> Result<(), A::Error> {
+            while let Some(key) = frame.next_key::<String>()? {
+                if key == "id" {
+                    *self.0 = frame.next_value::<Value>()?.as_str().map(str::to_owned);
+                    break;
+                }
+                frame.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let mut id = None;
+    // It ends mid-frame, so reading it fails; the id is kept from before it does.
+    let _ = serde::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_slice(start),
+        Id(&mut id),
+    );
+    id
 }
 
 fn line(frame: &Value) -> Arc<str> {

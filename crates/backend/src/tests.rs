@@ -44,7 +44,13 @@ async fn chat(input: DuplexStream, mut output: DuplexStream) -> Result<(), Strin
             // Stops reading what it is asked, as a chat does while it waits on something else.
             Some("stall") => {
                 say(&mut output, json!({"id": id, "result": "stalled"})).await;
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+                let long = params["ms"].as_u64().unwrap_or(3_600_000);
+                tokio::time::sleep(Duration::from_millis(long)).await;
+            }
+            Some("cancel") => say(&mut output, json!({"id": id, "result": "cancelled"})).await,
+            Some("huge") => {
+                let answer = json!({"id": id, "result": "x".repeat(wire::MAX_FRAME)});
+                say(&mut output, answer).await;
             }
             Some("break") => return Err("it broke".into()),
             Some("panic") => panic!("the chat panicked"),
@@ -467,6 +473,12 @@ async fn an_answer_or_a_frame_too_large_to_read_breaks_no_connection_and_no_chat
     let session = client.open().await;
     let burst = json!({"count": 1, "bytes": wire::MAX_FRAME});
     client.ask("burst", Some(&session), burst).await;
+    // An answer of the chat's own that large is not left unanswered: whoever asked is told.
+    let huge = client.ask("huge", Some(&session), json!({})).await;
+    assert_eq!(
+        huge["error"]["message"],
+        "the answer is too large to send at once"
+    );
     assert_eq!(
         client.say(&session, "after").await["result"]["said"],
         "after"
@@ -517,10 +529,67 @@ async fn a_chat_that_stops_reading_holds_up_nothing_else_and_can_still_be_closed
     let why = refused["error"]["message"].as_str().unwrap();
     assert!(why.contains("has not read"), "{why}");
 
+    // What stops a turn is taken all the same, and only so much of that.
+    let stop = json!({"method": "cancel", "session": stalled});
+    let first = client.post(stop.clone()).await;
+    for _ in 0..session::URGENT_FRAMES {
+        client.post(stop.clone()).await;
+    }
+    let refused = loop {
+        let frame = client.frame().await.expect("the connection was dropped");
+        if frame.get("error").is_some() && frame["id"].as_u64() >= Some(first) {
+            break frame;
+        }
+    };
+    assert_eq!(
+        refused["id"].as_u64(),
+        Some(first + session::URGENT_FRAMES as u64),
+        "{refused}"
+    );
+
     let closing = client.ask("session.close", Some(&stalled), json!({})).await;
     assert_eq!(closing["result"]["closing"], true);
     let after = client.say(&stalled, "after it was closed").await;
     assert_eq!(after["error"]["message"], "this chat has ended");
+}
+
+#[tokio::test]
+async fn what_stops_a_turn_is_read_before_the_requests_that_were_waiting() {
+    let backend = backend();
+    let mut client = connect(&backend);
+    let session = client.open().await;
+    let paused = client
+        .ask("stall", Some(&session), json!({"ms": 500}))
+        .await;
+    assert_eq!(paused["result"], "stalled");
+
+    // Each is more than the chat's pipe holds, so at most the first is part written
+    // by the time the chat reads again; the rest wait behind it.
+    let large = json!({"text": "x".repeat(200 * 1024)});
+    let mut waiting = Vec::new();
+    for _ in 0..4 {
+        let say = json!({"method": "say", "session": session, "params": large});
+        waiting.push(client.post(say).await);
+    }
+    let cancel = client
+        .post(json!({"method": "cancel", "session": session}))
+        .await;
+
+    let mut answered = Vec::new();
+    while answered.len() < 5 {
+        let frame = client.frame().await.expect("the connection was dropped");
+        if frame.get("method").is_none() {
+            assert!(frame.get("result").is_some(), "{frame}");
+            answered.push(frame["id"].as_u64().unwrap());
+        }
+    }
+    let at = answered.iter().position(|id| *id == cancel).unwrap();
+    assert!(
+        at <= 1,
+        "sent {waiting:?} then {cancel}, read as {answered:?}"
+    );
+    answered.remove(at);
+    assert_eq!(answered, waiting, "what was waiting lost its order");
 }
 
 #[tokio::test]

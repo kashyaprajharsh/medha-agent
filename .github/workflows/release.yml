@@ -102,23 +102,33 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-  # Invoke the reusable CI workflow at the immutable release SHA. Unlike an API
-  # lookup, this dependency waits through queued/running jobs and can only pass
-  # after every CI job succeeds. Dry-run dispatches still exercise packaging only.
+  # Reuse all required jobs at the immutable release SHA, including partial
+  # reruns. Missing/failed CI refuses publishing; queued CI is awaited.
   ci:
     name: CI at release SHA
     needs: validate
     if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
     permissions:
       contents: read
-    uses: ./.github/workflows/ci.yml
-    with:
-      checkout_ref: ${{ needs.validate.outputs.sha }}
+      actions: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - name: Verify completed CI without rerunning it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_CHECK_SHA: ${{ needs.validate.outputs.sha }}
+        run: python3 .github/scripts/release_ci_gate.py --repository "$GITHUB_REPOSITORY" --sha "$CI_CHECK_SHA"
 
   # Validation requires CI for publishing; dry runs exercise packaging only.
   build:
     name: ${{ matrix.target }}
-    needs: validate
+    needs: [validate, ci]
+    if: ${{ always() && needs.validate.result == 'success' && (needs.ci.result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.publish)) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -197,7 +207,8 @@ jobs:
   # The desktop app, with the `medha` program for the same target bundled inside.
   desktop:
     name: desktop ${{ matrix.target }}
-    needs: validate
+    needs: [validate, ci]
+    if: ${{ always() && needs.validate.result == 'success' && (needs.ci.result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.publish)) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -321,6 +332,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      actions: read
       id-token: write
       attestations: write
     steps:
@@ -328,6 +340,12 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
+
+      - name: Reconfirm exact-commit CI before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_CHECK_SHA: ${{ needs.validate.outputs.sha }}
+        run: python3 .github/scripts/release_ci_gate.py --repository "$GITHUB_REPOSITORY" --sha "$CI_CHECK_SHA"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:

@@ -83,6 +83,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Release CI gate
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
   # Test each published host OS before release packaging.
   test:
     name: test (${{ matrix.os }})

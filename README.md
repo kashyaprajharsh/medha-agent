@@ -122,8 +122,11 @@ The TUI and desktop can be installed separately. Both start or join one
 authenticated local backend per `MEDHA_HOME` (default `~/.medha`). Resuming a
 conversation already open in the other app adds a viewer to that same chat;
 closing one viewer leaves the others running. The backend owns turns, approvals,
-history and credentials. Compatible installations share it; replacing an
-incompatible backend is refused while it has active work.
+history and credentials. Installations that can work together share it,
+whichever release each is. After an update, a backend left running by an
+earlier release gives way to the new one once it has no active work; until
+then it keeps serving. A backend that cannot do what a client needs is asked to
+give way, and that is refused while it has active work.
 
 Type a task, press **Enter**, and approve or deny the actions it proposes as they come
 up. Press `/` for the command palette.

@@ -314,6 +314,25 @@ The gate activates when:
 | A **tool approval** | "Don't ask again **this session**." Nothing is written to disk. |
 | A **file-permission prompt** | "Trust this path." Persisted to the machine-local `$MEDHA_HOME/projects/<workspace-id>/trust.lock`. |
 
+A prompt about one file outside the workspace offers a fourth answer in the TUI
+and the desktop: **always allow this folder**. The prompt names the folder, and
+choosing it trusts that folder and everything under it for the access asked
+(read or write), in the same `trust.lock`. Nothing is written to the repository.
+
+| Answer to a path prompt | What is remembered |
+|---|---|
+| **Allow once** | Nothing |
+| **Always allow this file** | That one path |
+| **Always allow this folder** | The folder the file is in, and what is under it |
+| **Deny** | Nothing |
+
+The folder answer is only offered when the folder is a working folder. It is
+never offered for the home folder or anything above it, a folder within two
+steps of the top of a disk, a shared temporary folder, or a folder that holds
+credentials. Protected credential stores stay closed inside a trusted folder.
+A folder trusted for reading still asks before a write. Editors connected over
+ACP keep the three standard answers.
+
 > **An escalated prompt can never be remembered.** When a gate exists *only* because
 > of trust-flow escalation, the kernel passes `escalated: true` and that prompt is
 > asked afresh every single time — `Always` cannot silence it. Otherwise one "always
@@ -2460,8 +2479,16 @@ upstream changes. `/skill lock` and `/skill sync` pin a team's set.
 | `/skill list` | List available skills |
 | `/skill load <name>` | Load a skill |
 | `/skill add <path>` | Add a new skill |
+| `/skill enable <name>` | Switch a skill on (asks first) |
+| `/skill disable <name>` | Switch a skill off; it stays installed |
 | `/skill lock` | Pin skill versions |
 | `/skill sync` | Sync with team skills |
+
+A skill that carries code files is installed switched off, so its code can be
+read first. It is listed as `(disabled)` in the `/skill` list. There, Enter on
+it asks to switch it on, and Space switches any skill off or on. A skill the
+safety check flagged is always asked about before it is switched on. The
+desktop's Extensions page has the same switch.
 
 ---
 

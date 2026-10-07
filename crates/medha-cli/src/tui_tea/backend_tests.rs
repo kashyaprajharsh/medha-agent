@@ -334,6 +334,7 @@ async fn an_approval_recovered_at_the_same_barrier_keeps_its_review_position() {
             protocol::ApprovalDecision::Deny,
         ],
         folder: None,
+        path: None,
     };
     approval(&mut f.model, prompt.clone());
     f.model.approval_sel = 1;

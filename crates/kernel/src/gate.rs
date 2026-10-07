@@ -60,6 +60,31 @@ impl From<Approval> for PathApproval {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    File,
+    Directory,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathAccess {
+    Read,
+    Write,
+}
+
+/// Resolved permission target. Presentation must not infer scope from an action
+/// string or from the absence of a parent-folder choice.
+#[derive(Clone, Copy)]
+pub struct PathRequest<'a> {
+    pub action: &'a str,
+    pub detail: Option<&'a str>,
+    pub path: &'a std::path::Path,
+    pub kind: PathKind,
+    pub access: PathAccess,
+    pub folder: Option<&'a std::path::Path>,
+}
+
 /// Capabilities requested together for one command. Paths are resolved by the
 /// executor before review; these are grants, never a replacement workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -118,17 +143,14 @@ pub trait HumanGate: Send + Sync {
         }
     }
 
-    /// Ask about one path outside the workspace. `folder` is the folder that
+    /// Ask about one path outside the workspace. `request.folder` is the folder that
     /// may be remembered in its place, when there is one fit to offer. A gate
     /// that does not override this never answers with the folder: its
     /// `Always` remembers the path alone, as it did before there was a choice.
-    async fn confirm_path(
-        &self,
-        action: &str,
-        detail: Option<&str>,
-        _folder: Option<&std::path::Path>,
-    ) -> PathApproval {
-        self.confirm(action, detail, false).await.into()
+    async fn confirm_path(&self, request: PathRequest<'_>) -> PathApproval {
+        self.confirm(request.action, request.detail, false)
+            .await
+            .into()
     }
 }
 

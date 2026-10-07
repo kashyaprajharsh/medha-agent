@@ -324,14 +324,19 @@ choosing it trusts that folder and everything under it for the access asked
 | **Allow once** | Nothing |
 | **Always allow this file** | That one path |
 | **Always allow this folder** | The folder the file is in, and what is under it |
+| **Always allow this folder and its contents** | The requested directory and everything under it |
+| **Always allow this path** | The requested path when it does not yet exist or its type is unknown |
 | **Deny** | Nothing |
 
 The folder answer is only offered when the folder is a working folder. It is
 never offered for the home folder or anything above it, a folder within two
 steps of the top of a disk, a shared temporary folder, or a folder that holds
 credentials. Protected credential stores stay closed inside a trusted folder.
-A folder trusted for reading still asks before a write. Editors connected over
-ACP keep the three standard answers.
+A folder trusted for reading still asks before a write. Remembered access applies
+to future chats in this project, and Medha's file tools and sandboxed commands
+use it. Write access also permits reading. The prompt states this scope before
+approval. Editors connected over ACP currently keep Medha's three-answer policy;
+ACP itself permits additional permission options.
 
 > **An escalated prompt can never be remembered.** When a gate exists *only* because
 > of trust-flow escalation, the kernel passes `escalated: true` and that prompt is

@@ -36,8 +36,9 @@ pub use events::{
 };
 pub use executor::{BackgroundTask, Executor};
 pub use gate::{
-    Approval, AutoDeny, ExecutionAccess, HumanGate, NetworkDecision, PathApproval,
-    execution_access, execution_access_scope, network_once_active, network_once_scope,
+    Approval, AutoDeny, ExecutionAccess, HumanGate, NetworkDecision, PathAccess, PathApproval,
+    PathKind, PathRequest, execution_access, execution_access_scope, network_once_active,
+    network_once_scope,
 };
 pub use hooks::{
     HookAudit, HookBatch, HookContext, HookDirective, HookRequest, HookRunner, HookStatus, NoHooks,

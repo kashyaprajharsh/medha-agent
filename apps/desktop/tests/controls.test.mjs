@@ -735,6 +735,11 @@ test("a path approval offers each answer the backend sends, and the folder says 
       kind: "path",
       choices: ["once", "always", "folder", "deny"],
       folder: "/work/proj/src",
+      path: {
+        path: "/work/proj/src/a.txt",
+        kind: "file",
+        access: "read",
+      },
     },
   });
   const answered = [];
@@ -759,6 +764,37 @@ test("a path approval offers each answer the backend sends, and the folder says 
   assert.match(card.textContent, /Its folder: \/work\/proj\/src/);
   await click(buttons[2]);
   assert.deepEqual(answered, [[4, "folder"]]);
+});
+
+test("directory and unknown targets never claim an exact file grant", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive } = await import(await moduleUrl("live"));
+  for (const [kind, label] of [
+    ["directory", "Always allow this folder and its contents"],
+    ["unknown", "Always allow this path"],
+  ]) {
+    let state = reduceLive(startingLive(), { method: "ready", params: { session: "s" } });
+    state = reduceLive(state, { method: "approval", params: {
+      gate_id: 9, action: "Write access to /work/other/target", escalated: false,
+      kind: "path", choices: ["once", "always", "deny"],
+      path: { path: "/work/other/target", kind, access: "write" },
+    }});
+    await act(() => root.render(h(LiveTail, { state, onAnswer() {}, onApprove() {}, onOpenAgent() {} })));
+    const labels = [...document.querySelectorAll(".ask-actions button")].map(button => button.textContent);
+    assert.deepEqual(labels, ["Allow", label, "Deny"]);
+    assert.equal(labels.includes("Always allow this file"), false);
+  }
+});
+
+test("action approvals keep their action label", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive } = await import(await moduleUrl("live"));
+  let state = reduceLive(startingLive(), { method: "approval", params: {
+    gate_id: 2, action: "shell command", escalated: false,
+    kind: "action", choices: ["once", "always", "deny"],
+  }});
+  await act(() => root.render(h(LiveTail, { state, onAnswer() {}, onApprove() {}, onOpenAgent() {} })));
+  assert.deepEqual([...document.querySelectorAll(".ask-actions button")].map(button => button.textContent), ["Allow", "Always allow", "Deny"]);
 });
 
 test("a long compaction says so instead of looking stuck on Working", async () => {

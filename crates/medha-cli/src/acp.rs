@@ -480,7 +480,10 @@ impl Peer {
 enum GateAnswer {
     Action(oneshot::Sender<kernel::Approval>),
     Access(oneshot::Sender<kernel::NetworkDecision>),
-    Path(oneshot::Sender<kernel::PathApproval>),
+    Path {
+        answer: oneshot::Sender<kernel::PathApproval>,
+        folder_offered: bool,
+    },
 }
 
 pub(crate) struct PendingGate {
@@ -513,7 +516,7 @@ impl PendingGate {
                     kernel::Approval::Deny => kernel::NetworkDecision::Deny,
                 })
                 .map_err(|_| ()),
-            GateAnswer::Path(answer) => answer.send(approval.into()).map_err(|_| ()),
+            GateAnswer::Path { answer, .. } => answer.send(approval.into()).map_err(|_| ()),
         }
     }
 
@@ -528,11 +531,9 @@ impl PendingGate {
                 decision,
                 D::Approve | D::Once | D::Session | D::Persistent | D::Deny
             ),
-            GateAnswer::Path(_) => {
-                matches!(
-                    decision,
-                    D::Approve | D::Once | D::Always | D::Folder | D::Deny
-                )
+            GateAnswer::Path { folder_offered, .. } => {
+                matches!(decision, D::Approve | D::Once | D::Always | D::Deny)
+                    || (folder_offered && matches!(decision, D::Folder))
             }
         }
     }
@@ -555,7 +556,7 @@ impl PendingGate {
                     _ => kernel::NetworkDecision::Deny,
                 })
                 .map_err(|_| ()),
-            GateAnswer::Path(answer) => answer
+            GateAnswer::Path { answer, .. } => answer
                 .send(match decision {
                     D::Approve | D::Once => kernel::PathApproval::Once,
                     D::Always => kernel::PathApproval::Path,
@@ -959,6 +960,7 @@ impl kernel::HumanGate for AcpGate {
                     kind: protocol::ApprovalKind::Action,
                     choices,
                     folder: None,
+                    path: None,
                 },
             )
         };
@@ -982,23 +984,24 @@ impl kernel::HumanGate for AcpGate {
         approval
     }
 
-    /// A Medha client is offered the folder as a choice of its own. An editor
-    /// is asked as it always was: its protocol has no such choice to show.
-    async fn confirm_path(
-        &self,
-        action: &str,
-        detail: Option<&str>,
-        folder: Option<&Path>,
-    ) -> kernel::PathApproval {
+    /// Medha viewers share the same path choices. The standalone editor keeps
+    /// its existing choices by policy; ACP itself permits additional options.
+    async fn confirm_path(&self, request: kernel::PathRequest<'_>) -> kernel::PathApproval {
         if self.peer.is_acp() {
-            return self.confirm(action, detail, false).await.into();
+            return self
+                .confirm(request.action, request.detail, false)
+                .await
+                .into();
         }
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         lock_pending(&self.pending).insert(
             gate_id,
             PendingGate {
-                answer: GateAnswer::Path(tx),
+                answer: GateAnswer::Path {
+                    answer: tx,
+                    folder_offered: request.folder.is_some(),
+                },
                 escalated: false,
             },
         );
@@ -1010,16 +1013,28 @@ impl kernel::HumanGate for AcpGate {
             approved: false,
         };
         use protocol::ApprovalDecision as D;
-        let folder_choice = folder.map(|_| D::Folder);
+        let folder_choice = request.folder.map(|_| D::Folder);
         let choices = [Some(D::Once), Some(D::Always), folder_choice, Some(D::Deny)];
         let prompt = protocol::ApprovalPrompt {
             gate_id,
-            action: action.to_owned(),
-            detail: detail.map(str::to_owned),
+            action: request.action.to_owned(),
+            detail: request.detail.map(str::to_owned),
             escalated: false,
             kind: protocol::ApprovalKind::Path,
             choices: choices.into_iter().flatten().collect(),
-            folder: folder.map(|folder| folder.display().to_string()),
+            folder: request.folder.map(|folder| folder.display().to_string()),
+            path: Some(protocol::ApprovalPath {
+                path: request.path.display().to_string(),
+                kind: match request.kind {
+                    kernel::PathKind::File => protocol::PathKind::File,
+                    kernel::PathKind::Directory => protocol::PathKind::Directory,
+                    kernel::PathKind::Unknown => protocol::PathKind::Unknown,
+                },
+                access: match request.access {
+                    kernel::PathAccess::Read => protocol::PathAccess::Read,
+                    kernel::PathAccess::Write => protocol::PathAccess::Write,
+                },
+            }),
         };
         if !self.writer.notify_params("approval", &prompt) {
             return kernel::PathApproval::Deny;
@@ -1105,6 +1120,7 @@ impl AcpGate {
                 kind: protocol::ApprovalKind::Access,
                 choices,
                 folder: None,
+                path: None,
             },
         ) {
             return kernel::NetworkDecision::Deny;
@@ -3532,7 +3548,16 @@ mod tests {
             let asking = Arc::clone(&gate);
             let asked = tokio::spawn(async move {
                 let action = "Read access to /work/proj/src/a.txt";
-                asking.confirm_path(action, None, offered).await
+                asking
+                    .confirm_path(kernel::PathRequest {
+                        action,
+                        detail: None,
+                        path: Path::new("/work/proj/src/a.txt"),
+                        kind: kernel::PathKind::File,
+                        access: kernel::PathAccess::Read,
+                        folder: offered,
+                    })
+                    .await
             });
             let frame = tokio::time::timeout(Duration::from_secs(1), output.recv())
                 .await
@@ -3550,7 +3575,23 @@ mod tests {
                 None => json!(["once", "always", "deny"]),
             };
             assert_eq!(frame["params"]["choices"], choices);
+            assert_eq!(frame["params"]["path"]["kind"], "file");
             assert_eq!(prompt.folder.as_deref(), offered.and_then(Path::to_str));
+            if offered.is_none() {
+                assert!(
+                    respond_gate(&pending, prompt.gate_id, protocol::ApprovalDecision::Folder)
+                        .is_err()
+                );
+                assert_eq!(
+                    lock_pending(&pending).len(),
+                    1,
+                    "invalid answer consumed the prompt"
+                );
+                assert!(
+                    !asked.is_finished(),
+                    "an unoffered answer must not authorize access"
+                );
+            }
             dispatch_rpc(
                 json!({"jsonrpc": "2.0", "id": 91, "method": "approval.respond",
                 "params": {"gate_id": prompt.gate_id, "decision": choice}}),

@@ -456,6 +456,30 @@ pub enum ApprovalKind {
     Path,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PathKind {
+    File,
+    Directory,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PathAccess {
+    Read,
+    Write,
+}
+
+/// The resolved target reviewed by a path approval. Choices live on the prompt,
+/// so all viewers use the same answers and scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalPath {
+    pub path: String,
+    pub kind: PathKind,
+    pub access: PathAccess,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalPrompt {
     pub gate_id: u64,
@@ -469,6 +493,8 @@ pub struct ApprovalPrompt {
     /// The folder the `Folder` choice would remember.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<ApprovalPath>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1239,18 +1239,41 @@ impl PermissionManager {
             .as_ref()
             .ok_or(PermissionError::NoHumanGate)?;
 
-        let prompt = match detail {
+        let mut prompt = match detail {
             Some(detail) => detail.to_string(),
             None => format!("This path is outside the workspace: {}", resolved.display()),
         };
-
+        let kind = match std::fs::metadata(&resolved) {
+            Ok(metadata) if metadata.is_dir() => kernel::PathKind::Directory,
+            Ok(metadata) if metadata.is_file() => kernel::PathKind::File,
+            _ => kernel::PathKind::Unknown,
+        };
+        let scope = match kind {
+            kernel::PathKind::Directory => "this folder and its contents",
+            kernel::PathKind::File => "this file",
+            kernel::PathKind::Unknown => "this path",
+        };
+        prompt.push_str(&format!(
+            "\nRemembering access to {scope} applies to future chats in this project. \
+             Medha's file tools and commands can use remembered access."
+        ));
+        if permission == PermissionType::Write {
+            prompt.push_str(" Write access also permits reading.");
+        }
         let folder = folder_to_offer(&resolved);
+        let action = format!("{permission:?} access to {}", resolved.display());
         let decision = human_gate
-            .confirm_path(
-                &format!("{permission:?} access to {}", resolved.display()),
-                Some(&prompt),
-                folder.as_deref(),
-            )
+            .confirm_path(kernel::PathRequest {
+                action: &action,
+                detail: Some(&prompt),
+                path: &resolved,
+                kind,
+                access: match permission {
+                    PermissionType::Read => kernel::PathAccess::Read,
+                    PermissionType::Write => kernel::PathAccess::Write,
+                },
+                folder: folder.as_deref(),
+            })
             .await;
 
         match (decision, folder) {
@@ -1773,17 +1796,109 @@ mod tests {
             Approval::Deny
         }
 
-        async fn confirm_path(
-            &self,
-            _: &str,
-            _: Option<&str>,
-            folder: Option<&Path>,
-        ) -> kernel::PathApproval {
+        async fn confirm_path(&self, request: kernel::PathRequest<'_>) -> kernel::PathApproval {
             self.asked.fetch_add(1, Ordering::SeqCst);
-            let offered = folder.map(Path::to_path_buf);
+            let offered = request.folder.map(Path::to_path_buf);
             self.offered.lock().unwrap().push(offered);
             self.answer
         }
+    }
+
+    /// Gate presentation must describe the permission scope the manager resolved.
+    #[tokio::test]
+    async fn path_prompts_identify_target_type_access_duration_and_command_scope() {
+        struct ReviewedPath {
+            path: PathBuf,
+            kind: kernel::PathKind,
+            access: kernel::PathAccess,
+            detail: String,
+            folder: Option<PathBuf>,
+        }
+        struct ReviewingGate(Arc<std::sync::Mutex<Vec<ReviewedPath>>>);
+        #[async_trait::async_trait]
+        impl HumanGate for ReviewingGate {
+            async fn confirm(&self, _: &str, _: Option<&str>, _: bool) -> Approval {
+                panic!("permission review must carry a typed target")
+            }
+            async fn confirm_path(&self, request: kernel::PathRequest<'_>) -> kernel::PathApproval {
+                self.0.lock().unwrap().push(ReviewedPath {
+                    path: request.path.to_owned(),
+                    kind: request.kind,
+                    access: request.access,
+                    detail: request.detail.unwrap().to_owned(),
+                    folder: request.folder.map(Path::to_owned),
+                });
+                kernel::PathApproval::Deny
+            }
+        }
+        let ws = unique_dir("ws_path_review");
+        let state = unique_dir("state_path_review");
+        let outside = unique_dir("outside_path_review");
+        let directory = outside.join("project/src");
+        std::fs::create_dir_all(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let file = directory.join("existing");
+        std::fs::write(&file, "fixture").unwrap();
+        // Its extension must not make a nonexistent target appear to be a file.
+        let missing = directory.join("new.txt");
+        let reviewed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mgr =
+            PermissionManager::new(&ws, state.join("trust.lock"), state.join("audit.log")).unwrap();
+        mgr.set_human_gate(Arc::new(ReviewingGate(Arc::clone(&reviewed))));
+        for (path, access) in [
+            (&directory, PermissionType::Read),
+            (&file, PermissionType::Read),
+            (&missing, PermissionType::Write),
+        ] {
+            assert!(matches!(
+                mgr.request_permission(path, access).await,
+                Err(PermissionError::Denied { .. })
+            ));
+        }
+        let reviewed = reviewed.lock().unwrap();
+        assert_eq!(reviewed.len(), 3);
+        for (index, (path, kind, access, scope)) in [
+            (
+                &directory,
+                kernel::PathKind::Directory,
+                kernel::PathAccess::Read,
+                "this folder and its contents",
+            ),
+            (
+                &file,
+                kernel::PathKind::File,
+                kernel::PathAccess::Read,
+                "this file",
+            ),
+            (
+                &missing,
+                kernel::PathKind::Unknown,
+                kernel::PathAccess::Write,
+                "this path",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = &reviewed[index];
+            assert_eq!(&request.path, path);
+            assert_eq!(request.kind, kind);
+            assert_eq!(request.access, access);
+            assert!(request.detail.contains(scope), "{}", request.detail);
+            assert!(request.detail.contains("future chats in this project"));
+            assert!(request.detail.contains("file tools and commands"));
+            assert_eq!(
+                request.detail.contains("Write access also permits reading"),
+                access == kernel::PathAccess::Write
+            );
+        }
+        assert!(reviewed[0].folder.is_none());
+        assert_eq!(reviewed[1].folder.as_ref(), Some(&directory));
+        assert_eq!(reviewed[2].folder.as_ref(), Some(&directory));
+        assert!(
+            !state.join("trust.lock").exists(),
+            "denied reviews must not persist grants"
+        );
     }
 
     /// Remembering a folder is the widest thing one answer can grant, so what it

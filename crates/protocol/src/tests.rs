@@ -2,6 +2,65 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn path_approvals_preserve_the_resolved_target_and_one_set_of_choices() {
+    for kind in [PathKind::File, PathKind::Directory, PathKind::Unknown] {
+        let prompt = ApprovalPrompt {
+            gate_id: 4,
+            action: "Read access to /outside/project/src".into(),
+            detail: Some("Remembered folder access includes its contents and future chats.".into()),
+            escalated: false,
+            kind: ApprovalKind::Path,
+            choices: vec![
+                ApprovalDecision::Once,
+                ApprovalDecision::Always,
+                ApprovalDecision::Folder,
+                ApprovalDecision::Deny,
+            ],
+            folder: Some("/outside/project".into()),
+            path: Some(ApprovalPath {
+                path: "/outside/project/src".into(),
+                kind,
+                access: PathAccess::Read,
+            }),
+        };
+        let value = serde_json::to_value(&prompt).unwrap();
+        let current: ApprovalPrompt = serde_json::from_value(value).unwrap();
+        let target = current.path.unwrap();
+        assert_eq!(target.kind, kind);
+        assert_eq!(target.access, PathAccess::Read);
+        assert_eq!(target.path, "/outside/project/src");
+        assert!(matches!(
+            current.choices.as_slice(),
+            [
+                ApprovalDecision::Once,
+                ApprovalDecision::Always,
+                ApprovalDecision::Folder,
+                ApprovalDecision::Deny
+            ]
+        ));
+    }
+}
+
+#[test]
+fn approvals_without_path_metadata_keep_their_existing_choices() {
+    let prompt: ApprovalPrompt = serde_json::from_value(json!({
+        "gate_id": 8, "action": "command", "detail": null, "escalated": false,
+        "kind": "access", "choices": ["once", "session", "persistent", "deny"],
+    }))
+    .unwrap();
+    assert!(prompt.path.is_none());
+    assert!(matches!(
+        prompt.choices.as_slice(),
+        [
+            ApprovalDecision::Once,
+            ApprovalDecision::Session,
+            ApprovalDecision::Persistent,
+            ApprovalDecision::Deny
+        ]
+    ));
+}
+
+#[test]
 fn scoped_commands_match_the_existing_envelope_and_cannot_override_it() {
     let call = Call::new(Scope::Chat("live"), &Configure::Mode(Mode::Plan)).unwrap();
     assert_eq!(

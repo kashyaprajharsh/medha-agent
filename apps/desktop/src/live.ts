@@ -13,8 +13,13 @@ export type Approval = {
   action: string;
   detail?: string;
   escalated: boolean;
-  /** "path" asks about one file outside the workspace. */
+  /** A path prompt can target either a file or a directory. */
   kind?: string;
+  path?: {
+    path: string;
+    kind: "file" | "directory" | "unknown";
+    access: "read" | "write";
+  };
   /** The answers the backend offers, in the order it offers them. */
   choices: ApprovalChoice[];
   /** The folder the "folder" answer would remember. */
@@ -273,7 +278,23 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
         sessionId: str(params.session),
         model: str(params.model),
       };
-    case "approval":
+    case "approval": {
+      const target =
+        params.path && typeof params.path === "object"
+          ? (params.path as Record<string, unknown>)
+          : undefined;
+      const path: Approval["path"] =
+        target && typeof target.path === "string" &&
+        (target.access === "read" || target.access === "write")
+          ? {
+              path: target.path,
+              kind:
+                target.kind === "file" || target.kind === "directory"
+                  ? target.kind
+                  : "unknown",
+              access: target.access,
+            }
+          : undefined;
       return {
         ...state,
         approvals: [
@@ -284,6 +305,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
             detail: str(params.detail),
             escalated: params.escalated === true,
             kind: str(params.kind),
+            path,
             choices: Array.isArray(params.choices)
               ? (params.choices as ApprovalChoice[])
               : ["once", "deny"],
@@ -291,6 +313,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
           },
         ],
       };
+    }
     case "exit":
       return {
         ...state,

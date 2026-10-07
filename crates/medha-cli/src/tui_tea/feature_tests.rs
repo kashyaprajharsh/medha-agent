@@ -207,6 +207,7 @@ fn access(model: &mut Model) {
                 protocol::ApprovalDecision::Deny,
             ],
             folder: None,
+            path: None,
         },
     );
     model.approval_ready = true;
@@ -238,6 +239,69 @@ async fn network_approval_keeps_all_four_choices_and_wraps_in_both_directions() 
         );
         receipt(&mut f, true);
         assert!(f.model.pending_approvals.is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn path_approval_labels_match_the_reviewed_scope_and_send_each_offered_answer() {
+    use protocol::{ApprovalDecision as D, PathKind as K};
+    for (kind, label, folder) in [
+        (
+            K::File,
+            "Yes, always allow this file",
+            Some("/outside/project"),
+        ),
+        (
+            K::Directory,
+            "Yes, always allow this folder and its contents",
+            None,
+        ),
+        (
+            K::Unknown,
+            "Yes, always allow this path",
+            Some("/outside/project"),
+        ),
+    ] {
+        let mut choices = vec![D::Once, D::Always];
+        if folder.is_some() {
+            choices.push(D::Folder);
+        }
+        choices.push(D::Deny);
+        for (index, expected) in choices.iter().copied().enumerate() {
+            let mut f = fixture().await;
+            let prompt = protocol::ApprovalPrompt {
+                gate_id: 9,
+                action: "Write access to /outside/project/target".into(),
+                detail: Some("Remembering access applies to future chats in this project. Medha's file tools and commands can use it.".into()),
+                escalated: false,
+                kind: protocol::ApprovalKind::Path,
+                choices: choices.clone(),
+                folder: folder.map(str::to_owned),
+                path: Some(protocol::ApprovalPath {
+                    path: "/outside/project/target".into(), kind, access: protocol::PathAccess::Write,
+                }),
+            };
+            observed(
+                &mut f.model,
+                medha_client::Said::Frame(serde_json::json!({
+                    "method": "approval", "params": prompt,
+                })),
+            )
+            .unwrap();
+            f.model.approval_ready = true;
+            let labels = f.model.pending_approvals[0].responder.options_for(false);
+            assert_eq!(labels[1], label);
+            assert_eq!(labels.len(), choices.len());
+            handle_approval_key(
+                &mut f.model,
+                key(KeyCode::Char(char::from(b'1' + index as u8))),
+            );
+            assert!(
+                matches!(&f.model.remote.as_ref().unwrap().pending[0].effect, Effect::Approve(answer) if serde_json::to_value(answer.decision).unwrap() == serde_json::to_value(expected).unwrap())
+            );
+            receipt(&mut f, true);
+            assert!(f.model.pending_approvals.is_empty());
+        }
     }
 }
 

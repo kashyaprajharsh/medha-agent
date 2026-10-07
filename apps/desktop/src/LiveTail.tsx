@@ -38,7 +38,13 @@ function answerLabel(choice: ApprovalChoice, approval: Approval): string {
   const labels: Record<ApprovalChoice, string> = {
     once: "Allow",
     always:
-      approval.kind === "path" ? "Always allow this file" : "Always allow",
+      approval.kind === "path"
+        ? approval.path?.kind === "file"
+          ? "Always allow this file"
+          : approval.path?.kind === "directory"
+            ? "Always allow this folder and its contents"
+            : "Always allow this path"
+        : "Always allow",
     folder: "Always allow this folder",
     session: "Allow for this session",
     persistent: "Always allow for this project",

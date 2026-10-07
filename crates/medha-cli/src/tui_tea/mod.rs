@@ -559,7 +559,15 @@ impl ApprovalResponder {
                     "Yes, allow once"
                 }
                 // For a path, which of the two is remembered is said in the choice itself.
-                protocol::ApprovalDecision::Always if about_a_path => "Yes, always allow this file",
+                protocol::ApprovalDecision::Always if about_a_path => {
+                    match prompt.path.as_ref().map(|path| path.kind) {
+                        Some(protocol::PathKind::File) => "Yes, always allow this file",
+                        Some(protocol::PathKind::Directory) => {
+                            "Yes, always allow this folder and its contents"
+                        }
+                        _ => "Yes, always allow this path",
+                    }
+                }
                 protocol::ApprovalDecision::Always => "Yes, always allow",
                 protocol::ApprovalDecision::Folder => "Yes, always allow this whole folder",
                 protocol::ApprovalDecision::Session => "Allow for this session",

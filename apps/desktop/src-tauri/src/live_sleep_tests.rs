@@ -17,7 +17,46 @@ fn stand_in_model() -> (String, Arc<Mutex<Vec<usize>>>) {
     (url, seen)
 }
 
-fn answer(mut stream: std::net::TcpStream, record: &Mutex<Vec<usize>>) {
+fn answer(stream: std::net::TcpStream, record: &Mutex<Vec<usize>>) {
+    answer_held(stream, record, None);
+}
+
+struct HeldReply {
+    arrived: std::sync::mpsc::Sender<()>,
+    released: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+fn held_model() -> (
+    String,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let model = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (arrived, waiting) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let held = Arc::new(HeldReply {
+        arrived,
+        released: Mutex::new(released),
+    });
+    std::thread::spawn(move || {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        for stream in listener.incoming().flatten() {
+            let (record, held) = (Arc::clone(&record), Arc::clone(&held));
+            std::thread::spawn(move || answer_held(stream, &record, Some(&held)));
+        }
+    });
+    (model, waiting, release)
+}
+
+fn answer_held(
+    mut stream: std::net::TcpStream,
+    record: &Mutex<Vec<usize>>,
+    held: Option<&HeldReply>,
+) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
     let mut request = Vec::new();
     let mut buffer = [0u8; 8192];
     let body = loop {
@@ -51,6 +90,20 @@ fn answer(mut stream: std::net::TcpStream, record: &Mutex<Vec<usize>>) {
         return;
     };
     record.lock().unwrap().push(messages.len());
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user");
+    if last_user.is_some_and(|message| message["content"].to_string().contains("HOLD"))
+        && let Some(held) = held
+    {
+        let _ = held.arrived.send(());
+        let _ = held
+            .released
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(20));
+    }
     let usage = json!({ "prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6 });
     let response = if body["stream"] == true {
         let chunks = [
@@ -219,6 +272,404 @@ impl Drop for Chat {
         self.sessions.inner.backend.stop();
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[cfg(unix)]
+struct TuiClient {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    input: Box<dyn Write + Send>,
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+#[cfg(unix)]
+impl TuiClient {
+    fn start(chat: &Chat, model: &str, session: &str) -> Self {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let executable =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug/medha");
+        let mut command = portable_pty::CommandBuilder::new(executable);
+        command.args(["--resume", session]);
+        command.cwd(&chat.sessions.inner.workspace);
+        command.env("MEDHA_HOME", chat.root.join("home"));
+        command.env("MEDHA_BASE_URL", model);
+        command.env("MEDHA_MODEL", "stand-in");
+        command.env("MEDHA_API_KEY", "unused");
+        command.env("MEDHA_MAX_CTX", "100000");
+        command.env("MEDHA_CRED_STORE", "file");
+        command.env("MEDHA_MODE", "careful");
+        command.env("TERM", "xterm-256color");
+        let child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let input = pair.master.take_writer().unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let captured = Arc::clone(&output);
+        std::thread::spawn(move || {
+            let mut buffer = [0; 8192];
+            while let Ok(length) = reader.read(&mut buffer) {
+                if length == 0 {
+                    break;
+                }
+                let mut output = captured.lock().unwrap();
+                assert!(
+                    output.len() + length <= 2 * 1024 * 1024,
+                    "test PTY output exceeded its bound"
+                );
+                output.extend_from_slice(&buffer[..length]);
+            }
+        });
+        Self {
+            child,
+            _master: pair.master,
+            input,
+            output,
+        }
+    }
+    fn write(&mut self, text: &str) {
+        self.input.write_all(text.as_bytes()).unwrap();
+        self.input.flush().unwrap();
+    }
+    fn until(&self, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let output = String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned();
+            if output.contains(marker) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "TUI never showed {marker:?}: {output:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn exit(&mut self) {
+        self.write("\x04");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success(), "TUI failed: {status:?}");
+                self.until("\x1b[?1049l");
+                return;
+            }
+            assert!(Instant::now() < deadline, "TUI did not exit after Ctrl-D");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TuiClient {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            if let Some(pid) = self.child.process_id() {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            } else {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tui_and_desktop_follow_one_conversation_and_either_viewer_can_leave() {
+    let (model, waiting, release) = held_model();
+    let Some(chat) = Chat::open("tui-desktop", &model) else {
+        return;
+    };
+    chat.turn("seed for shared history");
+    let session = chat.wait("ready", |frame| frame["method"] == "ready")["params"]["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut tui = TuiClient::start(&chat, &model, &session);
+    tui.until("seed for shared history");
+    chat.sleep();
+    assert!(chat.call("session.settings", json!({}))["result"].is_object());
+    tui.write("HOLD from actual TUI\r");
+    waiting.recv_timeout(Duration::from_secs(20)).unwrap();
+    // Detach the original desktop while the TUI owns an active turn.
+    chat.sessions.close(chat.key).unwrap();
+    let home = chat.root.join("home/serve");
+    let backend = Backend::joined_to(
+        std::fs::read_to_string(home.join("address")).unwrap(),
+        &std::fs::read_to_string(home.join("token")).unwrap(),
+    );
+    let follower = LiveSessions::on(chat.sessions.inner.workspace.clone(), backend);
+    let frames: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let sink = Arc::clone(&frames);
+    follower
+        .open_to(
+            Arc::new(move |frame| sink.lock().unwrap().push(frame)),
+            "following",
+            Some(&session),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if frames.lock().unwrap().iter().any(|frame| {
+            frame["method"] == "session.presentation" && frame["params"]["running"] == true
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "desktop never attached to the active TUI turn: {:?}",
+            frames.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let id = follower.request("following", "cancel", json!({})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame["id"] == id && frame["error"].is_null())
+            && frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|frame| frame["params"]["kind"] == "turn.cancelled")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "desktop cancellation did not settle the TUI turn"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    release.send(()).unwrap();
+    tui.exit();
+    let id = follower
+        .request(
+            "following",
+            "message.send",
+            json!({"content":"desktop after TUI exit"}),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame["id"] == id && frame["error"].is_null())
+            && frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|frame| frame["params"]["kind"] == "turn.done")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "desktop chat stopped when the TUI left: {:?}",
+            frames.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame["method"] == "exit")
+    );
+    follower.close("following").unwrap();
+}
+
+#[test]
+fn an_independent_desktop_connection_attaches_to_an_active_turn_and_survives_owner_detach() {
+    let (model, waiting, release) = held_model();
+    let Some(chat) = Chat::open("independent-viewer", &model) else {
+        return;
+    };
+    chat.turn("saved history");
+    let session = chat.wait("ready", |frame| frame["method"] == "ready")["params"]["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    chat.call(
+        "message.send",
+        json!({"content":"HOLD while another desktop opens"}),
+    );
+    waiting.recv_timeout(Duration::from_secs(20)).unwrap();
+    let home = chat.root.join("home/serve");
+    let backend = Backend::joined_to(
+        std::fs::read_to_string(home.join("address")).unwrap(),
+        &std::fs::read_to_string(home.join("token")).unwrap(),
+    );
+    let follower = LiveSessions::on(chat.sessions.inner.workspace.clone(), backend);
+    let frames: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let sink = Arc::clone(&frames);
+    follower
+        .open_to(
+            Arc::new(move |frame| sink.lock().unwrap().push(frame)),
+            "following",
+            Some(&session),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if frames.lock().unwrap().iter().any(|frame| {
+            frame["method"] == "session.presentation" && frame["params"]["running"] == true
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the follower never received active state: {:?}",
+            frames.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    chat.sessions.close_all();
+    assert!(
+        chat.sessions
+            .open_to(chat.emit(), "after-window-quit", None)
+            .is_err()
+    );
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame["params"]["kind"] == "turn.done")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the original viewer interrupted the follower's turn"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let id = follower
+        .request("following", "session.settings", json!({}))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame["id"] == id && frame["result"].is_object())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the detached owner stopped the live chat"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame["method"] == "exit")
+    );
+    follower.close("following").unwrap();
+}
+
+#[test]
+fn sleeping_one_viewer_preserves_another_and_waking_rejoins_the_same_live_chat() {
+    let (model, _) = stand_in_model();
+    let Some(chat) = Chat::open("shared-sleep", &model) else {
+        return;
+    };
+    chat.turn("history before either viewer sleeps");
+    let session = chat.wait("ready", |frame| frame["method"] == "ready")["params"]["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let home = chat.root.join("home/serve");
+    let backend = Backend::joined_to(
+        std::fs::read_to_string(home.join("address")).unwrap(),
+        &std::fs::read_to_string(home.join("token")).unwrap(),
+    );
+    let follower = LiveSessions::on(chat.sessions.inner.workspace.clone(), backend);
+    let frames: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let sink = Arc::clone(&frames);
+    follower
+        .open_to(
+            Arc::new(move |frame| sink.lock().unwrap().push(frame)),
+            "awake-viewer",
+            Some(&session),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| frame["method"] == "session.presentation")
+    {
+        assert!(Instant::now() < deadline, "the other viewer never attached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    chat.sleep();
+    let id = follower
+        .request("awake-viewer", "session.settings", json!({}))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| frame["id"] == id && frame["result"].is_object())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "sleep stopped the other viewer's chat"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Wake the sleeping desktop while the other viewer still holds this
+    // incarnation. It must attach, not wait for or kill that viewer's chat.
+    assert!(chat.call("session.settings", json!({}))["result"].is_object());
+    chat.turn("continue after rejoining the same live incarnation");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| frame["params"]["kind"] == "turn.done")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the awake viewer did not see the new turn"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame["method"] == "exit")
+    );
+    assert_eq!(chat.count(|frame| frame["method"] == "exit"), 0);
+    follower.close("awake-viewer").unwrap();
 }
 
 #[test]

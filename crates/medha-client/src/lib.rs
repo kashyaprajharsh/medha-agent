@@ -245,8 +245,7 @@ impl Connection {
         if line.len() > wire::MAX_FRAME {
             return Err(TOO_LARGE.into());
         }
-        let stops =
-            line.len() <= STOP_BYTES && frame["method"].as_str().is_some_and(wire::is_control);
+        let stops = line.len() <= STOP_BYTES && wire::is_control_frame(&frame);
         let (bytes, places) = match stops {
             true => (UNSENT_BYTES + STOPS_UNSENT, UNANSWERED + STOPS_UNANSWERED),
             false => (UNSENT_BYTES, UNANSWERED),
@@ -506,17 +505,22 @@ impl Connection {
 
     pub fn is_live(&self, session: &str) -> bool {
         self.call(protocol::Scope::Service, &protocol::ListSessions {})
-            .is_ok_and(|listed| listed.sessions.iter().any(|live| live.session == session))
+            .is_ok_and(|listed| {
+                listed.sessions.iter().any(|live| {
+                    live.session == session || live.conversation.as_deref() == Some(session)
+                })
+            })
     }
 
-    /// Starts a chat, or resumes one, and hears everything it says from its
-    /// first frame. The chat ends with this connection, as one on a pipe did.
+    /// Starts or resumes a chat, or follows a live incarnation in this folder.
+    /// A followed chat is never retired to obtain ownership.
     ///
     /// `leaving` says the chat being resumed is this window's own and already
     /// on its way out, because it slept or was just closed: its end is waited
-    /// for. A chat that is live for any other reason is someone's, and is left alone.
+    /// for. Otherwise another client's live chat is shared, with coherent state
+    /// followed by events after its snapshot barrier.
     pub fn open_chat(
-        &self,
+        self: &Arc<Self>,
         folder: &Path,
         resume: Option<&str>,
         leaving: bool,
@@ -544,6 +548,25 @@ impl Connection {
                 Err(error) => error,
             };
             let ours = leaving || resume.is_some_and(|id| self.routes().over.contains_key(id));
+            if let Some(id) = resume {
+                let folder = folder.canonicalize().map_err(|error| error.to_string())?;
+                let listed = self.call(protocol::Scope::Service, &protocol::ListSessions {})?;
+                if let Some(live) = listed.sessions.into_iter().find(|live| {
+                    live.conversation.as_deref().unwrap_or(&live.session) == id
+                        && live
+                            .about
+                            .as_ref()
+                            .is_some_and(|about| about.folder == folder)
+                }) {
+                    let listening = self.routes().chats.contains_key(&live.session);
+                    if listening && !ours {
+                        return Err(OPEN_ELSEWHERE.into());
+                    }
+                    if !listening && (!ours || live.clients > 0) {
+                        return self.follow_live(live, hear);
+                    }
+                }
+            }
             if !resume.is_some_and(|id| self.is_live(id)) {
                 // One of this window's own, on its way out, can end between being
                 // refused and being looked for. Asked again, it starts.
@@ -586,6 +609,43 @@ impl Connection {
         Ok(opening.chat.take().expect("opened chat"))
     }
 
+    fn follow_live(
+        self: &Arc<Self>,
+        live: protocol::LiveSession,
+        hear: Hear,
+    ) -> Result<Chat, String> {
+        let connection = Arc::clone(self);
+        reading().block_on(async move {
+            let cursor = live.stream.map(|stream| protocol::Cursor {
+                stream,
+                after: live.head,
+            });
+            let (mut view, _) =
+                View::attach(connection, live.session, cursor, ViewLimits::default()).await?;
+            let snapshot = view.call(&protocol::GetPresentation {}).await?;
+            view.covered_through(
+                snapshot
+                    .cursor
+                    .clone()
+                    .ok_or("The backend returned no presentation barrier")?,
+            )?;
+            let chat = view.chat();
+            hear(Said::Frame(json!({"method":"ready", "params": {
+                "proto":"1.0", "session":snapshot.conversation,
+                "model":snapshot.settings.as_ref().map(|settings| &settings.model)
+            }})));
+            hear(Said::Frame(
+                json!({"method":"session.presentation", "params":snapshot}),
+            ));
+            reading().spawn(async move {
+                while let Some(said) = view.recv().await {
+                    hear(said);
+                }
+            });
+            Ok(chat)
+        })
+    }
+
     /// A chat's own request; one with an id is answered among the chat's frames.
     /// Nothing is sent once the chat is over, so it never reaches a later chat of the same id.
     pub fn tell(&self, chat: &Chat, mut frame: Value) -> Result<(), String> {
@@ -610,12 +670,14 @@ impl Connection {
     /// on; a chat that was this window's alone ends for want of anyone watching.
     pub fn leave(&self, chat: &Chat) {
         let mut routes = self.routes();
-        if routes.forget(&chat.session, chat.opened).is_none() {
+        let Some(hear) = routes.forget(&chat.session, chat.opened) else {
             return;
-        }
+        };
         routes.is_over(chat.session.clone());
         let detach = json!({ "method": "session.detach", "session": chat.session });
         let _ = self.post(&mut routes, detach, None);
+        drop(routes);
+        hear(Said::Ended(None));
     }
 
     fn heard(&self, mut frame: Value) {

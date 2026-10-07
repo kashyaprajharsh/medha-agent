@@ -1,4 +1,20 @@
 use super::*;
+
+#[test]
+fn state_recovery_and_agent_stop_have_reserved_admission_without_prioritizing_mutations() {
+    assert!(is_control_frame(
+        &json!({"method":"session.presentation","params":{}})
+    ));
+    assert!(is_control_frame(
+        &json!({"method":"session.change","params":{"action":"stop_agents"}})
+    ));
+    assert!(!is_control_frame(
+        &json!({"method":"session.change","params":{"action":"apply_patch"}})
+    ));
+    assert!(!is_control_frame(
+        &json!({"method":"session.change","params":{"action":"forget_memory"}})
+    ));
+}
 use tokio::io::{BufReader, DuplexStream, ReadHalf, WriteHalf, duplex, split};
 
 const ROLES: Roles = Roles {

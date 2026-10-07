@@ -118,6 +118,13 @@ work after it settles, rewinding a session.
 **The TUI is the primary way to use
 MEDHA**; the flags below exist for scripting and CI.
 
+The TUI and desktop can be installed separately. Both start or join one
+authenticated local backend per `MEDHA_HOME` (default `~/.medha`). Resuming a
+conversation already open in the other app adds a viewer to that same chat;
+closing one viewer leaves the others running. The backend owns turns, approvals,
+history and credentials. Compatible installations share it; replacing an
+incompatible backend is refused while it has active work.
+
 Type a task, press **Enter**, and approve or deny the actions it proposes as they come
 up. Press `/` for the command palette.
 
@@ -284,8 +291,11 @@ verification. The context engine also calls a model when summarization is needed
 
 ```mermaid
 flowchart TB
-    UI["User<br/>TUI · CLI · Desktop · Editor"] --> CLI["medha-cli<br/>Session, configuration, plugins"]
-    CLI --> K["Kernel<br/>Context → model → authorize → execute → observe → verify"]
+    UI["Interactive clients<br/>TUI · Desktop"] --> CLIENT["medha-client + medha-protocol<br/>Authenticated local IPC"]
+    CLIENT --> CLI["medha serve<br/>Session, configuration, plugins"]
+    DIRECT["Headless CLI · plain REPL · Editor ACP"] --> RUNTIME["Shared runtime"]
+    CLI --> RUNTIME
+    RUNTIME --> K["Kernel<br/>Context → model → authorize → execute → observe → verify"]
     K <--> C["Context engine<br/>Budget, compaction, durable handoff"]
     K <--> P["Providers<br/>OpenAI-compatible · Gemini"]
     C -. "optional summary request" .-> P
@@ -297,8 +307,14 @@ flowchart TB
     K <--> D["Durable state<br/>Event log · artifacts · memory"]
 ```
 
-Desktop runs `medha --acp` for live sessions. Local command isolation depends on
-the selected sandbox backend; remote MCP services execute outside that local jail.
+Desktop and TUI use `medha serve` for live sessions. Standard editor ACP and
+headless commands use the same runtime directly and take the same conversation
+lease, preventing two processes from executing the same durable chat. Local
+command isolation depends on the selected sandbox backend; remote MCP services
+execute outside that local jail. For strict cleanup of escaped command helpers,
+set `[sandbox].strict_cleanup = true` and a container `image` in `medha.lock`;
+this requires Docker or Podman and fails closed when unavailable. Native process
+groups provide weaker cleanup for deliberately reparented helpers.
 The [full architecture](docs/WHAT_IS_MEDHA.md#architecture-at-a-glance) includes the
 [kernel loop](docs/WHAT_IS_MEDHA.md#the-main-loop),
 [authorization](docs/WHAT_IS_MEDHA.md#tool-authorization-flow),

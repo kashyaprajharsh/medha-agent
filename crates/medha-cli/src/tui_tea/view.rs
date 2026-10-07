@@ -1544,11 +1544,7 @@ pub(super) fn draw_status(f: &mut Frame, model: &Model, area: Rect) {
         ));
     }
     // Use the cached patch count because status rendering runs every frame.
-    let unmerged = model
-        .agents
-        .as_ref()
-        .map(|control| control.cached_unmerged())
-        .unwrap_or(0);
+    let unmerged = model.unmerged_count();
     if unmerged > 0 {
         left.push(Span::styled(
             format!("  ⎇ {unmerged} patch(es) — /agents"),
@@ -1716,10 +1712,11 @@ pub(super) fn input_text_width(outer_width: u16) -> usize {
     outer_width.saturating_sub(6).max(1) as usize
 }
 pub(super) fn input_rows(model: &Model, outer_width: u16) -> usize {
-    if model.input.is_empty() {
+    let input = model.edited().0;
+    if input.is_empty() {
         return 1;
     }
-    layout_input(&model.input, 0, input_text_width(outer_width))
+    layout_input(input, 0, input_text_width(outer_width))
         .0
         .len()
 }
@@ -1740,6 +1737,7 @@ fn placeholder(width: usize) -> &'static str {
 }
 
 pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
+    let (input, cursor) = model.edited();
     let (accent, glyph) = if model.running {
         (theme::faint(), "…")
     } else {
@@ -1754,7 +1752,20 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
         .padding(ratatui::widgets::Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if model.input.is_empty() && !model.running {
+    if let Some(form) = &model.mcp_credential
+        && input.is_empty()
+    {
+        f.render_widget(
+            Paragraph::new(if form.saving {
+                "Saving the MCP token…"
+            } else {
+                "API token (masked; Enter saves, Esc cancels):"
+            }),
+            inner,
+        );
+        return;
+    }
+    if input.is_empty() && !model.running {
         if let Some(setup) = &model.model_setup {
             let prompt = if matches!(
                 model.picker.as_ref().map(|p| &p.kind),
@@ -1813,21 +1824,11 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
     }
     let tw = inner.width.saturating_sub(2).max(1) as usize;
     // `cursor` is a byte offset; layout_input positions by char index.
-    let cursor_chars = model.input[..model.cursor.min(model.input.len())]
-        .chars()
-        .count();
-    let display_input = if model
-        .model_setup
-        .as_ref()
-        .is_some_and(ModelSetup::is_secret)
-        || model
-            .search_setup
-            .as_ref()
-            .is_some_and(SearchSetup::is_secret)
-    {
-        "•".repeat(model.input.chars().count())
+    let cursor_chars = input[..cursor.min(input.len())].chars().count();
+    let display_input = if model.secret_input() {
+        "•".repeat(input.chars().count())
     } else {
-        model.input.clone()
+        input.to_string()
     };
     let (rows, crow, ccol) = layout_input(&display_input, cursor_chars, tw);
     let lines: Vec<Line> = rows
@@ -1862,8 +1863,7 @@ fn draw_attachment_chips(f: &mut Frame, model: &Model, area: Rect) {
         return;
     }
     let lines: Vec<Line> = model
-        .attachments
-        .chips()
+        .attachment_chips()
         .into_iter()
         .map(|chip| Line::from(Span::styled(chip, Style::default().fg(theme::accent()))))
         .collect();
@@ -2261,7 +2261,7 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     // Border and horizontal padding consume four cells of composer width.
     let text_rows = input_rows(model, content_w.saturating_sub(4)) as u16;
     let box_h = text_rows.clamp(1, 8) + 2;
-    let chip_h = model.attachments.chips().len().min(5) as u16;
+    let chip_h = model.attachment_chips().len().min(5) as u16;
     // The fleet takes the gap above the composer, and gives it back the moment
     // nothing is running, so it costs no screen when there are no children.
     let tree_h = agent_tree_height(model);
@@ -2323,6 +2323,7 @@ pub(super) fn view(f: &mut Frame, model: &mut Model) {
     if !gate_open
         && model.model_setup.is_none()
         && model.search_setup.is_none()
+        && model.mcp_credential.is_none()
         && model.input.starts_with('/')
     {
         draw_autocomplete(f, model, pad_h(chunks[3]));
@@ -2417,9 +2418,19 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
             viz: &model.tool_viz,
         };
         let mut total = 0usize;
-        for e in model.items.iter_mut() {
-            e.ensure(&cx, vw);
-            total += e.height;
+        let mut first = 0;
+        let item_count = model.items.len();
+        for (index, entry) in model.items.iter_mut().enumerate().rev() {
+            entry.ensure(&cx, vw);
+            if total + entry.height > MAX_SCROLLBACK_LINES && index + 1 < item_count {
+                first = index + 1;
+                break;
+            }
+            total += entry.height;
+        }
+        if first > 0 {
+            model.items.drain(..first);
+            model.text_selection = None;
         }
         // Approval rows participate in the same physical-row scroll model.
         model.approval_rows = if let Some(pending) = model.pending_approval() {
@@ -2428,7 +2439,7 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
                     &pending.action,
                     pending.detail.as_deref(),
                     model.approval_sel,
-                    pending.responder.options_for(pending.escalated),
+                    &pending.responder.options_for(pending.escalated),
                     MAX_TOOL_OUTPUT_LINES,
                     pending.escalated,
                 )
@@ -2437,7 +2448,7 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
                     &pending.action,
                     pending.detail.as_deref(),
                     model.approval_sel,
-                    pending.responder.options_for(pending.escalated),
+                    &pending.responder.options_for(pending.escalated),
                     pending.escalated,
                 )
             };
@@ -2457,9 +2468,21 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
                     Style::default().fg(theme::faint()),
                 )));
             }
-            rows.iter()
-                .flat_map(|l| wrap_line(l, vw as usize))
-                .collect()
+            let mut bounded = VecDeque::new();
+            let mut omitted = false;
+            for row in rows.iter().flat_map(|line| wrap_line(line, vw as usize)) {
+                if bounded.len() == 2048 {
+                    bounded.pop_front();
+                    omitted = true;
+                }
+                bounded.push_back(row);
+            }
+            if omitted {
+                bounded.push_front(Line::from(
+                    "… leading detail omitted; the decision options remain below.",
+                ));
+            }
+            bounded.into_iter().collect()
         } else {
             Vec::new()
         };
@@ -2565,7 +2588,6 @@ mod clarify_view_tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     fn state(prompt: &str, description: &str) -> ClarifyState {
-        let (responder, _receiver) = tokio::sync::oneshot::channel();
         ClarifyState {
             questions: vec![kernel::Question {
                 prompt: prompt.into(),
@@ -2594,7 +2616,7 @@ mod clarify_view_tests {
             other_input: String::new(),
             other_cursor: 0,
             validation: None,
-            responder,
+            responder: QuestionResponder::Remote(1),
         }
     }
 

@@ -221,6 +221,26 @@ export function queuedMessages(state: LiveState) {
 export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
   const params = frame.params ?? {};
   switch (frame.method) {
+    case "session.presentation": {
+      let recovered = { ...state, items: [], approvals: [], questions: [], activity: undefined } as LiveState;
+      for (const row of Array.isArray(params.frames) ? params.frames : []) {
+        recovered = reduceLive(recovered, row as LiveFrame);
+      }
+      for (const prompt of Array.isArray(params.approvals) ? params.approvals : []) {
+        recovered = reduceLive(recovered, { method: "approval", params: prompt });
+      }
+      for (const prompt of Array.isArray(params.questions) ? params.questions : []) {
+        recovered = reduceLive(recovered, { method: "question", params: prompt });
+      }
+      return {
+        ...recovered,
+        sessionId: str(params.session),
+        status: params.running === true ? "running" : "idle",
+        settings: params.settings as SessionSettings | undefined,
+        model: str((params.settings as SessionSettings | undefined)?.model),
+        agents: toAgents(params.agents),
+      };
+    }
     case "session.rewound":
       return params.code_only
         ? { ...state, settled: state.settled + 1 }
@@ -307,6 +327,17 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
       return state;
   }
   switch (params.kind) {
+    case "turn.started":
+      return { ...state, status: "running", stopReason: undefined, error: undefined };
+    case "message.accepted": {
+      const text = str(params.content) ?? "";
+      const alreadyShown = state.status !== "idle" && state.sent.some(
+        (sent) => sent.text === text && state.items.some((item) => item.kind === "user" && item.id === sent.id),
+      );
+      return { ...state, status: "running", items: alreadyShown ? state.items : [
+        ...closeReasoning(state.items), { kind: "user", id: nextId("user"), text, ts: now() },
+      ] };
+    }
     case "model.waiting":
       return { ...state, activity: { kind: "model", started: now() } };
     case "notice":
@@ -468,7 +499,7 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
         ...state,
         items: message
           ? [...closeReasoning(state.items), message]
-          : state.items,
+          : [...closeReasoning(state.items), { kind: "user", id: nextId("user"), text: str(params.content) ?? "", ts: now() }],
         notice: "Your instruction reached Medha.",
       };
     }

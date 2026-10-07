@@ -6,30 +6,30 @@ use crossterm::event::{
     MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
-use kernel::{Budget, EventLog, Kernel, Message, Provider, Session, StopReason, ToolCategory};
+use kernel::ToolCategory;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+#[cfg(test)]
 use sandbox::WorkspaceSandbox;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 
-mod agent_watch;
-mod attach;
+mod backend_features;
+mod backend_plugins;
+pub(crate) mod backend_ui;
+mod input;
 mod markdown;
-mod plugins;
 mod spin;
+mod staged_images;
+#[cfg(test)]
+mod tree_tests;
 mod tty;
-mod update;
 mod view;
-pub(crate) use agent_watch::AgentWatch;
-pub(crate) use runtime::agents::AgentStep;
-use update::*;
+pub(crate) use protocol::AgentStep;
 use view::*;
 
 mod termbg;
@@ -37,6 +37,12 @@ pub(crate) mod theme;
 
 /// Maximum lines retained in scrollback.
 const MAX_SCROLLBACK_LINES: usize = 5000;
+const MAX_ITEM_BYTES: usize = 256 * 1024;
+const MAX_PANE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AGENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_COMPOSER_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SECRET_BYTES: usize = 64 * 1024;
+const PREVIEW_NOTICE: &str = "\n… preview limited; the full content remains in saved history.";
 /// Maximum diff lines rendered inline.
 const MAX_DIFF_LINES: usize = 60;
 /// Maximum raw tool I/O lines rendered per call.
@@ -45,22 +51,12 @@ const MAX_TOOL_OUTPUT_LINES: usize = 500;
 const PASTE_COLLAPSE_THRESHOLD: usize = 1000;
 /// Redraw interval for 60 fps.
 const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
-const TURN_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-const TURN_ABORT_GRACE: Duration = Duration::from_secs(2);
-const FORCE_ABORT_SLOW_NOTICE: Duration = Duration::from_secs(2);
-
-// Task-local ownership prevents serialized prompts from inheriting a later
-// foreground turn's cancellation token.
-tokio::task_local! {
-    static FOREGROUND_TURN_CANCEL: CancellationToken;
-}
 
 pub(crate) use crate::application_catalog::{COMMANDS, MODEL_PROTOCOLS};
 
-pub(crate) use crate::desktop_controls::ProfileProvider;
-
 /// Compatibility commands intentionally omitted from autocomplete and help.
 const HIDDEN_COMMANDS: &[&str] = &[
+    "/reconnect",
     "/paste",
     "/detach",
     "/plan",
@@ -96,15 +92,21 @@ pub(super) const SKILL_MANAGE_ACTIONS: &[(&str, &str)] = &[
 
 fn command_matches(model: &Model) -> Vec<(String, String)> {
     let input = model.input.as_str();
+    let extra: Vec<(String, String)> = model
+        .remote
+        .as_ref()
+        .map(|peer| {
+            peer.plugins
+                .commands
+                .iter()
+                .map(|command| (command.name.clone(), command.description.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     COMMANDS
         .iter()
         .map(|(name, about)| (name.to_string(), about.to_string()))
-        .chain(
-            model
-                .plugin_commands
-                .iter()
-                .map(|command| (command.name.clone(), command.description.clone())),
-        )
+        .chain(extra)
         .filter(|(name, _)| name.starts_with(input))
         .collect()
 }
@@ -115,310 +117,6 @@ fn is_slash_command(line: &str) -> bool {
         Some(tok) => COMMANDS.iter().any(|(c, _)| *c == tok) || HIDDEN_COMMANDS.contains(&tok),
         None => false,
     }
-}
-
-/// Channel shared by agent events and approval requests.
-pub(crate) fn channel() -> (
-    mpsc::UnboundedSender<TuiEvent>,
-    mpsc::UnboundedReceiver<TuiEvent>,
-) {
-    mpsc::unbounded_channel()
-}
-
-/// Human gate backed by a TUI event and one-shot response.
-pub(crate) struct TuiGate {
-    pub(crate) tx: mpsc::UnboundedSender<TuiEvent>,
-}
-
-#[async_trait::async_trait]
-impl kernel::HumanGate for TuiGate {
-    async fn confirm(
-        &self,
-        action: &str,
-        detail: Option<&str>,
-        escalated: bool,
-    ) -> kernel::Approval {
-        let cancel = FOREGROUND_TURN_CANCEL
-            .try_with(CancellationToken::clone)
-            .ok();
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return kernel::Approval::Deny;
-        }
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let req = TuiEvent::Approval(
-            action.to_string(),
-            detail.map(str::to_string),
-            escalated,
-            cancel.clone(),
-            resp_tx,
-        );
-        if self.tx.send(req).is_err() {
-            return kernel::Approval::Deny;
-        }
-        match cancel {
-            Some(cancel) => {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => kernel::Approval::Deny,
-                    response = resp_rx => response.unwrap_or(kernel::Approval::Deny),
-                }
-            }
-            None => resp_rx.await.unwrap_or(kernel::Approval::Deny),
-        }
-    }
-
-    async fn confirm_network(
-        &self,
-        detail: Option<&str>,
-        escalated: bool,
-    ) -> kernel::NetworkDecision {
-        self.confirm_access(detail, escalated).await
-    }
-
-    async fn confirm_access(
-        &self,
-        detail: Option<&str>,
-        escalated: bool,
-    ) -> kernel::NetworkDecision {
-        let cancel = FOREGROUND_TURN_CANCEL
-            .try_with(CancellationToken::clone)
-            .ok();
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return kernel::NetworkDecision::Deny;
-        }
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let req = TuiEvent::AccessApproval(
-            detail.map(str::to_string),
-            escalated,
-            cancel.clone(),
-            resp_tx,
-        );
-        if self.tx.send(req).is_err() {
-            return kernel::NetworkDecision::Deny;
-        }
-        match cancel {
-            Some(cancel) => {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => kernel::NetworkDecision::Deny,
-                    response = resp_rx => response.unwrap_or(kernel::NetworkDecision::Deny),
-                }
-            }
-            None => resp_rx.await.unwrap_or(kernel::NetworkDecision::Deny),
-        }
-    }
-}
-
-/// Sends structured questions to the TUI; `None` means dismissal or closure.
-pub(crate) struct TuiAsker {
-    pub(crate) tx: mpsc::UnboundedSender<TuiEvent>,
-}
-
-#[async_trait::async_trait]
-impl kernel::Asker for TuiAsker {
-    async fn ask(&self, questions: Vec<kernel::Question>) -> Option<Vec<kernel::Answer>> {
-        let cancel = FOREGROUND_TURN_CANCEL
-            .try_with(CancellationToken::clone)
-            .ok();
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return None;
-        }
-        let (resp_tx, resp_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(TuiEvent::Clarify(questions, cancel.clone(), resp_tx))
-            .is_err()
-        {
-            return None;
-        }
-        match cancel {
-            Some(cancel) => {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => None,
-                    response = resp_rx => response.ok().flatten(),
-                }
-            }
-            None => resp_rx.await.ok().flatten(),
-        }
-    }
-}
-
-/// Events from the agent to the UI.
-#[derive(Debug)]
-pub(crate) enum TuiEvent {
-    ImagesLoaded {
-        session: ulid::Ulid,
-        generation: u64,
-        result: Result<Vec<crate::attachments::Attachment>, String>,
-    },
-    /// How the running turn differs from what was asked, e.g. an image the
-    /// model cannot see being described by another model instead.
-    TurnNotice(String),
-    Text(String),
-    Reasoning(String),
-    ToolStarted(String, Option<String>),
-    ToolCall(Option<String>, String, serde_json::Value),
-    ToolResult(Option<String>, String, bool, serde_json::Value),
-    Compaction(u32, u32, bool, Option<String>),
-    /// Compaction is running (true) / finished (false) — drives the live indicator.
-    Compacting(bool),
-    /// The turn is being retried after a transient provider failure and will
-    /// stream its reply again from the start.
-    Restarted,
-    /// One step of a child agent's own working-out, addressed by its path so it
-    /// lands in that agent's view rather than in the conversation that spawned it.
-    AgentStep {
-        /// Root surface session captured when the child was admitted.
-        surface_session: Option<ulid::Ulid>,
-        path: orchestrator::AgentPath,
-        step: AgentStep,
-    },
-    ContextPressure(kernel::ContextPressure),
-    /// Provider-reported token accounting for one request.
-    Usage(kernel::Usage),
-    /// Session cost so far in USD; `true` = indicative list price (shown "est.").
-    Cost(f64, bool),
-    Verify(bool, String),
-    Approval(
-        String,
-        Option<String>,
-        bool,
-        Option<CancellationToken>,
-        oneshot::Sender<kernel::Approval>,
-    ),
-    /// Command-capability prompt for network and/or directories; four-way answer
-    /// (once / session / persistent / deny).
-    AccessApproval(
-        Option<String>,
-        bool,
-        Option<CancellationToken>,
-        oneshot::Sender<kernel::NetworkDecision>,
-    ),
-    /// `clarify` tool: ask the user structured questions, reply with their
-    /// answers (or `None` if dismissed).
-    Clarify(
-        Vec<kernel::Question>,
-        Option<CancellationToken>,
-        oneshot::Sender<Option<Vec<kernel::Answer>>>,
-    ),
-    Done(Vec<Message>, StopReason),
-    Error(String, Option<Vec<Message>>),
-    /// The task which owned a force-aborted foreground turn has been dropped.
-    /// Events it queued before cancellation are ignored until this marker; the
-    /// marker is sent only after joining that task, so the next turn cannot
-    /// overlap its process-group teardown or mutation-lease cleanup.
-    ForegroundAbortSettled,
-    /// Force-abort cancellation has not finished promptly. This is advisory:
-    /// foreground ownership remains held until `ForegroundAbortSettled`.
-    ForegroundAbortSlow,
-    /// `/lsp` completed querying the registered LSP status tool.
-    LspStatus(Result<serde_json::Value, String>),
-    /// A background agent's report is durably recorded and collectable.
-    ///
-    /// Sent from the orchestrator *after* the outbox write, so acting on it can
-    /// never read a report that is not there yet.
-    AgentReportReady(Option<ulid::Ulid>),
-    /// The `/agents` panel's rows, resolved off the UI thread. Patches live in
-    /// the event log so they survive a restart, and reading the log is not
-    /// something a keystroke handler may block on.
-    AgentRows(Vec<AgentRow>),
-    /// A patch was viewed or applied. `Err` carries the refusal — an unverified
-    /// patch or a conflict — which is the outcome that matters most.
-    AgentPatchAction(Result<String, String>),
-    /// Detached follow-up admission finished; releases the session-boundary
-    /// guard before its success/failure notice is shown.
-    AgentFollowupFinished(Result<String, String>),
-    McpStatus(Result<serde_json::Value, String>),
-    PluginHealth(Vec<mcp::ServerStatus>),
-    PluginCommandExpanded {
-        session: ulid::Ulid,
-        typed: String,
-        result: Result<String, String>,
-    },
-    /// A remote MCP server's browser sign-in is waiting on this URL.
-    McpAuthUrl {
-        server: String,
-        url: String,
-    },
-    /// A remote MCP server wants credentials Medha could not classify — ask.
-    McpNeedsAuth {
-        server: String,
-        url: String,
-    },
-    /// A server's catalogue is ready to browse.
-    McpTools {
-        server: String,
-        tools: Vec<(String, bool)>,
-    },
-    /// A queued steer was applied at a turn boundary — promote its "queued"
-    /// notice to a real user line.
-    Steered(String),
-    /// The session ended with steers never applied (cancel / finish raced
-    /// them) — give the text back to the input box, never lose it.
-    SteersReturned(Vec<String>),
-    /// `/resume` completed loading the session list from the log.
-    SessionsLoaded(Vec<kernel::SessionMeta>),
-    /// `/skill install <src>` finished with a complete package report.
-    SkillInstalled(Result<tools::InstallReport, String>),
-    /// A background plugin install, update, or marketplace fetch finished.
-    PluginJob(plugins::JobDone),
-    /// `/skill search <query>` finished querying the registered sources.
-    SkillSearchResults(Result<tools::SearchResults, String>),
-    /// `/skill update` finished checking (and possibly applying) updates; the
-    /// lines are ready-to-show status/outcome rows.
-    SkillUpdateReport(Vec<String>),
-    /// Model setup queried the endpoint's `/v1/models`; `Err` carries the
-    /// reason so the form can fall back to manual model-id entry honestly.
-    /// Tagged with the queried base URL so a slow reply for an abandoned
-    /// draft can never populate a newer draft for a different endpoint.
-    ModelsDiscovered {
-        base_url: String,
-        result: Result<Vec<providers::openai_compat::ModelInfo>, String>,
-    },
-    /// `/mcp catalog` search results, as ready-to-edit `/mcp add` lines.
-    McpCatalog(Result<Vec<CatalogPick>, String>),
-    /// `/usage` finished reading the log.
-    UsageReport(String),
-    /// A past session's events were replayed into a transcript; swap to it.
-    Resumed(
-        ulid::Ulid,
-        Vec<Message>,
-        Vec<kernel::Event>,
-        Option<kernel::SessionClaim>,
-    ),
-    ResumeFailed {
-        source: ulid::Ulid,
-        target: ulid::Ulid,
-        error: String,
-    },
-    /// `/rewind` completed loading this session's rewind points from the log.
-    RewindPointsLoaded(Vec<RewindPoint>),
-    MemoryProvenance(Box<memory::MemoryEntry>, Option<kernel::Event>),
-    /// A picker pin/forget completed under the same durable mutation lease used
-    /// by kernel-dispatched memory tools.
-    MemoryMutationFinished {
-        verb: String,
-        result: Result<Vec<memory::MemoryEntry>, String>,
-    },
-    /// A rewind finished. `new_id` is `Some` for conversation scopes (swap to
-    /// the forked branch); `None` for code-only (conversation untouched). `msgs`
-    /// is the branch's replayed conversation, `rolled` the files reverted,
-    /// `prefill` the chosen prompt to drop back into the input box.
-    Rewound {
-        source: ulid::Ulid,
-        new_id: Option<ulid::Ulid>,
-        msgs: Vec<Message>,
-        memory_events: Vec<kernel::Event>,
-        rolled: usize,
-        scope: RewindScope,
-        prefill: Option<(String, Vec<crate::attachments::Attachment>)>,
-        claim: Option<kernel::SessionClaim>,
-    },
-    RewindFailed {
-        source: ulid::Ulid,
-        error: String,
-    },
 }
 
 /// A user-message boundary offered by `/rewind`; the cut occurs before `at_event`.
@@ -439,20 +137,6 @@ pub(crate) enum RewindScope {
     ConversationAndCode,
     /// Roll the files back only; keep the conversation intact (no fork/prefill).
     Code,
-}
-
-impl RewindScope {
-    /// True for scopes that rewind the conversation (fork + prefill + swap).
-    fn touches_conversation(self) -> bool {
-        matches!(
-            self,
-            RewindScope::Conversation | RewindScope::ConversationAndCode
-        )
-    }
-    /// True for scopes that roll files back.
-    fn touches_code(self) -> bool {
-        matches!(self, RewindScope::Code | RewindScope::ConversationAndCode)
-    }
 }
 
 impl RewindPoint {
@@ -542,6 +226,7 @@ struct AgentDoneRow {
 /// A transcript item with a memoized physical-row render.
 struct Entry {
     item: Item,
+    bytes: usize,
     lines: Option<Vec<Line<'static>>>,
     height: usize,
 }
@@ -570,15 +255,20 @@ struct LastClick {
 }
 
 impl Entry {
-    fn new(item: Item) -> Self {
+    fn new(mut item: Item) -> Self {
+        limit_item(&mut item);
+        let bytes = item_bytes(&item);
         Self {
             item,
+            bytes,
             lines: None,
             height: 0,
         }
     }
     fn invalidate(&mut self) {
+        limit_item(&mut self.item);
         self.lines = None;
+        self.bytes = item_bytes(&self.item);
     }
     /// Renders and caches physical rows so height and scroll agree. Markdown is
     /// rendered whole, since tables and fences make earlier lines depend on later
@@ -590,6 +280,11 @@ impl Entry {
         let mut rows: Vec<Line<'static>> = Vec::new();
         for logical in render_item(&self.item, cx) {
             rows.extend(wrap_line(&logical, width as usize));
+            if rows.len() >= 1024 {
+                rows.truncate(1024);
+                rows.push(Line::from(PREVIEW_NOTICE.trim()));
+                break;
+            }
         }
         self.height = rows.len();
         self.lines = Some(rows);
@@ -642,8 +337,10 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     }
 
     // Coalesce adjacent glyphs with the same style.
-    ranges
+    let omitted = ranges.len() > 1024;
+    let mut rows: Vec<_> = ranges
         .into_iter()
+        .take(1024)
         .map(|(a, b)| {
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut buf = String::new();
@@ -662,7 +359,84 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
             }
             Line::from(spans)
         })
-        .collect()
+        .collect();
+    if omitted {
+        rows.push(Line::from(PREVIEW_NOTICE.trim()));
+    }
+    rows
+}
+
+fn item_bytes(item: &Item) -> usize {
+    match item {
+        Item::User(s) | Item::Assistant(s) | Item::Thinking(s) | Item::Notice(s) => s.len(),
+        Item::ToolCall { id, tool, args } => {
+            id.as_ref().map_or(0, String::len) + tool.len() + crate::chat_presentation::size(args)
+        }
+        Item::ToolResult {
+            id, tool, payload, ..
+        } => {
+            id.as_ref().map_or(0, String::len)
+                + tool.len()
+                + crate::chat_presentation::size(payload)
+        }
+        Item::Compaction { summary, .. } => summary.as_ref().map_or(0, String::len),
+        Item::Verify { summary, .. } => summary.len(),
+        Item::AgentsDone(rows) => rows.iter().map(|row| row.name.len() + 64).sum(),
+    }
+}
+
+fn append_preview(buffer: &mut String, delta: &str) {
+    if buffer.ends_with(PREVIEW_NOTICE) {
+        return;
+    }
+    let room = MAX_ITEM_BYTES.saturating_sub(buffer.len());
+    if delta.len() <= room {
+        buffer.push_str(delta);
+        return;
+    }
+    let content_limit = MAX_ITEM_BYTES - PREVIEW_NOTICE.len();
+    if buffer.len() > content_limit {
+        buffer.truncate(floor_char_boundary(buffer, content_limit));
+    }
+    let take = floor_char_boundary(delta, content_limit.saturating_sub(buffer.len()));
+    buffer.push_str(&delta[..take]);
+    buffer.push_str(PREVIEW_NOTICE);
+}
+
+fn limit_item(item: &mut Item) {
+    match item {
+        Item::User(s)
+        | Item::Assistant(s)
+        | Item::Thinking(s)
+        | Item::Notice(s)
+        | Item::Verify { summary: s, .. } => {
+            if s.len() > MAX_ITEM_BYTES {
+                s.truncate(floor_char_boundary(
+                    s,
+                    MAX_ITEM_BYTES - PREVIEW_NOTICE.len(),
+                ));
+                s.push_str(PREVIEW_NOTICE);
+            }
+        }
+        Item::Compaction {
+            summary: Some(s), ..
+        } => {
+            if s.len() > MAX_ITEM_BYTES {
+                s.truncate(floor_char_boundary(
+                    s,
+                    MAX_ITEM_BYTES - PREVIEW_NOTICE.len(),
+                ));
+                s.push_str(PREVIEW_NOTICE);
+            }
+        }
+        Item::ToolCall { args, .. } | Item::ToolResult { payload: args, .. } => {
+            let bytes = crate::chat_presentation::size(args);
+            if bytes > MAX_ITEM_BYTES {
+                *args = serde_json::json!({"preview_omitted_bytes": bytes, "notice": PREVIEW_NOTICE.trim()});
+            }
+        }
+        _ => {}
+    }
 }
 
 fn ordered_selection(selection: TextSelection) -> Option<(TextPoint, TextPoint)> {
@@ -769,74 +543,26 @@ fn word_cell_range(text: &str, target: usize) -> Option<(usize, usize)> {
     Some((chars[first].1, chars[last - 1].2))
 }
 
-/// The decision channel behind an approval card. A standard prompt returns a
-/// three-way [`kernel::Approval`]; a network-grant prompt returns a four-way
-/// [`kernel::NetworkDecision`]. Keeping both on one card path means the queue,
-/// cancellation, and ready-signal logic is written once.
+/// Approval choices come from the backend's authoritative prompt.
 enum ApprovalResponder {
-    Standard(oneshot::Sender<kernel::Approval>),
-    Access(oneshot::Sender<kernel::NetworkDecision>),
+    Remote(protocol::ApprovalPrompt),
 }
-
 impl ApprovalResponder {
-    /// Option labels shown on the card, in selection-index order. An escalated
-    /// action drops every remembering tier: it is re-reviewed every time, so
-    /// offering "always" would promise a suppression that never happens.
-    fn options_for(&self, escalated: bool) -> &'static [&'static str] {
-        match (self, escalated) {
-            (Self::Standard(_), false) => &["Yes, allow once", "Yes, always allow", "No, deny"],
-            (Self::Standard(_), true) => &["Yes, allow once", "No, deny"],
-            (Self::Access(_), false) => &[
-                "Allow once and run",
-                "Allow for this session",
-                "Always allow for this project",
-                "No, deny",
-            ],
-            (Self::Access(_), true) => &["Allow once and run", "No, deny"],
-        }
-    }
-
-    fn len_for(&self, escalated: bool) -> usize {
-        self.options_for(escalated).len()
-    }
-
-    /// Send the decision for the selected option index (last option is deny).
-    fn answer_for(self, sel: usize, escalated: bool) {
-        let label = self.options_for(escalated).get(sel).copied();
-        match self {
-            Self::Standard(tx) => {
-                let _ = tx.send(match label {
-                    Some("Yes, allow once") => kernel::Approval::Once,
-                    Some("Yes, always allow") => kernel::Approval::Always,
-                    _ => kernel::Approval::Deny,
-                });
-            }
-            Self::Access(tx) => {
-                let _ = tx.send(match label {
-                    Some("Allow once and run") => kernel::NetworkDecision::Once,
-                    Some("Allow for this session") => kernel::NetworkDecision::Session,
-                    Some("Always allow for this project") => kernel::NetworkDecision::Persistent,
-                    _ => kernel::NetworkDecision::Deny,
-                });
-            }
-        }
-    }
-
-    fn deny(self) {
-        self.answer_for(usize::MAX, false);
-    }
-
-    /// Past-tense notice shown after the user picks option `sel`.
-    fn verb_for(&self, sel: usize, escalated: bool) -> &'static str {
-        match self.options_for(escalated).get(sel).copied() {
-            Some("Yes, allow once") => "approved",
-            Some("Yes, always allow") => "approved (always for this action)",
-            Some("Allow once and run") => "access allowed (once)",
-            Some("Allow for this session") => "access allowed (this session)",
-            Some("Always allow for this project") => "access allowed (persisted)",
-            _ if matches!(self, Self::Access(_)) => "access denied",
-            _ => "rejected",
-        }
+    fn options_for(&self, _escalated: bool) -> Vec<&'static str> {
+        let Self::Remote(prompt) = self;
+        prompt
+            .choices
+            .iter()
+            .map(|choice| match choice {
+                protocol::ApprovalDecision::Approve | protocol::ApprovalDecision::Once => {
+                    "Yes, allow once"
+                }
+                protocol::ApprovalDecision::Always => "Yes, always allow",
+                protocol::ApprovalDecision::Session => "Allow for this session",
+                protocol::ApprovalDecision::Persistent => "Always allow for this project",
+                protocol::ApprovalDecision::Deny => "No, deny",
+            })
+            .collect()
     }
 }
 
@@ -846,10 +572,6 @@ struct PendingApproval {
     detail: Option<String>,
     /// Trust-escalated actions cannot be remembered or auto-approved.
     escalated: bool,
-    /// Foreground turns carry their task-local cancellation token. `None`
-    /// belongs to work outside that foreground owner (for example a background
-    /// agent) and must survive the foreground turn ending.
-    cancel: Option<CancellationToken>,
     responder: ApprovalResponder,
 }
 
@@ -881,7 +603,11 @@ struct ClarifyState {
     other_cursor: usize,
     /// Inline validation feedback (for example, an unanswered radio question).
     validation: Option<String>,
-    responder: oneshot::Sender<Option<Vec<kernel::Answer>>>,
+    responder: QuestionResponder,
+}
+
+enum QuestionResponder {
+    Remote(u64),
 }
 
 impl ClarifyState {
@@ -1088,7 +814,7 @@ enum PickerKind {
     AutonomyMode,
     /// `/skill search` results: pick one to install. Holds the ranked hits;
     /// Enter installs the selected one through the guard-gated installer.
-    SkillSearch(Vec<tools::SkillHit>),
+    SkillSearch(Vec<protocol::SkillHit>),
     /// The skill hub's "Manage skills…" sub-menu (updates / sources / lock /
     /// sync). Fixed rows from [`SKILL_MANAGE_ACTIONS`]; no data to carry.
     SkillManage,
@@ -1097,7 +823,7 @@ enum PickerKind {
     /// an "Add a source…" row, one per source, then "Back".
     SkillSources(Vec<(String, String, bool)>),
     /// `/plugins`: every plugin screen; its rows and keys live in `plugins`.
-    Plugins(plugins::Screen),
+    BackendPlugins(Box<backend_plugins::Screen>),
     /// `/theme`: pick the colour theme. Rows are [`theme::modes`]; choosing one
     /// re-colours the UI live for the session.
     Theme,
@@ -1269,7 +995,7 @@ impl PickerKind {
             PickerKind::SkillSearch(_) => " add a skill — ↑↓ select · Enter · Esc back ".into(),
             PickerKind::SkillManage => " manage skills — ↑↓ select · Enter · Esc back ".into(),
             PickerKind::SkillSources(_) => " skill sources — ↑↓ · Enter · Esc back ".into(),
-            PickerKind::Plugins(screen) => screen.title(),
+            PickerKind::BackendPlugins(screen) => screen.title(),
             PickerKind::Theme => " theme — ↑↓ select · Enter apply · Esc done ".into(),
             PickerKind::Mcp(_) => {
                 " MCP — Enter connect · space on/off · t tools · d remove · Esc close ".into()
@@ -1598,7 +1324,7 @@ impl PickerKind {
                 .iter()
                 .map(|(label, _)| (*label).to_string())
                 .collect(),
-            PickerKind::Plugins(screen) => screen.labels(),
+            PickerKind::BackendPlugins(screen) => screen.labels(),
             PickerKind::SkillSources(sources) => {
                 let mut rows = vec!["➕ Add a source…".to_string()];
                 for (repo, path, removable) in sources {
@@ -1630,6 +1356,7 @@ enum SessionOp {
     Rewind {
         source: ulid::Ulid,
     },
+    Opening,
 }
 
 /// Guided model setup keeps credentials out of history and the transcript.
@@ -1642,9 +1369,18 @@ enum ModelSetupStep {
     Discovering,
     ModelId,
     ContextWindow,
+    Saving,
+    Activating,
+}
+
+#[derive(Default)]
+struct Editor {
+    text: String,
+    cursor: usize,
 }
 
 struct ModelSetup {
+    editor: Editor,
     mode: ModelSetupMode,
     step: ModelSetupStep,
     protocol: kernel::Protocol,
@@ -1655,6 +1391,12 @@ struct ModelSetup {
     max_ctx: Option<u32>,
 }
 
+struct McpCredential {
+    id: String,
+    saving: bool,
+    editor: Editor,
+}
+
 enum ModelSetupMode {
     Add,
     UpdateKey { profile: String },
@@ -1663,6 +1405,7 @@ enum ModelSetupMode {
 impl ModelSetup {
     fn new() -> Self {
         Self {
+            editor: Editor::default(),
             mode: ModelSetupMode::Add,
             step: ModelSetupStep::BaseUrl,
             protocol: kernel::Protocol::OpenAiChat,
@@ -1675,6 +1418,7 @@ impl ModelSetup {
 
     fn update_key(profile: String, protocol: kernel::Protocol, base_url: String) -> Self {
         Self {
+            editor: Editor::default(),
             mode: ModelSetupMode::UpdateKey { profile },
             step: ModelSetupStep::ApiKey,
             protocol,
@@ -1708,6 +1452,10 @@ impl ModelSetup {
                 }
             },
             ModelSetupStep::Discovering => "Querying the server for its models… (Esc cancels)",
+            ModelSetupStep::Saving => {
+                "Saving the model… (Esc leaves the form; an accepted save can still finish)"
+            }
+            ModelSetupStep::Activating => "The model is saved; activating it…",
             ModelSetupStep::ModelId => "Model ID (as the server names it):",
             ModelSetupStep::ContextWindow => {
                 "Context window in tokens (optional; blank = unknown):"
@@ -1728,10 +1476,12 @@ enum SearchSetupStep {
     /// Entering the secret: an API key (Tavily/Brave, masked) or the instance
     /// URL (SearXNG, not masked).
     Secret,
+    Saving,
 }
 
 /// In-flight `/search` draft. `provider` is set once the picker is confirmed.
 struct SearchSetup {
+    editor: Editor,
     provider: tools::SearchProvider,
     step: SearchSetupStep,
 }
@@ -1740,6 +1490,7 @@ impl SearchSetup {
     fn new() -> Self {
         // DuckDuckGo is a placeholder until the picker sets the real choice.
         Self {
+            editor: Editor::default(),
             provider: tools::SearchProvider::DuckDuckGo,
             step: SearchSetupStep::Provider,
         }
@@ -1779,6 +1530,31 @@ impl Picker {
     }
 }
 
+/// Data needed to render and stage local files. The chat sandbox stays in the backend.
+#[derive(Clone)]
+struct WorkspaceView {
+    root: std::path::PathBuf,
+    execution: String,
+}
+
+impl WorkspaceView {
+    fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+    fn exec_backend_label(&self) -> &str {
+        &self.execution
+    }
+}
+#[cfg(test)]
+impl From<Arc<WorkspaceSandbox>> for WorkspaceView {
+    fn from(local: Arc<WorkspaceSandbox>) -> Self {
+        Self {
+            root: local.root().into(),
+            execution: local.exec_backend_label().into(),
+        }
+    }
+}
+
 /// Complete TUI state.
 struct Model {
     /// Capped transcript items; durable history remains in the event log.
@@ -1788,9 +1564,9 @@ struct Model {
     /// name→glyph table here.
     tool_viz: HashMap<String, ToolViz>,
     input: String,
-    attachments: attach::PendingImages,
+    images: staged_images::Pending,
     /// A message held back until its attachments finish being admitted.
-    submit_deferred: Option<String>,
+    backend_deferred: Option<backend_ui::DeferredSend>,
     /// UTF-8 byte offset, always on a character boundary.
     cursor: usize,
     history: Vec<String>,
@@ -1848,15 +1624,18 @@ struct Model {
     active_profile: String,
     /// Persistent model profiles, shared with the main entrypoint so a TUI add
     /// is immediately available to this and future sessions.
-    model_config: Arc<Mutex<config::Config>>,
     /// `/model add` is a guided flow. Its API-key field is masked and never
     /// enters history, the transcript, or config.toml.
     model_setup: Option<ModelSetup>,
+    /// Reject receipts from a cancelled or replaced credential form.
+    form_generation: u64,
+    command_draft: Option<String>,
+    command_refused: bool,
     /// Live web-search settings shared with the `web.*` tools. `/search` writes
     /// it so a provider change takes effect on the next search without restart.
-    search: tools::SearchHandle,
     /// `/search` is a guided flow like `/model add`; its key field is masked.
     search_setup: Option<SearchSetup>,
+    mcp_credential: Option<McpCredential>,
     /// Autonomy dial (`/mode`): how much runs without asking. Applied to the
     /// session at the start of each turn; the safety floor is level-independent.
     autonomy: kernel::AutonomyLevel,
@@ -1864,7 +1643,6 @@ struct Model {
     /// An asynchronous resume/rewind owns the session boundary until its
     /// terminal event. Composer submissions and other boundaries wait.
     session_op: Option<SessionOp>,
-    session_owner: Option<Arc<dyn kernel::SessionOwner>>,
     /// Detached follow-up admissions not yet visible in the active roster.
     pending_agent_launches: usize,
     /// User messages accepted by a child but not yet reported as applied or
@@ -1872,7 +1650,6 @@ struct Model {
     pending_agent_steers: usize,
     /// A background report is collectable but a turn is already in flight. It
     /// cannot be injected mid-response, so the signal is held until this settles.
-    agent_report_deferred: bool,
     /// Tool whose call is currently streaming: (name, optional target file/command).
     /// Drives the "writing medha.html…" activity label instead of a vague "thinking".
     current_tool: Option<(String, Option<String>)>,
@@ -1880,11 +1657,9 @@ struct Model {
     turn_started: Option<Instant>,
     /// Interrupt handle for the running turn: Esc → graceful cancel_turn,
     /// Enter mid-turn → steer (applied at the next turn boundary).
-    interrupt: Option<kernel::InterruptHandle>,
     /// Owned foreground turn. The surface retains this handle until the turn
     /// has settled, and shutdown cancels then joins it before restoring the
     /// terminal or tearing down shared LSP/MCP/agent services.
-    foreground_turn: Option<tokio::task::JoinHandle<()>>,
     /// An Esc was sent and the kernel is settling in-flight tools — used to
     /// show one "stopping…" notice instead of one per Esc press.
     cancelling: bool,
@@ -1898,12 +1673,10 @@ struct Model {
     clarify: Option<ClarifyState>,
     /// Owner tag for `clarify`, kept beside the state so renderer test fixtures
     /// can construct the presentation-only form without cancellation plumbing.
-    clarify_cancel: Option<CancellationToken>,
     /// Selected approval option: once, always, or deny.
     approval_sel: usize,
     approval_expanded: bool,
     /// Session-scoped remembered approvals.
-    auto_approve: std::collections::HashSet<String>,
     reasoning: kernel::ReasoningConfig,
     /// Model/profile-level control support; unknown stays visibly unverified.
     reasoning_support: kernel::ReasoningSupport,
@@ -1928,53 +1701,25 @@ struct Model {
     anim_frame: u64,
     intro_frame: Option<u64>,
     should_quit: bool,
+    /// One returned draft exceeding the composer budget; saved before exit.
+    recovery_draft: Option<String>,
     last_redraw: Instant,
     /// Full large-paste content indexed by compact input placeholders.
     pastes: Vec<String>,
-    /// Workspace sandbox handle, used only to roll files back on `/rewind`
-    /// (code time-travel). File ops still go through the executor for turns;
-    /// this is the out-of-band restore path.
-    restore: Arc<WorkspaceSandbox>,
+    /// Workspace identity and execution label returned by the backend.
+    restore: WorkspaceView,
     /// Live owned shell tasks, polled from the executor so the *user* sees a
     /// foreground command that is still running in a concurrent session.
     bg_tasks: Vec<kernel::BackgroundTask>,
-    /// Running-task count last reflected on screen, so the status line only
-    /// forces an idle redraw when the number actually changes.
-    bg_shown_running: usize,
     /// A compaction (summarize pass) is currently running — shows a live
     /// "compacting…" indicator.
     compacting: bool,
     /// Expand compaction cards to show their full summary text (toggled by ^E).
     show_summary: bool,
-    /// Skill store + the session's registered tool names, so `/skills` can
-    /// re-scan live. `None` in tests / when skills aren't wired.
-    skills: Option<Arc<tools::SkillStore>>,
-    memory: Option<Arc<memory::MemoryProjection>>,
+    /// Whether this chat exposes the backend's memory commands.
     memory_enabled: bool,
-    memory_budget_tokens: u32,
-    memory_stale_after_days: u32,
-    known_tools: Arc<std::collections::HashSet<String>>,
-    /// MCP host handle, so `/mcp` can list/connect/remove/add live. `None` when
-    /// MCP is disabled or unwired (tests).
-    mcp: Option<Arc<mcp::McpManager>>,
-    plugin_health: HashMap<String, mcp::ServerState>,
-    /// The same plugin store `medha plugins` manages. `None` in tests.
-    plugins: Option<extensions::Store>,
-    plugin_markets: Option<extensions::sources::Marketplaces>,
-    /// Enabled plugin actions offered as `/` commands.
-    plugin_commands: Vec<plugins::commands::PluginCommand>,
-    /// Shown in the chat instead of the prompt a plugin command expands to.
-    typed_command: Option<String>,
-    queued_plugin_label: Option<String>,
-    pending_plugin_prompt: Option<(String, String)>,
+    /// A plugin command is being expanded by the backend.
     plugin_command_busy: bool,
-    /// Applies plugin changes to the running session; returns warnings.
-    apply_plugins: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
-    /// Set after `apply_plugins` so the skill list in the prompt is rebuilt.
-    plugins_changed: bool,
-    /// Sub-agent control plane, so the user can see that Medha delegated and to
-    /// what. `None` when sub-agents are disabled.
-    agents: Option<Arc<orchestrator::AgentControl>>,
     /// Children running right now, refreshed on the animation tick.
     agent_runs: Vec<orchestrator::Agent>,
     /// What each child is doing, from the live plane rather than the event log,
@@ -2015,6 +1760,7 @@ struct Model {
     /// tree until it has been taken once, then stops competing for attention: a
     /// hint that never quiets down is one that stops being read.
     switched_before: bool,
+    remote: Option<backend_ui::Peer>,
 }
 
 /// How much of one child's stream is kept for viewing.
@@ -2039,9 +1785,16 @@ fn append_pane_item(pane: &mut VecDeque<Entry>, item: Item, limit: usize) -> boo
     } else {
         pane.push_back(Entry::new(item));
     }
+    trim_pane(pane, limit)
+}
+
+fn trim_pane(pane: &mut VecDeque<Entry>, limit: usize) -> bool {
+    let mut bytes: usize = pane.iter().map(|entry| entry.bytes).sum();
     let mut dropped = false;
-    while pane.len() > limit {
-        pane.pop_front();
+    while pane.len() > limit || bytes > MAX_PANE_BYTES {
+        if let Some(entry) = pane.pop_front() {
+            bytes = bytes.saturating_sub(entry.bytes);
+        }
         dropped = true;
     }
     dropped
@@ -2060,12 +1813,7 @@ fn append_pane_notice(pane: &mut VecDeque<Entry>, notice: String, limit: usize) 
     if let Some(live) = live {
         pane.push_back(live);
     }
-    let mut dropped = false;
-    while pane.len() > limit {
-        pane.pop_front();
-        dropped = true;
-    }
-    dropped
+    trim_pane(pane, limit)
 }
 
 /// Add one step to a pane, coalescing streamed deltas onto the item they extend
@@ -2080,8 +1828,9 @@ fn append_agent_step(pane: &mut VecDeque<Entry>, step: AgentStep) {
             (Item::Thinking(buffer), true) => buffer,
             _ => return false,
         };
-        buffer.push_str(delta);
+        append_preview(buffer, delta);
         entry.invalidate();
+        trim_pane(pane, MAX_AGENT_PANE_ITEMS);
         true
     };
     let queued_notice = |text: &str| format!("↳ queued for this agent: {text}");
@@ -2175,14 +1924,14 @@ impl Model {
         reasoning: kernel::ReasoningConfig,
         ui: lockfile::UiConfig,
         tool_viz: HashMap<String, ToolViz>,
-        restore: Arc<WorkspaceSandbox>,
+        restore: impl Into<WorkspaceView>,
     ) -> Self {
         Self {
             items: VecDeque::with_capacity(MAX_SCROLLBACK_LINES),
             tool_viz,
             input: String::new(),
-            attachments: attach::PendingImages::default(),
-            submit_deferred: None,
+            images: staged_images::Pending::default(),
+            backend_deferred: None,
             cursor: 0,
             history: Vec::new(),
             history_idx: None,
@@ -2210,29 +1959,25 @@ impl Model {
             protocol: kernel::Protocol::OpenAiChat,
             max_ctx,
             active_profile: String::new(),
-            model_config: Arc::new(Mutex::new(config::Config::default())),
             model_setup: None,
-            search: Arc::new(Mutex::new(tools::SearchSettings::default())),
+            form_generation: 0,
+            command_draft: None,
+            command_refused: false,
             search_setup: None,
+            mcp_credential: None,
             autonomy: kernel::AutonomyLevel::Careful,
             running: false,
             session_op: None,
-            session_owner: None,
             pending_agent_launches: 0,
             pending_agent_steers: 0,
-            agent_report_deferred: false,
             current_tool: None,
             turn_started: None,
-            interrupt: None,
-            foreground_turn: None,
             cancelling: false,
             force_aborting: false,
             pending_approvals: VecDeque::new(),
             clarify: None,
-            clarify_cancel: None,
             approval_sel: 0,
             approval_expanded: false,
-            auto_approve: std::collections::HashSet::new(),
             reasoning,
             reasoning_support: kernel::ReasoningSupport::Unknown,
             streaming: true,
@@ -2245,32 +1990,17 @@ impl Model {
             show_thinking: ui.show_thinking,
             full_transparency: ui.full_transparency,
             should_quit: false,
+            recovery_draft: None,
             anim_frame: 0,
             intro_frame: Some(0),
             last_redraw: Instant::now(),
             pastes: Vec::new(),
-            restore,
+            restore: restore.into(),
             bg_tasks: Vec::new(),
-            bg_shown_running: 0,
             compacting: false,
             show_summary: false,
-            skills: None,
-            memory: None,
             memory_enabled: true,
-            memory_budget_tokens: memory::recall::DEFAULT_K3_BUDGET_TOKENS,
-            memory_stale_after_days: memory::recall::DEFAULT_STALE_AFTER_DAYS,
-            mcp: None,
-            plugin_health: HashMap::new(),
-            plugins: None,
-            plugin_markets: None,
-            plugin_commands: Vec::new(),
-            typed_command: None,
-            queued_plugin_label: None,
-            pending_plugin_prompt: None,
             plugin_command_busy: false,
-            apply_plugins: None,
-            plugins_changed: false,
-            agents: None,
             agent_runs: Vec::new(),
             agent_progress: HashMap::new(),
             agents_done: Vec::new(),
@@ -2281,133 +2011,8 @@ impl Model {
             switch_cursor: 0,
             switching: false,
             switched_before: false,
-            known_tools: Arc::new(std::collections::HashSet::new()),
+            remote: None,
         }
-    }
-
-    /// Wire the skill store (project + user dirs) and the session's tool names so
-    /// `/skills` can list them. Set once in `run_tea`.
-    fn with_skills(
-        mut self,
-        store: Arc<tools::SkillStore>,
-        known_tools: std::collections::HashSet<String>,
-    ) -> Self {
-        self.skills = Some(store);
-        self.known_tools = Arc::new(known_tools);
-        self
-    }
-
-    fn with_memory(
-        mut self,
-        store: Arc<memory::MemoryProjection>,
-        enabled: bool,
-        budget_tokens: u32,
-        stale_after_days: u32,
-    ) -> Self {
-        self.memory = Some(store);
-        self.memory_enabled = enabled;
-        self.memory_budget_tokens = budget_tokens;
-        self.memory_stale_after_days = stale_after_days;
-        self
-    }
-
-    fn with_model_profiles(
-        mut self,
-        profiles: Arc<Mutex<config::Config>>,
-        active_profile: String,
-    ) -> Self {
-        self.model_config = profiles;
-        self.active_profile = active_profile;
-        self
-    }
-
-    fn with_protocol(mut self, protocol: kernel::Protocol) -> Self {
-        self.protocol = protocol;
-        self
-    }
-
-    fn with_reasoning_support(mut self, support: kernel::ReasoningSupport) -> Self {
-        self.reasoning_support = support;
-        self
-    }
-
-    /// Share the tools' live search-settings handle so `/search` updates the
-    /// same settings the running `web.*` tools read.
-    fn with_search(mut self, search: tools::SearchHandle) -> Self {
-        self.search = search;
-        self
-    }
-
-    /// Replaces the system message's skill manifest while preserving memory.
-    fn refresh_skill_manifest(&self, transcript: &mut [Message]) {
-        let Some(store) = &self.skills else { return };
-        let Some(sys) = transcript.first_mut() else {
-            return;
-        };
-        if sys.role != kernel::Role::System {
-            return;
-        }
-        const MARKER: &str = "## Skills available";
-        let memory = sys
-            .content
-            .find(memory::recall::MEMORY_MARKER)
-            .map(|idx| sys.content[idx..].trim().to_string());
-        if let Some(idx) = sys.content.find(MARKER) {
-            let head = sys.content[..idx].trim_end().to_string();
-            sys.content = head;
-        } else if let Some(idx) = sys.content.find(memory::recall::MEMORY_MARKER) {
-            sys.content = sys.content[..idx].trim_end().to_string();
-        }
-        let fresh = store.manifest(&self.known_tools, None);
-        if !fresh.is_empty() {
-            sys.content.push_str("\n\n");
-            sys.content.push_str(&fresh);
-        }
-        if let Some(memory) = memory {
-            sys.content.push_str("\n\n");
-            sys.content.push_str(&memory);
-        }
-    }
-
-    /// Render the `/skills` notice: effective skills (scope, availability),
-    /// shadowed ones, and parse errors. Mirrors `/tasks`' upsert-in-place block.
-    fn skills_notice(&self) -> String {
-        let Some(store) = &self.skills else {
-            return "skills: unavailable".to_string();
-        };
-        let disc = store.discover(&self.known_tools);
-        if disc.listings.is_empty() && disc.errors.is_empty() {
-            return "skills: none installed\n\n(add one under .medha/skills/<name>/SKILL.md, \
-                    or ask me to save a procedure as a skill)"
-                .to_string();
-        }
-        let mut out = String::from("skills:");
-        for l in disc.effective() {
-            let s = &l.skill;
-            let avail = if l.available() {
-                String::new()
-            } else {
-                format!("  (unavailable: needs {})", l.missing_tools.join(", "))
-            };
-            out.push_str(&format!(
-                "\n  {} [{}]  {}{}",
-                s.name,
-                s.scope.as_str(),
-                s.description,
-                avail
-            ));
-        }
-        for l in disc.listings.iter().filter(|l| l.shadowed) {
-            out.push_str(&format!(
-                "\n  {} [{}]  — shadowed by project",
-                l.skill.name,
-                l.skill.scope.as_str()
-            ));
-        }
-        for (path, reason) in &disc.errors {
-            out.push_str(&format!("\n  ⚠ {} — {reason}", path.display()));
-        }
-        out
     }
 
     /// How many owned shell tasks are still running.
@@ -2415,55 +2020,13 @@ impl Model {
         self.bg_tasks.iter().filter(|t| t.running).count()
     }
 
+    fn attachment_chips(&self) -> Vec<String> {
+        self.images.chips()
+    }
+
     /// The approval currently rendered and answerable.
     fn pending_approval(&self) -> Option<&PendingApproval> {
         self.pending_approvals.front()
-    }
-
-    /// Deny every queued prompt when the whole interactive surface is closing.
-    /// Ordinary turn completion uses the owner-aware helper below so a
-    /// background agent's prompt is not coupled to the foreground lifecycle.
-    fn deny_pending_approvals(&mut self) {
-        while let Some(p) = self.pending_approvals.pop_front() {
-            p.responder.deny();
-        }
-        self.approval_sel = 0;
-        self.approval_ready = false;
-        // Also drop any live clarify form (its tool future is gone once the turn
-        // settles) so a stale question can't linger on screen owning input.
-        if let Some(state) = self.clarify.take() {
-            let _ = state.responder.send(None);
-        }
-        self.clarify_cancel = None;
-    }
-
-    /// Deny only prompts owned by the foreground turn. The TUI gate and asker
-    /// are also shared by background agents, whose requests intentionally have
-    /// no foreground task-local token; ending one turn must not reject them.
-    fn deny_foreground_prompts(&mut self) {
-        let mut kept = VecDeque::with_capacity(self.pending_approvals.len());
-        let mut removed = false;
-        while let Some(pending) = self.pending_approvals.pop_front() {
-            if pending.cancel.is_some() {
-                pending.responder.deny();
-                removed = true;
-            } else {
-                kept.push_back(pending);
-            }
-        }
-        self.pending_approvals = kept;
-        if removed {
-            // Reset presentation after removing any non-front owner.
-            self.approval_sel = 0;
-            self.approval_ready = false;
-            self.dirty = true;
-        }
-        if self.clarify_cancel.is_some() {
-            if let Some(state) = self.clarify.take() {
-                let _ = state.responder.send(None);
-            }
-            self.clarify_cancel = None;
-        }
     }
 
     /// The declared category of a tool (from the executor specs), or `Other` if
@@ -2476,8 +2039,8 @@ impl Model {
     }
 
     /// Expands paste placeholders before submission.
-    fn resolve_pastes(&self, s: &str) -> String {
-        expand_paste_tokens(&self.pastes, s)
+    fn resolve_pastes(&self, s: &str) -> Result<String, String> {
+        input::expand_paste_tokens(&self.pastes, s)
     }
 
     fn max_scroll(&self) -> usize {
@@ -2702,13 +2265,15 @@ impl Model {
         } else {
             &mut self.parked_main
         };
-        let appended = matches!(pane.back().map(|e| &e.item), Some(Item::Assistant(_)));
+        let appended = self.streamed_this_turn > 0
+            && matches!(pane.back().map(|e| &e.item), Some(Item::Assistant(_)));
         if appended {
             let e = pane.back_mut().unwrap();
             if let Item::Assistant(buf) = &mut e.item {
-                buf.push_str(delta);
+                append_preview(buf, delta);
             }
             e.invalidate(); // only the streaming item re-renders next frame
+            trim_pane(pane, MAX_SCROLLBACK_LINES);
             if showing {
                 self.dirty = true;
                 if self.auto_scroll {
@@ -2758,14 +2323,11 @@ impl Model {
             }
         }
         if let Some(returned) = returned {
-            if !self.input.is_empty() {
-                self.input.push('\n');
-            }
-            self.input.push_str(&returned);
-            self.cursor = self.input.len();
+            backend_ui::restore_draft(self, returned);
             self.dirty = true;
         }
         self.pending_agent_steers = self.pending_agent_steers.saturating_sub(settled_steers);
+        self.trim_agent_views();
         self.reconcile_switch_cursor(selected);
     }
 
@@ -2779,7 +2341,11 @@ impl Model {
         }
         self.parked_scroll
             .insert(self.focus.clone(), (self.scroll_offset, self.auto_scroll));
-        let leaving = std::mem::take(&mut self.items);
+        let mut leaving = std::mem::take(&mut self.items);
+        // Only the displayed pane needs physical-row caches.
+        for entry in &mut leaving {
+            entry.invalidate();
+        }
         match self.focus.take() {
             Some(path) => {
                 self.agent_panes.insert(path, leaving);
@@ -2814,11 +2380,6 @@ impl Model {
         self.cache_last_usage = None;
         self.cache_unreported_attempts = 0;
         self.context_pressure = None;
-        self.attachments.reset();
-        self.submit_deferred = None;
-        self.typed_command = None;
-        self.queued_plugin_label = None;
-        self.pending_plugin_prompt = None;
         self.plugin_command_busy = false;
         if self.focus.is_some() {
             self.focus_pane(None);
@@ -2828,7 +2389,7 @@ impl Model {
         self.agent_runs.clear();
         self.agent_progress.clear();
         self.agents_done.clear();
-        self.agent_report_deferred = false;
+        self.pending_agent_launches = 0;
         self.pending_agent_steers = 0;
         self.switching = false;
         self.switch_cursor = 0;
@@ -2854,22 +2415,62 @@ impl Model {
         self.reconcile_switch_cursor(selected);
     }
 
+    fn trim_agent_views(&mut self) {
+        while self.agent_panes.len() > 128 {
+            let Some(path) = self.agent_panes.keys().min().cloned() else {
+                break;
+            };
+            self.agent_panes.remove(&path);
+            self.parked_scroll.remove(&Some(path));
+        }
+        while self
+            .agent_panes
+            .values()
+            .flat_map(|pane| pane.iter())
+            .map(|entry| entry.bytes)
+            .sum::<usize>()
+            > MAX_AGENT_BYTES
+        {
+            let Some(path) = self
+                .agent_panes
+                .iter()
+                .filter(|(_, pane)| !pane.is_empty())
+                .min_by_key(|(path, _)| {
+                    self.agent_runs
+                        .iter()
+                        .find(|run| &run.path == *path)
+                        .map_or(0, |run| run.started_ms)
+                })
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.agent_panes.get_mut(&path).expect("pane").pop_front();
+        }
+    }
+
     fn has_active_agents(&self) -> bool {
-        self.pending_agent_launches > 0
-            || self.pending_agent_steers > 0
-            || self
-                .agents
-                .as_ref()
-                .is_some_and(|control| !control.active().is_empty())
+        if self.pending_agent_launches > 0 || self.pending_agent_steers > 0 {
+            return true;
+        }
+        if let Some(peer) = &self.remote {
+            return peer.agent_requests > 0
+                || self.pending_agent_launches > 0
+                || self.pending_agent_steers > 0
+                || peer.live.agents.iter().any(|agent| agent.status.is_none());
+        }
+        false
     }
 
     fn foreground_owned(&self) -> bool {
-        self.running
-            || self.force_aborting
-            || self
-                .foreground_turn
-                .as_ref()
-                .is_some_and(|turn| !turn.is_finished())
+        self.running || self.force_aborting || self.remote.as_ref().is_some_and(|peer| peer.sending)
+    }
+
+    fn unmerged_count(&self) -> usize {
+        if let Some(peer) = &self.remote {
+            return peer.live.pending_patches;
+        }
+        0
     }
 
     /// The switcher's rows: the conversation first, then every agent this session
@@ -2916,40 +2517,6 @@ impl Model {
             .min(rows.len().saturating_sub(1));
     }
 
-    /// Forget what the abandoned attempt rendered, so a retried turn's reply
-    /// arrives once. Only this turn's streamed items are dropped; the answer
-    /// above them belongs to a turn that finished.
-    fn drop_streamed_this_turn(&mut self) {
-        let mut streamed = std::mem::take(&mut self.streamed_this_turn);
-        let showing = self.focus.is_none();
-        let pane = if showing {
-            &mut self.items
-        } else {
-            &mut self.parked_main
-        };
-        // Notices can be inserted while a response is streaming (most notably
-        // a queued steer). Remove the streamed blocks themselves rather than
-        // blindly popping the same number of tail entries, or a retry can erase
-        // the notice and leave an abandoned partial answer behind.
-        let mut index = pane.len();
-        while index > 0 && streamed > 0 {
-            index -= 1;
-            if matches!(pane[index].item, Item::Assistant(_) | Item::Thinking(_)) {
-                pane.remove(index);
-                streamed -= 1;
-            }
-        }
-        self.reasoning_received_this_turn = false;
-        self.current_tool = None;
-        if showing {
-            self.invalidate_all_renders();
-            self.dirty = true;
-            if self.auto_scroll {
-                self.scroll_to_bottom();
-            }
-        }
-    }
-
     fn push_thinking_delta(&mut self, delta: &str) {
         self.reasoning_received_this_turn = true;
         let showing = self.focus.is_none();
@@ -2958,13 +2525,15 @@ impl Model {
         } else {
             &mut self.parked_main
         };
-        let appended = matches!(pane.back().map(|e| &e.item), Some(Item::Thinking(_)));
+        let appended = self.streamed_this_turn > 0
+            && matches!(pane.back().map(|e| &e.item), Some(Item::Thinking(_)));
         if appended {
             let e = pane.back_mut().unwrap();
             if let Item::Thinking(buf) = &mut e.item {
-                buf.push_str(delta);
+                append_preview(buf, delta);
             }
             e.invalidate();
+            trim_pane(pane, MAX_SCROLLBACK_LINES);
             if showing {
                 self.dirty = true;
                 if self.auto_scroll {
@@ -3017,307 +2586,117 @@ impl Model {
 
     // Editing maintains `cursor` on a UTF-8 character boundary.
 
+    fn edited(&self) -> (&str, usize) {
+        let editor = self
+            .mcp_credential
+            .as_ref()
+            .map(|form| &form.editor)
+            .or_else(|| self.model_setup.as_ref().map(|form| &form.editor))
+            .or_else(|| self.search_setup.as_ref().map(|form| &form.editor));
+        editor.map_or((&self.input, self.cursor), |editor| {
+            (&editor.text, editor.cursor)
+        })
+    }
+
+    fn edited_mut(&mut self) -> (&mut String, &mut usize) {
+        if let Some(form) = &mut self.mcp_credential {
+            return (&mut form.editor.text, &mut form.editor.cursor);
+        }
+        if let Some(form) = &mut self.model_setup {
+            return (&mut form.editor.text, &mut form.editor.cursor);
+        }
+        if let Some(form) = &mut self.search_setup {
+            return (&mut form.editor.text, &mut form.editor.cursor);
+        }
+        (&mut self.input, &mut self.cursor)
+    }
+
+    fn clear_edited(&mut self) {
+        let (text, cursor) = self.edited_mut();
+        text.clear();
+        *cursor = 0;
+    }
+
     fn insert_char(&mut self, c: char) {
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
+        if !self.can_insert(c.len_utf8()) {
+            return;
+        }
+        let (text, cursor) = self.edited_mut();
+        text.insert(*cursor, c);
+        *cursor += c.len_utf8();
     }
 
     fn insert_text(&mut self, s: &str) {
-        self.input.insert_str(self.cursor, s);
-        self.cursor += s.len();
+        if !self.can_insert(s.len()) {
+            return;
+        }
+        let (text, cursor) = self.edited_mut();
+        text.insert_str(*cursor, s);
+        *cursor += s.len();
+    }
+
+    fn secret_input(&self) -> bool {
+        self.model_setup.as_ref().is_some_and(ModelSetup::is_secret)
+            || self
+                .search_setup
+                .as_ref()
+                .is_some_and(SearchSetup::is_secret)
+            || self.mcp_credential.is_some()
+    }
+
+    fn can_insert(&mut self, bytes: usize) -> bool {
+        let form = self.model_setup.is_some()
+            || self.search_setup.is_some()
+            || self.mcp_credential.is_some();
+        let used = self.edited().0.len()
+            + if form {
+                0
+            } else {
+                self.pastes.iter().map(String::len).sum::<usize>()
+            };
+        let limit = if self.secret_input() {
+            MAX_SECRET_BYTES
+        } else {
+            MAX_COMPOSER_BYTES
+        };
+        if bytes > limit.saturating_sub(used) {
+            self.push_notice("Input is too large. Split it into smaller messages; the existing draft is preserved.");
+            false
+        } else {
+            true
+        }
     }
 
     fn backspace(&mut self) {
-        if let Some(c) = self.input[..self.cursor].chars().next_back() {
-            self.cursor -= c.len_utf8();
-            self.input.remove(self.cursor);
+        let (text, cursor) = self.edited_mut();
+        if let Some(c) = text[..*cursor].chars().next_back() {
+            *cursor -= c.len_utf8();
+            text.remove(*cursor);
         }
     }
 
     fn move_left(&mut self) {
-        if let Some(c) = self.input[..self.cursor].chars().next_back() {
-            self.cursor -= c.len_utf8();
+        let (text, cursor) = self.edited_mut();
+        if let Some(c) = text[..*cursor].chars().next_back() {
+            *cursor -= c.len_utf8();
         }
     }
 
     fn move_right(&mut self) {
-        if let Some(c) = self.input[self.cursor..].chars().next() {
-            self.cursor += c.len_utf8();
+        let (text, cursor) = self.edited_mut();
+        if let Some(c) = text[*cursor..].chars().next() {
+            *cursor += c.len_utf8();
         }
     }
-}
-
-/// Events that update the model.
-#[derive(Debug)]
-enum Msg {
-    KeyPress(KeyEvent),
-    MouseScroll(i32),
-    Mouse(MouseEvent),
-    Paste(String),
-    Resize(u16),
-    AgentEvent(TuiEvent),
-    Tick,
-}
-
-/// Stop and settle the foreground owner before the TUI releases its terminal
-/// and before main tears down shared services.
-async fn shutdown_foreground_turn(
-    model: &mut Model,
-    rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
-    grace: Duration,
-) -> bool {
-    // Stop admitting new gate/question requests, then deny both already-rendered
-    // prompts and those queued behind a final burst of stream events.
-    rx.close();
-    if let Some(handle) = model.interrupt.take() {
-        handle.cancel_turn();
-    }
-    model.deny_pending_approvals();
-    while let Ok(event) = rx.try_recv() {
-        match event {
-            TuiEvent::Approval(_, _, _, _, responder) => {
-                let _ = responder.send(kernel::Approval::Deny);
-            }
-            TuiEvent::Clarify(_, _, responder) => {
-                let _ = responder.send(None);
-            }
-            _ => {}
-        }
-    }
-
-    let Some(mut task) = model.foreground_turn.take() else {
-        model.running = false;
-        return true;
-    };
-    let graceful = tokio::time::timeout(grace, &mut task).await.is_ok();
-    if !graceful {
-        task.abort();
-        let _ = tokio::time::timeout(TURN_ABORT_GRACE, task).await;
-    }
-    model.running = false;
-    model.current_tool = None;
-    model.compacting = false;
-    model.turn_started = None;
-    model.cancelling = false;
-    model.force_aborting = false;
-    graceful
-}
-
-/// Runs the async TUI on the existing Tokio runtime with panic-safe restoration.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_tea<P, L>(
-    kernel: Arc<Kernel<P, L>>,
-    mut session: Session,
-    system: String,
-    model_name: String,
-    max_ctx: Option<u32>,
-    model_profiles: Arc<Mutex<config::Config>>,
-    active_profile: String,
-    open_setup: bool,
-    budget: Budget,
-    ui: lockfile::UiConfig,
-    resumed: Vec<Message>,
-    restore: Arc<WorkspaceSandbox>,
-    stray_log: std::path::PathBuf,
-    skill_store: Arc<tools::SkillStore>,
-    memory_store: Arc<memory::MemoryProjection>,
-    memory_enabled: bool,
-    memory_budget_tokens: u32,
-    memory_stale_after_days: u32,
-    known_tools: std::collections::HashSet<String>,
-    search_handle: tools::SearchHandle,
-    mcp: Option<Arc<mcp::McpManager>>,
-    plugins: extensions::Store,
-    plugin_markets: extensions::sources::Marketplaces,
-    live_plugins: crate::plugin_session::LivePlugins,
-    agents: Option<Arc<orchestrator::AgentControl>>,
-    tx: mpsc::UnboundedSender<TuiEvent>,
-    mut rx: mpsc::UnboundedReceiver<TuiEvent>,
-) -> anyhow::Result<()>
-where
-    P: ProfileProvider + 'static,
-    L: EventLog + 'static,
-{
-    // The unbounded notifier wakes the UI without blocking the orchestrator.
-    if let Some(control) = &agents
-        && let Ok(mut slot) = control.notifier_handle().lock()
-    {
-        let ready = tx.clone();
-        *slot = Some(Arc::new(move |surface_session| {
-            let _ = ready.send(TuiEvent::AgentReportReady(surface_session));
-        }));
-    }
-
-    // Detect before `tty::init` redirects output; OSC 11 needs the real terminal.
-    theme::set(theme::detect());
-
-    // A private TTY and redirected stray output protect the alternate screen.
-    let (mut terminal, mut redirect) = tty::init(&stray_log)?;
-
-    // Tool metadata is the presentation source of truth.
-    let tool_viz: HashMap<String, ToolViz> = kernel
-        .executor
-        .specs()
-        .into_iter()
-        .map(|s| {
-            (
-                s.name,
-                ToolViz {
-                    icon: s.icon,
-                    category: s.category,
-                },
-            )
-        })
-        .collect();
-    let mut model = Model::new(
-        model_name,
-        max_ctx,
-        kernel.provider.reasoning(),
-        ui,
-        tool_viz,
-        restore,
-    )
-    .with_protocol(kernel.provider.protocol())
-    .with_reasoning_support(kernel.provider.reasoning_support())
-    .with_skills(skill_store, known_tools)
-    .with_memory(
-        memory_store,
-        memory_enabled,
-        memory_budget_tokens,
-        memory_stale_after_days,
-    )
-    .with_model_profiles(model_profiles, active_profile)
-    .with_search(search_handle);
-    model.mcp = mcp;
-    model.plugins = Some(plugins);
-    model.plugin_markets = Some(plugin_markets);
-    plugins::refresh_commands(&mut model);
-    model.apply_plugins = Some(Arc::new(move || live_plugins.apply()));
-    model.agents = agents;
-    model.session_owner = kernel.session_owner();
-    model.autonomy = session.autonomy;
-    model.streaming = kernel.provider.streaming();
-    // First run (nothing configured) or explicit `medha --setup`: open the
-    // model-setup form immediately — the same surface `/model add` uses. The
-    // quiet variant keeps the welcome identity screen visible behind the form.
-    if open_setup {
-        update::open_model_setup_quiet(&mut model);
-    } else {
-        plugins::review_hooks(&mut model);
-    }
-    let mut transcript = crate::session_transcript(system, resumed);
-    let mut events = EventStream::new();
-    let mut ticker = tokio::time::interval(REDRAW_INTERVAL);
-    let mut redraw_needed = true;
-
-    terminal.draw(|f| view(f, &mut model)).ok();
-
-    loop {
-        if model.should_quit {
-            break;
-        }
-
-        // Input (scroll/keys) redraws IMMEDIATELY (bypasses the frame throttle) so
-        // scrolling steps evenly and feels responsive, instead of coalescing a burst
-        // of wheel events into one big jump on the next tick. Agent-stream redraws
-        // stay throttled (coalesced) so token floods don't thrash the screen.
-        let mut immediate = false;
-
-        tokio::select! {
-            maybe_ev = events.next() => {
-                match maybe_ev {
-                    Some(Ok(CtEvent::Key(key))) => { update(&mut model, Msg::KeyPress(key), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
-                    Some(Ok(CtEvent::Mouse(m))) => match m.kind {
-                        MouseEventKind::ScrollUp => { update(&mut model, Msg::MouseScroll(-2), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
-                        MouseEventKind::ScrollDown => { update(&mut model, Msg::MouseScroll(2), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
-                        MouseEventKind::Down(MouseButton::Left)
-                        | MouseEventKind::Drag(MouseButton::Left)
-                        | MouseEventKind::Up(MouseButton::Left) => {
-                            update(&mut model, Msg::Mouse(m), &kernel, &mut session, &mut transcript, &budget, &tx);
-                            redraw_needed = true;
-                            immediate = true;
-                        }
-                        _ => {}
-                    },
-                    Some(Ok(CtEvent::Paste(data))) => { update(&mut model, Msg::Paste(data), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
-                    Some(Ok(CtEvent::Resize(_, h))) => { update(&mut model, Msg::Resize(h), &kernel, &mut session, &mut transcript, &budget, &tx); redraw_needed = true; immediate = true; }
-                    _ => {}
-                }
-            }
-            // Drain each burst so streaming deltas coalesce before the next frame.
-            Some(ev) = rx.recv() => {
-                update(&mut model, Msg::AgentEvent(ev), &kernel, &mut session, &mut transcript, &budget, &tx);
-                let mut drained = 0u32;
-                while let Ok(ev) = rx.try_recv() {
-                    update(&mut model, Msg::AgentEvent(ev), &kernel, &mut session, &mut transcript, &budget, &tx);
-                    drained += 1;
-                    if drained >= 10_000 { break; } // safety bound per wake
-                }
-                if drained > 0 { tracing::trace!(drained, "coalesced agent events"); }
-                redraw_needed = true;
-            }
-            _ = ticker.tick() => {
-                update(&mut model, Msg::Tick, &kernel, &mut session, &mut transcript, &budget, &tx);
-                // Avoid redraws when no visible state is moving.
-                let running = model.bg_running();
-                if model.running || model.welcome || model.intro_frame.is_some() || model.dirty
-                    || !model.agent_runs.is_empty()
-                    || running > 0
-                    || running != model.bg_shown_running
-                    || model
-                        .clipboard_status
-                        .as_ref()
-                        .is_some_and(|(_, until)| *until > Instant::now())
-                {
-                    redraw_needed = true;
-                }
-                model.bg_shown_running = running;
-            }
-        }
-
-        if let Some(text) = model.pending_clipboard.take() {
-            let count = text.chars().count();
-            let status = match tty::copy_to_clipboard(&mut terminal, &text) {
-                Ok(()) => format!("copied {count} chars"),
-                Err(error) => {
-                    tracing::warn!(%error, "could not copy transcript selection");
-                    "clipboard unavailable".to_string()
-                }
-            };
-            model.clipboard_status = Some((status, Instant::now() + Duration::from_secs(2)));
-            redraw_needed = true;
-            immediate = true;
-        }
-
-        // Redraw when: a user input just happened (immediate — snappy scroll/typing),
-        // an unshown approval must appear, or the frame interval elapsed (throttled
-        // path for streaming).
-        let force = model.pending_approval().is_some() && !model.approval_ready;
-        if redraw_needed && (immediate || force || model.last_redraw.elapsed() >= REDRAW_INTERVAL) {
-            terminal.draw(|f| view(f, &mut model)).ok();
-            model.last_redraw = Instant::now();
-            redraw_needed = false;
-        }
-    }
-
-    shutdown_foreground_turn(&mut model, &mut rx, TURN_SHUTDOWN_GRACE).await;
-
-    // Restore the terminal before a closing hook can take its bounded timeout.
-    tty::restore(&mut terminal, &mut redirect);
-
-    kernel
-        .observe_hook(
-            &session,
-            kernel::HookPoint::SessionEnd,
-            serde_json::json!({ "source": "tui" }),
-        )
-        .await;
-    Ok(())
 }
 
 #[cfg(test)]
+mod pane_tests;
+
+#[cfg(test)]
 mod tests {
-    /// Slash commands must bypass the mid-turn steering path.
+    use super::input::{expand_paste_tokens, strip_paste_markers};
+    use super::*;
     #[test]
     fn agent_commands_are_recognised_so_they_survive_a_running_turn() {
         assert!(super::is_slash_command("/steer tokio-research narrow it"));
@@ -3327,237 +2706,16 @@ mod tests {
         assert!(!super::is_slash_command("/Users/me/notes.txt read this"));
     }
 
-    use super::*;
-
-    /// Flatten a rendered line to its plain text (drops styling) for assertions.
     fn text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
+
     fn block(lines: &[Line]) -> String {
         lines.iter().map(text).collect::<Vec<_>>().join("\n")
     }
-    /// Never written through here, so it roots at the existing temp folder instead of creating one.
+
     fn test_sbx() -> Arc<WorkspaceSandbox> {
         Arc::new(WorkspaceSandbox::new_jailed(std::env::temp_dir()).unwrap())
-    }
-
-    #[tokio::test]
-    async fn tui_gate_prompt_returns_deny_when_its_turn_is_cancelled() {
-        let (tx, mut rx) = channel();
-        let gate = TuiGate { tx };
-        let cancel = CancellationToken::new();
-
-        let confirm = FOREGROUND_TURN_CANCEL.scope(
-            cancel.clone(),
-            kernel::HumanGate::confirm(&gate, "shell.exec: cargo test", None, false),
-        );
-        let observe_then_cancel = async {
-            let event = rx.recv().await.expect("approval request should be emitted");
-            let TuiEvent::Approval(_, _, _, Some(tag), _) = &event else {
-                panic!("approval should carry its foreground turn token");
-            };
-            assert!(!tag.is_cancelled());
-            cancel.cancel();
-            event
-        };
-
-        let (decision, event) = tokio::join!(confirm, observe_then_cancel);
-        assert_eq!(decision, kernel::Approval::Deny);
-        let TuiEvent::Approval(_, _, _, Some(tag), _) = event else {
-            unreachable!()
-        };
-        assert!(tag.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn tui_asker_returns_none_when_its_turn_is_cancelled() {
-        let (tx, mut rx) = channel();
-        let asker = TuiAsker { tx };
-        let cancel = CancellationToken::new();
-        let questions = vec![kernel::Question {
-            prompt: "Continue?".into(),
-            header: "Choice".into(),
-            options: vec![
-                kernel::QOption {
-                    label: "Yes".into(),
-                    description: String::new(),
-                    recommended: true,
-                },
-                kernel::QOption {
-                    label: "No".into(),
-                    description: String::new(),
-                    recommended: false,
-                },
-            ],
-            multi_select: false,
-        }];
-
-        let ask =
-            FOREGROUND_TURN_CANCEL.scope(cancel.clone(), kernel::Asker::ask(&asker, questions));
-        let observe_then_cancel = async {
-            let event = rx.recv().await.expect("question request should be emitted");
-            let TuiEvent::Clarify(_, Some(tag), _) = &event else {
-                panic!("question should carry its foreground turn token");
-            };
-            assert!(!tag.is_cancelled());
-            cancel.cancel();
-            event
-        };
-
-        let (answer, event) = tokio::join!(ask, observe_then_cancel);
-        assert!(answer.is_none());
-        let TuiEvent::Clarify(_, Some(tag), _) = event else {
-            unreachable!()
-        };
-        assert!(tag.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn cancelled_gate_waiter_does_not_emit_a_second_approval_card() {
-        let (tx, mut rx) = channel();
-        let gate = Arc::new(TuiGate { tx });
-        let serial = Arc::new(futures::lock::Mutex::new(()));
-        let cancel = CancellationToken::new();
-
-        let calls = FOREGROUND_TURN_CANCEL.scope(cancel.clone(), async {
-            let first = {
-                let gate = Arc::clone(&gate);
-                let serial = Arc::clone(&serial);
-                async move {
-                    let _guard = serial.lock().await;
-                    kernel::HumanGate::confirm(gate.as_ref(), "first", None, false).await
-                }
-            };
-            let second = {
-                let gate = Arc::clone(&gate);
-                let serial = Arc::clone(&serial);
-                async move {
-                    let _guard = serial.lock().await;
-                    kernel::HumanGate::confirm(gate.as_ref(), "second", None, false).await
-                }
-            };
-            tokio::join!(first, second)
-        });
-        let cancel_after_first = async {
-            let first = rx.recv().await.expect("the first card should be emitted");
-            cancel.cancel();
-            drop(first);
-            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
-        };
-
-        let ((first, second), extra) = tokio::join!(calls, cancel_after_first);
-        assert_eq!(first, kernel::Approval::Deny);
-        assert_eq!(second, kernel::Approval::Deny);
-        assert!(
-            extra.is_err(),
-            "a waiter queued at Esc emitted a stale card"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_permission_waiter_does_not_emit_a_second_approval_card() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let first_path = outside.join("first.txt");
-        let second_path = outside.join("second.txt");
-        std::fs::write(&first_path, "first").unwrap();
-        std::fs::write(&second_path, "second").unwrap();
-
-        let (tx, mut rx) = channel();
-        let gate = Arc::new(TuiGate { tx });
-        let sandbox = Arc::new(
-            WorkspaceSandbox::new(
-                &workspace,
-                temp.path().join("trust.lock"),
-                temp.path().join("audit.log"),
-                Some(gate),
-            )
-            .unwrap(),
-        );
-        let cancel = CancellationToken::new();
-
-        let requests = FOREGROUND_TURN_CANCEL.scope(cancel.clone(), async {
-            tokio::join!(
-                sandbox.resolve(first_path.to_str().unwrap()),
-                sandbox.resolve(second_path.to_str().unwrap())
-            )
-        });
-        let cancel_after_first = async {
-            let first = rx
-                .recv()
-                .await
-                .expect("the first path card should be emitted");
-            cancel.cancel();
-            drop(first);
-            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
-        };
-
-        let ((first, second), extra) = tokio::join!(requests, cancel_after_first);
-        assert!(first.is_err());
-        assert!(second.is_err());
-        assert!(
-            extra.is_err(),
-            "a permission request queued at Esc emitted a stale card"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_and_joins_active_turn_and_denies_all_approvals() {
-        let mut model = Model::new(
-            "m".into(),
-            None,
-            kernel::ReasoningConfig::default(),
-            lockfile::UiConfig::default(),
-            HashMap::new(),
-            test_sbx(),
-        );
-        let (surface_tx, mut surface_rx) = channel();
-        let (interrupt, queue) = kernel::InterruptQueue::pair();
-        let cancel = queue.token();
-        model.interrupt = Some(interrupt);
-        model.running = true;
-
-        let (visible_tx, visible_rx) = oneshot::channel();
-        model.pending_approvals.push_back(PendingApproval {
-            action: "edit".into(),
-            detail: None,
-            escalated: false,
-            cancel: None,
-            responder: ApprovalResponder::Standard(visible_tx),
-        });
-        let (queued_tx, queued_rx) = oneshot::channel();
-        surface_tx
-            .send(TuiEvent::Approval(
-                "shell.exec".into(),
-                None,
-                false,
-                None,
-                queued_tx,
-            ))
-            .unwrap();
-
-        let (settled_tx, settled_rx) = oneshot::channel();
-        model.foreground_turn = Some(tokio::spawn(async move {
-            cancel.cancelled().await;
-            let visible = visible_rx.await.unwrap();
-            let queued = queued_rx.await.unwrap();
-            let _ = settled_tx.send((visible, queued));
-        }));
-
-        let graceful =
-            shutdown_foreground_turn(&mut model, &mut surface_rx, Duration::from_secs(1)).await;
-        assert!(graceful, "cooperative turn should join within the grace");
-        assert_eq!(
-            settled_rx.await.unwrap(),
-            (kernel::Approval::Deny, kernel::Approval::Deny)
-        );
-        assert!(model.foreground_turn.is_none());
-        assert!(model.pending_approvals.is_empty());
-        assert!(!model.running);
-        assert!(surface_tx.is_closed(), "new prompts must be refused");
     }
 
     #[test]
@@ -3593,51 +2751,6 @@ mod tests {
             .is_some(),
             "double-clicking a one-cell word is still a real selection"
         );
-    }
-
-    #[test]
-    fn refresh_skill_manifest_injects_saved_skill_same_session() {
-        let scratch = tempfile::Builder::new()
-            .prefix("medha-skref-")
-            .tempdir()
-            .unwrap();
-        let proj = scratch.path().join(".medha").join("skills");
-        std::fs::create_dir_all(proj.join("note-taker")).unwrap();
-        std::fs::write(
-            proj.join("note-taker").join("SKILL.md"),
-            "---\nname = \"note-taker\"\ndescription = \"Capture a decision\"\n---\n\nsteps",
-        )
-        .unwrap();
-        let store = Arc::new(tools::SkillStore::new(proj, None));
-        let mut known = std::collections::HashSet::new();
-        known.insert("edit".to_string());
-        known.insert("skill".to_string());
-        let model = Model::new(
-            "m".into(),
-            None,
-            kernel::ReasoningConfig::default(),
-            lockfile::UiConfig::default(),
-            HashMap::new(),
-            test_sbx(),
-        )
-        .with_skills(store, known);
-
-        // A system message with no skills section yet (as at startup with none).
-        let mut transcript = vec![Message::system(
-            "BASE PROMPT\n\n## Memory\n\n── MEMORY (0 entries) ──",
-        )];
-        model.refresh_skill_manifest(&mut transcript);
-        assert!(transcript[0].content.contains("## Skills available"));
-        assert!(transcript[0].content.contains("note-taker"));
-        // Idempotent: a second refresh must not stack a duplicate section.
-        model.refresh_skill_manifest(&mut transcript);
-        assert_eq!(
-            transcript[0].content.matches("## Skills available").count(),
-            1
-        );
-        assert!(transcript[0].content.starts_with("BASE PROMPT"));
-        assert_eq!(transcript[0].content.matches("## Memory").count(), 1);
-        assert!(transcript[0].content.ends_with("── MEMORY (0 entries) ──"));
     }
 
     #[test]
@@ -3709,25 +2822,6 @@ mod tests {
             !out.contains('┌') && !out.contains('│') && !out.contains('╭'),
             "approval must not draw a box"
         );
-    }
-
-    /// The plain gate and the ACP bridge both surface `escalated`; the primary
-    /// surface must not silently offer a suppression it will never honour.
-    #[test]
-    fn an_escalated_card_warns_and_never_offers_always() {
-        let responder = ApprovalResponder::Standard(oneshot::channel().0);
-        let opts = responder.options_for(true);
-        assert_eq!(opts, &["Yes, allow once", "No, deny"]);
-        let card = block(&render_approval("fs_write", None, 0, opts, true));
-        assert!(card.contains("untrusted web content"), "{card}");
-        assert!(!card.contains("always"), "{card}");
-        assert_eq!(responder.verb_for(1, true), "rejected");
-        let network = ApprovalResponder::Access(oneshot::channel().0);
-        assert_eq!(
-            network.options_for(true),
-            &["Allow once and run", "No, deny"]
-        );
-        assert_eq!(network.verb_for(1, true), "access denied");
     }
 
     #[test]
@@ -3872,200 +2966,6 @@ mod tests {
         // Near-miss typo goes to the model too (autocomplete guides while typing).
         assert!(!is_slash_command("/claer"));
         assert!(!is_slash_command("/"));
-    }
-
-    #[test]
-    fn steer_events_promote_queued_notice_and_return_unsent_text() {
-        let ui = lockfile::UiConfig::default();
-        let mut m = Model::new(
-            "m".into(),
-            None,
-            kernel::ReasoningConfig::default(),
-            ui,
-            HashMap::new(),
-            test_sbx(),
-        );
-        let mut session = kernel::Session::new();
-        let mut transcript: Vec<Message> = Vec::new();
-
-        // Steer queued in the TUI → notice; kernel applies it → Steered
-        // promotes the notice to a real user line (exactly one).
-        m.push_notice("↳ queued for this task: check the tests");
-        update::handle_agent_event(
-            &mut m,
-            TuiEvent::Steered("check the tests".into()),
-            &mut session,
-            &mut transcript,
-        );
-        assert!(
-            !m.items
-                .iter()
-                .any(|e| matches!(&e.item, Item::Notice(n) if n.starts_with("↳ queued")))
-        );
-        assert!(
-            m.items
-                .iter()
-                .any(|e| matches!(&e.item, Item::User(s) if s == "check the tests"))
-        );
-
-        // Cancel raced a steer → the text lands back in the input box.
-        m.push_notice("↳ queued for this task: do Y instead");
-        update::handle_agent_event(
-            &mut m,
-            TuiEvent::SteersReturned(vec!["do Y instead".into()]),
-            &mut session,
-            &mut transcript,
-        );
-        assert_eq!(
-            m.input, "do Y instead",
-            "returned steer must be editable, not lost"
-        );
-        assert_eq!(m.cursor, m.input.len());
-        assert!(
-            !m.items
-                .iter()
-                .any(|e| matches!(&e.item, Item::Notice(n) if n.starts_with("↳ queued")))
-        );
-    }
-
-    #[test]
-    fn text_and_reasoning_stream_into_separate_transcript_items() {
-        // Text and reasoning must remain distinct transcript channels.
-        let ui = lockfile::UiConfig::default();
-        let mut m = Model::new(
-            "m".into(),
-            None,
-            kernel::ReasoningConfig::default(),
-            ui,
-            HashMap::new(),
-            test_sbx(),
-        );
-        let mut session = kernel::Session::new();
-        let mut transcript: Vec<Message> = Vec::new();
-
-        for d in [
-            "Shape 2: `<think>",
-            "` tags) and the rest ",
-            "of the answer",
-        ] {
-            update::handle_agent_event(
-                &mut m,
-                TuiEvent::Text(d.to_string()),
-                &mut session,
-                &mut transcript,
-            );
-        }
-        let thinking = m
-            .items
-            .iter()
-            .filter(|e| matches!(e.item, Item::Thinking(_)))
-            .count();
-        assert_eq!(thinking, 0, "no Thinking item for a text-only answer");
-        assert!(
-            m.items.iter().any(|e| matches!(&e.item, Item::Assistant(s) if s == "Shape 2: `<think>` tags) and the rest of the answer")),
-            "the full answer is one visible Assistant item"
-        );
-
-        update::handle_agent_event(
-            &mut m,
-            TuiEvent::Reasoning("planning".into()),
-            &mut session,
-            &mut transcript,
-        );
-        update::handle_agent_event(
-            &mut m,
-            TuiEvent::Text("done.".into()),
-            &mut session,
-            &mut transcript,
-        );
-        assert!(
-            m.items
-                .iter()
-                .any(|e| matches!(&e.item, Item::Thinking(s) if s == "planning"))
-        );
-        assert!(
-            m.items
-                .iter()
-                .any(|e| matches!(&e.item, Item::Assistant(s) if s == "done."))
-        );
-    }
-
-    #[test]
-    fn resumed_history_replays_tool_results_with_their_tool_names() {
-        let ui = lockfile::UiConfig::default();
-        let mut m = Model::new(
-            "m".into(),
-            None,
-            kernel::ReasoningConfig::default(),
-            ui,
-            HashMap::new(),
-            test_sbx(),
-        );
-        let msgs = vec![
-            Message::user("list files"),
-            Message::assistant_calls(
-                "checking",
-                vec![kernel::ToolIntent {
-                    id: "call-1".into(),
-                    tool: "ls".into(),
-                    args: serde_json::json!({"path": "."}),
-                }],
-            ),
-            Message::tool_result("call-1", r#"{"entries": 3}"#),
-            Message::tool_result("call-1", r#"{"error": "denied"}"#),
-            Message::tool_result("call-1", r#"{"reason": "not permitted"}"#),
-        ];
-        update::repaint_history(&mut m, &msgs);
-        assert_eq!(
-            m.items
-                .iter()
-                .filter(|e| matches!(&e.item, Item::ToolResult { ok: false, .. }))
-                .count(),
-            2
-        );
-        assert!(
-            m.items
-                .iter()
-                .any(|e| matches!(&e.item, Item::ToolCall { tool, .. } if tool == "ls"))
-        );
-        assert!(
-            m.items.iter().any(
-                |e| matches!(&e.item, Item::ToolResult { tool, ok: true, .. } if tool == "ls")
-            ),
-            "successful result replays with its tool name"
-        );
-        assert!(
-            m.items
-                .iter()
-                .any(|e| matches!(&e.item, Item::ToolResult { ok: false, .. })),
-            "error payloads replay as failures"
-        );
-    }
-
-    #[test]
-    fn resumed_history_shows_only_what_the_person_typed() {
-        let mut m = Model::new(
-            "m".into(),
-            None,
-            kernel::ReasoningConfig::default(),
-            lockfile::UiConfig::default(),
-            HashMap::new(),
-            test_sbx(),
-        );
-        let msgs = vec![
-            Message::user("hii"),
-            Message::user("[session_start hook p/c] be terse").carrying(kernel::TrustLabel::Tool),
-        ];
-        update::repaint_history(&mut m, &msgs);
-        let users: Vec<_> = m
-            .items
-            .iter()
-            .filter_map(|e| match &e.item {
-                Item::User(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(users, ["hii"]);
     }
 
     #[test]
@@ -4264,160 +3164,34 @@ mod tests {
     fn expand_tokens_round_trips_and_ignores_plain_text() {
         let pastes = vec!["FULL CONTENT".to_string()];
         assert_eq!(
-            expand_paste_tokens(&pastes, "before [paste #0: 12 chars] after"),
+            expand_paste_tokens(&pastes, "before [paste #0: 12 chars] after").unwrap(),
             "before FULL CONTENT after"
         );
         // A bare bracket that isn't a real token is left untouched.
-        assert_eq!(expand_paste_tokens(&pastes, "arr[0] = 1"), "arr[0] = 1");
+        assert_eq!(
+            expand_paste_tokens(&pastes, "arr[0] = 1").unwrap(),
+            "arr[0] = 1"
+        );
         // No pastes → identity.
         assert_eq!(
-            expand_paste_tokens(&[], "[paste #0: 5 chars]"),
+            expand_paste_tokens(&[], "[paste #0: 5 chars]").unwrap(),
             "[paste #0: 5 chars]"
         );
-    }
-
-    fn push_approval(model: &mut Model, action: &str) -> oneshot::Receiver<kernel::Approval> {
-        push_approval_ex(model, action, false)
-    }
-
-    fn push_approval_ex(
-        model: &mut Model,
-        action: &str,
-        escalated: bool,
-    ) -> oneshot::Receiver<kernel::Approval> {
-        let (tx, rx) = oneshot::channel();
-        let ev = TuiEvent::Approval(action.to_string(), None, escalated, None, tx);
-        // Drive the same path handle_agent_event uses, minus the generic plumbing.
-        match ev {
-            TuiEvent::Approval(action, detail, escalated, cancel, responder) => {
-                if !escalated && model.auto_approve.contains(&action) {
-                    let _ = responder.send(kernel::Approval::Once);
-                } else {
-                    let was_empty = model.pending_approvals.is_empty();
-                    model.pending_approvals.push_back(PendingApproval {
-                        action,
-                        detail,
-                        escalated,
-                        cancel,
-                        responder: ApprovalResponder::Standard(responder),
-                    });
-                    if was_empty {
-                        model.approval_sel = 0;
-                        model.approval_ready = false;
-                        model.dirty = true;
-                    }
-                }
-            }
-            _ => unreachable!(),
-        }
-        rx
+        assert_eq!(
+            expand_paste_tokens(&pastes, "[paste #99: 12 chars] literal").unwrap(),
+            "[paste #99: 12 chars] literal"
+        );
     }
 
     #[test]
-    fn escalated_approval_is_never_auto_approved() {
-        let ui = lockfile::UiConfig::default();
-        let mut m = Model::new(
-            "m".into(),
-            None,
-            kernel::ReasoningConfig::default(),
-            ui,
-            HashMap::new(),
-            test_sbx(),
-        );
-        m.auto_approve
-            .insert("shell.exec: curl example.com".to_string());
-
-        let mut rx = push_approval_ex(&mut m, "shell.exec: curl example.com", false);
+    fn repeated_paste_references_cannot_amplify_a_small_composer_without_bound() {
+        let pastes = vec!["x".repeat(MAX_COMPOSER_BYTES / 2)];
         assert!(
-            m.pending_approvals.is_empty(),
-            "remembered action auto-approves"
-        );
-        assert_eq!(rx.try_recv(), Ok(kernel::Approval::Once));
-
-        // Trust escalation requires fresh review despite a remembered action.
-        let _rx2 = push_approval_ex(&mut m, "shell.exec: curl example.com", true);
-        assert_eq!(
-            m.pending_approvals.len(),
-            1,
-            "escalated action is always re-asked, never waved through"
-        );
-    }
-
-    #[test]
-    fn concurrent_approvals_queue_without_dropping_responders() {
-        let ui = lockfile::UiConfig::default();
-        let mut m = Model::new(
-            "m".into(),
-            None,
-            kernel::ReasoningConfig::default(),
-            ui,
-            HashMap::new(),
-            test_sbx(),
-        );
-
-        let mut rx1 = push_approval(&mut m, "Read access to /outside/a");
-        let mut rx2 = push_approval(&mut m, "Read access to /outside/b");
-
-        assert_eq!(m.pending_approvals.len(), 2);
-        assert_eq!(
-            m.pending_approval().map(|p| p.action.as_str()),
-            Some("Read access to /outside/a")
-        );
-
-        m.approval_ready = true;
-        handle_approval_key(
-            &mut m,
-            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
-        );
-        assert_eq!(rx1.try_recv(), Ok(kernel::Approval::Once));
-
-        assert_eq!(m.pending_approvals.len(), 1);
-        assert_eq!(
-            m.pending_approval().map(|p| p.action.as_str()),
-            Some("Read access to /outside/b")
-        );
-
-        m.approval_ready = true;
-        handle_approval_key(
-            &mut m,
-            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-        );
-        assert_eq!(rx2.try_recv(), Ok(kernel::Approval::Deny));
-        assert!(m.pending_approvals.is_empty());
-    }
-
-    #[test]
-    fn esc_is_not_wired_to_deny_an_approval() {
-        // Esc belongs to turn cancellation, not approval denial.
-        let lines = render_approval(
-            "fs_write",
-            None,
-            0,
-            &["Yes, allow once", "Yes, always allow", "No, deny"],
-            false,
-        );
-        let help = block(&lines);
-        assert!(
-            !help.contains("esc to reject"),
-            "help text still ties Esc to deny: {help}"
-        );
-
-        let ui = lockfile::UiConfig::default();
-        let mut m = Model::new(
-            "m".into(),
-            None,
-            kernel::ReasoningConfig::default(),
-            ui,
-            HashMap::new(),
-            test_sbx(),
-        );
-        let _rx = push_approval(&mut m, "Read access to /outside/a");
-        m.approval_ready = true;
-        handle_approval_key(&mut m, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(
-            m.pending_approvals.len(),
-            1,
-            "Esc must not consume a pending approval"
+            expand_paste_tokens(
+                &pastes,
+                "[paste #0: many chars][paste #0: many chars][paste #0: many chars]"
+            )
+            .is_err()
         );
     }
 }

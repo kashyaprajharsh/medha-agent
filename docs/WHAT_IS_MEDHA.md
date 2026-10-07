@@ -109,11 +109,17 @@ Arrows show runtime calls or component wiring. The kernel owns the agent loop;
 
 ```mermaid
 flowchart TB
-    UI["User surfaces<br/>Desktop, TUI, REPL, headless, ACP editors"]
-    BOOT["medha-cli<br/>Config, session setup, prompt and media admission"]
+    UI["Interactive clients<br/>Desktop, TUI"]
+    CLIENT["medha-client + medha-protocol<br/>Authenticated local IPC"]
+    SERVE["medha serve<br/>Shared backend per Medha home"]
+    DIRECT["Plain REPL, headless CLI, ACP editors"]
+    BOOT["runtime<br/>Workspace, session setup, policy and media admission"]
     K["kernel<br/>Agent loop, budgets, interrupts, trust"]
 
-    UI -->|"Prompt + attachments"| BOOT
+    UI -->|"Typed commands + bounded stream"| CLIENT
+    CLIENT --> SERVE
+    SERVE --> BOOT
+    DIRECT --> BOOT
     BOOT -->|"Kernel::run_session"| K
 
     subgraph reasoning["Context and model calls"]
@@ -148,8 +154,11 @@ flowchart TB
     EXT -.->|"Lifecycle hooks"| CONTROL
 ```
 
-The desktop joins one `medha serve` backend, or starts it. Live sessions run
-inside it, and it answers session/history and desktop control requests.
+Desktop and TUI join one `medha serve` backend per `MEDHA_HOME`, or start it.
+Both can follow a live conversation, recover its presentation at a stream
+barrier, and answer the same approval or question. The backend owns execution
+and durable state; a conversation lease also excludes a direct CLI/editor turn
+in another process. Closing one viewer leaves remaining viewers attached.
 `media` normalizes admitted images, and `transcript-view` formats desktop history
 and live tool steps. The `gate` crate below is the offline Eval Gate, distinct
 from the kernel's interactive `HumanGate`.

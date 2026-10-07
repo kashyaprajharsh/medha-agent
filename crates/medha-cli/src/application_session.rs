@@ -146,19 +146,6 @@ pub(crate) async fn handle<P: Provider, L: EventLog>(
             Err(_) => Err("Invalid skill request".into()),
         },
         "application.command.expand" => {
-            if running
-                || agents.is_some_and(|control| !control.active().is_empty())
-                || kernel
-                    .executor
-                    .background_tasks()
-                    .iter()
-                    .any(|task| task.running)
-            {
-                return Some(Err(
-                    "Finish foreground and background work before expanding a plugin command."
-                        .into(),
-                ));
-            }
             match serde_json::from_value::<protocol::ExpandCommand>(params) {
                 Ok(request) => {
                     let builtin: Vec<_> = crate::application_catalog::COMMANDS
@@ -166,6 +153,19 @@ pub(crate) async fn handle<P: Provider, L: EventLog>(
                         .map(|(name, _)| *name)
                         .collect();
                     let commands = crate::application_commands::load(&resources.store, &builtin);
+                    if crate::application_commands::has_snippets(&commands, &request.typed)
+                        && (running
+                            || agents.is_some_and(|control| !control.active().is_empty())
+                            || kernel
+                                .executor
+                                .background_tasks()
+                                .iter()
+                                .any(|task| task.running))
+                    {
+                        return Some(Err(
+                            "Finish active work before running plugin command snippets.".into(),
+                        ));
+                    }
                     crate::application_commands::expand_with_snippets(
                         &commands,
                         &request.typed,

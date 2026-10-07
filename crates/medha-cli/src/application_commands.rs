@@ -20,14 +20,14 @@ pub(crate) fn load(store: &Store, builtin: &[&str]) -> Vec<PluginCommand> {
     let actions = store.actions().unwrap_or_default();
     let mut counts = HashMap::new();
     for action in &actions {
-        *counts.entry(slug(&action.title)).or_insert(0usize) += 1;
+        *counts.entry(action_name(action)).or_insert(0usize) += 1;
     }
     let mut used = HashSet::new();
     actions
         .iter()
-        .filter(|action| !slug(&action.title).is_empty())
+        .filter(|action| !action_name(action).is_empty())
         .map(|action| {
-            let title = slug(&action.title);
+            let title = action_name(action);
             let short = format!("/{title}");
             let base = if counts[&title] > 1 || builtin.contains(&short.as_str()) {
                 format!("/{}:{title}", slug(&action.plugin_id))
@@ -56,13 +56,6 @@ pub(crate) fn has_snippets(commands: &[PluginCommand], line: &str) -> bool {
         .iter()
         .find(|command| command.name == name)
         .is_some_and(|command| command.prompt.contains("!`"))
-}
-
-pub(crate) fn name_for_action<'a>(commands: &'a [PluginCommand], id: &str) -> Option<&'a str> {
-    commands
-        .iter()
-        .find(|command| command.action_id == id)
-        .map(|command| command.name.as_str())
 }
 
 /// Resolve a typed action through the extension host, which checks its current
@@ -101,6 +94,15 @@ pub(crate) fn expand(commands: &[PluginCommand], line: &str) -> Option<String> {
     } else {
         format!("{}\n\n{args}", command.prompt)
     })
+}
+
+fn action_name(action: &extensions::OperatorAction) -> String {
+    let title = slug(&action.title);
+    if title.is_empty() {
+        slug(action.id.rsplit('/').next().unwrap_or(&action.id))
+    } else {
+        title
+    }
 }
 
 fn slug(value: &str) -> String {

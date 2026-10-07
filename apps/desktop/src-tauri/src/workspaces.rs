@@ -354,9 +354,10 @@ impl Workspaces {
         });
         Ok(Value::Array(rows))
     }
-    pub fn close_terminals(&self) {
+    pub fn close_all(&self) {
         if let Ok(runtimes) = self.runtimes.lock() {
             for runtime in runtimes.values() {
+                runtime.live.close_all();
                 runtime.terminals.close_all();
             }
         }

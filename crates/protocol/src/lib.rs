@@ -361,6 +361,17 @@ pub struct Settings {
 }
 empty_command!(GetSettings, "session.settings", Chat, Settings);
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionsReloaded {
+    pub warnings: Vec<String>,
+}
+empty_command!(
+    ReloadExtensions,
+    "extensions.reload",
+    Chat,
+    ExtensionsReloaded
+);
+
 /// An externally tagged enum produces the existing one-setting JSON object,
 /// and refuses malformed/multiple changes instead of selecting one silently.
 #[derive(Debug, Clone, Serialize, Deserialize)]

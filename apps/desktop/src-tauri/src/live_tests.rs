@@ -148,6 +148,57 @@ fn history_shows_what_the_assistant_said_as_markdown_and_nothing_else() {
 }
 
 #[test]
+fn a_shared_snapshot_excludes_history_and_continues_live_markdown_and_tool_targets() {
+    let snapshot = json!({"revision":1,"conversation":"conversation","running":true,"turn":1,
+        "pending_steers":[],"force_aborting":false,"settings":null,
+        "items":[{"type":"assistant","text":"old saved history"},
+            {"type":"tool_call","id":"r","tool":"read","args":{"path":"src/lib.rs"}},
+            {"type":"assistant","text":"**current"}],"current_turn_from":1,"omitted_items":0,
+        "approvals":[],"questions":[],"metrics":protocol::PresentationMetrics::default(),"agents":[],"omitted_agent_views":0,"cursor":null});
+    let mut steps = Steps::default();
+    let mut segment = String::new();
+    let rendered = render_snapshot(
+        json!({"method":"session.presentation","params":snapshot.clone()}),
+        &mut steps,
+        &mut segment,
+    );
+    assert_eq!(rendered["method"], "session.presentation", "{rendered}");
+    assert_eq!(rendered["params"]["frames"].as_array().unwrap().len(), 2);
+    assert!(!rendered.to_string().contains("old saved history"));
+    let next = render(text("**"), &mut segment);
+    assert!(
+        next["params"]["html"]
+            .as_str()
+            .unwrap()
+            .contains("<strong>current</strong>")
+    );
+    assert_eq!(
+        rendered["params"]["frames"][0]["params"]["target"],
+        "src/lib.rs"
+    );
+    sanitize(
+        json!({"method":"event", "params":{"kind":"tool.observation","id":"r","tool":"read","ok":true,
+        "payload":{"content":"file", "hash":"content-hash"}}}),
+        &mut steps,
+    );
+    let page = sanitize(
+        json!({"method":"event", "params":{"kind":"tool.call","id":"page","tool":"read",
+        "args":{"hash":"content-hash","offset":10,"length":20}}}),
+        &mut steps,
+    );
+    assert_eq!(page["params"]["target"], "src/lib.rs · 10–30");
+    let mut idle = snapshot;
+    idle["running"] = json!(false);
+    idle["current_turn_from"] = Value::Null;
+    let rendered = render_snapshot(
+        json!({"method":"session.presentation","params":idle}),
+        &mut steps,
+        &mut segment,
+    );
+    assert!(rendered["params"]["frames"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn streamed_html_escapes_model_markup() {
     let mut segment = String::new();
     let frame = render(text("<img src=x onerror=alert(1)>"), &mut segment);

@@ -28,6 +28,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "net"
 media = { path = "../../../crates/media" }
 wire = { path = "../../../crates/wire" }
 medha-client = { path = "../../../crates/medha-client" }
+protocol = { package = "medha-protocol", path = "../../../crates/protocol" }
 transcript-view = { path = "../../../crates/transcript-view" }
 tauri-plugin-updater = "2"
 

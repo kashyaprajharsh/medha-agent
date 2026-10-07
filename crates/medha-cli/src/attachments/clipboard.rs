@@ -5,25 +5,18 @@
 //! screenshot taken with Win+Shift+S is invisible to it and PowerShell has to
 //! hand the bytes over instead.
 
-use super::Attachment;
 use anyhow::{Context, Result, bail, ensure};
-use kernel::ArtifactStore;
-use std::sync::Arc;
 
 const NO_IMAGE: &str = "the clipboard does not contain an image; copy one, or use /attach PATH";
 
-pub async fn clipboard(store: Arc<dyn ArtifactStore>) -> Result<Vec<Attachment>> {
-    tokio::task::spawn_blocking(move || {
-        let png = match native_image() {
-            Ok(bytes) => bytes,
-            Err(error) if is_wsl() => windows_clipboard_image().map_err(|fallback| {
-                fallback.context(format!("clipboard unavailable in WSL ({error})"))
-            })?,
-            Err(error) => return Err(error),
-        };
-        Ok(vec![super::admit(png, "clipboard".into(), &store)?])
-    })
-    .await?
+pub(crate) fn bytes() -> Result<Vec<u8>> {
+    match native_image() {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if is_wsl() => windows_clipboard_image().map_err(|fallback| {
+            fallback.context(format!("clipboard unavailable in WSL ({error})"))
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 fn native_image() -> Result<Vec<u8>> {

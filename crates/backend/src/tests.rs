@@ -48,6 +48,13 @@ async fn chat(input: DuplexStream, mut output: DuplexStream) -> Result<(), Strin
                 tokio::time::sleep(Duration::from_millis(long)).await;
             }
             Some("cancel") => say(&mut output, json!({"id": id, "result": "cancelled"})).await,
+            Some("session.sleep") => {
+                say(
+                    &mut output,
+                    json!({"id": id, "result": {"slept": params["idle"] != false}}),
+                )
+                .await;
+            }
             Some("huge") => {
                 let answer = json!({"id": id, "result": "x".repeat(wire::MAX_FRAME)});
                 say(&mut output, answer).await;
@@ -904,6 +911,52 @@ async fn cancellation_reaches_a_turn_without_waiting_for_its_unread_input_pipe()
             .get("result")
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn idle_sleep_ends_only_its_viewer_and_never_enters_shared_replay() {
+    let backend = backend();
+    let (mut sleeper, mut awake) = (connect(&backend), connect(&backend));
+    let session = sleeper
+        .ask("session.create", None, json!({"ends_with_client": true}))
+        .await["result"]["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    sleeper.attach(&session, None).await;
+    awake.attach(&session, None).await;
+    let busy = sleeper
+        .ask("session.sleep", Some(&session), json!({"idle": false}))
+        .await;
+    assert_eq!(busy["result"]["slept"], false);
+    assert_eq!(backend.find(&session).unwrap().summary()["clients"], 2);
+
+    let sleeping = sleeper
+        .ask("session.sleep", Some(&session), json!({}))
+        .await;
+    assert_eq!(sleeping["result"]["slept"], true);
+    let (_, ended) = sleeper.event().await;
+    assert_eq!(ended["method"], "session.ended");
+    assert_eq!(ended["params"]["viewer_only"], true);
+    assert_eq!(backend.find(&session).unwrap().summary()["clients"], 1);
+    assert_eq!(
+        sleeper.say(&session, "detached").await["error"]["message"],
+        "attach to the session first"
+    );
+    assert_eq!(
+        awake.say(&session, "still awake").await["result"]["said"],
+        "still awake"
+    );
+
+    let mut late = connect(&backend);
+    assert_eq!(late.attach(&session, Some(0)).await["replayed"], 1);
+    assert_eq!(late.event().await.1["params"]["text"], "still awake");
+    late.ask("session.detach", Some(&session), json!({})).await;
+    awake.ask("session.sleep", Some(&session), json!({})).await;
+    until("last sleeping viewer releases the tied chat", || {
+        backend.live() == 0
+    })
+    .await;
 }
 
 #[tokio::test]

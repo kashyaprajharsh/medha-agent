@@ -317,6 +317,188 @@ const ROLES: wire::Roles = wire::Roles {
     guest: "client",
 };
 
+#[cfg(unix)]
+struct TerminalClient {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    output: Arc<Mutex<Vec<u8>>>,
+    heard: String,
+}
+
+#[cfg(unix)]
+impl TerminalClient {
+    fn start(world: &World, folder: &Path) -> Self {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_medha"));
+        command.cwd(folder);
+        command.env("TERM", "xterm-256color");
+        command.env("MEDHA_HOME", world.home());
+        command.env("MEDHA_BASE_URL", &world.provider.url);
+        command.env("MEDHA_MODEL", "test-model");
+        command.env("MEDHA_API_KEY", SECRET);
+        command.env("MEDHA_PROTOCOL", "open-ai-chat");
+        command.env("MEDHA_CRED_STORE", "file");
+        command.env("MEDHA_MODE", "careful");
+        command.env("RUST_LOG", "info");
+        let child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let writer = pair.master.take_writer().unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = output.clone();
+        std::thread::spawn(move || {
+            let mut bytes = [0u8; 8192];
+            while let Ok(count) = reader.read(&mut bytes) {
+                if count == 0 {
+                    break;
+                }
+                let mut output = captured.lock().unwrap();
+                if output.len() + count > 2 * 1024 * 1024 {
+                    break;
+                }
+                output.extend_from_slice(&bytes[..count]);
+            }
+        });
+        Self {
+            child,
+            master: pair.master,
+            writer,
+            output,
+            heard: String::new(),
+        }
+    }
+
+    fn type_text(&mut self, text: &str) {
+        self.writer.write_all(text.as_bytes()).unwrap();
+        self.writer.flush().unwrap();
+    }
+
+    fn until(&mut self, marker: &str) {
+        let deadline = Instant::now() + WAIT;
+        while !self.heard.contains(marker) {
+            self.heard = String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned();
+            assert!(
+                Instant::now() < deadline,
+                "terminal never drew {marker:?}; output {:?}",
+                self.heard
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn exit(&mut self) {
+        self.type_text("\x04");
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success(), "terminal failed: {status:?}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal did not exit after Ctrl-D"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.until("\x1b[?1049l");
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalClient {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            // Only the exact process started by this fixture.
+            if let Some(pid) = self.child.process_id() {
+                // The unreaped fixture child owns this PID, so reuse is impossible.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            } else {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_terminal_and_another_client_share_one_chat_and_survive_viewer_exit() {
+    let world = World::new();
+    let folder = world.folder("terminal");
+    let backend = world.backend();
+    let mut viewer = backend.connect().await;
+    let mut terminal = TerminalClient::start(&world, &folder);
+    terminal.until("test-model");
+    let listed = viewer.ask("session.list", None, json!({})).await;
+    let live: Vec<_> = listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|chat| chat["about"]["folder"] == json!(folder))
+        .collect();
+    assert_eq!(live.len(), 1, "{listed}");
+    let session = live[0]["session"].as_str().unwrap().to_string();
+    let attached = viewer
+        .ask("session.attach", Some(&session), json!({"after":0}))
+        .await;
+    assert_eq!(attached["result"]["gap"], false);
+    let settings = viewer
+        .ask("session.settings", Some(&session), json!({}))
+        .await;
+    assert_eq!(settings["result"]["mode"], "careful");
+
+    terminal.type_text("FROM_TUI\r");
+    assert!(world.provider.asked().contains("FROM_TUI"));
+    viewer.until(|frame| kind(frame, "turn.done")).await;
+    terminal.until("echo: FROM_TUI");
+    viewer.send(&session, "FROM_OTHER_VIEWER").await;
+    assert!(world.provider.asked().contains("FROM_OTHER_VIEWER"));
+    viewer.until(|frame| kind(frame, "turn.done")).await;
+    terminal.until("echo: FROM_OTHER_VIEWER");
+
+    // Resize the actual PTY and use a control while attached to an active turn.
+    terminal
+        .master
+        .resize(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    terminal.type_text("HOLD terminal cancellation\r");
+    assert!(
+        world
+            .provider
+            .asked()
+            .contains("HOLD terminal cancellation")
+    );
+    viewer.until(|frame| kind(frame, "turn.started")).await;
+    terminal.type_text("\x1b");
+    viewer.until(|frame| kind(frame, "turn.cancelled")).await;
+    world.provider.release.send(()).unwrap();
+    terminal.exit();
+
+    // Closing a terminal detaches its viewer; the other viewer remains usable.
+    let settings = viewer
+        .ask("session.settings", Some(&session), json!({}))
+        .await;
+    assert!(settings.get("error").is_none(), "{settings}");
+    let status = viewer.ask("backend.status", None, json!({})).await;
+    assert_eq!(status["result"]["chats"], 1);
+}
+
 impl Client {
     async fn meet<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, token: &str) -> Self {
         let (read, write) = tokio::io::split(stream);

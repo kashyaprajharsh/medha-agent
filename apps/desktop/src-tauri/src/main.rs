@@ -13,15 +13,99 @@ mod workspaces;
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 use tauri::{AppHandle, Manager, State, ipc::Channel};
 use workspaces::{Runtime, Workspaces};
 
 struct DesktopState {
     workspaces: Arc<Workspaces>,
-    terminals: Mutex<HashMap<String, Arc<Runtime>>>,
+    terminals: Arc<TerminalTickets>,
     views: Arc<view::Views>,
+}
+struct TerminalTicket {
+    runtime: Option<Arc<Runtime>>,
+    generation: Arc<()>,
+}
+#[derive(Default)]
+struct TerminalTickets {
+    open: Mutex<HashMap<String, TerminalTicket>>,
+    closed: AtomicBool,
+    opening: AtomicUsize,
+    quitting: AtomicBool,
+}
+impl TerminalTickets {
+    fn close_all(&self) {
+        self.closed.store(true, Ordering::Release);
+        let tickets = std::mem::take(
+            &mut *self
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (key, ticket) in tickets {
+            if let Some(runtime) = ticket.runtime {
+                let _ = runtime.terminals.close_generation(&key, &ticket.generation);
+            }
+        }
+    }
+
+    fn wait_until_reaped(&self) {
+        // Kept off the app thread. The process must not exit while a native
+        // spawn can still return a child, or before cleanup has reaped it.
+        while self.opening.load(Ordering::Acquire) != 0 || !terminal::all_reaped() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+pub(crate) fn reap_terminals(app: &AppHandle) {
+    if let Some(state) = app.try_state::<DesktopState>() {
+        state.terminals.close_all();
+        state.workspaces.close_all();
+        state.terminals.wait_until_reaped();
+    }
+}
+impl Drop for DesktopState {
+    fn drop(&mut self) {
+        self.terminals.close_all();
+    }
+}
+// A failed or cancelled opening must retire only its own incarnation. In
+// particular, a late native spawn cannot claim a key reused by a new tab.
+struct TerminalOpening {
+    tickets: Arc<TerminalTickets>,
+    key: String,
+    generation: Arc<()>,
+    runtime: Option<Arc<Runtime>>,
+    keep: bool,
+}
+impl Drop for TerminalOpening {
+    fn drop(&mut self) {
+        if !self.keep {
+            let mut tickets = self
+                .tickets
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if tickets
+                .get(&self.key)
+                .is_some_and(|ticket| Arc::ptr_eq(&ticket.generation, &self.generation))
+            {
+                tickets.remove(&self.key);
+            }
+            drop(tickets);
+            if let Some(runtime) = &self.runtime {
+                let _ = runtime
+                    .terminals
+                    .close_generation(&self.key, &self.generation);
+            }
+        }
+        self.tickets.opening.fetch_sub(1, Ordering::Release);
+    }
 }
 #[tauri::command]
 fn workspace_list(state: State<'_, DesktopState>) -> Result<Value, String> {
@@ -205,27 +289,78 @@ async fn terminal_open(
     rows: u16,
     output: Channel<Value>,
 ) -> Result<Value, String> {
-    let runtime =
-        state
-            .workspaces
-            .start(&workspace_id, chat_key.as_deref(), session_id.as_deref())?;
-    let mut terminals = state.terminals.lock().map_err(|e| e.to_string())?;
-    if terminals.len() >= 16 {
-        return Err("Close an unused terminal before opening another".into());
+    let generation = Arc::new(());
+    {
+        let mut terminals = state.terminals.open.lock().map_err(|e| e.to_string())?;
+        if state.terminals.closed.load(Ordering::Acquire) {
+            return Err("The window is closing".into());
+        }
+        if terminals.len() >= 16 {
+            return Err("Close an unused terminal before opening another".into());
+        }
+        if terminals.contains_key(&key) {
+            return Err("This terminal is already open".into());
+        }
+        terminals.insert(
+            key.clone(),
+            TerminalTicket {
+                runtime: None,
+                generation: Arc::clone(&generation),
+            },
+        );
+        state.terminals.opening.fetch_add(1, Ordering::Release);
     }
-    let result = runtime.terminals.open(&key, cols, rows, move |frame| {
-        let _ = output.send(frame);
-    })?;
-    terminals.insert(key, runtime);
-    Ok(result)
+    let opening = TerminalOpening {
+        tickets: Arc::clone(&state.terminals),
+        key,
+        generation,
+        runtime: None,
+        keep: false,
+    };
+    let workspaces = Arc::clone(&state.workspaces);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut opening = opening;
+        let runtime =
+            workspaces.start(&workspace_id, chat_key.as_deref(), session_id.as_deref())?;
+        opening.runtime = Some(Arc::clone(&runtime));
+        {
+            let mut tickets = opening.tickets.open.lock().map_err(|e| e.to_string())?;
+            let ticket = tickets
+                .get_mut(&opening.key)
+                .filter(|ticket| Arc::ptr_eq(&ticket.generation, &opening.generation))
+                .ok_or("This terminal was closed while its shell was starting")?;
+            ticket.runtime = Some(Arc::clone(&runtime));
+        }
+        let result = runtime.terminals.open(
+            &opening.key,
+            cols,
+            rows,
+            Arc::clone(&opening.generation),
+            move |frame| {
+                let _ = output.send(frame);
+            },
+        )?;
+        let tickets = opening.tickets.open.lock().map_err(|e| e.to_string())?;
+        if !tickets
+            .get(&opening.key)
+            .is_some_and(|ticket| Arc::ptr_eq(&ticket.generation, &opening.generation))
+        {
+            return Err("This terminal was closed while its shell was starting".into());
+        }
+        opening.keep = true;
+        Ok(result)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 fn terminal_runtime(state: &DesktopState, key: &str) -> Result<Arc<Runtime>, String> {
     state
         .terminals
+        .open
         .lock()
         .map_err(|e| e.to_string())?
         .get(key)
-        .cloned()
+        .and_then(|ticket| ticket.runtime.clone())
         .ok_or("Terminal is closed".into())
 }
 #[tauri::command]
@@ -234,7 +369,10 @@ async fn terminal_write(
     key: String,
     data: String,
 ) -> Result<(), String> {
-    terminal_runtime(&state, &key)?.terminals.write(&key, &data)
+    let runtime = terminal_runtime(&state, &key)?;
+    tauri::async_runtime::spawn_blocking(move || runtime.terminals.write(&key, &data))
+        .await
+        .map_err(|error| error.to_string())?
 }
 #[tauri::command]
 async fn terminal_resize(
@@ -243,19 +381,25 @@ async fn terminal_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    terminal_runtime(&state, &key)?
-        .terminals
-        .resize(&key, cols, rows)
+    let runtime = terminal_runtime(&state, &key)?;
+    tauri::async_runtime::spawn_blocking(move || runtime.terminals.resize(&key, cols, rows))
+        .await
+        .map_err(|error| error.to_string())?
 }
 #[tauri::command]
 fn terminal_close(state: State<'_, DesktopState>, key: String) -> Result<(), String> {
     let runtime = state
         .terminals
+        .open
         .lock()
         .map_err(|e| e.to_string())?
         .remove(&key);
-    if let Some(runtime) = runtime {
-        runtime.terminals.close(&key)?;
+    if let Some(ticket) = runtime
+        && let Some(runtime) = ticket.runtime
+    {
+        runtime
+            .terminals
+            .close_generation(&key, &ticket.generation)?;
     }
     Ok(())
 }
@@ -481,7 +625,7 @@ fn main() {
                     Workspaces::new(app.path().app_data_dir()?, explicit)
                         .map_err(std::io::Error::other)?,
                 ),
-                terminals: Mutex::new(HashMap::new()),
+                terminals: Arc::default(),
                 views: Arc::default(),
             });
             Ok(())
@@ -489,7 +633,8 @@ fn main() {
         .register_asynchronous_uri_scheme_protocol(view::SCHEME, outputs::serve)
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
-                window.state::<DesktopState>().workspaces.close_terminals();
+                window.state::<DesktopState>().terminals.close_all();
+                window.state::<DesktopState>().workspaces.close_all();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -530,6 +675,57 @@ fn main() {
             update::update_check,
             update::update_apply
         ])
-        .run(tauri::generate_context!())
-        .expect("Medha desktop failed to open");
+        .build(tauri::generate_context!())
+        .expect("Medha desktop failed to open")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event
+                && let Some(state) = app.try_state::<DesktopState>()
+            {
+                state.terminals.close_all();
+                state.workspaces.close_all();
+                if state.terminals.opening.load(Ordering::Acquire) != 0 || !terminal::all_reaped() {
+                    api.prevent_exit();
+                    if !state.terminals.quitting.swap(true, Ordering::AcqRel) {
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            reap_terminals(&app);
+                            app.exit(code.unwrap_or(0));
+                        });
+                    }
+                }
+            }
+        });
+}
+
+#[cfg(test)]
+mod terminal_ticket_tests {
+    use super::*;
+
+    #[test]
+    fn closing_a_window_still_tracks_a_pending_or_committed_opening_until_it_returns() {
+        for keep in [false, true] {
+            let tickets = Arc::new(TerminalTickets::default());
+            let generation = Arc::new(());
+            tickets.open.lock().unwrap().insert(
+                "pending".into(),
+                TerminalTicket {
+                    runtime: None,
+                    generation: Arc::clone(&generation),
+                },
+            );
+            tickets.opening.fetch_add(1, Ordering::Release);
+            let opening = TerminalOpening {
+                tickets: Arc::clone(&tickets),
+                key: "pending".into(),
+                generation,
+                runtime: None,
+                keep,
+            };
+            tickets.close_all();
+            assert!(tickets.open.lock().unwrap().is_empty());
+            assert_eq!(tickets.opening.load(Ordering::Acquire), 1);
+            drop(opening);
+            assert_eq!(tickets.opening.load(Ordering::Acquire), 0);
+        }
+    }
 }

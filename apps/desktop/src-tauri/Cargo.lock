@@ -2065,6 +2065,7 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "medha-client",
+ "medha-protocol",
  "media",
  "portable-pty",
  "rfd",

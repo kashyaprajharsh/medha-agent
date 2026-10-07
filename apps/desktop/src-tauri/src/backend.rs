@@ -12,7 +12,12 @@ pub(crate) struct Backend(Arc<medha_client::Backend>);
 impl Backend {
     pub(crate) fn shared() -> Arc<Self> {
         static SHARED: OnceLock<Arc<Backend>> = OnceLock::new();
-        Arc::clone(SHARED.get_or_init(|| Arc::new(Self(medha_client::Backend::shared(executable)))))
+        Arc::clone(SHARED.get_or_init(|| {
+            Arc::new(Self(medha_client::Backend::for_surface(
+                executable,
+                &["shared-live-state"],
+            )))
+        }))
     }
 
     pub(crate) fn connection(&self) -> Result<Arc<Connection>, String> {

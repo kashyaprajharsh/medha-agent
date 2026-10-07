@@ -4,37 +4,123 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 type OpenTerminals = Arc<Mutex<HashMap<String, Terminal>>>;
 type Output = Box<dyn Read + Send>;
 
+#[derive(Default)]
+struct Reaped {
+    done: Mutex<bool>,
+    changed: Condvar,
+}
+impl Reaped {
+    fn finish(&self) {
+        *self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
+    fn wait(&self) {
+        let mut done = self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*done {
+            done = self
+                .changed
+                .wait(done)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+struct Slot {
+    local: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+}
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.local.fetch_sub(1, Ordering::AcqRel);
+        self.total.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn total_slots() -> &'static Arc<AtomicUsize> {
+    static TOTAL: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    TOTAL.get_or_init(Arc::default)
+}
+
+pub(crate) fn all_reaped() -> bool {
+    total_slots().load(Ordering::Acquire) == 0
+}
+
+fn reserve_slot(local: &Arc<AtomicUsize>) -> Result<Arc<Slot>, String> {
+    let total = total_slots();
+    local.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < 4).then_some(count + 1))
+        .map_err(|_| "At most four terminals per workspace can be open or closing. Wait for a closing shell to exit.")?;
+    if total
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < 16).then_some(count + 1)
+        })
+        .is_err()
+    {
+        local.fetch_sub(1, Ordering::AcqRel);
+        return Err(
+            "At most sixteen terminals can be open or closing. Wait for a closing shell to exit."
+                .into(),
+        );
+    }
+    Ok(Arc::new(Slot {
+        local: Arc::clone(local),
+        total: Arc::clone(total),
+    }))
+}
+
 struct Terminal {
-    master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
     input: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Option<Box<dyn Child + Send + Sync>>,
     generation: Arc<()>,
+    reaped: Arc<Reaped>,
+    slot: Option<Arc<Slot>>,
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            #[cfg(unix)]
-            let foreground = self.master.process_group_leader();
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            #[cfg(unix)]
-            if let Some(group) = foreground.filter(|group| *group > 1) {
-                // PTY foreground jobs may have their own process group.
-                unsafe {
-                    libc::kill(-group, libc::SIGHUP);
-                }
-            }
-            // Signal before window destruction returns; reap off the UI thread.
-            let _ = child.kill();
+            let master = self.master.take();
+            let input = Arc::clone(&self.input);
+            let reaped = Arc::clone(&self.reaped);
+            let slot = self.slot.take();
+            // Signal, reap and terminal-handle destruction can all block in
+            // the OS. None of them belong on the app thread or map lock.
             std::thread::spawn(move || {
-                let _ = child.wait();
+                if !matches!(child.try_wait(), Ok(Some(_))) {
+                    #[cfg(unix)]
+                    {
+                        if let Some(group) = master
+                            .as_ref()
+                            .and_then(|master| master.process_group_leader())
+                            .filter(|group| *group > 1 && Some(*group as u32) != child.process_id())
+                        {
+                            // A foreground job may have its own process group.
+                            unsafe {
+                                libc::kill(-group, libc::SIGHUP);
+                            }
+                        }
+                    }
+                    // portable-pty gives Unix shells SIGHUP and a short grace
+                    // period before SIGKILL; Windows uses TerminateProcess.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                reaped.finish();
+                drop(input);
+                drop(master);
+                drop(slot);
             });
         }
     }
@@ -43,6 +129,7 @@ impl Drop for Terminal {
 pub struct Terminals {
     workspace: PathBuf,
     open: OpenTerminals,
+    occupied: Arc<AtomicUsize>,
 }
 
 impl Terminals {
@@ -50,6 +137,7 @@ impl Terminals {
         Self {
             workspace,
             open: Arc::default(),
+            occupied: Arc::default(),
         }
     }
 
@@ -58,6 +146,7 @@ impl Terminals {
         key: &str,
         cols: u16,
         rows: u16,
+        generation: Arc<()>,
         emit: impl Fn(Value) + Send + 'static,
     ) -> Result<Value, String> {
         let shell = user_shell();
@@ -67,12 +156,19 @@ impl Terminals {
         command.cwd(&self.workspace);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        self.spawn(key, cols, rows, command, emit)?;
+        self.spawn_in(
+            key,
+            (cols, rows),
+            generation,
+            move |size| spawn(command, size),
+            emit,
+        )?;
         Ok(
             json!({ "shell": shell.file_name().unwrap_or_default().to_string_lossy(), "workspace": self.workspace }),
         )
     }
 
+    #[cfg(test)]
     fn spawn(
         &self,
         key: &str,
@@ -81,18 +177,68 @@ impl Terminals {
         command: CommandBuilder,
         emit: impl Fn(Value) + Send + 'static,
     ) -> Result<(), String> {
+        self.spawn_in(
+            key,
+            (cols, rows),
+            Arc::new(()),
+            move |size| spawn(command, size),
+            emit,
+        )
+    }
+
+    fn spawn_in(
+        &self,
+        key: &str,
+        dimensions: (u16, u16),
+        generation: Arc<()>,
+        start: impl FnOnce(PtySize) -> Result<(Terminal, Output), String>,
+        emit: impl Fn(Value) + Send + 'static,
+    ) -> Result<(), String> {
         validate_key(key)?;
-        let size = size(cols, rows)?;
+        let size = size(dimensions.0, dimensions.1)?;
         let mut open = self.open.lock().map_err(|error| error.to_string())?;
         if open.contains_key(key) {
             return Err("This terminal is already open".into());
         }
-        if open.len() >= 4 {
-            return Err("Close a terminal before opening another (maximum four)".into());
-        }
-        let (terminal, mut reader) = spawn(command, size)?;
-        let generation = Arc::clone(&terminal.generation);
-        open.insert(key.to_owned(), terminal);
+        let slot = reserve_slot(&self.occupied)?;
+        // A reservation can be removed while native spawn is still blocked.
+        // Closing never waits for spawn and the eventual child is retired.
+        open.insert(
+            key.to_owned(),
+            Terminal {
+                master: None,
+                input: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+                child: None,
+                generation: Arc::clone(&generation),
+                reaped: Arc::default(),
+                slot: Some(Arc::clone(&slot)),
+            },
+        );
+        drop(open);
+        let (mut terminal, mut reader) = match start(size) {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.close_generation(key, &generation)?;
+                return Err(error);
+            }
+        };
+        terminal.slot = Some(Arc::clone(&slot));
+        terminal.generation = Arc::clone(&generation);
+        let reaped = Arc::clone(&terminal.reaped);
+        let active = {
+            let mut open = self.open.lock().map_err(|error| error.to_string())?;
+            if open
+                .get(key)
+                .is_some_and(|old| Arc::ptr_eq(&old.generation, &generation))
+            {
+                open.insert(key.to_owned(), terminal);
+                true
+            } else {
+                drop(open);
+                drop(terminal);
+                false
+            }
+        };
         let terminals = Arc::downgrade(&self.open);
         let key = key.to_owned();
         std::thread::spawn(move || {
@@ -116,13 +262,24 @@ impl Terminals {
                     None
                 }
             });
-            let code = terminal
-                .and_then(|mut terminal| terminal.child.take())
-                .and_then(|mut child| child.wait().ok())
-                .map(|status| status.exit_code());
+            let code = terminal.and_then(|mut terminal| {
+                // Natural EOF can precede reaping. Keep all terminal handles
+                // alive until wait has completed, just as on explicit close.
+                let status = terminal.child.as_mut()?.wait().ok();
+                terminal.child.take();
+                reaped.finish();
+                status.map(|status| status.exit_code())
+            });
+            reaped.wait();
+            drop(reader);
+            drop(slot);
             emit(json!({ "kind": "exit", "code": code }));
         });
-        Ok(())
+        if active {
+            Ok(())
+        } else {
+            Err("This terminal was closed while its shell was starting".into())
+        }
     }
 
     pub fn write(&self, key: &str, data: &str) -> Result<(), String> {
@@ -135,6 +292,7 @@ impl Terminals {
             .lock()
             .map_err(|error| error.to_string())?
             .get(key)
+            .filter(|terminal| terminal.child.is_some())
             .map(|terminal| Arc::clone(&terminal.input))
             .ok_or("This terminal has exited")?;
         let mut input = input.lock().map_err(|error| error.to_string())?;
@@ -150,10 +308,13 @@ impl Terminals {
         open.get(key)
             .ok_or("This terminal has exited")?
             .master
+            .as_ref()
+            .ok_or("This terminal has exited")?
             .resize(size)
             .map_err(|error| format!("Could not resize terminal: {error}"))
     }
 
+    #[cfg(test)]
     pub fn close(&self, key: &str) -> Result<(), String> {
         let terminal = self
             .open
@@ -164,10 +325,29 @@ impl Terminals {
         Ok(())
     }
 
+    pub fn close_generation(&self, key: &str, generation: &Arc<()>) -> Result<(), String> {
+        let terminal = {
+            let mut open = self.open.lock().map_err(|error| error.to_string())?;
+            if open
+                .get(key)
+                .is_some_and(|terminal| Arc::ptr_eq(&terminal.generation, generation))
+            {
+                open.remove(key)
+            } else {
+                None
+            }
+        };
+        drop(terminal);
+        Ok(())
+    }
+
     pub fn close_all(&self) {
-        if let Ok(mut open) = self.open.lock() {
-            open.clear();
-        }
+        let terminals = self
+            .open
+            .lock()
+            .map(|mut open| std::mem::take(&mut *open))
+            .unwrap_or_default();
+        drop(terminals);
     }
 }
 
@@ -196,10 +376,12 @@ fn spawn(command: CommandBuilder, size: PtySize) -> Result<(Terminal, Output), S
     drop(pair.slave);
     Ok((
         Terminal {
-            master: pair.master,
+            master: Some(pair.master),
             input: Arc::new(Mutex::new(input)),
             child: Some(child),
             generation: Arc::new(()),
+            reaped: Arc::default(),
+            slot: None,
         },
         reader,
     ))

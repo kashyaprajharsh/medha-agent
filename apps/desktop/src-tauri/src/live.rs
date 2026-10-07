@@ -183,6 +183,7 @@ struct Inner {
     workspace: PathBuf,
     open: Mutex<Open>,
     backend: Arc<Backend>,
+    closed: AtomicBool,
 }
 
 impl LiveSessions {
@@ -195,6 +196,7 @@ impl LiveSessions {
             workspace,
             open: Mutex::new(HashMap::new()),
             backend,
+            closed: AtomicBool::new(false),
         });
         if let Ok(mut every) = EVERY.lock() {
             every.push(Arc::downgrade(&inner));
@@ -262,6 +264,19 @@ impl LiveSessions {
         drop(removed);
         Ok(())
     }
+
+    pub fn close_all(&self) {
+        let removed = {
+            let mut open = self
+                .inner
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.inner.closed.store(true, Ordering::Release);
+            std::mem::take(&mut *open)
+        };
+        drop(removed);
+    }
 }
 
 fn every() -> Vec<Arc<Inner>> {
@@ -318,6 +333,9 @@ impl Inner {
     fn awake(&self, key: &str) -> Result<MutexGuard<'_, Open>, String> {
         loop {
             let mut open = self.open.lock().map_err(|error| error.to_string())?;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(STOPPED.into());
+            }
             let Some(live) = open.get(key) else {
                 return Ok(open);
             };
@@ -402,7 +420,12 @@ impl Inner {
             let mut segment = String::new();
             let mut steps = Steps::default();
             pump_stream(Weighed { frames, waiting }, |frame| {
-                emitter(render(sanitize(frame, &mut steps), &mut segment));
+                let frame = if frame["method"] == "session.presentation" {
+                    render_snapshot(frame, &mut steps, &mut segment)
+                } else {
+                    render(sanitize(frame, &mut steps), &mut segment)
+                };
+                emitter(frame);
             });
             over.store(true, Ordering::Relaxed);
             if pumping.closed() {
@@ -469,9 +492,9 @@ impl Inner {
             {
                 return;
             }
-            let shutdown = json!({ "jsonrpc": "2.0", "id": 0, "method": "shutdown" });
-            let _ = connection.tell(&chat, shutdown);
-            let _ = connection.tell(&chat, json!({ "method": "session.close" }));
+            // Closing a viewer is not permission to stop another frontend's
+            // turn. The backend ends an ephemeral chat after its last viewer.
+            connection.leave(&chat);
         });
 
         Live {
@@ -618,6 +641,58 @@ fn render(mut frame: Value, segment: &mut String) -> Value {
         ) => segment.clear(),
         _ => {}
     }
+    frame
+}
+
+fn render_snapshot(mut frame: Value, steps: &mut Steps, segment: &mut String) -> Value {
+    let snapshot: protocol::PresentationSnapshot = match serde_json::from_value(
+        frame["params"].take(),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return json!({"method":"exit", "params":{"stderr":format!("Invalid shared chat state: {error}")}});
+        }
+    };
+    segment.clear();
+    *steps = Steps::default();
+    let mut frames: Vec<Value> = snapshot.current_turn_from.map(|from| {
+        snapshot.items.into_iter().skip(from).map(|row| {
+            use protocol::{PresentationItem as Row, TurnEvent as Event};
+            let event = match row {
+                Row::User { text } => Event::Steered { content: text },
+                Row::Assistant { text } => Event::Text { delta: text },
+                Row::Reasoning { text } => Event::Reasoning { delta: text },
+                Row::ToolCall { id, tool, args } => Event::ToolCall { id, tool, args },
+                Row::ToolResult { id, tool, ok, payload } => Event::ToolResult { id, tool, ok, payload },
+                Row::Compaction { before, after, summarized, summary } => Event::Compaction { before, after, summarized, summary },
+                Row::Verify { ok, summary } => Event::Verify { ok, summary },
+                Row::Notice { text } => Event::Notice { text },
+                Row::PreviewOmitted { subject, bytes, .. } => Event::Notice { text: format!("{subject} preview omitted ({bytes} bytes); the full result remains in saved history.") },
+            };
+            render(sanitize(json!({"method":"event", "params":event}), steps), segment)
+        }).collect()
+    }).unwrap_or_default();
+    if let Some(usage) = &snapshot.metrics.last_usage {
+        frames.push(
+            json!({"method":"event", "params": {"kind":"usage", "prompt_tokens":usage.prompt_tokens,
+            "total_tokens":usage.total_tokens, "completion_tokens":usage.completion_tokens,
+            "cached_prompt_tokens":usage.cached_prompt_tokens}}),
+        );
+    }
+    if let Some(pressure) = &snapshot.metrics.context_pressure {
+        frames.push(json!({"method":"event", "params": {"kind":"context.pressure", "input_tokens":pressure.input_tokens,
+            "input_limit":pressure.input_limit, "usable_input_tokens":pressure.usable_input_tokens, "quality":pressure.quality}}));
+    }
+    if snapshot.metrics.compacting {
+        frames.push(json!({"method":"event", "params":{"kind":"compacting", "active":true}}));
+    }
+    frame["params"] = json!({
+        "session":snapshot.conversation, "running":snapshot.running,
+        "settings":snapshot.settings, "frames":frames,
+        "approvals":snapshot.approvals, "questions":snapshot.questions,
+        "force_aborting":snapshot.force_aborting,
+        "agents":snapshot.roster,
+    });
     frame
 }
 

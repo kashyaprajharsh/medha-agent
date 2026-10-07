@@ -54,6 +54,38 @@ mod tests {
     }
 
     #[test]
+    fn late_viewers_get_the_agent_roster_at_the_same_barrier_as_active_text() {
+        let mut state = Presentation::default();
+        state.seed("one".into(), &[], settings());
+        state
+            .observe(
+                "agents",
+                json!({"agents":[{
+                    "name":"worker","path":"worker","session":"child","write":false,
+                    "objective":"read the code","started_ms":1,"status":"running",
+                    "doing":{"state":"thinking"},"tool_calls":0,"tokens":10,
+                }]}),
+            )
+            .unwrap();
+        observe(&mut state, TurnEvent::Started { turn: 1 });
+        observe(
+            &mut state,
+            TurnEvent::Text {
+                delta: "active".into(),
+            },
+        );
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.roster[0].session, "child");
+        assert!(snapshot.running);
+        assert_eq!(snapshot.current_turn_from, Some(0));
+        state.seed("two".into(), &[], settings());
+        assert!(
+            state.snapshot().roster.is_empty(),
+            "a rewind must not retain the old roster"
+        );
+    }
+
+    #[test]
     fn retries_preserve_durable_rows_and_do_not_join_an_older_answer() {
         let mut state = Presentation::default();
         state.seed(
@@ -288,6 +320,7 @@ struct Rows {
     bytes: usize,
     omitted: u64,
     attempt: usize,
+    turn_from: usize,
 }
 
 impl Rows {
@@ -298,6 +331,7 @@ impl Rows {
         self.bytes -= bytes;
         self.omitted += 1;
         self.attempt = self.attempt.saturating_sub(1);
+        self.turn_from = self.turn_from.saturating_sub(1);
         true
     }
 
@@ -406,6 +440,7 @@ pub(crate) struct Presentation {
     approvals: BTreeMap<u64, protocol::ApprovalPrompt>,
     questions: BTreeMap<u64, protocol::QuestionPrompt>,
     agents: BTreeMap<String, Pane>,
+    roster: Vec<protocol::RosterAgent>,
     omitted_agents: u64,
     form_bytes: usize,
 }
@@ -422,6 +457,7 @@ impl Presentation {
     ) {
         if self.conversation != conversation {
             self.agents.clear();
+            self.roster.clear();
             self.omitted_agents = 0;
             self.metrics = protocol::PresentationMetrics::default();
             self.pending_steers.clear();
@@ -499,6 +535,7 @@ impl Presentation {
                 self.force_aborting = false;
                 self.metrics.reasoning_received_this_turn = false;
                 self.rows.attempt = self.rows.items.len();
+                self.rows.turn_from = self.rows.items.len();
             }
             TurnEvent::Steered { content } => {
                 if let Some(index) = self
@@ -670,6 +707,15 @@ impl Presentation {
                     self.form_bytes -= size(&prompt);
                 }
             }
+            "agents" => {
+                let roster: Vec<protocol::RosterAgent> =
+                    serde_json::from_value(params["agents"].clone())
+                        .map_err(|_| "Invalid agent roster presentation.")?;
+                if roster.len() > MAX_AGENTS || size(&roster) > 1024 * 1024 {
+                    return Err("Agent roster exceeds its presentation budget.");
+                }
+                self.roster = roster;
+            }
             "agent.step" => {
                 {
                     let event = serde_json::from_value::<protocol::AgentEvent>(params)
@@ -795,10 +841,12 @@ impl Presentation {
             force_aborting: self.force_aborting,
             settings: self.settings.clone(),
             items: self.rows.snapshot(),
+            current_turn_from: self.running.then_some(self.rows.turn_from),
             omitted_items: self.rows.omitted,
             approvals: self.approvals.values().cloned().collect(),
             questions: self.questions.values().cloned().collect(),
             metrics: self.metrics.clone(),
+            roster: self.roster.clone(),
             agents: self
                 .agents
                 .iter()

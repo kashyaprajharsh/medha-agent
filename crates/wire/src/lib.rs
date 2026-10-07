@@ -23,6 +23,7 @@ pub const CAPABILITIES: &[&str] = &[
     "application-resources",
     "session-inspection",
     "live-conversation",
+    "shared-live-state",
 ];
 pub const CLIENT_CAPABILITIES: &[&str] = &[
     "lifecycle",
@@ -87,8 +88,14 @@ pub fn is_control(method: &str) -> bool {
             | "session.detach"
             | "session.abandon"
             | "session.attach"
+            | "session.presentation"
             | "agent.control"
     )
+}
+
+pub fn is_control_frame(frame: &serde_json::Value) -> bool {
+    frame["method"].as_str().is_some_and(is_control)
+        || (frame["method"] == "session.change" && frame["params"]["action"] == "stop_agents")
 }
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 

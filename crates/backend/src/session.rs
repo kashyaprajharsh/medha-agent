@@ -98,6 +98,7 @@ struct Requested {
     client: Client,
     id: Value,
     presentation: bool,
+    sleep: bool,
 }
 
 impl Session {
@@ -233,7 +234,7 @@ impl Session {
         if self.closing.is_cancelled() {
             return Err("this chat has ended".into());
         }
-        let ahead = frame["method"].as_str().is_some_and(wire::is_control);
+        let ahead = wire::is_control_frame(&frame);
         let mut given = None;
         if let Some(asked) = frame.get("id").cloned() {
             let mut stream = self.stream();
@@ -245,6 +246,7 @@ impl Session {
                     client: client.clone(),
                     id: asked,
                     presentation: frame["method"] == "session.presentation",
+                    sleep: frame["method"] == "session.sleep",
                 },
             );
             frame["id"] = json!(id);
@@ -347,6 +349,25 @@ impl Session {
                     }
                     frame["id"] = asked.id;
                     asked.client.send(line(&frame));
+                    if asked.sleep && frame["result"]["slept"] == true {
+                        // This is a viewer-local end, not a stream event. It
+                        // is neither replayed nor delivered to other viewers.
+                        // Hold the subscription lock through last-viewer exit
+                        // so an attachment either wins or sees an ending chat.
+                        stream.viewers.remove(&asked.client.id);
+                        asked.client.send(line(&json!({
+                            "method": "session.event", "params": {
+                                "session": self.id, "stream": self.incarnation,
+                                "seq": stream.seq, "frame": {
+                                    "method": "session.ended",
+                                    "params": {"error": null, "viewer_only": true}
+                                }
+                            }
+                        })));
+                        if stream.viewers.is_empty() && self.tied.load(Ordering::Relaxed) {
+                            self.close();
+                        }
+                    }
                 }
             }
             _ => self.publish(frame),

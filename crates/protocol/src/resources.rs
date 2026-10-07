@@ -264,6 +264,8 @@ pub struct SessionSummary {
     pub updated: f64,
     pub title: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub events: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

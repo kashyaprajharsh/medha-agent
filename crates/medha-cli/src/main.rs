@@ -851,7 +851,6 @@ async fn main() -> Result<()> {
     let process =
         runtime::SessionOptions::from_process(flagged_mode, cli.reasoning_effort.clone())?;
     let lock_cwd = std::env::current_dir()?;
-    let lock = runtime::workspace::load_lock(&lock_cwd, &Stderr)?;
     let options = runtime::SessionOptions {
         model: cli.model.clone(),
         base_url: cli.base_url.clone(),
@@ -882,6 +881,14 @@ async fn main() -> Result<()> {
                 && std::io::stdin().is_terminal()),
         ..process
     };
+    let interactive = !cli.acp
+        && !cli.plain
+        && std::io::stdin().is_terminal()
+        && (cli.setup || (options.prompt.trim().is_empty() && cli.attach.is_empty()));
+    if interactive {
+        return tui_tea::backend_ui::run(lock_cwd, options.startup(), cli.setup).await;
+    }
+    let lock = runtime::workspace::load_lock(&lock_cwd, &Stderr)?;
     let runtime::session::Choices {
         autonomy,
         verify_command: verify_cmd,
@@ -890,10 +897,8 @@ async fn main() -> Result<()> {
     } = runtime::session::Choices::of(&lock, &options)?;
 
     let model = runtime::model::resolve(&lock, &options, &Stderr).await?;
-    let use_plain_repl = cli.plain;
 
     let workspace_home = runtime::Workspace::open(lock_cwd, &Stderr)?;
-    let medha_home = workspace_home.home.clone();
 
     // Never write logs over the TUI.
     let logs_dir = workspace_home.state.join("logs");
@@ -925,40 +930,16 @@ async fn main() -> Result<()> {
         return acp_chat::run(start, input, output, acp::restore_from_env(), None).await;
     }
 
-    // Chosen while the session is built, once the prompt is settled; kept for the dispatch below.
-    let (mut has_task, mut is_tty, mut use_tui) = (false, false, false);
-    let mut tui_channel = None;
-    let pick_surface = |_: &std::path::Path, prompt: &str| {
-        // The active surface supplies the human gate; non-interactive runs deny.
-        has_task = !options.first_run_setup && !prompt.trim().is_empty();
-        is_tty = std::io::stdin().is_terminal();
-        use_tui = options.first_run_setup || (is_tty && !has_task && !use_plain_repl);
-
-        if use_tui {
-            tui_channel = Some(tui_tea::channel());
-        }
-
-        let gate: Arc<dyn kernel::HumanGate> = if let Some((tx, _)) = &tui_channel {
-            Arc::new(tui_tea::TuiGate { tx: tx.clone() })
-        } else if is_tty {
+    let has_task = !options.prompt.trim().is_empty();
+    let is_tty = std::io::stdin().is_terminal();
+    let pick_surface = |_: &std::path::Path, _: &str| runtime::Surface {
+        gate: if is_tty {
             Arc::new(TerminalGate)
         } else {
             Arc::new(kernel::AutoDeny)
-        };
-
-        // Each interactive surface supplies its question form.
-        let asker: Arc<dyn kernel::Asker> = if let Some((tx, _)) = &tui_channel {
-            Arc::new(tui_tea::TuiAsker { tx: tx.clone() })
-        } else {
-            Arc::new(kernel::NoAsker)
-        };
-        runtime::Surface {
-            gate,
-            asker,
-            agents: tui_channel.as_ref().map(|(tx, _)| {
-                Arc::new(tui_tea::AgentWatch { tx: tx.clone() }) as Arc<dyn agents::AgentWatcher>
-            }),
-        }
+        },
+        asker: Arc::new(kernel::NoAsker),
+        agents: None,
     };
     let runtime::session::Started {
         kernel,
@@ -969,26 +950,26 @@ async fn main() -> Result<()> {
         attached_images,
         log: _,
         model_name,
-        model_profiles,
-        active_profile,
+        model_profiles: _,
+        active_profile: _,
         max_ctx,
-        open_setup,
+        open_setup: _,
         base_budget,
         agent_budget,
         agent_control,
-        ui_config,
-        workspace,
-        skill_store,
-        memory_store,
-        k3_budget_tokens,
-        stale_after_days,
-        known_tools,
-        search_handle,
+        ui_config: _,
+        workspace: _,
+        skill_store: _,
+        memory_store: _,
+        k3_budget_tokens: _,
+        stale_after_days: _,
+        known_tools: _,
+        search_handle: _,
         lsp_manager,
         mcp_manager,
-        session_plugins,
-        configured_mcp,
-        plugin_mcp_ids,
+        session_plugins: _,
+        configured_mcp: _,
+        plugin_mcp_ids: _,
         scratch: _scratch,
     } = runtime::session::start(
         runtime::session::Start {
@@ -1006,58 +987,11 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let mode = if use_tui {
-        "tui"
-    } else if has_task {
-        "headless"
-    } else {
-        "repl"
-    };
+    let mode = if has_task { "headless" } else { "repl" };
     tracing::info!(model = %model_name, mode, "medha session start");
 
     if !has_task {
-        let surface_result = if let Some((tx, rx)) = tui_channel {
-            tui_tea::run_tea(
-                kernel.clone(),
-                session,
-                system,
-                model_name,
-                max_ctx,
-                model_profiles,
-                active_profile,
-                open_setup,
-                task_budget(&base_budget, &agent_budget),
-                ui_config,
-                resumed,
-                workspace.clone(),
-                logs_dir.join("stray-stdout.log"),
-                skill_store.clone(),
-                memory_store.clone(),
-                lock.memory.enabled,
-                k3_budget_tokens,
-                stale_after_days,
-                known_tools.clone(),
-                search_handle.clone(),
-                mcp_manager.clone(),
-                session_plugins.store(),
-                plugins_cmd::marketplaces(&medha_home),
-                plugin_session::LivePlugins::new(
-                    session_plugins.store(),
-                    skill_store.clone(),
-                    mcp_manager.clone(),
-                    Box::new({
-                        let kernel = kernel.clone();
-                        move || kernel.reload_hooks()
-                    }),
-                    configured_mcp.clone(),
-                    plugin_mcp_ids,
-                ),
-                agent_control.clone(),
-                tx,
-                rx,
-            )
-            .await
-        } else if is_tty {
+        let surface_result = if is_tty {
             run_repl(
                 &kernel,
                 &session,

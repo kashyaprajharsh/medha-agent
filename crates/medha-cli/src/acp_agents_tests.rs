@@ -43,7 +43,7 @@ fn each_agent_says_what_it_is_doing_in_the_step_rows_words() {
     assert_eq!(row["status"], "running");
     assert_eq!(
         row["doing"],
-        json!({"state": "tool", "verb": "Read", "target": "docs/WHAT_IS_MEDHA.md"})
+        json!({"state": "tool", "tool": "read", "verb": "Read", "target": "docs/WHAT_IS_MEDHA.md"})
     );
     assert_eq!(
         (row["tool_calls"].as_u64(), row["tokens"].as_u64()),

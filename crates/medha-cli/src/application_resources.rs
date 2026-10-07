@@ -309,6 +309,7 @@ pub(crate) async fn read<L: EventLog>(
                     updated: session.last_ts,
                     title: Some(session.title),
                     model: None,
+                    events: session.events,
                 })
                 .collect(),
         ),

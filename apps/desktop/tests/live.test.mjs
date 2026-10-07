@@ -21,6 +21,57 @@ const event = (kind, params = {}) => ({
   params: { kind, ...params },
 });
 
+test("late attachment replaces active state and retains settings, prompts and agents", () => {
+  let state = reduceLive(startingLive(), event("model.text", { delta: "stale" }));
+  const snapshot = {
+    method: "session.presentation",
+    params: {
+      session: "conversation", running: true,
+      settings: { model: "test-model", mode: "plan" },
+      frames: [event("model.reasoning", { delta: "checking" }), event("model.text", { delta: "**current", html: "<p>**current</p>" })],
+      approvals: [{ gate_id: 9, action: "shell.exec", detail: "pwd" }],
+      questions: [{ question_id: 10, questions: [{ prompt: "Choose", options: [] }] }],
+      agents: [{ name: "worker", path: "worker", session: "child", objective: "read", status: "running" }],
+    },
+  };
+  state = reduceLive(state, snapshot);
+  assert.equal(state.sessionId, "conversation");
+  assert.equal(state.model, "test-model");
+  assert.equal(state.settings.mode, "plan");
+  assert.equal(state.status, "running");
+  assert.equal(state.items.at(-1).text, "**current");
+  assert.deepEqual(state.approvals.map((a) => a.gateId), [9]);
+  assert.deepEqual(state.questions.map((q) => q.id), [10]);
+  assert.equal(state.agents[0].session, "child");
+  state = reduceLive(state, snapshot);
+  assert.equal(state.items.length, 2, "a repeated snapshot must replace, not duplicate");
+  state = reduceLive(state, event("model.text", { delta: "**", html: "<p><strong>current</strong></p>" }));
+  assert.equal(state.items.at(-1).text, "**current**");
+  assert.match(state.items.at(-1).html, /<strong>current<\/strong>/);
+});
+
+test("idle shared attachment keeps durable history outside the live tail", () => {
+  const state = reduceLive(startingLive(), { method: "session.presentation", params: {
+    session: "conversation", running: false, frames: [], approvals: [], questions: [], agents: [],
+  } });
+  assert.equal(state.status, "idle");
+  assert.deepEqual(state.items, []);
+});
+
+test("other viewers' messages appear while optimistic local messages appear once", () => {
+  let state = recordSent(startingLive(), { kind: "user", id: "local-id", text: "local", ts: 1 });
+  state = reduceLive(state, event("message.accepted", { content: "local" }));
+  assert.equal(state.items.filter((item) => item.kind === "user").length, 1);
+  assert.equal(state.items[0].id, "local-id", "the optimistic item keeps its identity");
+  state = reduceLive(state, event("turn.done"));
+  state = reduceLive(state, event("message.accepted", { content: "other viewer" }));
+  state = reduceLive(state, event("turn.started", { turn: 2 }));
+  assert.equal(state.status, "running");
+  assert.deepEqual(state.items.filter((item) => item.kind === "user").map((item) => item.text), ["local", "other viewer"]);
+  state = reduceLive(state, event("message.steered", { content: "other viewer steer" }));
+  assert.equal(state.items.at(-1).text, "other viewer steer");
+});
+
 test("a retry removes the abandoned response while preserving completed work", () => {
   let state = reduceLive(
     startingLive(),

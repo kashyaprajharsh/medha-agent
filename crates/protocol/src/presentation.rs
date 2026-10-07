@@ -90,6 +90,37 @@ pub struct AgentPresentation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AgentDoing {
+    Thinking,
+    Tool {
+        #[serde(default)]
+        tool: Option<String>,
+        verb: String,
+        target: Option<String>,
+    },
+    Waiting {
+        action: String,
+    },
+    Idle,
+    Finished,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RosterAgent {
+    pub name: String,
+    pub path: String,
+    pub write: bool,
+    pub session: String,
+    pub objective: String,
+    pub started_ms: u64,
+    pub status: String,
+    pub doing: Option<AgentDoing>,
+    pub tool_calls: Option<u64>,
+    pub tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresentationSnapshot {
     pub revision: u64,
     pub conversation: String,
@@ -99,12 +130,18 @@ pub struct PresentationSnapshot {
     pub force_aborting: bool,
     pub settings: Option<Settings>,
     pub items: Vec<PresentationItem>,
+    /// First row of the active reply, excluding previously saved history.
+    /// None when idle. Frontends with a separate history view use this tail.
+    #[serde(default)]
+    pub current_turn_from: Option<usize>,
     /// Older rows evicted by the presentation budget remain in durable history.
     pub omitted_items: u64,
     pub approvals: Vec<ApprovalPrompt>,
     pub questions: Vec<QuestionPrompt>,
     pub metrics: PresentationMetrics,
     pub agents: Vec<AgentPresentation>,
+    #[serde(default)]
+    pub roster: Vec<RosterAgent>,
     pub omitted_agent_views: u64,
     /// Added by the backend at the output-order barrier, never guessed by a UI.
     pub cursor: Option<Cursor>,

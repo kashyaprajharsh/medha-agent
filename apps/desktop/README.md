@@ -2,8 +2,12 @@
 
 The Tauri app uses `work/desktop-concept.html` as its visual reference. Desktop
 and TUI share the kernel, providers, tools, policies, orchestrator, configuration,
-credentials, memory and event store. A typed local stdio bridge adapts that
-runtime to the desktop; there is no second agent backend.
+credentials, memory and event store. Both interactive clients connect through
+the shared `medha-client` library and typed `medha-protocol` contract to one
+authenticated local `medha serve` backend per Medha home. Either installation
+can start it. Resuming a live conversation attaches another viewer; closing one
+viewer leaves the others running. Standard editor ACP and noninteractive CLI
+commands continue to use the shared runtime directly.
 
 Launching the installed app opens Personal chats. Each Personal chat has its own
 managed folder for generated files. `medha-desktop /path/to/project` opens that

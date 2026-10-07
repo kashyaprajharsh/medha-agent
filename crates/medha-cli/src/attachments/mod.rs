@@ -2,5 +2,5 @@
 
 mod clipboard;
 
-pub use clipboard::clipboard;
+pub(crate) use clipboard::bytes as clipboard_bytes;
 pub use runtime::attachments::*;

@@ -35,7 +35,17 @@ pub async fn update_check(
     if let Some(version) = updates.version() {
         return Ok(Some(json!({ "version": version })));
     }
-    let updater = app.updater().map_err(|error| error.to_string())?;
+    let exiting = app.clone();
+    let updater = app
+        .updater_builder()
+        .on_before_exit(move || {
+            // The Windows installer exits directly, bypassing RunEvent. Keep
+            // native children owned through reap before preserving its cleanup.
+            crate::reap_terminals(&exiting);
+            exiting.cleanup_before_exit();
+        })
+        .build()
+        .map_err(|error| error.to_string())?;
     let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
         return Ok(None);
     };
@@ -61,6 +71,10 @@ pub async fn update_apply(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || update.install(bytes))
         .await
         .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    let exiting = app.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::reap_terminals(&exiting))
+        .await
         .map_err(|error| error.to_string())?;
     app.restart()
 }

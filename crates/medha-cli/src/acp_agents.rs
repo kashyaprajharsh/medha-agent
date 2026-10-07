@@ -123,6 +123,7 @@ fn doing(phase: &kernel::Phase) -> Value {
         kernel::Phase::Generating => json!({ "state": "thinking" }),
         kernel::Phase::InTool { tool, target } => json!({
             "state": "tool",
+            "tool": tool,
             "verb": transcript_view::tool_verb(tool),
             "target": target.as_deref().map(|target| transcript_view::clip(target, 160)),
         }),

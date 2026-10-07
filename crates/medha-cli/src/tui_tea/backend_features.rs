@@ -944,6 +944,21 @@ pub(super) fn skill_is_off(model: &Model, name: &str) -> bool {
             .any(|skill| skill.name == name && !skill.enabled)
     })
 }
+/// Switches a skill off, or on. One the safety check flagged at install is
+/// switched on only after being asked about; any other needs no asking.
+pub(super) fn toggle_skill(model: &mut Model, name: &str) {
+    let listed = model.remote.as_ref().and_then(|peer| peer.skills.as_ref());
+    let Some(skill) = listed.and_then(|all| all.skills.iter().find(|skill| skill.name == name))
+    else {
+        return;
+    };
+    let (on, flagged) = (skill.enabled, skill.verdict.as_deref() == Some("caution"));
+    model.picker = None;
+    match (on, flagged) {
+        (false, true) => begin_enable_skill(model, name),
+        _ => set_skill_enabled(model, name, !on),
+    }
+}
 pub(super) fn begin_enable_skill(model: &mut Model, name: &str) {
     if name.is_empty() {
         model.push_notice("usage: /skill enable <name>");

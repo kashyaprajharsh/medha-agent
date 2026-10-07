@@ -557,3 +557,62 @@ async fn a_skill_left_off_at_install_is_listed_and_switched_on_only_by_saying_so
             if name == "flagged"
     )));
 }
+
+/// Space in the list switches a skill off or on. Only switching on one that
+/// the safety check flagged is asked about first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn space_switches_a_skill_off_or_on_and_asks_only_for_one_that_was_flagged() {
+    let skill = |name: &str, enabled: bool, verdict: Option<&str>| protocol::SkillSummary {
+        name: name.into(),
+        description: "does a thing".into(),
+        scope: "user".into(),
+        available: enabled,
+        enabled,
+        missing_tools: Vec::new(),
+        verdict: verdict.map(str::to_owned),
+    };
+    let catalogue = protocol::SkillCatalogue {
+        skills: vec![
+            skill("ready", true, Some("safe")),
+            skill("parked", false, Some("safe")),
+            skill("flagged", false, Some("caution")),
+        ],
+        errors: Vec::new(),
+    };
+    // What pressing Space on one skill sends, and what it asks.
+    async fn pressed(
+        catalogue: &protocol::SkillCatalogue,
+        on: &str,
+    ) -> (Option<bool>, Option<String>) {
+        let mut f = fixture().await;
+        let listed = Resource::Skills(catalogue.clone());
+        backend_features::resource_reply(&mut f.model, listed, After::Skills);
+        let rows = f.model.picker.as_ref().unwrap().kind.labels();
+        let row = rows.iter().position(|row| row.starts_with(on)).unwrap();
+        f.model.picker.as_mut().unwrap().selected = row;
+        input::handle_key(&mut f.model, key(KeyCode::Char(' ')));
+        let sent = f.model.remote.as_ref().unwrap().pending.iter();
+        let mut sent = sent.filter_map(|asked| match &asked.effect {
+            Effect::Change(protocol::ChangeResource::ConfigureSkill { name, enabled }, _)
+                if name == on =>
+            {
+                Some(*enabled)
+            }
+            _ => None,
+        });
+        let asked = f
+            .model
+            .picker
+            .as_ref()
+            .and_then(|picker| match &picker.kind {
+                PickerKind::EnableSkill(name) => Some(name.clone()),
+                _ => None,
+            });
+        (sent.next_back(), asked)
+    }
+
+    assert_eq!(pressed(&catalogue, "ready").await, (Some(false), None));
+    assert_eq!(pressed(&catalogue, "parked").await, (Some(true), None));
+    let flagged = pressed(&catalogue, "flagged").await;
+    assert_eq!(flagged, (None, Some("flagged".into())));
+}

@@ -958,7 +958,9 @@ impl PickerKind {
                 " memory — ↑↓ select · Enter provenance · p pin/unpin · f forget · Esc cancel "
                     .into()
             }
-            PickerKind::Skill(_) => " skill hub — ↑↓ select · Enter · Esc cancel ".into(),
+            PickerKind::Skill(_) => {
+                " skill hub — ↑↓ select · Enter use · Space on/off · Esc cancel ".into()
+            }
             PickerKind::McpCatalog(_) => {
                 " MCP catalog — ↑↓ select · Enter fills in /mcp add · Esc close ".into()
             }

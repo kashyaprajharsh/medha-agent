@@ -375,6 +375,20 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
                     .unwrap_or(labels.len().saturating_sub(1))
             }
             KeyCode::Down => picker.selected = (picker.selected + 1) % labels.len().max(1),
+            // Space switches the selected skill off or on, and leaves it installed.
+            KeyCode::Char(' ') if matches!(&picker.kind, PickerKind::Skill(_)) => {
+                let name = if let PickerKind::Skill(skills) = &picker.kind {
+                    let row = picker.selected.checked_sub(SKILL_HUB_ACTIONS.len());
+                    row.and_then(|row| skills.get(row))
+                        .map(|(name, _)| name.clone())
+                } else {
+                    None
+                };
+                if let Some(name) = name {
+                    toggle_skill(model, &name);
+                }
+                return;
+            }
             // Space switches the selected server on or off without removing it,
             // so a parked server keeps its definition and credentials.
             KeyCode::Char(' ') if matches!(&picker.kind, PickerKind::Mcp(_)) => {

@@ -586,6 +586,17 @@ pub(super) fn cat_color(cat: ToolCategory) -> Color {
 }
 
 /// Humanizes the final dotted tool-name segment without a lookup table.
+/// What an approval is about, in a few words. A request for a path is named
+/// by the access asked for; the path is in the lines under it. Named as a
+/// tool is, it would be called after whatever follows the path's last dot.
+pub(super) fn approval_subject(action: &str) -> String {
+    let asked = action.rsplit(" · ").next().unwrap_or(action);
+    match asked.split_once(" access to ") {
+        Some((access, _)) => format!("{} access", access.to_lowercase()),
+        None => tool_label(action),
+    }
+}
+
 pub(super) fn tool_label(tool: &str) -> String {
     let seg = tool.rsplit('.').next().unwrap_or(tool).replace('_', " ");
     let mut chars = seg.chars();
@@ -882,7 +893,7 @@ fn render_approval_detail(
         Line::from(vec![
             Span::styled("Allow ", Style::default().fg(theme::text())),
             Span::styled(
-                tool_label(action).to_string(),
+                approval_subject(action),
                 Style::default()
                     .fg(theme::warn())
                     .add_modifier(Modifier::BOLD),
@@ -2382,7 +2393,7 @@ pub(super) fn draw_transcript(f: &mut Frame, model: &mut Model, area: Rect) {
         && area.height > 4
     {
         f.render_widget(
-            Paragraph::new(format!("Allow {}?", tool_label(&pending.action))).style(
+            Paragraph::new(format!("Allow {}?", approval_subject(&pending.action))).style(
                 Style::default()
                     .fg(theme::warn())
                     .add_modifier(Modifier::BOLD),

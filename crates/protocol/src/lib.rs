@@ -441,6 +441,8 @@ pub enum ApprovalDecision {
     Always,
     Session,
     Persistent,
+    /// For a path: remember the folder it is in, named in the prompt's `folder`.
+    Folder,
     Deny,
 }
 
@@ -450,6 +452,8 @@ pub enum ApprovalKind {
     #[default]
     Action,
     Access,
+    /// One path outside the workspace. `Always` remembers that path alone.
+    Path,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +466,9 @@ pub struct ApprovalPrompt {
     pub kind: ApprovalKind,
     #[serde(default)]
     pub choices: Vec<ApprovalDecision>,
+    /// The folder the `Folder` choice would remember.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

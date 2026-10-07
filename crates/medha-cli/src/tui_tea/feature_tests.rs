@@ -206,6 +206,7 @@ fn access(model: &mut Model) {
                 protocol::ApprovalDecision::Persistent,
                 protocol::ApprovalDecision::Deny,
             ],
+            folder: None,
         },
     );
     model.approval_ready = true;

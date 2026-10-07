@@ -587,8 +587,11 @@ export function App() {
     [currentKey, answer],
   );
   const approveCurrent = useCallback(
-    (approval: Parameters<typeof approve>[1], allow: boolean) => {
-      if (currentKey) approve(currentKey, approval, allow);
+    (
+      approval: Parameters<typeof approve>[1],
+      decision: Parameters<typeof approve>[2],
+    ) => {
+      if (currentKey) approve(currentKey, approval, decision);
     },
     [currentKey, approve],
   );

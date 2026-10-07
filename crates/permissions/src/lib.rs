@@ -516,6 +516,35 @@ fn sync_parent(
     Ok(())
 }
 
+/// The folder a person may be offered to remember in place of one file in
+/// it. Remembering a folder opens everything under it, so only a folder that
+/// is someone's own working place is ever offered: never the home folder or
+/// anything above it, never a folder within two steps of the top of a disk
+/// (a whole volume, or a system folder such as `/private/etc`), never a place
+/// every program keeps its temporary files, and never one that holds
+/// credentials. A path that is itself a folder needs no offer: remembering it
+/// already covers what is in it.
+fn folder_to_offer(resolved: &Path) -> Option<PathBuf> {
+    if resolved.is_dir() {
+        return None;
+    }
+    let folder = resolved.parent()?;
+    let depth = folder
+        .components()
+        .filter(|part| matches!(part, std::path::Component::Normal(_)))
+        .count();
+    let shared = [dirs::home_dir(), Some(std::env::temp_dir())]
+        .into_iter()
+        .flatten()
+        .chain(["/tmp", "/var/tmp"].map(PathBuf::from));
+    // Each as it is named and as it resolves: a home or temporary folder is often reached through a link.
+    let too_wide = shared
+        .flat_map(|place| [place.canonicalize().ok(), Some(place)])
+        .flatten()
+        .any(|place| place.starts_with(folder));
+    (depth >= 3 && !too_wide && !is_protected(folder)).then(|| folder.to_path_buf())
+}
+
 impl PermissionManager {
     /// Expand a user path and anchor relative paths to this manager's sandbox.
     /// File tools define relative paths in workspace coordinates; consulting
@@ -1215,24 +1244,33 @@ impl PermissionManager {
             None => format!("This path is outside the workspace: {}", resolved.display()),
         };
 
+        let folder = folder_to_offer(&resolved);
         let decision = human_gate
-            .confirm(
+            .confirm_path(
                 &format!("{permission:?} access to {}", resolved.display()),
                 Some(&prompt),
-                false, // an out-of-workspace path prompt is not a trust-flow escalation
+                folder.as_deref(),
             )
             .await;
 
-        match decision {
-            kernel::Approval::Deny => {
+        match (decision, folder) {
+            (kernel::PathApproval::Deny, _) => {
                 self.audit_log(path, &resolved, permission, "denied")?;
                 Err(PermissionError::Denied { path: resolved })
             }
-            kernel::Approval::Once => {
+            (kernel::PathApproval::Once, _) => {
                 self.audit_log(path, &resolved, permission, "allowed (user approved, once)")?;
                 Ok(resolved)
             }
-            kernel::Approval::Always => {
+            // Only a folder that was offered is ever remembered: an answer naming
+            // the folder where none was offered remembers the path alone.
+            (kernel::PathApproval::Folder, Some(folder)) => {
+                self.trust_path(folder, permission)?;
+                let outcome = "allowed (user approved, folder persisted)";
+                self.audit_log(path, &resolved, permission, outcome)?;
+                Ok(resolved)
+            }
+            (kernel::PathApproval::Path | kernel::PathApproval::Folder, _) => {
                 self.trust_path(resolved.clone(), permission)?;
                 self.audit_log(
                     path,
@@ -1720,6 +1758,136 @@ mod tests {
             self.actions.lock().unwrap().push(action.to_string());
             self.decision
         }
+    }
+
+    /// Answers a path prompt as it is told to, and keeps the folder each prompt offered.
+    struct PathGate {
+        asked: Arc<AtomicU32>,
+        offered: Arc<std::sync::Mutex<Vec<Option<PathBuf>>>>,
+        answer: kernel::PathApproval,
+    }
+
+    #[async_trait::async_trait]
+    impl HumanGate for PathGate {
+        async fn confirm(&self, _: &str, _: Option<&str>, _: bool) -> Approval {
+            Approval::Deny
+        }
+
+        async fn confirm_path(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            folder: Option<&Path>,
+        ) -> kernel::PathApproval {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let offered = folder.map(Path::to_path_buf);
+            self.offered.lock().unwrap().push(offered);
+            self.answer
+        }
+    }
+
+    /// Remembering a folder is the widest thing one answer can grant, so what it
+    /// opens is pinned: that folder and what is under it, for the access asked.
+    #[tokio::test]
+    async fn a_remembered_folder_opens_what_is_in_it_and_nothing_beside_or_above_it() {
+        let ws = unique_dir("ws_folder");
+        let state = unique_dir("state_folder");
+        let outside = unique_dir("outside_folder");
+        let files = [
+            "src/a.txt",
+            "src/b.txt",
+            "src/deep/c.txt",
+            "other/d.txt",
+            "top.txt",
+        ];
+        for file in files {
+            let file = outside.join("proj").join(file);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x").unwrap();
+        }
+        let proj = outside.join("proj").canonicalize().unwrap();
+        let (asked, offered) = (Arc::new(AtomicU32::new(0)), Arc::default());
+        let mut mgr =
+            PermissionManager::new(&ws, state.join("trust.lock"), state.join("audit.log")).unwrap();
+        mgr.set_human_gate(Arc::new(PathGate {
+            asked: asked.clone(),
+            offered: Arc::clone(&offered),
+            answer: kernel::PathApproval::Folder,
+        }));
+
+        mgr.request_read(&proj.join("src/a.txt")).await.unwrap();
+        assert_eq!(*offered.lock().unwrap(), [Some(proj.join("src"))]);
+        mgr.request_read(&proj.join("src/b.txt")).await.unwrap();
+        mgr.request_read(&proj.join("src/deep/c.txt"))
+            .await
+            .unwrap();
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "asked again inside it");
+
+        // From here every prompt is refused: whatever is still allowed was opened by the folder.
+        let refused = Arc::new(AtomicU32::new(0));
+        mgr.set_human_gate(Arc::new(CountingGate(refused.clone(), Approval::Deny)));
+        for closed in ["other/d.txt", "top.txt"] {
+            let asked = mgr.request_read(&proj.join(closed)).await;
+            assert!(
+                matches!(asked, Err(PermissionError::Denied { .. })),
+                "{closed}"
+            );
+        }
+        let written = mgr.request_write(&proj.join("src/a.txt")).await;
+        assert!(matches!(written, Err(PermissionError::Denied { .. })));
+        assert_eq!(refused.load(Ordering::SeqCst), 3);
+    }
+
+    /// A folder is offered only where it is a place of someone's work. Where
+    /// none is offered, an answer that names the folder remembers the file alone.
+    #[tokio::test]
+    async fn a_folder_too_wide_to_remember_is_never_offered_nor_granted() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(folder_to_offer(&home.join("notes.txt")), None);
+        assert_eq!(folder_to_offer(&home.join(".ssh/config")), None);
+        assert_eq!(folder_to_offer(Path::new("/etc/hosts")), None);
+        // As `/etc` really is on a Mac, and as a file at the top of another disk is.
+        assert_eq!(folder_to_offer(Path::new("/private/etc/hosts")), None);
+        assert_eq!(folder_to_offer(Path::new("/Volumes/Disk/notes.txt")), None);
+        let work = unique_dir("offer").join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        assert_eq!(folder_to_offer(&work), None, "a folder covers itself");
+        assert_eq!(folder_to_offer(&work.join("a.txt")), Some(work.clone()));
+
+        // Two files straight in the folder every program keeps its temporary files in.
+        let temporary = std::env::temp_dir().canonicalize().unwrap();
+        let stamp = std::process::id();
+        let (one, other) = (
+            temporary.join(format!("medha-perm-one-{stamp}.txt")),
+            temporary.join(format!("medha-perm-other-{stamp}.txt")),
+        );
+        std::fs::write(&one, "x").unwrap();
+        std::fs::write(&other, "x").unwrap();
+        let ws = unique_dir("ws_wide");
+        let state = unique_dir("state_wide");
+        let (asked, offered) = (Arc::new(AtomicU32::new(0)), Arc::default());
+        let mut mgr =
+            PermissionManager::new(&ws, state.join("trust.lock"), state.join("audit.log")).unwrap();
+        mgr.set_human_gate(Arc::new(PathGate {
+            asked: asked.clone(),
+            offered: Arc::clone(&offered),
+            answer: kernel::PathApproval::Folder,
+        }));
+        mgr.request_read(&one).await.unwrap();
+        assert_eq!(*offered.lock().unwrap(), [None]);
+        mgr.request_read(&one).await.unwrap();
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "the file was not remembered"
+        );
+        mgr.request_read(&other).await.unwrap();
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "the folder was opened unasked"
+        );
+        let _ = (std::fs::remove_file(one), std::fs::remove_file(other));
     }
 
     /// Refused before any prompt, even with "Always" and a trusted parent folder.

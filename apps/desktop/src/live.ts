@@ -1,10 +1,24 @@
 import type { LiveFrame, SessionSettings, ToolScreen } from "./api";
 
+/** What may be answered to an approval, as the backend names each answer. */
+export type ApprovalChoice =
+  | "once"
+  | "always"
+  | "folder"
+  | "session"
+  | "persistent"
+  | "deny";
 export type Approval = {
   gateId: number;
   action: string;
   detail?: string;
   escalated: boolean;
+  /** "path" asks about one file outside the workspace. */
+  kind?: string;
+  /** The answers the backend offers, in the order it offers them. */
+  choices: ApprovalChoice[];
+  /** The folder the "folder" answer would remember. */
+  folder?: string;
   pending?: boolean;
 };
 export type QuestionForm = {
@@ -269,6 +283,11 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
             action: str(params.action) ?? "an action",
             detail: str(params.detail),
             escalated: params.escalated === true,
+            kind: str(params.kind),
+            choices: Array.isArray(params.choices)
+              ? (params.choices as ApprovalChoice[])
+              : ["once", "deny"],
+            folder: str(params.folder),
           },
         ],
       };

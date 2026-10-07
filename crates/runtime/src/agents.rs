@@ -980,6 +980,16 @@ impl kernel::HumanGate for AttributedGate {
             )
             .await
     }
+
+    async fn confirm_path(
+        &self,
+        action: &str,
+        detail: Option<&str>,
+        folder: Option<&std::path::Path>,
+    ) -> kernel::PathApproval {
+        let action = format!("agent '{}' · {action}", self.agent);
+        self.inner.confirm_path(&action, detail, folder).await
+    }
 }
 
 /// A step in a child agent's own transcript.

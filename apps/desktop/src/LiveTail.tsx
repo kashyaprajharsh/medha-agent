@@ -6,6 +6,7 @@ import {
   queuedMessages,
   type LiveItem,
   type Approval,
+  type ApprovalChoice,
   type LiveAgent,
   type LiveState,
   type QuestionForm,
@@ -22,6 +23,30 @@ import { UserText } from "./UserText";
 // A live reply is newer than anything saved, so its outputs sort last.
 const LIVE = 1e12;
 
+/** Who is asking and for what. A path request arrives as "Read access to /a/b",
+ *  with the agent's name in front when one of Medha's agents is the one asking. */
+function asks(approval: Approval): string {
+  if (approval.kind !== "path") return `Medha wants to ${approval.action}`;
+  const parts = approval.action.split(" · ");
+  const request = parts.pop() ?? "";
+  const who = parts.join(" · ") || "Medha";
+  return `${who} wants ${request.charAt(0).toLowerCase()}${request.slice(1)}`;
+}
+
+/** Each answer says what it remembers, so the wider one is never chosen unseen. */
+function answerLabel(choice: ApprovalChoice, approval: Approval): string {
+  const labels: Record<ApprovalChoice, string> = {
+    once: "Allow",
+    always:
+      approval.kind === "path" ? "Always allow this file" : "Always allow",
+    folder: "Always allow this folder",
+    session: "Allow for this session",
+    persistent: "Always allow for this project",
+    deny: "Deny",
+  };
+  return labels[choice];
+}
+
 type Props = {
   state: LiveState;
   showReasoning?: boolean;
@@ -29,7 +54,7 @@ type Props = {
     form: QuestionForm,
     answers?: { selected: string[]; other?: string }[],
   ) => void;
-  onApprove: (approval: Approval, allow: boolean) => void;
+  onApprove: (approval: Approval, decision: ApprovalChoice) => void;
   openSession?: string | null;
   onOpenAgent: (agent: LiveAgent) => void;
 };
@@ -101,7 +126,7 @@ export const LiveTail = memo(function LiveTail({
         >
           <div className="ask-top">
             <Icon name="shield" />
-            <b>Medha wants to {approval.action}</b>
+            <b>{asks(approval)}</b>
           </div>
           {approval.detail && (
             <pre className="ask-detail">{approval.detail}</pre>
@@ -111,23 +136,29 @@ export const LiveTail = memo(function LiveTail({
               This action always asks, even if you allowed it before.
             </p>
           )}
+          {approval.folder && (
+            <p className="ask-note">Its folder: {approval.folder}</p>
+          )}
           <div className="ask-actions">
-            <button
-              type="button"
-              className="btn-gold"
-              disabled={approval.pending}
-              onClick={() => onApprove(approval, true)}
-            >
-              {approval.pending ? "Sending…" : "Allow"}
-            </button>
-            <button
-              type="button"
-              className="btn-line"
-              disabled={approval.pending}
-              onClick={() => onApprove(approval, false)}
-            >
-              Deny
-            </button>
+            {approval.choices.map((choice) => (
+              <button
+                type="button"
+                key={choice}
+                className={
+                  choice === "once"
+                    ? "btn-gold"
+                    : choice === "deny"
+                      ? "btn-line ask-deny"
+                      : "btn-line"
+                }
+                disabled={approval.pending}
+                onClick={() => onApprove(approval, choice)}
+              >
+                {choice === "once" && approval.pending
+                  ? "Sending…"
+                  : answerLabel(choice, approval)}
+              </button>
+            ))}
           </div>
         </div>
       ))}

@@ -721,6 +721,46 @@ test("calendar groups do not put last Sunday's session into this week's Monday",
   );
 });
 
+test("a path approval offers each answer the backend sends, and the folder says which folder", async () => {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { reduceLive, startingLive } = await import(await moduleUrl("live"));
+  let state = reduceLive(startingLive(), { method: "ready", params: { session: "s" } });
+  state = reduceLive(state, {
+    method: "approval",
+    params: {
+      gate_id: 4,
+      action: "agent 'docs' · Read access to /work/proj/src/a.txt",
+      detail: "This path is outside the workspace: /work/proj/src/a.txt",
+      escalated: false,
+      kind: "path",
+      choices: ["once", "always", "folder", "deny"],
+      folder: "/work/proj/src",
+    },
+  });
+  const answered = [];
+  await act(() =>
+    root.render(
+      h(LiveTail, {
+        state,
+        showReasoning: false,
+        onAnswer() {},
+        onApprove: (approval, decision) => answered.push([approval.gateId, decision]),
+        onOpenAgent() {},
+      }),
+    ),
+  );
+  const card = document.querySelector(".ask");
+  assert.equal(card.querySelector(".ask-top b").textContent, "agent 'docs' wants read access to /work/proj/src/a.txt");
+  const buttons = [...card.querySelectorAll(".ask-actions button")];
+  assert.deepEqual(
+    buttons.map((button) => button.textContent),
+    ["Allow", "Always allow this file", "Always allow this folder", "Deny"],
+  );
+  assert.match(card.textContent, /Its folder: \/work\/proj\/src/);
+  await click(buttons[2]);
+  assert.deepEqual(answered, [[4, "folder"]]);
+});
+
 test("a long compaction says so instead of looking stuck on Working", async () => {
   const { LiveTail } = await import(await moduleUrl("LiveTail"));
   const { reduceLive, startingLive, recordSent } = await import(await moduleUrl("live"));

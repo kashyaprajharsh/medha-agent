@@ -13,6 +13,7 @@ import {
   recordSent,
   startingLive,
   type Approval,
+  type ApprovalChoice,
   type LiveState,
   type QuestionForm,
 } from "./live";
@@ -184,7 +185,7 @@ export function useLive() {
   );
 
   const approve = useCallback(
-    (key: string, approval: Approval, allow: boolean) => {
+    (key: string, approval: Approval, decision: ApprovalChoice) => {
       patch(key, (state) => ({
         ...state,
         approvals: state.approvals.map((item) =>
@@ -194,7 +195,7 @@ export function useLive() {
       void api
         .liveCall(key, "approval.respond", {
           gate_id: approval.gateId,
-          approve: allow,
+          decision,
         })
         .then(() =>
           patch(key, (state) => ({

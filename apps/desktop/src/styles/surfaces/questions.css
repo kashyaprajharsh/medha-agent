@@ -42,9 +42,14 @@
 }
 .ask-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--s-2);
   padding: var(--s-3) 18px;
   border-top: 1px solid var(--hair);
+}
+/* Refusing stands apart from the ways of allowing. */
+.ask-deny {
+  margin-left: auto;
 }
 .question-card {
   margin-bottom: var(--s-5);

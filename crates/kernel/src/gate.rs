@@ -4,7 +4,8 @@ use async_trait::async_trait;
 
 /// The human's answer to an approval prompt. Callers interpret `Always` in their
 /// own context: a tool approval treats it as "don't ask again this session", while
-/// a file-permission prompt treats it as "persist this path to medha.lock".
+/// a file-permission prompt treats it as "remember this path in this machine's
+/// trust file", which is kept outside the repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Approval {
     /// Allow this one operation; do not remember the decision.
@@ -34,6 +35,29 @@ pub enum NetworkDecision {
     Persistent,
     /// Reject.
     Deny,
+}
+
+/// The human's answer about one path outside the workspace. Remembering the
+/// folder is a wider grant than remembering the path, so it is an answer of
+/// its own that only a person choosing it can give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathApproval {
+    Once,
+    /// Remember this path alone.
+    Path,
+    /// Remember the folder it is in, and so everything in that folder.
+    Folder,
+    Deny,
+}
+
+impl From<Approval> for PathApproval {
+    fn from(approval: Approval) -> Self {
+        match approval {
+            Approval::Once => Self::Once,
+            Approval::Always => Self::Path,
+            Approval::Deny => Self::Deny,
+        }
+    }
 }
 
 /// Capabilities requested together for one command. Paths are resolved by the
@@ -92,6 +116,19 @@ pub trait HumanGate: Send + Sync {
             Approval::Always => NetworkDecision::Once,
             Approval::Deny => NetworkDecision::Deny,
         }
+    }
+
+    /// Ask about one path outside the workspace. `folder` is the folder that
+    /// may be remembered in its place, when there is one fit to offer. A gate
+    /// that does not override this never answers with the folder: its
+    /// `Always` remembers the path alone, as it did before there was a choice.
+    async fn confirm_path(
+        &self,
+        action: &str,
+        detail: Option<&str>,
+        _folder: Option<&std::path::Path>,
+    ) -> PathApproval {
+        self.confirm(action, detail, false).await.into()
     }
 }
 

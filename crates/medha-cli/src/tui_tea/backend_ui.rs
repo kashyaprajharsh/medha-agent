@@ -956,9 +956,17 @@ fn approval(model: &mut Model, prompt: protocol::ApprovalPrompt) {
         prompt.gate_id
     });
     model.pending_approvals.retain(|pending| !matches!(&pending.responder, ApprovalResponder::Remote(old) if old.gate_id == prompt.gate_id));
+    // The folder a choice would remember is shown, so that choice says what it opens.
+    let detail = match (&prompt.detail, &prompt.folder) {
+        (detail, Some(folder)) => {
+            let asked = detail.as_deref().unwrap_or_default();
+            Some(format!("{asked}\nIts folder: {folder}"))
+        }
+        (detail, None) => detail.clone(),
+    };
     model.pending_approvals.push_back(PendingApproval {
         action: prompt.action.clone(),
-        detail: prompt.detail.clone(),
+        detail,
         escalated: prompt.escalated,
         responder: ApprovalResponder::Remote(prompt),
     });

@@ -32,3 +32,8 @@ kernel = { path = "crates/kernel" }
 providers = { path = "crates/providers" }
 context = { path = "crates/context" }
 media = { path = "crates/media" }
+
+# Full event-log checks are CPU-bound even in development. Optimize the hash
+# implementation while keeping Medha's own code debuggable.
+[profile.dev.package.sha2]
+opt-level = 3

@@ -162,8 +162,8 @@ fn backfill_event_fts(conn: &mut Connection) -> Result<(), StoreError> {
         .map_err(|error| StoreError::Db(error.to_string()))
 }
 
-fn verify_chain_anchor(conn: &Connection, rows: &[(i64, Row, Vec<u8>)]) -> Result<(), StoreError> {
-    let (count, head) = validated_chain(rows)?;
+fn verify_chain_anchor(conn: &Connection) -> Result<(), StoreError> {
+    let (count, head) = validated_chain(conn)?;
     let (anchored_count, anchored_head) = read_chain_anchor(conn)?.ok_or_else(|| {
         StoreError::Db("event-chain anchor is missing; refusing unanchored log".into())
     })?;
@@ -182,8 +182,10 @@ fn verify_chain_anchor(conn: &Connection, rows: &[(i64, Row, Vec<u8>)]) -> Resul
 /// caller holds one `IMMEDIATE` transaction through both this rebuild and the
 /// result query, closing the otherwise exploitable rebuild/query race.
 fn rebuild_verified_event_fts(conn: &Connection) -> Result<(), StoreError> {
+    verify_chain_anchor(conn)?;
+    // Retain the authenticated rows before any index DML. Even a shadow-table
+    // trigger must not make us decode history changed by our own FTS writes.
     let rows = load_chain_rows(conn)?;
-    verify_chain_anchor(conn, &rows)?;
     conn.execute("DELETE FROM events_fts", [])
         .map_err(|error| StoreError::Db(error.to_string()))?;
     for (_, row, _) in rows {
@@ -697,8 +699,7 @@ impl SqliteLog {
             .map_err(|_| StoreError::Db("verification cache poisoned".into()))?;
         if force || *cached != Some(version) {
             *cached = None;
-            let rows = load_chain_rows(&tx)?;
-            verify_chain_anchor(&tx, &rows)?;
+            verify_chain_anchor(&tx)?;
             #[cfg(test)]
             self.verification_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1268,7 +1269,6 @@ impl Drop for SqliteMutationLease {
     }
 }
 
-#[derive(Clone)]
 struct Row {
     id: String,
     session_id: String,
@@ -1334,13 +1334,14 @@ fn ensure_hash_version_column(conn: &mut Connection) -> Result<(), StoreError> {
         .map_err(|error| StoreError::Db(error.to_string()))
 }
 
+const CHAIN_ROWS_SQL: &str =
+    "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+            prev_hash, hash, hash_version, ts
+     FROM events ORDER BY rowid ASC";
+
 fn load_chain_rows(conn: &Connection) -> Result<Vec<(i64, Row, Vec<u8>)>, StoreError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
-                    prev_hash, hash, hash_version, ts
-             FROM events ORDER BY rowid ASC",
-        )
+        .prepare(CHAIN_ROWS_SQL)
         .map_err(|error| StoreError::Db(error.to_string()))?;
     stmt.query_map([], chain_row)
         .map_err(|error| StoreError::Db(error.to_string()))?
@@ -1376,33 +1377,94 @@ fn decode_events(rows: Vec<(i64, Row, Vec<u8>)>) -> Result<Vec<Event>, StoreErro
         .collect()
 }
 
-fn validated_chain(rows: &[(i64, Row, Vec<u8>)]) -> Result<(u64, [u8; 32]), StoreError> {
+/// A borrowed SQLite row for hashing. The canonical encoder takes raw payload
+/// bytes separately, so verification need not allocate or parse the JSON. The
+/// ordinary Row decoder remains responsible for payloads returned to readers.
+struct HashRow<'a> {
+    event: Event,
+    payload: &'a [u8],
+    stored_hash: &'a [u8],
+}
+
+fn hashing_row<'a>(row: &'a rusqlite::Row<'_>) -> rusqlite::Result<Option<HashRow<'a>>> {
+    let payload = row.get_ref(5)?.as_str()?.as_bytes();
+    let stored_hash = row.get_ref(9)?.as_blob()?;
+    let previous = row.get_ref(8)?.as_blob()?;
+    let mut prev_hash = [0u8; 32];
+    if previous.len() == 32 {
+        prev_hash.copy_from_slice(previous);
+    }
+    let (Ok(id), Ok(session_id), Some(kind), Some(trust)) = (
+        Ulid::from_string(row.get_ref(1)?.as_str()?),
+        Ulid::from_string(row.get_ref(2)?.as_str()?),
+        EventKind::parse(row.get_ref(4)?.as_str()?),
+        TrustLabel::parse(row.get_ref(6)?.as_str()?),
+    ) else {
+        return Ok(None);
+    };
+    let parent_id: Option<String> = row.get(3)?;
+    Ok(Some(HashRow {
+        event: Event {
+            id,
+            session_id,
+            parent_id: parent_id.and_then(|parent| Ulid::from_string(&parent).ok()),
+            kind,
+            // Never exposed to a reader: chain_hash_with_payload uses payload.
+            payload: serde_json::Value::Null,
+            trust,
+            provenance: Provenance {
+                source: row.get(7)?,
+            },
+            prev_hash,
+            hash_version: row.get(10)?,
+            ts: row.get(11)?,
+        },
+        payload,
+        stored_hash,
+    }))
+}
+
+fn validated_chain(conn: &Connection) -> Result<(u64, [u8; 32]), StoreError> {
+    let mut stmt = conn
+        .prepare(CHAIN_ROWS_SQL)
+        .map_err(|error| StoreError::Db(error.to_string()))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|error| StoreError::Db(error.to_string()))?;
+    let mut count = 0u64;
     let mut prev = [0u8; 32];
-    for (index, (_, row, stored_hash)) in rows.iter().enumerate() {
-        let event = row
-            .clone()
-            .into_event()
-            .ok_or_else(|| StoreError::Db(format!("corrupt event row at index {index}")))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| StoreError::Db(error.to_string()))?
+    {
+        let HashRow {
+            event,
+            payload,
+            stored_hash,
+        } = hashing_row(row)
+            .map_err(|error| StoreError::Db(error.to_string()))?
+            .ok_or_else(|| StoreError::Db(format!("corrupt event row at index {count}")))?;
         if !matches!(event.hash_version, 1 | EVENT_HASH_VERSION) {
             return Err(StoreError::Db(format!(
-                "unsupported event hash version {} at index {index}",
+                "unsupported event hash version {} at index {count}",
                 event.hash_version
             )));
         }
         if event.prev_hash != prev {
             return Err(StoreError::Db(format!(
-                "hash chain broken at event index {index}: prev_hash does not link"
+                "hash chain broken at event index {count}: prev_hash does not link"
             )));
         }
-        let computed = chain_hash_with_payload(&prev, &event, row.payload.as_bytes());
-        if computed.as_slice() != stored_hash.as_slice() {
+        let computed = chain_hash_with_payload(&prev, &event, payload);
+        if computed.as_slice() != stored_hash {
             return Err(StoreError::Db(format!(
-                "hash chain broken at event index {index}: content does not match stored hash"
+                "hash chain broken at event index {count}: content does not match stored hash"
             )));
         }
         prev = computed;
+        count += 1;
     }
-    Ok((rows.len() as u64, prev))
+    Ok((count, prev))
 }
 
 /// Upgrade a valid legacy chain in one SQLite transaction. Logical events are
@@ -1432,10 +1494,8 @@ fn migrate_event_chain_v2(conn: &mut Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Db(error.to_string()))?;
         return Ok(());
     }
-    let rows = load_chain_rows(&tx)?;
-
     // Authenticate the old representation before changing any link.
-    let (old_count, old_head) = validated_chain(&rows)?;
+    let (old_count, old_head) = validated_chain(&tx)?;
     if let Some((anchored_count, anchored_head)) = read_chain_anchor(&tx)?
         && (anchored_count != old_count || anchored_head != old_head)
     {
@@ -1444,6 +1504,9 @@ fn migrate_event_chain_v2(conn: &mut Connection) -> Result<(), StoreError> {
         ));
     }
 
+    // Freeze the authenticated representation before UPDATEs: triggers must
+    // not cause a rewritten payload to be legitimized during migration.
+    let rows = load_chain_rows(&tx)?;
     let mut prev = [0u8; 32];
     for (rowid, row, _) in rows {
         let payload = row.payload.clone();
@@ -2513,6 +2576,66 @@ mod tests {
         }
         log.verify().unwrap();
         (dir, db, log)
+    }
+
+    #[tokio::test]
+    async fn verification_stops_at_a_broken_prefix_without_loading_the_tail() {
+        let (dir, db, log) = seeded_chain("stream-prefix").await;
+        let attacker = Connection::open(&db).unwrap();
+        attacker
+            .execute_batch(
+                "UPDATE events SET payload = '{}' WHERE rowid = 1;
+                 UPDATE events SET payload = CAST(x'80' AS TEXT) WHERE rowid = 2;",
+            )
+            .unwrap();
+
+        // An eager row load fails on the tail's invalid UTF-8 first. Streaming
+        // must reject the first corrupt hash before fetching that tail at all.
+        let error = log.verify().unwrap_err().to_string();
+        assert!(
+            error.contains("event index 0: content does not match stored hash"),
+            "verification read past the corrupt prefix: {error}"
+        );
+        drop((attacker, log));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn verification_hashes_raw_v2_payload_bytes_and_readers_still_decode_them() {
+        let dir = std::env::temp_dir().join(format!("medha-chain-raw-v2-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let log = SqliteLog::open(&db).unwrap();
+        let session = kernel::Session::new();
+        let mut event = Event::model_reasoning(&session, "hi");
+        event.parent_id = Some(Ulid::new());
+        event.provenance.source = "raw-json-ज्ञान".into();
+        let event = log.append(event).await.unwrap();
+        // These spellings change when JSON is parsed and serialized again.
+        let raw = r#"{ "nested": [true, null], "number": 1.00, "text": "\u0068i" }"#;
+        let hash = chain_hash_with_payload(&event.prev_hash, &event, raw.as_bytes());
+        let mut writer = Connection::open(&db).unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute(
+            "UPDATE events SET payload = ?1, hash = ?2",
+            rusqlite::params![raw, hash.as_slice()],
+        )
+        .unwrap();
+        set_chain_anchor(&tx, 1, &hash).unwrap();
+        tx.commit().unwrap();
+
+        log.verify().unwrap();
+        let decoded = log.checked_events(session.id).await.unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].payload,
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()
+        );
+        assert_eq!(decoded[0].id, event.id);
+        assert_eq!(decoded[0].parent_id, event.parent_id);
+        assert_eq!(decoded[0].provenance.source, event.provenance.source);
+        assert_eq!(decoded[0].ts, event.ts);
+        drop((writer, log));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

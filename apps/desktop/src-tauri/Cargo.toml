@@ -12,6 +12,10 @@ build = "build.rs"
 # crates remain in the repository's existing workspace.
 [workspace]
 
+# This standalone workspace does not inherit the root workspace's profiles.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -1288,11 +1288,20 @@ fn observed(model: &mut Model, said: Said) -> anyhow::Result<()> {
         }
         "session.rewound" => recover(model),
         "mcp.auth" => {
-            if let (Some(id), Some(url)) = (params["id"].as_str(), params["url"].as_str()) {
+            if let (Some(id), Some(url)) = (params["server"].as_str(), params["url"].as_str()) {
                 model.push_notice(format!(
                     "Signing in to '{id}'. If the browser did not open, use:\n{url}"
                 ));
             }
+        }
+        // How a sign-in begun here ended: it is reported once the browser is done.
+        "mcp.signed_in" => {
+            let id = params["server"].as_str().unwrap_or("server");
+            let text = match params["error"].as_str() {
+                Some(error) => format!("MCP: '{id}': {error}"),
+                None => backend_features::mcp_status_text(std::slice::from_ref(&params["status"])),
+            };
+            model.upsert_notice("MCP", text);
         }
         // Transport replies are separately routed and optional future events
         // cannot become command dispatch or safety decisions.

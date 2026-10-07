@@ -1859,6 +1859,26 @@ pub(super) fn search_mcp_catalog(model: &mut Model, query: &str) {
         ),
     );
 }
+/// The state of servers as a person reads it, not as it travels.
+pub(super) fn mcp_status_text(servers: &[serde_json::Value]) -> String {
+    let mut lines = vec!["MCP servers:".to_string()];
+    for server in servers {
+        let name = server["server"].as_str().unwrap_or("server");
+        let state = server["state"].as_str().unwrap_or("unknown");
+        let tools = server["tools"].as_u64().unwrap_or(0);
+        let filtered = match server["hidden"].as_u64().unwrap_or(0) {
+            0 => String::new(),
+            hidden => format!(", {hidden} filtered"),
+        };
+        lines.push(format!("  {name} [{state}]  {tools} tool(s){filtered}"));
+        if let Some(detail) = server["detail"].as_str() {
+            lines.push(format!("    {detail}"));
+        }
+    }
+    lines.push("  · /mcp start <id> to connect · medha mcp add … to add".into());
+    lines.join("\n")
+}
+
 pub(super) fn mcp_reply(model: &mut Model, reply: protocol::McpResult, after: After) {
     match reply {
         protocol::McpResult::Servers(servers) => {
@@ -1933,7 +1953,7 @@ pub(super) fn mcp_reply(model: &mut Model, reply: protocol::McpResult, after: Af
                     model.picker = Some(Picker::new(PickerKind::McpAuth { id: id.into(), url }));
                 }
             } else {
-                model.push_notice(value.to_string());
+                model.upsert_notice("MCP", mcp_status_text(std::slice::from_ref(&value)));
                 if matches!(after, After::Mcp) {
                     open_mcp_picker(model);
                 }

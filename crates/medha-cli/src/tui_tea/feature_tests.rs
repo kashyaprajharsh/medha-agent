@@ -470,3 +470,48 @@ async fn a_late_command_suggestion_preserves_the_new_composer() {
         |entry| matches!(&entry.item, Item::Notice(text) if text.contains("/skill update --all"))
     ));
 }
+
+/// A sign-in to an MCP server is told in three parts, each as the backend
+/// sends it: the answer to starting it, its link, and how it ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_mcp_sign_in_shows_its_link_and_how_it_ended_in_words() {
+    let mut f = fixture().await;
+    let last = |model: &Model| {
+        let mut notices = model.items.iter().filter_map(|entry| match &entry.item {
+            Item::Notice(text) => Some(text.clone()),
+            _ => None,
+        });
+        notices.next_back().unwrap_or_default()
+    };
+    let said =
+        |method: &str, params: Value| Said::Frame(json!({ "method": method, "params": params }));
+
+    let begun = json!({ "server": "linear", "state": "signing_in" });
+    backend_features::mcp_reply(
+        &mut f.model,
+        protocol::McpResult::Status(begun),
+        After::Notice,
+    );
+    let shown = last(&f.model);
+    assert!(shown.contains("linear [signing_in]"), "{shown}");
+    assert!(!shown.contains('{'), "shown as it travels: {shown}");
+
+    let link = json!({ "server": "linear", "url": "https://example.test/sign-in" });
+    super::super::observed(&mut f.model, said("mcp.auth", link)).unwrap();
+    let shown = last(&f.model);
+    assert!(
+        shown.contains("'linear'") && shown.contains("https://example.test/sign-in"),
+        "{shown}"
+    );
+
+    let status = json!({ "server": "linear", "state": "ready", "tools": 12 });
+    let done = json!({ "server": "linear", "ok": true, "status": status });
+    super::super::observed(&mut f.model, said("mcp.signed_in", done)).unwrap();
+    let shown = last(&f.model);
+    assert!(shown.contains("linear [ready]  12 tool(s)"), "{shown}");
+
+    let failed = json!({ "server": "linear", "ok": false, "error": "sign-in was cancelled" });
+    super::super::observed(&mut f.model, said("mcp.signed_in", failed)).unwrap();
+    let shown = last(&f.model);
+    assert!(shown.contains("'linear': sign-in was cancelled"), "{shown}");
+}

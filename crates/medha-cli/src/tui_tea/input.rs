@@ -736,9 +736,25 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
                         }
                         _ => {
                             if let Some(name) = skill_name {
-                                load_skill_by_name(model, &name);
+                                // One left off at install is offered to be switched on; it cannot be used as it is.
+                                if skill_is_off(model, &name) {
+                                    begin_enable_skill(model, &name);
+                                } else {
+                                    load_skill_by_name(model, &name);
+                                }
                             }
                         }
+                    }
+                    return;
+                }
+                if let PickerKind::EnableSkill(name) = &picker.kind {
+                    let name = name.clone();
+                    let confirmed = picker.selected == 1;
+                    model.picker = None;
+                    if confirmed {
+                        set_skill_enabled(model, &name, true);
+                    } else {
+                        open_skill_picker(model);
                     }
                     return;
                 }
@@ -1439,6 +1455,8 @@ pub(super) enum SlashAction {
     LoadSkill(String),
     SkillInfo(String),
     RemoveSkill(String),
+    EnableSkill(String),
+    DisableSkill(String),
     ModelPicker,
     AddModel,
     /// `/model <name>` — switch to a saved profile without opening the picker.
@@ -1601,6 +1619,22 @@ pub(super) fn classify_slash(cmd: &str) -> SlashAction {
         c if c.strip_prefix("skill remove").is_some_and(is_cmd_boundary) => {
             SlashAction::RemoveSkill(
                 c.strip_prefix("skill remove")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            )
+        }
+        c if c.strip_prefix("skill enable").is_some_and(is_cmd_boundary) => {
+            SlashAction::EnableSkill(
+                c.strip_prefix("skill enable")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            )
+        }
+        c if c.strip_prefix("skill disable").is_some_and(is_cmd_boundary) => {
+            SlashAction::DisableSkill(
+                c.strip_prefix("skill disable")
                     .unwrap_or("")
                     .trim()
                     .to_string(),

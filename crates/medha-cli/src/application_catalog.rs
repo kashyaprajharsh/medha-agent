@@ -63,7 +63,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/skill",
-        "skill hub — use a skill, or add one (search / paste a link)  ·  /skill <name> to load",
+        "skill hub — use a skill, or add one (search / paste a link)  ·  /skill <name> to load  ·  /skill enable|disable <name>",
     ),
     (
         "/plugins",

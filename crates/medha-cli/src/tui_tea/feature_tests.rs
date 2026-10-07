@@ -515,3 +515,45 @@ async fn an_mcp_sign_in_shows_its_link_and_how_it_ended_in_words() {
     let shown = last(&f.model);
     assert!(shown.contains("'linear': sign-in was cancelled"), "{shown}");
 }
+
+/// A skill whose code is to be read first is installed switched off. It must
+/// still be found in the list, or there is no way here to switch it on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_left_off_at_install_is_listed_and_switched_on_only_by_saying_so() {
+    let mut f = fixture().await;
+    let skill = |name: &str, enabled: bool| protocol::SkillSummary {
+        name: name.into(),
+        description: "does a thing".into(),
+        scope: "user".into(),
+        available: enabled,
+        enabled,
+        missing_tools: Vec::new(),
+        verdict: None,
+    };
+    let catalogue = protocol::SkillCatalogue {
+        skills: vec![skill("ready", true), skill("flagged", false)],
+        errors: Vec::new(),
+    };
+    backend_features::resource_reply(&mut f.model, Resource::Skills(catalogue), After::Skills);
+    let rows = f.model.picker.as_ref().unwrap().kind.labels();
+    let flagged = rows.iter().position(|row| row.starts_with("flagged"));
+    let flagged = flagged.expect("a skill installed switched off was left out of the list");
+    assert!(rows[flagged].contains("(disabled)"), "{}", rows[flagged]);
+
+    // Picking it asks first, and the answer it starts on keeps it off.
+    f.model.picker.as_mut().unwrap().selected = flagged;
+    input::handle_key(&mut f.model, key(KeyCode::Enter));
+    let asking = f.model.picker.as_ref().expect("nothing was asked");
+    assert!(matches!(&asking.kind, PickerKind::EnableSkill(name) if name == "flagged"));
+    assert_eq!(asking.selected, 0);
+    assert!(f.model.remote.as_ref().unwrap().pending.is_empty());
+
+    input::handle_key(&mut f.model, key(KeyCode::Down));
+    input::handle_key(&mut f.model, key(KeyCode::Enter));
+    let sent = &f.model.remote.as_ref().unwrap().pending;
+    assert!(sent.iter().any(|asked| matches!(
+        &asked.effect,
+        Effect::Change(protocol::ChangeResource::ConfigureSkill { name, enabled: true }, _)
+            if name == "flagged"
+    )));
+}

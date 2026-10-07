@@ -781,6 +781,9 @@ enum PickerKind {
     Skill(Vec<(String, String)>),
     /// Destructive user-skill removal always gets explicit confirmation.
     RemoveSkill(String),
+    /// A skill installed switched off, for its code to be read first, is
+    /// switched on only by saying so.
+    EnableSkill(String),
     /// Provider presets shared with first-run setup, followed by Custom.
     ModelProtocol,
     /// OpenAI-compatible deployment presets shared with first-run setup,
@@ -965,6 +968,9 @@ impl PickerKind {
             PickerKind::RemoveSkill(name) => {
                 format!(" remove user skill '{name}'? — ↑↓ move · Enter confirm · Esc back ")
             }
+            PickerKind::EnableSkill(name) => {
+                format!(" switch on '{name}'? · ↑↓ move · Enter confirm · Esc back ")
+            }
             PickerKind::ProviderPreset => {
                 " choose provider — ↑↓ move · Enter/→ continue · Esc/← back ".into()
             }
@@ -1118,6 +1124,10 @@ impl PickerKind {
             PickerKind::RemoveSkill(_) => {
                 vec!["Keep skill".to_string(), "Remove user skill".to_string()]
             }
+            PickerKind::EnableSkill(_) => vec![
+                "Keep it off".to_string(),
+                "Switch it on. I have read what it runs".to_string(),
+            ],
             PickerKind::ModelProtocol => MODEL_PROTOCOLS
                 .iter()
                 .map(|(label, available, _)| {

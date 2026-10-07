@@ -391,6 +391,8 @@ pub(super) fn dispatch_slash(model: &mut Model, command: &str) {
         A::LoadSkill(name) => load_skill_by_name(model, &name),
         A::SkillInfo(name) => show_skill_info(model, &name),
         A::RemoveSkill(name) => begin_remove_skill(model, &name),
+        A::EnableSkill(name) => begin_enable_skill(model, &name),
+        A::DisableSkill(name) => set_skill_enabled(model, &name, false),
         A::InstallSkill(source) => install_skill(model, &source),
         A::SkillSources(args) => skill_sources(model, &args),
         A::SearchSkills(query) => search_skills(model, &query),
@@ -851,7 +853,8 @@ pub(super) fn resource_reply(model: &mut Model, resource: Resource, after: After
         Resource::Skills(catalogue) => {
             let text = catalogue.skills.iter().map(|skill| format!("{}  {} — {}{}", if skill.enabled && skill.available { "✔" } else { "○" }, skill.name, skill.description,
                 if !skill.enabled { " (disabled)" } else if !skill.available { " (missing tools)" } else { "" })).chain(catalogue.errors.iter().map(|error| format!("! {error}"))).collect::<Vec<_>>().join("\n");
-            let rows = catalogue.skills.iter().filter(|skill| skill.enabled).map(|skill| (skill.name.clone(), skill.description.clone())).collect();
+            // One installed switched off is listed too, and says so: picking it is how it is switched on.
+            let rows = catalogue.skills.iter().map(|skill| (skill.name.clone(), match skill.enabled { true => skill.description.clone(), false => format!("(disabled) {}", skill.description) })).collect();
             model.remote.as_mut().expect("viewer").skills = Some(catalogue);
             if matches!(after, After::SkillList) { model.upsert_notice("skills", format!("skills\n{text}")); }
             else { model.picker = Some(Picker::new(PickerKind::Skill(rows))); }
@@ -930,6 +933,39 @@ pub(super) fn show_skill_info(model: &mut Model, name: &str) {
 }
 pub(super) fn begin_remove_skill(model: &mut Model, name: &str) {
     model.picker = Some(Picker::new(PickerKind::RemoveSkill(name.into())));
+}
+/// Whether the last list of skills says this one is installed but switched off.
+pub(super) fn skill_is_off(model: &Model, name: &str) -> bool {
+    let listed = model.remote.as_ref().and_then(|peer| peer.skills.as_ref());
+    listed.is_some_and(|catalogue| {
+        catalogue
+            .skills
+            .iter()
+            .any(|skill| skill.name == name && !skill.enabled)
+    })
+}
+pub(super) fn begin_enable_skill(model: &mut Model, name: &str) {
+    if name.is_empty() {
+        model.push_notice("usage: /skill enable <name>");
+        return;
+    }
+    model.picker = Some(Picker::new(PickerKind::EnableSkill(name.into())));
+}
+pub(super) fn set_skill_enabled(model: &mut Model, name: &str, enabled: bool) {
+    if name.is_empty() {
+        model.push_notice("usage: /skill disable <name>");
+        return;
+    }
+    request(
+        model,
+        Effect::Change(
+            Change::ConfigureSkill {
+                name: name.into(),
+                enabled,
+            },
+            After::Reload(Box::new(After::Skills)),
+        ),
+    );
 }
 pub(super) fn remove_user_skill(model: &mut Model, name: &str) {
     request(

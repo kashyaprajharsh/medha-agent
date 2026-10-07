@@ -322,8 +322,7 @@ struct TerminalClient {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    output: Arc<Mutex<Vec<u8>>>,
-    heard: String,
+    output: Arc<Mutex<test_support::TerminalCapture>>,
 }
 
 #[cfg(unix)]
@@ -353,7 +352,7 @@ impl TerminalClient {
         drop(pair.slave);
         let writer = pair.master.take_writer().unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();
-        let output = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::new(Mutex::new(test_support::TerminalCapture::new(40, 120)));
         let captured = output.clone();
         std::thread::spawn(move || {
             let mut bytes = [0u8; 8192];
@@ -361,11 +360,7 @@ impl TerminalClient {
                 if count == 0 {
                     break;
                 }
-                let mut output = captured.lock().unwrap();
-                if output.len() + count > 2 * 1024 * 1024 {
-                    break;
-                }
-                output.extend_from_slice(&bytes[..count]);
+                captured.lock().unwrap().record(&bytes[..count]);
             }
         });
         Self {
@@ -373,7 +368,6 @@ impl TerminalClient {
             master: pair.master,
             writer,
             output,
-            heard: String::new(),
         }
     }
 
@@ -384,13 +378,17 @@ impl TerminalClient {
 
     fn until(&mut self, marker: &str) {
         let deadline = Instant::now() + WAIT;
-        while !self.heard.contains(marker) {
-            self.heard = String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned();
+        loop {
+            let output = self.output.lock().unwrap();
+            if output.contains(marker) {
+                return;
+            }
             assert!(
                 Instant::now() < deadline,
-                "terminal never drew {marker:?}; output {:?}",
-                self.heard
+                "terminal never drew {marker:?}; {}",
+                output.evidence()
             );
+            drop(output);
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -468,6 +466,7 @@ async fn real_terminal_and_another_client_share_one_chat_and_survive_viewer_exit
     terminal.until("echo: FROM_OTHER_VIEWER");
 
     // Resize the actual PTY and use a control while attached to an active turn.
+    terminal.output.lock().unwrap().resize(24, 80);
     terminal
         .master
         .resize(portable_pty::PtySize {

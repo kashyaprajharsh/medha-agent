@@ -11,6 +11,32 @@ fn joined(address: &str) -> Arc<Connection> {
     connection
 }
 
+#[test]
+fn reply_saturation_fixture_counts_a_pending_bootstrap_request() {
+    let (lines, _queued) = tokio::sync::mpsc::unbounded_channel();
+    let (controls, _urgent) = tokio::sync::mpsc::unbounded_channel();
+    let connection = Arc::new(Connection {
+        lines,
+        controls,
+        unsent: Arc::default(),
+        routes: Mutex::default(),
+        stop: tokio::sync::watch::channel(false).0,
+    });
+    let chat = connection
+        .listen("fixture".into(), Arc::new(|_| {}))
+        .unwrap();
+    connection
+        .tell(
+            &chat,
+            json!({"id": "bootstrap", "method": "session.presentation"}),
+        )
+        .unwrap();
+    exhaust_ordinary_replies(&connection);
+    assert_eq!(connection.routes().replies.len(), UNANSWERED);
+    assert!(!connection.has_room(128, "session.settings"));
+    assert!(connection.has_room(128, "cancel"));
+}
+
 /// The terminal and the desktop are installed apart and are seldom one build.
 /// Each must be able to use the backend the other started.
 #[test]

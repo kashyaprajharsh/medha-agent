@@ -8,21 +8,24 @@ fn scratch(tag: &str) -> tempfile::TempDir {
 }
 
 /// Quit, then kill: a killed browser leaves its temp folders behind.
-fn stop_browser(mut child: std::process::Child) {
+fn stop_browser(mut child: std::process::Child) -> Option<std::process::ExitStatus> {
+    if let Some(status) = child.try_wait().ok().flatten() {
+        return Some(status);
+    }
     #[cfg(unix)]
     {
         // SAFETY: signals only the browser this test started.
         unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(3) {
-            if child.try_wait().ok().flatten().is_some() {
-                return;
+            if let Some(status) = child.try_wait().ok().flatten() {
+                return Some(status);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
     let _ = child.kill();
-    let _ = child.wait();
+    child.wait().ok()
 }
 
 fn browser_log(base: &Path) -> std::process::Stdio {
@@ -31,9 +34,13 @@ fn browser_log(base: &Path) -> std::process::Stdio {
         .into()
 }
 
-fn browser_failure(base: &Path, browser: &Path) -> String {
+fn browser_failure(
+    base: &Path,
+    browser: &Path,
+    status: Option<std::process::ExitStatus>,
+) -> String {
     format!(
-        "browser {}: {}",
+        "browser {}; exit {status:?}: {}",
         browser.display(),
         std::fs::read_to_string(base.join("browser.stderr.log")).unwrap_or_default()
     )
@@ -218,7 +225,7 @@ fn a_real_render_shows_the_page_and_reaches_nothing_else() {
         std::thread::sleep(Duration::from_millis(200));
     }
     std::thread::sleep(Duration::from_millis(500));
-    stop_browser(status);
+    let status = stop_browser(status);
     assert!(
         spy.accept().is_err(),
         "a page rendered without network reached another local port"
@@ -226,7 +233,7 @@ fn a_real_render_shows_the_page_and_reaches_nothing_else() {
     let png = std::fs::read(&out).unwrap_or_else(|error| {
         panic!(
             "the page must render: {error}; {}",
-            browser_failure(base.path(), &browser)
+            browser_failure(base.path(), &browser, status)
         )
     });
     let shot = image::load_from_memory(&png).unwrap().to_rgb8();
@@ -292,11 +299,11 @@ fn another_local_service_never_receives_the_page_credential() {
     while !out.exists() && started.elapsed() < Duration::from_secs(30) {
         std::thread::sleep(Duration::from_millis(100));
     }
-    stop_browser(child);
+    let status = stop_browser(child);
     assert!(
         !seen.is_empty(),
         "the page never reached the other service; {}",
-        browser_failure(base.path(), &browser)
+        browser_failure(base.path(), &browser, status)
     );
     for request in &seen {
         assert!(
@@ -369,6 +376,41 @@ impl kernel::ArtifactStore for MemArtifacts {
     fn size(&self, _: &str) -> Result<usize, String> {
         Ok(0)
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_browser_that_exits_before_render_reports_its_status_and_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = scratch("failed-start");
+    std::fs::write(base.path().join("index.html"), "<h1>test</h1>").unwrap();
+    let browser = base.path().join("failed-browser");
+    std::fs::write(
+        &browser,
+        "#!/bin/sh\nprintf 'startup output\\n'\nprintf 'startup failure\\n' >&2\nexit 7\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let page = BrowserScreenshot {
+        sbx: Arc::new(sandbox::WorkspaceSandbox::new_jailed(base.path()).unwrap()),
+        artifacts: Arc::new(MemArtifacts::default()),
+        browser,
+    };
+    let result = page
+        .render(&json!({"path": "index.html", "render": true}))
+        .await;
+    let Err(ToolError::Failed(error)) = result else {
+        panic!("a failed browser must return a rendering failure");
+    };
+    assert!(error.contains("exited with code 7"), "{error}");
+    assert!(
+        error.contains("startup output") && error.contains("startup failure"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("within 30s"),
+        "an early exit is not a timeout: {error}"
+    );
 }
 
 /// `read` with `render: true` returns the picture; an ungranted URL never starts a browser.

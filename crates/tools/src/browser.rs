@@ -443,6 +443,8 @@ impl BrowserScreenshot {
             last_size = size_now;
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        let timed_out = started.elapsed() >= RENDER_TIMEOUT && process.is_running();
+        let early_exit = (!process.is_running()).then(|| process.exit_code());
         // Asked to quit first: a killed browser leaves its temp folders behind.
         #[cfg(unix)]
         if let Some(pid) = process.pid.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
@@ -454,9 +456,24 @@ impl BrowserScreenshot {
         process.wait().await;
         drop(server);
         let raw = std::fs::read(&out).map_err(|_| {
-            let (_, stderr) = process.snapshot();
-            let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
-            ToolError::Failed(format!("the page did not render within 30s: {tail}"))
+            let (stdout, stderr) = process.snapshot();
+            let tail = |text: &str| text.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
+            let outcome = if timed_out {
+                "the browser did not produce a screenshot within 30s".into()
+            } else if let Some(code) = early_exit {
+                let status = code
+                    .map(|code| code.to_string())
+                    .unwrap_or("unknown".into());
+                format!("the browser exited with code {status} without a screenshot")
+            } else {
+                "the browser produced no readable screenshot".into()
+            };
+            ToolError::Failed(format!(
+                "{outcome}; browser {}; stdout: {}; stderr: {}",
+                self.browser.display(),
+                tail(&stdout),
+                tail(&stderr)
+            ))
         })?;
         let image = tokio::task::spawn_blocking(move || media::normalize(raw))
             .await

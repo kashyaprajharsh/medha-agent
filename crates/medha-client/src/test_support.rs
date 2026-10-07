@@ -89,16 +89,21 @@ pub fn exhaust_ordinary_replies(connection: &Arc<Connection>) {
         (session.clone(), *opened)
     };
     for id in 0..UNANSWERED {
-        connection
-            .tell(
-                &Chat {
-                    session: session.clone(),
-                    opened,
-                },
-                json!({"id": id, "method": "session.settings"}),
-            )
-            .unwrap();
+        let sent = connection.tell(
+            &Chat {
+                session: session.clone(),
+                opened,
+            },
+            json!({"id": id, "method": "session.settings"}),
+        );
+        if let Err(error) = sent {
+            // A frontend bootstrap request can already hold a reply slot.
+            // Fill the remaining capacity, rather than assuming all 1024 are free.
+            assert_eq!(error, NOT_TAKING);
+            break;
+        }
     }
+    assert!(connection.routes().is_full(UNANSWERED, EVENTUALLY));
 }
 
 pub fn disconnect(connection: &Arc<Connection>) {

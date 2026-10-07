@@ -279,7 +279,7 @@ struct TuiClient {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
     input: Box<dyn Write + Send>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Arc<Mutex<test_support::TerminalCapture>>,
 }
 
 #[cfg(unix)]
@@ -310,7 +310,7 @@ impl TuiClient {
         drop(pair.slave);
         let input = pair.master.take_writer().unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();
-        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let output = Arc::new(Mutex::new(test_support::TerminalCapture::new(40, 120)));
         let captured = Arc::clone(&output);
         std::thread::spawn(move || {
             let mut buffer = [0; 8192];
@@ -318,12 +318,7 @@ impl TuiClient {
                 if length == 0 {
                     break;
                 }
-                let mut output = captured.lock().unwrap();
-                assert!(
-                    output.len() + length <= 2 * 1024 * 1024,
-                    "test PTY output exceeded its bound"
-                );
-                output.extend_from_slice(&buffer[..length]);
+                captured.lock().unwrap().record(&buffer[..length]);
             }
         });
         Self {
@@ -340,14 +335,16 @@ impl TuiClient {
     fn until(&self, marker: &str) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let output = String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned();
+            let output = self.output.lock().unwrap();
             if output.contains(marker) {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "TUI never showed {marker:?}: {output:?}"
+                "TUI never showed {marker:?}: {}",
+                output.evidence()
             );
+            drop(output);
             std::thread::sleep(Duration::from_millis(10));
         }
     }

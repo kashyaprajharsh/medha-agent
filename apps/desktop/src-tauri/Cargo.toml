@@ -36,4 +36,5 @@ tauri-plugin-updater = "2"
 libc = "0.2"
 
 [dev-dependencies]
+test-support = { path = "../../../crates/test-support" }
 medha-client = { path = "../../../crates/medha-client", features = ["test-support"] }

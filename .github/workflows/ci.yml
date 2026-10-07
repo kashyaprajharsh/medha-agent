@@ -140,6 +140,22 @@ jobs:
           rust-analyzer --version
           clangd --version
 
+      # Use an explicit non-updating browser, rather than the runner image's
+      # machine-wide Chrome installation. Real rendering/security tests remain required.
+      - name: Provision Windows test browser
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = '155.0.8059.39'
+          $archive = Join-Path $env:RUNNER_TEMP 'chrome-for-testing.zip'
+          $folder = Join-Path $env:RUNNER_TEMP 'chrome-for-testing'
+          Invoke-WebRequest "https://storage.googleapis.com/chrome-for-testing-public/$version/win64/chrome-win64.zip" -OutFile $archive
+          Expand-Archive $archive -DestinationPath $folder
+          $browser = Join-Path $folder 'chrome-win64/chrome.exe'
+          if (!(Test-Path $browser)) { throw 'Chrome for Testing executable is missing' }
+          Write-Output "Browser: $browser; version: $((Get-Item $browser).VersionInfo.FileVersion)"
+          "MEDHA_BROWSER=$browser" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           key: ${{ matrix.os }}

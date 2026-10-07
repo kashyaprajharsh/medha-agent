@@ -8,3 +8,6 @@ publish.workspace = true
 
 [dependencies]
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+vt100 = "0.16.2"

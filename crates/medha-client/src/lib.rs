@@ -877,11 +877,19 @@ enum Fit {
 /// A backend is another client's as much as this one's, and theirs may be a
 /// different build. So it is joined whenever it speaks this protocol and can do
 /// everything this build relies on, whatever build it is. It is asked to give
-/// way only when it cannot. `stale` adds: or when it is merely another build,
-/// which is how a build under development replaces the one left running before it.
+/// way when it cannot, and when it is an earlier release than this client: that
+/// is how an update takes effect without anyone stopping the backend by hand.
+/// A later one is never asked, so two clients of different ages do not take
+/// turns stopping each other's. `stale` adds: or when it is merely another
+/// build, which is how a build under development replaces the one before it.
 #[cfg(test)]
 fn fit(welcome: &Value, stale: bool) -> Fit {
     fit_for(welcome, stale, &[])
+}
+
+/// A release as numbers that compare in order; one not written that way has no order.
+fn release(version: &str) -> Option<Vec<u64>> {
+    version.split('.').map(|part| part.parse().ok()).collect()
 }
 
 fn fit_for(welcome: &Value, stale: bool, required: &[&str]) -> Fit {
@@ -894,7 +902,9 @@ fn fit_for(welcome: &Value, stale: bool, required: &[&str]) -> Fit {
         .iter()
         .chain(required)
         .any(|needed| !offers(needed));
-    let other = stale && welcome["build"] != wire::BUILD_ID;
+    let theirs = welcome["backend"].as_str().and_then(release);
+    let earlier = theirs.is_some_and(|theirs| Some(theirs) < release(env!("CARGO_PKG_VERSION")));
+    let other = earlier || (stale && welcome["build"] != wire::BUILD_ID);
     match (lacking, other) {
         (false, false) => Fit::Join,
         _ if !offers("lifecycle") => Fit::Legacy,

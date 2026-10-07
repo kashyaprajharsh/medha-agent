@@ -58,6 +58,16 @@ fn a_backend_of_another_build_is_joined_when_it_can_do_all_this_one_needs() {
     assert_eq!(stale, Fit::GiveWay { needed: false });
     let same = json!({ "build": wire::BUILD_ID, "capabilities": wire::CAPABILITIES });
     assert_eq!(fit(&same, true), Fit::Join);
+    // After an update, the backend an earlier release left running is asked to
+    // give way. A later one is joined: the two never stop each other's in turn.
+    let released = |version: &str| {
+        json!({ "backend": version, "build": "another",
+        "capabilities": wire::CAPABILITIES })
+    };
+    let earlier = fit(&released("0.1.9"), false);
+    assert_eq!(earlier, Fit::GiveWay { needed: false });
+    assert_eq!(fit(&released(env!("CARGO_PKG_VERSION")), false), Fit::Join);
+    assert_eq!(fit(&released("999.0.0"), false), Fit::Join);
 
     // One with work in hand does not give way. It is joined if it can be used, and refused only if it cannot.
     let (usable, unusable) = (address(), address());

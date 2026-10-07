@@ -249,7 +249,7 @@ impl ServeChats {
 /// retain the daemon's environment defaults. Neither path saves overrides.
 fn options(params: &Value) -> Result<SessionOptions, String> {
     if let Some(startup) = params.get("startup").filter(|s| !s.is_null()) {
-        if ["model", "mode", "reasoning", "resume"]
+        if ["model", "mode", "reasoning"]
             .iter()
             .any(|key| params.get(key).is_some_and(|v| !v.is_null()))
         {
@@ -257,6 +257,14 @@ fn options(params: &Value) -> Result<SessionOptions, String> {
         }
         let chosen = serde_json::from_value::<protocol::StartupOptions>(startup.clone())
             .map_err(|_| "invalid chat startup options".to_string())?;
+        // The chat to resume is also named beside the options: the backend reads
+        // it there to keep two clients from resuming one chat at once. It must be
+        // the chat the options name, or one of the two would be resumed unguarded.
+        if let Some(named) = params.get("resume").filter(|named| !named.is_null())
+            && !matches!(&chosen.resume, protocol::Resume::Id(id) if named.as_str() == Some(id))
+        {
+            return Err("the chat to resume is not the one the startup options name".into());
+        }
         return SessionOptions::from_startup(chosen).map_err(|error| format!("{error:#}"));
     }
     let text = |key: &str| params[key].as_str().map(str::to_owned);

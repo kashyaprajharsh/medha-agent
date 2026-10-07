@@ -2201,6 +2201,57 @@ async fn resolved_terminal_startup_wins_over_the_daemons_unrelated_environment()
     );
 }
 
+/// The terminal names the chat to resume twice: beside its startup options,
+/// where the backend keeps two clients from resuming one chat at once, and
+/// inside them, where the chat itself reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_is_resumed_with_startup_options_as_the_terminal_asks_for_it() {
+    let world = World::new();
+    let folder = world.folder("w");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let chat = client.open(&folder).await;
+    client.send(&chat, "remember the word heron").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    world.provider.asked();
+    client.ask("session.close", Some(&chat), json!({})).await;
+    client
+        .until(|frame| frame["method"] == "session.ended")
+        .await;
+
+    let startup = protocol::StartupOptions {
+        resume: protocol::Resume::Id(chat.clone()),
+        model_env: protocol::ModelOverrides {
+            base_url: Some(world.provider.url.clone()),
+            model: Some("test-model".into()),
+            api_key: Some(SECRET.into()),
+            protocol: Some("open-ai-chat".into()),
+            token_accounting: Some("adaptive".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let another = json!({"folder": folder, "startup": startup,
+        "resume": "01ARZ3NDEKTSV4RRFFQ69G5FAV"});
+    let refused = client.ask("session.create", None, another).await;
+    let why = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(why.contains("not the one"), "{refused}");
+
+    let asked = json!({"folder": folder, "startup": startup, "resume": chat});
+    let resumed = client.ask("session.create", None, asked).await;
+    assert_eq!(resumed["result"]["session"], chat.as_str(), "{resumed}");
+    client
+        .ask("session.attach", Some(&chat), json!({"after": 0}))
+        .await;
+    client.send(&chat, "what was the word").await;
+    client.until(|frame| kind(frame, "turn.done")).await;
+    let seen = world.provider.asked();
+    assert!(
+        seen.contains("remember the word heron") && seen.contains("what was the word"),
+        "the resumed chat lost its history: {seen}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_force_stop_settles_all_viewers_before_another_turn_runs() {
     let world = World::new();

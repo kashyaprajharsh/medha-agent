@@ -387,5 +387,15 @@ fn closing_a_tab_releases_its_shell_and_rejects_further_input() {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH)
     );
+    // The exit frame confirms reaping. The cleanup thread can still be
+    // destroying its writer/master and holding its own slot reference.
+    // Require that final release within the same overall cleanup deadline.
+    while terminals.occupied.load(Ordering::Acquire) != 0 {
+        assert!(
+            Instant::now() < cleanup,
+            "terminal handles survived the cleanup deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(terminals.occupied.load(Ordering::Acquire), 0);
 }

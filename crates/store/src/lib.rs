@@ -395,6 +395,10 @@ impl FileArtifactStore {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .map_err(|e| StoreError::Io(e.to_string()))?;
         }
+        // Resolve the existing directory once. On Windows this supplies the
+        // extended-length absolute form required by the native publication API;
+        // even a short directory can exceed MAX_PATH after adding a blob's name.
+        let dir = std::fs::canonicalize(&dir).map_err(|e| StoreError::Io(e.to_string()))?;
         Ok(Self { dir })
     }
 
@@ -2024,6 +2028,29 @@ mod tests {
         assert_eq!(store.put(b"hello world").unwrap(), hash);
         // non-hex hash is rejected (no path traversal)
         assert!(store.get("../etc/passwd", 0, None).is_err());
+    }
+
+    #[test]
+    fn artifacts_publish_and_repair_beyond_the_legacy_windows_path_limit() {
+        let root = test_support::scratch("medha-art-long-path");
+        let mut dir = root.join("artifacts");
+        for _ in 0..4 {
+            dir.push("nested-artifact-store-".repeat(4));
+        }
+        assert!(dir.to_string_lossy().len() > 300);
+
+        let store = FileArtifactStore::open(&dir).unwrap();
+        let bytes = b"an image artifact in a long project state path";
+        let hash = store.put(bytes).unwrap();
+        assert_eq!(store.get(&hash, 0, None).unwrap(), bytes);
+        assert_eq!(store.put(bytes).unwrap(), hash);
+
+        std::fs::write(store.dir.join(&hash), b"incomplete artifact").unwrap();
+        assert!(store.get(&hash, 0, None).is_err());
+        let reopened = FileArtifactStore::open(&dir).unwrap();
+        assert_eq!(reopened.put(bytes).unwrap(), hash);
+        assert_eq!(reopened.get(&hash, 0, None).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 1);
     }
 
     #[test]

@@ -197,6 +197,10 @@ impl View {
         self.cursor.clone()
     }
 
+    pub fn connection(&self) -> Arc<Connection> {
+        self.connection.clone()
+    }
+
     pub fn chat(&self) -> Chat {
         self.inbox
             .state

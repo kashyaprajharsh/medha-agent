@@ -1,5 +1,5 @@
-//! Desktop question forms retain the waiting tool future until a real answer.
-use crate::acp::{Peer, Writer};
+//! Shared question forms retain the waiting tool future until a real answer.
+use crate::chat::Writer;
 use kernel::{Answer, Question};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -12,10 +12,9 @@ use tokio::sync::oneshot;
 type Response = oneshot::Sender<Option<Vec<Answer>>>;
 pub(crate) type Questions = Arc<Mutex<HashMap<u64, (Vec<Question>, Response)>>>;
 
-pub(crate) struct AcpAsker {
+pub(crate) struct Asker {
     pub writer: Arc<Writer>,
     pub pending: Questions,
-    pub peer: Peer,
     pub next_id: AtomicU64,
 }
 
@@ -40,12 +39,8 @@ impl Drop for Guard {
 }
 
 #[async_trait::async_trait]
-impl kernel::Asker for AcpAsker {
+impl kernel::Asker for Asker {
     async fn ask(&self, questions: Vec<Question>) -> Option<Vec<Answer>> {
-        // Standard ACP has no question extension. The desktop speaks Medha's dialect.
-        if self.peer.is_acp() {
-            return None;
-        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let view = questions
             .iter()

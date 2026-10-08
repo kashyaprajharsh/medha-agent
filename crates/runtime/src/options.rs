@@ -88,10 +88,12 @@ impl SessionOptions {
             },
             first_run_setup: self.first_run_setup,
             may_start_unconfigured: self.may_start_unconfigured,
+            session_mcp: self.session_mcp.clone(),
         }
     }
 
     pub fn from_startup(chosen: protocol::StartupOptions) -> anyhow::Result<Self> {
+        crate::session_mcp::validate(&chosen.session_mcp)?;
         if let Some(cost) = chosen.budget.max_cost_usd {
             anyhow::ensure!(
                 cost.is_finite() && cost >= 0.0,
@@ -169,6 +171,7 @@ impl SessionOptions {
             },
             first_run_setup: chosen.first_run_setup,
             may_start_unconfigured: chosen.may_start_unconfigured,
+            session_mcp: chosen.session_mcp,
             ..Self::default()
         })
     }
@@ -246,6 +249,7 @@ pub struct SessionOptions {
     pub may_start_unconfigured: bool,
     /// Who runs the user's remote MCP servers for every chat, when someone does.
     pub mcp_host: Option<mcp::hub::Endpoint>,
+    pub session_mcp: Vec<protocol::SessionMcpServer>,
 }
 
 #[cfg(test)]

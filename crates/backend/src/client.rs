@@ -305,6 +305,22 @@ async fn handle<C: Chats>(
             Ok(_) => Err(refused("attach to the session first")),
             Err(error) => Err(error),
         },
+        "turn.cancel" => match session("turn.cancel") {
+            Ok(session) if session.heard_by(me.id) => {
+                match serde_json::from_value::<protocol::CancelTurn>(frame["params"].clone()) {
+                    Ok(target) if session.cancel_numbered_turn(target.turn) => {
+                        Ok(json!({"cancelled":true}))
+                    }
+                    Ok(_) => match session.forward(me, frame) {
+                        Ok(()) => return,
+                        Err(error) => Err(refused(error)),
+                    },
+                    Err(_) => Err(refused("A valid turn number is required")),
+                }
+            }
+            Ok(_) => Err(refused("attach to the session first")),
+            Err(error) => Err(error),
+        },
         "turn.abort" => match session("turn.abort") {
             Ok(session) if session.heard_by(me.id) => Ok(json!({"accepted": session.abort_turn()})),
             Ok(_) => Err(refused("attach to the session first")),

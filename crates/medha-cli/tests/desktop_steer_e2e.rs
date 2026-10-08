@@ -1,13 +1,15 @@
 //! A desktop follow-up sent while the model writes its final answer lands after
 //! the last steer boundary. It must still reach the model, as the next run, and
 //! a stop must hand it back instead of running it.
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+#[path = "common/backend.rs"]
+mod folder_backend;
 
 fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
     let mut request = Vec::new();
@@ -99,9 +101,10 @@ fn kind(frame: &Value) -> Option<&str> {
 }
 
 struct Desktop {
+    _backend: folder_backend::Backend,
+    input: tokio::sync::mpsc::Sender<Value>,
+    session: Option<String>,
     _root: tempfile::TempDir,
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
     frames: mpsc::Receiver<Value>,
     log: Vec<Value>,
     seen: mpsc::Receiver<Value>,
@@ -125,41 +128,81 @@ impl Desktop {
         let (release, release_rx) = mpsc::channel();
         std::thread::spawn(move || fake_provider(listener, seen_tx, release_rx));
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_medha"))
-            .arg("--acp")
-            .current_dir(&workspace)
-            .env("MEDHA_HOME", &home)
-            .env("MEDHA_BASE_URL", format!("http://{address}/v1"))
-            .env("MEDHA_MODEL", "test-model")
-            .env("MEDHA_API_KEY", "test-key")
-            .env("MEDHA_PROTOCOL", "open-ai-chat")
-            .env("MEDHA_TOKEN_ACCOUNTING", "adaptive")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+        let mut backend = folder_backend::Backend::start(
+            &home,
+            &[
+                ("MEDHA_BASE_URL", format!("http://{address}/v1")),
+                ("MEDHA_MODEL", "test-model".into()),
+                ("MEDHA_API_KEY", "test-key".into()),
+                ("MEDHA_PROTOCOL", "open-ai-chat".into()),
+                ("MEDHA_TOKEN_ACCOUNTING", "adaptive".into()),
+            ],
+        );
+        backend
+            .ask(&workspace, "settings.defaults", json!({}))
             .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
+        let (input, mut outgoing) = tokio::sync::mpsc::channel::<Value>(128);
         let (frame_tx, frames) = mpsc::channel();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Ok(frame) = serde_json::from_str::<Value>(&line)
-                    && frame_tx.send(frame).is_err()
-                {
-                    return;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let address = std::fs::read_to_string(home.join("serve/address")).unwrap();
+                let token = std::fs::read_to_string(home.join("serve/token")).unwrap();
+                let stream = wire::connect(&address).await.unwrap();
+                let (read, mut write) = tokio::io::split(stream);
+                let mut read = tokio::io::BufReader::new(read);
+                wire::greet(
+                    &mut read,
+                    &mut write,
+                    &token,
+                    wire::Roles {
+                        host: "backend",
+                        guest: "client",
+                    },
+                )
+                .await
+                .unwrap();
+                let writer = tokio::spawn(async move {
+                    while let Some(frame) = outgoing.recv().await {
+                        if !wire::write_frame(&mut write, &frame).await {
+                            break;
+                        }
+                    }
+                });
+                while let Some(mut frame) = wire::read_frame(&mut read).await {
+                    if frame["method"] == "session.event" {
+                        frame = frame["params"]["frame"].take();
+                    }
+                    if frame_tx.send(frame).is_err() {
+                        break;
+                    }
                 }
-            }
+                writer.abort();
+            });
         });
         let mut desktop = Desktop {
+            _backend: backend,
+            input,
+            session: None,
             _root: root,
-            child,
-            stdin,
             frames,
             log: Vec::new(),
             seen,
             release,
         };
+        desktop.send(json!({"id": "open", "method": "session.create",
+            "params": {"folder": workspace, "ends_with_client": true}}));
+        desktop.until(|frame| frame["id"] == "open");
+        desktop.session = Some(
+            desktop.log.last().unwrap()["result"]["session"]
+                .as_str()
+                .expect("backend chat id")
+                .to_string(),
+        );
+        desktop.send(json!({"id": "attach", "method": "session.attach", "params": {"after": 0}}));
 
         desktop.until(|frame| frame["method"] == "ready");
         desktop.send(json!({"jsonrpc": "2.0", "id": 1, "method": "message.send", "params": {"content": "first task"}}));
@@ -178,8 +221,11 @@ impl Desktop {
         desktop
     }
 
-    fn send(&mut self, request: Value) {
-        writeln!(self.stdin, "{request}").unwrap();
+    fn send(&mut self, mut request: Value) {
+        if let Some(session) = &self.session {
+            request["session"] = json!(session);
+        }
+        self.input.blocking_send(request).unwrap();
     }
 
     fn until(&mut self, done: impl Fn(&Value) -> bool) {
@@ -206,13 +252,6 @@ impl Desktop {
 impl Drop for Desktop {
     fn drop(&mut self) {
         let _ = self.release.send(());
-        let _ = writeln!(
-            self.stdin,
-            "{}",
-            json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"})
-        );
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

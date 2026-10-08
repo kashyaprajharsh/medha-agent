@@ -1,4 +1,4 @@
-//! The live sub-agent roster for a bridge client: the same registry and
+//! The live sub-agent roster for backend viewers: the same registry and
 //! progress the TUI's agent tree reads, sent as one `agents` notification
 //! whenever it changes, so a window can say what each agent is doing now.
 
@@ -8,11 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Sends child steps through the same bounded writer as the parent. The
-/// editor dialect keeps its standard notifications; Medha viewers get the
-/// complete child stream, including reasoning and returned steering text.
+/// application channel carries the complete child stream, including reasoning
+/// and returned steering text. Frontend adapters choose its presentation.
 pub(crate) struct Watch {
-    pub writer: Arc<crate::acp::Writer>,
-    pub peer: crate::acp::Peer,
+    pub writer: Arc<crate::chat::Writer>,
 }
 
 impl runtime::agents::AgentWatcher for Watch {
@@ -22,30 +21,26 @@ impl runtime::agents::AgentWatcher for Watch {
         path: &AgentPath,
         step: protocol::AgentStep,
     ) {
-        if !self.peer.is_acp() {
-            self.writer.notify_params(
-                "agent.step",
-                &protocol::AgentEvent {
-                    surface_session: surface_session.map(|id| id.to_string()),
-                    path: path.as_str().to_owned(),
-                    step,
-                },
-            );
-        }
+        self.writer.notify_params(
+            "agent.step",
+            &protocol::AgentEvent {
+                surface_session: surface_session.map(|id| id.to_string()),
+                path: path.as_str().to_owned(),
+                step,
+            },
+        );
     }
 
     fn usage(&self, usage: &kernel::Usage) {
-        if !self.peer.is_acp() {
-            self.writer.notify_params(
-                "event",
-                &protocol::TurnEvent::Usage {
-                    prompt_tokens: usage.prompt_tokens,
-                    total_tokens: usage.total_tokens,
-                    completion_tokens: Some(usage.completion_tokens),
-                    cached_prompt_tokens: usage.cached_prompt_tokens,
-                },
-            );
-        }
+        self.writer.notify_params(
+            "event",
+            &protocol::TurnEvent::Usage {
+                prompt_tokens: usage.prompt_tokens,
+                total_tokens: usage.total_tokens,
+                completion_tokens: Some(usage.completion_tokens),
+                cached_prompt_tokens: usage.cached_prompt_tokens,
+            },
+        );
     }
 }
 
@@ -143,5 +138,5 @@ fn now_ms() -> u64 {
 }
 
 #[cfg(test)]
-#[path = "acp_agents_tests.rs"]
+#[path = "chat_agents_tests.rs"]
 mod tests;

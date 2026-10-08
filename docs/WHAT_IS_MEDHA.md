@@ -109,10 +109,10 @@ Arrows show runtime calls or component wiring. The kernel owns the agent loop;
 
 ```mermaid
 flowchart TB
-    UI["Interactive clients<br/>Desktop, TUI"]
+    UI["Interactive clients<br/>Desktop, TUI, ACP editors"]
     CLIENT["medha-client + medha-protocol<br/>Authenticated local IPC"]
     SERVE["medha serve<br/>Shared backend per Medha home"]
-    DIRECT["Plain REPL, headless CLI, ACP editors"]
+    DIRECT["Plain REPL, headless CLI"]
     BOOT["runtime<br/>Workspace, session setup, policy and media admission"]
     K["kernel<br/>Agent loop, budgets, interrupts, trust"]
 
@@ -154,10 +154,10 @@ flowchart TB
     EXT -.->|"Lifecycle hooks"| CONTROL
 ```
 
-Desktop and TUI join one `medha serve` backend per `MEDHA_HOME`, or start it.
-Both can follow a live conversation, recover its presentation at a stream
+Desktop, TUI and editor ACP join one `medha serve` backend per `MEDHA_HOME`, or start it.
+All can follow a live conversation, recover its presentation at a stream
 barrier, and answer the same approval or question. The backend owns execution
-and durable state; a conversation lease also excludes a direct CLI/editor turn
+and durable state; a conversation lease also excludes a direct CLI turn
 in another process. Closing one viewer leaves remaining viewers attached.
 `media` normalizes admitted images, and `transcript-view` formats desktop history
 and live tool steps. The `gate` crate below is the offline Eval Gate, distinct
@@ -335,8 +335,9 @@ credentials. Protected credential stores stay closed inside a trusted folder.
 A folder trusted for reading still asks before a write. Remembered access applies
 to future chats in this project, and Medha's file tools and sandboxed commands
 use it. Write access also permits reading. The prompt states this scope before
-approval. Editors connected over ACP currently keep Medha's three-answer policy;
-ACP itself permits additional permission options.
+approval. Editors connected over ACP receive the same offered scopes as Desktop
+and TUI, with explicit permission option labels. An unknown or cancelled editor
+answer is denied.
 
 > **An escalated prompt can never be remembered.** When a gate exists *only* because
 > of trust-flow escalation, the kernel passes `escalated: true` and that prompt is
@@ -1568,32 +1569,44 @@ second copy on screen is only somewhere to leak from.
 
 ### ACP — the editor bridge
 
-Line-delimited JSON-RPC 2.0 over stdio, so an editor extension can embed MEDHA. One
-JSON object per line, both directions, with a 16 MB frame cap so a runaway peer cannot
-balloon the process.
+`medha --acp` is a line-delimited JSON-RPC 2.0 adapter over the shared backend.
+Its stdio connection has a 16 MiB frame limit and bounded session, request and
+output queues. It does not construct a second engine or own the event store.
 
-**Editor → MEDHA:** `message.send`, `approval.respond`, `cancel`.
-
-**MEDHA → editor:** `event` notifications carrying a `kind` —
-
-| `kind` | Payload |
+| Editor method | Behavior |
 |---|---|
-| `model.text` / `model.reasoning` | Streaming deltas |
-| `model.restarted` | Discard the current partial model reply; a transient stream failure is being retried |
-| `tool.call` | Tool name and arguments, before it runs |
-| `tool.observation` | The **raw payload** — when `old`/`new`/`path` are present the editor can open a native diff |
-| `usage` | Prompt and total tokens |
-| `verify` | Verifier pass/fail and summary |
-| `compacting` / `compaction` | Compaction started/finished, with before/after tokens |
-| `message.steered` / `message.returned` | A steer was applied, or handed back unapplied |
+| `initialize` | Negotiate ACP version 1; advertise image, embedded-context, load and resume support |
+| `session/new` | Create a backend chat in the requested absolute `cwd` |
+| `session/load` | Attach or restore a saved chat; replay verified visible history before replying |
+| `session/resume` | Attach or restore without history replay |
+| `session/prompt` | Admit one prompt; stream text, reasoning and tool steps; reply only when that exact turn settles |
+| `session/cancel` | Cancel shared work without queuing a follow-up prompt |
+| `session/set_mode` | Change the chat's shared autonomy mode |
 
-Plus a separate `approval` notification carrying `gate_id`, `action`, `detail` and
-`escalated`, answered with `approval.respond`.
+The adapter emits `session/update` notifications and sends
+`session/request_permission` with the backend's offered approval choices. A
+response can select only an offered option; an unknown or cancelled answer denies
+the request. Another viewer may answer the same gate first. Ending the editor
+connection detaches its views; a chat with another viewer remains usable.
 
-> **An editor approval is "allow once".** It never persists a path to the
-> machine-local `trust.lock`. If the editor disconnects or never answers, the gate
-> resolves to **deny** — an unapproved action is never committed because a client
-> went away.
+Session-provided stdio MCP servers run in the chat's existing sandbox. Their
+arguments and environment stay ephemeral, including across extension reloads.
+They are separate from saved user/plugin servers and the shared remote MCP host.
+Additional workspace roots, audio and session-provided HTTP/SSE servers are not
+advertised. Credentials are configured through Medha's local settings.
+
+Saved history uses verified, UTF-8-safe fragments of at most 256 KiB, rather than
+the live presentation window. It includes saved image artifacts and coalesces
+compatibility events with canonical model messages. Records over 32 MiB return
+an explicit error; an unavailable image is shown as unavailable. A live tail
+that no longer fits the presentation window requires waiting for the turn to
+finish before loading it. Nothing is silently removed from durable history.
+
+ACP has no standard free-form question form. Medha sends a private
+`_medha/question` notification and offers answering in Desktop/TUI or dismissing
+the question. Extensions may answer through `_medha/question.respond`. Private
+`_medha/session.settings` and `_medha/session.configure` methods expose shared
+settings; application IPC methods are not exposed as editor methods.
 
 ---
 

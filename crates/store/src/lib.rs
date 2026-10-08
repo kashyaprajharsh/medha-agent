@@ -1206,6 +1206,57 @@ impl EventLog for SqliteLog {
             .map_err(|e| KernelError::Log(e.to_string()))
     }
 
+    async fn checked_history_record(
+        &self,
+        session: Ulid,
+        after: u64,
+        through: Option<u64>,
+        continuing: bool,
+    ) -> Result<(u64, Option<(u64, Event)>), KernelError> {
+        self.run_store_task(move |log| {
+            log.with_verified_snapshot(false, |conn| {
+                let session = session.to_string();
+                let head: u64 = conn
+                    .query_row(
+                        "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
+                        [&session],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| StoreError::Db(e.to_string()))?;
+                let head = through.unwrap_or(head).min(head);
+                let after = i64::try_from(after)
+                    .map_err(|_| StoreError::Db("Invalid history position".into()))?;
+                let sql = if continuing {
+                    "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                     prev_hash, hash, hash_version, ts FROM events
+                     WHERE session_id = ?1 AND rowid <= ?2 AND rowid = ?3
+                     AND kind IN ('user.message', 'model.text', 'model.message',
+                                  'model.intent', 'model.reasoning', 'tool.observation') LIMIT 1"
+                } else {
+                    "SELECT rowid, id, session_id, parent_id, kind, payload, trust, provenance,
+                     prev_hash, hash, hash_version, ts FROM events
+                     WHERE session_id = ?1 AND rowid <= ?2 AND rowid > ?3
+                     AND kind IN ('user.message', 'model.text', 'model.message',
+                                  'model.intent', 'model.reasoning', 'tool.observation')
+                     ORDER BY rowid LIMIT 1"
+                };
+                let mut query = conn
+                    .prepare(sql)
+                    .map_err(|e| StoreError::Db(e.to_string()))?;
+                let rows = query
+                    .query_map(rusqlite::params![session, head, after], chain_row)
+                    .map_err(|e| StoreError::Db(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| StoreError::Db(e.to_string()))?;
+                let position = rows.first().map(|row| row.0 as u64);
+                let event = decode_events(rows)?.pop();
+                Ok((head, position.zip(event)))
+            })
+        })
+        .await
+        .map_err(|e| KernelError::Log(e.to_string()))
+    }
+
     async fn acquire_mutation_lease(
         &self,
         mutation_key: &str,
@@ -2517,6 +2568,66 @@ mod tests {
             .expect("waiter should report acquisition");
         drop(waiter.await.unwrap());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bounded_history_reads_verify_the_chain_and_hold_their_upper_bound() {
+        let dir = test_support::scratch("history-page");
+        let db = dir.join("events.db");
+        let log = SqliteLog::open(&db).unwrap();
+        let session = kernel::Session::default();
+        let other = kernel::Session::default();
+        log.append(Event::user_message(&session, "first"))
+            .await
+            .unwrap();
+        log.append(Event::model_text(&other, "foreign"))
+            .await
+            .unwrap();
+        log.append(Event::model_text(&session, "answer"))
+            .await
+            .unwrap();
+        let (head, first) = log
+            .checked_history_record(session.id, 0, None, false)
+            .await
+            .unwrap();
+        let (position, first) = first.unwrap();
+        assert_eq!(first.payload["text"], "first");
+        assert_eq!(head, 3);
+        log.append(Event::model_text(&session, "later"))
+            .await
+            .unwrap();
+        let (_, next) = log
+            .checked_history_record(session.id, position, Some(head), false)
+            .await
+            .unwrap();
+        let (last, event) = next.unwrap();
+        assert_eq!(last, head);
+        assert_eq!(event.payload["text"], "answer");
+        assert!(
+            log.checked_history_record(session.id, last, Some(head), false)
+                .await
+                .unwrap()
+                .1
+                .is_none()
+        );
+        assert!(
+            log.checked_history_record(session.id, u64::MAX, None, false)
+                .await
+                .is_err()
+        );
+        let attacker = Connection::open(&db).unwrap();
+        attacker
+            .execute(
+                "UPDATE events SET payload = '{\"text\":\"forged\"}' WHERE rowid = 1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            log.checked_history_record(session.id, 0, None, false)
+                .await
+                .is_err(),
+            "history pagination bypassed full-chain authentication"
+        );
     }
 
     #[tokio::test]

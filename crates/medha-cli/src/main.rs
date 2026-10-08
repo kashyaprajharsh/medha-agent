@@ -1,17 +1,18 @@
 //! Medha CLI entrypoint. Configuration resolves from flags, environment,
 //! saved user settings, and finally first-run TUI setup.
 
-mod acp;
-mod acp_agents;
-mod acp_chat;
-mod acp_questions;
 mod application_catalog;
 mod application_commands;
 mod application_mcp;
 mod application_resources;
 mod application_session;
 mod attachments;
+mod chat;
+mod chat_agents;
+mod chat_history;
 mod chat_presentation;
+mod chat_questions;
+mod chat_session;
 mod connectors;
 mod desktop_changes;
 mod desktop_controls;
@@ -24,6 +25,7 @@ mod desktop_rewind;
 mod desktop_screens;
 mod desktop_service;
 mod desktop_skills;
+mod editor;
 mod hook_files;
 mod lock_edit;
 mod mcp_host;
@@ -136,8 +138,8 @@ struct Cli {
     #[arg(long)]
     plain: bool,
 
-    /// Expose the session over stdio to an editor. Speaks Agent Client Protocol
-    /// when the client sends `protocolVersion`, and Medha's own bridge otherwise.
+    /// Connect an editor over Agent Client Protocol on stdio. Chats run in the
+    /// shared Medha backend, alongside Desktop and TUI conversations.
     #[arg(long)]
     acp: bool,
 
@@ -888,6 +890,9 @@ async fn main() -> Result<()> {
     if interactive {
         return tui_tea::backend_ui::run(lock_cwd, options.startup(), cli.setup).await;
     }
+    if cli.acp {
+        return editor::run(options.startup(), tokio::io::stdin(), tokio::io::stdout()).await;
+    }
     let lock = runtime::workspace::load_lock(&lock_cwd, &Stderr)?;
     let runtime::session::Choices {
         autonomy,
@@ -913,22 +918,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-
-    if cli.acp {
-        let start = runtime::session::Start {
-            lock: &lock,
-            options: &options,
-            workspace: &workspace_home,
-            model,
-            autonomy,
-            verify_command: verify_cmd,
-            verify_required,
-            verify_timeout,
-            notices: &Stderr,
-        };
-        let (input, output) = (tokio::io::stdin(), tokio::io::stdout());
-        return acp_chat::run(start, input, output, acp::restore_from_env(), None).await;
-    }
 
     let has_task = !options.prompt.trim().is_empty();
     let is_tty = std::io::stdin().is_terminal();
@@ -969,6 +958,7 @@ async fn main() -> Result<()> {
         mcp_manager,
         session_plugins: _,
         configured_mcp: _,
+        session_mcp_ids: _,
         plugin_mcp_ids: _,
         scratch: _scratch,
     } = runtime::session::start(

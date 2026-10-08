@@ -18,6 +18,7 @@ pub(crate) struct Runtime {
     pub memory_stale_days: u32,
     pub mcp: Option<Arc<mcp::McpManager>>,
     pub configured_mcp: std::sync::Mutex<std::collections::HashSet<String>>,
+    pub session_mcp_ids: std::collections::HashSet<String>,
 }
 impl Runtime {
     pub async fn catalog<P: kernel::Provider, L: EventLog>(&self, kernel: &Kernel<P, L>) -> Value {
@@ -52,7 +53,10 @@ impl Runtime {
         // never stands in the way of the rest of what changed.
         let mut left = Vec::new();
         if let Some(manager) = &self.mcp {
-            for id in previous.iter().filter(|id| !cfg.mcp.contains_key(*id)) {
+            for id in previous
+                .iter()
+                .filter(|id| !cfg.mcp.contains_key(*id) && !self.session_mcp_ids.contains(*id))
+            {
                 match manager.remove_server(id).await {
                     // Whoever else follows the configuration may have taken it away already.
                     Ok(()) | Err(mcp::Error::UnknownServer(_)) => {}
@@ -63,7 +67,11 @@ impl Runtime {
         self.configured_mcp
             .lock()
             .map_err(|_| "MCP settings unavailable")?
-            .retain(|id| cfg.mcp.contains_key(id) || left.iter().any(|(kept, _)| kept == id));
+            .retain(|id| {
+                cfg.mcp.contains_key(id)
+                    || self.session_mcp_ids.contains(id)
+                    || left.iter().any(|(kept, _)| kept == id)
+            });
         let mut warnings = self.plugins.apply();
         warnings.extend(
             left.iter()
@@ -78,7 +86,7 @@ impl Runtime {
     pub async fn connect(
         &self,
         params: &Value,
-        writer: &Arc<crate::acp::Writer>,
+        writer: &Arc<crate::chat::Writer>,
     ) -> Result<Value, String> {
         use sha2::{Digest, Sha256};
         let id = params["id"].as_str().ok_or("Server name required")?;
@@ -102,7 +110,7 @@ impl Runtime {
     pub async fn connect_connector(
         &self,
         params: &Value,
-        writer: &Arc<crate::acp::Writer>,
+        writer: &Arc<crate::chat::Writer>,
     ) -> Result<Value, String> {
         let connector = params["id"]
             .as_str()
@@ -123,8 +131,11 @@ impl Runtime {
         &self,
         id: &str,
         server: &crate::config::McpServer,
-        writer: &Arc<crate::acp::Writer>,
+        writer: &Arc<crate::chat::Writer>,
     ) -> Result<Value, String> {
+        if self.session_mcp_ids.contains(id) {
+            return Err("This server belongs to the editor session; its configuration cannot be replaced by a saved server.".into());
+        }
         let manager = self
             .mcp
             .as_ref()
@@ -178,7 +189,7 @@ impl Runtime {
     pub async fn sign_in_again(
         &self,
         params: &Value,
-        writer: &Arc<crate::acp::Writer>,
+        writer: &Arc<crate::chat::Writer>,
     ) -> Result<Value, String> {
         let id = params["id"].as_str().ok_or("Server name required")?;
         let manager = self
@@ -201,7 +212,7 @@ impl Runtime {
 /// OAuth waits on the person in a browser, so it runs beside the bridge
 /// instead of holding its request loop; the link and the outcome arrive as
 /// `mcp.auth` and `mcp.signed_in` notifications.
-fn sign_in(manager: Arc<mcp::McpManager>, id: String, writer: Arc<crate::acp::Writer>) {
+fn sign_in(manager: Arc<mcp::McpManager>, id: String, writer: Arc<crate::chat::Writer>) {
     tokio::spawn(async move {
         let (urls, mut links) = tokio::sync::mpsc::unbounded_channel();
         let relay = {

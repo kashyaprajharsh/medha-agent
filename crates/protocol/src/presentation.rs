@@ -10,6 +10,8 @@ use serde_json::Value;
 pub enum PresentationItem {
     User {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<super::SavedImage>,
     },
     Assistant {
         text: String,

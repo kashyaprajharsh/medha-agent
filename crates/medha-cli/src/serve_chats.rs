@@ -1,5 +1,4 @@
-//! How the backend starts a chat: the same chat `medha --acp` runs, on a
-//! channel of its own in place of the process's stdin and stdout.
+//! How the backend starts a shared chat on its own application channel.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -353,9 +352,10 @@ impl Chats for ServeChats {
         })
         .await?;
 
+        let session_mcp = runtime::session_mcp::identity(&options.session_mcp);
         let (to_chat, chat_input) = tokio::io::duplex(64 * 1024);
         let (chat_output, from_chat) = tokio::io::duplex(256 * 1024);
-        let control = Arc::<crate::acp::TurnControl>::default();
+        let control = Arc::<crate::chat::TurnControl>::default();
         let mut chat = chats().spawn({
             let notices = Arc::clone(&notices);
             let control = Arc::clone(&control);
@@ -372,7 +372,7 @@ impl Chats for ServeChats {
                     verify_timeout: choices.verify_timeout,
                     notices: notices.as_ref(),
                 };
-                crate::acp_chat::run(start, chat_input, chat_output, restore, Some(control)).await
+                crate::chat_session::run(start, chat_input, chat_output, restore, control).await
             }
         });
         let ended = |outcome: Result<anyhow::Result<()>, tokio::task::JoinError>| match outcome {
@@ -413,6 +413,7 @@ impl Chats for ServeChats {
             "folder": folder,
             "model": ready["params"]["model"],
             "notices": notices.lines().clone(),
+            "session_mcp": session_mcp,
         });
         Ok(Opened {
             session,
@@ -422,6 +423,7 @@ impl Chats for ServeChats {
             done: Box::pin(async move { ended(chat.await) }),
             control: Some(Arc::new(move |action| match action {
                 backend::TurnAction::Cancel => control.cancel(),
+                backend::TurnAction::CancelTurn(turn) => control.cancel_for(Some(turn)),
                 backend::TurnAction::Abort => control.abort(),
             })),
         })

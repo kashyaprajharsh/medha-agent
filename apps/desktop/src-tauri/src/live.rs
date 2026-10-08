@@ -659,7 +659,7 @@ fn render_snapshot(mut frame: Value, steps: &mut Steps, segment: &mut String) ->
         snapshot.items.into_iter().skip(from).map(|row| {
             use protocol::{PresentationItem as Row, TurnEvent as Event};
             let event = match row {
-                Row::User { text } => Event::Steered { content: text },
+                Row::User { text, .. } => Event::Steered { content: text },
                 Row::Assistant { text } => Event::Text { delta: text },
                 Row::Reasoning { text } => Event::Reasoning { delta: text },
                 Row::ToolCall { id, tool, args } => Event::ToolCall { id, tool, args },

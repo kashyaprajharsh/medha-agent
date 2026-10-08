@@ -1,6 +1,6 @@
 //! Explicit application MCP controls; parsing, persistence and connections are
 //! owned by the backend. Credential-bearing commands are never reflected.
-use crate::{acp::Writer, config, desktop_extensions::Runtime};
+use crate::{chat::Writer, config, desktop_extensions::Runtime};
 use protocol::{McpCommand as Command, McpResult as Reply};
 use serde_json::json;
 use std::sync::Arc;

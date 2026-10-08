@@ -642,6 +642,34 @@ pub trait EventLog: Send + Sync {
         Ok(self.events(session).await)
     }
 
+    /// One verified history record at a fixed upper bound. Positions belong to
+    /// this log, are monotonically increasing, and cannot cross a conversation.
+    /// Durable implementations query a single row rather than materializing
+    /// the conversation for every page.
+    async fn checked_history_record(
+        &self,
+        session: Ulid,
+        after: u64,
+        through: Option<u64>,
+        continuing: bool,
+    ) -> Result<(u64, Option<(u64, Event)>), KernelError> {
+        let events = self.checked_events(session).await?;
+        let head = through
+            .unwrap_or(events.len() as u64)
+            .min(events.len() as u64);
+        let position = if continuing {
+            after
+        } else {
+            after.saturating_add(1)
+        };
+        let event = position
+            .checked_sub(1)
+            .filter(|_| position <= head)
+            .and_then(|index| events.get(index as usize))
+            .cloned();
+        Ok((head, event.map(|event| (position, event))))
+    }
+
     /// Acquire the durable writer lane for one state identity. The lease must
     /// stay alive from before the side effect through its `ToolObs` and any
     /// derived event. Single-process backends can use this no-op default.

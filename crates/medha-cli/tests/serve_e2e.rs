@@ -14,6 +14,9 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 const SECRET: &str = "sk-zz-never-on-the-wire";
 const WAIT: Duration = Duration::from_secs(60);
 
+#[path = "common/editor_checks.rs"]
+mod editor_checks;
+
 fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut request = Vec::new();
     loop {
@@ -99,7 +102,19 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
     if asked.contains("HOLD") {
         let _ = release.lock().unwrap().recv_timeout(WAIT);
     }
-    let events = if asked.contains("RUN") && !ran {
+    let read_completed = body["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .is_some_and(|message| message["role"] == "tool");
+    let events = if let Some(path) = asked.strip_prefix("READ_PATH ").filter(|_| !read_completed) {
+        let arguments = json!({"path":path});
+        let call = json!({"index":0,"id":"read_path","type":"function",
+            "function":{"name":"read","arguments":arguments.to_string()}});
+        vec![
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[call]}}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ]
+    } else if asked.contains("RUN") && !ran {
         let shell = body["tools"]
             .as_array()
             .into_iter()
@@ -179,16 +194,31 @@ fn medha(home: &Path, provider: &Provider) -> Command {
     command
 }
 
-/// `medha --acp`, one chat in a process of its own, as an editor runs it.
-struct OwnProcess {
+/// The real external ACP adapter, connected to this test's shared backend.
+struct EditorProcess {
     child: Child,
-    input: std::process::ChildStdin,
-    output: std::io::BufReader<std::process::ChildStdout>,
+    input: Option<std::process::ChildStdin>,
+    frames: mpsc::Receiver<Value>,
+    heard: Vec<Value>,
     asked: u64,
+    session: String,
 }
-
-impl OwnProcess {
+impl EditorProcess {
     fn start(folder: &Path, home: &Path, provider: &Provider, env: &[(&str, &str)]) -> Self {
+        let mut editor = Self::launch(folder, home, provider, env);
+        let hello = editor.rpc(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{}}),
+        );
+        assert_eq!(hello["result"]["protocolVersion"], 1, "{hello}");
+        let made = editor.rpc("session/new", json!({"cwd":folder,"mcpServers":[]}));
+        editor.session = made["result"]["sessionId"]
+            .as_str()
+            .expect("ACP session id")
+            .to_owned();
+        editor
+    }
+    fn launch(folder: &Path, home: &Path, provider: &Provider, env: &[(&str, &str)]) -> Self {
         let mut child = medha(home, provider)
             .arg("--acp")
             .envs(env.iter().copied())
@@ -199,39 +229,89 @@ impl OwnProcess {
             .spawn()
             .unwrap();
         let input = child.stdin.take().unwrap();
-        let output = std::io::BufReader::new(child.stdout.take().unwrap());
-        let mut chat = Self {
+        let stdout = child.stdout.take().unwrap();
+        let (sender, frames) = mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let frame: Value = serde_json::from_str(&line).expect("ACP JSON frame");
+                if sender.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
             child,
-            input,
-            output,
+            input: Some(input),
+            frames,
+            heard: Vec::new(),
             asked: 0,
-        };
-        while chat.frame()["method"] != "ready" {}
-        chat
+            session: String::new(),
+        }
     }
-
     fn frame(&mut self) -> Value {
-        use std::io::BufRead;
-        let mut line = String::new();
-        self.output.read_line(&mut line).unwrap();
-        serde_json::from_str(&line).expect("a frame from the chat")
+        let frame = self
+            .frames
+            .recv_timeout(WAIT)
+            .unwrap_or_else(|e| panic!("ACP went quiet: {e}; {:?}", self.heard));
+        self.heard.push(frame.clone());
+        frame
     }
-
-    fn ask(&mut self, method: &str, params: Value) -> Value {
+    fn send(&mut self, method: &str, params: Value) -> u64 {
         self.asked += 1;
-        let id = self.asked;
-        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        writeln!(self.input, "{request}").unwrap();
+        writeln!(
+            self.input.as_mut().unwrap(),
+            "{}",
+            json!({"jsonrpc":"2.0","id":self.asked,"method":method,"params":params})
+        )
+        .unwrap();
+        self.asked
+    }
+    fn result(&mut self, id: u64) -> Value {
+        if let Some(frame) = self.heard.iter().find(|frame| frame["id"] == id) {
+            return frame.clone();
+        }
         loop {
             let frame = self.frame();
-            if frame["id"] == json!(id) {
+            if frame["id"] == id {
                 return frame;
             }
         }
     }
+    fn rpc(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send(method, params);
+        self.result(id)
+    }
+    fn disconnect(mut self) {
+        drop(self.input.take());
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success(), "ACP failed on stdin EOF: {status}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "ACP did not exit on stdin EOF");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn ask(&mut self, method: &str, params: Value) -> Value {
+        let (method, mut params) = match method {
+            "session.settings" => ("_medha/session.settings", json!({})),
+            "session.configure" => ("_medha/session.configure", json!({"change":params})),
+            "message.send" => (
+                "session/prompt",
+                json!({"prompt":[{"type":"text","text":params["content"]}]}),
+            ),
+            other => (other, params),
+        };
+        params["sessionId"] = json!(self.session);
+        self.rpc(method, params)
+    }
 }
-
-impl Drop for OwnProcess {
+impl Drop for EditorProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -645,7 +725,7 @@ async fn a_live_snapshot_covers_its_events_and_a_delayed_steer_never_becomes_a_n
     assert!(snapshot.running);
     assert_eq!(snapshot.turn, 1);
     assert_eq!(snapshot.conversation, session);
-    assert_eq!(snapshot.items.iter().filter(|item| matches!(item, protocol::PresentationItem::User { text } if text == "HOLD snapshot")).count(), 1);
+    assert_eq!(snapshot.items.iter().filter(|item| matches!(item, protocol::PresentationItem::User { text, .. } if text == "HOLD snapshot")).count(), 1);
     let cursor = snapshot.cursor.unwrap();
     assert!(cursor.after > 0);
 
@@ -881,7 +961,7 @@ async fn cli_and_backend_cannot_own_the_same_chat_and_a_crash_releases_ownership
     client.send(&session, "seed the lease history").await;
     client.until(|frame| kind(frame, "turn.done")).await;
     let refused = medha(&world.home(), &world.provider)
-        .args(["--acp", "--resume", &session])
+        .args(["--resume", &session, "direct lease probe"])
         .current_dir(&folder)
         .stdin(Stdio::null())
         .output()
@@ -902,22 +982,30 @@ async fn cli_and_backend_cannot_own_the_same_chat_and_a_crash_releases_ownership
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    // The other direction uses the same direct runtime the TUI builds on.
-    let mut child = medha(&world.home(), &world.provider)
-        .args(["--acp", "--resume", &session])
-        .current_dir(&folder)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut own = OwnProcess {
-        input: child.stdin.take().unwrap(),
-        output: std::io::BufReader::new(child.stdout.take().unwrap()),
-        child,
-        asked: 0,
-    };
-    while own.frame()["method"] != "ready" {}
+    // One-shot execution deliberately stays in-process and uses the same
+    // durable lease. ACP now attaches to the backend instead of competing.
+    struct DirectOwner(Child);
+    impl Drop for DirectOwner {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut own = DirectOwner(
+        medha(&world.home(), &world.provider)
+            .args(["--resume", &session, "HOLD direct owner"])
+            .current_dir(&folder)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    loop {
+        if world.provider.asked().contains("HOLD direct owner") {
+            break;
+        }
+    }
     let refused = client.create(&folder, Some(&session)).await;
     assert!(
         refused["error"]["message"]
@@ -926,8 +1014,9 @@ async fn cli_and_backend_cannot_own_the_same_chat_and_a_crash_releases_ownership
             .contains("already open"),
         "{refused}"
     );
-    own.child.kill().unwrap();
-    own.child.wait().unwrap();
+    own.0.kill().unwrap();
+    own.0.wait().unwrap();
+    let _ = world.provider.release.send(());
     let resumed = client.create(&folder, Some(&session)).await;
     assert_eq!(resumed["result"]["session"], session, "{resumed}");
 }
@@ -1712,47 +1801,32 @@ async fn the_backend_answers_what_the_desktop_asks_about_a_folder() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_chat_in_the_backend_answers_its_own_requests_as_one_in_its_own_process_does() {
+async fn editor_and_application_commands_share_settings_and_policy() {
     let world = World::new();
     let folder = world.folder("w");
     let backend = world.backend();
     let mut client = backend.connect().await;
     let chat = client.open(&folder).await;
-    let mut alone = OwnProcess::start(&folder, &world.home(), &world.provider, &[]);
-
-    let requests = [
-        ("hello", json!({})),
+    let mut editor = EditorProcess::start(&folder, &world.home(), &world.provider, &[]);
+    for (method, params) in [
         ("session.settings", json!({})),
-        ("session.configure", json!({"mode": "plan"})),
+        ("session.configure", json!({"mode":"plan"})),
         ("session.settings", json!({})),
-        ("session.configure", json!({"mode": "no-such-mode"})),
-        ("session.rewind.points", json!({})),
-        ("patch.list", json!({})),
-        (
-            "agent.control",
-            json!({"agent": "nobody", "action": "stop"}),
-        ),
-        ("memory.list", json!({})),
-        ("memory.provenance", json!({"id": "nothing"})),
-        ("tasks.list", json!({})),
-        ("extensions.catalog", json!({})),
-        ("extensions.reload", json!({})),
-        ("mcp.screens", json!({})),
-        ("mcp.disconnect", json!({"server": "none"})),
-        ("mcp.connect", json!({"server": "none"})),
-        (
-            "question.respond",
-            json!({"question_id": 1, "dismiss": true}),
-        ),
-        ("approval.respond", json!({"gate_id": 9, "approve": true})),
-        ("interrupt", json!({})),
-        ("no.such.method", json!({})),
-    ];
-    for (method, params) in requests {
-        let in_backend = outcome(&client.ask(method, Some(&chat), params.clone()).await);
-        let in_process = outcome(&alone.ask(method, params));
-        assert_eq!(in_backend, in_process, "{method}");
+    ] {
+        let application = outcome(&client.ask(method, Some(&chat), params.clone()).await);
+        let external = outcome(&editor.ask(method, params));
+        assert_eq!(application, external, "{method}");
     }
+    assert!(
+        editor
+            .ask("session.configure", json!({"mode":"bad"}))
+            .get("error")
+            .is_some()
+    );
+    assert_eq!(
+        editor.ask("session.settings", json!({}))["result"]["mode"],
+        "plan"
+    );
 }
 
 /// A chat reads its saved key as it starts, and that waits on the same lock.
@@ -1969,7 +2043,7 @@ async fn a_chat_in_the_backend_obeys_the_environment_as_one_in_its_own_process_d
     let backend = world.backend_in(&env);
     let mut client = backend.connect().await;
     let chat = client.open(&folder).await;
-    let mut alone = OwnProcess::start(&folder, &world.home(), &world.provider, &env);
+    let mut alone = EditorProcess::start(&folder, &world.home(), &world.provider, &env);
 
     let in_backend = outcome(&client.ask("session.settings", Some(&chat), json!({})).await);
     assert_eq!(in_backend["mode"], "plan", "{in_backend}");

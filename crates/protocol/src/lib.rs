@@ -11,6 +11,8 @@ mod resources;
 pub use resources::*;
 mod session_features;
 pub use session_features::*;
+mod editor;
+pub use editor::*;
 
 pub trait Command: Serialize + DeserializeOwned {
     const METHOD: &'static str;
@@ -259,6 +261,10 @@ pub struct StartupOptions {
     pub first_run_setup: bool,
     #[serde(default)]
     pub may_start_unconfigured: bool,
+    /// Ephemeral servers supplied by this session's local editor. Never saved
+    /// to user configuration or added to the shared remote MCP host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_mcp: Vec<SessionMcpServer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +273,8 @@ pub struct ChatAbout {
     pub model: String,
     #[serde(default)]
     pub notices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_mcp: Option<String>,
 }
 
 /// The live routing id is distinct from the durable conversation id that may
@@ -603,10 +611,21 @@ pub enum CountQuality {
 pub enum TurnEvent {
     #[serde(rename = "turn.started")]
     Started { turn: u64 },
+    /// Completion of exactly one kernel run, after its final stream events.
+    /// Admission and completion are distinct, including when queued steering
+    /// causes another run immediately afterwards.
+    #[serde(rename = "turn.settled")]
+    Settled { completion: TurnCompletion },
     #[serde(rename = "presentation.reset")]
     PresentationReset { revision: u64 },
     #[serde(rename = "message.accepted")]
-    User { content: String },
+    User {
+        content: String,
+        #[serde(default)]
+        turn: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<SavedImage>,
+    },
     #[serde(rename = "model.waiting")]
     Waiting,
     #[serde(rename = "notice")]

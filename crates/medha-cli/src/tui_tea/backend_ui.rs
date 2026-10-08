@@ -865,7 +865,7 @@ fn tool_viz(bootstrap: &protocol::Bootstrap) -> HashMap<String, ToolViz> {
 pub(super) fn item(item: protocol::PresentationItem) -> Item {
     use protocol::PresentationItem as P;
     match item {
-        P::User { text } => Item::User(text),
+        P::User { text, .. } => Item::User(text),
         P::Assistant { text } => Item::Assistant(text),
         P::Reasoning { text } => Item::Thinking(text),
         P::Notice { text } => Item::Notice(text),
@@ -1334,7 +1334,7 @@ fn turn_event(model: &mut Model, event: protocol::TurnEvent) {
             model.streamed_this_turn = 0;
         }
         E::PresentationReset { .. } | E::Restarted => recover(model),
-        E::User { content } => model.push_main_item(Item::User(content)),
+        E::User { content, .. } => model.push_main_item(Item::User(content)),
         E::Text { delta } => {
             model.current_tool = None;
             model.push_text_delta(&delta);

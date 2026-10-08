@@ -28,6 +28,7 @@ pub type Done = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 #[derive(Clone, Copy)]
 pub enum TurnAction {
     Cancel,
+    CancelTurn(u64),
     Abort,
 }
 pub type Control = Arc<dyn Fn(TurnAction) -> bool + Send + Sync>;

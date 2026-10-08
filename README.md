@@ -172,9 +172,10 @@ medha plugins                  # discover, install, enable, update, roll back pl
 medha lsp                      # language-server sessions and health
 ```
 
-`--acp` serves one workspace session per process. Configure MCP servers with
-`medha mcp` before launch; request-level ACP server attachment is rejected until
-dynamic attachment is supported.
+`--acp` connects editors to the same backend as Desktop and TUI. One editor
+connection can follow multiple workspace sessions. `session/load` restores saved
+history; `session/resume` attaches without replaying it. Session-provided stdio MCP
+servers stay private to that chat and are not saved to the user configuration.
 
 Headless runs have no human to ask, so anything needing approval is **denied** rather
 than silently proceeding.
@@ -294,9 +295,9 @@ verification. The context engine also calls a model when summarization is needed
 
 ```mermaid
 flowchart TB
-    UI["Interactive clients<br/>TUI · Desktop"] --> CLIENT["medha-client + medha-protocol<br/>Authenticated local IPC"]
+    UI["Interactive clients<br/>TUI · Desktop · Editor ACP"] --> CLIENT["medha-client + medha-protocol<br/>Authenticated local IPC"]
     CLIENT --> CLI["medha serve<br/>Session, configuration, plugins"]
-    DIRECT["Headless CLI · plain REPL · Editor ACP"] --> RUNTIME["Shared runtime"]
+    DIRECT["Headless CLI · plain REPL"] --> RUNTIME["Shared runtime"]
     CLI --> RUNTIME
     RUNTIME --> K["Kernel<br/>Context → model → authorize → execute → observe → verify"]
     K <--> C["Context engine<br/>Budget, compaction, durable handoff"]
@@ -310,8 +311,8 @@ flowchart TB
     K <--> D["Durable state<br/>Event log · artifacts · memory"]
 ```
 
-Desktop and TUI use `medha serve` for live sessions. Standard editor ACP and
-headless commands use the same runtime directly and take the same conversation
+Desktop, TUI and editor ACP use `medha serve` for live sessions. Headless commands
+and the plain REPL use the same runtime directly and take the same conversation
 lease, preventing two processes from executing the same durable chat. Local
 command isolation depends on the selected sandbox backend; remote MCP services
 execute outside that local jail. For strict cleanup of escaped command helpers,

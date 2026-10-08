@@ -152,6 +152,12 @@ impl Session {
             .is_some_and(|control| control(crate::TurnAction::Cancel))
     }
 
+    pub(crate) fn cancel_numbered_turn(&self, turn: u64) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|control| control(crate::TurnAction::CancelTurn(turn)))
+    }
+
     pub(crate) fn abort_turn(&self) -> bool {
         self.control
             .as_ref()
@@ -245,7 +251,10 @@ impl Session {
                 Requested {
                     client: client.clone(),
                     id: asked,
-                    presentation: frame["method"] == "session.presentation",
+                    presentation: matches!(
+                        frame["method"].as_str(),
+                        Some("session.presentation" | "session.history")
+                    ),
                     sleep: frame["method"] == "session.sleep",
                 },
             );

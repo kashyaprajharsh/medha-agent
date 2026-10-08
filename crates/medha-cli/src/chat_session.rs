@@ -1,6 +1,5 @@
-//! One chat over the editor bridge, from start to finish: built, run on a byte
-//! stream in each direction, and shut down. A process serving one chat hands it
-//! its own stdin and stdout; a backend hands each chat a channel of its own.
+//! One backend chat: build the shared runtime, run its application channel and
+//! release its agents and local servers when the router retires the chat.
 
 use std::sync::Arc;
 
@@ -8,14 +7,14 @@ use runtime::session::{Start, Started};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{acp, acp_questions, desktop_extensions, plugin_session};
+use crate::{chat, chat_questions, desktop_extensions, plugin_session};
 
 pub(crate) async fn run<R, W>(
     start: Start<'_>,
     input: R,
     output: W,
     restore: Option<Value>,
-    control: Option<Arc<acp::TurnControl>>,
+    control: Arc<chat::TurnControl>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -49,30 +48,23 @@ where
         mcp_manager,
         session_plugins,
         configured_mcp,
+        session_mcp_ids,
         plugin_mcp_ids,
         scratch: _scratch,
         ..
-    } = runtime::session::start(start, |cwd, _| {
-        let mut made = acp::bridge_to(output, cwd.to_path_buf());
-        if let Some(control) = control {
-            made.writer.enable_presentation();
-            made.control = control;
-        }
+    } = runtime::session::start(start, |_, _| {
+        let mut made = chat::bridge_to(output);
+        made.writer.enable_presentation();
+        made.control = control;
         let surface = runtime::Surface {
-            gate: Arc::new(acp::AcpGate::new(
-                made.writer.clone(),
-                made.pending.clone(),
-                made.peer.clone(),
-            )),
-            asker: Arc::new(acp_questions::AcpAsker {
+            gate: Arc::new(chat::Gate::new(made.writer.clone(), made.pending.clone())),
+            asker: Arc::new(chat_questions::Asker {
                 writer: Arc::clone(&made.writer),
                 pending: Arc::clone(&made.questions),
-                peer: made.peer.clone(),
                 next_id: std::sync::atomic::AtomicU64::new(1),
             }),
-            agents: Some(Arc::new(crate::acp_agents::Watch {
+            agents: Some(Arc::new(crate::chat_agents::Watch {
                 writer: Arc::clone(&made.writer),
-                peer: made.peer.clone(),
             })),
         };
         bridge = Some(made);
@@ -80,9 +72,9 @@ where
     })
     .await?;
     let bridge = bridge.expect("a started chat has chosen its surface");
-    tracing::info!(model = %model_name, mode = "acp", "medha session start");
+    tracing::info!(model = %model_name, mode = "backend", "medha session start");
 
-    let surface_result = acp::run(
+    let surface_result = chat::run(
         kernel.clone(),
         session,
         system,
@@ -109,6 +101,7 @@ where
             memory_stale_days: stale_after_days,
             mcp: mcp_manager.clone(),
             configured_mcp: std::sync::Mutex::new(configured_mcp.clone()),
+            session_mcp_ids,
             plugins: plugin_session::LivePlugins::new(
                 session_plugins.store(),
                 skill_store.clone(),

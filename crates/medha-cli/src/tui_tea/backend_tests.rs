@@ -176,7 +176,10 @@ fn snapshot(model: &Model, text: &str) -> protocol::PresentationSnapshot {
         current_turn_from: None,
         conversation: model.remote.as_ref().unwrap().conversation.clone(),
         turn: 1,
-        items: vec![protocol::PresentationItem::User { text: text.into() }],
+        items: vec![protocol::PresentationItem::User {
+            text: text.into(),
+            images: Vec::new(),
+        }],
         revision: 0,
         running: false,
         pending_steers: Vec::new(),

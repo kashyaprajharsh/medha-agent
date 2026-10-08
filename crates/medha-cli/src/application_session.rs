@@ -1,6 +1,6 @@
 //! Commands over the chat that owns the runtime. Frontends never open these
 //! stores or mutate the conversation independently of its owner.
-use crate::{acp::Writer, application_resources, desktop_extensions::Runtime};
+use crate::{application_resources, chat::Writer, desktop_extensions::Runtime};
 use kernel::{EventLog, Kernel, Message, Provider, Session};
 use serde_json::{Value, json};
 use std::sync::Arc;

@@ -1,4 +1,4 @@
-//! Keep the terminal frontend a client. Shared rendering DTOs are allowed;
+//! Keep the terminal and editor frontends clients. Shared rendering DTOs are allowed;
 //! executing turns and owning durable stores/managers are not.
 use std::path::Path;
 
@@ -9,6 +9,9 @@ fn check(folder: &Path) {
         "Kernel {",
         "Session::new(",
         "runtime::session::start",
+        "runtime::model::resolve",
+        "chat::run(",
+        "chat_session::start",
         "Workspace::open(",
         "Store::open(",
         "SkillStore::",
@@ -37,6 +40,23 @@ fn check(folder: &Path) {
             }
         }
     }
+}
+
+#[test]
+fn every_editor_module_uses_the_backend_for_application_work() {
+    let cli = Path::new(env!("CARGO_MANIFEST_DIR"));
+    check(&cli.join("src/editor"));
+    let main = std::fs::read_to_string(cli.join("src/main.rs")).unwrap();
+    let client = main.find("return editor::run").unwrap();
+    let native = main
+        .find("let lock = runtime::workspace::load_lock")
+        .unwrap();
+    assert!(
+        client < native,
+        "editor startup must return before loading local engine policy"
+    );
+    assert!(!main.contains("mod acp;"));
+    assert!(!main.contains("acp::run("));
 }
 
 #[test]

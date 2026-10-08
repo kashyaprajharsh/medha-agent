@@ -24,6 +24,7 @@ pub const CAPABILITIES: &[&str] = &[
     "session-inspection",
     "live-conversation",
     "shared-live-state",
+    "editor-sessions",
 ];
 pub const CLIENT_CAPABILITIES: &[&str] = &[
     "lifecycle",
@@ -78,6 +79,7 @@ pub fn is_control(method: &str) -> bool {
     matches!(
         method,
         "cancel"
+            | "turn.cancel"
             | "turn.abort"
             | "interrupt"
             | "approval.respond"

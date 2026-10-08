@@ -14,6 +14,7 @@ pub mod plugin_session;
 pub mod plugin_store;
 pub mod reasoning;
 pub mod session;
+pub mod session_mcp;
 pub mod skill_judge;
 pub mod surface;
 pub mod verify;

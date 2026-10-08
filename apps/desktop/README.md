@@ -1,69 +1,96 @@
 # Medha Desktop
 
-The Tauri app uses `work/desktop-concept.html` as its visual reference. Desktop
-and TUI share the kernel, providers, tools, policies, orchestrator, configuration,
-credentials, memory and event store. Both interactive clients connect through
-the shared `medha-client` library and typed `medha-protocol` contract to one
-authenticated local `medha serve` backend per Medha home. Either installation
-can start it. Resuming a live conversation attaches another viewer; closing one
-viewer leaves the others running. Standard editor ACP and noninteractive CLI
-commands continue to use the shared runtime directly.
+Medha Desktop is the native desktop app for Medha. It brings agent conversations,
+files, tool activity, approvals and a terminal into one window, with support for
+local models and hosted providers.
 
-Launching the installed app opens Personal chats. Each Personal chat has its own
-managed folder for generated files. `medha-desktop /path/to/project` opens that
-project and its existing Medha history. Use the folder menu to open or switch
-projects in the same window. Running chats and terminal tabs remain attached to
-their original workspace. Global models, API keys and search preferences use the
-same `~/.medha` configuration as the TUI.
+![Medha Desktop](../../docs/assets/medha-desktop.gif)
 
-The composer selects a model, thinking/effort, autonomy mode and streaming.
-Settings adds, edits, removes and defaults models, including the TUI's local
-provider presets and custom endpoints. Model discovery uses the shared provider
-adapter. Context/output limits and advanced deployment settings are available
-on the model form. Adding a model first asks for a supported protocol, then a
-compatible provider. Connection and model fields appear after that selection.
-Provider presets fill the endpoint and authentication defaults; custom endpoints
-start empty. Changing the connection discards stale discovery results. Protocol
-values and availability come from the same picker table as the TUI.
-Keys stay in Medha's existing credential store and are never
-returned to the webview. Web search, instructions and appearance live in Settings.
+[Install](../../README.md#desktop-app) · [Develop](#development) ·
+[Build](#build) · [Technical overview](../../docs/WHAT_IS_MEDHA.md)
 
-Details open on demand: readable tool steps, clickable filenames, grouped work,
-agent transcripts, approvals, questions and usage. Live agent transcripts refresh
-every two seconds and support steering, stopping and follow-up instructions.
-Files preview Markdown, code, images, PDF pages, DOCX reading views and XLSX/CSV
-sheets. Changes shows each edit in the current session, newest first, with a
-whole-session view. Write/edit steps can jump to that file in Changes. Git changes
-shows actual staged, unstaged and untracked diffs, including repositories one
-folder below the workspace. Pending
-agent patches have a separate review view and use the existing merge checks.
+## Features
 
-Extensions manages skills, plugins and MCP servers, including reviewed plugin
-access, installation, enable/disable, updates and previous versions. Tool access
-lists the current runtime's tools. Removing a configured MCP server disconnects
-it from idle chats when they reload; active chats reload after work finishes.
-Connecting a local MCP server explicitly reviews its executable before starting it.
+- **Conversations:** start, resume, search and rewind chats; follow streaming
+  answers, reasoning, tool steps and usage.
+- **Model controls:** choose the model, reasoning effort, autonomy mode and
+  streaming in the composer. Configure providers, custom endpoints, API keys and
+  defaults in Settings.
+- **Projects and Personal chats:** work in a project folder or give each Personal
+  chat its own managed folder for generated files.
+- **Files and changes:** preview Markdown, code, images, PDFs, DOCX and
+  spreadsheets; inspect session edits, Git diffs and pending agent patches.
+- **Approvals and questions:** review requests and choose the access or answer
+  you want to give.
+- **Agents:** inspect transcripts, send steering or follow-up instructions, and
+  stop individual agents.
+- **Extensions:** install and manage skills, plugins and MCP servers, including
+  their enabled state and tool access.
+- **Terminal:** use your shell through a native PTY, with interactive programs,
+  resizing, Unicode and Ctrl+C. Hiding the terminal preserves running commands.
+- **Images:** attach, paste or drop images into the composer.
 
-Use **⌘B** for the sidebar, **⌘.** for the work panel and **⌃`** for the terminal.
-Collapsed sessions slide into view on hover; the same toggle keeps them open.
-Reading size and theme are remembered. `/model`, `/reasoning`, `/mode`, `/agents`,
-`/changes`, `/files`, `/context`, `/settings`, `/plugins`, `/rewind`, `/clear` and
-`/new` open the desktop controls. Clear starts a fresh chat and keeps history.
-Rewind forks the conversation, restores recorded workspace edits, or does both.
-It does not undo arbitrary shell commands or external side effects.
+## Get started
 
-The terminal uses a native PTY and your actual login shell, with interactive
-programs, history, Ctrl+C, Unicode and resizing. Hiding preserves running commands;
-closing a tab or the app stops its shell. New tabs use the selected chat/project
-folder. Shell `cd` is independent of the agent workspace. Up to four tabs are
-shown per workspace, bounded to sixteen across the window.
+1. Install the app using the [desktop installation instructions](../../README.md#desktop-app).
+2. Open **Settings** to configure a local model or hosted provider.
+3. Start a Personal chat, or use the folder menu to open a project.
 
-Images can be attached, pasted or dropped on the composer. Source images up to
-64 MiB use the shared media decoder and are normalized to the bridge's 2 MiB
-per-image transport budget. This removes the old 2 MiB source-file restriction.
-Admission errors and resizing notes appear in the composer.
+The desktop package includes the Medha backend. Desktop and the terminal app can
+be installed separately.
 
-## Develop
+Personal folders are created when you start their chats. Opening a project shows
+that folder's existing Medha history. Switching folders keeps running chats and
+terminal tabs attached to their original workspace; changing directory inside a
+terminal does not change the agent's workspace.
+
+Rewind can fork a conversation, restore recorded workspace edits, or do both.
+Arbitrary shell commands and external side effects are outside its undo scope.
+
+## Shared backend and data
+
+Desktop, the terminal app and editor ACP connect to one authenticated local
+backend per Medha home. They use the shared `medha-client` library and typed
+`medha-protocol` contract. The apps start or join the backend automatically.
+
+The default home is `~/.medha`; `MEDHA_HOME` selects a different one. Apps using
+the same home and workspace can follow the same live conversation. Closing one
+viewer leaves other viewers attached. Global models, credentials and preferences
+are shared, while project history and state are managed by the backend.
+
+API keys stay in Medha's credential store. Settings receives key-presence
+information rather than stored secret values. Remembered file and folder grants
+apply to future chats in that project and include command access; **Allow once**
+does not persist a grant.
+
+See the [technical overview](../../docs/WHAT_IS_MEDHA.md) for runtime, storage and
+permission details.
+
+## Keyboard shortcuts
+
+| Action | macOS | Windows / Linux |
+|---|---|---|
+| Toggle sidebar | `⌘B` | `Ctrl+B` |
+| Toggle work panel | `⌘.` | `Ctrl+.` |
+| Toggle terminal | `Ctrl+Backtick` | `Ctrl+Backtick` |
+| New chat | `⌘N` | `Ctrl+N` |
+| Search and commands | `⌘K` | `Ctrl+K` |
+
+Slash commands such as `/model`, `/reasoning`, `/mode`, `/agents`, `/changes`,
+`/files`, `/context`, `/settings`, `/plugins` and `/rewind` open the corresponding
+controls. `/clear` and `/new` start a fresh chat and retain conversation history.
+
+## Development
+
+The app uses React and TypeScript with Tauri 2. Install:
+
+- The Rust toolchain pinned in [rust-toolchain.toml](../../rust-toolchain.toml).
+- Node.js 24 and npm, matching the desktop CI environment.
+- The [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your
+  operating system. Linux also needs D-Bus development headers; the
+  [CI workflow](../../.github/workflows/ci.yml) lists the packages used by the project.
+
+From the repository root:
 
 ```sh
 cd apps/desktop
@@ -71,21 +98,57 @@ npm ci
 npm run tauri dev
 ```
 
-Set `MEDHA_DESKTOP_WORKSPACE=/path/to/project` to choose a project during
-development. The frontend never launches arbitrary commands or reads credentials.
+This prepares the backend, starts the Vite development server and opens the
+native app. Set `MEDHA_DESKTOP_WORKSPACE=/absolute/path/to/project` to choose a
+project during development.
 
-## Build and launch
+## Build
+
+From `apps/desktop`:
+
+```sh
+npm run tauri build
+```
+
+The build prepares a release backend and builds the frontend automatically.
+Native packages are written under `src-tauri/target/release/bundle/`; the bundled
+backend is built for the same target as the desktop app.
+
+For an app-only build on macOS:
 
 ```sh
 npm run tauri build -- --bundles app
 ```
 
-The native executable is `medha-desktop`. On macOS, `npm run link:command` links
-the built executable into `~/.local/bin`, refusing to replace an existing command.
-The built `Medha.app` also opens normally. The bundle includes the `medha` sidecar;
-the app starts it as `medha serve`, which is internal, not a user-facing command.
+Open the resulting `Medha.app`, or run `npm run link:command` to link its
+`medha-desktop` executable into `~/.local/bin`. The linking script refuses to
+replace an existing command. With that directory on your `PATH`, open a project
+with:
 
-Preview bounds are 2 MiB for text and 24 MiB for binary files. Unsupported or
-larger files can open in their system app. DOCX previews prioritize reading;
-they do not reproduce Word's exact page layout. Sheets show 100 rows at a time
-and up to 100 columns.
+```sh
+medha-desktop /absolute/path/to/project
+```
+
+## Tests and checks
+
+From `apps/desktop`:
+
+```sh
+npm run build
+npm test
+npm run prepare:backend
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+```
+
+Preparing the backend supplies the executable used by the desktop integration
+tests. [CI](../../.github/workflows/ci.yml) runs desktop checks on macOS, Linux and
+Windows. Installed-app verification should also exercise starting and resuming
+chats, approvals, extensions and terminal interactions.
+
+## More documentation
+
+- [Medha installation and usage](../../README.md)
+- [Technical overview](../../docs/WHAT_IS_MEDHA.md)
+- [Release packaging](../../.github/workflows/release.yml)

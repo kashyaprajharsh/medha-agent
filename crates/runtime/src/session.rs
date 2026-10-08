@@ -84,6 +84,7 @@ pub async fn start(
         verify_timeout,
         notices,
     } = input;
+    crate::session_mcp::validate(&options.session_mcp)?;
     let Model {
         provider,
         name: model_name,
@@ -438,6 +439,18 @@ pub async fn start(
                 .collect()
         })
         .unwrap_or_default();
+    let session_servers = crate::session_mcp::definitions(&options.session_mcp);
+    let session_mcp_ids = session_servers
+        .iter()
+        .map(|server| server.id.clone())
+        .collect();
+    for server in session_servers {
+        anyhow::ensure!(
+            !mcp_servers.iter().any(|known| known.id == server.id),
+            "An editor MCP server conflicts with a configured server"
+        );
+        mcp_servers.push(server);
+    }
     let configured_mcp: std::collections::HashSet<String> =
         mcp_servers.iter().map(|server| server.id.clone()).collect();
     let shared_mcp: std::collections::HashSet<String> = model_profiles
@@ -964,6 +977,7 @@ pub async fn start(
         mcp_manager,
         session_plugins,
         configured_mcp,
+        session_mcp_ids,
         plugin_mcp_ids,
         scratch,
     })
@@ -998,6 +1012,7 @@ pub struct Started {
     pub mcp_manager: Option<Arc<mcp::McpManager>>,
     pub session_plugins: plugin_session::SessionPlugins,
     pub configured_mcp: std::collections::HashSet<String>,
+    pub session_mcp_ids: std::collections::HashSet<String>,
     pub plugin_mcp_ids: std::collections::HashSet<String>,
     /// Deleted when dropped, so it lives as long as the chat does.
     pub scratch: Option<sandbox::Scratch>,

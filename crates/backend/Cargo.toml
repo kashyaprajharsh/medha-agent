@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+protocol = { package = "medha-protocol", path = "../protocol" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

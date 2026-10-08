@@ -1,12 +1,10 @@
-//! Editor bridge for one kernel session over line-delimited JSON-RPC 2.0 on
-//! stdio. It accepts messages, approvals, and cancellation while streaming
-//! event and approval notifications.
+//! Backend chat execution over the shared application protocol. External editor
+//! JSON-RPC is translated by `editor`, which never constructs a kernel.
 
 use kernel::{Budget, EventLog, Kernel, Message, Session, StopReason};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,9 +21,6 @@ const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const TURN_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const TURN_ABORT_GRACE: Duration = Duration::from_secs(2);
 const ROSTER_INTERVAL: Duration = Duration::from_millis(500);
-/// Settings a chat had when the desktop put it to sleep, handed back on waking.
-const RESTORE_ENV: &str = "MEDHA_ACP_SETTINGS";
-
 enum Outbound {
     Frame(Vec<u8>),
     Close(oneshot::Sender<io::Result<()>>),
@@ -63,7 +58,7 @@ impl Writer {
     /// Synchronous stream callbacks cannot wait, but incoming RPCs can. Leave
     /// headroom for their notifications and reply instead of ending a healthy
     /// chat when a fast reader supplies a burst of small requests.
-    async fn wait_for_room(&self) {
+    pub(crate) async fn wait_for_room(&self) {
         let spare = 8.min(self.tx.max_capacity().div_ceil(2));
         loop {
             let changed = self.progress.notified();
@@ -83,7 +78,7 @@ impl Writer {
         }
     }
 
-    fn write_value(&self, value: &Value) -> bool {
+    pub(crate) fn write_value(&self, value: &Value) -> bool {
         if self.cancelled.is_cancelled() {
             return false;
         }
@@ -199,7 +194,7 @@ impl Writer {
         self.notify_params("event", &event)
     }
 
-    fn respond(&self, id: Value, result: Value) -> bool {
+    pub(crate) fn respond(&self, id: Value, result: Value) -> bool {
         self.write_value(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
     }
 
@@ -232,6 +227,33 @@ impl Writer {
         );
     }
 
+    fn mark_history(&self) {
+        self.presentation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_history();
+    }
+
+    fn history(&self, id: Value, mut page: protocol::HistoryFragment, first: bool, running: bool) {
+        let presentation = self
+            .presentation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if first && running {
+            match presentation.history_tail() {
+                Ok(items) => page.live = Some(items),
+                Err(error) => {
+                    self.error(id, -32002, error);
+                    return;
+                }
+            }
+        }
+        self.respond(
+            id,
+            serde_json::to_value(page).expect("history page serializes"),
+        );
+    }
+
     fn reset_presentation<P: kernel::Provider>(
         &self,
         provider: &P,
@@ -254,7 +276,7 @@ impl Writer {
         );
     }
 
-    fn error(&self, id: Value, code: i32, message: impl Into<String>) -> bool {
+    pub(crate) fn error(&self, id: Value, code: i32, message: impl Into<String>) -> bool {
         self.write_value(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -262,7 +284,7 @@ impl Writer {
         }))
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         self.cancelled.cancelled().await;
     }
 }
@@ -289,12 +311,12 @@ async fn writer_loop<W>(
             Outbound::Frame(frame) => {
                 let len = frame.len();
                 let result = tokio::select! {
-                    _ = cancelled.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "ACP connection cancelled")),
+                    _ = cancelled.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "Output connection cancelled")),
                     result = output.write_all(&frame) => result,
                 };
                 let result = match result {
                     Ok(()) => tokio::select! {
-                        _ = cancelled.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "ACP connection cancelled")),
+                        _ = cancelled.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "Output connection cancelled")),
                         result = output.flush() => result,
                     },
                     Err(error) => Err(error),
@@ -314,7 +336,7 @@ async fn writer_loop<W>(
             }
             Outbound::Close(ack) => {
                 let result = tokio::select! {
-                    _ = cancelled.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "ACP connection cancelled")),
+                    _ = cancelled.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "Output connection cancelled")),
                     result = output.flush() => result,
                 };
                 let failed = result.is_err();
@@ -328,13 +350,13 @@ async fn writer_loop<W>(
     }
 }
 
-struct WriterTask {
+pub(crate) struct WriterTask {
     handle: Option<JoinHandle<()>>,
     cancelled: CancellationToken,
 }
 
 impl WriterTask {
-    async fn finish(mut self, writer: &Writer) {
+    pub(crate) async fn finish(mut self, writer: &Writer) {
         if !self.cancelled.is_cancelled() {
             let (ack_tx, ack_rx) = oneshot::channel();
             let close = tokio::time::timeout(
@@ -366,114 +388,6 @@ impl Drop for WriterTask {
         if let Some(handle) = &self.handle {
             handle.abort();
         }
-    }
-}
-
-/// Agent Client Protocol major version this bridge negotiates.
-pub(crate) const ACP_PROTOCOL_VERSION: i64 = 1;
-
-/// Which dialect the connected peer speaks. Chosen once, at `initialize`: a
-/// peer sending `protocolVersion` is an ACP client, anything else is a caller
-/// of Medha's original bridge, which stays supported.
-#[derive(Clone)]
-pub(crate) struct Peer {
-    acp: Arc<AtomicBool>,
-    workspace: Arc<PathBuf>,
-    session_id: Arc<Mutex<Option<String>>>,
-}
-
-impl Peer {
-    #[cfg(test)]
-    fn new() -> Self {
-        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::for_workspace(workspace)
-    }
-
-    fn for_workspace(workspace: PathBuf) -> Self {
-        let workspace = workspace.canonicalize().unwrap_or(workspace);
-        Self {
-            acp: Arc::new(AtomicBool::new(false)),
-            workspace: Arc::new(workspace),
-            session_id: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn select_acp(&self) {
-        self.acp.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_acp(&self) -> bool {
-        self.acp.load(Ordering::Acquire)
-    }
-
-    fn session_id(&self) -> Option<String> {
-        self.session_id
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    fn start_session(&self, cwd: &str, mcp_servers: Option<&Value>) -> Result<String, String> {
-        let requested = Path::new(cwd);
-        if !requested.is_absolute() {
-            return Err("session/new cwd must be an absolute path".into());
-        }
-        let requested = requested
-            .canonicalize()
-            .map_err(|error| format!("session/new cwd cannot be opened: {error}"))?;
-        if requested != *self.workspace {
-            return Err(format!(
-                "session/new cwd {} does not match Medha workspace {}",
-                requested.display(),
-                self.workspace.display()
-            ));
-        }
-        if let Some(servers) = mcp_servers {
-            let servers = servers
-                .as_array()
-                .ok_or("session/new mcpServers must be an array")?;
-            if !servers.is_empty() {
-                return Err(
-                    "per-session MCP servers are not supported; configure MCP before starting Medha"
-                        .into(),
-                );
-            }
-        }
-        let mut session = self
-            .session_id
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if session.is_some() {
-            return Err("this Medha process already owns an ACP session".into());
-        }
-        let id = format!("medha-{}", ulid::Ulid::new());
-        *session = Some(id.clone());
-        Ok(id)
-    }
-
-    fn validate_session(&self, params: &Value) -> Result<String, &'static str> {
-        let requested = params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .ok_or("sessionId must be a string")?;
-        let active = self
-            .session_id()
-            .ok_or("session/new must be called first")?;
-        if requested != active {
-            return Err("sessionId does not belong to this Medha process");
-        }
-        Ok(active)
-    }
-
-    /// Emit one `session/update` notification carrying `update`.
-    fn update(&self, writer: &Writer, update: Value) -> bool {
-        let Some(session_id) = self.session_id() else {
-            return false;
-        };
-        writer.notify(
-            "session/update",
-            json!({ "sessionId": session_id, "update": update }),
-        )
     }
 }
 
@@ -645,8 +559,7 @@ fn validate_send_intent(
 pub(crate) struct Bridge {
     pub(crate) writer: Arc<Writer>,
     pub(crate) pending: Pending,
-    pub(crate) peer: Peer,
-    pub(crate) questions: crate::acp_questions::Questions,
+    pub(crate) questions: crate::chat_questions::Questions,
     pub(crate) control: Arc<TurnControl>,
     writer_task: WriterTask,
 }
@@ -656,10 +569,11 @@ pub(crate) struct Bridge {
 #[derive(Default)]
 pub(crate) struct TurnControl {
     active: Mutex<Option<ActiveTurn>>,
-    gates: Mutex<Option<(Pending, crate::acp_questions::Questions)>>,
+    gates: Mutex<Option<(Pending, crate::chat_questions::Questions)>>,
 }
 
 struct ActiveTurn {
+    number: u64,
     interrupt: kernel::InterruptHandle,
     task: tokio::task::AbortHandle,
     aborted_at: Option<Instant>,
@@ -668,24 +582,32 @@ struct ActiveTurn {
 
 impl TurnControl {
     pub(crate) fn cancel(&self) -> bool {
+        self.cancel_for(None)
+    }
+
+    pub(crate) fn cancel_for(&self, number: Option<u64>) -> bool {
         let active = self
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if number.is_some_and(|number| active.as_ref().is_none_or(|active| active.number != number))
+        {
+            return false;
+        }
         let cancelled = active.as_ref().is_some_and(|handle| {
             handle.interrupt.cancel_turn();
             true
         });
-        drop(active);
         let gates = self
             .gates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let denied = gates.is_some_and(|(pending, questions)| {
-            crate::acp_questions::clear(&questions);
+            crate::chat_questions::clear(&questions);
             deny_pending(&pending) > 0
         });
+        drop(active);
         cancelled || denied
     }
 
@@ -708,11 +630,12 @@ impl TurnControl {
         true
     }
 
-    fn own(&self, interrupt: kernel::InterruptHandle, task: tokio::task::AbortHandle) {
+    fn own(&self, number: u64, interrupt: kernel::InterruptHandle, task: tokio::task::AbortHandle) {
         *self
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ActiveTurn {
+            number,
             interrupt,
             task,
             aborted_at: None,
@@ -744,30 +667,28 @@ impl TurnControl {
     }
 }
 
-pub(crate) fn bridge_to<W>(output: W, workspace: PathBuf) -> Bridge
+pub(crate) fn bridge_to<W>(output: W) -> Bridge
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    bridge_with_output_in(output, OUTBOUND_FRAMES, workspace)
+    bridge_with_output(output, OUTBOUND_FRAMES)
 }
 
-/// The settings a chat that slept is restarted with.
-pub(crate) fn restore_from_env() -> Option<Value> {
-    std::env::var(RESTORE_ENV)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-}
-
-#[cfg(test)]
 fn bridge_with_output<W>(output: W, capacity: usize) -> Bridge
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    bridge_with_output_in(output, capacity, workspace)
+    let (writer, writer_task) = output_writer(output, capacity);
+    Bridge {
+        writer,
+        pending: Arc::default(),
+        questions: Arc::default(),
+        control: Arc::default(),
+        writer_task,
+    }
 }
 
-fn bridge_with_output_in<W>(output: W, capacity: usize, workspace: PathBuf) -> Bridge
+pub(crate) fn output_writer<W>(output: W, capacity: usize) -> (Arc<Writer>, WriterTask)
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -784,8 +705,8 @@ where
         Arc::clone(&progress),
         Arc::clone(&failure),
     ));
-    Bridge {
-        writer: Arc::new(Writer {
+    (
+        Arc::new(Writer {
             tx,
             queued_bytes,
             cancelled: cancelled.clone(),
@@ -794,95 +715,30 @@ where
             presentation: Mutex::default(),
             presentation_enabled: AtomicBool::new(false),
         }),
-        pending: Arc::new(Mutex::new(HashMap::new())),
-        peer: Peer::for_workspace(workspace),
-        questions: Default::default(),
-        control: Arc::default(),
-        writer_task: WriterTask {
+        WriterTask {
             handle: Some(handle),
             cancelled,
         },
-    }
+    )
 }
 
 /// Human approval gate over JSON-RPC.
-pub struct AcpGate {
+pub struct Gate {
     writer: Arc<Writer>,
     pending: Pending,
-    peer: Peer,
     next_id: AtomicU64,
     always: Mutex<HashSet<String>>,
 }
 
-impl AcpGate {
-    pub(crate) fn new(writer: Arc<Writer>, pending: Pending, peer: Peer) -> Self {
+impl Gate {
+    pub(crate) fn new(writer: Arc<Writer>, pending: Pending) -> Self {
         Self {
             writer,
             pending,
-            peer,
             next_id: AtomicU64::new(1),
             always: Mutex::new(HashSet::new()),
         }
     }
-
-    /// ACP carries the request as a real JSON-RPC request the client answers by
-    /// `optionId`; an escalated action is never offered a remembering tier.
-    fn request_acp_permission(
-        &self,
-        gate_id: u64,
-        action: &str,
-        detail: Option<&str>,
-        escalated: bool,
-    ) -> bool {
-        let mut options = vec![json!({
-            "optionId": "allow-once",
-            "name": "Allow once",
-            "kind": "allow_once",
-        })];
-        if !escalated {
-            options.push(json!({
-                "optionId": "allow-always",
-                "name": "Allow always",
-                "kind": "allow_always",
-            }));
-        }
-        options.push(json!({
-            "optionId": "reject-once",
-            "name": "Reject",
-            "kind": "reject_once",
-        }));
-        self.writer.write_value(&json!({
-            "jsonrpc": "2.0",
-            "id": acp_gate_request_id(gate_id),
-            "method": "session/request_permission",
-            "params": {
-                "sessionId": self.peer.session_id(),
-                "toolCall": {
-                    "toolCallId": acp_gate_request_id(gate_id),
-                    "title": action,
-                    "kind": "other",
-                    "status": "pending",
-                    "rawInput": { "detail": detail },
-                },
-                "options": options,
-            },
-        }))
-    }
-}
-
-/// Gate ids share the outbound request-id space; the prefix keeps an editor's
-/// reply unambiguous without a second table.
-pub(crate) fn acp_gate_request_id(gate_id: u64) -> String {
-    format!("medha-gate-{gate_id}")
-}
-
-/// The gate id inside an ACP permission response id, if it is one of ours.
-pub(crate) fn acp_gate_id_from(value: &Value) -> Option<u64> {
-    value
-        .as_str()?
-        .strip_prefix("medha-gate-")?
-        .parse::<u64>()
-        .ok()
 }
 
 /// Removes a pending approval if its await is cancelled.
@@ -890,27 +746,24 @@ struct PendingGuard {
     pending: Pending,
     gate_id: u64,
     writer: Arc<Writer>,
-    medha: bool,
     approved: bool,
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         lock_pending(&self.pending).remove(&self.gate_id);
-        if self.medha {
-            self.writer.notify_params(
-                "approval.resolved",
-                &protocol::ApprovalResolved {
-                    gate_id: self.gate_id,
-                    approved: self.approved,
-                },
-            );
-        }
+        self.writer.notify_params(
+            "approval.resolved",
+            &protocol::ApprovalResolved {
+                gate_id: self.gate_id,
+                approved: self.approved,
+            },
+        );
     }
 }
 
 #[async_trait::async_trait]
-impl kernel::HumanGate for AcpGate {
+impl kernel::HumanGate for Gate {
     async fn confirm(
         &self,
         action: &str,
@@ -939,12 +792,9 @@ impl kernel::HumanGate for AcpGate {
             pending: Arc::clone(&self.pending),
             gate_id,
             writer: Arc::clone(&self.writer),
-            medha: !self.peer.is_acp(),
             approved: false,
         };
-        let sent = if self.peer.is_acp() {
-            self.request_acp_permission(gate_id, action, detail, escalated)
-        } else {
+        let sent = {
             let mut choices = vec![protocol::ApprovalDecision::Once];
             if !escalated {
                 choices.push(protocol::ApprovalDecision::Always);
@@ -984,15 +834,9 @@ impl kernel::HumanGate for AcpGate {
         approval
     }
 
-    /// Medha viewers share the same path choices. The standalone editor keeps
-    /// its existing choices by policy; ACP itself permits additional options.
+    /// Every viewer receives the same path choices. The editor adapter maps
+    /// these offered scopes to ACP permission options.
     async fn confirm_path(&self, request: kernel::PathRequest<'_>) -> kernel::PathApproval {
-        if self.peer.is_acp() {
-            return self
-                .confirm(request.action, request.detail, false)
-                .await
-                .into();
-        }
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         lock_pending(&self.pending).insert(
@@ -1009,7 +853,6 @@ impl kernel::HumanGate for AcpGate {
             pending: Arc::clone(&self.pending),
             gate_id,
             writer: Arc::clone(&self.writer),
-            medha: true,
             approved: false,
         };
         use protocol::ApprovalDecision as D;
@@ -1071,21 +914,13 @@ impl kernel::HumanGate for AcpGate {
     }
 }
 
-impl AcpGate {
+impl Gate {
     async fn access(
         &self,
         action: &str,
         detail: Option<&str>,
         escalated: bool,
     ) -> kernel::NetworkDecision {
-        if self.peer.is_acp() {
-            return match kernel::HumanGate::confirm(self, action, detail, escalated).await {
-                kernel::Approval::Once => kernel::NetworkDecision::Once,
-                kernel::Approval::Always if !escalated => kernel::NetworkDecision::Persistent,
-                kernel::Approval::Always => kernel::NetworkDecision::Once,
-                kernel::Approval::Deny => kernel::NetworkDecision::Deny,
-            };
-        }
         let gate_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = oneshot::channel();
         lock_pending(&self.pending).insert(
@@ -1099,7 +934,6 @@ impl AcpGate {
             pending: Arc::clone(&self.pending),
             gate_id,
             writer: Arc::clone(&self.writer),
-            medha: true,
             approved: false,
         };
         let mut choices = vec![protocol::ApprovalDecision::Once];
@@ -1164,99 +998,45 @@ fn deny_pending(pending: &Pending) -> usize {
 }
 
 /// Streams kernel updates as JSON-RPC `event` notifications.
-struct AcpSink {
+struct Sink {
     writer: Arc<Writer>,
-    peer: Peer,
     unread: Unread,
 }
 
-/// Map a Medha tool to the closest ACP `ToolKind`, so an editor can pick an icon.
-fn acp_tool_kind(tool: &str) -> &'static str {
-    match tool {
-        "read" | "ls" | "skill" => "read",
-        "write" | "edit" => "edit",
-        "grep" | "glob" | "code" | "sessions.search" => "search",
-        "shell.exec" | "git" | "diagnostics" => "execute",
-        "web" => "fetch",
-        "update_plan" | "clarify" => "think",
-        _ => "other",
-    }
-}
-
-impl kernel::StreamSink for AcpSink {
+impl kernel::StreamSink for Sink {
     fn phase(&self, phase: kernel::progress::Phase) {
-        if !self.peer.is_acp() && phase == kernel::progress::Phase::Generating {
+        if phase == kernel::progress::Phase::Generating {
             self.writer.turn_event(protocol::TurnEvent::Waiting);
         }
     }
     fn notice(&self, text: &str) {
-        if !self.peer.is_acp() {
-            self.writer.turn_event(protocol::TurnEvent::Notice {
-                text: text.to_owned(),
-            });
-        }
+        self.writer.turn_event(protocol::TurnEvent::Notice {
+            text: text.to_owned(),
+        });
     }
     fn text(&self, delta: &str) {
-        if self.peer.is_acp() {
-            self.peer.update(
-                &self.writer,
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": { "type": "text", "text": delta },
-                }),
-            );
-            return;
-        }
         self.writer.turn_event(protocol::TurnEvent::Text {
             delta: delta.to_owned(),
         });
     }
     fn reasoning(&self, delta: &str) {
-        if self.peer.is_acp() {
-            self.peer.update(
-                &self.writer,
-                json!({
-                    "sessionUpdate": "agent_thought_chunk",
-                    "content": { "type": "text", "text": delta },
-                }),
-            );
-            return;
-        }
         self.writer.turn_event(protocol::TurnEvent::Reasoning {
             delta: delta.to_owned(),
         });
     }
     fn tool_started(&self, tool: &str, target: Option<&str>) {
-        if !self.peer.is_acp() {
-            self.writer.turn_event(protocol::TurnEvent::ToolStarted {
-                tool: tool.to_owned(),
-                target: target.map(str::to_owned),
-            });
-        }
+        self.writer.turn_event(protocol::TurnEvent::ToolStarted {
+            tool: tool.to_owned(),
+            target: target.map(str::to_owned),
+        });
     }
     fn cost(&self, total_usd: f64, indicative: bool) {
-        if !self.peer.is_acp() {
-            self.writer.turn_event(protocol::TurnEvent::Cost {
-                total_usd,
-                indicative,
-            });
-        }
+        self.writer.turn_event(protocol::TurnEvent::Cost {
+            total_usd,
+            indicative,
+        });
     }
     fn tool_call(&self, tool: &str, args: &Value) {
-        if self.peer.is_acp() {
-            self.peer.update(
-                &self.writer,
-                json!({
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": tool,
-                    "title": tool,
-                    "kind": acp_tool_kind(tool),
-                    "status": "in_progress",
-                    "rawInput": args,
-                }),
-            );
-            return;
-        }
         self.writer.turn_event(protocol::TurnEvent::ToolCall {
             id: None,
             tool: tool.to_owned(),
@@ -1264,20 +1044,6 @@ impl kernel::StreamSink for AcpSink {
         });
     }
     fn tool_call_with_id(&self, id: &str, tool: &str, args: &Value) {
-        if self.peer.is_acp() {
-            self.peer.update(
-                &self.writer,
-                json!({
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": id,
-                    "title": tool,
-                    "kind": acp_tool_kind(tool),
-                    "status": "in_progress",
-                    "rawInput": args,
-                }),
-            );
-            return;
-        }
         self.writer.turn_event(protocol::TurnEvent::ToolCall {
             id: Some(id.to_owned()),
             tool: tool.to_owned(),
@@ -1285,22 +1051,6 @@ impl kernel::StreamSink for AcpSink {
         });
     }
     fn tool_result(&self, tool: &str, ok: bool, payload: &Value) {
-        if self.peer.is_acp() {
-            let text = serde_json::to_string(payload).unwrap_or_default();
-            self.peer.update(
-                &self.writer,
-                json!({
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": tool,
-                    "status": if ok { "completed" } else { "failed" },
-                    "content": [{
-                        "type": "content",
-                        "content": { "type": "text", "text": text },
-                    }],
-                }),
-            );
-            return;
-        }
         self.writer.turn_event(protocol::TurnEvent::ToolResult {
             id: None,
             tool: tool.to_owned(),
@@ -1309,22 +1059,6 @@ impl kernel::StreamSink for AcpSink {
         });
     }
     fn tool_result_with_id(&self, id: &str, tool: &str, ok: bool, payload: &Value) {
-        if self.peer.is_acp() {
-            let text = serde_json::to_string(payload).unwrap_or_default();
-            self.peer.update(
-                &self.writer,
-                json!({
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": id,
-                    "status": if ok { "completed" } else { "failed" },
-                    "content": [{
-                        "type": "content",
-                        "content": { "type": "text", "text": text },
-                    }],
-                }),
-            );
-            return;
-        }
         self.writer.turn_event(protocol::TurnEvent::ToolResult {
             id: Some(id.to_owned()),
             tool: tool.to_owned(),
@@ -1335,7 +1069,7 @@ impl kernel::StreamSink for AcpSink {
     fn tool_input(&self, id: &str, tool: &str, delta: &str) {
         // Only a server's tool can have a screen to draw this on, and only
         // Medha's own window draws one. Everything else is told at the call.
-        if !self.peer.is_acp() && mcp::McpManager::is_mcp_tool(tool) {
+        if mcp::McpManager::is_mcp_tool(tool) {
             self.writer.turn_event(protocol::TurnEvent::ToolInput {
                 id: id.to_owned(),
                 tool: tool.to_owned(),
@@ -1345,12 +1079,11 @@ impl kernel::StreamSink for AcpSink {
     }
     fn tool_screen(&self, id: &str, screen: &Value) {
         // Only Medha's own window draws screens; another editor gets the text result.
-        if !self.peer.is_acp() {
-            self.writer.turn_event(protocol::TurnEvent::ToolScreen {
-                id: id.to_owned(),
-                screen: screen.clone(),
-            });
-        }
+
+        self.writer.turn_event(protocol::TurnEvent::ToolScreen {
+            id: id.to_owned(),
+            screen: screen.clone(),
+        });
     }
     fn usage(&self, usage: &kernel::Usage) {
         self.writer.turn_event(protocol::TurnEvent::Usage {
@@ -1439,7 +1172,7 @@ enum TurnDone {
 const MAX_FRAME: u64 = 16 * 1024 * 1024;
 
 /// Retains partial input across cancellation; oversized frames disconnect.
-async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     stdin: &mut tokio::io::Take<BufReader<R>>,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<Option<String>> {
@@ -1448,7 +1181,9 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
         return Ok(None);
     }
     if buf.last() == Some(&b'\n') || n == 0 {
-        let line = String::from_utf8_lossy(buf).into_owned();
+        let line = std::str::from_utf8(buf)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .to_owned();
         buf.clear();
         stdin.set_limit(MAX_FRAME);
         return Ok(Some(line));
@@ -1462,26 +1197,22 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
 #[derive(Debug, PartialEq, Eq)]
 enum RpcAction {
     None,
-    /// `reply_to` is set for `session/prompt`, whose JSON-RPC response is the
-    /// turn's `stopReason` and therefore cannot be sent until the turn settles.
     StartTurn {
         content: String,
         /// Admitted into the artifact store as the turn starts, so pixels never
         /// sit in the transcript or the log.
-        images: Vec<AcpImage>,
-        reply_to: Option<Value>,
+        images: Vec<IncomingImage>,
         admission_reply_to: Option<Value>,
     },
     /// Admission is acknowledged only after the owned queue accepts it.
     Steer {
         content: String,
         reply_to: Option<Value>,
-        acp: bool,
     },
     Shutdown,
 }
 
-fn desktop_images(value: Option<&Value>) -> Result<Vec<AcpImage>, String> {
+fn desktop_images(value: Option<&Value>) -> Result<Vec<IncomingImage>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -1505,15 +1236,15 @@ fn desktop_images(value: Option<&Value>) -> Result<Vec<AcpImage>, String> {
                 .as_str()
                 .filter(|data| !data.is_empty() && data.len() <= 3_000_000)
                 .ok_or("Image data is missing or too large.")?;
-            Ok(AcpImage::Inline(mime.to_owned(), data.to_owned()))
+            Ok(IncomingImage::Inline(mime.to_owned(), data.to_owned()))
         })
         .collect()
 }
 
-/// Decode, normalise and store what the editor attached. Errors name the image
+/// Decode, normalise and store what a frontend attached. Errors name the image
 /// by position, because the editor sends bytes rather than a path.
-async fn admit_acp_images(
-    images: Vec<AcpImage>,
+async fn admit_images(
+    images: Vec<IncomingImage>,
     artifacts: &std::sync::Arc<dyn kernel::ArtifactStore>,
 ) -> Result<Vec<kernel::MediaPart>, String> {
     use base64::Engine;
@@ -1529,7 +1260,7 @@ async fn admit_acp_images(
                 let position = index + 1;
                 let label = image.label(position);
                 let bytes = match &image {
-                    AcpImage::Inline(_, data) => {
+                    IncomingImage::Inline(_, data) => {
                         if data.len() > crate::attachments::MAX_SOURCE_BYTES.div_ceil(3) * 4 {
                             return Err(format!(
                                 "image {position} exceeds the attachment size limit"
@@ -1541,8 +1272,6 @@ async fn admit_acp_images(
                                 format!("image {position} is not valid base64: {error}")
                             })?
                     }
-                    AcpImage::Linked(path) => crate::attachments::read_source(path)
-                        .map_err(|error| format!("image {position}: {error:#}"))?,
                 };
                 crate::attachments::admit(bytes, label, &artifacts)
                     .map(|attachment| attachment.part)
@@ -1554,167 +1283,24 @@ async fn admit_acp_images(
     .map_err(|error| format!("image admission task failed: {error}"))?
 }
 
-/// One editor prompt: its text, and any images the editor attached.
-#[derive(Default, Debug, PartialEq)]
-struct AcpPrompt {
-    text: String,
-    images: Vec<AcpImage>,
-}
-
-/// An image an editor attached. It arrives either as bytes in the prompt or as
-/// a link to a file on this machine — dragging a file into the composer usually
-/// produces the link, so reading only the inline form loses the attachment.
 #[derive(Debug, PartialEq, Eq)]
-enum AcpImage {
-    /// `(mime type, base64 payload)`.
+enum IncomingImage {
     Inline(String, String),
-    Linked(std::path::PathBuf),
 }
-
-impl AcpImage {
+impl IncomingImage {
     fn label(&self, position: usize) -> String {
-        match self {
-            Self::Inline(mime, _) => format!("image {position} ({mime})"),
-            Self::Linked(path) => crate::attachments::label_for(path),
-        }
+        let Self::Inline(mime, _) = self;
+        format!("image {position} ({mime})")
     }
 }
 
-impl AcpPrompt {
-    fn is_empty(&self) -> bool {
-        self.text.trim().is_empty() && self.images.is_empty()
-    }
-
-    fn push_text(&mut self, part: &str) {
-        if !self.text.is_empty() {
-            self.text.push('\n');
-        }
-        self.text.push_str(part);
-    }
-}
-
-/// The local file a `file://` URI names, if it is one.
-fn acp_file_path(uri: &str) -> Option<std::path::PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    // `file:///path` and `file://localhost/path` both address this machine.
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-    if !rest.starts_with('/') {
-        return None;
-    }
-    let decoded = percent_decode(rest);
-    Some(std::path::PathBuf::from(decoded))
-}
-
-fn percent_decode(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                match u8::from_str_radix(&raw[index + 1..index + 3], 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        index += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[index]);
-                        index += 1;
-                    }
-                }
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn is_image_mime(mime: Option<&str>) -> bool {
-    mime.is_some_and(|mime| {
-        mime.split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .starts_with("image/")
-    })
-}
-
-/// Split ACP prompt content blocks into what the kernel consumes. Image blocks
-/// were previously dropped here; an editor that attached a screenshot got an
-/// answer about the text alone and no indication anything was missing.
-fn acp_prompt(prompt: Option<&Value>) -> AcpPrompt {
-    let mut parsed = AcpPrompt::default();
-    for block in prompt.and_then(Value::as_array).into_iter().flatten() {
-        let mime = block.get("mimeType").and_then(Value::as_str);
-        match block.get("type").and_then(Value::as_str) {
-            Some("image") => {
-                if let Some(data) = block.get("data").and_then(Value::as_str) {
-                    parsed.images.push(AcpImage::Inline(
-                        mime.unwrap_or("image/png").to_string(),
-                        data.to_string(),
-                    ));
-                }
-            }
-            // A file dragged into the composer. The editor sends where it is,
-            // not what is in it, and only names the type some of the time — so
-            // the extension decides when the header does not.
-            Some("resource_link") => {
-                let uri = block.get("uri").and_then(Value::as_str).unwrap_or_default();
-                if let Some(path) = acp_file_path(uri).filter(|path| {
-                    is_image_mime(mime)
-                        || crate::attachments::refs::has_image_extension(&path.to_string_lossy())
-                }) {
-                    parsed.images.push(AcpImage::Linked(path));
-                } else {
-                    parsed.push_text(&format!("[attached resource: {uri}]"));
-                }
-            }
-            Some("resource") => {
-                let resource = block.get("resource");
-                let resource_mime = resource
-                    .and_then(|resource| resource.get("mimeType"))
-                    .and_then(Value::as_str);
-                let blob = resource
-                    .and_then(|resource| resource.get("blob"))
-                    .and_then(Value::as_str);
-                match blob.filter(|_| is_image_mime(resource_mime)) {
-                    Some(blob) => parsed.images.push(AcpImage::Inline(
-                        resource_mime.unwrap_or("image/png").to_string(),
-                        blob.to_string(),
-                    )),
-                    None => {
-                        if let Some(text) = resource
-                            .and_then(|resource| resource.get("text"))
-                            .and_then(Value::as_str)
-                        {
-                            parsed.push_text(text);
-                        }
-                    }
-                }
-            }
-            Some("text") => {
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    parsed.push_text(text);
-                }
-            }
-            _ => {}
-        }
-    }
-    parsed
-}
-
-/// Medha's stop reasons in ACP's vocabulary.
-fn acp_stop_reason(reason: &StopReason) -> &'static str {
+fn turn_outcome(reason: &StopReason) -> protocol::TurnOutcome {
     match reason {
-        StopReason::Finished => "end_turn",
-        StopReason::Interrupted => "cancelled",
-        StopReason::VerificationFailed | StopReason::Blocked => "refusal",
-        StopReason::Budget(kernel::BudgetStop::Tokens) => "max_tokens",
-        StopReason::Budget(_) => "max_turn_requests",
+        StopReason::Finished => protocol::TurnOutcome::Finished,
+        StopReason::Interrupted => protocol::TurnOutcome::Cancelled,
+        StopReason::VerificationFailed | StopReason::Blocked => protocol::TurnOutcome::Refused,
+        StopReason::Budget(kernel::BudgetStop::Tokens) => protocol::TurnOutcome::TokenLimit,
+        StopReason::Budget(_) => protocol::TurnOutcome::RequestLimit,
     }
 }
 
@@ -1738,7 +1324,6 @@ fn dispatch_rpc(
     interrupt: Option<&kernel::InterruptHandle>,
     pending: &Pending,
     writer: &Writer,
-    peer: &Peer,
 ) -> RpcAction {
     let Some(object) = message.as_object() else {
         writer.error(Value::Null, -32600, "invalid JSON-RPC request");
@@ -1747,29 +1332,6 @@ fn dispatch_rpc(
     let id = object.get("id").cloned();
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         writer.error(id.unwrap_or(Value::Null), -32600, "jsonrpc must be \"2.0\"");
-        return RpcAction::None;
-    }
-    // An ACP client answers `session/request_permission` with a response frame,
-    // which carries no method. Route it to the waiting gate.
-    if object.get("method").is_none()
-        && let Some(gate_id) = id.as_ref().and_then(acp_gate_id_from)
-    {
-        let chosen = object
-            .get("result")
-            .and_then(|result| result.get("outcome"))
-            .and_then(|outcome| {
-                (outcome.get("outcome").and_then(Value::as_str) == Some("selected"))
-                    .then(|| outcome.get("optionId").and_then(Value::as_str))
-                    .flatten()
-            });
-        let approval = match chosen {
-            Some("allow-once") => kernel::Approval::Once,
-            Some("allow-always") => kernel::Approval::Always,
-            _ => kernel::Approval::Deny,
-        };
-        if let Some(sender) = lock_pending(pending).remove(&gate_id) {
-            let _ = sender.send(approval);
-        }
         return RpcAction::None;
     }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
@@ -1783,128 +1345,7 @@ fn dispatch_rpc(
     let params = object.get("params").cloned().unwrap_or(Value::Null);
 
     match method {
-        // A peer that names a protocolVersion is an ACP client; everything else
-        // is a caller of Medha's original bridge, which keeps working unchanged.
-        "initialize" if params.get("protocolVersion").is_some() => {
-            if writer.presents() {
-                rpc_error(
-                    writer,
-                    &id,
-                    -32602,
-                    "ACP initialization belongs to the editor bridge; backend chats use the application protocol.",
-                );
-                return RpcAction::None;
-            }
-            peer.select_acp();
-            rpc_result(
-                writer,
-                &id,
-                json!({
-                    "protocolVersion": ACP_PROTOCOL_VERSION,
-                    "agentInfo": { "name": "medha", "version": env!("CARGO_PKG_VERSION") },
-                    "agentCapabilities": {
-                        "loadSession": false,
-                        "promptCapabilities": {
-                            "image": true,
-                            "audio": false,
-                            "embeddedContext": true,
-                        },
-                    },
-                    "authMethods": [],
-                }),
-            );
-            RpcAction::None
-        }
-        "authenticate" => {
-            rpc_result(writer, &id, json!({}));
-            RpcAction::None
-        }
-        "session/new" => {
-            if !peer.is_acp() {
-                rpc_error(
-                    writer,
-                    &id,
-                    -32000,
-                    "initialize must be called before session/new",
-                );
-                return RpcAction::None;
-            }
-            let Some(cwd) = params.get("cwd").and_then(Value::as_str) else {
-                rpc_error(writer, &id, -32602, "session/new cwd must be a string");
-                return RpcAction::None;
-            };
-            match peer.start_session(cwd, params.get("mcpServers")) {
-                Ok(session_id) => rpc_result(writer, &id, json!({ "sessionId": session_id })),
-                Err(error) => rpc_error(writer, &id, -32602, error),
-            }
-            RpcAction::None
-        }
-        "session/prompt" => {
-            if let Err(error) = peer.validate_session(&params) {
-                rpc_error(writer, &id, -32602, error);
-                return RpcAction::None;
-            }
-            let prompt = acp_prompt(params.get("prompt"));
-            if prompt.is_empty() {
-                rpc_error(writer, &id, -32602, "prompt must contain text or an image");
-                return RpcAction::None;
-            }
-            if prompt.images.len() > crate::attachments::MAX_PER_MESSAGE {
-                rpc_error(
-                    writer,
-                    &id,
-                    -32602,
-                    format!(
-                        "at most {} images per prompt",
-                        crate::attachments::MAX_PER_MESSAGE
-                    ),
-                );
-                return RpcAction::None;
-            }
-            if running {
-                // A steer carries text only. Refusing is the honest answer:
-                // accepting would drop the image the editor just attached.
-                if !prompt.images.is_empty() {
-                    rpc_error(
-                        writer,
-                        &id,
-                        -32000,
-                        "images cannot be added to a turn that is already running",
-                    );
-                } else if interrupt.is_some() {
-                    return RpcAction::Steer {
-                        content: prompt.text,
-                        reply_to: id,
-                        acp: true,
-                    };
-                } else {
-                    rpc_error(writer, &id, -32000, "a turn is already running");
-                }
-                return RpcAction::None;
-            }
-            RpcAction::StartTurn {
-                content: if prompt.text.trim().is_empty() {
-                    crate::attachments::IMAGE_ONLY_PROMPT.to_string()
-                } else {
-                    prompt.text
-                },
-                images: prompt.images,
-                reply_to: id,
-                admission_reply_to: None,
-            }
-        }
-        "session/cancel" => {
-            if let Err(error) = peer.validate_session(&params) {
-                rpc_error(writer, &id, -32602, error);
-                return RpcAction::None;
-            }
-            if let Some(handle) = interrupt {
-                handle.cancel_turn();
-            }
-            deny_pending(pending);
-            RpcAction::None
-        }
-        "initialize" | "hello" => {
+        "hello" => {
             rpc_result(
                 writer,
                 &id,
@@ -1946,13 +1387,11 @@ fn dispatch_rpc(
                 RpcAction::Steer {
                     content,
                     reply_to: id,
-                    acp: false,
                 }
             } else {
                 RpcAction::StartTurn {
                     content,
                     images,
-                    reply_to: None,
                     admission_reply_to: id,
                 }
             }
@@ -2020,10 +1459,9 @@ fn dispatch_line(
     interrupt: Option<&kernel::InterruptHandle>,
     pending: &Pending,
     writer: &Writer,
-    peer: &Peer,
 ) -> RpcAction {
     match serde_json::from_str::<Value>(line) {
-        Ok(message) => dispatch_rpc(message, model, running, interrupt, pending, writer, peer),
+        Ok(message) => dispatch_rpc(message, model, running, interrupt, pending, writer),
         Err(_) => {
             // A malformed peer message cannot approve safely. Reject any gate
             // waiting on that peer instead of retaining it indefinitely.
@@ -2096,7 +1534,6 @@ where
     let Bridge {
         writer,
         pending,
-        peer,
         questions,
         control,
         writer_task,
@@ -2114,12 +1551,11 @@ where
             let _ = report_tx.send(owner);
         }));
     }
-    let mut roster = agents.clone().map(crate::acp_agents::Roster::new);
+    let mut roster = agents.clone().map(crate::chat_agents::Roster::new);
     let mut roster_tick = tokio::time::interval(ROSTER_INTERVAL);
     roster_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Connection changes are pushed to the window as they happen.
     let mut mcp_changes = extensions.mcp.as_ref().map(|manager| manager.subscribe());
-    let mut prompt_reply: Option<Value> = None;
     if let Some(saved) = restore {
         // Its start hooks already added their context to this conversation.
         if !resumed.is_empty() {
@@ -2180,8 +1616,10 @@ where
 
     let mut reports_ready = true; // Also collect reports retained across restart.
     let mut turn_requested = false;
-    let mut asleep = false;
     let mut turn_number = 0u64;
+    let mut history_head = 0u64;
+    let mut history_marked = false;
+    let mut history_reader = crate::chat_history::Reader::default();
     loop {
         if !running && (turn_requested || reports_ready) {
             reports_ready = false;
@@ -2199,6 +1637,15 @@ where
                 None => Vec::new(),
             };
             if turn_requested || !taken.is_empty() {
+                history_head = kernel
+                    .log
+                    .checked_history_record(session.id, 0, None, true)
+                    .await?
+                    .0;
+                if !history_marked {
+                    writer.mark_history();
+                }
+                history_marked = false;
                 turn_requested = false;
                 running = true;
                 turn_number += 1;
@@ -2213,9 +1660,8 @@ where
                 let kernel = kernel.clone();
                 let session = session.clone();
                 let budget = crate::task_budget(&base_budget, &agent_budget);
-                let sink = AcpSink {
+                let sink = Sink {
                     writer: writer.clone(),
-                    peer: peer.clone(),
                     unread: unread.clone(),
                 };
                 let agents = agents.clone();
@@ -2233,7 +1679,11 @@ where
                         Err(error) => TurnDone::Err(error.to_string()),
                     }
                 });
-                control.own(interrupt.as_ref().expect("a running turn").clone(), owner);
+                control.own(
+                    turn_number,
+                    interrupt.as_ref().expect("a running turn").clone(),
+                    owner,
+                );
             }
         }
         tokio::select! {
@@ -2249,9 +1699,37 @@ where
                 if let Ok(request) = serde_json::from_str::<Value>(trimmed)
                     && request["jsonrpc"] == "2.0"
                     && let Some(method) = request["method"].as_str()
-                    && !peer.is_acp()
                 {
                     let params = request.get("params").cloned().unwrap_or(Value::Null);
+                    if method == "session.history.image" {
+                        let Some(id) = request.get("id").cloned() else { continue; };
+                        match serde_json::from_value::<protocol::ReadHistoryImage>(params) {
+                            Ok(query) => match crate::chat_history::image(&kernel.artifacts, query).await {
+                                Ok(image) => { writer.respond(id, json!(image)); }
+                                Err(error) => { writer.error(id, -32001, error); }
+                            },
+                            Err(_) => { writer.error(id, -32602, "Invalid image request"); }
+                        }
+                        continue;
+                    }
+                    if method == "session.history" {
+                        let Some(id) = request.get("id").cloned() else { continue; };
+                        match serde_json::from_value::<protocol::ReadHistory>(params) {
+                            Ok(mut query) => {
+                                let first = query.through.is_none();
+                                if first && (query.after != 0 || query.offset != 0) {
+                                    writer.error(id, -32602, "Start history at its beginning"); continue;
+                                }
+                                if first && running { query.through = Some(history_head); query.conversation = Some(session.id.to_string()); }
+                                match history_reader.read(kernel.log.as_ref(), &session, query, &kernel.artifacts).await {
+                                    Ok(page) => { writer.history(id, page, first, running); }
+                                    Err(error) => { writer.error(id, -32001, error); }
+                                }
+                            }
+                            Err(_) => { writer.error(id, -32602, "Invalid history request"); }
+                        }
+                        continue;
+                    }
                     if method == "message.send" && let Err(error) = validate_send_intent(&params, running, turn_number, interrupt.as_ref().is_some_and(|handle| handle.cancel_requested())) {
                         rpc_error(&writer, &request.get("id").cloned(), -32002, error);
                         continue;
@@ -2267,7 +1745,7 @@ where
                     let result = if let Some(result) = crate::application_session::handle(&kernel, &session, &mut transcript, &extensions, method, params.clone(), running, &writer, agents.as_ref()).await {
                         Some(result)
                     } else if method == "question.respond" {
-                        Some(crate::acp_questions::respond(&questions, &params))
+                        Some(crate::chat_questions::respond(&questions, &params))
                     } else if method == "session.rewind.points" {
                         Some(crate::desktop_rewind::points(&kernel, &session, extensions.workspace.root()).await)
                     } else if method == "session.rewind" {
@@ -2303,8 +1781,6 @@ where
                         // A service viewer sleeps by detaching, not by ending
                         // everybody's runtime. The router retires its viewer
                         // after this answer; the last-viewer policy owns exit.
-                        // The standalone bridge retains its process sleep.
-                        asleep = idle && !writer.presents();
                         if idle {
                             let resumable = !kernel.log.events(session.id).await.is_empty();
                             let settings = crate::desktop_controls::handle("session.settings", &params, &kernel, &mut session, &mut model, &mut active_profile, &model_config, &extensions.model_env, running, agents.as_ref()).await.and_then(Result::ok);
@@ -2322,42 +1798,47 @@ where
                                 if matches!(method, "session.settings" | "session.configure" | "session.profile.saved") { writer.notify("settings", value.clone()); }
                                 if method == "session.rewind" {
                                     if value["code_only"] != true { writer.reset_presentation(kernel.provider.as_ref(), &session, &transcript, &active_profile, &model, &model_config); }
-                                    writer.notify("session.rewound", json!({ "session": value["session"], "code_only": value["code_only"] })); roster = agents.clone().map(crate::acp_agents::Roster::new);
+                                    writer.notify("session.rewound", json!({ "session": value["session"], "code_only": value["code_only"] })); roster = agents.clone().map(crate::chat_agents::Roster::new);
                                 }
                                 rpc_result(&writer, &id, value);
                             }
                             Err(error) => rpc_error(&writer, &id, -32001, error),
                         }
-                        if asleep { break; }
+                        continue;
+                    }
+                    if method == "turn.cancel" {
+                        match serde_json::from_value::<protocol::CancelTurn>(params) {
+                            Ok(target) => rpc_result(&writer, &request.get("id").cloned(), json!({"cancelled":control.cancel_for(Some(target.turn))})),
+                            Err(_) => rpc_error(&writer, &request.get("id").cloned(), -32602, "A valid turn number is required"),
+                        }
                         continue;
                     }
                     if method == "turn.abort" {
                         rpc_result(&writer, &request.get("id").cloned(), json!({"accepted": control.abort()}));
                         continue;
                     }
-                    if matches!(method, "cancel" | "interrupt" | "shutdown" | "exit") { crate::acp_questions::clear(&questions); }
+                    if matches!(method, "cancel" | "interrupt" | "shutdown" | "exit") { crate::chat_questions::clear(&questions); }
                 }
-                match dispatch_line(trimmed, &model, running, interrupt.as_ref(), &pending, &writer, &peer) {
+                match dispatch_line(trimmed, &model, running, interrupt.as_ref(), &pending, &writer) {
                     RpcAction::None => {}
                     RpcAction::Shutdown => break,
-                    RpcAction::Steer { content, reply_to, acp } => {
+                    RpcAction::Steer { content, reply_to } => {
                         if !admit_steer(&unread, interrupt.as_ref(), &content) {
                             rpc_error(&writer, &reply_to, -32002, "The turn ended, is stopping, or its message queue is full. Your message was not accepted.");
                             continue;
                         }
-                        if !acp { writer.turn_event(protocol::TurnEvent::Queued { content: Some(content) }); }
-                        rpc_result(&writer, &reply_to, if acp { json!({"stopReason": "end_turn"}) } else { json!({"accepted": true, "steered": true, "turn": turn_number}) });
+                        writer.turn_event(protocol::TurnEvent::Queued { content: Some(content) });
+                        rpc_result(&writer, &reply_to, json!({"accepted": true, "steered": true, "turn": turn_number}));
                     }
-                    RpcAction::StartTurn { content, images, reply_to, admission_reply_to } => {
-                        prompt_reply = reply_to;
+                    RpcAction::StartTurn { content, images, admission_reply_to } => {
                         let mut prompt = Message::user(content);
-                        match admit_acp_images(images, &kernel.artifacts).await {
+                        match admit_images(images, &kernel.artifacts).await {
                             Ok(attachments) => prompt.attachments = attachments,
                             Err(error) => {
-                                // The editor attached an image Medha cannot
+                                // The frontend attached an image Medha cannot
                                 // read. Answering the text alone would look
                                 // like it was seen, so the turn does not start.
-                                if let Some(id) = admission_reply_to.clone().or_else(|| prompt_reply.take()) {
+                                if let Some(id) = admission_reply_to.clone() {
                                     rpc_error(&writer, &Some(id), -32602, &error);
                                 } else {
                                     writer.event("turn.error", json!({"message":error}));
@@ -2366,7 +1847,14 @@ where
                             }
                         }
                         transcript.push(prompt);
-                        if writer.presents() { writer.turn_event(protocol::TurnEvent::User { content: transcript.last().expect("accepted prompt").content.clone() }); }
+                        writer.mark_history();
+                        history_marked = true;
+                        if writer.presents() {
+                            let prompt = transcript.last().expect("accepted prompt");
+                            writer.turn_event(protocol::TurnEvent::User {
+                                content:prompt.content.clone(), turn:turn_number.saturating_add(1), images:crate::chat_history::images(&prompt.attachments)
+                            });
+                        }
                         turn_requested = true;
                         if let Some(id) = admission_reply_to { rpc_result(&writer, &Some(id), json!({ "accepted": true, "steered": false, "turn": turn_number.saturating_add(1) })); }
                     }
@@ -2380,10 +1868,7 @@ where
                 // also releases a gate whose task ended with an error before
                 // consuming its response.
                 deny_pending(&pending);
-                crate::acp_questions::clear(&questions);
-                // `session/prompt` is answered here, not at dispatch: its result
-                // is the turn's stopReason.
-                let reply = prompt_reply.take();
+                crate::chat_questions::clear(&questions);
                 // Unread messages run next after a normal finish; after a stop they go back.
                 let left = take_unread(&unread);
                 let completed = !force_aborted && matches!(&joined, Some(Ok(TurnDone::Ok(_, reason))) if *reason != StopReason::Interrupted);
@@ -2395,17 +1880,18 @@ where
                     let (message, history) = crate::failed_turn_history(kernel.log.as_ref(), &session, &transcript, "force-stopped".into()).await;
                     if let Some(history) = history { transcript = history; writer.reset_presentation(kernel.provider.as_ref(), &session, &transcript, &active_profile, &model, &model_config); }
                     if message != "force-stopped" { writer.event("notice", json!({"text": message})); }
-                    if let Some(id) = reply { writer.respond(id, json!({"stopReason": "cancelled"})); }
-                    else { writer.event("turn.cancelled", json!({})); }
+                    writer.event("turn.cancelled", json!({}));
+                    writer.turn_event(protocol::TurnEvent::Settled { completion: protocol::TurnCompletion { turn: turn_number, outcome: protocol::TurnOutcome::Cancelled } });
                     writer.notify_params("event", &protocol::TurnEvent::AbortSettled);
                     continue;
                 }
                 match joined {
                     Some(Ok(TurnDone::Ok(updated, reason))) => {
                         transcript = updated;
-                        if let Some(id) = reply {
-                            writer.respond(id, json!({ "stopReason": acp_stop_reason(&reason) }));
-                        } else if !carried.is_empty() {
+                        writer.turn_event(protocol::TurnEvent::Settled { completion: protocol::TurnCompletion { turn: turn_number, outcome: turn_outcome(&reason) } });
+                        if !carried.is_empty() {
+                            writer.mark_history();
+                            history_marked = true;
                             // The run continues, so the peer sees delivery, not a stop.
                             for content in &carried { writer.event("message.steered", json!({ "content": content })); }
                             // Why the previous run ended still matters, e.g. a failed check.
@@ -2419,25 +1905,19 @@ where
                     Some(Ok(TurnDone::Err(e))) => {
                         let (e, history) = crate::failed_turn_history(kernel.log.as_ref(), &session, &transcript, e).await;
                         if let Some(history) = history { transcript = history; writer.reset_presentation(kernel.provider.as_ref(), &session, &transcript, &active_profile, &model, &model_config); }
-                        match reply {
-                            Some(id) => { writer.error(id, -32000, e); }
-                            None => { writer.event("turn.error", json!({ "message": e })); }
-                        }
+                        writer.event("turn.error", json!({ "message": e }));
+                        writer.turn_event(protocol::TurnEvent::Settled { completion: protocol::TurnCompletion { turn: turn_number, outcome: protocol::TurnOutcome::Failed { message: e } } });
                     }
                     Some(Err(error)) => {
                         let message = format!("turn task failed: {error}");
                         let (message, history) = crate::failed_turn_history(kernel.log.as_ref(), &session, &transcript, message).await;
                         if let Some(history) = history { transcript = history; writer.reset_presentation(kernel.provider.as_ref(), &session, &transcript, &active_profile, &model, &model_config); }
-                        match reply {
-                            Some(id) => { writer.error(id, -32000, message); }
-                            None => { writer.event("turn.error", json!({ "message": message })); }
-                        }
+                        writer.event("turn.error", json!({ "message": message }));
+                        writer.turn_event(protocol::TurnEvent::Settled { completion: protocol::TurnCompletion { turn: turn_number, outcome: protocol::TurnOutcome::Failed { message } } });
                     }
                     None => {
-                        match reply {
-                            Some(id) => { writer.error(id, -32000, "turn task disappeared"); }
-                            None => { writer.event("turn.error", json!({ "message": "turn task disappeared" })); }
-                        }
+                        writer.event("turn.error", json!({ "message": "turn task disappeared" }));
+                        writer.turn_event(protocol::TurnEvent::Settled { completion: protocol::TurnCompletion { turn: turn_number, outcome: protocol::TurnOutcome::Failed { message: "turn task disappeared".into() } } });
                     }
                 }
                 if !carried.is_empty() {
@@ -2448,9 +1928,10 @@ where
             Some(owner) = report_rx.recv(), if agents.is_some() => {
                 if owner.is_none() || owner == Some(session.id) { reports_ready = true; }
             }
-            _ = roster_tick.tick(), if roster.is_some() || running => {
+            _ = roster_tick.tick(), if roster.is_some() || running || history_reader.has_cached() => {
+                history_reader.expire(Instant::now());
                 if control.report_slow_abort() { writer.notify_params("event", &protocol::TurnEvent::AbortSlow); }
-                if let Some(update) = roster.as_mut().and_then(crate::acp_agents::Roster::changed) {
+                if let Some(update) = roster.as_mut().and_then(crate::chat_agents::Roster::changed) {
                     writer.notify("agents", update);
                 }
             }
@@ -2466,17 +1947,14 @@ where
     settle_turn(&mut interrupt, &pending, &mut turns, TURN_SHUTDOWN_GRACE).await;
     control.finish();
     deny_pending(&pending);
-    crate::acp_questions::clear(&questions);
-    // A sleeping chat has not ended; it wakes on the next message.
-    if !asleep {
-        kernel
-            .observe_hook(
-                &session,
-                kernel::HookPoint::SessionEnd,
-                json!({ "source": "acp" }),
-            )
-            .await;
-    }
+    crate::chat_questions::clear(&questions);
+    kernel
+        .observe_hook(
+            &session,
+            kernel::HookPoint::SessionEnd,
+            json!({ "source": "backend" }),
+        )
+        .await;
     writer_task.finish(&writer).await;
     if let Some(reason) = *writer
         .failure
@@ -2491,7 +1969,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kernel::{Approval, HumanGate, Role, StreamSink};
+
+    #[tokio::test]
+    async fn framed_input_rejects_invalid_utf8_and_preserves_a_cancelled_partial_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut sender, receiver) = tokio::io::duplex(256);
+        let mut reader = BufReader::new(receiver).take(MAX_FRAME);
+        let mut partial = Vec::new();
+        sender.write_all(b"{\"text\":\"part").await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_frame(&mut reader, &mut partial)
+            )
+            .await
+            .is_err()
+        );
+        sender.write_all("ial 🪕\"}\n".as_bytes()).await.unwrap();
+        assert_eq!(
+            read_frame(&mut reader, &mut partial)
+                .await
+                .unwrap()
+                .unwrap(),
+            "{\"text\":\"partial 🪕\"}\n"
+        );
+        sender.write_all(b"{\"text\":\"\xff\"}\n").await.unwrap();
+        assert_eq!(
+            read_frame(&mut reader, &mut partial)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    use kernel::{Approval, HumanGate, Role};
+    use std::path::Path;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
@@ -2550,268 +2062,8 @@ mod tests {
         pending: &Pending,
     ) -> (RpcAction, Vec<Value>) {
         let (writer, mut rx) = capture_writer(32);
-        let action = dispatch_rpc(
-            message,
-            "test-model",
-            running,
-            interrupt,
-            pending,
-            &writer,
-            &Peer::new(),
-        );
+        let action = dispatch_rpc(message, "test-model", running, interrupt, pending, &writer);
         (action, captured_values(&mut rx))
-    }
-
-    /// An ACP client's whole opening exchange, in the order an editor sends it.
-    #[test]
-    fn an_acp_client_completes_the_standard_session_handshake() {
-        let peer = Peer::new();
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (writer, mut rx) = capture_writer(32);
-        let send = |message: Value, running: bool| -> RpcAction {
-            dispatch_rpc(message, "m", running, None, &pending, &writer, &peer)
-        };
-
-        send(
-            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                   "params": {"protocolVersion": 1, "clientCapabilities": {}}}),
-            false,
-        );
-        assert!(
-            peer.is_acp(),
-            "protocolVersion selects the standard dialect"
-        );
-        let initialized = captured_values(&mut rx);
-        assert_eq!(initialized[0]["result"]["protocolVersion"], json!(1));
-        assert_eq!(
-            initialized[0]["result"]["agentCapabilities"]["loadSession"],
-            json!(false)
-        );
-
-        let cwd = peer.workspace.display().to_string();
-        send(
-            json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                   "params": {"cwd": cwd, "mcpServers": []}}),
-            false,
-        );
-        let created = captured_values(&mut rx);
-        let session_id = created[0]["result"]["sessionId"].clone();
-        assert_eq!(session_id, json!(peer.session_id()));
-
-        let action = send(
-            json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
-                   "params": {"sessionId": session_id,
-                              "prompt": [{"type": "text", "text": "fix the test"}]}}),
-            false,
-        );
-        // The response is the turn's stopReason, so it must be deferred.
-        assert_eq!(
-            action,
-            RpcAction::StartTurn {
-                content: "fix the test".into(),
-                images: Vec::new(),
-                reply_to: Some(json!(3)),
-                admission_reply_to: None,
-            }
-        );
-        assert!(
-            captured_values(&mut rx).is_empty(),
-            "session/prompt must not answer before the turn ends"
-        );
-    }
-
-    #[test]
-    fn acp_rejects_duplicate_foreign_and_unimplemented_session_inputs() {
-        fn initialize(peer: &Peer, writer: &Writer, pending: &Pending) {
-            dispatch_rpc(
-                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                       "params": {"protocolVersion": 1}}),
-                "m",
-                false,
-                None,
-                pending,
-                writer,
-                peer,
-            );
-        }
-
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (writer, mut rx) = capture_writer(32);
-        let peer = Peer::new();
-        initialize(&peer, &writer, &pending);
-        captured_values(&mut rx);
-        let cwd = peer.workspace.display().to_string();
-        dispatch_rpc(
-            json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-                   "params": {"cwd": cwd, "mcpServers": []}}),
-            "m",
-            false,
-            None,
-            &pending,
-            &writer,
-            &peer,
-        );
-        let created = captured_values(&mut rx);
-        let session_id = created[0]["result"]["sessionId"].clone();
-
-        dispatch_rpc(
-            json!({"jsonrpc": "2.0", "id": 3, "method": "session/new",
-                   "params": {"cwd": peer.workspace.display().to_string(), "mcpServers": []}}),
-            "m",
-            false,
-            None,
-            &pending,
-            &writer,
-            &peer,
-        );
-        assert!(captured_values(&mut rx)[0].get("error").is_some());
-
-        dispatch_rpc(
-            json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
-                   "params": {"sessionId": "foreign", "prompt": [{"type": "text", "text": "x"}]}}),
-            "m",
-            false,
-            None,
-            &pending,
-            &writer,
-            &peer,
-        );
-        assert!(captured_values(&mut rx)[0].get("error").is_some());
-
-        let second = Peer::new();
-        initialize(&second, &writer, &pending);
-        captured_values(&mut rx);
-        dispatch_rpc(
-            json!({"jsonrpc": "2.0", "id": 5, "method": "session/new",
-                   "params": {"cwd": second.workspace.display().to_string(),
-                              "mcpServers": [{"name": "repo-server"}]}}),
-            "m",
-            false,
-            None,
-            &pending,
-            &writer,
-            &second,
-        );
-        assert!(captured_values(&mut rx)[0].get("error").is_some());
-        assert_eq!(peer.session_id().map(Value::String), Some(session_id));
-    }
-
-    #[test]
-    fn an_acp_permission_response_reaches_the_waiting_gate() {
-        let peer = Peer::new();
-        peer.select_acp();
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (writer, mut rx) = capture_writer(8);
-        let (tx, mut answered) = oneshot::channel();
-        lock_pending(&pending).insert(7, tx.into());
-
-        dispatch_rpc(
-            json!({"jsonrpc": "2.0", "id": acp_gate_request_id(7),
-                   "result": {"outcome": {"outcome": "selected", "optionId": "allow-once"}}}),
-            "m",
-            true,
-            None,
-            &pending,
-            &writer,
-            &peer,
-        );
-        assert_eq!(answered.try_recv(), Ok(Approval::Once));
-        assert!(lock_pending(&pending).is_empty());
-
-        let (tx, mut cancelled) = oneshot::channel();
-        lock_pending(&pending).insert(8, tx.into());
-        dispatch_rpc(
-            json!({"jsonrpc": "2.0", "id": acp_gate_request_id(8),
-                   "result": {"outcome": {"outcome": "cancelled"}}}),
-            "m",
-            true,
-            None,
-            &pending,
-            &writer,
-            &peer,
-        );
-        assert_eq!(
-            cancelled.try_recv(),
-            Ok(Approval::Deny),
-            "cancelled is not consent"
-        );
-        captured_values(&mut rx);
-    }
-
-    #[test]
-    fn escalated_permission_options_omit_the_remembering_tier() {
-        let peer = Peer::new();
-        peer.select_acp();
-        let (writer, mut rx) = capture_writer(8);
-        let gate = AcpGate::new(
-            Arc::clone(&writer),
-            Arc::new(Mutex::new(HashMap::new())),
-            peer,
-        );
-
-        gate.request_acp_permission(1, "shell.exec", Some("cargo test"), true);
-        let escalated = captured_values(&mut rx);
-        assert_eq!(
-            escalated[0]["params"]["toolCall"]["rawInput"]["detail"],
-            "cargo test"
-        );
-        let kinds: Vec<&str> = escalated[0]["params"]["options"]
-            .as_array()
-            .expect("options array")
-            .iter()
-            .filter_map(|option| option["kind"].as_str())
-            .collect();
-        assert_eq!(kinds, ["allow_once", "reject_once"]);
-
-        gate.request_acp_permission(2, "shell.exec", None, false);
-        let plain = captured_values(&mut rx);
-        assert!(
-            plain[0]["params"]["options"]
-                .as_array()
-                .expect("options array")
-                .iter()
-                .any(|option| option["kind"] == "allow_always")
-        );
-    }
-
-    #[tokio::test]
-    async fn acp_always_is_remembered_for_the_live_non_escalated_action() {
-        let peer = Peer::new();
-        peer.select_acp();
-        peer.start_session(&peer.workspace.display().to_string(), Some(&json!([])))
-            .unwrap();
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (writer, mut rx) = capture_writer(8);
-        let gate = Arc::new(AcpGate::new(
-            Arc::clone(&writer),
-            Arc::clone(&pending),
-            peer.clone(),
-        ));
-        let waiting = {
-            let gate = Arc::clone(&gate);
-            tokio::spawn(async move { gate.confirm("edit", Some("a.rs"), false).await })
-        };
-        let frame = rx.recv().await.expect("permission request");
-        let request: Value = match frame {
-            Outbound::Frame(frame) => serde_json::from_slice(&frame).unwrap(),
-            Outbound::Close(_) => panic!("writer closed"),
-        };
-        dispatch_rpc(
-            json!({"jsonrpc": "2.0", "id": request["id"].clone(),
-                   "result": {"outcome": {"outcome": "selected", "optionId": "allow-always"}}}),
-            "m",
-            true,
-            None,
-            &pending,
-            &writer,
-            &peer,
-        );
-        assert_eq!(waiting.await.unwrap(), Approval::Always);
-        assert_eq!(
-            gate.confirm("edit", Some("b.rs"), false).await,
-            Approval::Always
-        );
-        assert!(rx.try_recv().is_err(), "remembered approval prompted again");
     }
 
     #[test]
@@ -2823,9 +2075,8 @@ mod tests {
             .lock()
             .unwrap()
             .extend(["same".to_string(), "same".into(), "late".into()]);
-        let sink = AcpSink {
+        let sink = Sink {
             writer,
-            peer: Peer::new(),
             unread: unread.clone(),
         };
         sink.steered("same");
@@ -2840,9 +2091,8 @@ mod tests {
     fn desktop_waiting_and_retry_notices_are_emitted_without_extending_standard_acp() {
         use kernel::StreamSink;
         let (writer, mut rx) = capture_writer(8);
-        let sink = AcpSink {
+        let sink = Sink {
             writer,
-            peer: Peer::new(),
             unread: Unread::default(),
         };
         sink.phase(kernel::progress::Phase::Generating);
@@ -2856,19 +2106,14 @@ mod tests {
                 .unwrap()
                 .contains("Retrying")
         );
-        sink.peer.select_acp();
-        sink.phase(kernel::progress::Phase::Generating);
-        sink.notice("retry");
-        assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn turn_callbacks_preserve_the_typed_stream_contract_and_tui_progress() {
         use kernel::StreamSink;
         let (writer, mut rx) = capture_writer(32);
-        let sink = AcpSink {
+        let sink = Sink {
             writer,
-            peer: Peer::new(),
             unread: Unread::default(),
         };
         sink.phase(kernel::Phase::Generating);
@@ -2931,32 +2176,6 @@ mod tests {
                 indicative: true
             }
         ));
-
-        // These new Medha callbacks do not extend the editor's ACP dialect.
-        sink.peer.select_acp();
-        sink.tool_started("read", None);
-        sink.cost(0.50, true);
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn acp_tool_updates_keep_the_provider_call_id() {
-        let peer = Peer::new();
-        peer.select_acp();
-        peer.start_session(&peer.workspace.display().to_string(), Some(&json!([])))
-            .unwrap();
-        let (writer, mut rx) = capture_writer(8);
-        let sink = AcpSink {
-            writer,
-            peer,
-            unread: Unread::default(),
-        };
-        sink.tool_call_with_id("call-17", "read", &json!({"path": "a.rs"}));
-        sink.tool_result_with_id("call-17", "read", true, &json!({"content": "x"}));
-        let updates = captured_values(&mut rx);
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0]["params"]["update"]["toolCallId"], "call-17");
-        assert_eq!(updates[1]["params"]["update"]["toolCallId"], "call-17");
     }
 
     #[test]
@@ -2975,216 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn medha_stop_reasons_map_onto_the_acp_vocabulary() {
-        assert_eq!(acp_stop_reason(&StopReason::Finished), "end_turn");
-        assert_eq!(acp_stop_reason(&StopReason::Interrupted), "cancelled");
-        assert_eq!(acp_stop_reason(&StopReason::VerificationFailed), "refusal");
-        assert_eq!(
-            acp_stop_reason(&StopReason::Budget(kernel::BudgetStop::Tokens)),
-            "max_tokens"
-        );
-    }
-
-    #[test]
-    fn acp_prompt_blocks_keep_text_resources_and_images() {
-        let prompt = json!([
-            {"type": "text", "text": "explain"},
-            {"type": "resource", "resource": {"uri": "file:///a.rs", "text": "fn main() {}"}},
-            {"type": "image", "mimeType": "image/jpeg", "data": "QUJD"},
-            {"type": "audio", "data": "not supported"},
-        ]);
-
-        let parsed = acp_prompt(Some(&prompt));
-
-        assert_eq!(parsed.text, "explain\nfn main() {}");
-        assert_eq!(
-            parsed.images,
-            [AcpImage::Inline("image/jpeg".into(), "QUJD".into())]
-        );
-        assert_eq!(acp_prompt(None), AcpPrompt::default());
-        assert!(acp_prompt(None).is_empty());
-    }
-
-    /// Dragging a file into an editor's composer usually sends a link to it,
-    /// not its bytes. Reading only the inline form loses the attachment with no
-    /// sign anything was missing.
-    #[test]
-    fn a_linked_image_file_is_an_attachment() {
-        let by_mime = acp_prompt(Some(&json!([
-            {"type": "resource_link", "uri": "file:///tmp/a%20shot.png",
-             "name": "a shot.png", "mimeType": "image/png"},
-        ])));
-        assert_eq!(
-            by_mime.images,
-            [AcpImage::Linked("/tmp/a shot.png".into())],
-            "a percent-encoded file URI names a real path"
-        );
-
-        // Editors do not always send a mimeType; the extension decides then.
-        let by_extension = acp_prompt(Some(&json!([
-            {"type": "resource_link", "uri": "file:///tmp/diagram.JPEG"},
-        ])));
-        assert_eq!(
-            by_extension.images,
-            [AcpImage::Linked("/tmp/diagram.JPEG".into())]
-        );
-    }
-
-    /// A linked file that is not an image still has to be visible: saying so is
-    /// what stops the model answering as though nothing was attached.
-    #[test]
-    fn a_linked_non_image_is_named_rather_than_dropped() {
-        let parsed = acp_prompt(Some(&json!([
-            {"type": "resource_link", "uri": "file:///tmp/report.pdf", "mimeType": "application/pdf"},
-            {"type": "resource_link", "uri": "https://example.com/remote.png", "mimeType": "image/png"},
-        ])));
-
-        assert!(parsed.images.is_empty(), "no bytes to attach");
-        assert_eq!(
-            parsed.text,
-            "[attached resource: file:///tmp/report.pdf]\n\
-             [attached resource: https://example.com/remote.png]"
-        );
-    }
-
-    #[tokio::test]
-    async fn acp_linked_image_uses_the_shared_source_limit() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("huge.png");
-        std::fs::File::create(&path)
-            .unwrap()
-            .set_len(media::MAX_SOURCE_BYTES as u64 + 1)
-            .unwrap();
-        let artifacts: Arc<dyn kernel::ArtifactStore> =
-            Arc::new(store::FileArtifactStore::open(temp.path().join("artifacts")).unwrap());
-        let error = admit_acp_images(vec![AcpImage::Linked(path)], &artifacts)
-            .await
-            .unwrap_err();
-        assert!(error.contains("larger"), "{error}");
-    }
-
-    #[test]
-    fn an_embedded_blob_resource_is_an_image_and_text_resources_still_are_not() {
-        let parsed = acp_prompt(Some(&json!([
-            {"type": "resource", "resource": {"uri": "file:///a.png", "mimeType": "image/png", "blob": "QUJD"}},
-            {"type": "resource", "resource": {"uri": "file:///a.rs", "mimeType": "text/rust", "text": "fn main() {}"}},
-        ])));
-
-        assert_eq!(
-            parsed.images,
-            [AcpImage::Inline("image/png".into(), "QUJD".into())]
-        );
-        assert_eq!(parsed.text, "fn main() {}");
-    }
-
-    #[test]
-    fn an_image_only_prompt_is_a_prompt() {
-        let parsed = acp_prompt(Some(&json!([
-            {"type": "image", "data": "QUJD"},
-        ])));
-
-        assert!(!parsed.is_empty(), "an image alone is enough to answer");
-        assert_eq!(
-            parsed.images,
-            [AcpImage::Inline("image/png".into(), "QUJD".into())]
-        );
-    }
-
-    #[tokio::test]
-    async fn an_image_only_prompt_carries_the_shared_default_text() {
-        let peer = Peer::new();
-        let (writer, mut rx) = capture_writer(8);
-        let session = peer
-            .start_session(&peer.workspace.display().to_string(), Some(&json!([])))
-            .unwrap();
-
-        let action = dispatch_line(
-            &json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
-                    "params": {"sessionId": session,
-                               "prompt": [{"type": "image", "mimeType": "image/png", "data": "QUJD"}]}})
-                .to_string(),
-            "m",
-            false,
-            None,
-            &Default::default(),
-            &writer,
-            &peer,
-        );
-
-        assert_eq!(
-            action,
-            RpcAction::StartTurn {
-                content: crate::attachments::IMAGE_ONLY_PROMPT.to_string(),
-                images: vec![AcpImage::Inline("image/png".into(), "QUJD".into())],
-                reply_to: Some(json!(4)),
-                admission_reply_to: None,
-            }
-        );
-        let _ = captured_values(&mut rx);
-    }
-
-    /// Steering carries text only, so an image arriving mid-turn is refused
-    /// rather than quietly dropped from the message that mentions it.
-    #[tokio::test]
-    async fn an_image_cannot_join_a_running_turn() {
-        let peer = Peer::new();
-        let (writer, mut rx) = capture_writer(8);
-        let session = peer
-            .start_session(&peer.workspace.display().to_string(), Some(&json!([])))
-            .unwrap();
-        let (handle, _queue) = kernel::InterruptQueue::pair();
-
-        let action = dispatch_line(
-            &json!({"jsonrpc": "2.0", "id": 5, "method": "session/prompt",
-                    "params": {"sessionId": session,
-                               "prompt": [{"type": "text", "text": "and this"},
-                                          {"type": "image", "data": "QUJD"}]}})
-            .to_string(),
-            "m",
-            true,
-            Some(&handle),
-            &Default::default(),
-            &writer,
-            &peer,
-        );
-
-        assert_eq!(action, RpcAction::None);
-        let replies = captured_values(&mut rx);
-        let message = replies
-            .iter()
-            .filter_map(|value| value.pointer("/error/message").and_then(Value::as_str))
-            .collect::<String>();
-        assert!(message.contains("already running"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn editors_are_told_images_are_accepted() {
-        let peer = Peer::new();
-        let (writer, mut rx) = capture_writer(8);
-
-        dispatch_line(
-            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                    "params": {"protocolVersion": ACP_PROTOCOL_VERSION}})
-            .to_string(),
-            "m",
-            false,
-            None,
-            &Default::default(),
-            &writer,
-            &peer,
-        );
-
-        let replies = captured_values(&mut rx);
-        assert_eq!(
-            replies[0].pointer("/result/agentCapabilities/promptCapabilities/image"),
-            Some(&json!(true))
-        );
-    }
-
-    /// The original bridge must keep working for callers that already use it.
-    #[test]
     fn a_legacy_initialize_does_not_switch_dialects() {
-        let peer = Peer::new();
         let (writer, mut rx) = capture_writer(8);
         dispatch_rpc(
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
@@ -3193,10 +2203,8 @@ mod tests {
             None,
             &Arc::new(Mutex::new(HashMap::new())),
             &writer,
-            &peer,
         );
-        assert!(!peer.is_acp());
-        assert_eq!(captured_values(&mut rx)[0]["result"]["proto"], json!("1.0"));
+        assert_eq!(captured_values(&mut rx)[0]["error"]["code"], -32601);
     }
 
     #[test]
@@ -3349,7 +2357,6 @@ mod tests {
                 None,
                 &Arc::new(Mutex::new(HashMap::new())),
                 &writer,
-                &Peer::new(),
             ),
             RpcAction::None
         );
@@ -3389,7 +2396,6 @@ mod tests {
                 running.then_some(&handle),
                 &pending,
                 &writer,
-                &Peer::new(),
             );
         }
 
@@ -3430,11 +2436,7 @@ mod tests {
     async fn approval_entries_are_raii_scoped_and_disconnect_denies_them() {
         let (writer, mut rx) = capture_writer(8);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let gate = Arc::new(AcpGate::new(
-            Arc::clone(&writer),
-            Arc::clone(&pending),
-            Peer::new(),
-        ));
+        let gate = Arc::new(Gate::new(Arc::clone(&writer), Arc::clone(&pending)));
 
         let dropped_gate = Arc::clone(&gate);
         let dropped = tokio::spawn(async move { dropped_gate.confirm("edit", None, false).await });
@@ -3466,11 +2468,7 @@ mod tests {
         use kernel::NetworkDecision as N;
         let (writer, mut output) = capture_writer(32);
         let pending: Pending = Arc::default();
-        let gate = Arc::new(AcpGate::new(
-            Arc::clone(&writer),
-            Arc::clone(&pending),
-            Peer::new(),
-        ));
+        let gate = Arc::new(Gate::new(Arc::clone(&writer), Arc::clone(&pending)));
         for (choice, expected) in [
             ("once", N::Once),
             ("session", N::Session),
@@ -3505,7 +2503,6 @@ mod tests {
                 None,
                 &pending,
                 &writer,
-                &Peer::new(),
             );
             assert_eq!(asked.await.unwrap(), expected);
             let replies = captured_values(&mut output);
@@ -3532,11 +2529,7 @@ mod tests {
         use kernel::PathApproval as P;
         let (writer, mut output) = capture_writer(32);
         let pending: Pending = Arc::default();
-        let gate = Arc::new(AcpGate::new(
-            Arc::clone(&writer),
-            Arc::clone(&pending),
-            Peer::new(),
-        ));
+        let gate = Arc::new(Gate::new(Arc::clone(&writer), Arc::clone(&pending)));
         let folder = Path::new("/work/proj/src");
         for (offered, choice, expected) in [
             (Some(folder), "once", P::Once),
@@ -3600,7 +2593,6 @@ mod tests {
                 None,
                 &pending,
                 &writer,
-                &Peer::new(),
             );
             assert_eq!(asked.await.unwrap(), expected);
             captured_values(&mut output);
@@ -3611,11 +2603,7 @@ mod tests {
     async fn escalated_access_refuses_remembering_without_consuming_the_prompt() {
         let (writer, mut output) = capture_writer(16);
         let pending: Pending = Arc::default();
-        let gate = Arc::new(AcpGate::new(
-            Arc::clone(&writer),
-            Arc::clone(&pending),
-            Peer::new(),
-        ));
+        let gate = Arc::new(Gate::new(Arc::clone(&writer), Arc::clone(&pending)));
         let asked =
             tokio::spawn(async move { gate.confirm_access(Some("outside sandbox"), true).await });
         let frame = output.recv().await.unwrap();
@@ -3648,11 +2636,10 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_question_settles_the_form_once_and_releases_its_response() {
         let (writer, mut output) = capture_writer(8);
-        let pending: crate::acp_questions::Questions = Arc::default();
-        let asker = crate::acp_questions::AcpAsker {
+        let pending: crate::chat_questions::Questions = Arc::default();
+        let asker = crate::chat_questions::Asker {
             writer,
             pending: Arc::clone(&pending),
-            peer: Peer::new(),
             next_id: AtomicU64::new(1),
         };
         let asked = tokio::spawn(async move { kernel::Asker::ask(&asker, vec![]).await });
@@ -3680,15 +2667,7 @@ mod tests {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (malformed_tx, mut malformed_rx) = oneshot::channel();
         lock_pending(&pending).insert(1, malformed_tx.into());
-        dispatch_line(
-            "{broken",
-            "model",
-            true,
-            None,
-            &pending,
-            &writer,
-            &Peer::new(),
-        );
+        dispatch_line("{broken", "model", true, None, &pending, &writer);
         assert_eq!(malformed_rx.try_recv(), Ok(Approval::Deny));
         assert!(lock_pending(&pending).is_empty());
         captured_values(&mut rx);
@@ -3704,7 +2683,6 @@ mod tests {
                 Some(&handle),
                 &pending,
                 &writer,
-                &Peer::new(),
             ),
             RpcAction::Shutdown
         );
@@ -3753,11 +2731,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_late_cancel_cannot_stop_or_deny_the_next_turn() {
+        let control = TurnControl::default();
+        let (handle, queue) = kernel::InterruptQueue::pair();
+        let task = tokio::spawn(std::future::pending::<()>());
+        control.own(2, handle, task.abort_handle());
+        let pending: Pending = Arc::default();
+        let (answer, mut answered) = oneshot::channel();
+        lock_pending(&pending).insert(5, answer.into());
+        *control.gates.lock().unwrap() = Some((pending.clone(), Default::default()));
+        assert!(!control.cancel_for(Some(1)));
+        assert!(!queue.token().is_cancelled());
+        assert!(answered.try_recv().is_err());
+        assert_eq!(lock_pending(&pending).len(), 1);
+        assert!(control.cancel_for(Some(2)));
+        assert!(queue.token().is_cancelled());
+        assert_eq!(answered.await.unwrap(), Approval::Deny);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn backend_control_cancels_the_turn_and_denies_its_gate_without_rpc_input() {
         let control = TurnControl::default();
         let (handle, queue) = kernel::InterruptQueue::pair();
         let owned = tokio::spawn(std::future::pending::<()>());
-        control.own(handle, owned.abort_handle());
+        control.own(1, handle, owned.abort_handle());
         let pending: Pending = Arc::default();
         let (answer, answered) = oneshot::channel();
         lock_pending(&pending).insert(5, answer.into());
@@ -3791,7 +2790,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         waiting.await.unwrap();
-        control.own(handle, task.abort_handle());
+        control.own(1, handle, task.abort_handle());
         assert!(control.abort());
         assert!(queue.token().is_cancelled());
         assert!(control.active.lock().unwrap().is_some());
@@ -3806,11 +2805,7 @@ mod tests {
     fn child_streams_keep_parent_identity_tool_ids_and_returned_text() {
         use runtime::agents::AgentWatcher;
         let (writer, mut output) = capture_writer(32);
-        let peer = Peer::new();
-        let watch = crate::acp_agents::Watch {
-            writer,
-            peer: peer.clone(),
-        };
+        let watch = crate::chat_agents::Watch { writer };
         let session = ulid::Ulid::new();
         let path = orchestrator::AgentPath::root().child("reviewer").unwrap();
         for step in [
@@ -3856,14 +2851,6 @@ mod tests {
         assert_eq!(frames[4]["params"]["step"]["data"]["id"], "call-7");
         assert_eq!(frames[8]["params"]["step"]["data"], json!(["keep me"]));
         assert_eq!(frames[9]["params"]["total_tokens"], 23);
-        peer.select_acp();
-        watch.step(
-            Some(session),
-            &path,
-            protocol::AgentStep::Text("private child".into()),
-        );
-        watch.usage(&kernel::Usage::default());
-        assert!(captured_values(&mut output).is_empty());
     }
 
     #[test]
@@ -3916,7 +2903,6 @@ mod tests {
             writer: blocked_writer,
             pending: _,
             questions: _,
-            peer: _,
             writer_task: blocked_task,
             control: _,
         } = bridge_with_output(blocked_output, 2);
@@ -3950,7 +2936,6 @@ mod tests {
             writer: healthy_writer,
             pending: _,
             questions: _,
-            peer: _,
             writer_task: healthy_task,
             control: _,
         } = bridge_with_output(healthy_output, 2);
@@ -3970,7 +2955,6 @@ mod tests {
             writer,
             pending: _,
             questions: _,
-            peer: _,
             writer_task,
             control: _,
         } = bridge_with_output(BrokenOutput, 2);

@@ -219,7 +219,8 @@ mod tests {
         assert_eq!(
             state.snapshot().items,
             vec![Item::User {
-                text: "same".into()
+                text: "same".into(),
+                images: Vec::new()
             }]
         );
     }
@@ -432,6 +433,7 @@ pub(crate) struct Presentation {
     conversation: String,
     running: bool,
     turn: u64,
+    history_start: Option<u64>,
     pending_steers: Vec<String>,
     force_aborting: bool,
     settings: Option<protocol::Settings>,
@@ -446,6 +448,37 @@ pub(crate) struct Presentation {
 }
 
 impl Presentation {
+    pub(crate) fn mark_history(&mut self) {
+        self.history_start = Some(self.rows.omitted + self.rows.items.len() as u64);
+    }
+
+    pub(crate) fn history_tail(&self) -> Result<Vec<Item>, &'static str> {
+        let start = self
+            .history_start
+            .ok_or("The active history boundary is unavailable")?;
+        if start < self.rows.omitted {
+            return Err(
+                "The active turn exceeds the live replay budget. Wait for it to finish before loading.",
+            );
+        }
+        let start = (start - self.rows.omitted) as usize;
+        let items: Vec<_> = self
+            .rows
+            .items
+            .iter()
+            .skip(start)
+            .map(|(item, _)| item.clone())
+            .collect();
+        if items
+            .iter()
+            .any(|item| matches!(item, Item::PreviewOmitted { .. }))
+        {
+            return Err(
+                "The active turn includes oversized output. Wait for it to finish before loading.",
+            );
+        }
+        Ok(items)
+    }
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
@@ -482,6 +515,7 @@ impl Presentation {
                 {
                     self.rows.push(Item::User {
                         text: message.content.clone(),
+                        images: crate::chat_history::images(&message.attachments),
                     })
                 }
                 kernel::Role::Assistant => {
@@ -537,6 +571,7 @@ impl Presentation {
                 self.rows.attempt = self.rows.items.len();
                 self.rows.turn_from = self.rows.items.len();
             }
+            TurnEvent::Settled { .. } => {}
             TurnEvent::Steered { content } => {
                 if let Some(index) = self
                     .pending_steers
@@ -545,9 +580,17 @@ impl Presentation {
                 {
                     self.pending_steers.remove(index);
                 }
-                self.rows.push(Item::User { text: content });
+                self.rows.push(Item::User {
+                    text: content,
+                    images: Vec::new(),
+                });
             }
-            TurnEvent::User { content } => self.rows.push(Item::User { text: content }),
+            TurnEvent::User {
+                content, images, ..
+            } => self.rows.push(Item::User {
+                text: content,
+                images,
+            }),
             TurnEvent::Queued {
                 content: Some(content),
             } => self.pending_steers.push(content),
@@ -745,7 +788,10 @@ impl Presentation {
                     pane.seen = self.revision;
                     match event.step {
                         AgentStep::Task { objective, .. } => {
-                            pane.rows.push(Item::User { text: objective });
+                            pane.rows.push(Item::User {
+                                text: objective,
+                                images: Vec::new(),
+                            });
                             pane.rows.attempt = pane.rows.items.len();
                         }
                         AgentStep::Text(delta) => pane.rows.text(&delta, false),
@@ -785,7 +831,10 @@ impl Presentation {
                         AgentStep::SteerQueued(_) => pane.pending = pane.pending.saturating_add(1),
                         AgentStep::Steered(text) => {
                             pane.pending = pane.pending.saturating_sub(1);
-                            pane.rows.push(Item::User { text });
+                            pane.rows.push(Item::User {
+                                text,
+                                images: Vec::new(),
+                            });
                         }
                         AgentStep::SteersReturned(texts) => {
                             pane.pending = pane.pending.saturating_sub(texts.len());

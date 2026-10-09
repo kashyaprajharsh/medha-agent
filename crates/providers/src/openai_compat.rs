@@ -103,10 +103,13 @@ fn profile_reasoning_efforts(profile: &ProviderProfile) -> Vec<ReasoningEffort> 
     if profile.reasoning == ReasoningSupport::Unsupported {
         return Vec::new();
     }
-    let levels = profile
-        .reasoning_efforts
-        .as_deref()
-        .unwrap_or(ReasoningEffort::ALL);
+    let levels = profile.reasoning_efforts.as_deref().unwrap_or_else(|| {
+        if profile.protocol == Protocol::GeminiInteractions {
+            gemini_interactions::known_reasoning_efforts(&profile.model).unwrap_or(&[])
+        } else {
+            ReasoningEffort::ALL
+        }
+    });
     levels
         .iter()
         .copied()
@@ -660,6 +663,7 @@ pub async fn list_models_for_profile(
     // Bounded timeout: this runs at startup before the UI paints, so a slow or
     // unreachable endpoint must not hang the launch (it falls back gracefully).
     let client = reqwest::Client::builder()
+        .user_agent(http::USER_AGENT)
         .timeout(std::time::Duration::from_secs(6))
         // Model discovery carries the credential too — see transport::http::client.
         .no_proxy()
@@ -2260,6 +2264,8 @@ mod wire_tool_name_tests {
 #[cfg(test)]
 mod gemini_client_tests {
     use super::*;
+    use kernel::{BlastRadius, ToolCategory, ToolSpec};
+    use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -2289,6 +2295,13 @@ mod gemini_client_tests {
                 headers
                     .lines()
                     .any(|line| line.eq_ignore_ascii_case("x-goog-api-key: discovery-secret")),
+                "{headers}"
+            );
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line
+                        .eq_ignore_ascii_case(&format!("user-agent: {}", http::USER_AGENT))),
                 "{headers}"
             );
             let body = serde_json::json!({
@@ -2351,6 +2364,9 @@ mod gemini_client_tests {
                     break;
                 }
             }
+            assert!(String::from_utf8_lossy(&bytes).lines().any(|line| {
+                line.eq_ignore_ascii_case(&format!("user-agent: {}", http::USER_AGENT))
+            }));
             let body = serde_json::json!({
                 "object": "list",
                 "data": [
@@ -2463,7 +2479,7 @@ mod gemini_client_tests {
 
         let mut profile = ProviderProfile::openai_chat(
             format!("http://{address}/v1"),
-            "gemini-model",
+            "gemini-3.6-flash",
             AuthKind::XGoogApiKey,
         );
         profile.protocol = Protocol::GeminiInteractions;
@@ -2519,12 +2535,175 @@ mod gemini_client_tests {
                         && state.value == serde_json::json!("opaque-signed-state")
                 })
         )));
-        assert!(matches!(blocks.last(), Some(Block::Usage(usage)) if usage.total_tokens == 9));
+        assert!(
+            matches!(blocks.last(), Some(Block::Usage(usage)) if usage.total_tokens == 9 && usage.completion_tokens == 6)
+        );
 
         let body = rx.await.unwrap();
-        assert_eq!(body["model"], "gemini-model");
+        assert_eq!(body["model"], "gemini-3.6-flash");
         assert_eq!(body["store"], false);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_http_reports_usage_and_refuses_incomplete_calls_in_both_modes() {
+        // Synthetic v1 responses: a syntactically valid call is executable only
+        // after a successful terminal status, regardless of response mode.
+        for streaming in [false, true] {
+            for status in ["requires_action", "incomplete"] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let steps = vec![
+                    json!({"type":"model_output","content":[{"type":"text","text":"checking"}]}),
+                    json!({"type":"function_call","id":"c1","name":"fs_read","arguments":{"path":"dummy.txt"}}),
+                ];
+                let usage = json!({"total_input_tokens":21576,"total_cached_tokens":16356,
+                    "total_output_tokens":1,"total_thought_tokens":56,"total_tokens":21633});
+                let (kind, response) = if streaming {
+                    let mut events = String::new();
+                    for (index, step) in steps.iter().enumerate() {
+                        for event in [
+                            json!({"event_type":"step.start","index":index,"step":step}),
+                            json!({"event_type":"step.stop","index":index}),
+                        ] {
+                            events.push_str(&format!("data: {event}\n\n"));
+                        }
+                    }
+                    let terminal = json!({"event_type":"interaction.completed",
+                        "interaction":{"status":status,"usage":usage}});
+                    events.push_str(&format!("data: {terminal}\n\n"));
+                    ("text/event-stream", events)
+                } else {
+                    (
+                        "application/json",
+                        json!({"status":status,"steps":steps,"usage":usage}).to_string(),
+                    )
+                };
+                let served = async {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "client closed before headers");
+                        bytes.extend_from_slice(&chunk[..read]);
+                        assert!(bytes.len() <= 32768, "fixture request exceeded its bound");
+                        if let Some(position) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break position + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+                    assert!(headers.starts_with("POST /v1/interactions HTTP/1.1"));
+                    assert!(
+                        headers
+                            .lines()
+                            .any(|line| line.eq_ignore_ascii_case("x-goog-api-key: dummy-key"))
+                    );
+                    assert!(headers.lines().any(|line| {
+                        line.eq_ignore_ascii_case(&format!("user-agent: {}", http::USER_AGENT))
+                    }));
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().ok())
+                                .flatten()
+                        })
+                        .expect("request length");
+                    assert!(header_end + length <= 32768);
+                    while bytes.len() < header_end + length {
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "client closed before body");
+                        bytes.extend_from_slice(&chunk[..read]);
+                        assert!(bytes.len() <= 32768);
+                    }
+                    let body: Value =
+                        serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                    assert_eq!(body["stream"], streaming);
+                    assert_eq!(body["model"], "gemini-3.8-flash");
+                    assert_eq!(body["generation_config"]["thinking_level"], "high");
+                    assert_eq!(body["tools"][0]["name"], "fs_read");
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                        response.len()
+                    );
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                };
+
+                let mut profile = ProviderProfile::openai_chat(
+                    format!("http://{address}/v1"),
+                    "gemini-3.8-flash",
+                    AuthKind::XGoogApiKey,
+                );
+                profile.protocol = Protocol::GeminiInteractions;
+                let provider = ProviderClient::from_profile(profile, "dummy-key")
+                    .unwrap()
+                    .with_reasoning(ReasoningConfig {
+                        enabled: Some(true),
+                        effort: Some(ReasoningEffort::High),
+                    })
+                    .unwrap();
+                provider.set_streaming(streaming);
+                let request = provider.prepare_request(&CompiledContext {
+                    model: String::new(), messages: vec![Message::user("synthetic request")], ordered: None,
+                    tools: vec![ToolSpec { name: "fs.read".into(), description: "synthetic read".into(),
+                        schema: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                        blast_radius: BlastRadius::Read, category: ToolCategory::Read, icon: "r".into() }],
+                }).unwrap();
+                let received = async {
+                    match provider.stream_prepared(&request).await {
+                        Ok(stream) => stream.collect::<Vec<_>>().await,
+                        Err(error) => vec![Err(error)],
+                    }
+                };
+                // No detached server tasks remain if the request or assertion fails.
+                let (blocks, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(received, served)
+                })
+                .await
+                .expect("local interaction timed out");
+                if status == "incomplete" {
+                    assert!(
+                        blocks
+                            .iter()
+                            .any(|block| matches!(block, Err(ProviderError::Truncated)))
+                    );
+                    assert!(blocks.iter().all(|block| !matches!(
+                        block,
+                        Ok(Block::ToolIntent(_) | Block::CompletedMessage(_))
+                    )));
+                    assert!(
+                        blocks
+                            .iter()
+                            .filter_map(|block| block.as_ref().err())
+                            .all(|error| !error.is_retryable())
+                    );
+                } else {
+                    let blocks: Vec<_> = blocks.into_iter().collect::<Result<_, _>>().unwrap();
+                    assert!(
+                        blocks
+                            .iter()
+                            .any(|block| matches!(block, Block::ToolIntent(call)
+                        if call.tool == "fs.read" && call.args["path"] == "dummy.txt"))
+                    );
+                    assert_eq!(
+                        blocks
+                            .iter()
+                            .filter(|block| matches!(block, Block::Usage(_)))
+                            .count(),
+                        1
+                    );
+                    let Some(Block::Usage(usage)) = blocks.last() else {
+                        panic!("usage missing")
+                    };
+                    assert_eq!(usage.prompt_tokens, 21576);
+                    assert_eq!(usage.completion_tokens, 57);
+                    assert_eq!(usage.total_tokens, 21633);
+                    assert_eq!(usage.cached_prompt_tokens, Some(16356));
+                }
+            }
+        }
     }
 
     #[test]
@@ -2557,6 +2736,86 @@ mod gemini_client_tests {
 #[cfg(test)]
 mod reasoning_request_tests {
     use super::*;
+
+    fn gemini_profile(model: &str) -> ProviderProfile {
+        let mut profile =
+            ProviderProfile::openai_chat("http://example.test/v1", model, AuthKind::None);
+        profile.protocol = Protocol::GeminiInteractions;
+        profile
+    }
+
+    #[test]
+    fn gemini_efforts_are_model_specific_and_explicit_overrides_win() {
+        let flash = ProviderClient::from_profile(gemini_profile("gemini-3.8-flash"), "").unwrap();
+        assert_eq!(
+            flash.reasoning_efforts(),
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High
+            ]
+        );
+        assert!(
+            flash
+                .set_reasoning(ReasoningConfig::from_effort_text("minimal").unwrap())
+                .is_err()
+        );
+        for model in ["gemini-3.6-flash", "gemini-3.5-flash-lite"] {
+            let provider = ProviderClient::from_profile(gemini_profile(model), "").unwrap();
+            assert!(
+                provider
+                    .reasoning_efforts()
+                    .contains(&ReasoningEffort::Minimal)
+            );
+            provider
+                .set_reasoning(ReasoningConfig::from_effort_text("minimal").unwrap())
+                .unwrap();
+        }
+        let mut custom = gemini_profile("custom-model");
+        custom.reasoning_efforts = Some(vec![ReasoningEffort::Minimal, ReasoningEffort::High]);
+        let provider = ProviderClient::from_profile(custom, "").unwrap();
+        assert_eq!(
+            provider.reasoning_efforts(),
+            [ReasoningEffort::Minimal, ReasoningEffort::High]
+        );
+        provider
+            .set_reasoning(ReasoningConfig::from_effort_text("minimal").unwrap())
+            .unwrap();
+        let unknown = ProviderClient::from_profile(gemini_profile("unknown-model"), "").unwrap();
+        assert!(
+            unknown.reasoning_efforts().is_empty(),
+            "unknown Gemini levels stay unverified; use the server default or an explicit profile"
+        );
+    }
+
+    #[test]
+    fn switching_from_minimal_to_gemini_flash_uses_server_default() {
+        let provider =
+            ProviderClient::from_profile(gemini_profile("gemini-3.6-flash"), "").unwrap();
+        provider
+            .set_reasoning(ReasoningConfig::from_effort_text("minimal").unwrap())
+            .unwrap();
+        provider
+            .switch_provider_profile(gemini_profile("gemini-3.8-flash"), "")
+            .unwrap();
+        assert_eq!(provider.reasoning(), ReasoningConfig::default());
+        let request = provider
+            .prepare_request(&CompiledContext {
+                model: String::new(),
+                messages: vec![Message::user("hi")],
+                ordered: None,
+                tools: Vec::new(),
+            })
+            .unwrap();
+        assert!(request.body.get("generation_config").is_none());
+        provider
+            .set_reasoning(ReasoningConfig::from_effort_text("medium").unwrap())
+            .unwrap();
+        assert_eq!(
+            provider.prepare_request(&request.context).unwrap().body["generation_config"]["thinking_level"],
+            "medium"
+        );
+    }
 
     #[test]
     fn reading_model_limits_never_relocks_the_connection() {
@@ -2773,8 +3032,11 @@ mod reasoning_request_tests {
                 .is_err()
         );
         assert_eq!(provider.reasoning().effort, Some(ReasoningEffort::High));
-        let mut gemini =
-            ProviderProfile::openai_chat("http://example.test/v1", "gemini", AuthKind::None);
+        let mut gemini = ProviderProfile::openai_chat(
+            "http://example.test/v1",
+            "gemini-3.8-flash",
+            AuthKind::None,
+        );
         gemini.protocol = Protocol::GeminiInteractions;
         provider.switch_provider_profile(gemini, "").unwrap();
         for effort in ["xhigh", "max", "ultra", "none"] {

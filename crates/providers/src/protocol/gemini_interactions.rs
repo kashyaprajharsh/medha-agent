@@ -15,6 +15,18 @@ use std::collections::{BTreeMap, HashMap};
 
 const THOUGHT_SIGNATURE: &str = "thought_signature";
 
+/// Verified offline defaults, also used when catalogue metadata is unavailable.
+/// Unknown model IDs need the server default or an explicit profile override.
+/// https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
+pub(crate) fn known_reasoning_efforts(model: &str) -> Option<&'static [ReasoningEffort]> {
+    use ReasoningEffort::{High, Low, Medium, Minimal};
+    match model.strip_prefix("models/").unwrap_or(model) {
+        "gemini-3.8-flash" => Some(&[Low, Medium, High]),
+        "gemini-3.6-flash" | "gemini-3.5-flash-lite" => Some(&[Minimal, Low, Medium, High]),
+        _ => None,
+    }
+}
+
 #[derive(Serialize)]
 struct Request {
     model: String,
@@ -396,9 +408,21 @@ fn thought_signature(states: &[ProviderState]) -> Result<Option<String>, Provide
 
 #[derive(Default, Clone)]
 struct UsageRaw {
-    input: u32,
-    output: u32,
-    total: u32,
+    input: Option<u32>,
+    output: Option<u32>,
+    thought: Option<u32>,
+    total: Option<u32>,
+    cached: Option<u32>,
+}
+
+impl UsageRaw {
+    fn merge(&mut self, newer: Self) {
+        self.input = newer.input.or(self.input);
+        self.output = newer.output.or(self.output);
+        self.thought = newer.thought.or(self.thought);
+        self.total = newer.total.or(self.total);
+        self.cached = newer.cached.or(self.cached);
+    }
 }
 
 fn usage_from(value: &Value) -> Option<UsageRaw> {
@@ -407,29 +431,36 @@ fn usage_from(value: &Value) -> Option<UsageRaw> {
         .and_then(|interaction| interaction.get("usage"))
         .or_else(|| value.get("usage"))
         .or_else(|| value.pointer("/metadata/total_usage"))?;
-    let number = |name: &str| {
+    let reported = |name: &str| {
         usage
             .get(name)
             .and_then(Value::as_u64)
-            .unwrap_or_default()
-            .min(u64::from(u32::MAX)) as u32
+            .map(|count| count.min(u64::from(u32::MAX)) as u32)
     };
     Some(UsageRaw {
-        input: number("total_input_tokens"),
-        output: number("total_output_tokens"),
-        total: number("total_tokens"),
+        input: reported("total_input_tokens"),
+        output: reported("total_output_tokens"),
+        thought: reported("total_thought_tokens"),
+        total: reported("total_tokens"),
+        cached: reported("total_cached_tokens"),
     })
 }
 
 fn usage_block(usage: UsageRaw) -> Block {
+    let prompt_tokens = usage.input.unwrap_or_default();
     Block::Usage(Usage {
-        prompt_tokens: usage.input,
-        completion_tokens: usage.output,
-        total_tokens: usage.total,
-        // The Interactions usage object reports no cache bucket here. Left
-        // unreported rather than guessed at: a zero would be read as a measured
-        // miss and make the route look like one that never caches.
-        cached_prompt_tokens: None,
+        prompt_tokens,
+        // Interactions separates output and thoughts. Google bills both at
+        // the output rate; total_tokens already includes them. Normalize once,
+        // after merging cumulative reports, so repeated thoughts are not added.
+        completion_tokens: usage
+            .output
+            .unwrap_or_default()
+            .saturating_add(usage.thought.unwrap_or_default()),
+        total_tokens: usage.total.unwrap_or_default(),
+        // Cached tokens are a subset of total_input_tokens, not extra input.
+        // Missing remains unknown; a reported zero is a measured cache miss.
+        cached_prompt_tokens: usage.cached.map(|cached| cached.min(prompt_tokens)),
     })
 }
 
@@ -564,22 +595,7 @@ pub(crate) fn parse_interaction(
 ) -> Result<Vec<Block>, ProviderError> {
     let value: Value = serde_json::from_str(body)
         .map_err(|error| ProviderError::Decode(format!("Gemini response parse: {error}")))?;
-    if value.get("status").and_then(Value::as_str) == Some("failed") {
-        return Err(ProviderError::Response(
-            value
-                .get("error")
-                .map(Value::to_string)
-                .unwrap_or_else(|| "Gemini interaction failed".into()),
-        ));
-    }
-    if !matches!(
-        value.get("status").and_then(Value::as_str),
-        Some("completed" | "requires_action")
-    ) {
-        return Err(ProviderError::Stream(
-            "Gemini response omitted a terminal interaction status".into(),
-        ));
-    }
+    validate_terminal_status(&value)?;
     let steps = value
         .get("steps")
         .and_then(Value::as_array)
@@ -591,6 +607,27 @@ pub(crate) fn parse_interaction(
         blocks.push(usage_block(usage));
     }
     Ok(blocks)
+}
+
+/// Check before releasing completed messages/tool intents, including when a
+/// truncated response contains unfinished arguments or an unsigned thought.
+fn validate_terminal_status(interaction: &Value) -> Result<(), ProviderError> {
+    match interaction.get("status").and_then(Value::as_str) {
+        Some("completed" | "requires_action") => Ok(()),
+        Some("incomplete") => Err(ProviderError::Truncated),
+        Some("failed") => Err(ProviderError::Response(
+            interaction
+                .get("error")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "Gemini interaction failed".into()),
+        )),
+        Some("cancelled") => Err(ProviderError::Response(
+            "Gemini interaction was cancelled".into(),
+        )),
+        _ => Err(ProviderError::Stream(
+            "Gemini response omitted a terminal interaction status".into(),
+        )),
+    }
 }
 
 #[derive(Default)]
@@ -655,7 +692,11 @@ impl ResponseDecoder {
         // `interaction.usage`. Retain the newest report so neither shape loses
         // accounting when the terminal payload omits usage.
         if let Some(usage) = usage_from(&value) {
-            self.usage = Some(usage);
+            // Usage fields are optional and reports cumulative. Keep the last
+            // known value of each field without adding successive snapshots.
+            self.usage
+                .get_or_insert_with(UsageRaw::default)
+                .merge(usage);
         }
         let kind = value
             .get("event_type")
@@ -901,6 +942,7 @@ impl ResponseDecoder {
     }
 
     fn complete(&mut self, value: &Value) -> Result<Vec<Block>, ProviderError> {
+        validate_terminal_status(value.get("interaction").unwrap_or(value))?;
         if !self.active.is_empty() {
             return Err(ProviderError::Stream(format!(
                 "Gemini terminal interaction arrived before step.stop for indices {:?}",
@@ -1298,6 +1340,162 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_responses_never_complete_or_release_tool_calls() {
+        // Reconstruct the documented terminal shape with synthetic tool data.
+        // Validate status before decoding even a partial function argument.
+        let body = json!({
+            "status": "incomplete",
+            "steps": [{"type":"function_call","id":"c1","name":"write","arguments":"{\"path\":"}],
+            "usage": {"total_input_tokens":10,"total_output_tokens":20,"total_tokens":30}
+        });
+        let error = parse_interaction(&body.to_string(), &HashMap::new()).unwrap_err();
+        assert!(matches!(error, ProviderError::Truncated), "{error}");
+        assert!(!error.is_retryable());
+
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        decoder.push(&SseEvent {
+            event: Some("step.start".into()),
+            data: json!({"event_type":"step.start","index":0,"step":{"type":"function_call","id":"c1","name":"write","arguments":{}}}).to_string(),
+        }).unwrap();
+        let error = decoder
+            .push(&SseEvent {
+                event: Some("interaction.completed".into()),
+                data: json!({"event_type":"interaction.completed","interaction":body}).to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Truncated), "{error}");
+        assert!(!decoder.completed());
+    }
+
+    #[test]
+    fn an_incomplete_stream_with_stopped_steps_is_not_success() {
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        for data in [
+            json!({"event_type":"step.start","index":0,"step":{"type":"model_output","content":[{"type":"text","text":"partial"}]}}),
+            json!({"event_type":"step.stop","index":0}),
+        ] {
+            decoder
+                .push(&SseEvent {
+                    event: None,
+                    data: data.to_string(),
+                })
+                .unwrap();
+        }
+        let result = decoder.push(&SseEvent {
+            event: Some("interaction.completed".into()),
+            data:
+                json!({"event_type":"interaction.completed","interaction":{"status":"incomplete"}})
+                    .to_string(),
+        });
+        assert!(matches!(result, Err(ProviderError::Truncated)));
+        assert!(!decoder.completed());
+    }
+
+    #[test]
+    fn usage_accounts_for_cached_input_and_billed_thought_once() {
+        let usage = json!({"total_input_tokens":21576,"total_output_tokens":1,
+            "total_thought_tokens":56,"total_cached_tokens":16356,"total_tokens":21633});
+        let body = json!({"status":"completed","steps":[],"usage":usage});
+        let blocks = parse_interaction(&body.to_string(), &HashMap::new()).unwrap();
+        let Some(Block::Usage(counts)) = blocks.last() else {
+            panic!("usage missing");
+        };
+        assert_eq!(counts.prompt_tokens, 21576);
+        assert_eq!(counts.completion_tokens, 57);
+        assert_eq!(counts.total_tokens, 21633);
+        assert_eq!(counts.cached_prompt_tokens, Some(16356));
+        assert_eq!(counts.uncached_prompt_tokens(), 5220);
+        let price = kernel::Pricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 12.0,
+            cached_input_per_mtok: Some(0.2),
+            indicative: false,
+        };
+        let expected = (5220.0 * 2.0 + 16356.0 * 0.2 + 57.0 * 12.0) / 1_000_000.0;
+        assert!((price.cost(counts) - expected).abs() < 1e-12);
+
+        // Streaming usage is cumulative, not a sum of every SSE update.
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        decoder
+            .push(&SseEvent {
+                event: None,
+                data: json!({"event_type":"interaction.start","metadata":{"total_usage":{
+                "total_input_tokens":100,"total_output_tokens":0,"total_thought_tokens":2}}})
+                .to_string(),
+            })
+            .unwrap();
+        decoder.push(&SseEvent { event: None,
+            data: json!({"event_type":"interaction.status_update","status":"in_progress","metadata":{"total_usage":usage}}).to_string() }).unwrap();
+        let blocks = decoder.push(&SseEvent { event: Some("interaction.completed".into()),
+            data: json!({"event_type":"interaction.completed","interaction":{"status":"completed"}}).to_string() }).unwrap();
+        let Some(Block::Usage(streamed)) = blocks.last() else {
+            panic!("usage missing");
+        };
+        assert_eq!(
+            serde_json::to_value(streamed).unwrap(),
+            serde_json::to_value(counts).unwrap()
+        );
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn usage_keeps_unknown_cache_distinct_from_zero_and_bounds_arithmetic() {
+        for (value, cached) in [(Value::Null, None), (json!(0), Some(0))] {
+            let body = json!({"status":"completed","steps":[],"usage":{
+                "total_input_tokens":1,"total_output_tokens":1,"total_cached_tokens":value}});
+            let blocks = parse_interaction(&body.to_string(), &HashMap::new()).unwrap();
+            let Some(Block::Usage(counts)) = blocks.last() else {
+                panic!("usage missing");
+            };
+            assert_eq!(counts.cached_prompt_tokens, cached);
+            assert_eq!(
+                counts.completion_tokens, 1,
+                "missing thought count adds no invented tokens"
+            );
+        }
+        let body = json!({"status":"completed","steps":[],"usage":{
+            "total_input_tokens":u64::MAX,"total_output_tokens":u64::MAX,
+            "total_thought_tokens":u64::MAX,"total_cached_tokens":u64::MAX,"total_tokens":u64::MAX}});
+        let blocks = parse_interaction(&body.to_string(), &HashMap::new()).unwrap();
+        let Some(Block::Usage(counts)) = blocks.last() else {
+            panic!("usage missing");
+        };
+        assert_eq!(counts.prompt_tokens, u32::MAX);
+        assert_eq!(counts.completion_tokens, u32::MAX);
+        assert_eq!(counts.cached_prompt_tokens, Some(u32::MAX));
+    }
+
+    #[test]
+    fn partial_usage_updates_preserve_reported_buckets_and_later_zeroes() {
+        let mut decoder = ResponseDecoder::new(HashMap::new());
+        for usage in [
+            json!({"total_input_tokens":100,"total_cached_tokens":80,"total_output_tokens":2,"total_thought_tokens":3}),
+            json!({"total_output_tokens":4}),
+            json!({"total_cached_tokens":0}),
+        ] {
+            decoder.push(&SseEvent { event: None,
+                data: json!({"event_type":"interaction.status_update","status":"in_progress","metadata":{"total_usage":usage}}).to_string() }).unwrap();
+        }
+        let blocks = decoder.push(&SseEvent { event: None,
+            data: json!({"event_type":"interaction.completed","interaction":{"status":"completed","usage":{"total_tokens":107}}}).to_string() }).unwrap();
+        let Some(Block::Usage(counts)) = blocks.last() else {
+            panic!("usage missing");
+        };
+        assert_eq!(counts.prompt_tokens, 100);
+        assert_eq!(counts.completion_tokens, 7);
+        assert_eq!(counts.cached_prompt_tokens, Some(0));
+        assert_eq!(counts.total_tokens, 107);
+        decoder.finish().unwrap();
+
+        let body = json!({"status":"completed","steps":[],"usage":{
+            "total_input_tokens":10,"total_cached_tokens":100}});
+        let blocks = parse_interaction(&body.to_string(), &HashMap::new()).unwrap();
+        assert!(
+            matches!(blocks.last(), Some(Block::Usage(usage)) if usage.cached_prompt_tokens == Some(10))
+        );
+    }
+
+    #[test]
     fn nonstream_thought_without_signature_fails_closed() {
         let body = json!({
             "status": "completed",
@@ -1583,8 +1781,8 @@ mod tests {
     }
 
     #[test]
-    fn nonterminal_responses_cannot_authorize_calls() {
-        for status in [Value::Null, json!("in_progress"), json!("cancelled")] {
+    fn nonterminal_and_cancelled_responses_cannot_authorize_calls() {
+        for status in [Value::Null, json!("in_progress")] {
             let body = json!({"status":status, "steps":[
                 {"type":"function_call", "id":"c", "name":"write", "arguments":{}}
             ]})
@@ -1594,6 +1792,16 @@ mod tests {
                 Err(ProviderError::Stream(_))
             ));
         }
+        let body = json!({"status":"cancelled", "steps":[
+            {"type":"function_call","id":"c","name":"write","arguments":{}}
+        ]})
+        .to_string();
+        let error = parse_interaction(&body, &HashMap::new()).unwrap_err();
+        assert!(matches!(error, ProviderError::Response(_)));
+        assert!(
+            !error.is_retryable(),
+            "a cancelled interaction must not resubmit the prompt"
+        );
     }
 
     #[test]

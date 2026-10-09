@@ -238,7 +238,7 @@ pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
                     let stored_key = matches!(&requested, Change::SavedProfile(_));
                     match requested {
                         Change::Profile(name) | Change::SavedProfile(name) => {
-                            let resolved = {
+                            let mut resolved = {
                                 let cfg =
                                     cfg.lock().map_err(|_| "model configuration unavailable")?;
                                 config::resolve_model_as(
@@ -252,6 +252,10 @@ pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
                                 )
                                 .map_err(|error| error.to_string())?
                             };
+                            providers::models_dev::resolve_reasoning_efforts(
+                                &mut resolved.provider,
+                            )
+                            .await;
                             kernel.provider.switch_profile(&resolved)?;
                             *model = resolved.provider.model;
                             *active = resolved.name;

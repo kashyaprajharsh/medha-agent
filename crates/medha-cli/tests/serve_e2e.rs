@@ -1092,6 +1092,154 @@ struct World {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gemini_reasoning_choices_and_model_switches_are_shared_between_viewers() {
+    let world = World::new();
+    let folder = world.folder("gemini-settings");
+    // A current local snapshot makes catalogue resolution deterministic/offline
+    // and keeps this test away from the owner's HOME and credentials.
+    let os_home = world.root.path().join("os-home");
+    std::fs::create_dir_all(os_home.join(".medha")).unwrap();
+    let fetched = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let snapshot = json!({"schema_version":4,"fetched_at_unix":fetched,"entries":{
+        "google/gemini-3.8-flash":{"reasoning_efforts":["low","medium","high"]},
+        "google/gemini-fixture-only":{"reasoning_efforts":["low","high"]}
+    }});
+    std::fs::write(
+        os_home.join(".medha/models_dev_cache.json"),
+        snapshot.to_string(),
+    )
+    .unwrap();
+    let os_home = os_home.to_str().unwrap();
+    let backend = world.backend_in(&[
+        ("HOME", os_home),
+        ("USERPROFILE", os_home),
+        ("MEDHA_BASE_URL", ""),
+        ("MEDHA_MODEL", ""),
+        ("MEDHA_PROTOCOL", ""),
+    ]);
+    let mut first = backend.connect().await;
+    for (name, model, default) in [
+        ("flash6", "gemini-3.6-flash", true),
+        ("flash8", "gemini-3.8-flash", false),
+        ("catalogue", "gemini-fixture-only", false),
+    ] {
+        first
+            .about(
+                &folder,
+                json!({"method":"settings.model.save","params":{
+                    "name":name,"default":default,"key":SECRET,
+                    "profile":{"protocol":"gemini-interactions","base_url":world.provider.url,
+                        "model":model,"auth":"x-goog-api-key","max_ctx":128000,"reasoning":"effort"}
+                }}),
+            )
+            .await
+            .expect("save isolated Gemini profile");
+    }
+    let chat = first.open(&folder).await;
+    let initial = first.ask("session.settings", Some(&chat), json!({})).await;
+    assert_eq!(initial["result"]["model"], "gemini-3.6-flash", "{initial}");
+    assert_eq!(
+        initial["result"]["efforts"],
+        json!(["minimal", "low", "medium", "high"])
+    );
+    let minimal = first
+        .ask(
+            "session.configure",
+            Some(&chat),
+            json!({"effort":"minimal"}),
+        )
+        .await;
+    assert_eq!(minimal["result"]["effort"], "minimal", "{minimal}");
+
+    let mut second = backend.connect().await;
+    let attached = second
+        .ask("session.attach", Some(&chat), json!({"after":0}))
+        .await;
+    assert_eq!(attached["result"]["gap"], false);
+    let switched = first
+        .ask(
+            "session.configure",
+            Some(&chat),
+            json!({"profile":"flash8"}),
+        )
+        .await;
+    assert_eq!(
+        switched["result"]["model"], "gemini-3.8-flash",
+        "{switched}"
+    );
+    assert_eq!(switched["result"]["effort"], "auto");
+    assert_eq!(switched["result"]["reasoning"], "auto");
+    assert_eq!(
+        switched["result"]["efforts"],
+        json!(["low", "medium", "high"])
+    );
+    let (_, notification) = second
+        .until(|frame| {
+            frame["method"] == "settings" && frame["params"]["model"] == "gemini-3.8-flash"
+        })
+        .await;
+    assert_eq!(notification["params"], switched["result"]);
+    let refused = second
+        .ask(
+            "session.configure",
+            Some(&chat),
+            json!({"effort":"minimal"}),
+        )
+        .await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not supported"),
+        "{refused}"
+    );
+    let high = second
+        .ask("session.configure", Some(&chat), json!({"effort":"high"}))
+        .await;
+    assert_eq!(high["result"]["effort"], "high", "{high}");
+    let observed = first.ask("session.settings", Some(&chat), json!({})).await;
+    assert_eq!(observed["result"], high["result"]);
+
+    // A model absent from bundled corrections uses the exact catalogue effort
+    // list on switching, and again when a new chat starts with that default.
+    let custom = first
+        .ask(
+            "session.configure",
+            Some(&chat),
+            json!({"profile":"catalogue"}),
+        )
+        .await;
+    assert_eq!(
+        custom["result"]["efforts"],
+        json!(["low", "high"]),
+        "{custom}"
+    );
+    first
+        .about(
+            &folder,
+            json!({"method":"settings.model.default","params":{"name":"catalogue"}}),
+        )
+        .await
+        .unwrap();
+    let new_chat = first.open(&folder).await;
+    let new_settings = first
+        .ask("session.settings", Some(&new_chat), json!({}))
+        .await;
+    assert_eq!(
+        new_settings["result"]["model"], "gemini-fixture-only",
+        "{new_settings}"
+    );
+    assert_eq!(new_settings["result"]["efforts"], json!(["low", "high"]));
+    assert!(
+        world.provider.seen.try_recv().is_err(),
+        "settings made an inference call"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typed_application_resources_preserve_credentials_and_reject_stale_grants() {
     use protocol::{ChangeResource, ReadResource, ResourceResult};
     let world = World::new();

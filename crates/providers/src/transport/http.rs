@@ -13,6 +13,7 @@ use crate::{AuthKind, ProviderProfile};
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const USER_AGENT: &str = concat!("medha/", env!("CARGO_PKG_VERSION"));
 
 /// Bound successful non-streaming responses before allocating their full body.
 pub(crate) async fn response_text(response: reqwest::Response) -> Result<String, ProviderError> {
@@ -79,6 +80,7 @@ const MAX_RETRY_AFTER_MS: f64 = 60_000.0;
 /// stream which is working correctly.
 pub(crate) fn client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         // Medha reads only its own MEDHA_* namespace; an ambient *_PROXY would
@@ -490,6 +492,65 @@ mod tests {
         let _ = client();
         assert!(STREAM_IDLE_TIMEOUT < READ_TIMEOUT, "idle must bite first");
         assert!(CONNECT_TIMEOUT < STREAM_IDLE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn user_agent_is_sent_and_a_profile_can_override_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut agents = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    assert!(request.len() <= 8192);
+                }
+                agents.push(
+                    String::from_utf8(request)
+                        .unwrap()
+                        .lines()
+                        .filter_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("user-agent")
+                                .then(|| value.trim().to_owned())
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            agents
+        });
+        let client = client();
+        let mut profile =
+            ProviderProfile::openai_chat(format!("http://{address}"), "model", AuthKind::None);
+        for custom in [false, true] {
+            if custom {
+                profile
+                    .headers
+                    .insert("User-Agent".into(), "my-deployment-client/1".into());
+            }
+            with_profile(client.get(&profile.base_url), &profile, "")
+                .unwrap()
+                .send()
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            server.await.unwrap(),
+            [
+                vec![concat!("medha/", env!("CARGO_PKG_VERSION"))],
+                vec!["my-deployment-client/1"]
+            ]
+        );
     }
 
     #[test]

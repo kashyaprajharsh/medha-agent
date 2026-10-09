@@ -1,6 +1,7 @@
 //! Cached models.dev metadata. Missing values remain unknown; prices are
 //! indicative for self-hosted routes.
 
+use kernel::{Protocol, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ const API_URL: &str = "https://models.dev/api.json";
 /// Re-fetch if the cache is older than this; models.dev updates periodically,
 /// not every second, so a cached copy is fine to reuse for a while.
 const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const CACHE_SCHEMA_VERSION: u32 = 3;
+const CACHE_SCHEMA_VERSION: u32 = 4;
 
 static PROCESS_ENTRIES: tokio::sync::OnceCell<BTreeMap<String, ModelMeta>> =
     tokio::sync::OnceCell::const_new();
@@ -221,6 +222,9 @@ pub struct ModelMeta {
     pub cached_input_per_mtok: Option<f64>,
     #[serde(default)]
     pub capabilities: Option<ModelCapabilities>,
+    /// Exact effort values, separate from toggle/budget reasoning controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +276,47 @@ struct ModelEntry {
     tool_calls: Option<bool>,
     #[serde(default)]
     reasoning: Option<bool>,
+    #[serde(default)]
+    reasoning_options: Vec<ReasoningOption>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ReasoningOption {
+    Effort {
+        // Public entries can contain null as a default marker. Preserve known
+        // strings and ignore other representations without losing the table.
+        values: Vec<serde_json::Value>,
+    },
+    // Toggles, budgets and future controls are not effort strings.
+    #[serde(other)]
+    Other,
+}
+
+impl ModelEntry {
+    fn reasoning_efforts(&self) -> Option<Vec<ReasoningEffort>> {
+        self.reasoning_options.iter().find_map(|option| {
+            let ReasoningOption::Effort { values } = option else {
+                return None;
+            };
+            let mut efforts = Vec::new();
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    continue;
+                };
+                if let Some(effort) = ReasoningEffort::ALL
+                    .iter()
+                    .find(|effort| effort.as_str() == value)
+                    && !efforts.contains(effort)
+                {
+                    efforts.push(*effort);
+                }
+            }
+            // A newly introduced effort we cannot encode is unknown, not an
+            // explicit statement that this model has no effort control.
+            (values.is_empty() || !efforts.is_empty()).then_some(efforts)
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -336,10 +381,15 @@ async fn fetch_and_flatten(
         return Err(format!("models.dev returned {}", resp.status()));
     }
     let providers: BTreeMap<String, Provider> = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(flatten(providers))
+}
+
+fn flatten(providers: BTreeMap<String, Provider>) -> BTreeMap<String, ModelMeta> {
     let mut flat = BTreeMap::new();
     let mut unqualified: BTreeMap<String, Vec<ModelMeta>> = BTreeMap::new();
     for (provider_id, provider) in providers {
         for (id, model) in provider.models {
+            let reasoning_efforts = model.reasoning_efforts();
             let capability_values = ModelCapabilities {
                 modalities: model.modalities,
                 attachment: model.attachment,
@@ -355,10 +405,12 @@ async fn fetch_and_flatten(
                 capabilities: capability_values
                     .has_known_value()
                     .then_some(capability_values),
+                reasoning_efforts,
             };
             if meta.context.is_some()
                 || meta.input_per_mtok.is_some()
                 || meta.capabilities.is_some()
+                || meta.reasoning_efforts.is_some()
             {
                 let normalized_id = id.to_lowercase();
                 flat.insert(
@@ -377,21 +429,22 @@ async fn fetch_and_flatten(
             flat.insert(id, candidates.into_iter().next().expect("one candidate"));
         }
     }
-    Ok(flat)
+    flat
 }
 
 /// Load the metadata table: fresh disk cache if present, else fetch + re-cache.
-async fn entries() -> Option<BTreeMap<String, ModelMeta>> {
+async fn entries() -> Option<&'static BTreeMap<String, ModelMeta>> {
     if let Some(entries) = PROCESS_ENTRIES.get() {
-        return Some(entries.clone());
+        return Some(entries);
     }
     let cached = load_disk_cache();
     if let Some(cache) = cached.as_ref().filter(|cache| cache.current_schema()) {
         let entries = cache.entries.clone();
-        let _ = PROCESS_ENTRIES.set(entries.clone());
-        return Some(entries);
+        let _ = PROCESS_ENTRIES.set(entries);
+        return PROCESS_ENTRIES.get();
     }
     let client = reqwest::Client::builder()
+        .user_agent(crate::transport::http::USER_AGENT)
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .ok()?;
@@ -401,8 +454,8 @@ async fn entries() -> Option<BTreeMap<String, ModelMeta>> {
             // Offline upgrades can still use the old prices/context metadata.
             // Do not rewrite it with the new version: retry refresh next launch.
             let entries = cached?.entries;
-            let _ = PROCESS_ENTRIES.set(entries.clone());
-            return Some(entries);
+            let _ = PROCESS_ENTRIES.set(entries);
+            return PROCESS_ENTRIES.get();
         }
     };
     save_disk_cache(&Cache {
@@ -410,15 +463,52 @@ async fn entries() -> Option<BTreeMap<String, ModelMeta>> {
         fetched_at_unix: now_unix(),
         entries: fetched.clone(),
     });
-    let _ = PROCESS_ENTRIES.set(fetched.clone());
-    Some(fetched)
+    let _ = PROCESS_ENTRIES.set(fetched);
+    PROCESS_ENTRIES.get()
+}
+
+/// Apply catalogue effort metadata to native Gemini profiles without persisting
+/// it as a user override. Both chat opening and model switching use this path.
+/// Explicit profile levels win; unavailable metadata leaves offline defaults
+/// to the protocol adapter. This does not infer effort controls from toggles.
+pub async fn resolve_reasoning_efforts(profile: &mut crate::ProviderProfile) {
+    if profile.reasoning_efforts.is_some() || profile.protocol != Protocol::GeminiInteractions {
+        return;
+    }
+    let Some(entries) = entries().await else {
+        return;
+    };
+    apply_reasoning_efforts(profile, entries);
+}
+
+fn apply_reasoning_efforts(
+    profile: &mut crate::ProviderProfile,
+    entries: &BTreeMap<String, ModelMeta>,
+) {
+    if profile.reasoning_efforts.is_some() || profile.protocol != Protocol::GeminiInteractions {
+        return;
+    }
+    let id = profile
+        .model
+        .strip_prefix("models/")
+        .unwrap_or(&profile.model);
+    let qualified = if id.starts_with("google/") {
+        id.to_owned()
+    } else {
+        format!("google/{id}")
+    };
+    // An unqualified same-named model from another provider is not evidence
+    // about native Google Interactions, even when it is the only catalogue row.
+    if let Some(meta) = entries.get(&qualified) {
+        profile.reasoning_efforts = meta.reasoning_efforts.clone();
+    }
 }
 
 /// Look up `model_id`'s context window from models.dev. Returns `None` on
 /// network failure or if the model genuinely isn't listed — never a guess.
 pub async fn context_window(model_id: &str) -> Option<u32> {
     let entries = entries().await?;
-    lookup(model_id, &entries).and_then(|m| m.context)
+    lookup(model_id, entries).and_then(|m| m.context)
 }
 
 /// Look up `model_id`'s list price (USD per MTok input, output). This is the
@@ -428,7 +518,7 @@ pub async fn context_window(model_id: &str) -> Option<u32> {
 /// catalogue publishes one.
 pub async fn pricing(model_id: &str) -> Option<(f64, f64, Option<f64>)> {
     let entries = entries().await?;
-    let meta = lookup(model_id, &entries)?;
+    let meta = lookup(model_id, entries)?;
     Some((
         meta.input_per_mtok?,
         meta.output_per_mtok?,
@@ -444,7 +534,7 @@ pub async fn capabilities(model_id: &str) -> Option<ModelCapabilities> {
         return None;
     }
     let entries = entries().await?;
-    exact_lookup(model_id, &entries).and_then(|meta| meta.capabilities.clone())
+    exact_lookup(model_id, entries).and_then(|meta| meta.capabilities.clone())
 }
 
 /// Resolve a model's capabilities with a user-supplied exact override taking
@@ -509,6 +599,144 @@ mod tests {
     use super::*;
 
     #[test]
+    fn null_and_unrecognized_effort_values_do_not_break_other_models_metadata() {
+        // Sarvam's current public records include null as the default option;
+        // it is not an effort name and must not invalidate the full catalogue.
+        let providers = serde_json::from_value(serde_json::json!({
+            "sarvam":{"models":{
+                "sarvam-30b":{"limit":{"context":32768},"reasoning_options":[{"type":"effort","values":[null,"low","medium","high"]}]},
+                "sarvam-105b":{"reasoning":true,"reasoning_options":[{"type":"effort","values":[null,"low","medium","high"]}]}
+            }},
+            "google":{"models":{"gemini-3.8-flash":{"reasoning_options":[{"type":"effort","values":["low","medium","high"]}]}}}
+        })).expect("unrecognized options cannot invalidate unrelated capabilities/prices");
+        let entries = flatten(providers);
+        for id in [
+            "sarvam/sarvam-30b",
+            "sarvam/sarvam-105b",
+            "google/gemini-3.8-flash",
+        ] {
+            assert_eq!(
+                entries[id].reasoning_efforts.as_deref(),
+                Some(
+                    [
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::High
+                    ]
+                    .as_slice()
+                )
+            );
+        }
+        assert_eq!(entries["sarvam/sarvam-30b"].context, Some(32768));
+        let future: ModelEntry = serde_json::from_value(serde_json::json!({
+            "reasoning_options":[{"type":"effort","values":[0,{"future":true}]}]
+        }))
+        .unwrap();
+        assert!(future.reasoning_efforts().is_none());
+    }
+
+    #[test]
+    fn catalogue_efforts_round_trip_and_do_not_turn_toggles_or_unknown_levels_into_efforts() {
+        let providers = serde_json::from_value(serde_json::json!({
+            "google": {"models": {
+                "gemini-3.8-flash": {"reasoning":true, "reasoning_options":[{"type":"effort","values":["low","medium","high"]}]},
+                "gemini-3.6-flash": {"reasoning_options":[{"type":"effort","values":["minimal","low","medium","high"]}]},
+                "toggle-only": {"reasoning":true,"reasoning_options":[{"type":"toggle"}]},
+                "future": {"reasoning":true,"reasoning_options":[{"type":"effort","values":["future-level"]}]},
+                "mixed": {"reasoning_options":[{"type":"new-control","anything":true},{"type":"effort","values":["low","future-level","high","low"]}]}
+            }}
+        })).unwrap();
+        let entries = flatten(providers);
+        assert_eq!(
+            entries["google/gemini-3.8-flash"]
+                .reasoning_efforts
+                .as_deref(),
+            Some(
+                [
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High
+                ]
+                .as_slice()
+            )
+        );
+        assert!(
+            entries["google/gemini-3.6-flash"]
+                .reasoning_efforts
+                .as_ref()
+                .unwrap()
+                .contains(&ReasoningEffort::Minimal)
+        );
+        assert!(entries["google/toggle-only"].reasoning_efforts.is_none());
+        assert!(entries["google/future"].reasoning_efforts.is_none());
+        assert_eq!(
+            entries["google/mixed"].reasoning_efforts.as_deref(),
+            Some([ReasoningEffort::Low, ReasoningEffort::High].as_slice())
+        );
+        let cache = Cache {
+            schema_version: CACHE_SCHEMA_VERSION,
+            fetched_at_unix: 0,
+            entries,
+        };
+        let reloaded: Cache =
+            serde_json::from_str(&serde_json::to_string(&cache).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.entries["google/gemini-3.8-flash"].reasoning_efforts,
+            cache.entries["google/gemini-3.8-flash"].reasoning_efforts
+        );
+        let previous: Cache =
+            serde_json::from_str(r#"{"schema_version":3,"fetched_at_unix":0,"entries":{}}"#)
+                .unwrap();
+        assert!(
+            !previous.current_schema(),
+            "an upgrade refreshes previously discarded effort metadata"
+        );
+    }
+
+    #[test]
+    fn native_reasoning_metadata_is_exact_and_preserves_explicit_profile_levels() {
+        let entries = flatten(serde_json::from_value(serde_json::json!({
+            "google": {"models":{"catalogue-model":{"reasoning_options":[{"type":"effort","values":["low","high"]}]}}},
+            "another-provider":{"models":{"different-model":{"reasoning_options":[{"type":"effort","values":["minimal"]}]}}}
+        })).unwrap());
+        let mut profile = crate::ProviderProfile::openai_chat(
+            "http://localhost/v1",
+            "catalogue-model",
+            crate::AuthKind::None,
+        );
+        apply_reasoning_efforts(&mut profile, &entries);
+        assert!(
+            profile.reasoning_efforts.is_none(),
+            "native Gemini metadata cannot change Chat Completions controls"
+        );
+        profile.protocol = Protocol::GeminiInteractions;
+        apply_reasoning_efforts(&mut profile, &entries);
+        assert_eq!(
+            profile.reasoning_efforts.as_deref(),
+            Some([ReasoningEffort::Low, ReasoningEffort::High].as_slice())
+        );
+        profile.reasoning_efforts = Some(vec![ReasoningEffort::Minimal]);
+        apply_reasoning_efforts(&mut profile, &entries);
+        assert_eq!(
+            profile.reasoning_efforts.as_deref(),
+            Some([ReasoningEffort::Minimal].as_slice())
+        );
+        profile.reasoning_efforts = None;
+        profile.model = "different-model".into();
+        apply_reasoning_efforts(&mut profile, &entries);
+        assert!(
+            profile.reasoning_efforts.is_none(),
+            "another provider's unqualified catalogue row is not native Google metadata"
+        );
+        profile.model = "catalogue-model-preview".into();
+        apply_reasoning_efforts(&mut profile, &entries);
+        assert!(
+            profile.reasoning_efforts.is_none(),
+            "do not infer preview/alias effort levels by fuzzy matching"
+        );
+    }
+
+    #[test]
     fn legacy_metadata_cache_requires_refresh_without_losing_offline_prices() {
         let legacy = r#"{"fetched_at_unix":123,"entries":{"m":{"context":128000,"input_per_mtok":1.0,"output_per_mtok":4.0}}}"#;
         let mut cache: Cache = serde_json::from_str(legacy).unwrap();
@@ -532,6 +760,7 @@ mod tests {
                 output_per_mtok: None,
                 cached_input_per_mtok: None,
                 capabilities: None,
+                reasoning_efforts: None,
             },
         );
         m.insert(
@@ -542,6 +771,7 @@ mod tests {
                 output_per_mtok: Some(75.0),
                 cached_input_per_mtok: None,
                 capabilities: None,
+                reasoning_efforts: None,
             },
         );
 
@@ -568,6 +798,7 @@ mod tests {
             output_per_mtok: Some(2.0),
             cached_input_per_mtok: None,
             capabilities: None,
+            reasoning_efforts: None,
         };
         let specific = ModelMeta {
             context: Some(131_072),
@@ -575,6 +806,7 @@ mod tests {
             output_per_mtok: Some(4.0),
             cached_input_per_mtok: None,
             capabilities: None,
+            reasoning_efforts: None,
         };
         let entries = BTreeMap::from([
             ("qwen3".to_string(), generic),

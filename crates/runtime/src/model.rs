@@ -62,6 +62,7 @@ pub async fn resolve(
         if resolved.provider.capabilities.is_none() {
             resolved.provider.capabilities = capability_resolution.capabilities;
         }
+        providers::models_dev::resolve_reasoning_efforts(&mut resolved.provider).await;
         let capability_summary = resolved
             .provider
             .capabilities

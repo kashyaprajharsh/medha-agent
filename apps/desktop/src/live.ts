@@ -1,4 +1,4 @@
-import type { LiveFrame, SessionSettings, ToolScreen } from "./api";
+import type { LiveFrame, MessageImage, SessionSettings, ToolScreen } from "./api";
 
 /** What may be answered to an approval, as the backend names each answer. */
 export type ApprovalChoice =
@@ -80,7 +80,7 @@ export type LiveAgent = {
 };
 
 export type LiveItem =
-  | { kind: "user"; id: string; text: string; ts: number }
+  | { kind: "user"; id: string; text: string; ts: number; images?: MessageImage[] }
   | { kind: "text"; id: string; text: string; html?: string }
   | { kind: "plan"; id: string; plan: Plan }
   | {
@@ -373,11 +373,14 @@ export function reduceLive(state: LiveState, frame: LiveFrame): LiveState {
       return { ...state, status: "running", stopReason: undefined, error: undefined };
     case "message.accepted": {
       const text = str(params.content) ?? "";
-      const alreadyShown = state.status !== "idle" && state.sent.some(
+      const alreadyShown = state.status !== "idle" && state.sent.find(
         (sent) => sent.text === text && state.items.some((item) => item.kind === "user" && item.id === sent.id),
       );
-      return { ...state, status: "running", items: alreadyShown ? state.items : [
-        ...closeReasoning(state.items), { kind: "user", id: nextId("user"), text, ts: now() },
+      const images = Array.isArray(params.images) ? params.images as MessageImage[] : [];
+      return { ...state, status: "running", items: alreadyShown ? state.items.map((item) =>
+        item.kind === "user" && item.id === alreadyShown.id && images.length
+          ? { ...item, images } : item) : [
+        ...closeReasoning(state.items), { kind: "user", id: nextId("user"), text, ts: now(), images },
       ] };
     }
     case "model.waiting":
@@ -664,8 +667,32 @@ export function explainError(message: string) {
   ) {
     return "Medha couldn’t reach the model. Check its server or choose another model below.";
   }
+  // A 403 is the provider refusing this request, which is often not about the
+  // key at all: its own words say why, so they are shown instead of a guess.
+  const refused = /returned status 403: (.*)/s.exec(message)?.[1];
+  if (refused !== undefined) {
+    const said = providerWords(refused);
+    return said
+      ? `The model provider refused this request. It said: “${said}”`
+      : "The model provider refused this request. Check that the saved key may use this model, or choose another model.";
+  }
   if (/401|403|unauthori[sz]ed|invalid api key/i.test(message)) {
     return "The model provider rejected the credentials. Check the saved profile’s credentials or choose another model.";
+  }
+  return undefined;
+}
+
+/** The sentence a provider put in its error body, when it sent one. */
+function providerWords(body: string) {
+  // The body may be followed by the runtime's own note on later lines.
+  for (const text of [body, body.split("\n")[0]]) {
+    try {
+      const parsed = JSON.parse(text);
+      const said = parsed?.error?.message ?? parsed?.message ?? parsed?.detail;
+      if (typeof said === "string" && said.trim()) return said.trim();
+    } catch {
+      continue;
+    }
   }
   return undefined;
 }

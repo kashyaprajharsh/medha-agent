@@ -186,6 +186,7 @@ export function App() {
     clearTail,
     takeReturned,
     ensureOpen,
+    loadSettings,
     configure,
     answer,
   } = useLive();
@@ -491,9 +492,11 @@ export function App() {
   function submit(
     message = currentKey ? (text.current[currentKey] ?? "") : "",
   ) {
-    const images = currentKey ? (attachments[currentKey] ?? []) : [];
+    const attached = currentKey ? (attachments[currentKey] ?? []) : [];
     const typed =
-      message.trim() || (images.length ? "Describe the attached images." : "");
+      message.trim() || (attached.length
+        ? attached.every((item) => "data" in item) ? "Describe the attached images." : "Help me with the attached files and folders."
+        : "");
     if (!currentKey || !typed) return;
     if (modelless) {
       held.current = true;
@@ -510,7 +513,7 @@ export function App() {
     setAway(false);
     setAttachments((all) => ({ ...all, [currentKey]: [] }));
     if (currentKey === spareDraft.current) spareDraft.current = null;
-    void send(currentKey, draftKey ? null : selected, body, images).catch(
+    void send(currentKey, draftKey ? null : selected, body, attached).catch(
       () => {
         setText((all) => ({
           ...all,
@@ -518,7 +521,7 @@ export function App() {
         }));
         setAttachments((all) => ({
           ...all,
-          [currentKey]: all[currentKey]?.length ? all[currentKey] : images,
+          [currentKey]: all[currentKey]?.length ? all[currentKey] : attached,
         }));
       },
     );
@@ -1042,7 +1045,7 @@ export function App() {
             onControl={setControl}
             onLoadSettings={async () => {
               if (currentKey)
-                await ensureOpen(currentKey, draftKey ? null : selected);
+                await loadSettings(currentKey, draftKey ? null : selected);
             }}
             onConfigure={async (change) => {
               if (currentKey)
@@ -1145,7 +1148,7 @@ export function App() {
               setText((all) => ({ ...all, [currentKey]: result.prefill }));
               setAttachments((all) => ({
                 ...all,
-                [currentKey]: result.images,
+                [currentKey]: result.attachments,
               }));
             }
             setReload((value) => value + 1);

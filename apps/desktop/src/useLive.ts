@@ -98,6 +98,21 @@ export function useLive() {
     return promise;
   }, []);
 
+  const loadSettings = useCallback(
+    async (key: string, resume: string | null) => {
+      const alreadyOpen = opened.current.has(key);
+      await ensureOpen(key, resume);
+      // Opening already fetched settings. An existing chat still needs a fresh
+      // catalogue: another window or the Settings page may have changed it.
+      if (!alreadyOpen) return;
+      const settings = await api.liveCall(key, "session.settings");
+      patch(key, (state) =>
+        reduceLive(state, { method: "settings", params: settings }),
+      );
+    },
+    [api, ensureOpen, patch],
+  );
+
   const send = useCallback(
     async (
       key: string,
@@ -121,7 +136,10 @@ export function useLive() {
       const message = {
         kind: "user" as const,
         id: crypto.randomUUID(),
-        text,
+        text: params.content,
+        images: attachments.flatMap((attachment) => "data" in attachment
+          ? [{ name: attachment.name, mime: attachment.mime, preview: attachment.preview }]
+          : []),
         ts: Date.now() / 1000,
       };
       const before = latest.current[key];
@@ -288,6 +306,7 @@ export function useLive() {
     clearTail,
     takeReturned,
     ensureOpen,
+    loadSettings,
     configure,
     answer,
   };

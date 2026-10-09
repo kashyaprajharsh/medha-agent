@@ -76,7 +76,7 @@ export const Transcript = memo(function Transcript({
             <span className="you-mark" aria-hidden="true">
               ›
             </span>
-            <UserText text={block.text} />
+            <UserText text={block.text} images={block.images} />
             <time>{clock(block.ts)}</time>
             {onRewind && (
               <button

@@ -65,6 +65,51 @@
 .you-text {
   min-width: 0;
 }
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin-top: var(--s-2);
+}
+.sent-image button {
+  display: grid;
+  gap: var(--s-1);
+  width: calc(var(--s-6) * 6);
+  padding: var(--s-2);
+  background: var(--hover);
+  border-radius: var(--r-md);
+  text-align: left;
+}
+.sent-image img {
+  width: 100%;
+  height: calc(var(--s-6) * 4);
+  object-fit: contain;
+}
+.sent-image span,
+.sent-file summary {
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+.message-image-full {
+  width: 100%;
+  height: auto;
+}
+.sent-file {
+  padding: var(--s-2);
+  border-radius: var(--r-md);
+  background: var(--hover);
+}
+.sent-file summary {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  cursor: pointer;
+}
+.sent-file code {
+  display: block;
+  margin-top: var(--s-2);
+  overflow-wrap: anywhere;
+}
 .you-lead {
   margin: 0 0 var(--s-2);
 }

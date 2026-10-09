@@ -77,9 +77,15 @@ impl Backend {
 
     /// The answer about `folder`, or the words the request was refused in.
     pub fn ask(&mut self, folder: &Path, method: &str, params: Value) -> Result<Value, String> {
+        self.request(folder, json!({"method": method, "params": params}))
+    }
+
+    /// A legacy history request carries its session/cursor beside the method.
+    pub fn request(&mut self, folder: &Path, mut request: Value) -> Result<Value, String> {
         self.asked += 1;
         let id = self.asked;
-        let request = json!({"id": id, "folder": folder, "method": method, "params": params});
+        request["id"] = json!(id);
+        request["folder"] = json!(folder);
         let (reader, writer) = (&mut self.reader, &mut self.writer);
         let reply = self.runtime.block_on(async {
             assert!(wire::write_frame(writer, &request).await);

@@ -3,7 +3,7 @@ import { Icon } from "./Icon";
 
 export type MessageToken = {
   id: string;
-  kind: "skill" | "image";
+  kind: "skill" | "image" | "file" | "folder";
   label: string;
   preview?: string;
   title?: string;
@@ -75,6 +75,7 @@ export function MessageTokens({
           title={token.title ?? token.label}
         >
           {token.kind === "image" && token.preview && <img src={token.preview} alt="" />}
+          {(token.kind === "file" || token.kind === "folder") && <Icon name={token.kind} />}
           <span className="msg-token-label">{token.label}</span>
           <button type="button" tabIndex={-1} aria-label={`Remove ${token.label}`} onMouseDown={(event) => event.preventDefault()} onClick={() => onRemove(token.id)}>
             <Icon name="x" />

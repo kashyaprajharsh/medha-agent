@@ -2,6 +2,9 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom";
 import { Icon } from "./Icon";
 import { SentToken } from "./MessageTokens";
+import { MessageAttachments } from "./MessageAttachments";
+import { attachedFiles } from "./messageRequest";
+import type { MessageImage } from "./api";
 
 // Past this, a message reads as a paste: a card in the thread, the text on demand.
 const PASTE_CHARS = 1500;
@@ -10,17 +13,19 @@ const PASTE_LINES = 25;
 // A skill chosen in the composer rides after the request in the TUI's words.
 const SKILL = /\n\n\[Loaded skill: ([^\]\n]+)\] Follow this procedure[^\n]*\n\n/;
 
-export function UserText({ text }: { text: string }) {
+export function UserText({ text: raw, images = [] }: { text: string; images?: MessageImage[] }) {
+  const { text, files } = attachedFiles(raw);
   const skill = SKILL.exec(text);
   const said = skill ? text.slice(0, skill.index) : text;
   const lines = said.split("\n").length;
   // The same token the composer showed, leading the text it was sent with.
   const lead = skill ? <SentToken kind="skill" label={skill[1]} /> : null;
-  return said.length > PASTE_CHARS || lines > PASTE_LINES ? (
-    <PastedText text={said} lines={lines} lead={lead} />
-  ) : (
-    <FoldedText text={said} lead={lead} />
-  );
+  return <div className="you-text">
+    {said.length > PASTE_CHARS || lines > PASTE_LINES
+      ? <PastedText text={said} lines={lines} lead={lead} />
+      : <FoldedText text={said} lead={lead} />}
+    <MessageAttachments images={images} files={files} />
+  </div>;
 }
 
 /** Folded to a few lines when long. Overflow is measured, not guessed, so the
@@ -41,7 +46,7 @@ function FoldedText({ text, lead }: { text: string; lead?: ReactNode }) {
   }, [text, open]);
 
   return (
-    <div className="you-text">
+    <div>
       <p
         ref={body}
         className={open ? undefined : long ? "folded faded" : "folded"}
@@ -76,7 +81,7 @@ function PastedText({ text, lines, lead }: { text: string; lines: number; lead?:
     .slice(0, 2)
     .join("\n");
   return (
-    <div className="you-text">
+    <div>
       {lead && <p className="you-lead">{lead}</p>}
       <button
         type="button"

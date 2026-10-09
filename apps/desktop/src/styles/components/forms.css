@@ -93,6 +93,26 @@ input[type="radio"] {
   color: var(--text);
   animation: pop-in var(--t-base) var(--ease-out) both;
 }
+.select-menu.searching {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+.select-menu.searching > .model-search {
+  flex: none;
+  margin: 6px 6px 0;
+}
+.select-options {
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+}
+.select-empty {
+  margin: 0;
+  padding: var(--s-2) 10px;
+  color: var(--faint);
+}
 .select-menu [role="option"] {
   display: flex;
   align-items: center;

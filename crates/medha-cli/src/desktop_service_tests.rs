@@ -9,6 +9,49 @@ fn kinds(page: &EventPage) -> Vec<&'static str> {
 }
 
 #[test]
+fn user_image_history_retains_references_and_names_without_bytes_or_provider_state() {
+    let session = Session::new();
+    let mut event = Event::user_message(&session, "A screenshot");
+    event.payload["attachments"] = json!([kernel::MediaPart {
+        mime_type: "image/png".into(),
+        source: kernel::MediaSource::Artifact("a".repeat(64)),
+        label: Some("shot.png".into()),
+        width: None,
+        height: None,
+        byte_size: None,
+        provider_state: vec![ProviderState {
+            protocol: Protocol::OpenAiResponses,
+            kind: "replay".into(),
+            value: json!("private-state"),
+        }],
+    }]);
+    let page = page_events(&[event], None, None).unwrap();
+    assert_eq!(page.events[0].images[0].name, "shot.png");
+    let encoded = serde_json::to_string(&page).unwrap();
+    assert!(!encoded.contains("private-state"));
+    assert!(!encoded.contains("base64"));
+}
+
+#[test]
+fn oversized_image_metadata_is_omitted_with_a_notice_inside_the_history_page_budget() {
+    let event = EventView {
+        kind: "user",
+        text: Some("kept".into()),
+        images: vec![protocol::SavedImage {
+            hash: "a".repeat(64),
+            mime: "image/png".into(),
+            name: "\u{1}".repeat(PAGE_BYTES),
+        }],
+        ..EventView::default()
+    };
+    let (fitted, bytes) = event.fitted();
+    assert!(bytes <= PAGE_BYTES);
+    assert_eq!(fitted.text.as_deref(), Some("kept"));
+    assert_eq!(fitted.omitted, ["images"]);
+    assert!(fitted.images.is_empty());
+}
+
+#[test]
 fn provider_state_never_reaches_the_window_while_tool_input_does() {
     let session = Session::new();
     let call = Event::model_intent(

@@ -102,6 +102,20 @@ fn each_surface_requires_its_own_features_without_requiring_an_identical_build()
         fit_for(&terminal, false, &["terminal-controls", "replay-stream"]),
         Fit::Join
     );
+    let without_images = json!({"build": "different", "capabilities":
+        wire::CAPABILITIES.iter().filter(|capability| **capability != "workspace-images").collect::<Vec<_>>()});
+    assert_eq!(
+        fit_for(
+            &without_images,
+            false,
+            &["shared-live-state", "workspace-images"]
+        ),
+        Fit::GiveWay { needed: true }
+    );
+    assert_eq!(
+        fit_for(&terminal, false, &["shared-live-state", "workspace-images"]),
+        Fit::Join
+    );
 }
 
 #[tokio::test]

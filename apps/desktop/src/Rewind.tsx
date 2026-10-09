@@ -1,12 +1,13 @@
 import { Select } from "./Select";
 import { useEffect, useState } from "react";
 import { useWorkspaceApi } from "./Workspace";
-import type { Attachment } from "./api";
+import type { Attachment, ImageAttachment } from "./api";
+import { attachedFiles } from "./messageRequest";
 export type RewindResult = {
   source: string;
   session: string;
   prefill: string;
-  images: Attachment[];
+  attachments: Attachment[];
   code_only: boolean;
 };
 type Point = { id: string; text: string; files: number };
@@ -57,13 +58,15 @@ export function Rewind({
         at: selected,
         scope,
       });
-      const rewound = result as RewindResult;
+      const rewound = result as Omit<RewindResult, "attachments"> & { images: Omit<ImageAttachment, "preview">[] };
+      const local = attachedFiles(rewound.prefill);
       onComplete({
         ...rewound,
-        images: rewound.images.map((image) => ({
+        prefill: local.text,
+        attachments: [...rewound.images.map((image) => ({
           ...image,
           preview: `data:${image.mime};base64,${image.data}`,
-        })),
+        })), ...local.files.map((file) => ({ ...file, id: crypto.randomUUID() }))],
       });
       onClose();
     } catch (cause) {

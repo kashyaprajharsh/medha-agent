@@ -605,11 +605,20 @@ pub(crate) async fn change(workspace: &Path, action: Change) -> Result<Reply, St
 
 pub(crate) async fn folder<L: EventLog>(
     log: &L,
+    artifacts: &std::sync::Arc<dyn kernel::ArtifactStore>,
     workspace: &Path,
     method: &str,
     params: Value,
 ) -> Option<Result<Value, String>> {
     let result = match method {
+        "application.image" => match decoded::<protocol::ReadWorkspaceImage>(params) {
+            Ok(request) => {
+                crate::chat_history::read_image(artifacts, request.hash, request.thumbnail)
+                    .await
+                    .and_then(encoded)
+            }
+            Err(error) => Err(error),
+        },
         "application.resources" => match decoded(params) {
             Ok(request) => read(log, workspace, request, None, None, &HashSet::new())
                 .await

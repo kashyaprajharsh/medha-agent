@@ -47,6 +47,34 @@
   gap: var(--s-1);
   padding: 6px 10px 10px;
 }
+.attachment-options {
+  position: absolute;
+  bottom: 100%;
+  left: var(--s-2);
+  z-index: 12;
+  display: grid;
+  gap: var(--s-1);
+  max-width: calc(var(--s-6) * 12);
+  padding: var(--s-2);
+  background: var(--raised);
+  border-radius: var(--r-lg);
+  box-shadow: var(--e2-shadow);
+}
+.attachment-options button {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2);
+  border-radius: var(--r-sm);
+}
+.attachment-options button:hover {
+  background: var(--hover);
+}
+.attachment-options p {
+  margin: var(--s-1) var(--s-2);
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
 .composer .grow {
   flex: 1;
 }

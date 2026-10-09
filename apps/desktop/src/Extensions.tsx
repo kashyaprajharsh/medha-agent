@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { Connectors } from "./Connectors";
-import { Icon } from "./Icon";
 import { useWorkspaceApi } from "./Workspace";
 import { McpDetails, McpForm, mcpView as serverView, useMcpSignIn, type McpPrefill, type McpServer, type McpStatus } from "./McpServers";
 import { McpCatalog } from "./McpCatalog";
@@ -10,7 +9,7 @@ import { SkillBrowse } from "./SkillBrowse";
 import { Sheet } from "./Sheet";
 import { SkillList, type Skill } from "./SkillList";
 import { SkillManage } from "./SkillManage";
-import { Add, Find, PageTop, summaryOf, ViewBar } from "./ExtensionParts";
+import { Add, Find, InstallSource, PageTop, summaryOf, ViewBar } from "./ExtensionParts";
 import { Hooks } from "./Hooks";
 import { ToolPreset } from "./ToolPreset";
 type Mcp = McpServer;
@@ -297,28 +296,15 @@ export function Extensions({
         {tab === "skills" && skillView === "installed" && (
           <>
             {installing && (
-              <form
-                className="plugin-install"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void act("extensions.skill.install", { source });
-                }}
-              >
-                <label>
-                  <Icon name="plus" />
-                  <input
-                    required
-                    autoFocus
-                    aria-label="Skill source"
-                    value={source}
-                    onChange={(event) => setSource(event.target.value)}
-                    placeholder="Skill folder, SKILL.md, or GitHub folder URL"
-                  />
-                </label>
-                <button className="btn-line" disabled={busy || locked || !source.trim()}>
-                  Install skill
-                </button>
-              </form>
+              <InstallSource
+                key="skill"
+                kind="skill"
+                value={source}
+                disabled={busy || locked}
+                onChange={setSource}
+                onInstall={(from) => act("extensions.skill.install", { source: from })}
+                onError={setError}
+              />
             )}
             <SkillList
               skills={skills}
@@ -368,28 +354,15 @@ export function Extensions({
         {tab === "plugins" && pluginView === "installed" && (
           <>
             {installing && (
-              <form
-                className="plugin-install"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void act("extensions.install", { source });
-                }}
-              >
-                <label>
-                  <Icon name="plus" />
-                  <input
-                    required
-                    autoFocus
-                    aria-label="Plugin source"
-                    value={source}
-                    onChange={(event) => setSource(event.target.value)}
-                    placeholder="owner/repo, name@marketplace, or a folder"
-                  />
-                </label>
-                <button className="btn-line" disabled={busy || locked || !source.trim()}>
-                  Install
-                </button>
-              </form>
+              <InstallSource
+                key="plugin"
+                kind="plugin"
+                value={source}
+                disabled={busy || locked}
+                onChange={setSource}
+                onInstall={(from) => act("extensions.install", { source: from })}
+                onError={setError}
+              />
             )}
             {notices.map((message) => (
               <p className="surface-error" key={message}>

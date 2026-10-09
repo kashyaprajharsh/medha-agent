@@ -8,6 +8,7 @@ import { Add, PageTop, ViewBar } from "./ExtensionParts";
 import { Icon } from "./Icon";
 import { Sheet } from "./Sheet";
 import { useWorkspace } from "./Workspace";
+import { profileFor } from "./modelSetup";
 type Model = {
   name: string;
   profile: Record<string, unknown> & {
@@ -189,6 +190,7 @@ export function Settings({
               <ModelForm
                 key={editing?.name || "new"}
                 model={editing}
+                saved={models}
                 protocols={protocols}
                 busy={busy}
                 onCancel={() => setEditing(undefined)}
@@ -387,12 +389,14 @@ export function Settings({
 }
 function ModelForm({
   model,
+  saved,
   protocols,
   busy,
   onSave,
   onCancel,
 }: {
   model: Model | null;
+  saved: Model[];
   protocols: ModelProtocol[];
   busy: boolean;
   onSave: (params: Record<string, unknown>) => Promise<void>;
@@ -405,6 +409,30 @@ function ModelForm({
   const [protocol, setProtocol] = useState(model?.profile.protocol || "");
   const selectedProtocol = protocols.find((item) => item.value === protocol);
   const presets = selectedProtocol?.providers || [];
+  // Servers already in use are offered again, so a second model needs no retyped address.
+  const reused = [
+    ...new Map(
+      saved
+        .filter(
+          (item) =>
+            item.profile.protocol === protocol &&
+            !presets.some((listed) => listed.url === item.profile.base_url),
+        )
+        .map((item) => [item.profile.base_url, item.profile.auth]),
+    ),
+  ];
+  // Named by host alone unless two addresses share one.
+  const own: Preset[] = reused.map(([address, kind]) => ({
+    name:
+      reused.filter(([other]) => hostOf(other) === hostOf(address)).length > 1
+        ? address.replace(/^https?:\/\//, "")
+        : hostOf(address),
+    url: address,
+    auth: kind,
+  }));
+  /** A key is stored per address, so any saved model there already holds it. */
+  const keySavedAt = (address: string) =>
+    saved.some((item) => item.key_present && item.profile.base_url === address);
   const [preset, setPreset] = useState(() =>
     model
       ? protocols
@@ -495,15 +523,15 @@ function ModelForm({
       ),
     };
   }
-  async function discover() {
+  async function discover(from: object = profile(), secret = key) {
     const version = ++discoveryVersion.current;
     setDiscovering(true);
     setDiscovered([]);
     setDiscoveryError("");
     try {
       const result = await api.settings("settings.model.discover", {
-        profile: profile(),
-        key,
+        profile: from,
+        key: secret,
       });
       if (version !== discoveryVersion.current) return;
       const rows = result.models as typeof discovered;
@@ -573,19 +601,31 @@ function ModelForm({
             value={preset}
             disabled={busy || !selectedProtocol?.available}
             onChange={(event) => {
-              const selected = presets.find(
+              const selected = [...presets, ...own].find(
                 (item) => item.url === event.target.value,
               );
+              const nextAuth =
+                selected?.auth || selectedProtocol?.auth || "bearer";
               setPreset(event.target.value);
               setUrl(selected?.url || "");
-              setAuth(selected?.auth || selectedProtocol?.auth || "bearer");
+              setAuth(nextAuth);
               resetConnection();
+              // With the key already saved there is nothing to ask for: list the models now.
+              if (
+                selected &&
+                selectedProtocol?.discovery &&
+                keySavedAt(selected.url)
+              )
+                void discover(
+                  profileFor({ protocol, url: selected.url, auth: nextAuth }),
+                  "",
+                );
             }}
           >
             <option value="" disabled>
               Choose a provider
             </option>
-            {presets.map((item) => (
+            {[...own, ...presets].map((item) => (
               <option key={item.url} value={item.url}>
                 {item.name}
               </option>
@@ -612,7 +652,7 @@ function ModelForm({
           <p className="quiet">
             {preset === "custom"
               ? "Enter your server’s base URL."
-              : "Filled from the provider preset. You can change it for your server."}
+              : "Filled in for this provider. You can change it for your server."}
           </p>
           {auth !== "none" && (
             <label>
@@ -622,8 +662,8 @@ function ModelForm({
                 autoComplete="new-password"
                 value={key}
                 placeholder={
-                  model?.key_present
-                    ? "Leave empty to keep saved key"
+                  keySavedAt(url)
+                    ? "Leave empty to use the saved key"
                     : "Paste API key"
                 }
                 onChange={(event) => {
@@ -642,9 +682,7 @@ function ModelForm({
                   busy ||
                   discovering ||
                   !url ||
-                  (auth !== "none" &&
-                    !key.trim() &&
-                    !(model?.key_present && url === model.profile.base_url))
+                  (auth !== "none" && !key.trim() && !keySavedAt(url))
                 }
                 onClick={() => void discover()}
               >
@@ -662,13 +700,12 @@ function ModelForm({
               Available models
               <Select
                 value={id}
+                search="Search models"
                 onChange={(event) => {
                   const selected = discovered.find(
                     (item) => item.id === event.target.value,
                   )!;
                   setId(selected.id);
-                  if (!name)
-                    setName(selected.id.replace(/[^a-zA-Z0-9._-]/g, "-"));
                   if (selected.context_length)
                     setContext(String(selected.context_length));
                 }}
@@ -692,12 +729,11 @@ function ModelForm({
             />
           </label>
           <label>
-            Profile name
+            Profile name{!model && " (optional)"}
             <input
-              required
               disabled={Boolean(model)}
               value={name}
-              placeholder="my-model"
+              placeholder="Named automatically from the model ID"
               onChange={(event) => setName(event.target.value)}
             />
           </label>

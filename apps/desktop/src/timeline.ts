@@ -1,4 +1,4 @@
-import type { HistoryEvent } from "./api";
+import type { HistoryEvent, MessageImage } from "./api";
 import type { LiveAgent, Plan, Step } from "./live";
 
 export type SubagentRun = {
@@ -17,6 +17,7 @@ export type Block =
       id: string;
       text: string;
       html?: string;
+      images?: MessageImage[];
       ts: number;
     }
   | {
@@ -144,6 +145,7 @@ export function toBlocks(events: HistoryEvent[]): Block[] {
           id: event.id,
           text: event.text ?? "",
           html: event.html,
+          images: event.images,
           ts: event.ts,
         });
     }

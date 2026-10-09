@@ -13,7 +13,7 @@ const { outputText } = ts.transpileModule(source, {
     module: ts.ModuleKind.ESNext,
   },
 });
-const { reduceLive, startingLive, recordSent, queuedMessages } = await import(
+const { reduceLive, startingLive, recordSent, queuedMessages, explainError } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`
 );
 const event = (kind, params = {}) => ({
@@ -70,6 +70,18 @@ test("other viewers' messages appear while optimistic local messages appear once
   assert.deepEqual(state.items.filter((item) => item.kind === "user").map((item) => item.text), ["local", "other viewer"]);
   state = reduceLive(state, event("message.steered", { content: "other viewer steer" }));
   assert.equal(state.items.at(-1).text, "other viewer steer");
+});
+
+test("image references reach other viewers and a recovered current turn", () => {
+  const images = [{ hash: "a".repeat(64), name: "shot.png", mime: "image/png" }];
+  const accepted = event("message.accepted", { content: "Look", images });
+  let state = reduceLive(startingLive(), accepted);
+  assert.deepEqual(state.items[0].images, images);
+  state = reduceLive(state, { method: "session.presentation", params: {
+    session: "conversation", running: true, frames: [accepted], approvals: [], questions: [], agents: [],
+  } });
+  assert.deepEqual(state.items[0].images, images);
+  assert.equal(state.items.length, 1);
 });
 
 test("a retry removes the abandoned response while preserving completed work", () => {
@@ -487,4 +499,16 @@ test("a call being written is kept only while it is useful, and never without bo
   const big = "x".repeat(600 * 1024);
   state = feed(feed(feed(state, "6", big), "6", big), "6", big);
   assert.ok(state.writing.at(-1).text.length <= 1024 * 1024);
+});
+
+test("a refused request shows the provider's reason instead of blaming the key", () => {
+  // Exactly what a gated free model answers to a valid key.
+  const gated =
+    'provider error: provider returned status 403: {"error":{"code":403,"message":"vendor/model:free is only available on agentic harnesses.","metadata":{"failed_routing_step":"Gate Free Endpoints by Agentic Harness"}}}\nThe task did not finish.';
+  const shown = explainError(gated);
+  assert.match(shown, /only available on agentic harnesses/);
+  assert.doesNotMatch(shown, /credentials/);
+  // No readable reason still must not claim the key is wrong.
+  assert.doesNotMatch(explainError("provider error: provider returned status 403: <html>Forbidden</html>"), /rejected the credentials/);
+  assert.match(explainError('provider error: provider returned status 401: {"detail":"Invalid API Key"}'), /rejected the credentials/);
 });

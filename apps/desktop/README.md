@@ -25,10 +25,12 @@ local models and hosted providers.
 - **Agents:** inspect transcripts, send steering or follow-up instructions, and
   stop individual agents.
 - **Extensions:** install and manage skills, plugins and MCP servers, including
-  their enabled state and tool access.
+  their enabled state and tool access. Choose a skill folder, `SKILL.md` or plugin
+  folder from your files, or paste a local path or supported URL.
 - **Terminal:** use your shell through a native PTY, with interactive programs,
   resizing, Unicode and Ctrl+C. Hiding the terminal preserves running commands.
-- **Images:** attach, paste or drop images into the composer.
+- **Attachments:** attach images, files and folders from the composer. Paste or
+  drop images and view them beside sent messages, including reopened chats.
 
 ## Get started
 
@@ -46,6 +48,12 @@ terminal does not change the agent's workspace.
 
 Rewind can fork a conversation, restore recorded workspace edits, or do both.
 Arbitrary shell commands and external side effects are outside its undo scope.
+
+Use the paperclip to choose **Images**, **Files** or **Folder**. Images are saved
+with the conversation. Other files and folders are shared by their local paths;
+Medha uses its tools to read them and asks for access when required. These paths
+remain in the conversation, so keep the files available when resuming work.
+Support for reading a particular format depends on the tools available.
 
 ## Shared backend and data
 

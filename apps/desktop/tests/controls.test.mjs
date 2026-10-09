@@ -7,6 +7,7 @@ import React, { act } from "react";
 
 const dom = new JSDOM('<!doctype html><div id="root"></div>', {
   pretendToBeVisual: true,
+  url: "http://localhost/",
 });
 for (const name of [
   "window",
@@ -17,6 +18,8 @@ for (const name of [
   "MouseEvent",
   "KeyboardEvent",
   "Event",
+  "CustomEvent",
+  "localStorage",
 ])
   globalThis[name] = dom.window[name];
 const { createRoot } = await import("react-dom/client");
@@ -26,6 +29,7 @@ globalThis.ResizeObserver = class {
   observe() {}
   disconnect() {}
 };
+dom.window.HTMLElement.prototype.scrollIntoView = function () {};
 globalThis.__medhaControlsTest = { active: true, api: {} };
 const modules = new Map([
   [
@@ -37,7 +41,7 @@ const modules = new Map([
   ],
   [
     "api",
-    "data:text/javascript," + encodeURIComponent("export const desktop = {}"),
+    "data:text/javascript," + encodeURIComponent("export const desktop = {chooseExtensionSource: (kind) => globalThis.__medhaControlsTest.chooseExtensionSource(kind), chooseAttachments: (kind) => globalThis.__medhaControlsTest.chooseAttachments(kind), admitImage: (bytes) => globalThis.__medhaControlsTest.admitImage(bytes)}"),
   ],
   [
     // The diagram engine needs a real browser; a whole diagram here is one that ends in a node.
@@ -48,8 +52,8 @@ const modules = new Map([
       ),
   ],
 ]);
-async function moduleUrl(name) {
-  if (modules.has(name)) return modules.get(name);
+async function moduleUrl(name, cache = modules) {
+  if (cache.has(name)) return cache.get(name);
   const source = await readFile(
     new URL(`../src/${name}.tsx`, import.meta.url),
     "utf8",
@@ -67,17 +71,17 @@ async function moduleUrl(name) {
     "import.meta.url",
     JSON.stringify(new URL(`../src/${name}.tsx`, import.meta.url).href),
   );
-  for (const match of [...outputText.matchAll(/from ["']([^"']+)["']/g)]) {
+  for (const match of [...outputText.matchAll(/^import\s.*?\sfrom\s["']([^"'\r\n]+)["']/gm)]) {
     const dependency = match[1];
     const url = dependency.startsWith("./")
-      ? await moduleUrl(dependency.slice(2))
+      ? await moduleUrl(dependency.slice(2), cache)
       : import.meta.resolve(dependency);
     outputText = outputText
       .replaceAll(`"${dependency}"`, JSON.stringify(url))
       .replaceAll(`'${dependency}'`, JSON.stringify(url));
   }
   const url = `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`;
-  modules.set(name, url);
+  cache.set(name, url);
   return url;
 }
 const { Select } = await import(await moduleUrl("Select"));
@@ -1671,4 +1675,491 @@ test("Backspace at the start of the message marks the nearest token first, then 
   await key(textarea, "Backspace");
   await key(textarea, "Backspace");
   assert.deepEqual(removedSkills, [null], "any other key disarms, so the skill needs its own two presses");
+});
+
+test("saving a new default refreshes an open chat's model picker without restarting or switching it", async () => {
+  // Keep App, Settings, Composer and useLive real. Only the native API and
+  // unrelated visual surfaces are substituted.
+  const cache = new Map(modules);
+  const stub = (name, source) => cache.set(name, "data:text/javascript," + encodeURIComponent(source));
+  for (const [name, exports] of Object.entries({
+    FileViewer: ["FileViewer"], FirstRun: ["FirstRun"], Extensions: ["Extensions"],
+    Rewind: ["Rewind"], LiveTail: ["LiveTail"], Palette: ["Palette"],
+    WorkSurface: ["WorkSurface"], Transcript: ["Transcript"], UpdateReady: ["UpdateReady"],
+    Welcome: ["Starters", "Welcome"], WorkspaceMenu: ["WorkspaceMenu"],
+  })) stub(name, exports.map((name) => `export function ${name}(){return null}`).join(";"));
+  stub("OutputScope", "export function OutputScope({children}){return children}");
+  stub("Sidebar", `import React from ${JSON.stringify(import.meta.resolve("react"))};
+    export const medhaIcon = '';
+    export function Sidebar(props){return React.createElement('nav',null,
+      React.createElement('button',{onClick:props.onSettings},'Open Settings'),
+      React.createElement('button',{onClick:props.onNew},'New session'),
+      ...props.sessions.map(session=>React.createElement('button',{
+        key:session.id,onClick:()=>props.onSelect(session.id)},session.title)))}`);
+  const { App } = await import(await moduleUrl("App", cache));
+  globalThis.requestAnimationFrame = dom.window.requestAnimationFrame.bind(dom.window);
+  globalThis.cancelAnimationFrame = dom.window.cancelAnimationFrame.bind(dom.window);
+  HTMLElement.prototype.scrollIntoView = () => {};
+  const saved = [{ name: "old", profile: { model: "old-model", base_url: "http://localhost/v1", protocol: "open-ai-chat", auth: "none" } }];
+  let defaultName = "old", receive;
+  const active = new Map(), calls = [], opened = [];
+  const catalogue = () => saved.map((model) => ({ ...model, default: model.name === defaultName, key_present: false }));
+  const currentSettings = (name) => ({
+    ...settings, profile: name, model: saved.find((model) => model.name === name).profile.model,
+    profiles: catalogue().map((model) => ({ name: model.name, model: model.profile.model, default: model.default, protocol: model.profile.protocol })),
+  });
+  const api = {
+    workspace: async () => "/project", sessions: async () => [{ id: "existing", title: "Existing chat", started_ts: 1 }],
+    branch: async () => null, defaults: async () => currentSettings(defaultName),
+    events: async () => ({ events: [], next_cursor: null }), extensions: async () => ({ skills: [] }),
+    liveFocus: async () => {}, onLive: async (callback) => { receive = callback; return () => {}; },
+    liveOpen: async (key, resume) => {
+      opened.push(key);
+      active.set(key, resume ? "old" : defaultName);
+      receive(key, { method: "ready", params: { session: resume ?? key, model: currentSettings(active.get(key)).model } });
+    },
+    liveCall: async (key, method, change) => {
+      calls.push({ key, method, change });
+      if (method === "extensions.reload") return {};
+      assert.ok(["session.settings", "session.configure"].includes(method), method);
+      if (method === "session.configure") active.set(key, change.profile);
+      return currentSettings(active.get(key));
+    },
+    settings: async (method = "settings.list", params) => {
+      if (method === "settings.model.save") { saved.push({ name: params.name, profile: params.profile }); return { saved: true }; }
+      if (method === "settings.model.default") { defaultName = params.name; return { saved: true }; }
+      assert.equal(method, "settings.list");
+      return { models: catalogue(), protocols: [], search: { provider: "duckduckgo" } };
+    },
+  };
+  Object.assign(globalThis.__medhaControlsTest, { api, workspace: { id: "project", name: "Project" }, theme: "dark", setTheme() {} });
+  const button = (text) => [...document.querySelectorAll("button")].find((node) => node.textContent.trim() === text);
+  const chip = () => document.querySelector(".chip");
+  await act(async () => root.render(h(App)));
+  await click(button("Existing chat"));
+  await click(chip());
+  assert.equal(document.querySelectorAll(".model-options button").length, 1);
+  await click(document.querySelector('[aria-label="Close settings"]'));
+  await click(button("Open Settings"));
+
+  await act(async () => {
+    await api.settings("settings.model.save", { name: "new", profile: { ...saved[0].profile, model: "new-model" } });
+    window.dispatchEvent(new CustomEvent("medha-preferences"));
+  });
+  // Reload the Settings page, then use its real Make default action.
+  await click(button("Existing chat"));
+  await click(button("Open Settings"));
+  await click(document.querySelectorAll(".ix-main")[1]);
+  await click(button("Make default"));
+  assert.equal(defaultName, "new");
+
+  await click(button("Existing chat"));
+  assert.equal(chip().textContent.trim(), "old", "changing the default must not switch an existing chat");
+  await click(chip());
+  const options = [...document.querySelectorAll(".model-options button")];
+  assert.deepEqual(options.map((node) => node.querySelector("b").textContent), ["old", "new"]);
+  assert.match(options[1].textContent, /new-model · default/);
+  assert.doesNotMatch(options[0].textContent, /default/);
+  assert.equal(options[0].getAttribute("aria-pressed"), "true");
+  assert.equal(opened.length, 1, "refreshing a picker must reuse the existing chat");
+  await click(options[1]);
+  assert.equal(chip().textContent.trim(), "new");
+  assert.ok(calls.some((call) => call.method === "session.configure" && call.change.profile === "new"));
+  await click(document.querySelector('[aria-label="Close settings"]'));
+  await click(button("New session"));
+  assert.equal(chip().textContent.trim(), "new", "an unopened draft uses the new default");
+  await click(chip());
+  assert.equal(opened.length, 2);
+  assert.equal(active.get(opened[1]), "new", "a new chat starts on the new default");
+});
+
+test("choosing a discovered Gemini model lets the backend name its profile and preserves the exact model ID", async () => {
+  const { Settings } = await import(await moduleUrl("Settings"));
+  const writes = [];
+  const api = {
+    settings: async (method = "settings.list", params) => {
+      if (method === "settings.model.discover") return { models: [{ id: "gemini-3.8-flash", context_length: 1048576 }] };
+      if (method === "settings.model.save") { writes.push(params); return { saved: true, name: "gemini-3-8-flash" }; }
+      assert.equal(method, "settings.list");
+      return { models: [], search: { provider: "duckduckgo" }, protocols: [{
+        value: "gemini-interactions", label: "Gemini Interactions v1", available: true, auth: "x-goog-api-key", discovery: true,
+        providers: [{ name: "Google Gemini", url: "https://generativelanguage.googleapis.com/v1", auth: "x-goog-api-key" }],
+      }] };
+    },
+  };
+  globalThis.__medhaControlsTest.api = api;
+  const button = (text) => [...document.querySelectorAll("button")].find((node) => node.textContent.trim() === text);
+  await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {} })));
+  await click(button("Add model"));
+  await click(button("Choose a protocol"));
+  await click(option("Gemini Interactions v1"));
+  await click(button("Choose a provider"));
+  await click(option("Google Gemini"));
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  await act(() => {
+    const key = document.querySelector('input[type="password"]');
+    setter.call(key, "dummy-key");
+    key.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await click(button("Find models on this server"));
+  await click(button("Choose a model"));
+  await click(option("gemini-3.8-flash"));
+  const inputFor = (label) => [...document.querySelectorAll("label")].find((node) => node.textContent.startsWith(label)).querySelector("input");
+  assert.equal(inputFor("Model ID").value, "gemini-3.8-flash");
+  const name = inputFor("Profile name");
+  assert.equal(name.value, "", "let the backend derive a valid, unique profile name");
+  assert.equal(name.required, false);
+  await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].name, "");
+  assert.equal(writes[0].profile.model, "gemini-3.8-flash");
+  assert.equal(writes[0].profile.protocol, "gemini-interactions");
+  assert.equal(writes[0].profile.auth, "x-goog-api-key");
+});
+
+const namedButton = (label) => [...document.querySelectorAll("button")].find((node) => node.textContent.trim() === label);
+async function inputValue(input, value) {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  await act(() => {
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+async function extensionForm(kind, chooseExtensionSource) {
+  const writes = [];
+  globalThis.__medhaControlsTest.chooseExtensionSource = chooseExtensionSource;
+  globalThis.__medhaControlsTest.api = {
+    settings: async () => ({ mcp: [] }),
+    extensions: async (method, params) => {
+      if (!method) return { plugins: [], skills: [], notices: [], skill_errors: [] };
+      assert.ok(["extensions.skill.install", "extensions.install"].includes(method));
+      writes.push([method, params]);
+      return { enabled: true };
+    },
+  };
+  const cache = new Map(modules);
+  // The unrelated connectors page loads images through Vite's browser-only glob.
+  cache.set("Connectors", "data:text/javascript," + encodeURIComponent("export function Connectors(){return null}"));
+  const { Extensions } = await import(await moduleUrl("Extensions", cache));
+  const render = async (locked = false) => act(async () => root.render(h(Extensions, {
+    sessionKey: null, ensureOpen: async () => {}, locked, onAsk() {},
+  })));
+  await render();
+  await click(namedButton(kind === "skill" ? "Skills" : "Plugins"));
+  await click(namedButton(`Add ${kind}`));
+  return { writes, render };
+}
+
+test("Add skill browses a folder or Markdown file and waits for an explicit install", async () => {
+  const picked = [];
+  const folder = "/Users/test/My skills/research";
+  const file = "/Users/test/Documents/SKILL.md";
+  const { writes } = await extensionForm("skill", async (kind) => {
+    picked.push(kind);
+    return kind === "skill_folder" ? folder : file;
+  });
+  await click(document.querySelector('[aria-label="Choose local skill"]'));
+  await click(namedButton("Choose folder"));
+  assert.deepEqual(picked, ["skill_folder"]);
+  assert.equal(document.querySelector('[aria-label="Skill source"]').value, folder);
+  assert.deepEqual(writes, [], "selecting a source must not install it");
+  await click(namedButton("Install skill"));
+  assert.deepEqual(writes, [["extensions.skill.install", { source: folder }]]);
+  assert.match(document.querySelector('[role="status"]').textContent, /Skill installed/);
+
+  await click(namedButton("Add skill"));
+  await click(document.querySelector('[aria-label="Choose local skill"]'));
+  await key(namedButton("Choose folder"), "Escape");
+  assert.equal(document.querySelector('[aria-label="Choose a skill from your files"]'), null);
+  assert.equal(document.activeElement, document.querySelector('[aria-label="Choose local skill"]'));
+  await click(document.querySelector('[aria-label="Choose local skill"]'));
+  await click(namedButton("Choose SKILL.md"));
+  assert.deepEqual(picked, ["skill_folder", "skill_file"]);
+  assert.equal(document.querySelector('[aria-label="Skill source"]').value, file);
+  assert.equal(writes.length, 1);
+  await click(namedButton("Install skill"));
+  assert.deepEqual(writes[1], ["extensions.skill.install", { source: file }]);
+});
+
+test("Add plugin retains pasted sources on cancel and installs a chosen folder with review still required", async () => {
+  const picked = [];
+  let selection = null;
+  const { writes } = await extensionForm("plugin", async (kind) => {
+    picked.push(kind);
+    return selection;
+  });
+  const input = () => document.querySelector('[aria-label="Plugin source"]');
+  await inputValue(input(), "owner/repo");
+  await click(document.querySelector('[aria-label="Choose local plugin"]'));
+  assert.equal(input().value, "owner/repo", "cancel does not erase a pasted source");
+  await click(namedButton("Install"));
+  assert.deepEqual(writes[0], ["extensions.install", { source: "owner/repo" }]);
+  assert.match(document.querySelector('[role="status"]').textContent, /Installed and off.*review its access/);
+
+  await click(namedButton("Add plugin"));
+  selection = "/Users/test/Downloads/My plugin";
+  await click(document.querySelector('[aria-label="Choose local plugin"]'));
+  assert.equal(input().value, selection);
+  assert.equal(writes.length, 1);
+  await click(namedButton("Install"));
+  assert.deepEqual(writes[1], ["extensions.install", { source: selection }]);
+  assert.deepEqual(picked, ["plugin_folder", "plugin_folder"]);
+});
+
+test("picker errors allow retry, pending selections cannot install or leak into another extension form", async () => {
+  let choose = async () => { throw new Error("Picker failed"); };
+  const { writes, render } = await extensionForm("skill", (kind) => choose(kind));
+  const input = () => document.querySelector('[aria-label="Skill source"]');
+  const browse = () => document.querySelector('[aria-label="Choose local skill"]');
+  await inputValue(input(), "https://github.com/owner/repo/tree/main/skill");
+  await click(browse());
+  await click(namedButton("Choose SKILL.md"));
+  assert.match(document.querySelector('[role="alert"]').textContent, /Picker failed/);
+  assert.equal(browse().disabled, false);
+  choose = async () => null;
+  await click(browse());
+  await click(namedButton("Choose SKILL.md"));
+  assert.equal(document.querySelector('[role="alert"]'), null);
+  assert.equal(input().value, "https://github.com/owner/repo/tree/main/skill");
+  await click(namedButton("Install skill"));
+  assert.deepEqual(writes[0], ["extensions.skill.install", { source: "https://github.com/owner/repo/tree/main/skill" }]);
+
+  await click(namedButton("Add skill"));
+  await render(true);
+  assert.equal(browse().disabled, true);
+  assert.equal(input().disabled, true);
+  await render(false);
+  let finish;
+  choose = () => new Promise((resolve) => { finish = resolve; });
+  await click(browse());
+  await click(namedButton("Choose folder"));
+  assert.equal(browse().disabled, true);
+  assert.equal(input().disabled, true);
+  await act(() => document.querySelector(".plugin-install").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  assert.equal(writes.length, 1);
+  await click(namedButton("Plugins"));
+  await act(async () => finish("/Users/test/old skill"));
+  assert.equal(document.querySelector('[aria-label="Plugin source"]').value, "");
+  assert.equal(writes.length, 1);
+});
+
+const screenshotData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+async function attachmentChat() {
+  const { LiveTail } = await import(await moduleUrl("LiveTail"));
+  const { Transcript } = await import(await moduleUrl("Transcript"));
+  const { toBlocks } = await import(await moduleUrl("timeline"));
+  const writes = [], reads = [];
+  let receive, live, changeHistory;
+  globalThis.__medhaControlsTest.api = {
+    onLive: async (callback) => { receive = callback; return () => {}; },
+    liveOpen: async () => {},
+    liveCall: async (_key, method, params) => {
+      if (method === "session.settings") return settings;
+      assert.equal(method, "message.send");
+      writes.push(params);
+      return { accepted: true };
+    },
+    historyImage: async (hash, thumbnail) => {
+      reads.push([hash, thumbnail]);
+      return { name: "saved image", mime: "image/png", data: screenshotData };
+    },
+  };
+  globalThis.__medhaControlsTest.admitImage = async () => ({ mime: "image/png", data: screenshotData });
+  globalThis.__medhaControlsTest.chooseAttachments = async () => null;
+  function Harness() {
+    const [draft, setDraft] = React.useState("Take a look");
+    const [attachments, setAttachments] = React.useState([]);
+    const [history, setHistory] = React.useState(null);
+    changeHistory = setHistory;
+    live = useLive();
+    return h(React.Fragment, null,
+      history ? h(Transcript, { blocks: toBlocks(history) })
+        : live.live.chat && h(LiveTail, { state: live.live.chat, onApprove() {}, onAnswer() {}, onOpenAgent() {} }),
+      h(Composer, {
+        value: draft, onChange: setDraft,
+        onSend: () => { void live.send("chat", null, draft, attachments); setDraft(""); setAttachments([]); },
+        onStop() {}, running: false, disabled: false, placeholder: "Task", settings, settingsLocked: false,
+        control: null, onControl() {}, onLoadSettings: async () => {}, onConfigure: async () => {},
+        showReasoning: false, onShowReasoning() {}, attachments, onAttachments: setAttachments,
+        onSurface() {}, onNew() {}, onRewind() {}, onSettings() {}, onExtensions() {},
+      }));
+  }
+  await act(() => root.render(h(Harness)));
+  return {
+    writes, reads,
+    receive: (params) => act(async () => receive("chat", { method: "event", params })),
+    history: (events) => act(async () => changeHistory(events)),
+    state: () => live.live.chat,
+  };
+}
+
+test("a pasted screenshot is visible beside its sent text, survives acknowledgement, and displays again from history", async () => {
+  const chat = await attachmentChat();
+  const screenshot = new dom.window.File(["test image"], "Screenshot.png", { type: "image/png" });
+  screenshot.arrayBuffer = async () => new Uint8Array([1, 2, 3]).buffer;
+  await act(async () => {
+    const pasted = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(pasted, "clipboardData", { value: { files: [screenshot] } });
+    document.querySelector("textarea").dispatchEvent(pasted);
+  });
+  assert.equal(document.querySelectorAll(".msg-token.token-image img").length, 1);
+  await click(document.querySelector('[aria-label="Send message"]'));
+  assert.equal(chat.writes[0].images[0].name, "Screenshot.png");
+  assert.equal(document.querySelector(".you .sent-image img").alt, "Screenshot.png");
+  assert.match(document.querySelector(".you").textContent, /Take a look/);
+
+  const images = [{ hash: "a".repeat(64), name: "Screenshot.png", mime: "image/png" }];
+  await chat.receive({ kind: "message.accepted", content: "Take a look", images });
+  assert.equal(document.querySelectorAll(".you").length, 1, "the acknowledgement must not duplicate the message");
+  assert.deepEqual(chat.reads, [[images[0].hash, true]]);
+  await click(document.querySelector('[aria-label="Open Screenshot.png"]'));
+  assert.equal(document.querySelector(".message-image-full").alt, "Screenshot.png");
+  assert.deepEqual(chat.reads.at(-1), [images[0].hash, false]);
+  await click(document.querySelector('[aria-label="Close"]'));
+  await chat.history([{ kind: "user", id: "saved-user", text: "Take a look", ts: 1, images }]);
+  assert.equal(document.querySelector(".you .sent-image img").alt, "Screenshot.png");
+  assert.match(document.querySelector(".you").textContent, /Take a look/);
+});
+
+test("the composer selects arbitrary files and a folder, preserves cancellation and sends durable path references", async () => {
+  const chat = await attachmentChat();
+  const pdf = { id: "pdf", kind: "file", name: "Report.pdf", path: '/Users/test/My docs/report "final".pdf' };
+  const archive = { id: "archive", kind: "file", name: "Archive.zip", path: "/Users/test/Archive.zip" };
+  const folder = { id: "folder", kind: "folder", name: "Project", path: "/Users/test/Project files" };
+  const choices = [];
+  globalThis.__medhaControlsTest.chooseAttachments = async (kind) => {
+    choices.push(kind);
+    return kind === "folder" ? [folder] : [pdf, archive];
+  };
+  await click(document.querySelector('[aria-label="Attach files"]'));
+  await click(namedButton("Files"));
+  assert.equal(document.querySelectorAll(".msg-token.token-file").length, 2);
+  globalThis.__medhaControlsTest.chooseAttachments = async () => null;
+  await click(document.querySelector('[aria-label="Attach files"]'));
+  await click(namedButton("Files"));
+  assert.equal(document.querySelectorAll(".msg-token.token-file").length, 2);
+  globalThis.__medhaControlsTest.chooseAttachments = async (kind) => { choices.push(kind); return [folder]; };
+  await click(document.querySelector('[aria-label="Attach files"]'));
+  await click(namedButton("Folder"));
+  assert.equal(document.querySelectorAll(".msg-token.token-folder").length, 1);
+  await click(document.querySelector('[aria-label="Send message"]'));
+  const { attachedFiles } = await import(await moduleUrl("messageRequest"));
+  const parsed = attachedFiles(chat.writes[0].content);
+  assert.equal(parsed.text, "Take a look");
+  assert.deepEqual(parsed.files.map((file) => file.path), [pdf.path, archive.path, folder.path]);
+  assert.deepEqual(chat.writes[0].images, []);
+  assert.deepEqual(choices, ["files", "folder"]);
+  assert.equal(document.querySelectorAll(".you .sent-file").length, 3);
+  assert.equal(document.querySelector(".you p").textContent, "Take a look");
+  assert.equal(chat.state().items[0].text, chat.writes[0].content);
+  await chat.history([{ kind: "user", id: "saved-files", text: chat.writes[0].content, ts: 1 }]);
+  assert.equal(document.querySelectorAll(".you .sent-file").length, 3);
+});
+
+test("rewind restores both saved images and local files as removable draft attachments", async () => {
+  const { Rewind } = await import(await moduleUrl("Rewind"));
+  const { messageRequest } = await import(await moduleUrl("messageRequest"));
+  const document = { id: "doc", kind: "file", name: "Report.pdf", path: "/Users/test/Report.pdf" };
+  const prefill = messageRequest("Read the report", [document]).content;
+  let restored;
+  globalThis.__medhaControlsTest.api.liveCall = async (_key, method) => {
+    if (method === "session.rewind.points") return { points: [{ id: "point", text: prefill, files: 0 }] };
+    assert.equal(method, "session.rewind");
+    return { source: "old", session: "new", prefill, code_only: false,
+      images: [{ id: "image", name: "Screenshot.png", mime: "image/png", data: screenshotData }] };
+  };
+  await act(async () => root.render(h(Rewind, { sessionKey: "chat", ensureOpen: async () => {}, onClose() {}, onComplete: (result) => { restored = result; } })));
+  await click(namedButton("Rewind"));
+  assert.equal(restored.prefill, "Read the report");
+  assert.equal(restored.attachments[0].preview, `data:image/png;base64,${screenshotData}`);
+  assert.equal(restored.attachments[1].path, document.path);
+});
+
+test("a late file selection preserves token removals and non-image drops explain the native file chooser", async () => {
+  const chat = await attachmentChat();
+  const pdf = { id: "pdf", kind: "file", name: "Report.pdf", path: "/Users/test/Report.pdf" };
+  const archive = { id: "zip", kind: "file", name: "Archive.zip", path: "/Users/test/Archive.zip" };
+  const folder = { id: "folder", kind: "folder", name: "Project", path: "/Users/test/Project" };
+  globalThis.__medhaControlsTest.chooseAttachments = async () => [pdf, archive];
+  await click(document.querySelector('[aria-label="Attach files"]'));
+  await click(namedButton("Files"));
+  let finish;
+  globalThis.__medhaControlsTest.chooseAttachments = () => new Promise((resolve) => { finish = resolve; });
+  await click(document.querySelector('[aria-label="Attach files"]'));
+  await click(namedButton("Folder"));
+  await click(document.querySelector('[aria-label="Remove Report.pdf"]'));
+  assert.equal(document.querySelectorAll(".msg-token.token-file").length, 1);
+  await act(async () => finish([folder]));
+  assert.equal(document.querySelectorAll(".msg-token.token-file").length, 1);
+  assert.equal(document.querySelectorAll(".msg-token.token-folder").length, 1);
+
+  await act(async () => {
+    const drop = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, "dataTransfer", { value: { files: [new dom.window.File(["%PDF"], "Report.pdf", { type: "application/pdf" })] } });
+    document.querySelector("form.composer").dispatchEvent(drop);
+  });
+  assert.match(document.querySelector(".composer-error").textContent, /Attach → Files or Folder/);
+  await click(document.querySelector('[aria-label="Send message"]'));
+  const { attachedFiles } = await import(await moduleUrl("messageRequest"));
+  assert.deepEqual(attachedFiles(chat.writes[0].content).files.map((file) => file.path), [archive.path, folder.path]);
+});
+
+test("a long picker narrows as you type, forgives a slip, and picks with Enter", async () => {
+  const ids = ["stepfun/step-5-preview", "anthropic/claude-haiku-5.5", "anthropic/claude-haiku-5.5:batch", "google/gemini-nano-banana-2.1", "mistralai/mistral-large-4-0"];
+  let submitted = 0;
+  function Harness() {
+    const [value, setValue] = React.useState("");
+    return h("form", { onSubmit(event) { event.preventDefault(); submitted++; } },
+      h(Select, { id: "picker", value, search: "Search models", onChange: (event) => setValue(event.target.value) },
+        h("option", { value: "" }, "Choose a model"), ...ids.map((id) => h("option", { key: id, value: id }, id))));
+  }
+  await act(() => root.render(h(Harness)));
+  await click(document.getElementById("picker"));
+  const box = document.querySelector('input[aria-label="Search models"]');
+  assert.equal(document.activeElement, box, "typing starts in the search box");
+  const listed = () => [...document.querySelectorAll('[role="option"]')].map((node) => node.textContent.trim());
+  await inputValue(box, "haiku batch");
+  assert.deepEqual(listed(), ["anthropic/claude-haiku-5.5:batch"], "every typed word must fit");
+  await inputValue(box, "gmni");
+  assert.deepEqual(listed(), ["google/gemini-nano-banana-2.1"], "a dropped letter still finds it");
+  await inputValue(box, "zzzz");
+  assert.deepEqual(listed(), []);
+  await inputValue(box, "claude");
+  assert.deepEqual(listed(), ids.slice(1, 3));
+  await key(box, "ArrowDown");
+  await key(box, "Enter");
+  assert.equal(document.getElementById("picker").textContent, "anthropic/claude-haiku-5.5:batch");
+  assert.equal(document.querySelector('[role="listbox"]'), null);
+  assert.equal(submitted, 0);
+});
+
+test("a second model on a server whose key is saved asks for no key and lists its models at once", async () => {
+  const { Settings } = await import(await moduleUrl("Settings"));
+  const calls = [];
+  const nvidia = "https://integrate.api.nvidia.com/v1";
+  globalThis.__medhaControlsTest.api = {
+    settings: async (method = "settings.list", params) => {
+      if (method !== "settings.list") calls.push([method, params]);
+      if (method === "settings.model.discover") return { models: [{ id: "meta/muse-glimmer-30b", context_length: 130000 }] };
+      if (method === "settings.model.save") return { saved: true, name: "muse-glimmer-30b" };
+      return {
+        models: [{ name: "glm-5-3", default: true, key_present: true, profile: { model: "z-ai/glm-5.3", base_url: nvidia, protocol: "open-ai-chat", auth: "bearer" } }],
+        search: { provider: "duckduckgo" },
+        protocols: [{ value: "open-ai-chat", label: "OpenAI-compatible Chat", available: true, auth: "bearer", discovery: true, providers: [] }],
+      };
+    },
+  };
+  await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {} })));
+  await click(namedButton("Add model"));
+  await click(namedButton("Choose a protocol"));
+  await click(option("OpenAI-compatible Chat"));
+  await click(namedButton("Choose a provider"));
+  await click(option("integrate.api.nvidia.com"));
+  await act(async () => {});
+  assert.deepEqual(calls.map(([method, params]) => [method, params.profile.base_url, params.key]), [["settings.model.discover", nvidia, ""]], "the saved key is used; none is typed or sent");
+  await click(namedButton("Choose a model"));
+  await click(option("meta/muse-glimmer-30b"));
+  await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  const [, saved] = calls.at(-1);
+  assert.deepEqual([saved.profile.model, saved.profile.base_url, saved.profile.auth, saved.key], ["meta/muse-glimmer-30b", nvidia, "bearer", ""]);
 });

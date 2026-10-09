@@ -23,15 +23,39 @@ pub(crate) async fn image(
     artifacts: &std::sync::Arc<dyn kernel::ArtifactStore>,
     request: protocol::ReadHistoryImage,
 ) -> Result<protocol::Image, String> {
-    let bytes = kernel::artifacts::read_all(artifacts, &request.hash).await?;
-    let image =
-        tokio::task::spawn_blocking(move || media::normalize_for_transport(bytes, 2_200_000))
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
+    read_image(artifacts, request.hash, false).await
+}
+
+pub(crate) async fn read_image(
+    artifacts: &std::sync::Arc<dyn kernel::ArtifactStore>,
+    hash: String,
+    thumbnail: bool,
+) -> Result<protocol::Image, String> {
+    // Image decoding can allocate a full pixel buffer. Limit concurrent views
+    // independently of the bounded folder-request lane.
+    static DECODERS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let permit = DECODERS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|error| error.to_string())?;
+    let bytes = kernel::artifacts::read_all(artifacts, &hash).await?;
+    let image = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if thumbnail {
+            media::thumbnail(bytes, 128 * 1024)
+        } else {
+            media::normalize_for_transport(bytes, 2_200_000)
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
     use base64::Engine;
     Ok(protocol::Image {
-        id: request.hash,
+        id: hash,
         name: "saved image".into(),
         mime: image.mime.into(),
         data: base64::engine::general_purpose::STANDARD.encode(image.bytes),

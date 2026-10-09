@@ -1,3 +1,4 @@
+mod attachments;
 mod backend;
 mod files;
 mod git;
@@ -124,6 +125,46 @@ async fn workspace_choose(
     };
     state.workspaces.add(folder.path().to_path_buf()).map(Some)
 }
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExtensionSourceKind {
+    SkillFolder,
+    SkillFile,
+    PluginFolder,
+}
+#[tauri::command]
+async fn extension_source_choose(kind: ExtensionSourceKind) -> Result<Option<String>, String> {
+    let dialog = rfd::AsyncFileDialog::new();
+    let selection = match kind {
+        ExtensionSourceKind::SkillFolder => {
+            dialog
+                .set_title("Choose a skill folder")
+                .pick_folder()
+                .await
+        }
+        ExtensionSourceKind::SkillFile => {
+            dialog
+                .set_title("Choose SKILL.md")
+                .add_filter("Markdown", &["md"])
+                .pick_file()
+                .await
+        }
+        ExtensionSourceKind::PluginFolder => {
+            dialog
+                .set_title("Choose a plugin folder")
+                .pick_folder()
+                .await
+        }
+    };
+    selection
+        .map(|file| {
+            file.path()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "This path cannot be represented as text".to_owned())
+        })
+        .transpose()
+}
 #[tauri::command]
 fn workspace_info(
     state: State<'_, DesktopState>,
@@ -208,6 +249,29 @@ async fn session_events(
         runtime
             .request("sessions.events", Some(&session_id), cursor.as_deref())
             .map(live::render_history)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn history_image(
+    state: State<'_, DesktopState>,
+    workspace_id: String,
+    chat_key: Option<String>,
+    session_id: Option<String>,
+    hash: String,
+    thumbnail: bool,
+) -> Result<Value, String> {
+    let runtime =
+        state
+            .workspaces
+            .resolve(&workspace_id, chat_key.as_deref(), session_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime.request_params(
+            "application.image",
+            serde_json::json!({"hash": hash, "thumbnail": thumbnail}),
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -640,6 +704,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             workspace_list,
             workspace_choose,
+            extension_source_choose,
             workspace_info,
             workspace_reveal,
             workspace_branch,
@@ -647,6 +712,7 @@ fn main() {
             usage_summary,
             session_defaults,
             session_events,
+            history_image,
             session_changes,
             live_open,
             live_request,
@@ -665,6 +731,7 @@ fn main() {
             settings_request,
             open_link,
             image_admit,
+            attachments::attachment_choose,
             outputs::screen_put,
             outputs::screen_drop,
             outputs::screen_keep,

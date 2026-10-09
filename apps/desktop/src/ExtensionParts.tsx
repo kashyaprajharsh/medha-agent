@@ -1,4 +1,5 @@
-import type { ReactNode, Ref } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode, type Ref } from "react";
+import { desktop, type ExtensionSourceKind } from "./api";
 import { Icon } from "./Icon";
 
 /** The first sentence of a description, without the lead-in its author wrote for the model. */
@@ -84,5 +85,100 @@ export function Add({ label, open, onClick }: { label: string; open: boolean; on
       <Icon name={open ? "x" : "plus"} />
       {label}
     </button>
+  );
+}
+
+/** Browse local sources or paste a path/URL, then explicitly install the selected source. */
+export function InstallSource({
+  kind,
+  value,
+  disabled,
+  onChange,
+  onInstall,
+  onError,
+}: {
+  kind: "skill" | "plugin";
+  value: string;
+  disabled: boolean;
+  onChange: (value: string) => void;
+  onInstall: (source: string) => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [choices, setChoices] = useState(false);
+  const [picking, setPicking] = useState(false);
+  const active = useRef(true);
+  const browse = useRef<HTMLButtonElement>(null);
+  const choicesId = useId();
+  useEffect(() => {
+    active.current = true;
+    return () => { active.current = false; };
+  }, []);
+  async function choose(selection: ExtensionSourceKind) {
+    if (disabled || picking) return;
+    setChoices(false);
+    setPicking(true);
+    onError("");
+    try {
+      const path = await desktop.chooseExtensionSource(selection);
+      if (active.current && path !== null) onChange(path);
+    } catch (cause) {
+      if (active.current) onError(String(cause));
+    } finally {
+      if (active.current) setPicking(false);
+    }
+  }
+  return (
+    <div className="extension-source" aria-busy={picking} onKeyDown={(event) => {
+      if (event.key === "Escape" && choices) {
+        event.preventDefault();
+        event.stopPropagation();
+        setChoices(false);
+        browse.current?.focus();
+      }
+    }}>
+      <form className="plugin-install" onSubmit={(event) => {
+        event.preventDefault();
+        if (!disabled && !picking && value.trim()) void onInstall(value);
+      }}>
+        <button
+          ref={browse}
+          type="button"
+          className="icon-btn"
+          aria-label={`Choose local ${kind}`}
+          title={`Choose ${kind === "skill" ? "a skill folder or SKILL.md" : "a plugin folder"}`}
+          aria-expanded={kind === "skill" ? choices : undefined}
+          aria-controls={kind === "skill" ? choicesId : undefined}
+          disabled={disabled || picking}
+          onClick={() => kind === "skill" ? setChoices(!choices) : void choose("plugin_folder")}
+        >
+          <Icon name="plus" />
+        </button>
+        <label>
+          <input
+            required
+            autoFocus
+            aria-label={kind === "skill" ? "Skill source" : "Plugin source"}
+            value={value}
+            disabled={disabled || picking}
+            onChange={(event) => onChange(event.target.value)}
+            placeholder={kind === "skill" ? "Skill folder, SKILL.md, or GitHub folder URL" : "owner/repo, name@marketplace, or a folder"}
+          />
+        </label>
+        <button className="btn-line" disabled={disabled || picking || !value.trim()}>
+          {kind === "skill" ? "Install skill" : "Install"}
+        </button>
+      </form>
+      {kind === "skill" && choices && (
+        <div id={choicesId} className="extension-source-choices" role="group" aria-label="Choose a skill from your files">
+          <button type="button" className="btn-line" disabled={disabled || picking} onClick={() => void choose("skill_folder")}>
+            Choose folder
+          </button>
+          <button type="button" className="btn-line" disabled={disabled || picking} onClick={() => void choose("skill_file")}>
+            Choose SKILL.md
+          </button>
+          <p>Choose the folder to include its scripts and reference files.</p>
+        </div>
+      )}
+    </div>
   );
 }

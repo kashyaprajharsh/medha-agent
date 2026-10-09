@@ -39,6 +39,12 @@ pub fn has_image_header(bytes: &[u8]) -> bool {
     image::guess_format(bytes).is_ok()
 }
 
+/// Formats that image admission can decode. Other file formats can remain
+/// local path references instead of being forced through image processing.
+pub fn has_supported_image_header(bytes: &[u8]) -> bool {
+    identify(bytes).is_ok()
+}
+
 /// Decode guard: a header claiming more pixels than this is refused before any
 /// buffer is allocated for it.
 const MAX_PIXELS: u64 = 50_000_000;
@@ -170,12 +176,30 @@ pub fn normalize_for_transport(raw: Vec<u8>, budget: usize) -> Result<Image> {
     within_limits(raw, budget.min(limits.max_encoded_bytes), limits)
 }
 
+/// A message thumbnail also limits decoded pixels. A compressed blank image
+/// can fit the byte budget while still occupying hundreds of MB in a viewer.
+pub fn thumbnail(raw: Vec<u8>, budget: usize) -> Result<Image> {
+    ensure!(raw.len() <= MAX_SOURCE_BYTES, "image source exceeds 64 MiB");
+    ensure!(budget > 0, "image transport budget must be positive");
+    let limits = ImageLimits::from_env()?;
+    image_within(raw, budget.min(limits.max_encoded_bytes), limits, Some(512))
+}
+
 #[cfg(test)]
 fn within(raw: Vec<u8>, budget: usize) -> Result<Image> {
     within_limits(raw, budget, ImageLimits::default())
 }
 
 fn within_limits(raw: Vec<u8>, budget: usize, limits: ImageLimits) -> Result<Image> {
+    image_within(raw, budget, limits, None)
+}
+
+fn image_within(
+    raw: Vec<u8>,
+    budget: usize,
+    limits: ImageLimits,
+    display_edge: Option<u32>,
+) -> Result<Image> {
     let kind = identify(&raw)?;
     let (width, height, orientation) = probe(&raw, kind.format, limits)?;
     // Decode even when the bytes will be forwarded untouched: a truncated file
@@ -183,7 +207,11 @@ fn within_limits(raw: Vec<u8>, budget: usize, limits: ImageLimits) -> Result<Ima
     // rejection halfway through a turn.
     let mut image = DynamicImage::from_decoder(reader(&raw, kind.format).into_decoder()?)
         .with_context(|| format!("this {} is damaged or truncated", kind.mime))?;
-    if kind.universal && orientation == Orientation::NoTransforms && raw.len() <= budget {
+    if kind.universal
+        && orientation == Orientation::NoTransforms
+        && raw.len() <= budget
+        && display_edge.is_none_or(|edge| width.max(height) <= edge)
+    {
         return Ok(Image {
             bytes: raw,
             mime: kind.mime,
@@ -199,6 +227,11 @@ fn within_limits(raw: Vec<u8>, budget: usize, limits: ImageLimits) -> Result<Ima
         notes.push("rotated to its EXIF orientation".to_string());
     }
     let (upright_width, upright_height) = (image.width(), image.height());
+    if let Some(edge) = display_edge
+        && upright_width.max(upright_height) > edge
+    {
+        image = image.thumbnail(edge, edge);
+    }
     let fitted = fit_budget(image, kind.format == ImageFormat::Jpeg, budget)?;
     if fitted.mime != kind.mime {
         notes.push(format!("{} → {}", kind.mime, fitted.mime));

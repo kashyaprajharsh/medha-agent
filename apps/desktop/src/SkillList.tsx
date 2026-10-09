@@ -94,8 +94,7 @@ export function SkillList({ skills, matches, searching, disabled, onToggle, onRe
       })}
       {!skills.length && (
         <p className="quiet">
-          No skills installed. Add SKILL.md packages in your Medha skills folder, or install a plugin that includes
-          skills.
+          No skills installed. Use Add skill to choose a skill folder or SKILL.md, or paste a path or GitHub URL.
         </p>
       )}
       {open && (

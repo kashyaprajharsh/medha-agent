@@ -70,6 +70,8 @@ struct EventView {
     ts: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<protocol::SavedImage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +170,15 @@ impl EventView {
                     self.omitted.push(name);
                 }
             }
+            if !self.images.is_empty()
+                && serde_json::to_vec(&self.images)
+                    .expect("images serialize")
+                    .len()
+                    > keep
+            {
+                self.images.clear();
+                self.omitted.push("images");
+            }
             if !self.omitted.is_empty() {
                 let output = self.output.get_or_insert_with(String::new);
                 if !output.ends_with(CUT) {
@@ -193,6 +204,7 @@ struct EventPage {
 /// event log: the backend keeps one connection per folder and answers on it.
 pub(crate) async fn answer(
     log: &store::SqliteLog,
+    artifacts: &std::sync::Arc<dyn kernel::ArtifactStore>,
     workspace: &std::path::Path,
     frame: &Value,
 ) -> Result<Value, String> {
@@ -205,16 +217,27 @@ pub(crate) async fn answer(
         limit: frame["limit"].as_u64().map(|limit| limit as usize),
         params: frame["params"].clone(),
     };
-    let reply = handle(log, workspace, request).await;
+    let reply = handle(log, artifacts, workspace, request).await;
     match reply.error {
         Some(error) => Err(error),
         None => Ok(reply.result.unwrap_or(Value::Null)),
     }
 }
 
-async fn handle(log: &store::SqliteLog, workspace: &std::path::Path, req: Request) -> Response {
-    if let Some(result) =
-        crate::application_resources::folder(log, workspace, &req.method, req.params.clone()).await
+async fn handle(
+    log: &store::SqliteLog,
+    artifacts: &std::sync::Arc<dyn kernel::ArtifactStore>,
+    workspace: &std::path::Path,
+    req: Request,
+) -> Response {
+    if let Some(result) = crate::application_resources::folder(
+        log,
+        artifacts,
+        workspace,
+        &req.method,
+        req.params.clone(),
+    )
+    .await
     {
         return match result {
             Ok(value) => Response::ok(req.id, value),
@@ -526,11 +549,16 @@ fn page_events(
             } else {
                 return None;
             };
-            Some(event_view(
-                event,
-                kind,
-                event.payload.get("text")?.as_str()?.to_owned(),
-            ))
+            let attachments: Vec<kernel::MediaPart> = event
+                .payload
+                .get("attachments")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default();
+            Some(EventView {
+                images: crate::chat_history::images(&attachments),
+                ..event_view(event, kind, event.payload.get("text")?.as_str()?.to_owned())
+            })
         }
         EventKind::ModelText => {
             text_before_canonical = true;

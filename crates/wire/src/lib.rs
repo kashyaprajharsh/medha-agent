@@ -25,6 +25,7 @@ pub const CAPABILITIES: &[&str] = &[
     "live-conversation",
     "shared-live-state",
     "editor-sessions",
+    "workspace-images",
 ];
 pub const CLIENT_CAPABILITIES: &[&str] = &[
     "lifecycle",

@@ -15,7 +15,7 @@ impl Backend {
         Arc::clone(SHARED.get_or_init(|| {
             Arc::new(Self(medha_client::Backend::for_surface(
                 executable,
-                &["shared-live-state"],
+                &["shared-live-state", "workspace-images"],
             )))
         }))
     }

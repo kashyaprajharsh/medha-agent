@@ -249,7 +249,7 @@ const UserMessage = memo(function UserMessage({
       <span className="you-mark" aria-hidden="true">
         ›
       </span>
-      <UserText text={message.text} />
+      <UserText text={message.text} images={message.images} />
       <time>{clock(message.ts)}</time>
     </div>
   );

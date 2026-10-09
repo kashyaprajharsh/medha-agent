@@ -31,6 +31,7 @@ export type HistoryEvent = {
   plan?: { explanation?: string; steps: { title: string; status: string }[] };
   ts: number;
   text?: string;
+  images?: MessageImage[];
   html?: string;
   tool_id?: string;
   status?: string;
@@ -40,7 +41,7 @@ export type HistoryEvent = {
   duration_ms?: number;
   screen?: ToolScreen;
   /** Structured values remain stored but were omitted to keep this page bounded. */
-  omitted?: ("plan" | "screen")[];
+  omitted?: ("plan" | "screen" | "images")[];
 };
 
 export type EventPage = { events: HistoryEvent[]; next_cursor: string | null };
@@ -107,7 +108,8 @@ export type Patch = {
   diff: string;
   verification?: { passed: boolean; command: string; output: string };
 };
-export type Attachment = {
+export type ImageAttachment = {
+  kind?: "image";
   id: string;
   name: string;
   mime: string;
@@ -115,6 +117,10 @@ export type Attachment = {
   preview: string;
   note?: string;
 };
+export type LocalAttachment = { kind: "file" | "folder"; id: string; name: string; path: string };
+export type Attachment = ImageAttachment | LocalAttachment;
+/** Saved rows keep content hashes; only optimistic messages have inline previews. */
+export type MessageImage = { hash?: string; name: string; mime: string; preview?: string };
 export type LiveMethod =
   | "message.send"
   | "approval.respond"
@@ -181,12 +187,23 @@ export type Workspace = {
   path: string;
   personal: boolean;
 };
+export type ExtensionSourceKind = "skill_folder" | "skill_file" | "plugin_folder";
 export const desktop = {
   admitImage: (bytes: Uint8Array) =>
     invoke<{ mime: string; data: string; note?: string }>("image_admit", bytes),
   workspaces: () =>
     invoke<{ initial: string; workspaces: Workspace[] }>("workspace_list"),
   chooseWorkspace: () => invoke<Workspace | null>("workspace_choose"),
+  chooseExtensionSource: (kind: ExtensionSourceKind) =>
+    invoke<string | null>("extension_source_choose", { kind }),
+  chooseAttachments: async (kind: "files" | "folder"): Promise<Attachment[] | null> => {
+    type Picked = Omit<ImageAttachment, "id" | "preview"> & { kind: "image" }
+      | Omit<LocalAttachment, "id">;
+    const selected = await invoke<Picked[] | null>("attachment_choose", { kind });
+    return selected?.map((item) => "data" in item
+      ? { ...item, id: crypto.randomUUID(), preview: `data:${item.mime};base64,${item.data}` }
+      : { ...item, id: crypto.randomUUID() }) ?? null;
+  },
   updateCheck: () => invoke<{ version: string } | null>("update_check"),
   updateApply: () => invoke<void>("update_apply"),
 };
@@ -283,6 +300,8 @@ export function createApi(workspaceId: string, getScope: () => Scope) {
       invoke<SessionSettings>("session_defaults", { workspaceId }),
     events: (sessionId: string, cursor: string | null) =>
       invoke<EventPage>("session_events", { workspaceId, sessionId, cursor }),
+    historyImage: (hash: string, thumbnail = true) =>
+      invoke<Omit<ImageAttachment, "preview">>("history_image", { ...scope(), hash, thumbnail }),
     changes: (sessionId: string) =>
       invoke<{ files: FileChange[] }>("session_changes", {
         workspaceId,

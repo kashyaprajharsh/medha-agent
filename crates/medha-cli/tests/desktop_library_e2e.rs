@@ -76,6 +76,102 @@ fn now() -> f64 {
 }
 
 #[test]
+fn saved_screenshots_reach_history_and_can_be_viewed_without_opening_a_chat() {
+    use base64::Engine;
+    use kernel::{ArtifactStore, Event, EventLog, MediaPart, MediaSource, Session};
+    use protocol::Command;
+    let root = tempfile::tempdir().unwrap();
+    let (home, folder) = (root.path().join("home"), root.path().join("project"));
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut service = Library::start(&folder, &home);
+    service.call("hello", Value::Null);
+    let state = std::fs::read_dir(home.join("projects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("events.db").is_file())
+        .unwrap();
+    let artifacts = store::FileArtifactStore::open(state.join("artifacts")).unwrap();
+    let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .unwrap();
+    let hash = artifacts.put(&bytes).unwrap();
+    let part = MediaPart {
+        mime_type: "image/png".into(),
+        source: MediaSource::Artifact(hash.clone()),
+        label: Some("Screenshot.png".into()),
+        width: Some(1),
+        height: Some(1),
+        byte_size: Some(bytes.len()),
+        provider_state: Vec::new(),
+    };
+    let log = store::SqliteLog::open(state.join("events.db")).unwrap();
+    let session = Session::new();
+    let mut event = Event::user_message(&session, "Look at this screenshot");
+    event.payload["attachments"] = json!([part]);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(log.append(event))
+        .unwrap();
+    let page = service
+        .backend
+        .request(
+            &folder,
+            json!({"method":"sessions.events", "session_id":session.id.to_string()}),
+        )
+        .unwrap();
+    assert_eq!(page["events"][0]["images"][0]["hash"], hash);
+    assert_eq!(page["events"][0]["images"][0]["name"], "Screenshot.png");
+    assert!(page["events"][0]["images"][0].get("data").is_none());
+    for thumbnail in [true, false] {
+        let image = service.call(
+            protocol::ReadWorkspaceImage::METHOD,
+            json!({"hash":hash, "thumbnail":thumbnail}),
+        );
+        assert_eq!(image["mime"], "image/png");
+        assert_eq!(image["data"], data);
+    }
+    // A very compressible image must still have a small thumbnail; its full
+    // view and stored artifact keep their original resolution and contents.
+    let wide = media::from_rgba(1280, 640, &vec![255; 1280 * 640 * 4]).unwrap();
+    assert!(wide.len() < 128 * 1024);
+    let wide_hash = artifacts.put(&wide).unwrap();
+    for (thumbnail, dimensions) in [(true, (512, 256)), (false, (1280, 640))] {
+        let image = service.call(
+            protocol::ReadWorkspaceImage::METHOD,
+            json!({"hash":wide_hash, "thumbnail":thumbnail}),
+        );
+        let returned = base64::engine::general_purpose::STANDARD
+            .decode(image["data"].as_str().unwrap())
+            .unwrap();
+        let view = media::normalize(returned).unwrap();
+        assert_eq!((view.width, view.height), dimensions);
+    }
+    assert!(
+        service
+            .backend
+            .ask(
+                &folder,
+                protocol::ReadWorkspaceImage::METHOD,
+                json!({"hash":"../secret", "thumbnail":true})
+            )
+            .is_err()
+    );
+    // The log remains valid, and a read does not publish another chat/session.
+    log.verify().unwrap();
+    assert_eq!(
+        service
+            .call("sessions.list", Value::Null)
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn one_process_lists_the_library_and_only_unused_chats_are_pruned() {
     let root = tempfile::tempdir().unwrap();
     let (home, library) = (root.path().join("home"), root.path().join("library"));

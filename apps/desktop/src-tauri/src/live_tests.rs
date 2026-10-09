@@ -199,6 +199,25 @@ fn a_shared_snapshot_excludes_history_and_continues_live_markdown_and_tool_targe
 }
 
 #[test]
+fn a_shared_current_turn_keeps_its_user_image_references() {
+    let images = json!([{"hash":"a".repeat(64), "name":"shot.png", "mime":"image/png"}]);
+    let snapshot = json!({"revision":1,"conversation":"conversation","running":true,"turn":1,
+        "pending_steers":[],"force_aborting":false,"settings":null,
+        "items":[{"type":"user","text":"Look", "images":images}], "current_turn_from":0,"omitted_items":0,
+        "approvals":[],"questions":[],"metrics":protocol::PresentationMetrics::default(),"agents":[],"omitted_agent_views":0,"cursor":null});
+    let rendered = render_snapshot(
+        json!({"method":"session.presentation", "params":snapshot}),
+        &mut Steps::default(),
+        &mut String::new(),
+    );
+    assert_eq!(
+        rendered["params"]["frames"][0]["params"]["kind"],
+        "message.accepted"
+    );
+    assert_eq!(rendered["params"]["frames"][0]["params"]["images"], images);
+}
+
+#[test]
 fn streamed_html_escapes_model_markup() {
     let mut segment = String::new();
     let frame = render(text("<img src=x onerror=alert(1)>"), &mut segment);

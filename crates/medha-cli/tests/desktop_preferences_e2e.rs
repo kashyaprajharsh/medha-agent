@@ -1,4 +1,5 @@
 //! Exercise the desktop's real forms, as it asks the backend, against isolated Medha state.
+use protocol::Command;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +32,51 @@ impl Bridge {
         reply["result"].clone()
     }
 }
+
+#[test]
+fn unnamed_discovered_models_have_unique_valid_names_and_both_catalogues_refresh() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("project");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut bridge = Bridge::start(&workspace, &home);
+    let profile = json!({
+        "protocol": "gemini-interactions",
+        "base_url": "https://generativelanguage.googleapis.com/v1",
+        "model": "gemini-3.8-flash",
+        "auth": "x-goog-api-key",
+        "max_ctx": 1048576,
+    });
+    for name in ["gemini-3-8-flash", "gemini-3-8-flash-2"] {
+        let saved = bridge.ok(
+            "settings.model.save",
+            json!({"name": "", "profile": profile, "key": "dummy-gemini-key", "default": true}),
+        );
+        assert_eq!(saved["name"], name);
+        let desktop = bridge.ok("settings.list", json!({}));
+        assert!(desktop["models"].as_array().unwrap().iter().any(|model| {
+            model["name"] == name
+                && model["profile"]["model"] == "gemini-3.8-flash"
+                && model["default"] == true
+        }));
+        let reply = bridge.ok(
+            protocol::ReadResource::METHOD,
+            json!(protocol::ReadResource::Models),
+        );
+        let protocol::ResourceResult::Models(catalogue) = serde_json::from_value(reply).unwrap()
+        else {
+            panic!("the TUI model catalogue was not returned");
+        };
+        assert!(catalogue.profiles.iter().any(|model| {
+            model.name == name && model.model == "gemini-3.8-flash" && model.default
+        }));
+    }
+    let config: runtime::config::Config =
+        toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+    assert_eq!(config.models.len(), 2);
+    assert_eq!(config.default_model.as_deref(), Some("gemini-3-8-flash-2"));
+}
+
 #[test]
 fn of_several_saves_made_from_the_same_text_one_is_kept_and_the_rest_are_told() {
     let root = tempfile::tempdir().unwrap();

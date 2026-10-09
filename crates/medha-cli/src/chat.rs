@@ -1236,7 +1236,15 @@ fn desktop_images(value: Option<&Value>) -> Result<Vec<IncomingImage>, String> {
                 .as_str()
                 .filter(|data| !data.is_empty() && data.len() <= 3_000_000)
                 .ok_or("Image data is missing or too large.")?;
-            Ok(IncomingImage::Inline(mime.to_owned(), data.to_owned()))
+            let name = image["name"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty() && name.len() <= 1024)
+                .map(str::to_owned);
+            Ok(IncomingImage::Inline(
+                mime.to_owned(),
+                data.to_owned(),
+                name,
+            ))
         })
         .collect()
 }
@@ -1260,7 +1268,7 @@ async fn admit_images(
                 let position = index + 1;
                 let label = image.label(position);
                 let bytes = match &image {
-                    IncomingImage::Inline(_, data) => {
+                    IncomingImage::Inline(_, data, _) => {
                         if data.len() > crate::attachments::MAX_SOURCE_BYTES.div_ceil(3) * 4 {
                             return Err(format!(
                                 "image {position} exceeds the attachment size limit"
@@ -1285,12 +1293,13 @@ async fn admit_images(
 
 #[derive(Debug, PartialEq, Eq)]
 enum IncomingImage {
-    Inline(String, String),
+    Inline(String, String, Option<String>),
 }
 impl IncomingImage {
     fn label(&self, position: usize) -> String {
-        let Self::Inline(mime, _) = self;
-        format!("image {position} ({mime})")
+        let Self::Inline(mime, _, name) = self;
+        name.clone()
+            .unwrap_or_else(|| format!("image {position} ({mime})"))
     }
 }
 
@@ -1969,6 +1978,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_inline_image_retains_its_filename_in_the_stored_artifact_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let artifacts: Arc<dyn kernel::ArtifactStore> =
+            Arc::new(store::FileArtifactStore::open(root.path()).unwrap());
+        let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        let images = desktop_images(Some(
+            &json!([{"mime":"image/png", "data":data, "name":"Screenshot.png"}]),
+        ))
+        .unwrap();
+        let parts = admit_images(images, &artifacts).await.unwrap();
+        assert_eq!(parts[0].label.as_deref(), Some("Screenshot.png"));
+        assert!(
+            matches!(&parts[0].source, kernel::MediaSource::Artifact(hash) if hash.len() == 64)
+        );
+    }
 
     #[tokio::test]
     async fn framed_input_rejects_invalid_utf8_and_preserves_a_cancelled_partial_read() {

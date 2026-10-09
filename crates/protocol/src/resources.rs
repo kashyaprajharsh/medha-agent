@@ -5,6 +5,20 @@ use super::{Command, ScopeKind};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// A bounded image view from a workspace's immutable artifact store. Reading
+/// history must not open a live chat or acquire its conversation lease.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadWorkspaceImage {
+    pub hash: String,
+    pub thumbnail: bool,
+}
+impl Command for ReadWorkspaceImage {
+    const METHOD: &'static str = "application.image";
+    const SCOPE: ScopeKind = ScopeKind::Folder;
+    type Output = super::Image;
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(pub String);

@@ -6,11 +6,13 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type KeyboardEvent,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { useWorkspace } from "./Workspace";
 import { Icon } from "./Icon";
+import { ranked } from "./fuzzy";
 
 function plain(node: ReactNode): string {
   return Children.toArray(node)
@@ -21,7 +23,10 @@ function plain(node: ReactNode): string {
     )
     .join("");
 }
-/** A quiet, keyboard-accessible picker shared by chat and settings. */
+/**
+ * A quiet, keyboard-accessible picker shared by chat and settings. A long list
+ * passes `search`, the words shown in an empty search box, to be typed into.
+ */
 export function Select({
   children,
   value,
@@ -29,6 +34,7 @@ export function Select({
   disabled,
   id,
   className,
+  search,
   "aria-label": label,
 }: {
   children: ReactNode;
@@ -37,6 +43,7 @@ export function Select({
   disabled?: boolean;
   id?: string;
   className?: string;
+  search?: string;
   "aria-label"?: string;
 }) {
   const workspace = useWorkspace();
@@ -54,11 +61,18 @@ export function Select({
       disabled: child.props.disabled,
     }));
   const trigger = useRef<HTMLButtonElement>(null),
-    menu = useRef<HTMLDivElement>(null);
+    menu = useRef<HTMLDivElement>(null),
+    panel = useRef<HTMLDivElement>(null);
   const menuId = useId();
   const scrollSelection = useRef(false);
   const [open, setOpen] = useState(false),
-    [index, setIndex] = useState(0);
+    [index, setIndex] = useState(0),
+    [query, setQuery] = useState("");
+  // A searched list drops its "Choose…" row: the search box already says what to do.
+  const pool =
+    search === undefined ? items : items.filter((item) => item.value !== "");
+  const shown =
+    search === undefined ? items : ranked(pool, query, (item) => item.label);
   const [position, setPosition] = useState({
     left: 0,
     top: 0,
@@ -73,15 +87,74 @@ export function Select({
   const selected = items.findIndex((item) => item.value === String(value));
   function show() {
     scrollSelection.current = true;
-    setIndex(Math.max(0, selected));
+    setQuery("");
+    setIndex(
+      Math.max(
+        0,
+        pool.findIndex((item) => item.value === String(value)),
+      ),
+    );
     setOpen(true);
   }
   function choose(next: number) {
-    const item = items[next];
+    const item = shown[next];
     if (!item || item.disabled) return;
     onChange({ target: { value: item.value } });
     setOpen(false);
     trigger.current?.focus();
+  }
+  /** Keys that move through the list; `typing` leaves letters and the caret to the search box. */
+  function onKey(event: KeyboardEvent, typing: boolean) {
+    const moves = typing
+      ? ["ArrowDown", "ArrowUp"]
+      : ["ArrowDown", "ArrowUp", "Home", "End"];
+    if (moves.includes(event.key)) {
+      event.preventDefault();
+      if (!open) {
+        show();
+        return;
+      }
+      if (!shown.length) return;
+      const direction = event.key === "ArrowUp" ? -1 : 1;
+      let next =
+        event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? shown.length - 1
+            : (index + direction + shown.length) % shown.length;
+      for (let count = 0; shown[next]?.disabled && count < shown.length; count++)
+        next = (next + direction + shown.length) % shown.length;
+      scrollSelection.current = true;
+      setIndex(next);
+    } else if (event.key === "Escape" && open) {
+      event.preventDefault();
+      event.stopPropagation();
+      setOpen(false);
+      trigger.current?.focus();
+    } else if (event.key === "Enter" || (event.key === " " && !typing)) {
+      event.preventDefault();
+      open ? choose(index) : show();
+    } else if (event.key === "Tab") {
+      setOpen(false);
+      if (typing) trigger.current?.focus();
+    } else if (
+      !typing &&
+      event.key.length === 1 &&
+      !event.metaKey &&
+      !event.ctrlKey
+    ) {
+      const match = shown.findIndex(
+        (item, at) =>
+          at > index &&
+          !item.disabled &&
+          item.label.toLowerCase().startsWith(event.key.toLowerCase()),
+      );
+      if (match >= 0) {
+        scrollSelection.current = true;
+        setIndex(match);
+        setOpen(true);
+      }
+    }
   }
   useLayoutEffect(() => {
     if (!open || !trigger.current) return;
@@ -90,10 +163,15 @@ export function Select({
       const width = Math.min(Math.max(rect.width, 200), window.innerWidth - 24);
       const roomAbove = Math.max(0, rect.top - 18);
       const roomBelow = Math.max(0, window.innerHeight - rect.bottom - 18);
+      // Sized for the whole list, so the menu stays put while a search narrows it.
+      const tallest = search === undefined ? 280 : 340;
       const above =
-        roomBelow < Math.min(items.length * 38 + 14, 280) &&
-        roomAbove > roomBelow;
-      const height = Math.min(280, above ? roomAbove : roomBelow);
+        roomBelow <
+          Math.min(
+            items.length * 38 + 14 + (search === undefined ? 0 : 48),
+            tallest,
+          ) && roomAbove > roomBelow;
+      const height = Math.min(tallest, above ? roomAbove : roomBelow);
       setPosition({
         left: Math.max(12, Math.min(rect.left, window.innerWidth - width - 12)),
         top: rect.bottom + 6,
@@ -122,7 +200,7 @@ export function Select({
     const close = (event: PointerEvent) => {
       if (
         !trigger.current?.contains(event.target as Node) &&
-        !menu.current?.contains(event.target as Node)
+        !(panel.current ?? menu.current)?.contains(event.target as Node)
       )
         setOpen(false);
     };
@@ -139,7 +217,50 @@ export function Select({
     if (row.top < box.top + 6) list.scrollTop += row.top - box.top - 6;
     else if (row.bottom > box.bottom - 6)
       list.scrollTop += row.bottom - box.bottom + 6;
-  }, [index, open]);
+  }, [index, open, query]);
+  const place = {
+    left: position.left,
+    top: position.above ? undefined : position.top,
+    bottom: position.above ? position.bottom : undefined,
+    width: position.width,
+    maxHeight: position.height,
+  };
+  const list = (
+    <div
+      ref={menu}
+      id={menuId}
+      role="listbox"
+      aria-label={label}
+      className={search === undefined ? "select-menu" : "select-options"}
+      style={search === undefined ? place : undefined}
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+    >
+      {shown.map((item, at) => (
+        <button
+          type="button"
+          tabIndex={-1}
+          disabled={item.disabled}
+          id={`${menuId}-${at}`}
+          key={item.value}
+          role="option"
+          aria-selected={item.value === String(value)}
+          aria-disabled={item.disabled}
+          className={at === index ? "focused" : ""}
+          onPointerMove={() => {
+            scrollSelection.current = false;
+            if (!item.disabled) setIndex(at);
+          }}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => choose(at)}
+        >
+          <span>{item.label}</span>
+          {item.value === String(value) && <Icon name="check" />}
+        </button>
+      ))}
+      {!shown.length && <p className="select-empty">Nothing matches.</p>}
+    </div>
+  );
   return (
     <>
       <button
@@ -155,95 +276,45 @@ export function Select({
         disabled={disabled}
         className={`select-trigger ${className || ""}`}
         onClick={() => (open ? setOpen(false) : show())}
-        onKeyDown={(event) => {
-          if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
-            event.preventDefault();
-            if (!open) {
-              show();
-              return;
-            }
-            const direction = event.key === "ArrowUp" ? -1 : 1;
-            let next =
-              event.key === "Home"
-                ? 0
-                : event.key === "End"
-                  ? items.length - 1
-                  : (index + direction + items.length) % items.length;
-            for (
-              let count = 0;
-              items[next]?.disabled && count < items.length;
-              count++
-            )
-              next = (next + direction + items.length) % items.length;
-            scrollSelection.current = true;
-            setIndex(next);
-          } else if (event.key === "Escape" && open) {
-            event.preventDefault();
-            event.stopPropagation();
-            setOpen(false);
-          } else if (["Enter", " "].includes(event.key)) {
-            event.preventDefault();
-            open ? choose(index) : show();
-          } else if (event.key === "Tab") setOpen(false);
-          else if (event.key.length === 1 && !event.metaKey && !event.ctrlKey) {
-            const match = items.findIndex(
-              (item, at) =>
-                at > index &&
-                !item.disabled &&
-                item.label.toLowerCase().startsWith(event.key.toLowerCase()),
-            );
-            if (match >= 0) {
-              scrollSelection.current = true;
-              setIndex(match);
-              setOpen(true);
-            }
-          }
-        }}
+        onKeyDown={(event) => onKey(event, false)}
       >
         <span>{items[selected]?.label || "Choose…"}</span>
         <Icon name="down" />
       </button>
       {open &&
         createPortal(
-          <div
-            ref={menu}
-            id={menuId}
-            role="listbox"
-            aria-label={label}
-            className="select-menu"
-            style={{
-              left: position.left,
-              top: position.above ? undefined : position.top,
-              bottom: position.above ? position.bottom : undefined,
-              width: position.width,
-              maxHeight: position.height,
-            }}
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={(event) => event.stopPropagation()}
-          >
-            {items.map((item, at) => (
-              <button
-                type="button"
-                tabIndex={-1}
-                disabled={item.disabled}
-                id={`${menuId}-${at}`}
-                key={item.value}
-                role="option"
-                aria-selected={item.value === String(value)}
-                aria-disabled={item.disabled}
-                className={at === index ? "focused" : ""}
-                onPointerMove={() => {
-                  scrollSelection.current = false;
-                  if (!item.disabled) setIndex(at);
-                }}
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => choose(at)}
-              >
-                <span>{item.label}</span>
-                {item.value === String(value) && <Icon name="check" />}
-              </button>
-            ))}
-          </div>,
+          search === undefined ? (
+            list
+          ) : (
+            <div
+              ref={panel}
+              className="select-menu searching"
+              style={place}
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="model-search">
+                <Icon name="search" />
+                <input
+                  autoFocus
+                  value={query}
+                  placeholder={search}
+                  aria-label={search}
+                  aria-controls={menuId}
+                  aria-activedescendant={
+                    shown.length ? `${menuId}-${index}` : undefined
+                  }
+                  onChange={(event) => {
+                    scrollSelection.current = true;
+                    setQuery(event.target.value);
+                    setIndex(0);
+                  }}
+                  onKeyDown={(event) => onKey(event, true)}
+                />
+              </div>
+              {list}
+            </div>
+          ),
           document.body,
         )}
     </>

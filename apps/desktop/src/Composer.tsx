@@ -100,6 +100,13 @@ const COMMANDS: { id: string; icon: IconName; description: string }[] = [
 ];
 
 export function Composer(props: Props) {
+  const latest = useRef(props);
+  latest.current = props;
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   // Keystrokes belong to the composer. The app keeps a draft reference, so
   // typing does not rerender the sidebar, transcript and workspace surfaces.
   const [value, setValue] = useState(props.value);
@@ -133,10 +140,10 @@ export function Composer(props: Props) {
     ...(props.skill ? [{ id: "skill", kind: "skill" as const, label: props.skill }] : []),
     ...props.attachments.map((attachment) => ({
       id: attachment.id,
-      kind: "image" as const,
+      kind: "data" in attachment ? "image" as const : attachment.kind,
       label: attachment.name,
-      preview: attachment.preview,
-      title: attachment.note || attachment.name,
+      preview: "data" in attachment ? attachment.preview : undefined,
+      title: "data" in attachment ? attachment.note || attachment.name : attachment.path,
     })),
   ];
   const armedToken = tokens.find((token) => token.id === armed);
@@ -144,9 +151,10 @@ export function Composer(props: Props) {
     setArmed(null);
     setLeaving(id);
     const drop = () => {
+      if (!mounted.current) return;
       setLeaving(null);
-      if (id === "skill") props.onSkill?.(null);
-      else props.onAttachments(props.attachments.filter((item) => item.id !== id));
+      if (id === "skill") latest.current.onSkill?.(null);
+      else latest.current.onAttachments(latest.current.attachments.filter((item) => item.id !== id));
     };
     // Exits are faster than entries; without motion the token just goes.
     if (matchMedia("(prefers-reduced-motion: reduce)").matches) drop();
@@ -223,12 +231,21 @@ export function Composer(props: Props) {
     }
   }
   async function attach(files: File[]) {
+    if (busy || !files.length) return;
     if (props.running) {
       setError("Attach images after this turn finishes.");
       return;
     }
-    if (props.attachments.length + files.length > 4) {
+    if (files.some((file) => file.type && !file.type.startsWith("image/"))) {
+      setError("For documents or folders, use Attach → Files or Folder.");
+      return;
+    }
+    if (props.attachments.filter((item) => "data" in item).length + files.length > 4) {
       setError("Attach up to four images at a time.");
+      return;
+    }
+    if (props.attachments.length + files.length > 16) {
+      setError("Attach up to sixteen items at a time.");
       return;
     }
     setBusy(true);
@@ -252,12 +269,56 @@ export function Composer(props: Props) {
           };
         }),
       );
-      props.onAttachments([...props.attachments, ...added]);
+      if (mounted.current) addAttachments(added);
     } catch (cause) {
-      setError(String(cause));
+      if (mounted.current) setError(String(cause));
     } finally {
-      setBusy(false);
+      if (mounted.current) {
+        setBusy(false);
+        input.current?.focus();
+      }
       if (chooser.current) chooser.current.value = "";
+    }
+  }
+  const [attachmentMenu, setAttachmentMenu] = useState(false);
+  const attachmentButton = useRef<HTMLButtonElement>(null);
+  const attachmentOptions = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!attachmentMenu) return;
+    const close = (event: PointerEvent) => {
+      if (!attachmentButton.current?.contains(event.target as Node)
+        && !attachmentOptions.current?.contains(event.target as Node)) setAttachmentMenu(false);
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [attachmentMenu]);
+  function addAttachments(chosen: Attachment[]) {
+    // The user can remove a token while a native picker or decoder is open.
+    // Merge into the current draft instead of restoring that older selection.
+    const current = latest.current.attachments;
+    const added = chosen.filter((item) => !current.some((old) =>
+      "path" in item && "path" in old && item.path === old.path));
+    const next = [...current, ...added];
+    if (next.length > 16 || next.filter((item) => "data" in item).length > 4)
+      throw new Error("Attach up to four images and sixteen total attachments per message.");
+    latest.current.onAttachments(next);
+  }
+  async function attachLocal(kind: "files" | "folder") {
+    if (busy || props.running) return;
+    setAttachmentMenu(false);
+    setBusy(true);
+    setError(undefined);
+    try {
+      const chosen = await desktop.chooseAttachments(kind);
+      if (!chosen || !mounted.current) return;
+      addAttachments(chosen);
+    } catch (cause) {
+      if (mounted.current) setError(String(cause));
+    } finally {
+      if (mounted.current) {
+        setBusy(false);
+        input.current?.focus();
+      }
     }
   }
   function command(id: string) {
@@ -324,6 +385,14 @@ export function Composer(props: Props) {
         onSubmit={(event) => {
           event.preventDefault();
           if (canSend) props.onSend();
+        }}
+        onKeyDownCapture={(event) => {
+          if (event.key === "Escape" && attachmentMenu) {
+            event.preventDefault();
+            event.stopPropagation();
+            setAttachmentMenu(false);
+            attachmentButton.current?.focus();
+          }
         }}
         onDragOver={(event) => {
           event.preventDefault();
@@ -448,15 +517,23 @@ export function Composer(props: Props) {
             onChange={(event) => void attach([...(event.target.files ?? [])])}
           />
           <button
+            ref={attachmentButton}
             type="button"
             className="icon-btn"
-            onClick={() => chooser.current?.click()}
+            onClick={() => setAttachmentMenu(!attachmentMenu)}
             disabled={busy || props.running}
-            title="Attach images · paste or drag here · message and processed images share a 16 MiB send limit"
-            aria-label="Attach images"
+            title="Attach images, files or a folder"
+            aria-label="Attach files"
+            aria-expanded={attachmentMenu}
           >
             <Icon name="clip" />
           </button>
+          {attachmentMenu && <div ref={attachmentOptions} className="attachment-options" role="group" aria-label="Add attachments">
+            <button type="button" onClick={() => { setAttachmentMenu(false); chooser.current?.click(); }}><Icon name="file" />Images</button>
+            <button type="button" onClick={() => void attachLocal("files")}><Icon name="file" />Files</button>
+            <button type="button" onClick={() => void attachLocal("folder")}><Icon name="folder" />Folder</button>
+            <p>Files and folders are shared by local path. Medha may ask for access.</p>
+          </div>}
           {(["model", "reasoning", "mode"] as Control[]).map((control) => (
             <button
               type="button"

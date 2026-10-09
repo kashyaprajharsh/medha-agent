@@ -160,3 +160,19 @@ fn transport_normalization_obeys_the_smaller_budget_and_rejects_zero() {
     assert!(image.width <= 256 && image.height <= 256);
     assert!(normalize_for_transport(raw, 0).is_err());
 }
+
+#[test]
+fn thumbnails_limit_pixels_even_when_the_original_compresses_under_the_byte_budget() {
+    let source = DynamicImage::new_rgb8(2048, 1024);
+    let png = encoded(&source, ImageFormat::Png);
+    assert!(png.len() < 128 * 1024);
+    let view = thumbnail(png.clone(), 128 * 1024).unwrap();
+    assert_eq!((view.width, view.height), (512, 256));
+    assert!(view.bytes.len() <= 128 * 1024);
+    assert_eq!(normalize(png.clone()).unwrap().bytes, png);
+    assert!(thumbnail(png, 0).is_err());
+
+    let jpeg = with_exif_orientation(&encoded(&canvas(1024, 256), ImageFormat::Jpeg), 6);
+    let upright = thumbnail(jpeg, 128 * 1024).unwrap();
+    assert_eq!((upright.width, upright.height), (128, 512));
+}

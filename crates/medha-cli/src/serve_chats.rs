@@ -313,7 +313,10 @@ impl Chats for ServeChats {
             let store = workspace
                 .open_store()
                 .map_err(|error| format!("{error:#}"))?;
-            serving.block_on(crate::desktop_service::answer(&store.log, &folder, &asked))
+            let artifacts: Arc<dyn kernel::ArtifactStore> = store.artifacts.clone();
+            serving.block_on(crate::desktop_service::answer(
+                &store.log, &artifacts, &folder, &asked,
+            ))
         })
         .await;
         // A saved key leaves the config file as it was, so the host is told rather than left to notice.

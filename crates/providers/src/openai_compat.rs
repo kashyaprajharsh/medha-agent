@@ -667,16 +667,32 @@ pub async fn list_models_for_profile(
         .timeout(std::time::Duration::from_secs(6))
         // Model discovery carries the credential too — see transport::http::client.
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
-    match profile.protocol {
-        Protocol::OpenAiChat => list_openai_chat_models(&client, &url, profile, credential).await,
-        Protocol::GeminiInteractions => {
-            list_gemini_models(&client, &url, profile, credential).await
+    let discovery = async {
+        match profile.protocol {
+            Protocol::OpenAiChat => {
+                list_openai_chat_models(&client, &url, profile, credential).await
+            }
+            Protocol::GeminiInteractions => {
+                list_gemini_models(&client, &url, profile, credential).await
+            }
+            Protocol::OpenAiResponses | Protocol::AnthropicMessages => unreachable!(),
         }
-        Protocol::OpenAiResponses | Protocol::AnthropicMessages => unreachable!(),
-    }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(15), discovery)
+        .await
+        .map_err(|_| ProviderError::ProgressTimeout { waited_secs: 15 })?
 }
+
+#[cfg(test)]
+#[path = "discovery_tests.rs"]
+mod discovery_tests;
+
+const DISCOVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
+const DISCOVERY_MAX_MODELS: usize = 10_000;
+const DISCOVERY_MAX_PAGES: usize = 16;
 
 async fn list_openai_chat_models(
     client: &reqwest::Client,
@@ -706,32 +722,43 @@ async fn list_openai_chat_models(
     let resp = http::with_profile(client.get(url), profile, credential)?
         .send()
         .await
-        .map_err(|error| ProviderError::Transport(error.to_string()))?;
-    // Read the body as text first so a parse failure can report the actual serde
-    // reason and a snippet — reqwest's `.json()` error is just the opaque
-    // "error decoding response body".
-    let body = http::require_success(resp)
-        .await?
-        .text()
-        .await
-        .map_err(|error| ProviderError::Transport(error.to_string()))?;
-    let parsed: ModelsResp = serde_json::from_str(&body).map_err(|error| {
-        let snippet: String = body.chars().take(200).collect();
-        ProviderError::Decode(format!(
-            "model list parse failed: {error} (body: {snippet})"
-        ))
+        .map_err(|error| ProviderError::Transport(error.without_url().to_string()))?;
+    let body = http::bounded_body(http::require_success(resp).await?, DISCOVERY_MAX_BYTES).await?;
+    let parsed: ModelsResp = serde_json::from_slice(&body).map_err(|_| {
+        ProviderError::Decode(
+            "The server returned an invalid model list; enter a model ID manually.".into(),
+        )
     })?;
-    Ok(parsed
-        .data
-        .into_iter()
-        .map(|model| ModelInfo {
-            id: model.id,
-            context_length: model
-                .context_length
-                .or(model.context_window)
-                .or(model.max_model_len),
-        })
-        .collect())
+    if parsed.data.len() > DISCOVERY_MAX_MODELS {
+        return Err(ProviderError::Decode(
+            "model discovery returned too many models".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut models = Vec::new();
+    for model in parsed.data {
+        validate_discovered_id(&model.id)?;
+        if seen.insert(model.id.clone()) {
+            models.push(ModelInfo {
+                id: model.id,
+                context_length: model
+                    .context_length
+                    .or(model.context_window)
+                    .or(model.max_model_len)
+                    .filter(|limit| *limit > 0),
+            });
+        }
+    }
+    Ok(models)
+}
+
+fn validate_discovered_id(id: &str) -> Result<(), ProviderError> {
+    if id.trim().is_empty() || id.len() > 512 || id.chars().any(char::is_control) {
+        return Err(ProviderError::Decode(
+            "The server returned an invalid model ID; enter one manually.".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn list_gemini_models(
@@ -763,7 +790,16 @@ async fn list_gemini_models(
     // bounded and reject a repeated token instead of looping on a malformed
     // upstream response.
     let mut seen_tokens = std::collections::HashSet::new();
+    let mut pages = 0;
+    let mut remaining = DISCOVERY_MAX_BYTES;
+    let mut received_models = 0usize;
     loop {
+        pages += 1;
+        if pages > DISCOVERY_MAX_PAGES {
+            return Err(ProviderError::Decode(
+                "Gemini model discovery exceeded 16 pages".into(),
+            ));
+        }
         let mut request = client.get(url).query(&[("pageSize", "1000")]);
         if let Some(token) = page_token.as_deref() {
             request = request.query(&[("pageToken", token)]);
@@ -771,12 +807,18 @@ async fn list_gemini_models(
         let resp = http::with_profile(request, profile, credential)?
             .send()
             .await
-            .map_err(|error| ProviderError::Transport(error.to_string()))?;
-        let page: ModelsResp = http::require_success(resp)
-            .await?
-            .json()
-            .await
-            .map_err(|error| ProviderError::Decode(error.to_string()))?;
+            .map_err(|error| ProviderError::Transport(error.without_url().to_string()))?;
+        let body = http::bounded_body(http::require_success(resp).await?, remaining).await?;
+        remaining -= body.len();
+        let page: ModelsResp = serde_json::from_slice(&body).map_err(|_| {
+            ProviderError::Decode("The server returned an invalid Gemini model list.".into())
+        })?;
+        received_models = received_models.saturating_add(page.models.len());
+        if received_models > DISCOVERY_MAX_MODELS {
+            return Err(ProviderError::Decode(
+                "Gemini model discovery returned too many models".into(),
+            ));
+        }
 
         for model in page.models {
             // The Models API also returns embedding-only models. When methods
@@ -804,20 +846,26 @@ async fn list_gemini_models(
                         .to_string()
                 });
             if !id.is_empty() {
+                validate_discovered_id(&id)?;
                 models
                     .entry(id)
                     .and_modify(|limit| {
                         if limit.is_none() {
-                            *limit = model.input_token_limit;
+                            *limit = model.input_token_limit.filter(|limit| *limit > 0);
                         }
                     })
-                    .or_insert(model.input_token_limit);
+                    .or_insert(model.input_token_limit.filter(|limit| *limit > 0));
             }
         }
 
         let Some(token) = page.next_page_token.filter(|token| !token.is_empty()) else {
             break;
         };
+        if token.len() > 4096 {
+            return Err(ProviderError::Decode(
+                "Gemini model discovery returned an oversized page token".into(),
+            ));
+        }
         if !seen_tokens.insert(token.clone()) {
             return Err(ProviderError::Decode(
                 "Gemini model discovery returned a repeated page token".into(),

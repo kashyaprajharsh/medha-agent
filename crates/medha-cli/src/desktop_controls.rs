@@ -252,6 +252,21 @@ pub(crate) async fn handle<P: ProfileProvider, L: EventLog + 'static>(
                                 )
                                 .map_err(|error| error.to_string())?
                             };
+                            if resolved.provider.capabilities.is_none() {
+                                resolved.provider.capabilities =
+                                    providers::models_dev::resolve_profile_capabilities(
+                                        &resolved.provider,
+                                    )
+                                    .await
+                                    .capabilities;
+                            }
+                            if resolved.provider.max_ctx.is_none() {
+                                resolved.provider.max_ctx =
+                                    providers::models_dev::profile_context_window(
+                                        &resolved.provider,
+                                    )
+                                    .await;
+                            }
                             providers::models_dev::resolve_reasoning_efforts(
                                 &mut resolved.provider,
                             )

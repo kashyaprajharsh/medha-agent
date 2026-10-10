@@ -366,6 +366,36 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
         return;
     }
     if let Some(picker) = model.picker.as_mut() {
+        if matches!(picker.kind, PickerKind::ProviderPreset { .. })
+            && key.code == KeyCode::Char('r')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            backend_ui::request(model, backend_ui::Effect::RefreshProviders);
+            return;
+        }
+        if let PickerKind::ProviderPreset { query, .. } | PickerKind::ModelDiscovery { query, .. } =
+            &mut picker.kind
+        {
+            match key.code {
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if query.len() + ch.len_utf8() <= 256 && !ch.is_control() {
+                        query.push(ch);
+                        picker.selected = 0;
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    picker.selected = 0;
+                    return;
+                }
+                _ => {}
+            }
+        }
         let labels = picker.kind.labels();
         match key.code {
             KeyCode::Up => {
@@ -516,43 +546,95 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
                         ));
                         return;
                     }
-                    match protocol {
-                        kernel::Protocol::GeminiInteractions => {
-                            model.picker = None;
-                            if let Some(setup) = model.model_setup.as_mut() {
-                                setup.protocol = protocol;
-                                setup.base_url =
-                                    "https://generativelanguage.googleapis.com/v1".into();
-                                setup.step = ModelSetupStep::ApiKey;
-                            }
-                            model.push_notice("Gemini Interactions v1 — enter the Gemini API key");
-                        }
-                        // Everything else reaches a base URL the same way.
-                        _ => {
-                            if let Some(setup) = model.model_setup.as_mut() {
-                                setup.protocol = protocol;
-                            }
-                            model.picker = Some(Picker::new(PickerKind::ProviderPreset));
-                        }
+                    if let Some(setup) = model.model_setup.as_mut() {
+                        setup.protocol = protocol;
+                        setup.step = ModelSetupStep::BaseUrl;
                     }
+                    model.picker = None;
                     return;
                 }
-                if matches!(picker.kind, PickerKind::ProviderPreset) {
+                if let PickerKind::ProviderPreset {
+                    saved,
+                    providers,
+                    query,
+                } = &picker.kind
+                {
                     let selected = picker.selected;
-                    let presets = config::provider_presets();
+                    let saved = saved_deployment_matches(saved, query);
+                    if let Some(saved) = saved.get(selected).cloned().cloned() {
+                        let protocol = backend_features::kernel_protocol(saved.protocol);
+                        if !matches!(
+                            protocol,
+                            kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
+                        ) {
+                            model.push_notice(
+                                "This saved deployment's protocol is not available yet.",
+                            );
+                            return;
+                        }
+                        let provider = saved
+                            .provider_id
+                            .as_ref()
+                            .and_then(|id| providers.iter().find(|p| &p.id == id))
+                            .cloned();
+                        model.picker = None;
+                        if let Some(setup) = model.model_setup.as_mut() {
+                            setup.protocol = protocol;
+                            setup.auth = saved.auth.or(Some(if !saved.requires_key {
+                                protocol::ModelAuth::None
+                            } else if protocol == kernel::Protocol::GeminiInteractions {
+                                protocol::ModelAuth::XGoogApiKey
+                            } else {
+                                protocol::ModelAuth::Bearer
+                            }));
+                            setup.provider_id = saved.provider_id;
+                            setup.base_url = saved.base_url;
+                            setup.provider = provider;
+                            setup.step = ModelSetupStep::ApiKey;
+                        }
+                        backend_features::discover_setup_if_ready(model);
+                        return;
+                    }
+                    let selected = selected.saturating_sub(saved.len());
+                    let provider = provider_matches(providers, query)
+                        .get(selected)
+                        .map(|p| (*p).clone());
+                    if let Some(provider) = &provider
+                        && !provider.available
+                    {
+                        model.push_notice(
+                            provider
+                                .unavailable_reason
+                                .clone()
+                                .unwrap_or_else(|| "This provider is not available yet.".into()),
+                        );
+                        return;
+                    }
                     model.picker = None;
                     if let Some(setup) = model.model_setup.as_mut() {
-                        if let Some((name, url)) = presets.get(selected) {
-                            setup.base_url = (*url).to_string();
-                            setup.step = ModelSetupStep::ApiKey;
-                            model.push_notice(format!(
-                                "{name} — now the API key (blank for local servers)"
-                            ));
+                        if let Some(provider) = provider {
+                            if let Some(protocol) = provider.protocol {
+                                setup.protocol = backend_features::kernel_protocol(protocol);
+                            }
+                            setup.auth = Some(provider.auth);
+                            setup.provider_id = Some(provider.id.clone());
+                            setup.base_url = provider.url.clone().unwrap_or_default();
+                            setup.step = if provider.parameters.is_empty() {
+                                ModelSetupStep::ApiKey
+                            } else {
+                                ModelSetupStep::EndpointParameter
+                            };
+                            setup.provider = Some(provider);
                         } else {
+                            setup.provider = None;
+                            setup.provider_id = None;
+                            setup.auth = None;
                             setup.step = ModelSetupStep::BaseUrl;
+                            model.picker = Some(Picker::new(PickerKind::ModelProtocol));
                             model.push_notice("Custom provider selected — enter its base URL");
                         }
                     }
+                    backend_features::discover_setup_if_ready(model);
                     return;
                 }
                 if matches!(picker.kind, PickerKind::AutonomyMode) {
@@ -596,8 +678,10 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
                     return;
                 }
                 // Server-reported context can complete setup without another field.
-                if let PickerKind::ModelDiscovery(models) = &picker.kind {
-                    let choice = models.get(picker.selected).cloned();
+                if let PickerKind::ModelDiscovery { models, query } = &picker.kind {
+                    let choice = discovered_matches(models, query)
+                        .get(picker.selected)
+                        .map(|model| (*model).clone());
                     model.picker = None;
                     if model.model_setup.is_none() {
                         return;
@@ -608,13 +692,13 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
                             if let Some(setup) = model.model_setup.as_mut() {
                                 setup.model = m.id;
                                 setup.max_ctx = m.context_length;
-                                if !ctx_known {
-                                    setup.step = ModelSetupStep::ContextWindow;
-                                }
+                                setup.step = if ctx_known {
+                                    ModelSetupStep::ConfirmTest
+                                } else {
+                                    ModelSetupStep::ContextWindow
+                                };
                             }
-                            if ctx_known {
-                                finish_model_setup(model);
-                            } else {
+                            if !ctx_known {
                                 model.push_notice(
                                     "the server didn't report a context window — enter it in tokens (blank = unknown)",
                                 );
@@ -928,8 +1012,8 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent) {
                 if matches!(
                     picker.kind,
                     PickerKind::ModelProtocol
-                        | PickerKind::ProviderPreset
-                        | PickerKind::ModelDiscovery(_)
+                        | PickerKind::ProviderPreset { .. }
+                        | PickerKind::ModelDiscovery { .. }
                 ) {
                     // Back out of "add model" to the model menu, not to nothing —
                     // ← behaves like a menu's back button. On a fresh install
@@ -1694,6 +1778,23 @@ pub(super) fn message_for(model: &Model, line: &str, attached: &[std::path::Path
 }
 
 pub(super) fn handle_paste(model: &mut Model, data: String) {
+    if let Some(picker) = &mut model.picker
+        && let PickerKind::ProviderPreset { query, .. } | PickerKind::ModelDiscovery { query, .. } =
+            &mut picker.kind
+    {
+        for ch in strip_paste_markers(&data)
+            .chars()
+            .filter(|ch| !ch.is_control())
+        {
+            if query.len() + ch.len_utf8() > 256 {
+                break;
+            }
+            query.push(ch);
+        }
+        picker.selected = 0;
+        model.dirty = true;
+        return;
+    }
     if let Some(state) = &mut model.clarify {
         if state.entering_other {
             let clean = strip_paste_markers(&data);
@@ -1710,7 +1811,11 @@ pub(super) fn handle_paste(model: &mut Model, data: String) {
     if model.model_setup.as_ref().is_some_and(|setup| {
         matches!(
             setup.step,
-            ModelSetupStep::Saving | ModelSetupStep::Activating | ModelSetupStep::Discovering
+            ModelSetupStep::Saving
+                | ModelSetupStep::Activating
+                | ModelSetupStep::Discovering
+                | ModelSetupStep::Resolving
+                | ModelSetupStep::Testing
         )
     }) || model
         .search_setup

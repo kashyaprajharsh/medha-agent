@@ -9,6 +9,8 @@ mod presentation;
 pub use presentation::*;
 mod resources;
 pub use resources::*;
+mod model_providers;
+pub use model_providers::*;
 mod session_features;
 pub use session_features::*;
 mod editor;

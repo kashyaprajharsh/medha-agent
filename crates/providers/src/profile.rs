@@ -65,6 +65,10 @@ pub enum ChatTokenLimit {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProviderProfile {
+    /// Public catalogue identity, independent of the pinned deployment URL
+    /// and the credential record. Absent on legacy/custom profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     pub protocol: Protocol,
     pub base_url: String,
     pub model: String,
@@ -114,6 +118,7 @@ impl ProviderProfile {
         auth: AuthKind,
     ) -> Self {
         Self {
+            provider_id: None,
             protocol: Protocol::OpenAiChat,
             base_url: base_url.into(),
             model: model.into(),
@@ -147,6 +152,13 @@ impl ProviderProfile {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .provider_id
+            .as_deref()
+            .is_some_and(|id| !crate::catalogue::valid_id(id))
+        {
+            return Err("invalid provider id".into());
+        }
         let base_url = self.base_url.trim();
         if base_url.is_empty() {
             return Err("provider base URL cannot be empty".into());
@@ -205,6 +217,24 @@ impl ProviderProfile {
         }
         Ok(())
     }
+
+    /// Existing credential records use the complete saved URL. Do not shorten
+    /// this to a hostname/provider id or rewrite it from refreshed metadata.
+    pub fn credential_target(&self) -> &str {
+        &self.base_url
+    }
+
+    /// A selected provider qualifies metadata without changing the wire model
+    /// id. A custom deployment retains its existing explicit-model behavior.
+    pub fn catalogue_model_id(&self) -> String {
+        match self.provider_id.as_deref() {
+            Some(provider) => format!(
+                "{provider}/{}",
+                self.model.strip_prefix("models/").unwrap_or(&self.model)
+            ),
+            None => self.model.clone(),
+        }
+    }
 }
 
 fn is_auth_header(name: &reqwest::header::HeaderName) -> bool {
@@ -223,6 +253,8 @@ impl<'de> Deserialize<'de> for ProviderProfile {
     {
         #[derive(Deserialize)]
         struct RawProfile {
+            #[serde(default)]
+            provider_id: Option<String>,
             #[serde(default)]
             protocol: Protocol,
             base_url: String,
@@ -255,6 +287,7 @@ impl<'de> Deserialize<'de> for ProviderProfile {
 
         let raw = RawProfile::deserialize(deserializer)?;
         Ok(Self {
+            provider_id: raw.provider_id,
             protocol: raw.protocol,
             base_url: raw.base_url,
             model: raw.model,
@@ -310,6 +343,24 @@ mod tests {
         let serialized = serde_json::to_value(&profile).unwrap();
         assert_eq!(serialized["auth"], "bearer");
         assert!(serialized.get("needs_key").is_none());
+    }
+
+    #[test]
+    fn catalogue_identity_is_optional_and_never_changes_the_credential_target() {
+        let original = "https://host.test:8443/accounts/a/v1/";
+        let mut profile: ProviderProfile = serde_json::from_value(
+            serde_json::json!({"base_url":original,"model":"model-3.8","needs_key":true}),
+        )
+        .unwrap();
+        assert!(profile.provider_id.is_none());
+        assert_eq!(profile.credential_target(), original);
+        profile.provider_id = Some("wafer.ai".into());
+        assert!(profile.validate().is_ok());
+        assert_eq!(profile.catalogue_model_id(), "wafer.ai/model-3.8");
+        let reloaded: ProviderProfile =
+            serde_json::from_value(serde_json::to_value(&profile).unwrap()).unwrap();
+        assert_eq!(reloaded.credential_target(), original);
+        assert_eq!(reloaded.provider_id.as_deref(), Some("wafer.ai"));
     }
 
     #[test]

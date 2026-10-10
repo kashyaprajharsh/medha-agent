@@ -4,17 +4,6 @@
 use kernel::{Protocol, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-const API_URL: &str = "https://models.dev/api.json";
-/// Re-fetch if the cache is older than this; models.dev updates periodically,
-/// not every second, so a cached copy is fine to reuse for a while.
-const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const CACHE_SCHEMA_VERSION: u32 = 4;
-
-static PROCESS_ENTRIES: tokio::sync::OnceCell<BTreeMap<String, ModelMeta>> =
-    tokio::sync::OnceCell::const_new();
 
 /// Whether a model capability is known from an authoritative source.
 ///
@@ -227,43 +216,23 @@ pub struct ModelMeta {
     pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Cache {
-    /// Old caches retain prices but lack capability fields. They must refresh
-    /// after upgrading rather than claim that capabilities are unknown for a week.
-    #[serde(default)]
-    schema_version: u32,
-    fetched_at_unix: u64,
-    /// lowercased model id → metadata
-    entries: BTreeMap<String, ModelMeta>,
-}
-
-impl Cache {
-    fn discard_ambiguous_legacy_modalities(&mut self) {
-        if self.schema_version < 2 {
-            // Older serializers wrote missing directions as empty arrays.
-            // Their negatives cannot be trusted, including during offline fallback.
-            for meta in self.entries.values_mut() {
-                if let Some(capabilities) = &mut meta.capabilities {
-                    capabilities.modalities = None;
-                }
-            }
-        }
-    }
-
-    fn current_schema(&self) -> bool {
-        self.schema_version == CACHE_SCHEMA_VERSION
-    }
-}
-
 #[derive(Deserialize)]
 struct Provider {
+    #[serde(default)]
+    name: String,
+    api: Option<String>,
+    npm: Option<String>,
+    doc: Option<String>,
+    #[serde(default)]
+    env: Vec<String>,
     #[serde(default)]
     models: BTreeMap<String, ModelEntry>,
 }
 
 #[derive(Deserialize)]
 struct ModelEntry {
+    #[serde(default)]
+    name: String,
     #[serde(default)]
     limit: Option<Limit>,
     #[serde(default)]
@@ -338,50 +307,82 @@ struct Cost {
     cache_read: Option<f64>,
 }
 
-fn cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".medha").join("models_dev_cache.json"))
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn load_disk_cache() -> Option<Cache> {
-    let path = cache_path()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut cache: Cache = serde_json::from_str(&text).ok()?;
-    cache.discard_ambiguous_legacy_modalities();
-    let fresh = now_unix().saturating_sub(cache.fetched_at_unix) < CACHE_TTL.as_secs();
-    fresh.then_some(cache)
-}
-
-fn save_disk_cache(cache: &Cache) {
-    if let Some(path) = cache_path() {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = serde_json::to_string(cache) {
-            let _ = std::fs::write(path, text);
-        }
+pub(crate) fn parse_catalogue(bytes: &[u8]) -> Result<crate::catalogue::Snapshot, String> {
+    use crate::catalogue::{CatalogueModel, ProviderRecord, Snapshot};
+    let providers: BTreeMap<String, Provider> = serde_json::from_slice(bytes)
+        .map_err(|_| "The model catalogue has an invalid representation.".to_owned())?;
+    let model_count = providers.values().map(|p| p.models.len()).sum::<usize>();
+    if providers.is_empty() || providers.len() > 512 || model_count == 0 || model_count > 30_000 {
+        return Err("The model catalogue has too many providers/models or is empty.".into());
     }
-}
-
-async fn fetch_and_flatten(
-    client: &reqwest::Client,
-) -> Result<BTreeMap<String, ModelMeta>, String> {
-    let resp = client
-        .get(API_URL)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("models.dev returned {}", resp.status()));
+    let mut records = crate::catalogue::local_providers();
+    for (id, provider) in &providers {
+        if !crate::catalogue::valid_id(id) {
+            return Err("Invalid catalogue provider id.".into());
+        }
+        if records.iter().any(|record| &record.id == id) {
+            return Err("Catalogue provider identity conflicts with a local provider.".into());
+        }
+        let mut record = ProviderRecord::from_metadata(
+            id,
+            &provider.name,
+            provider.api.as_deref(),
+            provider.npm.as_deref(),
+        );
+        record.doc = provider
+            .doc
+            .clone()
+            .filter(|doc| crate::catalogue::valid_url(doc).is_ok());
+        record.env = provider
+            .env
+            .iter()
+            .filter(|name| {
+                name.len() <= 128
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .cloned()
+            .collect();
+        for (id, model) in &provider.models {
+            if id.len() > 512 || id.is_empty() || id.chars().any(char::is_control) {
+                return Err("Invalid catalogue model id.".into());
+            }
+            // Explicitly non-text output models cannot run an agent chat.
+            if model
+                .modalities
+                .as_ref()
+                .and_then(|m| m.output.as_ref())
+                .is_some_and(|m| !m.iter().any(|v| v == "text"))
+            {
+                continue;
+            }
+            record.models.push(CatalogueModel {
+                id: id.clone(),
+                name: model
+                    .name
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(256)
+                    .collect(),
+                context_length: model
+                    .limit
+                    .as_ref()
+                    .and_then(|l| l.context)
+                    .filter(|v| *v > 0),
+            });
+        }
+        records.push(record);
     }
-    let providers: BTreeMap<String, Provider> = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(flatten(providers))
+    // Local servers stay first; hosted providers have a stable alphabetical order.
+    records[4..].sort_by_key(|p| (p.name.to_lowercase(), p.id.clone()));
+    let entries = flatten(providers);
+    Ok(Snapshot {
+        revision: crate::catalogue::revision(&records, &entries),
+        fetched_at_unix: 0,
+        providers: records,
+        entries,
+    })
 }
 
 fn flatten(providers: BTreeMap<String, Provider>) -> BTreeMap<String, ModelMeta> {
@@ -432,60 +433,31 @@ fn flatten(providers: BTreeMap<String, Provider>) -> BTreeMap<String, ModelMeta>
     flat
 }
 
-/// Load the metadata table: fresh disk cache if present, else fetch + re-cache.
-async fn entries() -> Option<&'static BTreeMap<String, ModelMeta>> {
-    if let Some(entries) = PROCESS_ENTRIES.get() {
-        return Some(entries);
-    }
-    let cached = load_disk_cache();
-    if let Some(cache) = cached.as_ref().filter(|cache| cache.current_schema()) {
-        let entries = cache.entries.clone();
-        let _ = PROCESS_ENTRIES.set(entries);
-        return PROCESS_ENTRIES.get();
-    }
-    let client = reqwest::Client::builder()
-        .user_agent(crate::transport::http::USER_AGENT)
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
-    let fetched = match fetch_and_flatten(&client).await {
-        Ok(entries) => entries,
-        Err(_) => {
-            // Offline upgrades can still use the old prices/context metadata.
-            // Do not rewrite it with the new version: retry refresh next launch.
-            let entries = cached?.entries;
-            let _ = PROCESS_ENTRIES.set(entries);
-            return PROCESS_ENTRIES.get();
-        }
-    };
-    save_disk_cache(&Cache {
-        schema_version: CACHE_SCHEMA_VERSION,
-        fetched_at_unix: now_unix(),
-        entries: fetched.clone(),
-    });
-    let _ = PROCESS_ENTRIES.set(fetched);
-    PROCESS_ENTRIES.get()
-}
-
-/// Apply catalogue effort metadata to native Gemini profiles without persisting
+/// Apply exact provider/model effort metadata without persisting
 /// it as a user override. Both chat opening and model switching use this path.
 /// Explicit profile levels win; unavailable metadata leaves offline defaults
 /// to the protocol adapter. This does not infer effort controls from toggles.
 pub async fn resolve_reasoning_efforts(profile: &mut crate::ProviderProfile) {
-    if profile.reasoning_efforts.is_some() || profile.protocol != Protocol::GeminiInteractions {
+    if profile.reasoning_efforts.is_some() {
         return;
     }
-    let Some(entries) = entries().await else {
-        return;
-    };
-    apply_reasoning_efforts(profile, entries);
+    let data = crate::catalogue::snapshot();
+    apply_reasoning_efforts(profile, &data.entries);
 }
 
 fn apply_reasoning_efforts(
     profile: &mut crate::ProviderProfile,
     entries: &BTreeMap<String, ModelMeta>,
 ) {
-    if profile.reasoning_efforts.is_some() || profile.protocol != Protocol::GeminiInteractions {
+    if profile.reasoning_efforts.is_some() {
+        return;
+    }
+    if profile.protocol != Protocol::GeminiInteractions {
+        if let Some(provider) = &profile.provider_id {
+            profile.reasoning_efforts = entries
+                .get(&format!("{provider}/{}", profile.model).to_lowercase())
+                .and_then(|meta| meta.reasoning_efforts.clone());
+        }
         return;
     }
     let id = profile
@@ -507,8 +479,8 @@ fn apply_reasoning_efforts(
 /// Look up `model_id`'s context window from models.dev. Returns `None` on
 /// network failure or if the model genuinely isn't listed — never a guess.
 pub async fn context_window(model_id: &str) -> Option<u32> {
-    let entries = entries().await?;
-    lookup(model_id, entries).and_then(|m| m.context)
+    let data = crate::catalogue::snapshot();
+    lookup(model_id, &data.entries).and_then(|m| m.context)
 }
 
 /// Look up `model_id`'s list price (USD per MTok input, output). This is the
@@ -517,8 +489,8 @@ pub async fn context_window(model_id: &str) -> Option<u32> {
 /// List price for a route: input, output, and the cache-read rate when the
 /// catalogue publishes one.
 pub async fn pricing(model_id: &str) -> Option<(f64, f64, Option<f64>)> {
-    let entries = entries().await?;
-    let meta = lookup(model_id, entries)?;
+    let data = crate::catalogue::snapshot();
+    let meta = lookup(model_id, &data.entries)?;
     Some((
         meta.input_per_mtok?,
         meta.output_per_mtok?,
@@ -533,8 +505,8 @@ pub async fn capabilities(model_id: &str) -> Option<ModelCapabilities> {
     if model_id.trim().is_empty() {
         return None;
     }
-    let entries = entries().await?;
-    exact_lookup(model_id, entries).and_then(|meta| meta.capabilities.clone())
+    let data = crate::catalogue::snapshot();
+    exact_lookup(model_id, &data.entries).and_then(|meta| meta.capabilities.clone())
 }
 
 /// Resolve a model's capabilities with a user-supplied exact override taking
@@ -560,6 +532,68 @@ pub async fn resolve_capabilities(
             source: CapabilitySource::ModelsDev,
         },
     )
+}
+
+/// Deployment overrides win. An explicit provider id requires an exact
+/// provider/model match; it never borrows a same-named model from another host.
+pub async fn resolve_profile_capabilities(
+    profile: &crate::ProviderProfile,
+) -> CapabilityResolution {
+    if profile.provider_id.is_none() {
+        return resolve_capabilities(&profile.model, profile.capabilities.as_ref()).await;
+    }
+    if let Some(capabilities) = &profile.capabilities {
+        return CapabilityResolution {
+            capabilities: Some(capabilities.clone()),
+            source: CapabilitySource::ProfileOverride,
+        };
+    }
+    let data = crate::catalogue::snapshot();
+    let capabilities =
+        profile_meta(profile, &data.entries, false).and_then(|meta| meta.capabilities.clone());
+    CapabilityResolution {
+        source: if capabilities.is_some() {
+            CapabilitySource::ModelsDev
+        } else {
+            CapabilitySource::Unknown
+        },
+        capabilities,
+    }
+}
+
+pub async fn profile_context_window(profile: &crate::ProviderProfile) -> Option<u32> {
+    if let Some(context) = profile.max_ctx {
+        return Some(context);
+    }
+    if profile.provider_id.is_none() {
+        return context_window(&profile.model).await;
+    }
+    let data = crate::catalogue::snapshot();
+    profile_meta(profile, &data.entries, true).and_then(|meta| meta.context)
+}
+
+pub async fn profile_pricing(profile: &crate::ProviderProfile) -> Option<(f64, f64, Option<f64>)> {
+    let data = crate::catalogue::snapshot();
+    let meta = profile_meta(profile, &data.entries, true)?;
+    Some((
+        meta.input_per_mtok?,
+        meta.output_per_mtok?,
+        meta.cached_input_per_mtok,
+    ))
+}
+
+fn profile_meta<'a>(
+    profile: &crate::ProviderProfile,
+    entries: &'a BTreeMap<String, ModelMeta>,
+    legacy_fuzzy: bool,
+) -> Option<&'a ModelMeta> {
+    if profile.provider_id.is_some() {
+        entries.get(&profile.catalogue_model_id().to_lowercase())
+    } else if legacy_fuzzy {
+        lookup(&profile.model, entries)
+    } else {
+        exact_lookup(&profile.model, entries)
+    }
 }
 
 fn exact_lookup<'a>(
@@ -597,6 +631,50 @@ fn lookup<'a>(model_id: &str, entries: &'a BTreeMap<String, ModelMeta>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalogue::{Cache, SCHEMA as CACHE_SCHEMA_VERSION};
+
+    #[test]
+    fn an_explicit_provider_never_inherits_another_deployments_metadata() {
+        let raw = serde_json::from_value(serde_json::json!({
+            "one":{"models":{"same":{"limit":{"context":8000},"cost":{"input":1.0,"output":2.0},"tool_call":true,"reasoning_options":[{"type":"effort","values":["low","high"]}]} }},
+            "two":{"models":{"same":{"limit":{"context":16000},"cost":{"input":3.0,"output":4.0},"tool_call":false,"reasoning_options":[{"type":"toggle"}]} }}
+        })).unwrap();
+        let entries = flatten(raw);
+        let mut profile = crate::ProviderProfile::openai_chat(
+            "https://one.test/v1",
+            "same",
+            crate::AuthKind::Bearer,
+        );
+        profile.provider_id = Some("one".into());
+        let meta = profile_meta(&profile, &entries, true).unwrap();
+        assert_eq!(meta.context, Some(8000));
+        assert_eq!(meta.input_per_mtok, Some(1.0));
+        assert_eq!(meta.capabilities.as_ref().unwrap().tool_calls, Some(true));
+        apply_reasoning_efforts(&mut profile, &entries);
+        assert_eq!(
+            profile.reasoning_efforts.as_deref(),
+            Some([ReasoningEffort::Low, ReasoningEffort::High].as_slice())
+        );
+        profile.provider_id = Some("unknown".into());
+        profile.reasoning_efforts = None;
+        assert!(profile_meta(&profile, &entries, true).is_none());
+        apply_reasoning_efforts(&mut profile, &entries);
+        assert!(profile.reasoning_efforts.is_none());
+        profile.provider_id = Some("two".into());
+        apply_reasoning_efforts(&mut profile, &entries);
+        assert!(
+            profile.reasoning_efforts.is_none(),
+            "a toggle is not an effort list"
+        );
+        profile.reasoning_efforts = Some(vec![ReasoningEffort::Medium]);
+        profile.provider_id = Some("one".into());
+        apply_reasoning_efforts(&mut profile, &entries);
+        assert_eq!(
+            profile.reasoning_efforts,
+            Some(vec![ReasoningEffort::Medium]),
+            "intentional deployment overrides win"
+        );
+    }
 
     #[test]
     fn null_and_unrecognized_effort_values_do_not_break_other_models_metadata() {
@@ -676,6 +754,8 @@ mod tests {
         let cache = Cache {
             schema_version: CACHE_SCHEMA_VERSION,
             fetched_at_unix: 0,
+            revision: String::new(),
+            providers: Vec::new(),
             entries,
         };
         let reloaded: Cache =

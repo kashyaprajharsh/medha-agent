@@ -472,8 +472,8 @@ pub(super) fn handle_model_setup_key(model: &mut Model, key: KeyEvent) -> bool {
             model.picker.as_ref().map(|picker| &picker.kind),
             Some(
                 PickerKind::ModelProtocol
-                    | PickerKind::ProviderPreset
-                    | PickerKind::ModelDiscovery(_)
+                    | PickerKind::ProviderPreset { .. }
+                    | PickerKind::ModelDiscovery { .. }
             )
         )
     {
@@ -482,7 +482,11 @@ pub(super) fn handle_model_setup_key(model: &mut Model, key: KeyEvent) -> bool {
     if model.model_setup.as_ref().is_some_and(|setup| {
         matches!(
             setup.step,
-            ModelSetupStep::Discovering | ModelSetupStep::Saving | ModelSetupStep::Activating
+            ModelSetupStep::Discovering
+                | ModelSetupStep::Saving
+                | ModelSetupStep::Activating
+                | ModelSetupStep::Resolving
+                | ModelSetupStep::Testing
         )
     }) && key.code != KeyCode::Esc
     {
@@ -511,7 +515,21 @@ pub(super) fn begin_model_setup(model: &mut Model) {
     model.search_setup = None;
     model.mcp_credential = None;
     model.model_setup = Some(ModelSetup::new());
-    model.picker = Some(Picker::new(PickerKind::ModelProtocol));
+    let saved = model
+        .remote
+        .as_ref()
+        .map(|peer| peer.models.profiles.clone())
+        .unwrap_or_default();
+    let providers = model
+        .remote
+        .as_ref()
+        .map(|peer| peer.models.providers.clone())
+        .unwrap_or_default();
+    model.picker = Some(Picker::new(PickerKind::ProviderPreset {
+        saved,
+        providers,
+        query: String::new(),
+    }));
 }
 pub(super) fn begin_model_key_update(model: &mut Model, profile: config::ModelProfile) {
     if !boundary_allowed(model) {
@@ -526,12 +544,45 @@ pub(super) fn begin_model_key_update(model: &mut Model, profile: config::ModelPr
         profile.provider.base_url,
     ));
 }
+pub(super) fn discover_setup_if_ready(model: &mut Model) {
+    let Some(setup) = model.model_setup.as_ref() else {
+        return;
+    };
+    if !matches!(setup.step, ModelSetupStep::ApiKey) {
+        return;
+    }
+    let key_saved = model.remote.as_ref().is_some_and(|peer| {
+        peer.models
+            .profiles
+            .iter()
+            .any(|profile| profile.key_present && profile.base_url == setup.base_url)
+    });
+    if setup.auth == Some(protocol::ModelAuth::None) || key_saved {
+        advance_model_setup(model);
+    }
+}
 fn advance_model_setup(model: &mut Model) {
     let value = model.edited().0.trim().to_string();
     let Some(setup) = model.model_setup.as_mut() else {
         return;
     };
     let effect = match setup.step {
+        ModelSetupStep::EndpointParameter if !value.is_empty() => {
+            let provider = setup.provider.as_ref().expect("provider parameter form");
+            setup
+                .parameters
+                .insert(provider.parameters[setup.parameter].clone(), value);
+            setup.parameter += 1;
+            if setup.parameter == provider.parameters.len() {
+                setup.step = ModelSetupStep::Resolving;
+                Some(Effect::ResolveDeployment(protocol::ResolveDeployment {
+                    provider_id: provider.id.clone(),
+                    parameters: setup.parameters.clone(),
+                }))
+            } else {
+                None
+            }
+        }
         ModelSetupStep::BaseUrl if !value.is_empty() => {
             setup.base_url = value.trim_end_matches('/').into();
             setup.step = ModelSetupStep::ApiKey;
@@ -551,13 +602,26 @@ fn advance_model_setup(model: &mut Model) {
                     After::KeySaved(profile.clone()),
                 ))
             } else {
-                if setup.protocol == kernel::Protocol::GeminiInteractions && value.is_empty() {
-                    model.push_notice("A Gemini API key is required.");
+                let key_saved = model.remote.as_ref().is_some_and(|peer| {
+                    peer.models
+                        .profiles
+                        .iter()
+                        .any(|profile| profile.key_present && profile.base_url == setup.base_url)
+                });
+                if (setup.protocol == kernel::Protocol::GeminiInteractions
+                    || setup
+                        .auth
+                        .is_some_and(|auth| auth != protocol::ModelAuth::None))
+                    && value.is_empty()
+                    && !key_saved
+                {
+                    model.push_notice("An API key is required for this provider.");
                     return;
                 }
                 setup.api_key = value;
                 setup.step = ModelSetupStep::Discovering;
                 Some(Effect::Discover(protocol::DiscoverModels {
+                    auth: setup.auth,
                     protocol: model_protocol(setup.protocol),
                     base_url: setup.base_url.clone(),
                     key: protocol::Secret(setup.api_key.clone()),
@@ -584,10 +648,31 @@ fn advance_model_setup(model: &mut Model) {
                 }
             };
             setup.max_ctx = setup.max_ctx.or(tokens);
+            setup.step = ModelSetupStep::ConfirmTest;
+            None
+        }
+        ModelSetupStep::ConfirmTest if value.eq_ignore_ascii_case("test") => {
+            let draft = setup_draft(setup);
+            setup.step = ModelSetupStep::Testing;
+            Some(Effect::TestModel(protocol::TestModel { draft }))
+        }
+        ModelSetupStep::ConfirmTest if value.is_empty() => {
             finish_model_setup(model);
             return;
         }
-        ModelSetupStep::Discovering | ModelSetupStep::Saving | ModelSetupStep::Activating => return,
+        ModelSetupStep::ConfirmTest => {
+            model.push_notice("Type test, or leave blank to save without testing.");
+            return;
+        }
+        ModelSetupStep::ReviewTest => {
+            finish_model_setup(model);
+            return;
+        }
+        ModelSetupStep::Discovering
+        | ModelSetupStep::Saving
+        | ModelSetupStep::Activating
+        | ModelSetupStep::Resolving
+        | ModelSetupStep::Testing => return,
         _ => {
             model.push_notice("This field is required.");
             return;
@@ -597,7 +682,14 @@ fn advance_model_setup(model: &mut Model) {
         && !request(model, effect)
     {
         if let Some(setup) = &mut model.model_setup {
-            setup.step = ModelSetupStep::ApiKey;
+            setup.step = if matches!(setup.step, ModelSetupStep::Resolving) {
+                setup.parameter = setup.parameter.saturating_sub(1);
+                ModelSetupStep::EndpointParameter
+            } else if matches!(setup.step, ModelSetupStep::Testing) {
+                ModelSetupStep::ConfirmTest
+            } else {
+                ModelSetupStep::ApiKey
+            };
         }
         return;
     }
@@ -619,14 +711,7 @@ pub(super) fn finish_model_setup(model: &mut Model) {
     ) {
         return;
     }
-    let draft = protocol::ModelDraft {
-        name: None,
-        protocol: model_protocol(setup.protocol),
-        base_url: setup.base_url.clone(),
-        model: setup.model.clone(),
-        context_limit: setup.max_ctx,
-        key: (!setup.api_key.is_empty()).then(|| protocol::Secret(setup.api_key.clone())),
-    };
+    let draft = setup_draft(setup);
     if request(
         model,
         Effect::Change(Change::SaveModel(draft), After::Models),
@@ -634,12 +719,33 @@ pub(super) fn finish_model_setup(model: &mut Model) {
         model.model_setup.as_mut().expect("setup").step = ModelSetupStep::Saving;
     }
 }
-fn model_protocol(protocol: kernel::Protocol) -> protocol::ModelProtocol {
+fn setup_draft(setup: &ModelSetup) -> protocol::ModelDraft {
+    protocol::ModelDraft {
+        provider_id: setup.provider_id.clone(),
+        auth: setup.auth,
+        headers: BTreeMap::new(),
+        name: None,
+        protocol: model_protocol(setup.protocol),
+        base_url: setup.base_url.clone(),
+        model: setup.model.clone(),
+        context_limit: setup.max_ctx,
+        key: (!setup.api_key.is_empty()).then(|| protocol::Secret(setup.api_key.clone())),
+    }
+}
+pub(super) fn model_protocol(protocol: kernel::Protocol) -> protocol::ModelProtocol {
     match protocol {
         kernel::Protocol::OpenAiChat => protocol::ModelProtocol::OpenAiChat,
         kernel::Protocol::GeminiInteractions => protocol::ModelProtocol::GeminiInteractions,
         kernel::Protocol::AnthropicMessages => protocol::ModelProtocol::AnthropicMessages,
         kernel::Protocol::OpenAiResponses => protocol::ModelProtocol::OpenAiResponses,
+    }
+}
+pub(super) fn kernel_protocol(protocol: protocol::ModelProtocol) -> kernel::Protocol {
+    match protocol {
+        protocol::ModelProtocol::OpenAiChat => kernel::Protocol::OpenAiChat,
+        protocol::ModelProtocol::GeminiInteractions => kernel::Protocol::GeminiInteractions,
+        protocol::ModelProtocol::AnthropicMessages => kernel::Protocol::AnthropicMessages,
+        protocol::ModelProtocol::OpenAiResponses => kernel::Protocol::OpenAiResponses,
     }
 }
 fn profiles(catalogue: &protocol::ModelCatalogue) -> Vec<config::ModelProfile> {
@@ -656,11 +762,17 @@ fn profiles(catalogue: &protocol::ModelCatalogue) -> Vec<config::ModelProfile> {
                     providers::AuthKind::None
                 },
             );
-            provider.protocol = match profile.protocol {
-                protocol::ModelProtocol::OpenAiChat => kernel::Protocol::OpenAiChat,
-                protocol::ModelProtocol::GeminiInteractions => kernel::Protocol::GeminiInteractions,
-                protocol::ModelProtocol::AnthropicMessages => kernel::Protocol::AnthropicMessages,
-                protocol::ModelProtocol::OpenAiResponses => kernel::Protocol::OpenAiResponses,
+            provider.protocol = kernel_protocol(profile.protocol);
+            provider.provider_id = profile.provider_id.clone();
+            provider.auth = match profile.auth {
+                Some(protocol::ModelAuth::None) => providers::AuthKind::None,
+                Some(protocol::ModelAuth::Bearer) => providers::AuthKind::Bearer,
+                Some(protocol::ModelAuth::XApiKey) => providers::AuthKind::XApiKey,
+                Some(protocol::ModelAuth::XGoogApiKey) => providers::AuthKind::XGoogApiKey,
+                None if profile.requires_key => {
+                    providers::AuthKind::for_protocol(provider.protocol)
+                }
+                None => providers::AuthKind::None,
             };
             provider.max_ctx = profile.context_limit;
             config::ModelProfile {

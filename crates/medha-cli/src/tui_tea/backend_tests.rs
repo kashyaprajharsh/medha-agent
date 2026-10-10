@@ -3,6 +3,333 @@ use serde_json::json;
 #[path = "feature_tests.rs"]
 mod parity;
 
+fn setup_provider() -> protocol::ModelProvider {
+    serde_json::from_value(json!({"id":"cloudflare-workers-ai","name":"Cloudflare Workers AI","url":"https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1","parameters":["CLOUDFLARE_ACCOUNT_ID"],"protocol":"open-ai-chat","auth":"bearer","available":true,"unavailable_reason":null,"doc":null,"env":[],"models":[{"id":"fixture-model","context_length":8000}]})).unwrap()
+}
+fn finish_setup_request(f: &mut Fixture, answer: Result<Answer, String>) {
+    let Pending {
+        effect,
+        form,
+        command,
+    } = f
+        .model
+        .remote
+        .as_mut()
+        .unwrap()
+        .pending
+        .pop_front()
+        .unwrap();
+    completed(
+        &mut f.model,
+        &mut f.view,
+        Completion {
+            generation: 1,
+            effect,
+            form,
+            command,
+            result: answer,
+        },
+    );
+}
+fn setup_enter(model: &mut Model) {
+    input::handle_key(model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_setup_searches_pasted_text_resolves_parameters_and_keeps_secrets_out_of_transcript()
+ {
+    let mut f = fixture().await;
+    f.model.remote.as_mut().unwrap().models.providers = vec![setup_provider()];
+    begin_model_setup(&mut f.model);
+    input::handle_paste(&mut f.model, "Cloudflare\n".into());
+    assert!(
+        matches!(&f.model.picker.as_ref().unwrap().kind, PickerKind::ProviderPreset { query, .. } if query == "Cloudflare")
+    );
+    assert!(f.model.input.is_empty());
+    setup_enter(&mut f.model);
+    assert!(matches!(
+        f.model.model_setup.as_ref().unwrap().step,
+        ModelSetupStep::EndpointParameter
+    ));
+    input::handle_paste(&mut f.model, "my-account".into());
+    setup_enter(&mut f.model);
+    assert!(
+        matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect, Effect::ResolveDeployment(resolve) if resolve.parameters["CLOUDFLARE_ACCOUNT_ID"] == "my-account")
+    );
+    finish_setup_request(
+        &mut f,
+        Ok(Answer::Deployment(protocol::ModelDeployment {
+            provider_id: "cloudflare-workers-ai".into(),
+            protocol: protocol::ModelProtocol::OpenAiChat,
+            auth: protocol::ModelAuth::Bearer,
+            base_url: "https://api.cloudflare.com/client/v4/accounts/my-account/ai/v1".into(),
+        })),
+    );
+    input::handle_paste(&mut f.model, "dummy-secret".into());
+    setup_enter(&mut f.model);
+    assert!(
+        matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect, Effect::Discover(discover) if discover.key.0 == "dummy-secret" && discover.auth == Some(protocol::ModelAuth::Bearer))
+    );
+    finish_setup_request(
+        &mut f,
+        Err("Discovery unavailable; use catalogue or enter manually".into()),
+    );
+    input::handle_paste(&mut f.model, "fixture".into());
+    assert!(
+        matches!(&f.model.picker.as_ref().unwrap().kind, PickerKind::ModelDiscovery { query, .. } if query == "fixture")
+    );
+    setup_enter(&mut f.model);
+    assert!(matches!(
+        f.model.model_setup.as_ref().unwrap().step,
+        ModelSetupStep::ConfirmTest
+    ));
+    setup_enter(&mut f.model); // blank -> Save, not Test
+    assert!(
+        matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect, Effect::Change(protocol::ChangeResource::SaveModel(draft), _) if draft.provider_id.as_deref() == Some("cloudflare-workers-ai") && draft.base_url.ends_with("my-account/ai/v1") && draft.model == "fixture-model")
+    );
+    assert!(f.model.history.is_empty());
+    assert!(
+        !f.model
+            .items
+            .iter()
+            .any(|entry| format!("{:?}", entry.item).contains("dummy-secret"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_model_test_is_owned_by_its_form_and_does_not_save_or_activate() {
+    let mut f = fixture().await;
+    let mut setup = ModelSetup::new();
+    setup.protocol = kernel::Protocol::OpenAiChat;
+    setup.base_url = "http://localhost/v1".into();
+    setup.model = "fixture".into();
+    setup.step = ModelSetupStep::ConfirmTest;
+    f.model.model_setup = Some(setup);
+    input::handle_paste(&mut f.model, "test".into());
+    setup_enter(&mut f.model);
+    assert!(matches!(
+        &f.model
+            .remote
+            .as_ref()
+            .unwrap()
+            .pending
+            .front()
+            .unwrap()
+            .effect,
+        Effect::TestModel(_)
+    ));
+    assert!(matches!(
+        f.model.model_setup.as_ref().unwrap().step,
+        ModelSetupStep::Testing
+    ));
+    input::handle_key(
+        &mut f.model,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    let check = protocol::ModelTestCheck {
+        status: protocol::ModelTestStatus::Passed,
+        message: "old test completed".into(),
+        failure: None,
+    };
+    finish_setup_request(
+        &mut f,
+        Ok(Answer::Tested(protocol::ModelTestResult {
+            text: check.clone(),
+            streaming: check.clone(),
+            tools: check,
+        })),
+    );
+    assert!(f.model.model_setup.is_none());
+    assert!(f.model.remote.as_ref().unwrap().pending.is_empty());
+    assert!(
+        !f.model
+            .items
+            .iter()
+            .any(|entry| format!("{:?}", entry.item).contains("old test completed"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalogue_refresh_preserves_provider_search_and_the_current_chat() {
+    let mut f = fixture().await;
+    f.model.remote.as_mut().unwrap().models.providers = vec![setup_provider()];
+    begin_model_setup(&mut f.model);
+    input::handle_paste(&mut f.model, "cloud".into());
+    input::handle_key(
+        &mut f.model,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+    );
+    assert!(matches!(
+        f.model
+            .remote
+            .as_ref()
+            .unwrap()
+            .pending
+            .front()
+            .unwrap()
+            .effect,
+        Effect::RefreshProviders
+    ));
+    let conversation = f.model.remote.as_ref().unwrap().conversation.clone();
+    finish_setup_request(
+        &mut f,
+        Ok(Answer::Providers(protocol::ProviderCatalogue {
+            revision: "new".into(),
+            providers: vec![setup_provider()],
+        })),
+    );
+    assert!(
+        matches!(&f.model.picker.as_ref().unwrap().kind, PickerKind::ProviderPreset { query, .. } if query == "cloud")
+    );
+    assert_eq!(f.model.remote.as_ref().unwrap().conversation, conversation);
+    assert_eq!(f.model.remote.as_ref().unwrap().models.revision, "new");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_selection_chooses_its_protocol_and_only_custom_setup_asks_for_one() {
+    let mut f = fixture().await;
+    let mut gemini = setup_provider();
+    gemini.id = "google".into();
+    gemini.name = "Google Gemini".into();
+    gemini.protocol = Some(protocol::ModelProtocol::GeminiInteractions);
+    gemini.auth = protocol::ModelAuth::XGoogApiKey;
+    gemini.url = Some("https://generativelanguage.googleapis.com/v1".into());
+    gemini.parameters.clear();
+    let mut unavailable = gemini.clone();
+    unavailable.id = "future".into();
+    unavailable.available = false;
+    unavailable.unavailable_reason = Some("Native protocol not implemented".into());
+    f.model.remote.as_mut().unwrap().models.providers = vec![unavailable, gemini];
+    begin_model_setup(&mut f.model);
+    assert!(matches!(
+        f.model.picker.as_ref().unwrap().kind,
+        PickerKind::ProviderPreset { .. }
+    ));
+    setup_enter(&mut f.model);
+    assert!(f.model.remote.as_ref().unwrap().pending.is_empty());
+    assert!(matches!(
+        f.model.picker.as_ref().unwrap().kind,
+        PickerKind::ProviderPreset { .. }
+    ));
+    assert!(
+        f.model
+            .picker
+            .as_ref()
+            .unwrap()
+            .kind
+            .labels()
+            .iter()
+            .any(|label| label.contains("Native protocol not implemented"))
+    );
+    input::handle_key(
+        &mut f.model,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    );
+    setup_enter(&mut f.model);
+    let setup = f.model.model_setup.as_ref().unwrap();
+    assert_eq!(setup.protocol, kernel::Protocol::GeminiInteractions);
+    assert!(matches!(setup.step, ModelSetupStep::ApiKey));
+    assert!(f.model.picker.is_none());
+
+    begin_model_setup(&mut f.model);
+    f.model.picker.as_mut().unwrap().selected = 2; // Custom follows both records.
+    setup_enter(&mut f.model);
+    assert!(matches!(
+        f.model.picker.as_ref().unwrap().kind,
+        PickerKind::ModelProtocol
+    ));
+    setup_enter(&mut f.model);
+    assert!(f.model.picker.is_none());
+    assert!(matches!(
+        f.model.model_setup.as_ref().unwrap().step,
+        ModelSetupStep::BaseUrl
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_deployment_setup_reuses_only_its_exact_key_and_preserves_its_auth_and_pinned_url() {
+    let mut f = fixture().await;
+    let profile: protocol::ModelProfile = serde_json::from_value(json!({
+        "provider_id":"cloudflare-workers-ai", "auth":"x-api-key",
+        "name":"old-model", "model":"old", "protocol":"open-ai-chat",
+        "base_url":"https://gateway.test/tenant-a/v1", "context_limit":8000,
+        "default":true, "key_present":true, "requires_key":true
+    }))
+    .unwrap();
+    let mut duplicate = profile.clone();
+    duplicate.name = "other-model".into();
+    let peer = f.model.remote.as_mut().unwrap();
+    peer.models.profiles = vec![profile, duplicate];
+    peer.models.providers = vec![setup_provider()];
+    begin_model_setup(&mut f.model);
+    let labels = f.model.picker.as_ref().unwrap().kind.labels();
+    assert_eq!(labels[0], "Saved — https://gateway.test/tenant-a/v1");
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|label| label.starts_with("Saved"))
+            .count(),
+        1
+    );
+    setup_enter(&mut f.model);
+    assert!(
+        matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect,
+        Effect::Discover(request) if request.base_url == "https://gateway.test/tenant-a/v1" && request.key.0.is_empty() && request.auth == Some(protocol::ModelAuth::XApiKey))
+    );
+    finish_setup_request(
+        &mut f,
+        Ok(Answer::Discovered(vec![protocol::DiscoveredModel {
+            id: "new".into(),
+            context_length: Some(8000),
+        }])),
+    );
+    setup_enter(&mut f.model);
+    setup_enter(&mut f.model);
+    assert!(
+        matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect,
+        Effect::Change(protocol::ChangeResource::SaveModel(draft), _) if draft.base_url == "https://gateway.test/tenant-a/v1" && draft.auth == Some(protocol::ModelAuth::XApiKey) && draft.key.is_none() && draft.provider_id.as_deref() == Some("cloudflare-workers-ai"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_provider_needs_no_key_and_a_different_tenant_cannot_reuse_a_saved_key() {
+    let mut f = fixture().await;
+    let mut provider = setup_provider();
+    provider.parameters.clear();
+    provider.url = Some("http://localhost:11434/v1".into());
+    provider.auth = protocol::ModelAuth::None;
+    f.model.remote.as_mut().unwrap().models.providers = vec![provider.clone()];
+    begin_model_setup(&mut f.model);
+    setup_enter(&mut f.model);
+    assert!(
+        matches!(&f.model.remote.as_ref().unwrap().pending.front().unwrap().effect,
+        Effect::Discover(request) if request.auth == Some(protocol::ModelAuth::None) && request.key.0.is_empty())
+    );
+    finish_setup_request(&mut f, Err("Local server is not running".into()));
+
+    provider.auth = protocol::ModelAuth::Bearer;
+    provider.url = Some("https://gateway.test/tenant-b/v1".into());
+    let peer = f.model.remote.as_mut().unwrap();
+    peer.models.providers = vec![provider];
+    peer.models.profiles = vec![
+        serde_json::from_value(json!({
+            "name":"tenant-a", "model":"old", "protocol":"open-ai-chat",
+            "base_url":"https://gateway.test/tenant-a/v1", "context_limit":null,
+            "default":true, "key_present":true, "requires_key":true
+        }))
+        .unwrap(),
+    ];
+    begin_model_setup(&mut f.model);
+    f.model.picker.as_mut().unwrap().selected = 1; // Provider follows the saved deployment.
+    setup_enter(&mut f.model);
+    setup_enter(&mut f.model); // A blank key must be refused for tenant-b.
+    assert!(f.model.remote.as_ref().unwrap().pending.is_empty());
+    assert!(matches!(
+        f.model.model_setup.as_ref().unwrap().step,
+        ModelSetupStep::ApiKey
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_recovery_has_a_place_when_all_human_controls_and_bytes_are_busy() {
     let mut f = fixture().await;
@@ -135,6 +462,8 @@ async fn fixture() -> Fixture {
         },
         models: protocol::ModelCatalogue {
             profiles: Vec::new(),
+            providers: Vec::new(),
+            revision: String::new(),
             search: protocol::SearchProvider::Duckduckgo,
             searxng_url: None,
         },
@@ -458,6 +787,9 @@ async fn closing_a_form_before_its_save_finishes_cannot_activate_that_profile() 
     f.model.model_setup.as_mut().unwrap().step = ModelSetupStep::Saving;
     let effect = Effect::Change(
         protocol::ChangeResource::SaveModel(protocol::ModelDraft {
+            provider_id: None,
+            auth: None,
+            headers: BTreeMap::new(),
             name: None,
             protocol: protocol::ModelProtocol::OpenAiChat,
             base_url: "http://localhost/v1".into(),

@@ -17,7 +17,7 @@ export function allowlist(bridge, command) {
 /** Extension, settings and instruction requests the pages name, minus the ones sent to a live session. */
 export function requested(code) {
   const live = new Set([...code.matchAll(/liveCall\([^,]+,\s*"([a-z_.]+)"/g)].map((match) => match[1]));
-  return [...new Set([...code.matchAll(/"((?:extensions|settings|instructions)\.[a-z_.]+)"/g)].map((match) => match[1]))]
+  return [...new Set([...code.matchAll(/"((?:extensions|settings|instructions)\.[a-z_.]+|application\.providers(?:\.[a-z_.]+)?)"/g)].map((match) => match[1]))]
     .filter((method) => !live.has(method))
     .sort();
 }

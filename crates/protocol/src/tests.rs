@@ -189,3 +189,24 @@ fn resource_commands_refuse_invented_actions_and_redact_secret_debugging() {
         .is_err()
     );
 }
+
+#[test]
+fn provider_commands_are_typed_scoped_and_keep_key_and_header_debugging_private() {
+    let draft: ModelDraft = serde_json::from_value(json!({"name":null,"protocol":"open-ai-chat","base_url":"https://fixture.test/v1","model":"m","context_limit":null,"key":"dummy-private-key","provider_id":"fixture","auth":"bearer","headers":{"x-account":"dummy-private-header"}})).unwrap();
+    let test = TestModel { draft };
+    let shown = format!("{test:?}");
+    assert!(!shown.contains("dummy-private-key") && !shown.contains("dummy-private-header"));
+    let call = Call::new(Scope::Folder(Path::new(".")), &test).unwrap();
+    let encoded = serde_json::to_value(call).unwrap();
+    assert_eq!(encoded["method"], "application.models.test");
+    assert_eq!(encoded["params"]["draft"]["provider_id"], "fixture");
+    assert!(Call::new(Scope::Service, &ReadProviders {}).is_err());
+    assert!(
+        serde_json::from_value::<ResolveDeployment>(
+            json!({"provider_id":"fixture","parameters":{},"api_key":"cannot belong here"})
+        )
+        .is_err()
+    );
+    let legacy: ModelDraft = serde_json::from_value(json!({"name":null,"protocol":"open-ai-chat","base_url":"http://localhost/v1","model":"m","context_limit":null,"key":null})).unwrap();
+    assert!(legacy.provider_id.is_none() && legacy.auth.is_none() && legacy.headers.is_empty());
+}

@@ -55,6 +55,25 @@ Medha uses its tools to read them and asks for access when required. These paths
 remain in the conversation, so keep the files available when resuming work.
 Support for reading a particular format depends on the tools available.
 
+### Models and providers
+
+Choose **Add model** in Settings, search for a provider, and select a model from
+its server. Saved servers are offered first. A saved key is reused only for its
+exact API endpoint; endpoint parameters such as an account ID are entered
+separately from credentials. **Custom endpoint** keeps manual protocol, address
+and model-ID entry available.
+
+The provider catalogue includes bundled metadata for offline use and supports
+background and manual refresh. If discovery is unavailable, catalogue models or
+a manual ID can still be saved. A listing does not guarantee that your account
+can use a model. Providers needing an unimplemented protocol or sign-in method
+are shown with an explanation.
+
+**Test model** is optional. It checks text, streaming and a synthetic function
+round trip, using up to four billed requests with a 45-second total deadline.
+It sends no project content and executes no tools. Test results describe that
+model, endpoint and key; they do not verify every capability or account.
+
 ## Shared backend and data
 
 Desktop, the terminal app and editor ACP connect to one authenticated local

@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub struct Model {
     pub provider: Arc<OpenAiCompat>,
     pub name: String,
+    pub catalogue_pricing: Option<(f64, f64, Option<f64>)>,
     pub profiles: Arc<std::sync::Mutex<config::Config>>,
     pub active_profile: String,
     pub max_ctx: Option<u32>,
@@ -54,11 +55,8 @@ pub async fn resolve(
     // A saved profile override wins over models.dev; unknown remains visible so
     // a future media pipeline can choose a safe fallback instead of guessing.
     if !open_setup {
-        let capability_resolution = providers::models_dev::resolve_capabilities(
-            &resolved.provider.model,
-            resolved.provider.capabilities.as_ref(),
-        )
-        .await;
+        let capability_resolution =
+            providers::models_dev::resolve_profile_capabilities(&resolved.provider).await;
         if resolved.provider.capabilities.is_none() {
             resolved.provider.capabilities = capability_resolution.capabilities;
         }
@@ -118,6 +116,7 @@ pub async fn resolve(
     }
 
     let model_name = resolved.provider.model.clone();
+    let catalogue_pricing = providers::models_dev::profile_pricing(&resolved.provider).await;
     let model_profiles = Arc::new(std::sync::Mutex::new(cfg.unwrap_or_default()));
     let active_profile = resolved.name.clone();
 
@@ -144,7 +143,7 @@ pub async fn resolve(
     }
     if max_ctx.is_none()
         && !model_name.is_empty()
-        && let Some(c) = providers::models_dev::context_window(&model_name).await
+        && let Some(c) = providers::models_dev::profile_context_window(&resolved.provider).await
     {
         max_ctx = Some(c);
         ctx_source = "models.dev";
@@ -227,6 +226,7 @@ pub async fn resolve(
     Ok(Model {
         provider,
         name: model_name,
+        catalogue_pricing,
         profiles: model_profiles,
         active_profile,
         max_ctx,

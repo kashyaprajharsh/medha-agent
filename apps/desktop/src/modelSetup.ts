@@ -1,4 +1,6 @@
-export type Provider = { name: string; url: string; auth: string };
+export type Provider = { id?: string; name: string; url: string; auth: string; protocol?: string; parameters?: string[]; models?: Found[] };
+export const providerKey = (provider: Provider) => provider.id ?? (provider.protocol ? `${provider.protocol}:${provider.url}` : provider.url);
+export type ModelTestResult = Record<"text" | "streaming" | "tools", { status: "passed" | "failed" | "skipped"; message: string; failure: string | null }>;
 export type Protocol = {
   value: string;
   label: string;
@@ -32,7 +34,7 @@ export const plainName = (name: string) => name.replace(/\s*\(local\)$/, "");
 export const authFor = (choice: { custom: boolean; auth: string }, key: string) => (choice.custom && !key ? "none" : choice.auth);
 
 /** The profile a new model is saved as; everything unasked keeps the value Settings would give it. */
-export function profileFor(connection: { protocol: string; url: string; auth: string }, model = "", context: number | null = null) {
+export function profileFor(connection: { protocol: string; url: string; auth: string; provider_id?: string }, model = "", context: number | null = null) {
   return {
     model: model || "model-discovery",
     base_url: connection.url,
@@ -47,6 +49,7 @@ export function profileFor(connection: { protocol: string; url: string; auth: st
     token_accounting: "adaptive",
     chat_token_limit: "auto",
     headers: {},
+    ...(connection.provider_id ? { provider_id: connection.provider_id } : {}),
   };
 }
 
@@ -70,7 +73,8 @@ export function sizeNote(listed: boolean, published: number | null | undefined) 
 /** Why a server gave no models, in words that say what to do next. */
 export function reasonFor(cause: unknown, url: string) {
   const text = String(cause);
-  if (/\b(401|403)\b|unauthori[sz]ed|forbidden|invalid.{0,12}key|api key/i.test(text)) return "That key was not accepted. Check it and try again.";
+  if (/\b403\b|forbidden/i.test(text)) return text.replace(/^Error:\s*/, "");
+  if (/\b401\b|unauthori[sz]ed|invalid.{0,12}key|api key/i.test(text)) return "That key was not accepted. Check it and try again.";
   if (/connect|refused|timed? ?out|dns|resolve|unreachable|network/i.test(text))
     return `Nothing answered at ${hostOf(url)}. Start the server, or check the address.`;
   return text.replace(/^Error:\s*/, "");

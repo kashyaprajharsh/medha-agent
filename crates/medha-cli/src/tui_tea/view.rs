@@ -1780,9 +1780,9 @@ pub(super) fn draw_input(f: &mut Frame, model: &Model, area: Rect) {
         if let Some(setup) = &model.model_setup {
             let prompt = if matches!(
                 model.picker.as_ref().map(|p| &p.kind),
-                Some(PickerKind::ProviderPreset)
+                Some(PickerKind::ProviderPreset { .. })
             ) {
-                "Choose a provider from the list above"
+                "Choose a provider from the list above".to_owned()
             } else {
                 setup.prompt()
             };

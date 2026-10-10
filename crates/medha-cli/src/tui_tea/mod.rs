@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 #[cfg(test)]
 use sandbox::WorkspaceSandbox;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -796,14 +796,20 @@ enum PickerKind {
     /// A skill installed switched off, for its code to be read first, is
     /// switched on only by saying so.
     EnableSkill(String),
-    /// Provider presets shared with first-run setup, followed by Custom.
+    /// Custom deployments choose their protocol explicitly.
     ModelProtocol,
-    /// OpenAI-compatible deployment presets shared with first-run setup,
-    /// followed by Custom.
-    ProviderPreset,
+    /// Saved deployments first, then public providers and a custom endpoint.
+    ProviderPreset {
+        saved: Vec<protocol::ModelProfile>,
+        providers: Vec<protocol::ModelProvider>,
+        query: String,
+    },
     /// Models the endpoint reported during setup — pick one instead of typing
     /// an id blind. A trailing row keeps manual entry available.
-    ModelDiscovery(Vec<providers::openai_compat::ModelInfo>),
+    ModelDiscovery {
+        models: Vec<providers::openai_compat::ModelInfo>,
+        query: String,
+    },
     /// Saved provider/model profiles. Switching is available only while idle,
     /// so a stream can never be retargeted midway through a response.
     /// `active` is the profile driving THIS session (may differ from the
@@ -985,14 +991,18 @@ impl PickerKind {
             PickerKind::EnableSkill(name) => {
                 format!(" switch on '{name}'? · ↑↓ move · Enter confirm · Esc back ")
             }
-            PickerKind::ProviderPreset => {
-                " choose provider — ↑↓ move · Enter/→ continue · Esc/← back ".into()
+            PickerKind::ProviderPreset { query, .. } => {
+                format!(
+                    " choose provider · search: {query} · ↑↓ move · Enter select · Ctrl-R refresh · Esc back "
+                )
             }
             PickerKind::ModelProtocol => {
                 " choose model protocol — ↑↓ move · Enter/→ continue · Esc/← back ".into()
             }
-            PickerKind::ModelDiscovery(_) => {
-                " choose a model — ↑↓ move · Enter/→ select · Esc/← back ".into()
+            PickerKind::ModelDiscovery { query, .. } => {
+                format!(
+                    " choose a model · search: {query} · ↑↓ move · Enter/→ select · Esc/← back "
+                )
             }
             PickerKind::Model { .. } => {
                 " model — ↑↓ move · Enter/→ switch or open · Esc close ".into()
@@ -1155,17 +1165,38 @@ impl PickerKind {
                     )
                 })
                 .collect(),
-            PickerKind::ProviderPreset => config::provider_presets()
-                .iter()
-                .enumerate()
-                .map(|(i, (name, url))| format!("{}. {name} — {url}", i + 1))
-                .chain(std::iter::once(format!(
-                    "{}. Custom — enter your own base URL",
-                    config::provider_presets().len() + 1
-                )))
+            PickerKind::ProviderPreset {
+                saved,
+                providers,
+                query,
+            } => saved_deployment_matches(saved, query)
+                .into_iter()
+                .map(|profile| format!("Saved — {}", profile.base_url))
+                .chain(
+                    provider_matches(providers, query)
+                        .into_iter()
+                        .map(|provider| {
+                            if !provider.available {
+                                return format!(
+                                    "{} — unavailable: {}",
+                                    provider.name,
+                                    provider
+                                        .unavailable_reason
+                                        .as_deref()
+                                        .unwrap_or("protocol/access not implemented")
+                                );
+                            }
+                            format!(
+                                "{} — {}",
+                                provider.name,
+                                provider.url.as_deref().unwrap_or("endpoint needed")
+                            )
+                        }),
+                )
+                .chain(std::iter::once("Custom — enter your own base URL".into()))
                 .collect(),
-            PickerKind::ModelDiscovery(models) => models
-                .iter()
+            PickerKind::ModelDiscovery { models, query } => discovered_matches(models, query)
+                .into_iter()
                 .map(|m| match m.context_length {
                     Some(c) => format!("{} · {c} ctx", m.id),
                     None => m.id.clone(),
@@ -1387,12 +1418,17 @@ enum SessionOp {
 #[derive(Clone, Copy)]
 enum ModelSetupStep {
     BaseUrl,
+    EndpointParameter,
+    Resolving,
     ApiKey,
     /// `/v1/models` is being queried in the background; Enter is inert until
     /// the result arrives (picker on success, manual ModelId on failure).
     Discovering,
     ModelId,
     ContextWindow,
+    ConfirmTest,
+    Testing,
+    ReviewTest,
     Saving,
     Activating,
 }
@@ -1413,6 +1449,11 @@ struct ModelSetup {
     model: String,
     /// Context window carried over from discovery, when the server reports it.
     max_ctx: Option<u32>,
+    provider_id: Option<String>,
+    auth: Option<protocol::ModelAuth>,
+    provider: Option<protocol::ModelProvider>,
+    parameters: BTreeMap<String, String>,
+    parameter: usize,
 }
 
 struct McpCredential {
@@ -1437,6 +1478,11 @@ impl ModelSetup {
             api_key: String::new(),
             model: String::new(),
             max_ctx: None,
+            provider_id: None,
+            auth: None,
+            provider: None,
+            parameters: BTreeMap::new(),
+            parameter: 0,
         }
     }
 
@@ -1450,11 +1496,28 @@ impl ModelSetup {
             api_key: String::new(),
             model: String::new(),
             max_ctx: None,
+            provider_id: None,
+            auth: None,
+            provider: None,
+            parameters: BTreeMap::new(),
+            parameter: 0,
         }
     }
 
-    fn prompt(&self) -> &'static str {
+    fn prompt(&self) -> String {
+        if matches!(self.step, ModelSetupStep::EndpointParameter) {
+            return format!(
+                "{} (endpoint parameter, not an API key):",
+                self.provider
+                    .as_ref()
+                    .and_then(|p| p.parameters.get(self.parameter))
+                    .map(String::as_str)
+                    .unwrap_or("Endpoint value")
+            );
+        }
         match self.step {
+            ModelSetupStep::EndpointParameter => unreachable!(),
+            ModelSetupStep::Resolving => "Validating the provider endpoint… (Esc cancels)",
             ModelSetupStep::BaseUrl => match self.protocol {
                 kernel::Protocol::OpenAiChat => {
                     "OpenAI-compatible API root or full /chat/completions URL (for example http://localhost:11434/v1):"
@@ -1466,10 +1529,10 @@ impl ModelSetup {
             },
             ModelSetupStep::ApiKey => match &self.mode {
                 ModelSetupMode::Add if self.protocol == kernel::Protocol::GeminiInteractions => {
-                    "Gemini API key (required; stored securely, never in config.toml):"
+                    "Gemini API key (blank keeps a saved key for this exact endpoint):"
                 }
                 ModelSetupMode::Add => {
-                    "API key (leave blank for a local server; stored securely, never in config.toml):"
+                    "API key (blank for a local server or to keep this endpoint's saved key):"
                 }
                 ModelSetupMode::UpdateKey { .. } => {
                     "New API key (stored securely, never in config.toml):"
@@ -1484,12 +1547,57 @@ impl ModelSetup {
             ModelSetupStep::ContextWindow => {
                 "Context window in tokens (optional; blank = unknown):"
             }
-        }
+            ModelSetupStep::ConfirmTest => "Test model? Type test for synthetic text/stream/tool checks (up to 4 billed requests, 45 seconds); blank saves without testing:",
+            ModelSetupStep::Testing => "Testing with synthetic messages; no tools run… (Esc closes this form)",
+            ModelSetupStep::ReviewTest => "Review the test results above. Enter saves; Esc cancels:",
+        }.into()
     }
 
     fn is_secret(&self) -> bool {
         matches!(self.step, ModelSetupStep::ApiKey)
     }
+}
+
+fn provider_matches<'a>(
+    providers: &'a [protocol::ModelProvider],
+    query: &str,
+) -> Vec<&'a protocol::ModelProvider> {
+    let wanted = query.to_lowercase();
+    providers
+        .iter()
+        .filter(|p| p.name.to_lowercase().contains(&wanted) || p.id.contains(&wanted))
+        .collect()
+}
+
+fn saved_deployment_matches<'a>(
+    profiles: &'a [protocol::ModelProfile],
+    query: &str,
+) -> Vec<&'a protocol::ModelProfile> {
+    let wanted = query.to_lowercase();
+    let mut seen = BTreeSet::new();
+    profiles
+        .iter()
+        .filter(|profile| {
+            (profile.base_url.to_lowercase().contains(&wanted)
+                || profile.name.to_lowercase().contains(&wanted)
+                || profile
+                    .provider_id
+                    .as_deref()
+                    .is_some_and(|id| id.contains(&wanted)))
+                && seen.insert(format!("{:?}:{}", profile.protocol, profile.base_url))
+        })
+        .collect()
+}
+
+fn discovered_matches<'a>(
+    models: &'a [providers::openai_compat::ModelInfo],
+    query: &str,
+) -> Vec<&'a providers::openai_compat::ModelInfo> {
+    let wanted = query.to_lowercase();
+    models
+        .iter()
+        .filter(|model| model.id.to_lowercase().contains(&wanted))
+        .collect()
 }
 
 /// Guided search setup keeps API keys out of history and the transcript.

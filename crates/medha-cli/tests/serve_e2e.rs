@@ -102,11 +102,20 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
     if asked.contains("HOLD") {
         let _ = release.lock().unwrap().recv_timeout(WAIT);
     }
+    if body["stream"] == false {
+        return respond(&mut stream, "application/json", &json!({"choices":[{"message":{"role":"assistant","content":format!("echo: {asked}")},"finish_reason":"stop"}]}).to_string());
+    }
     let read_completed = body["messages"]
         .as_array()
         .and_then(|messages| messages.last())
         .is_some_and(|message| message["role"] == "tool");
-    let events = if let Some(path) = asked.strip_prefix("READ_PATH ").filter(|_| !read_completed) {
+    let events = if asked.starts_with("Call medha_setup_echo") {
+        let call = json!({"index":0,"id":"setup-test","type":"function","function":{"name":"medha_setup_echo","arguments":"{\"value\":\"medha-check\"}"}});
+        vec![
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[call]}}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ]
+    } else if let Some(path) = asked.strip_prefix("READ_PATH ").filter(|_| !read_completed) {
         let arguments = json!({"path":path});
         let call = json!({"index":0,"id":"read_path","type":"function",
             "function":{"name":"read","arguments":arguments.to_string()}});
@@ -187,6 +196,7 @@ fn medha(home: &Path, provider: &Provider) -> Command {
         .env("MEDHA_API_KEY", SECRET)
         .env("MEDHA_PROTOCOL", "open-ai-chat")
         .env("MEDHA_TOKEN_ACCOUNTING", "adaptive")
+        .env("MEDHA_CATALOGUE_OFFLINE", "1")
         // These tests read the log, so what is written there is theirs to say.
         .env("RUST_LOG", "info")
         // Saved keys go to a file under the home, never to this machine's keychain.
@@ -426,6 +436,7 @@ impl TerminalClient {
         command.env("MEDHA_API_KEY", SECRET);
         command.env("MEDHA_PROTOCOL", "open-ai-chat");
         command.env("MEDHA_CRED_STORE", "file");
+        command.env("MEDHA_CATALOGUE_OFFLINE", "1");
         command.env("MEDHA_MODE", "careful");
         command.env("RUST_LOG", "info");
         let child = pair.slave.spawn_command(command).unwrap();
@@ -454,6 +465,17 @@ impl TerminalClient {
     fn type_text(&mut self, text: &str) {
         self.writer.write_all(text.as_bytes()).unwrap();
         self.writer.flush().unwrap();
+    }
+
+    fn asked(&mut self, provider: &Provider) -> String {
+        let request = provider.seen.recv_timeout(WAIT).unwrap_or_else(|error| {
+            panic!(
+                "no terminal model request arrived: {error}; child: {:?}; {}",
+                self.child.try_wait(),
+                self.output.lock().unwrap().evidence()
+            )
+        });
+        user_texts(&request)
     }
 
     fn until(&mut self, marker: &str) {
@@ -537,7 +559,7 @@ async fn real_terminal_and_another_client_share_one_chat_and_survive_viewer_exit
     assert_eq!(settings["result"]["mode"], "careful");
 
     terminal.type_text("FROM_TUI\r");
-    assert!(world.provider.asked().contains("FROM_TUI"));
+    assert!(terminal.asked(&world.provider).contains("FROM_TUI"));
     viewer.until(|frame| kind(frame, "turn.done")).await;
     terminal.until("echo: FROM_TUI");
     viewer.send(&session, "FROM_OTHER_VIEWER").await;
@@ -558,9 +580,8 @@ async fn real_terminal_and_another_client_share_one_chat_and_survive_viewer_exit
         .unwrap();
     terminal.type_text("HOLD terminal cancellation\r");
     assert!(
-        world
-            .provider
-            .asked()
+        terminal
+            .asked(&world.provider)
             .contains("HOLD terminal cancellation")
     );
     viewer.until(|frame| kind(frame, "turn.started")).await;
@@ -1247,6 +1268,9 @@ async fn typed_application_resources_preserve_credentials_and_reject_stale_grant
     let backend = world.backend();
     let mut client = backend.connect().await;
     let change = ChangeResource::SaveModel(protocol::ModelDraft {
+        provider_id: None,
+        auth: None,
+        headers: Default::default(),
         name: Some("saved".into()),
         protocol: protocol::ModelProtocol::OpenAiChat,
         base_url: world.provider.url.clone(),
@@ -1528,6 +1552,133 @@ async fn ten_chats_in_one_process_answer_their_own_clients_and_leak_no_key() {
     ] {
         assert!(!text.contains(SECRET), "the key reached {what}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_provider_setup_is_offline_capable_pins_credentials_and_tests_before_saving() {
+    let world = World::new();
+    let folder = world.folder("providers");
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let catalogue = client
+        .about(
+            &folder,
+            json!({"method":"application.providers","params":{}}),
+        )
+        .await
+        .unwrap();
+    let catalogue: protocol::ProviderCatalogue = serde_json::from_value(catalogue).unwrap();
+    assert!(catalogue.providers.len() >= 220);
+    assert_eq!(catalogue.revision.len(), 64);
+    assert!(
+        catalogue
+            .providers
+            .iter()
+            .any(|p| p.id == "anthropic" && !p.available && p.unavailable_reason.is_some())
+    );
+    let config_before =
+        std::fs::read_to_string(world.home().join("config.toml")).unwrap_or_default();
+    let invalid = client.about(&folder, json!({"method":"application.providers.resolve","params":{"provider_id":"cloudflare-workers-ai","parameters":{"CLOUDFLARE_ACCOUNT_ID":"../other"}}})).await;
+    assert!(invalid.is_err());
+    let deployment: protocol::ModelDeployment = serde_json::from_value(client.about(&folder, json!({"method":"application.providers.resolve","params":{"provider_id":"cloudflare-workers-ai","parameters":{"CLOUDFLARE_ACCOUNT_ID":"my-account"}}})).await.unwrap()).unwrap();
+    assert_eq!(
+        deployment.base_url,
+        "https://api.cloudflare.com/client/v4/accounts/my-account/ai/v1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(world.home().join("config.toml")).unwrap_or_default(),
+        config_before,
+        "reading/resolving metadata must not rewrite saved endpoints"
+    );
+    let mut draft = protocol::ModelDraft {
+        provider_id: Some("fixture".into()),
+        auth: Some(protocol::ModelAuth::Bearer),
+        headers: Default::default(),
+        name: Some("new-provider".into()),
+        protocol: protocol::ModelProtocol::OpenAiChat,
+        base_url: world.provider.url.clone(),
+        model: "fixture-model".into(),
+        context_limit: Some(8000),
+        key: None,
+    };
+    let missing_key = client
+        .about(
+            &folder,
+            json!({"method":"application.models.test","params":{"draft":draft}}),
+        )
+        .await;
+    assert!(
+        missing_key.unwrap_err().contains("API key is required"),
+        "an ambient daemon key cannot authorize setup"
+    );
+    assert!(world.provider.seen.try_recv().is_err());
+    draft.key = Some(protocol::Secret("dummy-setup-only".into()));
+    let tested: protocol::ModelTestResult = serde_json::from_value(
+        client
+            .about(
+                &folder,
+                json!({"method":"application.models.test","params":{"draft":draft}}),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(tested.text.status, protocol::ModelTestStatus::Passed);
+    assert_eq!(tested.streaming.status, protocol::ModelTestStatus::Passed);
+    assert_eq!(
+        tested.tools.status,
+        protocol::ModelTestStatus::Passed,
+        "{}",
+        tested.tools.message
+    );
+    for _ in 0..4 {
+        let request = world.provider.seen.recv_timeout(WAIT).unwrap();
+        assert_eq!(request["_test_authorization"], "bearer dummy-setup-only");
+    }
+    let credentials_before =
+        std::fs::read_to_string(world.home().join("credentials.toml")).unwrap_or_default();
+    assert!(
+        !credentials_before.contains("dummy-setup-only"),
+        "Test alone does not save a key"
+    );
+    client.about(&folder, json!({"method":"application.resources.change","params":protocol::ChangeResource::SaveModel(draft.clone())})).await.unwrap();
+    draft.key = None;
+    let discovered: Vec<protocol::DiscoveredModel> = serde_json::from_value(client.about(&folder, json!({"method":"application.models.discover","params":{"protocol":"open-ai-chat","base_url":draft.base_url,"auth":"bearer","key":""}})).await.unwrap()).unwrap();
+    assert_eq!(
+        discovered[0].id, "test-model",
+        "the exact saved deployment key is reusable"
+    );
+    draft.base_url.push_str("/another-account");
+    assert!(
+        client
+            .about(
+                &folder,
+                json!({"method":"application.models.test","params":{"draft":draft}})
+            )
+            .await
+            .unwrap_err()
+            .contains("API key is required")
+    );
+    let refreshed = client
+        .about(
+            &folder,
+            json!({"method":"application.providers.refresh","params":{}}),
+        )
+        .await
+        .unwrap_err();
+    assert!(refreshed.contains("OFFLINE"));
+    let after = client
+        .about(
+            &folder,
+            json!({"method":"application.providers","params":{}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after["revision"], catalogue.revision);
+    assert!(
+        !client.heard.contains("dummy-setup-only"),
+        "replies contain no saved secret"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1791,8 +1791,7 @@ test("choosing a discovered Gemini model lets the backend name its profile and p
   const button = (text) => [...document.querySelectorAll("button")].find((node) => node.textContent.trim() === text);
   await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {} })));
   await click(button("Add model"));
-  await click(button("Choose a protocol"));
-  await click(option("Gemini Interactions v1"));
+  assert.equal(button("Choose a protocol"), undefined, "a named provider selects its protocol");
   await click(button("Choose a provider"));
   await click(option("Google Gemini"));
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
@@ -1825,6 +1824,151 @@ async function inputValue(input, value) {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
+
+const fieldInput = (name) => [...document.querySelectorAll("label")].find((node) => node.textContent.trim().startsWith(name))?.querySelector("input");
+const providerFixture = {
+  id: "fixture", name: "Fixture Provider", url: "https://fixture.test/account-a/v1", auth: "bearer",
+  parameters: [], models: [{ id: "fixture-model", context_length: 8000 }],
+};
+function providerSettings(providers = [providerFixture], models = []) {
+  return { models, search: { provider: "duckduckgo" }, unavailable_providers: [{ id: "future", name: "Native Future", reason: "This native protocol is not implemented." }], protocols: [{ value: "open-ai-chat", label: "OpenAI Chat", available: true, auth: "bearer", discovery: true, providers }] };
+}
+async function providerForm(settingsApi) {
+  const { Settings } = await import(await moduleUrl("Settings"));
+  globalThis.__medhaControlsTest.api = { settings: settingsApi };
+  await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {} })));
+  await click(namedButton("Add model"));
+  assert.equal(namedButton("Choose a protocol"), undefined);
+}
+
+test("provider search saves its identity without reusing another endpoint's key or automatically testing", async () => {
+  const calls = [];
+  const existing = { name: "old", default: true, key_present: true, profile: { protocol: "open-ai-chat", model: "old", base_url: "https://fixture.test/account-b/v1", auth: "bearer" } };
+  await providerForm(async (method = "settings.list", params) => {
+    calls.push({ method, params });
+    if (method === "settings.model.save") return { saved: true };
+    assert.equal(method, "settings.list");
+    return providerSettings([providerFixture], [existing]);
+  });
+  await click(namedButton("Choose a provider"));
+  await inputValue(document.querySelector('input[placeholder="Search providers"]'), "Fixture");
+  await click(option("Fixture Provider"));
+  assert.equal(fieldInput("API endpoint").value, providerFixture.url);
+  assert.equal(fieldInput("API key").placeholder, "Paste API key", "same host with another account path is a different credential target");
+  assert.equal(namedButton("Find models on this server").disabled, true);
+  await inputValue(fieldInput("API key"), "dummy-only-key");
+  await inputValue(fieldInput("Model ID"), "fixture-model");
+  await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  const save = calls.find((call) => call.method === "settings.model.save");
+  assert.equal(save.params.profile.provider_id, "fixture");
+  assert.equal(save.params.profile.base_url, providerFixture.url);
+  assert.equal(save.params.key, "dummy-only-key");
+  assert.ok(!calls.some((call) => call.method === "settings.model.test" || call.method === "settings.model.discover"));
+});
+
+test("failed discovery offers catalogue models, clears stale context and permits manual save after an optional failed test", async () => {
+  const calls = [];
+  let finishTest;
+  const provider = { ...providerFixture, models: [...providerFixture.models, { id: "manual-window", context_length: null }] };
+  await providerForm(async (method = "settings.list", params) => {
+    calls.push({ method, params });
+    if (method === "settings.list") return providerSettings([provider]);
+    if (method === "settings.model.discover") throw new Error("403: access not granted to this account");
+    if (method === "settings.model.test") return new Promise((resolve) => { finishTest = resolve; });
+    if (method === "settings.model.save") return { saved: true };
+    assert.fail(method);
+  });
+  await click(namedButton("Choose a provider")); await click(option(provider.name));
+  await inputValue(fieldInput("API key"), "dummy-only-key");
+  await click(namedButton("Find models on this server"));
+  assert.match(document.querySelector(".model-discovery").parentElement.textContent, /availability is unverified/);
+  await click(namedButton("Choose a model")); await click(option("fixture-model"));
+  assert.equal(fieldInput("Context window").value, "8000");
+  await click(namedButton("fixture-model")); await click(option("manual-window"));
+  assert.equal(fieldInput("Context window").value, "", "the earlier model's context must not persist");
+  await click(namedButton("Test model"));
+  assert.ok(finishTest, "test runs only on explicit click");
+  await inputValue(fieldInput("Model ID"), "other-model");
+  const failed = { status: "failed", failure: "access_restricted", message: "old model not allowed" };
+  await act(async () => finishTest({ text: failed, streaming: failed, tools: failed }));
+  assert.ok(!document.body.textContent.includes("old model not allowed"), "a late result cannot validate another model");
+  await act(async () => document.querySelector(".settings-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  assert.equal(calls.find((call) => call.method === "settings.model.save").params.profile.model, "other-model");
+});
+
+test("endpoint parameters resolve explicitly and a closed form ignores late resolution", async () => {
+  const { ProviderFields } = await import(await moduleUrl("ProviderSetup"));
+  let finish, requests = [], resolved = [];
+  globalThis.__medhaControlsTest.api = { settings: (method, params) => {
+    requests.push({ method, params });
+    return new Promise((resolve) => { finish = resolve; });
+  } };
+  const provider = { ...providerFixture, id: "cloudflare-workers-ai", parameters: ["CLOUDFLARE_ACCOUNT_ID"] };
+  await act(() => root.render(h(ProviderFields, { provider, disabled: false, onChange() {}, onResolved: (url) => resolved.push(url) })));
+  assert.equal(namedButton("Use endpoint").disabled, true);
+  await inputValue(fieldInput("CLOUDFLARE ACCOUNT ID"), "my-account");
+  assert.equal(requests.length, 0);
+  await click(namedButton("Use endpoint"));
+  assert.deepEqual(requests, [{ method: "application.providers.resolve", params: { provider_id: provider.id, parameters: { CLOUDFLARE_ACCOUNT_ID: "my-account" } } }]);
+  await act(() => root.render(null));
+  await act(async () => finish({ base_url: "https://fixture.test/my-account/v1" }));
+  assert.deepEqual(resolved, []);
+});
+
+test("first-run setup filters providers and keeps unsupported providers visible with reasons", async () => {
+  const { FirstRun } = await import(await moduleUrl("FirstRun"));
+  const writes = [];
+  const other = { ...providerFixture, id: "other", name: "Other Provider" };
+  globalThis.__medhaControlsTest.api = { settings: async (method = "settings.list", params) => {
+    if (method === "settings.list") return providerSettings([providerFixture, other]);
+    if (method === "settings.model.discover") throw new Error("Discovery is unavailable");
+    if (method === "settings.model.save") { writes.push(params); return { saved: true }; }
+    if (method === "settings.model.context") return { published: null };
+    assert.fail("No model test should run automatically: " + method);
+  } };
+  await act(async () => root.render(h(FirstRun, { onDone() {}, onClose() {} })));
+  await inputValue(document.querySelector('[aria-label="Search providers"]'), "Fixture");
+  assert.ok(!document.querySelector(".fr-list").textContent.includes("Other Provider"));
+  assert.match(document.querySelector("details").textContent, /Native Future.*not implemented/);
+  await click([...document.querySelectorAll(".fr-row")].find((node) => node.textContent.includes("Fixture Provider")));
+  await inputValue(fieldInput("API key"), "dummy-first-run-key");
+  await click(namedButton("Find models"));
+  await click(namedButton("Use catalogue models"));
+  assert.match(document.body.textContent, /availability is unverified/);
+  await click(namedButton("Start"));
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].profile.provider_id, "fixture");
+  assert.equal(writes[0].profile.model, "fixture-model");
+  assert.equal(writes[0].default, true);
+});
+
+test("first-run provider selection chooses Gemini without a protocol question and keeps custom setup available", async () => {
+  const { FirstRun } = await import(await moduleUrl("FirstRun"));
+  const calls = [];
+  const google = { id: "google", name: "Google Gemini", url: "https://generativelanguage.googleapis.com/v1", auth: "x-goog-api-key", models: [] };
+  globalThis.__medhaControlsTest.api = { settings: async (method = "settings.list", params) => {
+    calls.push({ method, params });
+    if (method === "settings.list") return { ...providerSettings(), protocols: [
+      ...providerSettings().protocols,
+      { value: "gemini-interactions", label: "Gemini Interactions", available: true, auth: "x-goog-api-key", providers: [google] },
+    ] };
+    if (method === "settings.model.discover") return { models: [{ id: "gemini-fixture", context_length: 8000 }] };
+    if (method === "settings.model.save") return { saved: true };
+    assert.fail(method);
+  } };
+  await act(async () => root.render(h(FirstRun, { onDone() {}, onClose() {} })));
+  assert.equal(document.querySelector(".fr-tabs"), null, "protocol does not precede a named provider");
+  await click([...document.querySelectorAll(".fr-row")].find((node) => node.textContent.includes("Google Gemini")));
+  await inputValue(fieldInput("API key"), "dummy-gemini-key");
+  await click(namedButton("Find models"));
+  await click(namedButton("Start"));
+  const profile = calls.find((call) => call.method === "settings.model.save").params.profile;
+  assert.deepEqual([profile.protocol, profile.provider_id, profile.auth], ["gemini-interactions", "google", "x-goog-api-key"]);
+  await click(namedButton("Change"));
+  await click([...document.querySelectorAll(".fr-row")].find((node) => node.textContent.includes("Custom endpoint")));
+  assert.equal(document.querySelector(".fr-body select").options.length, 2, "custom endpoints retain explicit protocol selection");
+});
+
 async function extensionForm(kind, chooseExtensionSource) {
   const writes = [];
   globalThis.__medhaControlsTest.chooseExtensionSource = chooseExtensionSource;
@@ -2151,8 +2295,6 @@ test("a second model on a server whose key is saved asks for no key and lists it
   };
   await act(async () => root.render(h(Settings, { sessionKey: null, ensureOpen: async () => {} })));
   await click(namedButton("Add model"));
-  await click(namedButton("Choose a protocol"));
-  await click(option("OpenAI-compatible Chat"));
   await click(namedButton("Choose a provider"));
   await click(option("integrate.api.nvidia.com"));
   await act(async () => {});

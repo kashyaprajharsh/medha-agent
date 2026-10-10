@@ -49,6 +49,10 @@ pub enum SearchProvider {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub auth: Option<super::ModelAuth>,
     pub name: String,
     pub model: String,
     pub protocol: ModelProtocol,
@@ -62,18 +66,43 @@ pub struct ModelProfile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCatalogue {
     pub profiles: Vec<ModelProfile>,
+    #[serde(default)]
+    pub providers: Vec<super::ModelProvider>,
+    #[serde(default)]
+    pub revision: String,
     pub search: SearchProvider,
     pub searxng_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ModelDraft {
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub auth: Option<super::ModelAuth>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
     pub name: Option<String>,
     pub protocol: ModelProtocol,
     pub base_url: String,
     pub model: String,
     pub context_limit: Option<u32>,
     pub key: Option<Secret>,
+}
+impl std::fmt::Debug for ModelDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelDraft")
+            .field("provider_id", &self.provider_id)
+            .field("name", &self.name)
+            .field("protocol", &self.protocol)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("auth", &self.auth)
+            .field("context_limit", &self.context_limit)
+            .field("headers", &"[redacted]")
+            .field("key", &self.key)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,6 +484,8 @@ impl Command for ChangeResource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoverModels {
+    #[serde(default)]
+    pub auth: Option<super::ModelAuth>,
     pub protocol: ModelProtocol,
     pub base_url: String,
     pub key: Secret,

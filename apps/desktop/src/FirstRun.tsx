@@ -12,13 +12,16 @@ import {
   profileFor,
   reasonFor,
   sizeNote,
+  providerKey,
   type Found,
   type Protocol,
   type Provider,
+  type ModelTestResult,
 } from "./modelSetup";
+import { ModelTest, ProviderFields } from "./ProviderSetup";
 
 type Step = "choose" | "connect" | "models" | "manual";
-type Choice = { name: string; url: string; auth: string; custom: boolean };
+type Choice = Provider & { custom: boolean };
 
 /**
  * The first thing a new person sees: connect one model, in as few steps as the
@@ -36,15 +39,25 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
   const [found, setFound] = useState<Found[]>([]);
   const [picked, setPicked] = useState("");
   const [query, setQuery] = useState("");
+  const [providerQuery, setProviderQuery] = useState("");
+  const [tested, setTested] = useState<ModelTestResult>();
+  const [testing, setTesting] = useState(false);
+  const [unavailable, setUnavailable] = useState<{ id: string; name: string; reason: string }[]>([]);
   const [typed, setTyped] = useState("");
   const [context, setContext] = useState("");
   const [published, setPublished] = useState<{ model: string; size: number | null }>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const attempt = useRef(0);
+  const testVersion = useRef(0);
 
   const active = protocols.find((item) => item.value === protocol);
-  const connection = { protocol, url, auth: choice ? authFor(choice, key) : "none" };
+  const allProviders = protocols.flatMap((item) => item.providers.map((provider) => ({ ...provider, protocol: item.value })));
+  const connection = { protocol, url, auth: choice ? authFor(choice, key) : "none", provider_id: choice?.id };
+  useEffect(() => {
+    testVersion.current++; setTested(undefined); setTesting(false);
+    return () => { testVersion.current++; };
+  }, [protocol, url, key, choice, picked, typed, context]);
 
   useEffect(() => {
     let current = true;
@@ -54,10 +67,11 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
         if (!current) return;
         const list = (result.protocols as Protocol[]).filter((item) => item.available);
         setProtocols(list);
+        setUnavailable((result.unavailable_providers as typeof unavailable) ?? []);
         setProtocol(list[0]?.value ?? "");
         // Local servers are looked for unasked, so one that is running needs no setup.
         for (const item of list)
-          for (const provider of item.providers.filter((entry) => isLocal(entry.url)))
+          for (const provider of item.providers.filter((entry) => entry.auth === "none" && isLocal(entry.url)))
             void api
               .settings("settings.model.discover", {
                 profile: profileFor({ protocol: item.value, url: provider.url, auth: "none" }),
@@ -72,6 +86,7 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
       .catch((cause) => current && setError(String(cause)));
     return () => {
       current = false;
+      attempt.current++;
     };
   }, [api]);
 
@@ -113,17 +128,20 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
   }
 
   function choose(provider: Provider | null) {
+    attempt.current++;
     const next: Choice = provider
-      ? { name: plainName(provider.name), url: provider.url, auth: provider.auth, custom: false }
+      ? { ...provider, name: plainName(provider.name), custom: false }
       : { name: "Custom endpoint", url: "", auth: active?.auth ?? "bearer", custom: true };
     setChoice(next);
-    setUrl(next.url);
+    const chosenProtocol = next.protocol ?? protocol;
+    setProtocol(chosenProtocol);
+    setUrl(next.parameters?.length ? "" : next.url);
     setKey("");
     setError("");
     const ready = running[next.url];
     if (ready) return list(ready);
     setStep("connect");
-    if (!next.custom && next.auth === "none") void discover({ protocol, url: next.url, auth: "none" }, "");
+    if (!next.custom && next.auth === "none") void discover({ protocol: chosenProtocol, url: next.url, auth: "none", provider_id: next.id }, "");
   }
 
   async function save(model: string, size: number | null) {
@@ -147,15 +165,35 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
   const chosen = found.find((model) => model.id === picked);
   const size = Number(context) > 0 ? Number(context) : null;
   const start = () => (step === "manual" ? void save(typed.trim(), size) : void save(picked, chosen?.context_length ?? size));
+  async function testModel() {
+    const mine = ++testVersion.current;
+    setTesting(true); setTested(undefined); setError("");
+    try {
+      const reply = await api.settings("settings.model.test", { profile: profileFor(connection, step === "manual" ? typed.trim() : picked, chosen?.context_length ?? size), key });
+      if (mine === testVersion.current) setTested(reply as ModelTestResult);
+    } catch (cause) { if (mine === testVersion.current) setError(String(cause).replace(/^Error:\s*/, "")); }
+    finally { if (mine === testVersion.current) setTesting(false); }
+  }
+  async function refreshCatalogue() {
+    setBusy(true); setError("");
+    const mine = ++attempt.current;
+    try {
+      await api.settings("application.providers.refresh", {});
+      const reply = await api.settings();
+      if (mine === attempt.current) { setProtocols((reply.protocols as Protocol[]).filter((p) => p.available)); setUnavailable((reply.unavailable_providers as typeof unavailable) ?? []); }
+    } catch (cause) { if (mine === attempt.current) setError(String(cause)); }
+    finally { if (mine === attempt.current) setBusy(false); }
+  }
 
   // The model whose size nobody gave: typed by hand, or listed without one.
   const unsized = step === "manual" ? typed.trim() : step === "models" && chosen && !chosen.context_length ? chosen.id : "";
   useEffect(() => {
+    setPublished(undefined);
     if (!unsized) return;
     let current = true;
     const timer = window.setTimeout(() => {
       void api
-        .settings("settings.model.context", { model: unsized })
+        .settings("settings.model.context", { profile: profileFor({ protocol, url, auth: "none", provider_id: choice?.id }, unsized) })
         .then((reply) => current && setPublished({ model: unsized, size: (reply.published as number | null) ?? null }))
         .catch(() => {});
     }, 300);
@@ -163,7 +201,7 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
       current = false;
       window.clearTimeout(timer);
     };
-  }, [api, unsized]);
+  }, [api, unsized, protocol, url, choice?.id]);
 
   const sizeField = (
     <>
@@ -191,12 +229,13 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
               ? `Looking for ${choice.name} on this computer.`
               : `Your key stays on this computer and is sent only to ${choice?.name}.`;
 
-  const local = active?.providers.filter((provider) => isLocal(provider.url)) ?? [];
-  const hosted = active?.providers.filter((provider) => !isLocal(provider.url)) ?? [];
+  const matchingProvider = (provider: Provider) => provider.name.toLowerCase().includes(providerQuery.toLowerCase()) || provider.id?.includes(providerQuery.toLowerCase());
+  const local = allProviders.filter((provider) => isLocal(provider.url) && matchingProvider(provider));
+  const hosted = allProviders.filter((provider) => !isLocal(provider.url) && matchingProvider(provider));
   const row = (provider: Provider) => {
     const models = running[provider.url];
     return (
-      <li key={provider.url}>
+      <li key={providerKey(provider)}>
         <button type="button" className="fr-row" onClick={() => choose(provider)}>
           <i className={models ? "live" : undefined} />
           {plainName(provider.name)}
@@ -234,15 +273,7 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
 
         {step === "choose" && (
           <>
-            {protocols.length > 1 && (
-              <div className="fr-seg" role="group" aria-label="Protocol">
-                {protocols.map((item) => (
-                  <button type="button" key={item.value} aria-pressed={item.value === protocol} onClick={() => setProtocol(item.value)}>
-                    {item.label}
-                  </button>
-                ))}
-              </div>
-            )}
+            <input className="fr-in" value={providerQuery} aria-label="Search providers" placeholder="Search providers" onChange={(event) => setProviderQuery(event.target.value)} />
             <ul className="fr-list">
               {local.length > 0 && <li className="fr-group">On this computer</li>}
               {local.map(row)}
@@ -258,6 +289,9 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
                 </button>
               </li>
             </ul>
+            <button type="button" className="fr-link" disabled={busy} onClick={() => void refreshCatalogue()}>{busy ? "Refreshing…" : "Refresh provider catalogue"}</button>
+            {unavailable.length > 0 && <details><summary>Providers needing another protocol or sign-in method ({unavailable.length})</summary><ul>{unavailable.map((p) => <li key={p.id}>{p.name} — {p.reason}</li>)}</ul></details>}
+            {error && <p className="fr-err" role="alert">{error}</p>}
           </>
         )}
 
@@ -273,6 +307,10 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
 
         {step === "connect" && choice && (
           <div className="fr-body">
+            {choice.custom && protocols.length > 1 && <label>Protocol<select value={protocol} onChange={(event) => { attempt.current++; setProtocol(event.target.value); setChoice({ ...choice, auth: protocols.find((p) => p.value === event.target.value)?.auth ?? choice.auth }); setError(""); }}>
+              {protocols.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+            </select></label>}
+            {choice.parameters?.length ? <ProviderFields key={providerKey(choice)} provider={choice} disabled={busy} onChange={() => { attempt.current++; setUrl(""); setKey(""); }} onResolved={setUrl} /> : null}
             {(choice.custom || choice.auth === "none") && (
               <label>
                 Address
@@ -300,10 +338,17 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
                 <button type="button" className="fr-link" onClick={() => list([])}>
                   Type the model name instead
                 </button>
+                {choice.models?.length ? <button type="button" className="fr-link" onClick={() => { list(choice.models ?? []); setError("Catalogue models: account availability is unverified. Test the selected model or save it manually."); }}>Use catalogue models</button> : null}
               </p>
             )}
           </div>
         )}
+
+        {(step === "models" || step === "manual") && <div className="fr-body">
+          <p className="fr-note">Test uses synthetic messages, up to four billed requests and 45 seconds. No files or tools are executed. Saving without testing is supported.</p>
+          <button type="button" className="btn-line" disabled={busy || testing || !url || !(step === "manual" ? typed.trim() : picked)} onClick={() => void testModel()}>{testing ? "Testing model…" : "Test model"}</button>
+          <ModelTest result={tested} />
+        </div>}
 
         {step === "models" && (
           <div className="fr-body">
@@ -351,7 +396,7 @@ export function FirstRun({ onDone, onClose }: { onDone: () => void; onClose: () 
             Not now
           </button>
           {step === "connect" && (
-            <button className="btn-gold" disabled={busy}>
+            <button className="btn-gold" disabled={busy || !url}>
               {busy ? "Looking…" : error ? "Try again" : "Find models"}
             </button>
           )}

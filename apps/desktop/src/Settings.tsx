@@ -8,7 +8,8 @@ import { Add, PageTop, ViewBar } from "./ExtensionParts";
 import { Icon } from "./Icon";
 import { Sheet } from "./Sheet";
 import { useWorkspace } from "./Workspace";
-import { profileFor } from "./modelSetup";
+import { profileFor, providerKey, type Provider as Preset, type Protocol as ModelProtocol, type ModelTestResult } from "./modelSetup";
+import { ModelTest, ProviderFields } from "./ProviderSetup";
 type Model = {
   name: string;
   profile: Record<string, unknown> & {
@@ -19,15 +20,6 @@ type Model = {
   };
   default: boolean;
   key_present: boolean;
-};
-type Preset = { name: string; url: string; auth: string };
-type ModelProtocol = {
-  value: string;
-  label: string;
-  available: boolean;
-  auth: string;
-  discovery: boolean;
-  providers: Preset[];
 };
 type Search = {
   provider: string;
@@ -407,40 +399,39 @@ function ModelForm({
   const [id, setId] = useState(model?.profile.model || "");
   const [url, setUrl] = useState(model?.profile.base_url || "");
   const [protocol, setProtocol] = useState(model?.profile.protocol || "");
-  const selectedProtocol = protocols.find((item) => item.value === protocol);
-  const presets = selectedProtocol?.providers || [];
+  const [providerId, setProviderId] = useState((model?.profile.provider_id as string | undefined) ?? "");
+  const [catalogueProtocols, setCatalogueProtocols] = useState<ModelProtocol[]>();
+  const availableProtocols = catalogueProtocols ?? protocols;
+  const selectedProtocol = availableProtocols.find((item) => item.value === protocol);
+  const presets = availableProtocols.filter((p) => p.available).flatMap((p) => p.providers.map((provider) => ({ ...provider, protocol: p.value })));
   // Servers already in use are offered again, so a second model needs no retyped address.
   const reused = [
     ...new Map(
       saved
         .filter(
-          (item) =>
-            item.profile.protocol === protocol &&
-            !presets.some((listed) => listed.url === item.profile.base_url),
+          (item) => !presets.some((listed) => listed.protocol === item.profile.protocol && listed.url === item.profile.base_url),
         )
-        .map((item) => [item.profile.base_url, item.profile.auth]),
+        .map((item) => [`${item.profile.protocol}:${item.profile.base_url}`, item.profile]),
     ),
   ];
   // Named by host alone unless two addresses share one.
-  const own: Preset[] = reused.map(([address, kind]) => ({
+  const own: Preset[] = reused.map(([, profile]) => ({
     name:
-      reused.filter(([other]) => hostOf(other) === hostOf(address)).length > 1
-        ? address.replace(/^https?:\/\//, "")
-        : hostOf(address),
-    url: address,
-    auth: kind,
+      reused.filter(([, other]) => hostOf(other.base_url) === hostOf(profile.base_url)).length > 1
+        ? profile.base_url.replace(/^https?:\/\//, "")
+        : hostOf(profile.base_url),
+    url: profile.base_url,
+    auth: profile.auth,
+    protocol: profile.protocol,
   }));
   /** A key is stored per address, so any saved model there already holds it. */
   const keySavedAt = (address: string) =>
     saved.some((item) => item.key_present && item.profile.base_url === address);
-  const [preset, setPreset] = useState(() =>
-    model
-      ? protocols
-          .find((item) => item.value === model.profile.protocol)
-          ?.providers.find((item) => item.url === model.profile.base_url)
-          ?.url || "custom"
-      : "",
-  );
+  const [preset, setPreset] = useState(() => {
+    if (!model) return "";
+    const provider = protocols.find((item) => item.value === model.profile.protocol)?.providers.find((item) => (model.profile.provider_id && item.id === model.profile.provider_id) || item.url === model.profile.base_url);
+    return provider ? providerKey({ ...provider, protocol: model.profile.protocol }) : "custom";
+  });
   const [auth, setAuth] = useState(model?.profile.auth || "none");
   const [key, setKey] = useState("");
   const [isDefault, setDefault] = useState(model?.default || false);
@@ -474,10 +465,22 @@ function ModelForm({
   >([]);
   const [discovering, setDiscovering] = useState(false);
   const [discoveryError, setDiscoveryError] = useState("");
+  const [tested, setTested] = useState<ModelTestResult>();
+  const [testing, setTesting] = useState(false);
+  const [catalogueBusy, setCatalogueBusy] = useState(false);
+  const provider = [...presets, ...own].find((p) => providerKey(p) === preset);
   const discoveryVersion = useRef(0);
+  const testVersion = useRef(0);
+  const catalogueVersion = useRef(0);
+  useEffect(() => {
+    testVersion.current++;
+    setTested(undefined); setTesting(false);
+    return () => { testVersion.current++; };
+  }, [id, url, protocol, key, auth, context, output, headers, reasoning, efforts, images, counter, accounting, tokenField]);
   useEffect(
     () => () => {
       discoveryVersion.current++;
+      catalogueVersion.current++;
     },
     [],
   );
@@ -486,6 +489,9 @@ function ModelForm({
     setDiscovered([]);
     setDiscoveryError("");
     setDiscovering(false);
+    setTested(undefined);
+    setTesting(false);
+    testVersion.current++;
   }
   function resetConnection() {
     resetDiscovery();
@@ -507,6 +513,7 @@ function ModelForm({
       model: id || "model-discovery",
       base_url: url,
       protocol,
+      provider_id: providerId || null,
       auth,
       max_ctx: context ? Number(context) : null,
       max_output_tokens: output ? Number(output) : null,
@@ -543,11 +550,31 @@ function ModelForm({
     } catch (cause) {
       if (version !== discoveryVersion.current) return;
       setDiscoveryError(
-        `${String(cause)} You can enter the model ID manually.`,
+        `${String(cause)} ${provider?.models?.length ? "Showing catalogue models; account availability is unverified." : "You can enter the model ID manually."}`,
       );
+      setDiscovered(provider?.models ?? []);
     } finally {
       if (version === discoveryVersion.current) setDiscovering(false);
     }
+  }
+  async function refreshCatalogue() {
+    const version = ++catalogueVersion.current;
+    setCatalogueBusy(true);
+    try {
+      await api.settings("application.providers.refresh", {});
+      const reply = await api.settings();
+      if (version === catalogueVersion.current) setCatalogueProtocols(reply.protocols as ModelProtocol[]);
+    } catch (cause) { if (version === catalogueVersion.current) setDiscoveryError(String(cause)); }
+    finally { if (version === catalogueVersion.current) setCatalogueBusy(false); }
+  }
+  async function testModel() {
+    const version = ++testVersion.current;
+    setTesting(true); setTested(undefined); setDiscoveryError("");
+    try {
+      const reply = await api.settings("settings.model.test", { profile: profile(), key });
+      if (version === testVersion.current) setTested(reply as ModelTestResult);
+    } catch (cause) { if (version === testVersion.current) setDiscoveryError(String(cause)); }
+    finally { if (version === testVersion.current) setTesting(false); }
   }
   return (
     <form
@@ -561,13 +588,13 @@ function ModelForm({
       }}
     >
       <h3>{model ? `Edit ${model.name}` : "Add model"}</h3>
-      <label>
+      {(preset === "custom" || model) && <label>
         Protocol
         <Select
           value={protocol}
           disabled={busy}
           onChange={(event) => {
-            const next = protocols.find(
+            const next = availableProtocols.find(
               (item) => item.value === event.target.value,
             );
             if (!next?.available) return;
@@ -575,13 +602,14 @@ function ModelForm({
             setPreset("");
             setUrl("");
             setAuth(next.auth);
+            setProviderId("");
             resetConnection();
           }}
         >
           <option value="" disabled>
             Choose a protocol
           </option>
-          {protocols
+          {availableProtocols
             .filter((item) => item.available || item.value === protocol)
             .map((item) => (
               <option
@@ -593,31 +621,34 @@ function ModelForm({
               </option>
             ))}
         </Select>
-      </label>
-      {protocol && (
+      </label>}
+      {(
         <label>
           Provider
           <Select
             value={preset}
-            disabled={busy || !selectedProtocol?.available}
+            search="Search providers"
+            disabled={busy}
             onChange={(event) => {
               const selected = [...presets, ...own].find(
-                (item) => item.url === event.target.value,
+                (item) => providerKey(item) === event.target.value,
               );
-              const nextAuth =
-                selected?.auth || selectedProtocol?.auth || "bearer";
+              const nextProtocol = selected?.protocol || protocol || availableProtocols.find((p) => p.available)?.value || "";
+              const nextAuth = selected?.auth || availableProtocols.find((p) => p.value === nextProtocol)?.auth || "bearer";
+              setProtocol(nextProtocol);
               setPreset(event.target.value);
-              setUrl(selected?.url || "");
+              setUrl(selected?.parameters?.length ? "" : selected?.url || "");
               setAuth(nextAuth);
+              setProviderId(selected?.id ?? "");
               resetConnection();
               // With the key already saved there is nothing to ask for: list the models now.
               if (
                 selected &&
-                selectedProtocol?.discovery &&
-                keySavedAt(selected.url)
+                availableProtocols.find((p) => p.value === nextProtocol)?.discovery &&
+                !selected.parameters?.length && keySavedAt(selected.url)
               )
                 void discover(
-                  profileFor({ protocol, url: selected.url, auth: nextAuth }),
+                  profileFor({ protocol: nextProtocol, url: selected.url, auth: nextAuth, provider_id: selected.id }),
                   "",
                 );
             }}
@@ -626,7 +657,7 @@ function ModelForm({
               Choose a provider
             </option>
             {[...own, ...presets].map((item) => (
-              <option key={item.url} value={item.url}>
+              <option key={providerKey(item)} value={providerKey(item)}>
                 {item.name}
               </option>
             ))}
@@ -634,8 +665,10 @@ function ModelForm({
           </Select>
         </label>
       )}
+      <button type="button" className="btn-line" disabled={busy || catalogueBusy} onClick={() => void refreshCatalogue()}>{catalogueBusy ? "Refreshing providers…" : "Refresh provider catalogue"}</button>
       {protocol && preset && (
         <>
+          {provider?.parameters?.length ? <ProviderFields key={providerKey(provider)} provider={provider} disabled={busy} onChange={() => { setUrl(""); setKey(""); resetDiscovery(); }} onResolved={(url) => { setUrl(url); resetDiscovery(); }} /> : null}
           <label>
             API endpoint
             <input
@@ -706,8 +739,7 @@ function ModelForm({
                     (item) => item.id === event.target.value,
                   )!;
                   setId(selected.id);
-                  if (selected.context_length)
-                    setContext(String(selected.context_length));
+                  setContext(selected.context_length ? String(selected.context_length) : "");
                 }}
               >
                 <option value="">Choose a model</option>
@@ -725,9 +757,12 @@ function ModelForm({
               required
               value={id}
               placeholder="Model ID from your provider"
-              onChange={(event) => setId(event.target.value)}
+            onChange={(event) => setId(event.target.value)}
             />
           </label>
+          <p className="quiet">Test sends only synthetic messages and may make up to four billed requests. No files or tools are executed. You can save without testing.</p>
+          <button type="button" className="btn-line" disabled={busy || testing || discovering || !id.trim() || !url || (auth !== "none" && !key.trim() && !keySavedAt(url))} onClick={() => void testModel()}>{testing ? "Testing model…" : "Test model"}</button>
+          <ModelTest result={tested} />
           <label>
             Profile name{!model && " (optional)"}
             <input

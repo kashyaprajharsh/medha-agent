@@ -27,6 +27,7 @@ impl Backend {
             .arg("serve")
             .env("MEDHA_HOME", home)
             .env("MEDHA_CRED_STORE", "file")
+            .env("MEDHA_CATALOGUE_OFFLINE", "1")
             .env_remove("MEDHA_API_KEY")
             .envs(env.iter().map(|(key, value)| (*key, value.as_str())))
             .stdin(Stdio::null())

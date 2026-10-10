@@ -88,6 +88,7 @@ pub async fn start(
     let Model {
         provider,
         name: model_name,
+        catalogue_pricing,
         profiles: model_profiles,
         active_profile,
         max_ctx,
@@ -761,14 +762,12 @@ pub async fn start(
             cached_input_per_mtok: lock.pricing.cached_input_per_mtok,
             indicative: false,
         }),
-        _ => providers::models_dev::pricing(&model_name)
-            .await
-            .map(|(input, output, cached)| kernel::Pricing {
-                input_per_mtok: input,
-                output_per_mtok: output,
-                cached_input_per_mtok: cached,
-                indicative: true,
-            }),
+        _ => catalogue_pricing.map(|(input, output, cached)| kernel::Pricing {
+            input_per_mtok: input,
+            output_per_mtok: output,
+            cached_input_per_mtok: cached,
+            indicative: true,
+        }),
     };
     match &pricing {
         Some(p) if p.indicative => notices.say(&format!(

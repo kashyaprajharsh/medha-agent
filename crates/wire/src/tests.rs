@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn explicit_model_checks_and_catalogue_refresh_have_the_download_deadline() {
+    for method in [
+        "settings.model.test",
+        "application.models.test",
+        "application.providers.refresh",
+    ] {
+        assert!(slow_frame(&json!({"method": method, "params": {}})));
+    }
+    assert!(!slow_frame(
+        &json!({"method": "application.providers", "params": {}})
+    ));
+}
+
+#[test]
 fn state_recovery_and_agent_stop_have_reserved_admission_without_prioritizing_mutations() {
     assert!(is_control_frame(
         &json!({"method":"session.presentation","params":{}})

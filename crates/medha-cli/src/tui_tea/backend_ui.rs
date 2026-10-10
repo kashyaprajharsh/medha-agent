@@ -107,6 +107,9 @@ pub(super) enum Effect {
     Abort,
     Agent(protocol::AgentCommand, Option<String>),
     Discover(protocol::DiscoverModels),
+    RefreshProviders,
+    ResolveDeployment(protocol::ResolveDeployment),
+    TestModel(protocol::TestModel),
     UseSkill(protocol::UseSkill),
     Rewind(protocol::Rewind),
     Points,
@@ -160,6 +163,9 @@ impl Effect {
             Self::Question(p) => size(p),
             Self::Agent(p, _) => size(p),
             Self::Discover(p) => size(p),
+            Self::ResolveDeployment(p) => size(p),
+            Self::TestModel(p) => size(p),
+            Self::RefreshProviders => 0,
             Self::UseSkill(p) => size(p),
             Self::Rewind(p) => size(p),
             Self::Resume(id) => id.len(),
@@ -242,6 +248,9 @@ pub(super) fn request(model: &mut Model, effect: Effect) -> bool {
     let form = matches!(
         &effect,
         Effect::Discover(_)
+            | Effect::RefreshProviders
+            | Effect::ResolveDeployment(_)
+            | Effect::TestModel(_)
             | Effect::Mcp(protocol::McpCommand::Credential { .. }, _)
             | Effect::Change(
                 protocol::ChangeResource::SaveModel(_)
@@ -281,6 +290,9 @@ enum Answer {
     Accepted(protocol::Accepted),
     Cancelled(protocol::Cancelled),
     Discovered(Vec<protocol::DiscoveredModel>),
+    Providers(protocol::ProviderCatalogue),
+    Deployment(protocol::ModelDeployment),
+    Tested(protocol::ModelTestResult),
     Rewound(protocol::Rewound, Result<Vec<staged_images::Image>, String>),
     Points(protocol::RewindPoints),
     Snapshot(Box<protocol::PresentationSnapshot>),
@@ -518,6 +530,21 @@ async fn execute(context: Context, effect: &Effect) -> Result<Answer, String> {
             .call_async(protocol::Scope::Folder(&folder), p)
             .await
             .map(Answer::Discovered),
+        Effect::RefreshProviders => connection
+            .call_async(
+                protocol::Scope::Folder(&folder),
+                &protocol::RefreshProviders {},
+            )
+            .await
+            .map(Answer::Providers),
+        Effect::ResolveDeployment(p) => connection
+            .call_async(protocol::Scope::Folder(&folder), p)
+            .await
+            .map(Answer::Deployment),
+        Effect::TestModel(p) => connection
+            .call_async(protocol::Scope::Folder(&folder), p)
+            .await
+            .map(Answer::Tested),
         Effect::UseSkill(p) => connection
             .call_chat(&chat, p)
             .await
@@ -620,6 +647,7 @@ pub(crate) async fn run(
             "session-inspection",
             "live-conversation",
             "shared-live-state",
+            "model-providers",
         ],
     );
     eprintln!("Connecting to Medha…");
@@ -675,6 +703,8 @@ pub(crate) async fn run(
         },
         models: protocol::ModelCatalogue {
             profiles: Vec::new(),
+            providers: Vec::new(),
+            revision: String::new(),
             search: protocol::SearchProvider::Duckduckgo,
             searxng_url: None,
         },
@@ -1601,6 +1631,34 @@ fn completed(model: &mut Model, stream: &mut View, done: Completion) {
                 Effect::Discover(_) => {
                     if let Some(setup) = &mut model.model_setup {
                         setup.step = ModelSetupStep::ModelId;
+                        if let Some(provider) = &setup.provider
+                            && !provider.models.is_empty()
+                        {
+                            model.picker = Some(Picker::new(PickerKind::ModelDiscovery {
+                                models: provider
+                                    .models
+                                    .iter()
+                                    .map(|m| providers::openai_compat::ModelInfo {
+                                        id: m.id.clone(),
+                                        context_length: m.context_length,
+                                    })
+                                    .collect(),
+                                query: String::new(),
+                            }));
+                        }
+                    }
+                    model.push_notice("Live discovery failed. Catalogue models can still be chosen; availability for this account is unverified. A manual ID is also accepted.");
+                }
+                Effect::ResolveDeployment(_) => {
+                    if let Some(setup) = &mut model.model_setup {
+                        setup.parameter = 0;
+                        setup.parameters.clear();
+                        setup.step = ModelSetupStep::EndpointParameter;
+                    }
+                }
+                Effect::TestModel(_) => {
+                    if let Some(setup) = &mut model.model_setup {
+                        setup.step = ModelSetupStep::ConfirmTest;
                     }
                 }
                 _ => {}
@@ -1745,7 +1803,46 @@ fn completed(model: &mut Model, stream: &mut View, done: Completion) {
                     })
                     .collect();
                 if model.model_setup.is_some() {
-                    model.picker = Some(Picker::new(PickerKind::ModelDiscovery(rows)));
+                    model.picker = Some(Picker::new(PickerKind::ModelDiscovery {
+                        models: rows,
+                        query: String::new(),
+                    }));
+                }
+            }
+            Answer::Providers(catalogue) => {
+                peer.models.providers = catalogue.providers;
+                peer.models.revision = catalogue.revision;
+                if let Some(Picker {
+                    kind: PickerKind::ProviderPreset { providers, .. },
+                    selected,
+                }) = &mut model.picker
+                {
+                    *providers = peer.models.providers.clone();
+                    *selected = 0;
+                }
+                model.push_notice(
+                    "Provider catalogue refreshed; saved endpoints and keys unchanged.",
+                );
+            }
+            Answer::Deployment(deployment) => {
+                if let Some(setup) = &mut model.model_setup {
+                    setup.base_url = deployment.base_url;
+                    setup.step = ModelSetupStep::ApiKey;
+                    model.clear_edited();
+                }
+                backend_features::discover_setup_if_ready(model);
+            }
+            Answer::Tested(result) => {
+                for (name, check) in [
+                    ("Text", result.text),
+                    ("Streaming", result.streaming),
+                    ("Functions", result.tools),
+                ] {
+                    model.push_notice(format!("{name}: {:?} — {}", check.status, check.message));
+                }
+                if let Some(setup) = &mut model.model_setup {
+                    setup.step = ModelSetupStep::ReviewTest;
+                    model.clear_edited();
                 }
             }
             Answer::Points(points) => {

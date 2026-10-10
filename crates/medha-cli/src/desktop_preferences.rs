@@ -181,28 +181,23 @@ fn settings(cfg: &config::Config) -> Value {
     let models: Vec<Value> = cfg.model_profiles().iter().map(|model| json!({ "name": model.name, "profile": model.provider, "default": model.is_default, "key_present": config::key_present(&model.provider.base_url) })).collect();
     let mcp: Vec<Value> = cfg.mcp.iter().map(|(id, server)| { use sha2::{Digest, Sha256}; let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(server).expect("MCP definition"))); json!({ "id": id, "hash": hash, "url": server.url, "command": redact_command(&server.command), "executable": server.command.first(), "disabled": server.disabled, "auth": server.auth, "trust": server.trust, "key_present": config::mcp_key_present(id, server), "signed_in": config::mcp_signed_in(id, server), "env_names": server.env.keys().collect::<Vec<_>>(), "allow_tools": server.allow_tools, "deny_tools": server.deny_tools, "network": server.network, "parallel": server.parallel_calls }) }).collect();
     let provider = cfg.search_provider();
+    let catalogue = providers::catalogue::snapshot();
     // Keep protocol availability and wire values identical to the TUI picker.
     let protocols: Vec<Value> = crate::application_catalog::MODEL_PROTOCOLS
         .iter()
         .map(|(label, available, protocol)| {
             let auth = providers::AuthKind::for_protocol(*protocol).as_str();
-            let presets: Vec<Value> = match protocol {
-                kernel::Protocol::OpenAiChat => config::provider_presets()
-                    .iter()
-                    .map(|(name, url)| json!({"name": name, "url": url, "auth": if name.contains("(local)") { "none" } else { auth }}))
-                    .collect(),
-                kernel::Protocol::GeminiInteractions => vec![json!({
-                    "name": "Google Gemini",
-                    "url": "https://generativelanguage.googleapis.com/v1",
-                    "auth": auth
-                })],
-                _ => Vec::new(),
-            };
+            let presets: Vec<Value> = catalogue
+                .providers
+                .iter()
+                .filter(|p| p.available && p.protocol == Some(*protocol))
+                .map(|p| json!(p))
+                .collect();
             json!({"value": protocol, "label": label, "available": available,
                 "auth": auth, "discovery": available, "providers": presets})
         })
         .collect();
-    json!({ "models": models, "protocols": protocols, "presets": config::provider_presets().iter().map(|(name, url)| json!({"name": name, "url": url})).collect::<Vec<_>>(), "search": { "provider": provider.as_str(), "searxng_url": cfg.search.searxng_url, "key_present": config::search_cred_id(provider).is_some_and(config::key_present) }, "mcp": mcp, "keychain": config::prefer_keychain() })
+    json!({ "models": models, "protocols": protocols, "catalogue_revision": catalogue.revision, "unavailable_providers": catalogue.providers.iter().filter(|p| !p.available).map(|p| json!({"id":p.id,"name":p.name,"reason":p.unavailable_reason})).collect::<Vec<_>>(), "search": { "provider": provider.as_str(), "searxng_url": cfg.search.searxng_url, "key_present": config::search_cred_id(provider).is_some_and(config::key_present) }, "mcp": mcp, "keychain": config::prefer_keychain() })
 }
 fn instruction_path(workspace: &Path, kind: &str) -> Result<std::path::PathBuf> {
     match kind {
@@ -700,22 +695,32 @@ pub(crate) async fn handle(method: &str, params: &Value, workspace: &Path) -> Re
         "settings.model.discover" => {
             let profile: config::ProviderConfig =
                 serde_json::from_value(params["profile"].clone())?;
-            let credential = params["key"]
-                .as_str()
-                .filter(|key| !key.is_empty())
-                .map(str::to_owned)
-                .or_else(|| config::load_key(&profile.base_url))
-                .unwrap_or_default();
+            let credential = config::deployment_credential(&profile, params["key"].as_str())?;
             let models =
                 providers::openai_compat::list_models_for_profile(&profile, &credential).await?;
             Ok(
                 json!({"models": models.iter().map(|model| json!({"id": model.id, "context_length": model.context_length})).collect::<Vec<_>>() }),
             )
         }
+        "settings.model.test" => {
+            let profile: config::ProviderConfig =
+                serde_json::from_value(params["profile"].clone())?;
+            profile.validate().map_err(anyhow::Error::msg)?;
+            let credential = config::deployment_credential(&profile, params["key"].as_str())?;
+            Ok(serde_json::to_value(
+                providers::model_test::test(&profile, &credential).await,
+            )?)
+        }
         // The size a session would fall back to when neither config nor server gives one.
-        "settings.model.context" => Ok(json!({
-            "published": providers::models_dev::context_window(text(params, "model")?).await
-        })),
+        "settings.model.context" => {
+            let published = if let Some(profile) = params.get("profile") {
+                let profile: providers::ProviderProfile = serde_json::from_value(profile.clone())?;
+                providers::models_dev::profile_context_window(&profile).await
+            } else {
+                providers::models_dev::context_window(text(params, "model")?).await
+            };
+            Ok(json!({ "published": published }))
+        }
         "extensions.skill.install" => {
             let skills = tools::SkillStore::new(
                 workspace.join(".medha/skills"),

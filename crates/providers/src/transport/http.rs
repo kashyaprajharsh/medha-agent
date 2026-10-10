@@ -86,8 +86,35 @@ pub(crate) fn client() -> reqwest::Client {
         // Medha reads only its own MEDHA_* namespace; an ambient *_PROXY would
         // otherwise reroute model traffic and hand the credential to the proxy.
         .no_proxy()
+        // Pin credentials to the configured deployment, including custom
+        // authentication headers which redirect implementations may retain.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("provider HTTP client")
+}
+
+/// Discovery/catalogue callers select a smaller byte and total-read budget.
+pub(crate) async fn bounded_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, ProviderError> {
+    if response.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(ProviderError::Decode(
+            "model discovery exceeds its byte limit".into(),
+        ));
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ProviderError::Transport(e.without_url().to_string()))?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(ProviderError::Decode(
+                "model discovery exceeds its byte limit".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Keep a silent header timeout separate from connection failures and broken

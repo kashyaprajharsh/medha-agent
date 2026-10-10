@@ -46,6 +46,8 @@ pub(crate) fn models() -> Result<protocol::ModelCatalogue, String> {
         .map(|saved| {
             let profile = saved.provider;
             Ok(protocol::ModelProfile {
+                provider_id: profile.provider_id,
+                auth: Some(decoded(json!(profile.auth))?),
                 name: saved.name,
                 model: profile.model,
                 protocol: decoded(
@@ -59,11 +61,63 @@ pub(crate) fn models() -> Result<protocol::ModelCatalogue, String> {
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let catalogue = provider_catalogue(&providers::catalogue::snapshot())?;
     Ok(protocol::ModelCatalogue {
         profiles,
+        providers: catalogue.providers,
+        revision: catalogue.revision,
         search: decoded(json!(cfg.search_provider().as_str()))?,
         searxng_url: cfg.search.searxng_url,
     })
+}
+
+fn provider_catalogue(
+    snapshot: &providers::catalogue::Snapshot,
+) -> Result<protocol::ProviderCatalogue, String> {
+    Ok(protocol::ProviderCatalogue {
+        revision: snapshot.revision.clone(),
+        providers: decoded(
+            serde_json::to_value(&snapshot.providers)
+                .map_err(|_| "Could not encode provider catalogue.")?,
+        )?,
+    })
+}
+
+fn draft_profile(draft: &protocol::ModelDraft) -> Result<providers::ProviderProfile, String> {
+    let protocol: kernel::Protocol = decoded(json!(draft.protocol))?;
+    let auth = match draft.auth {
+        Some(auth) => decoded(json!(auth))?,
+        None if protocol == kernel::Protocol::GeminiInteractions
+            || draft
+                .key
+                .as_ref()
+                .is_some_and(|key| !key.0.trim().is_empty()) =>
+        {
+            providers::AuthKind::for_protocol(protocol)
+        }
+        None => providers::AuthKind::None,
+    };
+    let mut profile = providers::ProviderProfile::openai_chat(&draft.base_url, &draft.model, auth);
+    profile.provider_id = draft.provider_id.clone();
+    profile.protocol = protocol;
+    profile.headers = draft.headers.clone();
+    profile.max_ctx = draft.context_limit;
+    profile.validate()?;
+    if !matches!(
+        protocol,
+        kernel::Protocol::OpenAiChat | kernel::Protocol::GeminiInteractions
+    ) {
+        return Err("This model protocol is not implemented yet.".into());
+    }
+    Ok(profile)
+}
+
+async fn test_model(draft: protocol::ModelDraft) -> Result<Value, String> {
+    let profile = draft_profile(&draft)?;
+    let credential =
+        config::deployment_credential(&profile, draft.key.as_ref().map(|key| key.0.as_str()))
+            .map_err(|error| error.to_string())?;
+    encoded(providers::model_test::test(&profile, &credential).await)
 }
 
 fn skill_store(workspace: &Path) -> Result<tools::SkillStore, String> {
@@ -422,23 +476,9 @@ pub(crate) async fn read<L: EventLog>(
 pub(crate) async fn change(workspace: &Path, action: Change) -> Result<Reply, String> {
     let (method, params) = match action {
         Change::SaveModel(draft) => {
-            let protocol: kernel::Protocol = decoded(json!(draft.protocol))?;
-            if protocol == kernel::Protocol::GeminiInteractions
-                && draft.key.as_ref().is_none_or(|key| key.0.trim().is_empty())
-            {
-                return Err("Gemini Interactions requires an API key.".into());
-            }
-            let mut profile = providers::ProviderProfile::openai_chat(
-                &draft.base_url,
-                &draft.model,
-                if draft.key.as_ref().is_none_or(|key| key.0.is_empty()) {
-                    providers::AuthKind::None
-                } else {
-                    providers::AuthKind::for_protocol(protocol)
-                },
-            );
-            profile.protocol = protocol;
-            profile.max_ctx = draft.context_limit;
+            let profile = draft_profile(&draft)?;
+            config::deployment_credential(&profile, draft.key.as_ref().map(|key| key.0.as_str()))
+                .map_err(|error| error.to_string())?;
             let value = preferences(
                 workspace,
                 "settings.model.save",
@@ -611,6 +651,49 @@ pub(crate) async fn folder<L: EventLog>(
     params: Value,
 ) -> Option<Result<Value, String>> {
     let result = match method {
+        "application.providers" => match decoded::<protocol::ReadProviders>(params) {
+            Ok(_) => provider_catalogue(&providers::catalogue::snapshot()).and_then(encoded),
+            Err(error) => Err(error),
+        },
+        "application.providers.refresh" => match decoded::<protocol::RefreshProviders>(params) {
+            Ok(_) => providers::catalogue::refresh()
+                .await
+                .and_then(|snapshot| provider_catalogue(&snapshot))
+                .and_then(encoded),
+            Err(error) => Err(error),
+        },
+        "application.providers.resolve" => match decoded::<protocol::ResolveDeployment>(params) {
+            Ok(request) => {
+                let snapshot = providers::catalogue::snapshot();
+                (|| {
+                    let provider = snapshot
+                        .providers
+                        .iter()
+                        .find(|provider| provider.id == request.provider_id)
+                        .ok_or("Unknown provider.")?;
+                    if !provider.available {
+                        return Err(provider
+                            .unavailable_reason
+                            .clone()
+                            .unwrap_or_else(|| "Provider unavailable.".into()));
+                    }
+                    let base_url = provider.resolve_endpoint(&request.parameters)?;
+                    encoded(protocol::ModelDeployment {
+                        provider_id: provider.id.clone(),
+                        protocol: decoded(json!(
+                            provider.protocol.ok_or("Provider protocol unavailable.")?
+                        ))?,
+                        auth: decoded(json!(provider.auth))?,
+                        base_url,
+                    })
+                })()
+            }
+            Err(error) => Err(error),
+        },
+        "application.models.test" => match decoded::<protocol::TestModel>(params) {
+            Ok(request) => test_model(request.draft).await,
+            Err(error) => Err(error),
+        },
         "application.image" => match decoded::<protocol::ReadWorkspaceImage>(params) {
             Ok(request) => {
                 crate::chat_history::read_image(artifacts, request.hash, request.thumbnail)
@@ -637,14 +720,25 @@ pub(crate) async fn folder<L: EventLog>(
                         let mut profile = providers::ProviderProfile::openai_chat(
                             &request.base_url,
                             "discovery",
-                            if request.key.0.is_empty() {
+                            if request.key.0.is_empty() && request.auth.is_none() {
                                 providers::AuthKind::None
                             } else {
                                 providers::AuthKind::for_protocol(protocol)
                             },
                         );
                         profile.protocol = protocol;
-                        providers::openai_compat::list_models_for_profile(&profile, &request.key.0)
+                        if let Some(auth) = request.auth {
+                            profile.auth = match decoded(json!(auth)) {
+                                Ok(auth) => auth,
+                                Err(error) => return Some(Err(error)),
+                            };
+                        }
+                        let credential =
+                            match config::deployment_credential(&profile, Some(&request.key.0)) {
+                                Ok(key) => key,
+                                Err(error) => return Some(Err(error.to_string())),
+                            };
+                        providers::openai_compat::list_models_for_profile(&profile, &credential)
                             .await
                             .map_err(|e| e.to_string())
                             .and_then(|models| {

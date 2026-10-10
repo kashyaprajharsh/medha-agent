@@ -1924,12 +1924,31 @@ thinking levels onto the canonical reasoning controls.
 
 ### Model Metadata
 
-Context windows and per-MTok prices resolve from **models.dev**, an externally
-maintained database fetched once and cached — not a table baked into the binary. If
-a model genuinely isn't there, MEDHA says the value is unknown rather than
-fabricating one, and the caller either asks for it explicitly or disables the
-dependent feature. Prices feed the cost meter; for self-hosted routes they are
-indicative and labelled as such.
+The shared provider catalogue retains **models.dev** provider names, endpoints,
+package classifications, documentation, model limits, capabilities and pricing.
+A bundled snapshot supports first use offline; a last-known-good disk cache
+survives failed refreshes. The daemon refreshes stale metadata in the background
+on a weekly TTL, and clients can request a refresh explicitly. Concurrent callers
+share one bounded fetch; readers hold immutable snapshots with a revision.
+Package names are metadata and are never executed as provider adapters.
+
+Saved profiles can qualify metadata with `provider_id`, while retaining their
+existing protocol, endpoint and credential record. Explicit profile overrides
+take precedence. Unknown capabilities remain unknown. Older profiles retain
+their existing metadata lookup behavior. Prices feed the cost meter and are
+labelled indicative when taken from the public catalogue.
+
+Desktop and TUI select a provider before asking for access and a model. Custom
+endpoints and manual model IDs remain available. Endpoint templates require
+explicit non-secret values; catalogue refresh cannot redirect a saved key or
+rewrite a saved endpoint. Provider HTTP requests do not follow redirects.
+Discovery is bounded by time, response bytes, pages and model count.
+
+The optional setup test sends only synthetic messages, with at most four requests
+and a 45-second total deadline. It reports text, streaming completion and a
+fabricated function-call/result round trip separately, without running tools or
+entering the agent retry loop. Catalogue availability, account access and tested
+capabilities remain separate: a model listing alone is not a verification claim.
 
 ### Failure Classification
 

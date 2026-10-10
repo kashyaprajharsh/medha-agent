@@ -26,6 +26,7 @@ pub const CAPABILITIES: &[&str] = &[
     "shared-live-state",
     "editor-sessions",
     "workspace-images",
+    "model-providers",
 ];
 pub const CLIENT_CAPABILITIES: &[&str] = &[
     "lifecycle",
@@ -44,6 +45,7 @@ pub fn slow_request(method: &str) -> bool {
         method,
         "session.create"
             | "settings.model.discover"
+            | "settings.model.test"
             | "settings.model.context"
             | "extensions.install"
             | "extensions.skill.install"
@@ -53,6 +55,8 @@ pub fn slow_request(method: &str) -> bool {
             | "connectors.connect"
             | "application.resources.change"
             | "application.models.discover"
+            | "application.models.test"
+            | "application.providers.refresh"
             | "application.command.expand"
     )
 }

@@ -11,21 +11,6 @@ pub use key_store::move_keys;
 
 const KEYRING_SERVICE: &str = "medha";
 
-const PRESETS: &[(&str, &str)] = &[
-    ("Ollama (local)", "http://localhost:11434/v1"),
-    ("LM Studio (local)", "http://localhost:1234/v1"),
-    ("llama.cpp server (local)", "http://localhost:8080/v1"),
-    ("vLLM / SGLang (local)", "http://localhost:8000/v1"),
-    ("OpenRouter", "https://openrouter.ai/api/v1"),
-    ("Together", "https://api.together.xyz/v1"),
-    ("Groq", "https://api.groq.com/openai/v1"),
-    ("OpenAI", "https://api.openai.com/v1"),
-];
-
-pub fn provider_presets() -> &'static [(&'static str, &'static str)] {
-    PRESETS
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Load-only legacy connection, migrated into `models`.
@@ -1000,6 +985,9 @@ fn resolve_inner(
         .unwrap_or_default();
 
     let provider = providers::ProviderProfile {
+        provider_id: configured
+            .and_then(|p| p.provider_id.clone())
+            .filter(|_| !has_override),
         protocol,
         base_url,
         model,
@@ -1573,13 +1561,30 @@ pub fn resolve_model_as(cfg: &Config, name: &str, env_key: Option<&str>) -> Resu
         .model_profile(name)
         .ok_or_else(|| anyhow::anyhow!("no saved model named '{name}'"))?;
     // Prefer MEDHA_API_KEY to avoid an unnecessary macOS keychain prompt.
-    let api_key = normalize_api_key(
-        &env_key
-            .map(str::to_owned)
-            .or_else(|| load_key(&provider.base_url))
-            .unwrap_or_default(),
-    );
+    let api_key = deployment_credential(provider, env_key)?;
     resolve_keyed(cfg, name, &api_key, env_key.is_some())
+}
+
+/// Resolve a key only for the explicitly selected, pinned deployment. Setup,
+/// discovery and test callers do not consult MEDHA_API_KEY or other providers'
+/// environment variables; chat opening may hand its own explicit override in.
+pub fn deployment_credential(
+    profile: &providers::ProviderProfile,
+    supplied: Option<&str>,
+) -> Result<String> {
+    if profile.auth == providers::AuthKind::None {
+        return Ok(String::new());
+    }
+    let credential = match supplied.filter(|value| !value.trim().is_empty()) {
+        Some(value) => normalize_api_key(value),
+        None => read_key(profile.credential_target())?
+            .map(|value| normalize_api_key(&value))
+            .unwrap_or_default(),
+    };
+    if credential.is_empty() {
+        anyhow::bail!("An API key is required for this endpoint. Add one or use its saved key.");
+    }
+    Ok(credential)
 }
 
 pub fn resolve_model_with_key(cfg: &Config, name: &str, api_key: &str) -> Result<Resolved> {
@@ -2256,6 +2261,7 @@ mod tests {
 
     fn provider(model: &str) -> ProviderConfig {
         ProviderConfig {
+            provider_id: None,
             protocol: kernel::Protocol::OpenAiChat,
             base_url: format!("http://{model}.example/v1"),
             model: model.into(),

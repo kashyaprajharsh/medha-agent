@@ -136,12 +136,13 @@ fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
     assert_eq!(settings["models"][0]["profile"]["max_output_tokens"], 4096);
     assert_eq!(settings["models"][0]["default"], true);
     assert!(settings["models"][0].get("key").is_none());
+    assert!(!settings["catalogue_revision"].as_str().unwrap().is_empty());
     assert!(
-        settings["presets"]
+        settings["unavailable_providers"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| row["name"] == "Ollama (local)")
+            .any(|row| row["id"] == "anthropic" && row["reason"].is_string())
     );
     let protocols = settings["protocols"].as_array().unwrap();
     for option in protocols {
@@ -165,8 +166,17 @@ fn desktop_forms_share_model_limits_instructions_and_skill_state_with_medha() {
         .iter()
         .find(|row| row["value"] == "gemini-interactions")
         .unwrap();
-    assert_eq!(gemini["providers"][0]["name"], "Google Gemini");
-    assert_eq!(gemini["providers"][0]["auth"], "x-goog-api-key");
+    let google = gemini["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "google")
+        .unwrap();
+    assert_eq!(google["auth"], "x-goog-api-key");
+    assert_eq!(
+        google["url"],
+        "https://generativelanguage.googleapis.com/v1"
+    );
     assert!(
         gemini["providers"]
             .as_array()

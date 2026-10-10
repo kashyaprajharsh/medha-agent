@@ -290,6 +290,8 @@ pub async fn run(_args: &[String]) -> anyhow::Result<()> {
         )
         .init();
 
+    let _catalogue = providers::catalogue::start_background();
+
     let token: Arc<str> = new_token()?.into();
     let address = address(&directory, "backend")?;
     let listener =

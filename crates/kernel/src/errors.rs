@@ -30,4 +30,9 @@ pub enum KernelError {
     /// try once without it. Holds the server's words, reported if that fails too.
     #[error("{0}")]
     ImageSuspected(String),
+
+    /// The server named an image as too large or unreadable; the caller may send
+    /// it smaller or leave it out. Holds the server's words.
+    #[error("{0}")]
+    ImageUnfit(String),
 }

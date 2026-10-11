@@ -1126,6 +1126,10 @@ struct AutoImageProvider {
     refusal: &'static str,
     /// Refuses every request the same way, image or not.
     broken: bool,
+    /// Which requests this server refuses; by default any with an image.
+    refuses: fn(&PreparedModelRequest) -> bool,
+    /// Answers the first request it accepts with a tool call.
+    calls_tool: AtomicBool,
 }
 
 impl AutoImageProvider {
@@ -1143,6 +1147,8 @@ impl AutoImageProvider {
             sent: Mutex::new(Vec::new()),
             refusal: "this model does not support image input",
             broken: false,
+            refuses: carries_image,
+            calls_tool: AtomicBool::new(false),
         }
     }
 }
@@ -1176,8 +1182,16 @@ impl Provider for AutoImageProvider {
     ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
         // A text-only server: any request carrying an image is refused.
         self.sent.lock().unwrap().push(request.clone());
-        if self.broken || carries_image(request) {
+        if self.broken || (self.refuses)(request) {
             return Err(ProviderError::Status(400, self.refusal.into()));
+        }
+        if self.calls_tool.swap(false, Ordering::SeqCst) {
+            let call = ToolIntent {
+                id: "call-1".into(),
+                tool: "test.tool".into(),
+                args: json!({}),
+            };
+            return Ok(stream::iter([Ok(Block::ToolIntent(call))]).boxed());
         }
         Ok(stream::iter([Ok(Block::Text("described answer".into()))]).boxed())
     }
@@ -1192,17 +1206,41 @@ fn carries_image(request: &PreparedModelRequest) -> bool {
     })
 }
 
+/// Decoded size of every image a request carries.
+fn image_sizes(request: &PreparedModelRequest) -> Vec<usize> {
+    use base64::Engine;
+    let messages = request.context.ordered_messages();
+    let parts = messages.iter().flat_map(|message| &message.parts);
+    parts
+        .filter_map(|part| match part {
+            ContentPart::Media(MediaPart {
+                source: MediaSource::Base64(data),
+                ..
+            }) => base64::engine::general_purpose::STANDARD.decode(data).ok(),
+            _ => None,
+        })
+        .map(|bytes| bytes.len())
+        .collect()
+}
+
 fn image_message(text: &str) -> Message {
+    images_message(text, &["hash"])
+}
+
+fn images_message(text: &str, hashes: &[&str]) -> Message {
     let mut message = Message::user(text);
-    message.attachments.push(MediaPart {
-        mime_type: "image/png".into(),
-        source: MediaSource::Artifact("hash".into()),
-        label: Some("screen.png".into()),
-        width: None,
-        height: None,
-        byte_size: None,
-        provider_state: Vec::new(),
-    });
+    message.attachments = hashes
+        .iter()
+        .map(|hash| MediaPart {
+            mime_type: "image/png".into(),
+            source: MediaSource::Artifact((*hash).into()),
+            label: Some("screen.png".into()),
+            width: None,
+            height: None,
+            byte_size: None,
+            provider_state: Vec::new(),
+        })
+        .collect();
     message
 }
 
@@ -1230,18 +1268,26 @@ impl kernel::ArtifactStore for ImageArtifacts {
     }
 
     fn get(&self, hash: &str, offset: usize, len: Option<usize>) -> Result<Vec<u8>, String> {
-        if hash != "hash" {
-            return Err("missing artifact".into());
-        }
-        let bytes = b"pixels";
-        let end = len.map_or(bytes.len(), |length| (offset + length).min(bytes.len()));
-        Ok(bytes[offset.min(bytes.len())..end].to_vec())
+        let size = self.size(hash)?;
+        let end = len.map_or(size, |length| (offset + length).min(size));
+        Ok(vec![b'p'; end.saturating_sub(offset)])
     }
 
+    /// `hash` is six bytes; `bytes:N` is an image of `N` bytes.
     fn size(&self, hash: &str) -> Result<usize, String> {
-        (hash == "hash")
-            .then_some(6)
-            .ok_or_else(|| "missing artifact".into())
+        match hash.strip_prefix("bytes:") {
+            Some(size) => size.parse().map_err(|_| "missing artifact".into()),
+            None if hash == "hash" => Ok(6),
+            None => Err("missing artifact".into()),
+        }
+    }
+}
+
+struct ToBudget;
+
+impl kernel::ImageShrinker for ToBudget {
+    fn shrink(&self, _: &[u8], budget: usize) -> Result<(Vec<u8>, String), String> {
+        Ok((vec![b'p'; budget], "image/jpeg".into()))
     }
 }
 
@@ -1293,6 +1339,80 @@ async fn an_image_refusal_in_unknown_words_is_found_out_by_trying_without_it() {
     let error = outcome.unwrap_err();
     assert!(error.contains("invalid request: unknown model"), "{error}");
     assert_eq!((sent, learned), (2, ImageSupport::Unknown));
+}
+
+/// A server that reads images but refuses these ones is never remembered as one
+/// that cannot: they go smaller, then fewer, and later requests start from there.
+#[tokio::test]
+async fn a_vision_server_refusing_some_images_is_not_taken_for_a_text_one() {
+    const MIB: usize = 1024 * 1024;
+    let run = |refusal: &'static str,
+               refuses: fn(&PreparedModelRequest) -> bool,
+               images: &'static [&'static str]| async move {
+        let mut provider = AutoImageProvider::believed(ImageSupport::Unknown);
+        provider.refusal = refusal;
+        provider.refuses = refuses;
+        provider.calls_tool = AtomicBool::new(true);
+        let provider = Arc::new(provider);
+        let kernel = Kernel::new(
+            provider.clone(),
+            Arc::new(InMemoryLog::new()),
+            Arc::new(ToolExecutor),
+            Arc::new(Passthrough),
+            Arc::new(ImageArtifacts),
+            Arc::new(AllowAll),
+            Arc::new(AutoDeny),
+            Arc::new(NoVerify),
+        )
+        .with_image_shrinker(Arc::new(ToBudget));
+        let (_, stop) = kernel
+            .run_session(
+                &Session::new(),
+                vec![images_message("look", images)],
+                Budget::default(),
+                &kernel::NullSink,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop, StopReason::Finished);
+        let sent: Vec<_> = provider
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(image_sizes)
+            .collect();
+        (sent, *provider.observed.lock().unwrap())
+    };
+
+    // Too large, said in words no list has: sent smaller, and again after the tool.
+    let (sent, learned) = run(
+        "invalid request body",
+        |request| image_sizes(request).iter().any(|size| *size > 4 * MIB),
+        &["bytes:5000000", "hash"],
+    )
+    .await;
+    assert_eq!(
+        sent,
+        [vec![5_000_000, 6], vec![4 * MIB, 6], vec![4 * MIB, 6]]
+    );
+    assert_eq!(learned, ImageSupport::Supported);
+
+    // Too many: only the newest goes, and no request walks back up to try all.
+    let (sent, learned) = run(
+        "invalid request body",
+        |request| image_sizes(request).len() > 1,
+        &["hash", "bytes:300000"],
+    )
+    .await;
+    assert_eq!(sent, [vec![6, 300_000], vec![256 * 1024], vec![256 * 1024]]);
+    assert_eq!(learned, ImageSupport::Supported);
+
+    // Named as too large, then accepted without it: that teaches nothing of sight.
+    let (sent, learned) = run("image too large", carries_image, &["hash"]).await;
+    assert_eq!(sent, [vec![6], vec![], vec![]]);
+    assert_eq!(learned, ImageSupport::Unknown);
 }
 
 /// A text model with no vision model meets an image: the turn finishes on a

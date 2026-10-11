@@ -32,37 +32,6 @@ pub async fn read_all(
     Ok(bytes)
 }
 
-/// Resolve a disposable request copy. Durable messages retain content hashes.
-pub async fn resolve_media(
-    context: &mut crate::CompiledContext,
-    store: std::sync::Arc<dyn ArtifactStore>,
-) -> Result<(), String> {
-    use crate::{ContentPart, MediaSource};
-    use base64::Engine;
-    let mut messages = context.ordered_messages();
-    let mut encoded = std::collections::HashMap::new();
-    for message in &mut messages {
-        for part in &mut message.parts {
-            let ContentPart::Media(media) = part else {
-                continue;
-            };
-            let MediaSource::Artifact(hash) = &media.source else {
-                continue;
-            };
-            if !encoded.contains_key(hash) {
-                let bytes = read_all(&store, hash).await?;
-                encoded.insert(
-                    hash.clone(),
-                    base64::engine::general_purpose::STANDARD.encode(bytes),
-                );
-            }
-            media.source = MediaSource::Base64(encoded[hash].clone());
-        }
-    }
-    context.ordered = Some(messages);
-    Ok(())
-}
-
 #[async_trait::async_trait]
 pub trait ArtifactStore: Send + Sync + 'static {
     /// Store bytes, returning a content hash (idempotent for identical content).

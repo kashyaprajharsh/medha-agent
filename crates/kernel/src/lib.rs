@@ -15,6 +15,7 @@ pub mod policy;
 pub mod progress;
 pub mod provider;
 pub mod redact;
+pub mod request_images;
 pub mod sink;
 pub mod types;
 pub mod verify;
@@ -57,6 +58,7 @@ pub use provider::{
     Provider, ProviderCaps, ProviderError, ProviderFailure, ReasoningConfig, ReasoningEffort,
     ReasoningSupport, TokenAccountingMode, TokenCountError, TokenCountQuality, ToolCallStrategy,
 };
+pub use request_images::ImageShrinker;
 pub use sink::{NullSink, StreamSink};
 pub use types::{
     AutonomyLevel, BlastRadius, Block, CompiledContext, Containment, ContentPart, Decision,

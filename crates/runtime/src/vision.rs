@@ -116,6 +116,17 @@ pub fn connect(
     )?)
 }
 
+/// Re-encodes an image to fit a request its server refused at full size.
+pub struct Shrinker;
+
+impl kernel::ImageShrinker for Shrinker {
+    fn shrink(&self, bytes: &[u8], budget: usize) -> Result<(Vec<u8>, String), String> {
+        let image = media::normalize_for_transport(bytes.to_vec(), budget)
+            .map_err(|error| format!("{error:#}"))?;
+        Ok((image.bytes, image.mime.into()))
+    }
+}
+
 #[cfg(test)]
 #[path = "vision_tests.rs"]
 mod tests;

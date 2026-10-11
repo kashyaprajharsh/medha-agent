@@ -1276,13 +1276,28 @@ struct Read {
     images_reach_model: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// What `read` says of text to every model; images are added for those that see.
+macro_rules! read_text {
+    () => {
+        "Read a file by `path`, or a stored result by `hash`. Text comes one page at a time: \
+         up to 2000 lines from `offset` (1-based, default 1), fewer with `limit`, each as \
+         `N|text`. The number and bar are not part of the file, so leave them out when you \
+         edit. When more remains, the result says which offset continues it. Pass \
+         `count: true` for words, lines and characters instead of contents. With `hash`, \
+         `offset` and `length` are byte positions into a stored tool result. Supports paths \
+         outside the workspace with permission."
+    };
+}
+
 impl Read {
+    fn sees_images(&self) -> bool {
+        self.images_reach_model
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Why an image would be wasted on this model, when it would be.
     fn no_use_for_images(&self, instead: &str) -> Result<(), ToolError> {
-        if self
-            .images_reach_model
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.sees_images() {
             return Ok(());
         }
         Err(ToolError::Failed(format!(
@@ -1302,17 +1317,20 @@ impl Tool for Read {
     fn model_view(&self, payload: &Value) -> Option<String> {
         self.text.model_view(payload)
     }
+    // A model that images cannot reach is not told about them.
     fn description(&self) -> &str {
-        "Read a file by `path`, or a stored artifact by `hash`. For text, use \
-         `offset` (1-based line) and `limit` to read part of a large \
-         file instead of all of it. An image path or stored image hash returns the picture itself, so use \
-         this rather than a shell command to look at a screenshot or diagram — \
-         oversized images are scaled and rotated photos made upright first. Pass \
-         `count: true` for words, lines and characters instead of contents. With \
-         `hash`, `offset` and `length` are byte positions into a spilled tool result. \
-         Pass `render: true` with an HTML file or http(s) URL to see the page as a \
-         screenshot; never launch a browser from the shell. A URL asks for network. \
-         Supports paths outside the workspace with permission."
+        if self.sees_images() {
+            concat!(
+                read_text!(),
+                " An image path or stored image hash returns the picture itself, so use this \
+                 rather than a shell command to look at a screenshot or diagram: oversized \
+                 images are scaled, and rotated photos made upright, first. Pass \
+                 `render: true` with an HTML file or http(s) URL to see the page as a \
+                 screenshot; never launch a browser from the shell. A URL asks for network."
+            )
+        } else {
+            read_text!()
+        }
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::Read
@@ -1324,7 +1342,7 @@ impl Tool for Read {
         "◇"
     }
     fn schema(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File to read; omit when reading an artifact" },
@@ -1335,7 +1353,13 @@ impl Tool for Read {
                 "count": { "type": "boolean", "description": "Return word/line/character counts instead of contents" },
                 "render": { "type": "boolean", "description": "Screenshot the page at `path` (HTML file or URL)" }
             }
-        })
+        });
+        if !self.sees_images()
+            && let Some(properties) = schema["properties"].as_object_mut()
+        {
+            properties.remove("render");
+        }
+        schema
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         if args.get("hash").is_some() {
@@ -8172,7 +8196,25 @@ mod tests {
             "a model that reads images gets the image"
         );
 
+        // What the model is told of `read`: screenshots only if it can see them.
+        let offered = |reg: &ToolRegistry| {
+            let read = kernel::Executor::specs(reg)
+                .into_iter()
+                .find(|spec| spec.name == "read")
+                .unwrap();
+            assert!(
+                read.description.contains("`N|text`"),
+                "{}",
+                read.description
+            );
+            (
+                read.description.contains("screenshot"),
+                read.schema["properties"].get("render").is_some(),
+            )
+        };
+        assert_eq!(offered(&reg), (true, true));
         kernel::Executor::images_reach_model(&reg, false);
+        assert_eq!(offered(&reg), (false, false));
         for args in [
             json!({ "path": "page.html", "render": true }),
             json!({ "path": "dot.png" }),

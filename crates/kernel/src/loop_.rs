@@ -6,6 +6,7 @@ use crate::errors::KernelError;
 use crate::events::{Event, EventKind, EventLog};
 use crate::executor::Executor;
 use crate::provider::{InputTokenCount, Provider, TokenAccountingMode, TokenCountQuality};
+use crate::request_images::{Sending, Sent};
 use crate::sink::StreamSink;
 use crate::types::{
     BlastRadius, Block, CompiledContext, ContentPart, Message, ModelMessage, Observation,
@@ -13,6 +14,7 @@ use crate::types::{
 };
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn context_has_media(context: &CompiledContext) -> bool {
     context.ordered_messages().iter().any(|message| {
@@ -463,9 +465,13 @@ pub struct Kernel<P: Provider, L: EventLog> {
     pub gate: Arc<dyn crate::gate::HumanGate>,
     pub verifier: Arc<dyn crate::verify::Verifier>,
     hooks: Arc<dyn crate::hooks::HookRunner>,
-    /// Reads images for a route whose own model cannot. `None` means an image
-    /// reaching such a route fails the turn instead of being dropped.
+    /// Reads images for a route whose own model cannot. Without one, such a
+    /// route gets a note in each image's place.
     vision: Option<Arc<dyn crate::vision::VisionDescriber>>,
+    /// Makes an image smaller when a server refuses it at full size.
+    shrinker: Option<Arc<dyn crate::ImageShrinker>>,
+    /// This server took images only once they were smaller; later turns start there.
+    shrinks_images: AtomicBool,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     max_parallel_tools: usize,
     /// (per result, per round) limits set in config; each one unset is worked
@@ -632,6 +638,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             verifier,
             hooks: Arc::new(crate::hooks::NoHooks),
             vision: None,
+            shrinker: None,
+            shrinks_images: Default::default(),
             progressive_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             result_limits: (None, None),
@@ -666,6 +674,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             verifier: Arc::clone(&self.verifier),
             hooks: Arc::clone(&self.hooks),
             vision: self.vision.clone(),
+            shrinker: self.shrinker.clone(),
+            shrinks_images: Default::default(),
             progressive_context: self.progressive_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
             result_limits: self.result_limits,
@@ -684,10 +694,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
 
     /// Whether this route can carry images itself: the wire contract must
     /// support them and the model must not declare that it cannot see.
-    fn route_reads_images(&self, force_text: bool) -> Result<bool, KernelError> {
-        if force_text {
-            return Ok(false);
-        }
+    fn route_reads_images(&self) -> Result<bool, KernelError> {
         match self.provider.image_input_mode() {
             crate::ImageInputMode::Text => Ok(false),
             crate::ImageInputMode::Native => {
@@ -708,6 +715,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     /// Auxiliary model that reads images for a route that cannot.
     pub fn with_vision(mut self, vision: Arc<dyn crate::vision::VisionDescriber>) -> Self {
         self.vision = Some(vision);
+        self
+    }
+
+    pub fn with_image_shrinker(mut self, shrinker: Arc<dyn crate::ImageShrinker>) -> Self {
+        self.shrinker = Some(shrinker);
         self
     }
 
@@ -1338,7 +1350,17 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         let cancel = interrupts.as_ref().map(|q| q.token()).unwrap_or_default();
         let started = crate::events::now_ts();
         let mut images_left_out_said = false;
+        let (mut retired_said, mut unreadable_said) = (0, false);
+        // Where a refusal left this run's images; later requests start there.
+        let mut image_floor = match self.shrinks_images.load(Ordering::Relaxed) {
+            true => Sending::Shrunk,
+            false => Sending::Whole,
+        };
         let planning = session.autonomy == crate::types::AutonomyLevel::Plan;
+        // Tools describe themselves by this, so it is said before they are listed.
+        self.executor.images_reach_model(
+            self.vision.is_some() || self.route_reads_images().unwrap_or(false),
+        );
         let specs: Vec<_> = self
             .executor
             .specs()
@@ -1563,11 +1585,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // full prepare → count → compile loop. If compaction changes the
             // candidate, the request is rebuilt and re-counted before sending.
             let mut overflow_retried = false;
-            let mut image_fallback_retried = false;
-            // The server's words for a refusal being tested without its image.
-            let mut image_trial: Option<String> = None;
+            // How this request sends its images, and what the last try carried.
+            let mut sending = image_floor;
+            let mut sent = Sent::default();
+            // The server's first words for a refusal the images may have caused.
+            let mut image_refusal: Option<String> = None;
+            // Refused one small image, and never named size or damage as why.
+            let (mut small_refused, mut unfit_named) = (false, false);
             let mut tool_call_corrections = 0;
-            let mut force_text_images = false;
             let mut compaction_passes = 0u32;
             let (turn, request_tools) = 'model_call: loop {
                 let (prepared, prepared_input_tokens, reserved_output_tokens) = loop {
@@ -1597,13 +1622,30 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // Images either go to the model as pixels or reach it as a
                     // described, clearly-labelled substitute. They are never
                     // dropped on the way to a model that cannot see.
-                    if self.route_reads_images(force_text_images)? {
-                        crate::artifacts::resolve_media(
+                    if sending != Sending::AsText && self.route_reads_images()? {
+                        sent = crate::request_images::resolve_media(
                             &mut candidate,
                             Arc::clone(&self.artifacts),
+                            sending,
+                            self.shrinker.as_ref(),
                         )
-                        .await
-                        .map_err(KernelError::Provider)?;
+                        .await;
+                        if sending != Sending::OneSmall && sent.retired > retired_said {
+                            retired_said = sent.retired;
+                            sink.notice(&format!(
+                                "{} older image(s) from tools are no longer sent to the model, to \
+                                 keep requests within limits. The model was told.",
+                                sent.retired
+                            ));
+                        }
+                        if sent.unreadable > 0 && !unreadable_said {
+                            unreadable_said = true;
+                            sink.notice(&format!(
+                                "{} image(s) could not be read back and were left out. The model \
+                                 was told.",
+                                sent.unreadable
+                            ));
+                        }
                     } else {
                         let done = crate::vision::describe_media(
                             &mut candidate,
@@ -1893,15 +1935,36 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     .await
                 {
                     Ok(t) => {
-                        // The same request without its image went through: this
-                        // server does not take images, and that is remembered.
-                        if image_trial.take().is_some() {
-                            self.provider
-                                .observe_image_support(crate::ImageSupport::Unsupported);
-                            sink.notice(
-                                "This model's server refused a request with an image and accepted \
-                                 it without one. Images are left out for this model from now on.",
-                            );
+                        if image_refusal.take().is_some() {
+                            image_floor = sending;
+                            match sending {
+                                // Size and damage ruled out: it takes no images.
+                                Sending::AsText if small_refused && !unfit_named => {
+                                    self.provider
+                                        .observe_image_support(crate::ImageSupport::Unsupported);
+                                    sink.notice(
+                                        "This model's server refused a request with one small \
+                                         image and accepted it without one. Images are left out \
+                                         for this model from now on.",
+                                    );
+                                }
+                                Sending::AsText => sink.notice(
+                                    "The server refused this request's images, so they are left \
+                                     out for the rest of this turn. The model was told.",
+                                ),
+                                Sending::OneSmall => sink.notice(
+                                    "The server refused this request's images. Only the newest \
+                                     is sent, made small, for the rest of this turn.",
+                                ),
+                                Sending::Shrunk => {
+                                    self.shrinks_images.store(true, Ordering::Relaxed);
+                                    sink.notice(
+                                        "The server refused the images at full size. Large \
+                                         images are sent smaller from now on in this chat.",
+                                    );
+                                }
+                                Sending::Whole => {}
+                            }
                         }
                         if context_has_media(&prepared.context) {
                             if self.provider.image_input_mode() == crate::ImageInputMode::Auto {
@@ -1954,26 +2017,30 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     // The server's own refusal outranks what a catalogue says of
                     // the model in general: this deployment takes no images.
                     Err(KernelError::UnsupportedImage)
-                        if !image_fallback_retried
+                        if sending != Sending::AsText
                             && self.provider.image_input_mode() == crate::ImageInputMode::Auto
                             && self.provider.image_support()
                                 != crate::ImageSupport::Unsupported =>
                     {
-                        image_fallback_retried = true;
-                        force_text_images = true;
+                        sending = Sending::AsText;
                         self.provider
                             .observe_image_support(crate::ImageSupport::Unsupported);
                         sink.notice(
-                            "native image input was rejected; retrying once through auxiliary vision",
+                            "This model's server says it takes no images. They reach it as text \
+                             from now on.",
                         );
                         continue 'model_call;
                     }
-                    // Tried once without the image; only its being accepted
-                    // shows the image was the cause.
-                    Err(KernelError::ImageSuspected(refusal)) if !image_fallback_retried => {
-                        image_fallback_retried = true;
-                        force_text_images = true;
-                        image_trial = Some(refusal);
+                    // Not known to be the images' doing: send less of them each
+                    // try. Only a request that then passes shows what was wrong.
+                    Err(e @ (KernelError::ImageSuspected(_) | KernelError::ImageUnfit(_)))
+                        if sending != Sending::AsText =>
+                    {
+                        unfit_named |= matches!(e, KernelError::ImageUnfit(_));
+                        small_refused |=
+                            sent.images == 1 && sent.largest <= crate::request_images::SMALL;
+                        sending = sending.after_refusal(sent, self.shrinker.is_some());
+                        image_refusal.get_or_insert(e.to_string());
                         continue 'model_call;
                     }
                     Err(KernelError::ContextOverflow { reported_limit }) if !overflow_retried => {
@@ -2006,10 +2073,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         }
                         return Ok((messages, StopReason::Budget(stop)));
                     }
-                    // Refused without its image too: the image was not why, so
-                    // the first refusal is the one to report, and nothing is learned.
+                    // Refused without its images too: they were not why, so the
+                    // first refusal is the one to report, and nothing is learned.
                     Err(e) => {
-                        return Err(match image_trial.take() {
+                        return Err(match image_refusal.take() {
                             Some(refusal) => KernelError::Provider(refusal),
                             None => e,
                         });
@@ -2019,7 +2086,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // Before this round's tools run: could an image reach the model at
             // all? What a refusal just taught is already counted.
             self.executor.images_reach_model(
-                self.vision.is_some() || self.route_reads_images(false).unwrap_or(false),
+                self.vision.is_some() || self.route_reads_images().unwrap_or(false),
             );
             let (assistant, canonical, intents, usage, turn_interrupted) = turn;
             if let Some(u) = usage {
@@ -2578,6 +2645,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 "the provider rejected the output-token allowance; check the profile's max_output_tokens. Original rejection: {e}"
                             )));
                         }
+                        // With images aboard, they are the first thing to send less of.
+                        crate::provider::ProviderFailure::PayloadTooLarge
+                        | crate::provider::ProviderFailure::ImageUnfit
+                            if !emitted && context_has_media(&request.context) =>
+                        {
+                            return Err(KernelError::ImageUnfit(e.to_string()));
+                        }
+                        crate::provider::ProviderFailure::ImageUnfit => {}
                         crate::provider::ProviderFailure::PayloadTooLarge => {
                             return Err(KernelError::Provider(
                                 "the provider rejected the HTTP payload size; reduce retained media or byte-heavy tool results"

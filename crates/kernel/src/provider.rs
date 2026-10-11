@@ -332,6 +332,8 @@ pub enum ProviderFailure {
     PayloadTooLarge,
     /// This model/endpoint cannot accept the image modality.
     UnsupportedImage,
+    /// It takes images, but not this one: too large, or it could not decode it.
+    ImageUnfit,
     /// Requires model-visible correction, not a replay of the same request.
     InvalidToolCall,
     Transient,
@@ -470,6 +472,26 @@ fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
             };
         }
         return ProviderFailure::OutputLimit { available_output };
+    }
+    // Checked before "cannot see": a model that names one image as too large
+    // or damaged reads images, and must not be remembered as one that does not.
+    let unfit_shaped = [
+        "image exceeds",
+        "image too large",
+        "image_too_large",
+        "image size exceeds",
+        "image dimensions exceed",
+        "dimensions exceed max allowed size",
+        "media exceeds",
+        "media too large",
+        "invalid png image",
+        "invalid jpeg image",
+        "provided image cannot be decoded",
+    ]
+    .iter()
+    .any(|said| lower.contains(said));
+    if code.is_none_or(|code| matches!(code, 400 | 413 | 415 | 422)) && unfit_shaped {
+        return ProviderFailure::ImageUnfit;
     }
     // Deliberately narrow: ordinary "unsupported" request errors must not
     // reroute pixels through another model. Require both image/vision evidence
@@ -620,6 +642,18 @@ mod error_class_tests {
             .classify(),
             ProviderFailure::Fatal
         );
+        // One that names an image as too large or damaged does read images.
+        for said in [
+            "image exceeds 5 MB maximum: 6000000 bytes > 5242880 bytes",
+            "Invalid PNG image: this model does not support it",
+            "At least one of the image dimensions exceed max allowed size: 8000 pixels",
+        ] {
+            assert_eq!(
+                ProviderError::Status(400, said.into()).classify(),
+                ProviderFailure::ImageUnfit,
+                "{said}"
+            );
+        }
 
         assert_eq!(
             ProviderError::Status(400, "unsupported tool choice".into()).classify(),

@@ -75,6 +75,9 @@ fn user_texts(body: &Value) -> String {
         .join(" | ")
 }
 
+/// Largest request the SIZE_LIMIT_SERVER takes: room for a 4 MiB image, not more.
+const SERVER_SIZE_LIMIT: usize = 6_000_000;
+
 /// Echoes the last user message. One containing HOLD is answered only once
 /// released; one containing RUN is answered with a shell command first.
 fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc::Receiver<()>>) {
@@ -102,14 +105,25 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
     // A chat that names a text-only server gets one: it takes no images, and
     // says so the way a local server set to allow none does.
     let raw = body.to_string();
-    if raw.contains("TEXT_ONLY_SERVER") && raw.contains("\"image_url\"") {
-        let refusal = r#"{"error":{"message":"At most 0 image(s) may be provided in one prompt. (parameter=image)","type":"BadRequestError","param":"image","code":400}}"#;
+    let refuse = |stream: &mut TcpStream, refusal: &str| {
         let _ = write!(
             stream,
             "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}",
             refusal.len()
         );
-        return;
+    };
+    if raw.contains("TEXT_ONLY_SERVER") && raw.contains("\"image_url\"") {
+        return refuse(
+            &mut stream,
+            r#"{"error":{"message":"At most 0 image(s) may be provided in one prompt. (parameter=image)","type":"BadRequestError","param":"image","code":400}}"#,
+        );
+    }
+    // One that reads images but refuses a large request, in words of its own.
+    if raw.contains("SIZE_LIMIT_SERVER") && raw.len() > SERVER_SIZE_LIMIT {
+        return refuse(
+            &mut stream,
+            r#"{"error":{"message":"request rejected by the gateway","code":400}}"#,
+        );
     }
     if asked.contains("HOLD") {
         let _ = release.lock().unwrap().recv_timeout(WAIT);
@@ -1950,6 +1964,63 @@ async fn a_text_only_server_never_stops_a_chat_that_meets_an_image() {
     assert!(
         learned.contains("test-model") && learned.contains("false"),
         "{learned}"
+    );
+}
+
+/// A server that reads images refuses one for its size, in words no list has:
+/// the image goes smaller, the chat carries on, and the model is known to see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_image_too_large_for_its_server_is_sent_smaller() {
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("large");
+    // Noise does not compress, so this PNG is as large as its pixels.
+    let mut seed = 7u32;
+    let pixels: Vec<u8> = (0..1200 * 1200 * 4)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        })
+        .collect();
+    let picture = media::from_rgba(1200, 1200, &pixels).unwrap();
+    assert!(picture.len() > 4 * 1024 * 1024);
+    std::fs::write(folder.join("noise.png"), picture).unwrap();
+    let chat = client.open(&folder).await;
+    let turn = async |client: &mut Client, text: &str| {
+        client.send(&chat, text).await;
+        let (_, ended) = client
+            .until(|frame| kind(frame, "turn.done") || kind(frame, "turn.error"))
+            .await;
+        assert!(kind(&ended, "turn.done"), "{text}: {ended}");
+    };
+    // Whether each request that carried an image was one the server takes.
+    let image_requests = |world: &World| {
+        let mut taken = Vec::new();
+        while let Ok(request) = world.provider.seen.try_recv() {
+            let raw = request.to_string();
+            if raw.contains("\"image_url\"") {
+                taken.push(raw.len() <= SERVER_SIZE_LIMIT);
+            }
+        }
+        taken
+    };
+
+    turn(&mut client, "SIZE_LIMIT_SERVER hello").await;
+    turn(&mut client, "READ_PATH noise.png").await;
+    assert_eq!(
+        image_requests(&world),
+        [false, true],
+        "refused whole, then taken smaller"
+    );
+    // The next turn starts smaller: nothing is refused a second time.
+    turn(&mut client, "ok").await;
+    assert_eq!(image_requests(&world), [true]);
+
+    let learned = std::fs::read_to_string(world.home().join("learned_models.json")).unwrap();
+    assert!(
+        learned.contains("test-model") && learned.contains("true"),
+        "a model that took an image is remembered as one that sees: {learned}"
     );
 }
 

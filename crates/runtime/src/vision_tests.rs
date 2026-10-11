@@ -105,6 +105,32 @@ async fn the_same_image_is_not_paid_for_twice() {
     );
 }
 
+/// A real picture too large for a server comes back under the size asked for,
+/// still a picture.
+#[test]
+fn a_picture_refused_for_its_size_is_made_to_fit() {
+    use kernel::ImageShrinker as _;
+    // Noise does not compress, so this PNG is far over the budget.
+    let mut seed = 7u32;
+    let pixels: Vec<u8> = (0..1024 * 1024 * 4)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        })
+        .collect();
+    let picture = media::from_rgba(1024, 1024, &pixels).unwrap();
+    let budget = kernel::request_images::SMALL;
+    assert!(picture.len() > budget * 4);
+
+    let (bytes, kind) = Shrinker.shrink(&picture, budget).unwrap();
+    assert!(bytes.len() <= budget, "{} bytes", bytes.len());
+    assert!(media::has_supported_image_header(&bytes));
+    assert!(
+        matches!(kind.as_str(), "image/png" | "image/jpeg"),
+        "{kind}"
+    );
+}
+
 #[tokio::test]
 async fn an_unreachable_auxiliary_model_fails_loudly() {
     let aux = auxiliary("http://127.0.0.1:1/v1");

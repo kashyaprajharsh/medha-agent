@@ -1125,15 +1125,17 @@ struct AutoImageProvider {
 }
 
 impl AutoImageProvider {
-    fn new() -> Self {
+    /// A route whose metadata says `believed` about images, whatever its
+    /// server turns out to accept.
+    fn believed(believed: ImageSupport) -> Self {
         Self {
             caps: ProviderCaps {
-                images: ImageSupport::Unknown,
+                images: believed,
                 caching: false,
                 max_ctx: Some(32_000),
                 tool_calls: ToolCallStrategy::Native,
             },
-            observed: Mutex::new(ImageSupport::Unknown),
+            observed: Mutex::new(believed),
             sent: Mutex::new(Vec::new()),
         }
     }
@@ -1219,7 +1221,18 @@ impl kernel::ArtifactStore for ImageArtifacts {
 
 #[tokio::test]
 async fn unknown_native_image_rejection_retries_once_as_auxiliary_text() {
-    let provider = Arc::new(AutoImageProvider::new());
+    image_rejection_retries_once_as_text(ImageSupport::Unknown).await;
+}
+
+/// A catalogue can say a model reads images while this server takes none; the
+/// server's refusal is believed, and the turn goes on with a description.
+#[tokio::test]
+async fn a_server_refusing_images_is_believed_over_the_models_listing() {
+    image_rejection_retries_once_as_text(ImageSupport::Supported).await;
+}
+
+async fn image_rejection_retries_once_as_text(believed: ImageSupport) {
+    let provider = Arc::new(AutoImageProvider::believed(believed));
     let kernel = Kernel::new(
         provider.clone(),
         Arc::new(InMemoryLog::new()),

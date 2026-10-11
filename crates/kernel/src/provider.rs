@@ -483,7 +483,9 @@ fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
         || lower.contains("image input is not supported")
         || lower.contains("image input not supported")
         || lower.contains("images are not supported")
-        || lower.contains("vision is not supported");
+        || lower.contains("vision is not supported")
+        // A server set to take no images says how many it allows: none.
+        || lower.contains("at most 0 image");
     if code.is_none_or(|code| matches!(code, 400 | 415 | 422)) && image_shaped && unsupported_shaped
     {
         return ProviderFailure::UnsupportedImage;
@@ -600,10 +602,24 @@ mod error_class_tests {
             ProviderError::Status(400, "this model does not support image input".into()),
             ProviderError::Status(415, "unsupported content type: image/gif".into()),
             ProviderError::Response("vision is not supported by this model".into()),
+            // A text-only local server, exactly as its gateway words it.
+            ProviderError::Status(
+                400,
+                r#"{"error":{"code":"400","message":"litellm.BadRequestError: Hosted_vllmException - {\"error\":{\"message\":\"At most 0 image(s) may be provided in one prompt. (parameter=image)\",\"type\":\"BadRequestError\",\"param\":\"image\",\"code\":400}}"}}"#.into(),
+            ),
         ] {
             assert_eq!(error.classify(), ProviderFailure::UnsupportedImage);
             assert!(!error.is_retryable());
         }
+        // A server that does take images but was sent too many is another matter.
+        assert_eq!(
+            ProviderError::Status(
+                400,
+                "At most 4 image(s) may be provided in one prompt".into()
+            )
+            .classify(),
+            ProviderFailure::Fatal
+        );
 
         assert_eq!(
             ProviderError::Status(400, "unsupported tool choice".into()).classify(),

@@ -1924,10 +1924,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         // Rebuild and re-count: feedback changes the request body.
                         continue 'model_call;
                     }
+                    // The server's own refusal outranks what a catalogue says of
+                    // the model in general: this deployment takes no images.
                     Err(KernelError::UnsupportedImage)
                         if !image_fallback_retried
                             && self.provider.image_input_mode() == crate::ImageInputMode::Auto
-                            && self.provider.image_support() == crate::ImageSupport::Unknown =>
+                            && self.provider.image_support()
+                                != crate::ImageSupport::Unsupported =>
                     {
                         image_fallback_retried = true;
                         force_text_images = true;
@@ -2539,7 +2542,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 && self.provider.image_input_mode()
                                     == crate::ImageInputMode::Auto
                                 && self.provider.image_support()
-                                    == crate::ImageSupport::Unknown
+                                    != crate::ImageSupport::Unsupported
                                 && context_has_media(&request.context) =>
                         {
                             return Err(KernelError::UnsupportedImage);

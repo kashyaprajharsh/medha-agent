@@ -1337,6 +1337,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         // `None` (headless) → a token that never trips; every cancel path is dead.
         let cancel = interrupts.as_ref().map(|q| q.token()).unwrap_or_default();
         let started = crate::events::now_ts();
+        let mut images_left_out_said = false;
         let planning = session.autonomy == crate::types::AutonomyLevel::Plan;
         let specs: Vec<_> = self
             .executor
@@ -1563,6 +1564,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // candidate, the request is rebuilt and re-counted before sending.
             let mut overflow_retried = false;
             let mut image_fallback_retried = false;
+            // The server's words for a refusal being tested without its image.
+            let mut image_trial: Option<String> = None;
             let mut tool_call_corrections = 0;
             let mut force_text_images = false;
             let mut compaction_passes = 0u32;
@@ -1602,22 +1605,36 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         .await
                         .map_err(KernelError::Provider)?;
                     } else {
-                        let describer = self
-                            .vision
-                            .clone()
-                            .unwrap_or_else(|| Arc::new(crate::vision::NoVision));
-                        let described = crate::vision::describe_media(
+                        let done = crate::vision::describe_media(
                             &mut candidate,
                             Arc::clone(&self.artifacts),
-                            describer.as_ref(),
+                            self.vision.as_deref(),
                         )
-                        .await
-                        .map_err(KernelError::Provider)?;
-                        if described > 0 {
+                        .await;
+                        if let (Some(describer), true) = (&self.vision, done.described > 0) {
                             sink.notice(&format!(
-                                "{described} image(s) described by {} — this model has no image input",
+                                "{} image(s) described by {} — this model has no image input",
+                                done.described,
                                 describer.model()
                             ));
+                        }
+                        // Said once a run: every request of it carries the same images.
+                        if done.not_shown > 0 && !images_left_out_said {
+                            images_left_out_said = true;
+                            sink.notice(&match (&self.vision, &done.failure) {
+                                (Some(describer), Some(error)) => format!(
+                                    "{} image(s) left out: this model cannot read images and {} \
+                                     could not describe them ({error}). The model was told.",
+                                    done.not_shown,
+                                    describer.model()
+                                ),
+                                _ => format!(
+                                    "{} image(s) left out: this model cannot read images. The \
+                                     model was told. To have images described, name a vision \
+                                     model under [auxiliary] vision in config.toml.",
+                                    done.not_shown
+                                ),
+                            });
                         }
                     }
                     let prepared = self
@@ -1876,6 +1893,16 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     .await
                 {
                     Ok(t) => {
+                        // The same request without its image went through: this
+                        // server does not take images, and that is remembered.
+                        if image_trial.take().is_some() {
+                            self.provider
+                                .observe_image_support(crate::ImageSupport::Unsupported);
+                            sink.notice(
+                                "This model's server refused a request with an image and accepted \
+                                 it without one. Images are left out for this model from now on.",
+                            );
+                        }
                         if context_has_media(&prepared.context) {
                             if self.provider.image_input_mode() == crate::ImageInputMode::Auto {
                                 self.provider
@@ -1941,6 +1968,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         );
                         continue 'model_call;
                     }
+                    // Tried once without the image; only its being accepted
+                    // shows the image was the cause.
+                    Err(KernelError::ImageSuspected(refusal)) if !image_fallback_retried => {
+                        image_fallback_retried = true;
+                        force_text_images = true;
+                        image_trial = Some(refusal);
+                        continue 'model_call;
+                    }
                     Err(KernelError::ContextOverflow { reported_limit }) if !overflow_retried => {
                         overflow_retried = true;
                         if let Some(limit) = reported_limit {
@@ -1971,9 +2006,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         }
                         return Ok((messages, StopReason::Budget(stop)));
                     }
-                    Err(e) => return Err(e),
+                    // Refused without its image too: the image was not why, so
+                    // the first refusal is the one to report, and nothing is learned.
+                    Err(e) => {
+                        return Err(match image_trial.take() {
+                            Some(refusal) => KernelError::Provider(refusal),
+                            None => e,
+                        });
+                    }
                 }
             };
+            // Before this round's tools run: could an image reach the model at
+            // all? What a refusal just taught is already counted.
+            self.executor.images_reach_model(
+                self.vision.is_some() || self.route_reads_images(false).unwrap_or(false),
+            );
             let (assistant, canonical, intents, usage, turn_interrupted) = turn;
             if let Some(u) = usage {
                 self.context.update_usage(u.prompt_tokens, u.total_tokens);
@@ -2548,6 +2595,21 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             return Err(KernelError::UnsupportedImage);
                         }
                         crate::provider::ProviderFailure::UnsupportedImage => {}
+                        // Refusals are worded too many ways to list: test it without the image.
+                        crate::provider::ProviderFailure::Fatal
+                            if !emitted
+                                && matches!(
+                                    e,
+                                    crate::provider::ProviderError::Status(400 | 415 | 422, _)
+                                )
+                                && self.provider.image_input_mode()
+                                    == crate::ImageInputMode::Auto
+                                && self.provider.image_support()
+                                    != crate::ImageSupport::Unsupported
+                                && context_has_media(&request.context) =>
+                        {
+                            return Err(KernelError::ImageSuspected(e.to_string()));
+                        }
                         crate::provider::ProviderFailure::InvalidToolCall => {
                             if emitted && sink.supports_restart() {
                                 sink.restarted();

@@ -89,6 +89,10 @@ pub trait Executor: Send + Sync {
         Vec::new()
     }
 
+    /// Whether an image can reach the model (it reads them, or one is described
+    /// for it); image-only tools decline when it cannot. Default: ignored.
+    fn images_reach_model(&self, _reach: bool) {}
+
     /// Files a reply names that changed since `since` (Unix seconds), each as
     /// `{"path", "kind"}`, for a surface to show beside the reply. Default: none.
     async fn named_outputs(&self, _text: &str, _since: f64) -> Vec<serde_json::Value> {

@@ -156,6 +156,10 @@ impl Executor for NarrowedExecutor {
         }
         self.inner.preview(intent).await
     }
+
+    fn images_reach_model(&self, reach: bool) {
+        self.inner.images_reach_model(reach);
+    }
 }
 
 #[cfg(test)]

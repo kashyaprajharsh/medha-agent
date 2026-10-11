@@ -25,4 +25,9 @@ pub enum KernelError {
     /// caller can rebuild the canonical request through auxiliary vision once.
     #[error("provider does not support image input")]
     UnsupportedImage,
+
+    /// A request with an image was refused without saying why; the caller may
+    /// try once without it. Holds the server's words, reported if that fails too.
+    #[error("{0}")]
+    ImageSuspected(String),
 }

@@ -194,6 +194,10 @@ impl kernel::Executor for Rebound {
     async fn named_outputs(&self, text: &str, since: f64) -> Vec<serde_json::Value> {
         self.inner.named_outputs(text, since).await
     }
+
+    fn images_reach_model(&self, reach: bool) {
+        self.inner.images_reach_model(reach);
+    }
 }
 
 /// Delegate a bounded task to a child agent. The child is built from this

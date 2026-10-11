@@ -765,6 +765,8 @@ pub struct ToolRegistry {
     /// after the kernel is built. A child's tools are narrowed from it.
     agent_parent: ParentHandle,
     agent_session: SessionHandle,
+    /// Set by the kernel: whether an image can reach the model at all.
+    images_reach_model: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Shared handle to the surface's question-asker. `main` sets it after building
@@ -785,6 +787,7 @@ impl ToolRegistry {
             artifacts: None,
             agent_parent: Arc::new(Mutex::new(None)),
             agent_session: Arc::new(Mutex::new(None)),
+            images_reach_model: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -960,6 +963,7 @@ impl ToolRegistry {
                 artifacts: artifacts.clone(),
                 browser,
             }),
+            images_reach_model: r.images_reach_model.clone(),
         }));
         r.register(Arc::new(FsWrite {
             sbx: sandbox.clone(),
@@ -1132,6 +1136,11 @@ impl Executor for ToolRegistry {
         self.tasks.as_ref().map(|t| t.info()).unwrap_or_default()
     }
 
+    fn images_reach_model(&self, reach: bool) {
+        self.images_reach_model
+            .store(reach, std::sync::atomic::Ordering::Relaxed);
+    }
+
     async fn named_outputs(&self, text: &str, since: f64) -> Vec<serde_json::Value> {
         match &self.sandbox {
             Some(sbx) => outputs::named(sbx, text, since).await,
@@ -1264,6 +1273,23 @@ struct Read {
     count: WordCount,
     /// `render: true`; absent when no Chromium-family browser is installed.
     page: Option<browser::BrowserScreenshot>,
+    images_reach_model: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Read {
+    /// Why an image would be wasted on this model, when it would be.
+    fn no_use_for_images(&self, instead: &str) -> Result<(), ToolError> {
+        if self
+            .images_reach_model
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        Err(ToolError::Failed(format!(
+            "this model cannot read images, and no vision model is configured to describe \
+             them, so no image was made. {instead}"
+        )))
+    }
 }
 
 #[async_trait]
@@ -1318,6 +1344,9 @@ impl Tool for Read {
         let path = arg_str(args, "path")
             .map_err(|_| ToolError::Args("read needs `path` or `hash`".into()))?;
         if args.get("render").and_then(Value::as_bool) == Some(true) {
+            self.no_use_for_images(
+                "Check the page another way: read its source, or run a command that tests it.",
+            )?;
             return match &self.page {
                 Some(page) => page.render(args).await,
                 None => Err(ToolError::Failed(
@@ -1333,6 +1362,10 @@ impl Tool for Read {
         // The extension only routes the call; `image.view` identifies the bytes
         // and reports a mislabelled file rather than guessing.
         if media::has_image_extension(std::path::Path::new(&path)) {
+            self.no_use_for_images(
+                "Say what you need from the file, or inspect it with a command (its size, \
+                 format or metadata).",
+            )?;
             return self.image.execute(args).await;
         }
         self.text.execute(args).await
@@ -8117,6 +8150,41 @@ mod tests {
             page.model_text.is_none(),
             "a stored page keeps its own shape"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Screenshots and image reads are declined, with a reason, for a model
+    /// images cannot reach; text reads and models that see are unaffected.
+    #[tokio::test]
+    async fn a_model_images_cannot_reach_is_not_led_to_them() {
+        let dir = std::env::temp_dir().join(format!("medha-sight-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        std::fs::write(dir.join("page.html"), "<html><h1>hi</h1></html>").unwrap();
+        // A real image: the tool identifies the bytes, not the name.
+        let png = media::from_rgba(3, 2, &[200; 3 * 2 * 4]).unwrap();
+        std::fs::write(dir.join("dot.png"), png).unwrap();
+
+        let seen = run(&reg, "read", json!({ "path": "dot.png" })).await;
+        assert_eq!(seen.status, kernel::ObsStatus::Ok, "{}", seen.payload);
+        assert_eq!(
+            seen.media.len(),
+            1,
+            "a model that reads images gets the image"
+        );
+
+        kernel::Executor::images_reach_model(&reg, false);
+        for args in [
+            json!({ "path": "page.html", "render": true }),
+            json!({ "path": "dot.png" }),
+        ] {
+            let declined = run(&reg, "read", args).await;
+            assert_eq!(declined.status, kernel::ObsStatus::Error);
+            assert!(declined.media.is_empty(), "no image is made");
+            let reason = declined.payload["error"].as_str().unwrap();
+            assert!(reason.contains("this model cannot read images"), "{reason}");
+        }
+        let text = run(&reg, "read", json!({ "path": "page.html" })).await;
+        assert_eq!(text.status, kernel::ObsStatus::Ok);
         std::fs::remove_dir_all(&dir).ok();
     }
 

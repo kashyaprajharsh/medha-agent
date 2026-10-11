@@ -78,11 +78,9 @@ async fn an_image_a_model_cannot_see_travels_as_a_labelled_description() {
     };
     let mut context = context_with(&[&hash]);
 
-    let count = describe_media(&mut context, Arc::clone(&store), &describer)
-        .await
-        .unwrap();
+    let done = describe_media(&mut context, Arc::clone(&store), Some(&describer)).await;
 
-    assert_eq!(count, 1);
+    assert_eq!((done.described, done.not_shown), (1, 0));
     let parts = &context.ordered.as_ref().unwrap()[0].parts;
     assert!(
         !parts
@@ -109,26 +107,60 @@ async fn the_same_image_is_described_once_per_request() {
     let mut context = context_with(&[&hash, &hash]);
 
     assert_eq!(
-        describe_media(&mut context, Arc::clone(&store), &describer)
+        describe_media(&mut context, Arc::clone(&store), Some(&describer))
             .await
-            .unwrap(),
+            .described,
         2
     );
     assert_eq!(describer.calls.lock().unwrap().len(), 1);
 }
 
+/// A text model with no vision model beside it still gets its turn: the image
+/// is replaced by a note it reads, never sent and never silently dropped. The
+/// same holds when the vision model cannot be reached.
 #[tokio::test]
-async fn without_an_auxiliary_model_the_turn_says_so_instead_of_dropping_the_image() {
+async fn an_image_no_model_can_read_becomes_a_note_and_the_turn_goes_on() {
     let store: Arc<dyn ArtifactStore> = Arc::new(MemoryArtifacts::default());
     let hash = store.put(b"pixels").unwrap();
+    let texts = |context: &crate::CompiledContext| -> Vec<String> {
+        context.ordered.as_ref().unwrap()[0]
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text(text) => Some(text.text.clone()),
+                ContentPart::Media(_) => panic!("an image reached a model that cannot read it"),
+                _ => None,
+            })
+            .collect()
+    };
+
     let mut context = context_with(&[&hash]);
-
-    let error = describe_media(&mut context, store, &NoVision)
-        .await
-        .unwrap_err();
-
+    let done = describe_media(&mut context, Arc::clone(&store), None).await;
+    assert_eq!((done.described, done.not_shown, done.failure), (0, 1, None));
     assert!(
-        error.contains("no auxiliary vision model is configured"),
-        "{error}"
+        texts(&context).contains(
+            &"[image not shown: this model cannot read images, and no vision model is configured \
+          to describe it]"
+                .to_owned()
+        )
     );
+
+    struct Unreachable;
+    #[async_trait::async_trait]
+    impl VisionDescriber for Unreachable {
+        async fn describe(&self, _: &str, _: &str, _: &[u8]) -> Result<String, String> {
+            Err("connection refused".into())
+        }
+        fn model(&self) -> &str {
+            "aux/vision"
+        }
+    }
+    let mut context = context_with(&[&hash]);
+    let done = describe_media(&mut context, store, Some(&Unreachable)).await;
+    assert_eq!(done.not_shown, 1);
+    assert_eq!(done.failure.as_deref(), Some("connection refused"));
+    assert!(texts(&context).contains(
+        &"[image not shown: this model cannot read images, and aux/vision could not describe it]"
+            .to_owned()
+    ));
 }

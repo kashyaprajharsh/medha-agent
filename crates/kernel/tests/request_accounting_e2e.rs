@@ -1122,6 +1122,10 @@ struct AutoImageProvider {
     caps: ProviderCaps,
     observed: Mutex<ImageSupport>,
     sent: Mutex<Vec<PreparedModelRequest>>,
+    /// How this server words its refusal of a request that carries an image.
+    refusal: &'static str,
+    /// Refuses every request the same way, image or not.
+    broken: bool,
 }
 
 impl AutoImageProvider {
@@ -1137,6 +1141,8 @@ impl AutoImageProvider {
             },
             observed: Mutex::new(believed),
             sent: Mutex::new(Vec::new()),
+            refusal: "this model does not support image input",
+            broken: false,
         }
     }
 }
@@ -1168,16 +1174,36 @@ impl Provider for AutoImageProvider {
         &self,
         request: &PreparedModelRequest,
     ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
-        let mut sent = self.sent.lock().unwrap();
-        sent.push(request.clone());
-        if sent.len() == 1 {
-            return Err(ProviderError::Status(
-                400,
-                "this model does not support image input".into(),
-            ));
+        // A text-only server: any request carrying an image is refused.
+        self.sent.lock().unwrap().push(request.clone());
+        if self.broken || carries_image(request) {
+            return Err(ProviderError::Status(400, self.refusal.into()));
         }
         Ok(stream::iter([Ok(Block::Text("described answer".into()))]).boxed())
     }
+}
+
+fn carries_image(request: &PreparedModelRequest) -> bool {
+    request.context.ordered_messages().iter().any(|message| {
+        message
+            .parts
+            .iter()
+            .any(|part| matches!(part, ContentPart::Media(_)))
+    })
+}
+
+fn image_message(text: &str) -> Message {
+    let mut message = Message::user(text);
+    message.attachments.push(MediaPart {
+        mime_type: "image/png".into(),
+        source: MediaSource::Artifact("hash".into()),
+        label: Some("screen.png".into()),
+        width: None,
+        height: None,
+        byte_size: None,
+        provider_state: Vec::new(),
+    });
+    message
 }
 
 struct TestVision;
@@ -1224,6 +1250,102 @@ async fn unknown_native_image_rejection_retries_once_as_auxiliary_text() {
     image_rejection_retries_once_as_text(ImageSupport::Unknown).await;
 }
 
+/// A refusal in unlisted words is proved by the request passing without its
+/// image; a server that fails either way reports its own error and teaches nothing.
+#[tokio::test]
+async fn an_image_refusal_in_unknown_words_is_found_out_by_trying_without_it() {
+    let run = |refusal: &'static str, broken: bool| async move {
+        let mut provider = AutoImageProvider::believed(ImageSupport::Unknown);
+        provider.refusal = refusal;
+        provider.broken = broken;
+        let provider = Arc::new(provider);
+        let kernel = Kernel::new(
+            provider.clone(),
+            Arc::new(InMemoryLog::new()),
+            Arc::new(ToolExecutor),
+            Arc::new(Passthrough),
+            Arc::new(ImageArtifacts),
+            Arc::new(AllowAll),
+            Arc::new(AutoDeny),
+            Arc::new(NoVerify),
+        );
+        let outcome = kernel
+            .run_session(
+                &Session::new(),
+                vec![image_message("look")],
+                Budget::default(),
+                &kernel::NullSink,
+                None,
+            )
+            .await
+            .map(|(_, stop)| stop)
+            .map_err(|error| error.to_string());
+        let sent = provider.sent.lock().unwrap().len();
+        let learned = *provider.observed.lock().unwrap();
+        (outcome, sent, learned)
+    };
+
+    let (outcome, sent, learned) = run("invalid request: content[1] not allowed", false).await;
+    assert_eq!(outcome, Ok(StopReason::Finished));
+    assert_eq!((sent, learned), (2, ImageSupport::Unsupported));
+
+    let (outcome, sent, learned) = run("invalid request: unknown model", true).await;
+    let error = outcome.unwrap_err();
+    assert!(error.contains("invalid request: unknown model"), "{error}");
+    assert_eq!((sent, learned), (2, ImageSupport::Unknown));
+}
+
+/// A text model with no vision model meets an image: the turn finishes on a
+/// note, and so does the next one, with the image still in the history.
+#[tokio::test]
+async fn an_image_never_ends_a_text_models_turn_or_the_chat_after_it() {
+    let mut provider = AutoImageProvider::believed(ImageSupport::Unknown);
+    provider.refusal = "At most 0 image(s) may be provided in one prompt. (parameter=image)";
+    let provider = Arc::new(provider);
+    let kernel = Kernel::new(
+        provider.clone(),
+        Arc::new(InMemoryLog::new()),
+        Arc::new(ToolExecutor),
+        Arc::new(Passthrough),
+        Arc::new(ImageArtifacts),
+        Arc::new(AllowAll),
+        Arc::new(AutoDeny),
+        Arc::new(NoVerify),
+    );
+    let session = Session::new();
+    let run = |messages: Vec<Message>| {
+        kernel.run_session(
+            &session,
+            messages,
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        )
+    };
+
+    let (mut history, stop) = run(vec![image_message("does it render?")]).await.unwrap();
+    assert_eq!(stop, StopReason::Finished);
+    history.push(Message::user("ok"));
+    let (_, stop) = run(history).await.unwrap();
+    assert_eq!(stop, StopReason::Finished);
+
+    let sent = provider.sent.lock().unwrap();
+    assert_eq!(
+        sent.len(),
+        3,
+        "one refused request, its retry, then the next turn"
+    );
+    assert!(carries_image(&sent[0]));
+    for request in &sent[1..] {
+        assert!(!carries_image(request), "the image is not sent again");
+        assert!(request.context.ordered_messages().iter().any(|message| {
+            message.parts.iter().any(|part| {
+                matches!(part, ContentPart::Text(text) if text.text.starts_with("[image not shown: this model cannot read images"))
+            })
+        }));
+    }
+}
+
 /// A catalogue can say a model reads images while this server takes none; the
 /// server's refusal is believed, and the turn goes on with a description.
 #[tokio::test]
@@ -1244,16 +1366,7 @@ async fn image_rejection_retries_once_as_text(believed: ImageSupport) {
         Arc::new(NoVerify),
     )
     .with_vision(Arc::new(TestVision));
-    let mut input = Message::user("what is shown?");
-    input.attachments.push(MediaPart {
-        mime_type: "image/png".into(),
-        source: MediaSource::Artifact("hash".into()),
-        label: Some("screen.png".into()),
-        width: None,
-        height: None,
-        byte_size: None,
-        provider_state: Vec::new(),
-    });
+    let input = image_message("what is shown?");
 
     let (_, stop) = kernel
         .run_session(

@@ -1,6 +1,7 @@
 //! Provider adapters; `openai_compat` is the baseline.
 
 pub mod catalogue;
+mod learned;
 pub mod model_test;
 pub mod models_dev;
 pub mod openai_compat;

@@ -30,12 +30,9 @@ pub struct ProviderClient {
     caps: ProviderCaps,
     reasoning: Mutex<ReasoningConfig>,
     streaming: std::sync::atomic::AtomicBool,
-    /// Runtime evidence is deliberately scoped to the exact
-    /// protocol/endpoint/model tuple and expires within this process.
-    observed_images: Mutex<std::collections::HashMap<String, (ImageSupport, std::time::Instant)>>,
+    /// What servers showed about their models, per protocol/endpoint/model.
+    learned: crate::learned::Learned,
 }
-
-const IMAGE_OBSERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Compatibility name retained while callers migrate to the protocol/profile
 /// client introduced by the provider refactor.
@@ -197,8 +194,15 @@ impl ProviderClient {
             },
             reasoning: Mutex::new(ReasoningConfig::default()),
             streaming: std::sync::atomic::AtomicBool::new(true),
-            observed_images: Mutex::new(std::collections::HashMap::new()),
+            learned: crate::learned::Learned::default(),
         }
+    }
+
+    /// Keep what servers show about their models in `path`, and start from
+    /// what earlier sessions learned there.
+    pub fn remembering(mut self, path: std::path::PathBuf) -> Self {
+        self.learned = crate::learned::Learned::at(path);
+        self
     }
 
     fn image_identity(profile: &ProviderProfile) -> String {
@@ -920,20 +924,15 @@ impl Provider for ProviderClient {
     fn image_support(&self) -> kernel::ImageSupport {
         let profile = self.connection.lock().unwrap().profile.clone();
         let declared = Self::profile_image_support(&profile);
-        if profile.image_input != ImageInputMode::Auto || declared != ImageSupport::Unknown {
+        // The operator's setting and the protocol's own limit are final.
+        if profile.image_input != ImageInputMode::Auto || !profile.protocol.carries_images() {
             return declared;
         }
-        let identity = Self::image_identity(&profile);
-        let now = std::time::Instant::now();
-        let mut observations = self.observed_images.lock().unwrap();
-        match observations.get(&identity).copied() {
-            Some((support, expires)) if expires > now => support,
-            Some(_) => {
-                observations.remove(&identity);
-                ImageSupport::Unknown
-            }
-            None => ImageSupport::Unknown,
-        }
+        // What this server showed outranks what a catalogue says of the model:
+        // a vision model can be served with images turned off.
+        self.learned
+            .images(&Self::image_identity(&profile))
+            .unwrap_or(declared)
     }
 
     fn image_input_mode(&self) -> ImageInputMode {
@@ -945,10 +944,8 @@ impl Provider for ProviderClient {
         if profile.image_input != ImageInputMode::Auto {
             return;
         }
-        self.observed_images.lock().unwrap().insert(
-            Self::image_identity(&profile),
-            (support, std::time::Instant::now() + IMAGE_OBSERVATION_TTL),
-        );
+        self.learned
+            .set_images(&Self::image_identity(&profile), support);
     }
 
     fn context_identity(&self) -> String {
@@ -3011,6 +3008,30 @@ mod reasoning_request_tests {
 
         provider.switch_provider_profile(first, "").unwrap();
         assert_eq!(provider.image_support(), ImageSupport::Unsupported);
+    }
+
+    /// A catalogue describes the model; the server's refusal describes this
+    /// deployment, and wins. The operator's own setting stays final.
+    #[test]
+    fn what_the_server_showed_outranks_the_catalogue_but_not_the_operator() {
+        let mut listed = ProviderProfile::openai_chat("http://one/v1", "vision", AuthKind::None);
+        listed.capabilities = Some(crate::ModelCapabilities {
+            modalities: Some(crate::ModalitySet {
+                input: Some(["text".into(), "image".into()].into_iter().collect()),
+                output: Some(["text".into()].into_iter().collect()),
+            }),
+            ..crate::ModelCapabilities::default()
+        });
+        let provider = ProviderClient::from_profile(listed.clone(), "").unwrap();
+        assert_eq!(provider.image_support(), ImageSupport::Supported);
+        provider.observe_image_support(ImageSupport::Unsupported);
+        assert_eq!(provider.image_support(), ImageSupport::Unsupported);
+
+        let mut forced = listed;
+        forced.image_input = ImageInputMode::Native;
+        let provider = ProviderClient::from_profile(forced, "").unwrap();
+        provider.observe_image_support(ImageSupport::Unsupported);
+        assert_eq!(provider.image_support(), ImageSupport::Supported);
     }
 
     #[test]

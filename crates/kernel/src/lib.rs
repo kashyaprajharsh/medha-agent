@@ -66,6 +66,6 @@ pub use types::{
     Usage, canonical_tool_names, portable_tool_name, portable_tool_name_map,
 };
 pub use verify::{NoVerify, Verifier, VerifyReport};
-pub use vision::{NoVision, VisionDescriber, describe_media};
+pub use vision::{Substituted, VisionDescriber, describe_media};
 
 mod usage_reporting;

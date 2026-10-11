@@ -99,6 +99,18 @@ fn answer(mut stream: TcpStream, seen: mpsc::Sender<Value>, release: &Mutex<mpsc
         .as_array()
         .is_some_and(|all| all.iter().any(|message| message["role"] == "tool"));
     let _ = seen.send(body.clone());
+    // A chat that names a text-only server gets one: it takes no images, and
+    // says so the way a local server set to allow none does.
+    let raw = body.to_string();
+    if raw.contains("TEXT_ONLY_SERVER") && raw.contains("\"image_url\"") {
+        let refusal = r#"{"error":{"message":"At most 0 image(s) may be provided in one prompt. (parameter=image)","type":"BadRequestError","param":"image","code":400}}"#;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}",
+            refusal.len()
+        );
+        return;
+    }
     if asked.contains("HOLD") {
         let _ = release.lock().unwrap().recv_timeout(WAIT);
     }
@@ -1879,6 +1891,66 @@ async fn a_written_page_is_read_back_from_its_write_and_never_copied() {
         })
         .collect();
     assert!(stored.is_empty(), "nothing was copied: {stored:?}");
+}
+
+/// A text-only server refuses an image: the turn and the chat still go on, a
+/// second image read is declined up front, and the lesson is kept for later chats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_text_only_server_never_stops_a_chat_that_meets_an_image() {
+    const PNG: [u8; 70] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x38,
+        0x71, 0xe2, 0xc4, 0x7f, 0x00, 0x08, 0x0c, 0x03, 0x58, 0x1f, 0xff, 0xb6, 0xf3, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    let world = World::new();
+    let backend = world.backend();
+    let mut client = backend.connect().await;
+    let folder = world.folder("textonly");
+    std::fs::write(folder.join("dot.png"), PNG).unwrap();
+    let chat = client.open(&folder).await;
+    let turn = async |client: &mut Client, text: &str| {
+        client.send(&chat, text).await;
+        let (_, ended) = client
+            .until(|frame| kind(frame, "turn.done") || kind(frame, "turn.error"))
+            .await;
+        assert!(kind(&ended, "turn.done"), "{text}: {ended}");
+    };
+    let carried_image = |world: &World| {
+        let mut any = false;
+        while let Ok(request) = world.provider.seen.try_recv() {
+            any |= request.to_string().contains("\"image_url\"");
+        }
+        any
+    };
+
+    turn(&mut client, "TEXT_ONLY_SERVER hello").await;
+    assert!(!carried_image(&world));
+    // The model reads the image; the server refuses it; the turn finishes anyway.
+    turn(&mut client, "READ_PATH dot.png").await;
+    assert!(carried_image(&world), "the image was tried once");
+    // The image is still in the chat's history, and the chat still goes on.
+    turn(&mut client, "ok").await;
+    assert!(!carried_image(&world), "it is not sent again");
+    // Asked again, the read is declined before an image is made.
+    client.send(&chat, "READ_PATH dot.png").await;
+    let (_, declined) = client.until(|frame| kind(frame, "tool.observation")).await;
+    assert_eq!(declined["params"]["ok"], false, "{declined}");
+    assert!(
+        declined["params"]["payload"]["error"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("this model cannot read images")),
+        "{declined}"
+    );
+    client.until(|frame| kind(frame, "turn.done")).await;
+    assert!(!carried_image(&world));
+
+    let learned = std::fs::read_to_string(world.home().join("learned_models.json")).unwrap();
+    assert!(
+        learned.contains("test-model") && learned.contains("false"),
+        "{learned}"
+    );
 }
 
 /// The provider's key never travels back to the provider inside a tool result:

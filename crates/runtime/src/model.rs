@@ -200,6 +200,11 @@ pub async fn resolve(
         OpenAiCompat::from_profile(runtime_profile, resolved.credential)
             .map_err(|error| anyhow::anyhow!(error))?
     };
+    // What servers show about their models is kept between sessions.
+    let provider = match config::medha_home() {
+        Ok(home) => provider.remembering(home.join("learned_models.json")),
+        Err(_) => provider,
+    };
     let provider = Arc::new(provider);
 
     let reasoning = options

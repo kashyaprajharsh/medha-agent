@@ -145,6 +145,34 @@ mod tests {
         );
     }
 
+    /// A window that attaches to a running chat rebuilds from these rows, so a
+    /// result's stored place must be on its row: that is what names the pages
+    /// the model later reads from it.
+    #[test]
+    fn a_result_keeps_its_stored_place_for_a_window_that_attaches_later() {
+        let mut state = Presentation::default();
+        state.seed("one".into(), &[], settings());
+        observe(&mut state, TurnEvent::Started { turn: 1 });
+        observe(
+            &mut state,
+            TurnEvent::ToolResult {
+                id: Some("a".into()),
+                tool: "shell.exec".into(),
+                ok: true,
+                payload: json!({"exit_code": 0}),
+                source_event: Some("event".into()),
+                stored: Some("c0ffee".into()),
+            },
+        );
+        let rows = state.snapshot().items;
+        assert!(
+            rows.iter().any(
+                |row| matches!(row, Item::ToolResult { stored, .. } if stored.as_deref() == Some("c0ffee"))
+            ),
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn retries_preserve_durable_rows_and_do_not_join_an_older_answer() {
         let mut state = Presentation::default();
@@ -663,6 +691,7 @@ impl Presentation {
                         ok,
                         payload,
                         source_event: None,
+                        stored: None,
                     });
                 }
                 _ => {}
@@ -744,7 +773,7 @@ impl Presentation {
                 ok,
                 payload,
                 source_event,
-                ..
+                stored,
             } => {
                 self.metrics.current_tool = None;
                 self.rows.push(Item::ToolResult {
@@ -753,6 +782,7 @@ impl Presentation {
                     ok,
                     payload,
                     source_event,
+                    stored,
                 });
             }
             TurnEvent::Notice { text } => self.rows.push(Item::Notice { text }),
@@ -938,6 +968,7 @@ impl Presentation {
                             ok,
                             payload,
                             source_event: None,
+                            stored: None,
                         }),
                         AgentStep::Restarted => {
                             pane.rows.attempt = pane

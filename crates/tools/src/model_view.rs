@@ -102,6 +102,27 @@ pub(crate) fn clean_terminal(text: &str) -> String {
         .join("\n")
 }
 
+/// The lines of a page as the model is shown them, without their numbers: each
+/// exact, except that one longer than [`MAX_LINE`] is cut, with the cut marked.
+pub(crate) fn page_lines(content: &str) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+    content.split_inclusive('\n').map(|line| {
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        if text.len() <= MAX_LINE {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        let mut cut = MAX_LINE;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        std::borrow::Cow::Owned(format!(
+            "{} … [line cut: {} of {} bytes shown]",
+            &text[..cut],
+            cut,
+            text.len()
+        ))
+    })
+}
+
 /// A page of a file as numbered lines, `N|text`, then where the next page
 /// starts. The numbers are not part of the file; lines are otherwise exact.
 pub(crate) fn file_page(payload: &Value) -> Option<String> {
@@ -109,24 +130,10 @@ pub(crate) fn file_page(payload: &Value) -> Option<String> {
     let start = payload["start_line"].as_u64()?;
     let mut view = String::with_capacity(content.len() + content.len() / 6);
     let mut number = start;
-    for line in content.split_inclusive('\n') {
-        let text = line.strip_suffix('\n').unwrap_or(line);
+    for line in page_lines(content) {
         view.push_str(&number.to_string());
         view.push('|');
-        if text.len() > MAX_LINE {
-            let mut cut = MAX_LINE;
-            while !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            view.push_str(&text[..cut]);
-            view.push_str(&format!(
-                " … [line cut: {} of {} bytes shown]",
-                cut,
-                text.len()
-            ));
-        } else {
-            view.push_str(text);
-        }
+        view.push_str(&line);
         view.push('\n');
         number += 1;
     }

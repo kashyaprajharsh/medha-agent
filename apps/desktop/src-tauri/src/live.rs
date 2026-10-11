@@ -758,7 +758,7 @@ fn render_snapshot(mut frame: Value, steps: &mut Steps, segment: &mut String) ->
                 Row::Assistant { text, source_event } => Event::Text { delta: text, source_event },
                 Row::Reasoning { text } => Event::Reasoning { delta: text },
                 Row::ToolCall { id, tool, args } => Event::ToolCall { id, tool, args },
-                Row::ToolResult { id, tool, ok, payload, source_event } => Event::ToolResult { id, tool, ok, payload, source_event, stored: None },
+                Row::ToolResult { id, tool, ok, payload, source_event, stored } => Event::ToolResult { id, tool, ok, payload, source_event, stored },
                 Row::Compaction { before, after, summarized, summary } => Event::Compaction { before, after, summarized, summary },
                 Row::Verify { ok, summary } => Event::Verify { ok, summary },
                 Row::Notice { text } => Event::Notice { text },

@@ -36,6 +36,10 @@ pub enum PresentationItem {
         payload: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_event: Option<String>,
+        /// Where the whole of what the model would have read is kept, when it
+        /// was too large to send.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stored: Option<String>,
     },
     Notice {
         text: String,

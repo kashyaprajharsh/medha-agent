@@ -13,6 +13,7 @@ mod edit_match;
 mod model_view;
 pub mod outputs;
 mod shell_hints;
+mod shown;
 pub use agents::{ParentHandle, SessionHandle};
 
 pub mod hub;
@@ -937,9 +938,12 @@ impl ToolRegistry {
         let mut r = Self::new();
         r.sandbox = Some(sandbox.clone());
         r.artifacts = Some(artifacts.clone());
+        // What `read` showed, so `write` and `edit` know read output pasted back.
+        let shown = shown::ShownPages::default();
         r.register(Arc::new(Read {
             text: FsRead {
                 sbx: sandbox.clone(),
+                shown: shown.clone(),
             },
             image: ImageView {
                 sbx: sandbox.clone(),
@@ -962,6 +966,7 @@ impl ToolRegistry {
             pins: Default::default(),
             lsp: r.lsp.clone(),
             artifacts: artifacts.clone(),
+            shown: shown.clone(),
         }));
         r.register(Arc::new(Edit {
             replace: FsEdit {
@@ -969,6 +974,7 @@ impl ToolRegistry {
                 pins: Default::default(),
                 lsp: r.lsp.clone(),
                 artifacts: artifacts.clone(),
+                shown,
             },
             many: MultiEdit {
                 sbx: sandbox.clone(),
@@ -1335,6 +1341,7 @@ impl Tool for Read {
 
 struct FsRead {
     sbx: Arc<WorkspaceSandbox>,
+    shown: shown::ShownPages,
 }
 
 /// Lets the model look at an image file itself, instead of the user having to
@@ -1542,8 +1549,19 @@ impl Tool for FsRead {
         }))
     }
 
+    /// The page as numbered lines, remembered as shown so that the same lines
+    /// pasted back into a write or an edit are recognised.
     fn model_view(&self, payload: &Value) -> Option<String> {
-        model_view::file_page(payload)
+        let view = model_view::file_page(payload)?;
+        if let (Some(content), Some(start)) =
+            (payload["content"].as_str(), payload["start_line"].as_u64())
+        {
+            let lines = model_view::page_lines(content)
+                .map(|line| line.trim_end_matches('\r').to_owned())
+                .collect();
+            self.shown.remember(start, lines);
+        }
+        Some(view)
     }
 }
 
@@ -1604,6 +1622,22 @@ impl Tool for Edit {
         })
     }
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
+        // Text for a file never carries a read's line numbers, in any shape.
+        const TEXTS: [&str; 2] = ["old_string", "new_string"];
+        let single = TEXTS.into_iter().map(|field| (field, &args[field]));
+        let several = args["edits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|edit| TEXTS.into_iter().map(move |field| (field, &edit[field])));
+        for (field, text) in single.chain(several) {
+            if let Some(reason) = text
+                .as_str()
+                .and_then(|text| self.replace.shown.refusal(field, text))
+            {
+                return Err(ToolError::Args(reason));
+            }
+        }
         match self.shape(args) {
             Some(Shape::Many) => self.many.execute(args).await,
             Some(Shape::Replace) => self.replace.execute(args).await,
@@ -1655,6 +1689,7 @@ struct FsWrite {
     pins: PreviewPins,
     lsp: LspHandle,
     artifacts: Arc<dyn kernel::ArtifactStore>,
+    shown: shown::ShownPages,
 }
 #[async_trait]
 impl Tool for FsWrite {
@@ -1686,6 +1721,9 @@ impl Tool for FsWrite {
     async fn execute(&self, args: &Value) -> Result<Value, ToolError> {
         let path = arg_str(args, "path")?;
         let content = arg_str(args, "content")?;
+        if let Some(reason) = self.shown.refusal("content", &content) {
+            return Err(ToolError::Args(reason));
+        }
         // Resolve/authorise first, then serialize on the canonical physical
         // target. Keep that exact target pinned through the write.
         let guard = self
@@ -1936,6 +1974,7 @@ struct FsEdit {
     pins: PreviewPins,
     lsp: LspHandle,
     artifacts: Arc<dyn kernel::ArtifactStore>,
+    shown: shown::ShownPages,
 }
 #[async_trait]
 impl Tool for FsEdit {
@@ -8081,6 +8120,49 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Read output pasted into a file is refused, with its numbers named as the
+    /// reason, and the file is left as it was; rows that merely look numbered
+    /// are written as they are.
+    #[tokio::test]
+    async fn read_output_pasted_into_a_write_or_an_edit_is_refused() {
+        let dir = std::env::temp_dir().join(format!("medha-pasted-{}", ulid_like()));
+        let reg = reg_in(&dir);
+        let source = "fn main() {\n    run();\n}\n";
+        run(&reg, "write", json!({ "path": "a.rs", "content": source })).await;
+        run(&reg, "read", json!({ "path": "a.rs" })).await;
+
+        let pasted = "1|fn main() {\n2|    run();\n3|}\n";
+        let wrote = run(&reg, "write", json!({ "path": "b.rs", "content": pasted })).await;
+        assert_eq!(wrote.status, kernel::ObsStatus::Error);
+        let reason = wrote.payload["error"].as_str().unwrap();
+        assert!(
+            reason.contains("`content` holds lines copied from a read"),
+            "{reason}"
+        );
+        assert!(reason.ends_with("fn main() {\n    run();\n}"), "{reason}");
+        assert!(!dir.join("b.rs").exists());
+
+        let edited = run(
+            &reg,
+            "edit",
+            json!({ "path": "a.rs", "old_string": "    run();\n", "new_string": "2|    run();\n3|}\n" }),
+        )
+        .await;
+        assert_eq!(edited.status, kernel::ObsStatus::Error);
+        assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), source);
+
+        let rows = "1|alice\n2|bob\n";
+        let data = run(
+            &reg,
+            "write",
+            json!({ "path": "rows.txt", "content": rows }),
+        )
+        .await;
+        assert_eq!(data.status, kernel::ObsStatus::Ok, "{}", data.payload);
+        assert_eq!(std::fs::read_to_string(dir.join("rows.txt")).unwrap(), rows);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn ranged_read_preserves_crlf_then_edit_roundtrips() {
         let dir = std::env::temp_dir().join(format!("medha-crlf-{}", ulid_like()));
@@ -9420,7 +9502,10 @@ mod tests {
         let dir = test_support::scratch("medha-dirread");
         std::fs::create_dir_all(dir.join("inner")).unwrap();
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
-        let tool = FsRead { sbx };
+        let tool = FsRead {
+            sbx,
+            shown: Default::default(),
+        };
         // "Is a directory (os error 21)" names the problem and no remedy.
         let error = tool
             .execute(&json!({ "path": "inner" }))
@@ -9436,7 +9521,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("medha-missing-{}", ulid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         let sbx = Arc::new(WorkspaceSandbox::new_jailed(&dir).unwrap());
-        let tool = FsRead { sbx };
+        let tool = FsRead {
+            sbx,
+            shown: Default::default(),
+        };
 
         let error = tool
             .execute(&json!({ "path": "nope.txt" }))
@@ -9513,7 +9601,10 @@ mod tests {
             )
             .unwrap(),
         );
-        let tool = FsRead { sbx };
+        let tool = FsRead {
+            sbx,
+            shown: Default::default(),
+        };
 
         let out = tool
             .execute(&json!({ "path": target.to_string_lossy() }))

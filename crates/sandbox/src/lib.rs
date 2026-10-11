@@ -1338,6 +1338,11 @@ fn command_name(program: &str) -> &str {
         .unwrap_or(program)
 }
 
+/// Whether `program`, named bare, is one that only reads.
+pub fn reads_only(program: &str, args: &[String]) -> bool {
+    is_read_only_command(program, args)
+}
+
 fn is_read_only_command(command: &str, args: &[String]) -> bool {
     match command {
         "cat" | "head" | "tail" | "less" | "more" | "wc" | "stat" | "file" | "readlink"

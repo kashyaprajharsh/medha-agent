@@ -262,6 +262,18 @@ fn scan_command(intent: &ToolIntent, workspace: Option<&str>, scratch: Option<&s
     Decision::Allow
 }
 
+/// Each plain command in `command` as its words, or `None` when the shell could
+/// run or write something the text does not show.
+pub fn plain_commands(command: &str) -> Option<Vec<Vec<String>>> {
+    let syntax = parse_shell_syntax(command).ok()?;
+    let hidden = syntax.dynamic
+        || syntax.redirection
+        || syntax.background
+        || syntax.grouping
+        || syntax.comment;
+    (!hidden).then(|| syntax.commands.into_iter().map(|c| c.words).collect())
+}
+
 /// A deliberately small shell AST. Medha does not need to reproduce a shell's
 /// expansion semantics here; it needs to distinguish plain argv-like commands
 /// from syntax whose eventual executable or data flow is not statically known.

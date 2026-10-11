@@ -697,3 +697,218 @@ async fn parent_wait_does_not_hold_the_mutation_lane_needed_by_its_child() {
     assert_eq!(parent_observations, 2);
     assert_eq!(child_observations, 1);
 }
+
+/// Calls one change per chat: the message is `name lane`, plus `slow` to run
+/// until released or `ask` to need approval first.
+struct OneChange(ProviderCaps);
+
+#[async_trait]
+impl Provider for OneChange {
+    fn capabilities(&self) -> &ProviderCaps {
+        &self.0
+    }
+
+    async fn stream(
+        &self,
+        ctx: &CompiledContext,
+    ) -> Result<BoxStream<'static, Result<Block, ProviderError>>, ProviderError> {
+        if ctx
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Tool)
+        {
+            return Ok(stream::iter(vec![Ok(Block::Text("done".into()))]).boxed());
+        }
+        let said = ctx.messages.last().unwrap().content.clone();
+        let mut words = said.split(' ');
+        let (name, lane) = (words.next().unwrap(), words.next().unwrap());
+        let args = json!({ "lane": lane, "mode": words.next() });
+        Ok(stream::iter(vec![Ok(intent(name, "change", args))]).boxed())
+    }
+}
+
+#[derive(Default)]
+struct Changes {
+    seen: Mutex<Vec<String>>,
+    happened: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    answer: tokio::sync::Notify,
+}
+
+impl Changes {
+    fn note(&self, what: String) {
+        self.seen.lock().unwrap().push(what);
+        self.happened.notify_waiters();
+    }
+
+    /// Wait until `what` has happened, or fail the test.
+    async fn until(&self, what: &str) {
+        let wait = async {
+            loop {
+                let happened = self.happened.notified();
+                if self.seen.lock().unwrap().iter().any(|seen| seen == what) {
+                    return;
+                }
+                happened.await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap_or_else(|_| panic!("{what} never happened: {:?}", self.seen.lock().unwrap()));
+    }
+}
+
+#[async_trait]
+impl Executor for Changes {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "change".into(),
+            description: String::new(),
+            schema: json!({}),
+            blast_radius: BlastRadius::ReversibleLocal,
+            category: kernel::ToolCategory::Other,
+            icon: String::new(),
+        }]
+    }
+
+    fn blast_radius(&self, _: &str) -> Option<BlastRadius> {
+        Some(BlastRadius::ReversibleLocal)
+    }
+
+    /// A call whose lane is `none` only reads, though its tool can also write.
+    fn call_radius(&self, intent: &ToolIntent) -> Option<BlastRadius> {
+        match self.mutation_key(intent) {
+            Some(_) => self.blast_radius(&intent.tool),
+            None => Some(BlastRadius::Read),
+        }
+    }
+
+    fn least_radius(&self, _: &str) -> Option<BlastRadius> {
+        Some(BlastRadius::Read)
+    }
+
+    fn mutation_key(&self, intent: &ToolIntent) -> Option<String> {
+        let lane = intent.args["lane"].as_str();
+        lane.filter(|lane| *lane != "none").map(str::to_owned)
+    }
+
+    async fn execute(&self, intent: &ToolIntent) -> Observation {
+        self.note(format!("start {}", intent.id));
+        if intent.args["mode"] == "slow" {
+            self.release.notified().await;
+        }
+        self.note(format!("end {}", intent.id));
+        Observation::ok(&intent.id, json!({}))
+    }
+}
+
+impl kernel::Policy for Changes {
+    fn authorize(
+        &self,
+        _: kernel::AutonomyLevel,
+        intent: &ToolIntent,
+        _: Option<BlastRadius>,
+    ) -> kernel::Decision {
+        match intent.args["mode"] == "ask" {
+            true => kernel::Decision::Human,
+            false => kernel::Decision::Allow,
+        }
+    }
+}
+
+#[async_trait]
+impl kernel::HumanGate for Changes {
+    async fn confirm(&self, action: &str, _: Option<&str>, _: bool) -> kernel::Approval {
+        self.note(format!("asked {action}"));
+        self.answer.notified().await;
+        kernel::Approval::Once
+    }
+}
+
+/// A long change holds up only what overlaps it: a change elsewhere runs beside
+/// it, an approval card is shown at once, and the approved change waits its turn.
+#[tokio::test]
+async fn a_long_change_holds_up_only_what_overlaps_it() {
+    let world = Arc::new(Changes::default());
+    let kernel = Arc::new(Kernel::new(
+        Arc::new(OneChange(ContextDrivenProvider::new().caps)),
+        Arc::new(InMemoryLog::new()),
+        world.clone(),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        world.clone(),
+        world.clone(),
+        Arc::new(NoVerify),
+    ));
+    let chat = |said: &'static str| {
+        let kernel = kernel.clone();
+        tokio::spawn(async move {
+            let session = Session::new();
+            let turn = kernel.run_session(
+                &session,
+                vec![Message::user(said)],
+                Budget::default(),
+                &kernel::NullSink,
+                None,
+            );
+            turn.await.unwrap();
+        })
+    };
+
+    let build = chat("build path:/repo slow");
+    world.until("start build").await;
+    let apart = chat("apart path:/elsewhere/notes.md");
+    let card = chat("card path:/repo/src/main.rs ask");
+    world.until("end apart").await;
+    world.until("asked change").await;
+
+    world.answer.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !world
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&"start card".to_string()),
+        "an approved change still waits for the one it overlaps"
+    );
+    world.release.notify_one();
+    for chat in [build, apart, card] {
+        chat.await.unwrap();
+    }
+    let seen = world.seen.lock().unwrap().clone();
+    let at = |what: &str| seen.iter().position(|seen| seen == what).unwrap();
+    assert!(at("end apart") < at("end build"), "{seen:?}");
+    assert!(at("asked change") < at("end build"), "{seen:?}");
+    assert!(at("end build") < at("start card"), "{seen:?}");
+}
+
+/// Plan mode judges the call, not the tool: a tool that can also write may
+/// still read, and its write is still refused.
+#[tokio::test]
+async fn plan_mode_lets_a_writing_tool_read_and_refuses_its_write() {
+    let world = Arc::new(Changes::default());
+    let kernel = Kernel::new(
+        Arc::new(OneChange(ContextDrivenProvider::new().caps)),
+        Arc::new(InMemoryLog::new()),
+        world.clone(),
+        Arc::new(Passthrough),
+        Arc::new(MemArtifacts),
+        world.clone(),
+        world.clone(),
+        Arc::new(NoVerify),
+    );
+    for said in ["peek none", "poke path:/repo/a.rs"] {
+        let mut session = Session::new();
+        session.autonomy = kernel::AutonomyLevel::Plan;
+        let turn = kernel.run_session(
+            &session,
+            vec![Message::user(said)],
+            Budget::default(),
+            &kernel::NullSink,
+            None,
+        );
+        turn.await.unwrap();
+    }
+    assert_eq!(*world.seen.lock().unwrap(), ["start peek", "end peek"]);
+}

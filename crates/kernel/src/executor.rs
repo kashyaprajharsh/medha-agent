@@ -22,6 +22,18 @@ pub trait Executor: Send + Sync {
         None
     }
 
+    /// Risk of this one call, for a tool whose verb is an argument. Defaults to
+    /// the tool's own, which is never lower.
+    fn call_radius(&self, intent: &ToolIntent) -> Option<BlastRadius> {
+        self.blast_radius(&intent.tool)
+    }
+
+    /// The lowest risk any call of this tool has: `Read` for one that can also
+    /// write, so read-only modes still offer it.
+    fn least_radius(&self, tool: &str) -> Option<BlastRadius> {
+        self.blast_radius(tool)
+    }
+
     /// The registered tool's presentation category, or `None` if unknown.
     fn category(&self, _tool: &str) -> Option<ToolCategory> {
         None

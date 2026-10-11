@@ -20,6 +20,7 @@ pub mod sink;
 pub mod types;
 pub mod verify;
 pub mod vision;
+pub mod write_lanes;
 
 #[path = "loop_.rs"]
 pub mod kernel_loop;

@@ -442,6 +442,10 @@ pub struct McpToolSpec {
     /// Whether a screen may call this tool. True unless the server says otherwise.
     #[serde(default = "yes", skip_serializing_if = "Clone::clone")]
     pub app: bool,
+    /// The server marks it read-only and the user lets this server's calls
+    /// overlap: only then may a call run beside other changes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reads_only: bool,
 }
 
 fn yes() -> bool {
@@ -1211,6 +1215,18 @@ impl McpManager {
         name.starts_with(TOOL_PREFIX)
     }
 
+    /// Whether a call to `name` may run beside other changes.
+    pub fn reads_only(&self, name: &str) -> bool {
+        let reads = |spec: &McpToolSpec| spec.name == name && spec.reads_only;
+        let here = self
+            .catalogs()
+            .values()
+            .any(|c| c.exposed.iter().any(reads));
+        here || self
+            .hub()
+            .is_some_and(|link| link.tool_specs().iter().any(reads))
+    }
+
     /// Every tool a server offers, paired with whether it currently reaches the
     /// model. Drives the tool browser, so a filtered tool is still listed —
     /// switched off rather than invisible.
@@ -1572,7 +1588,7 @@ impl McpManager {
     /// Re-list a server's catalogue. Doubles as the liveness probe: a successful
     /// round trip is what proves a fresh connection and clears its failure count.
     async fn refresh_tools(&self, server_id: &str, expected: Option<u64>) {
-        let Some((peer, filter, generation, lapse)) = ({
+        let Some((peer, (filter, parallel), generation, lapse)) = ({
             let servers = self.inner.servers.lock().await;
             servers.get(server_id).and_then(|slot| {
                 if expected.is_some_and(|generation| slot.generation != generation)
@@ -1583,7 +1599,7 @@ impl McpManager {
                 slot.peer.clone().map(|peer| {
                     (
                         peer,
-                        slot.config.tools.clone(),
+                        (slot.config.tools.clone(), slot.config.parallel_calls),
                         slot.generation,
                         slot.lapse.clone(),
                     )
@@ -1594,7 +1610,7 @@ impl McpManager {
         };
         match timeout(self.inner.config.request_timeout, peer.list_all_tools()).await {
             Ok(Ok(tools)) => {
-                let catalog = build_catalog(server_id, &filter, tools);
+                let catalog = build_catalog(server_id, &filter, parallel, tools);
                 let mut servers = self.inner.servers.lock().await;
                 let Some(slot) = servers.get_mut(server_id) else {
                     return;
@@ -2011,7 +2027,7 @@ impl McpManager {
                 peer: client.peer().clone(),
                 client,
                 pid: None,
-                catalog: build_catalog(&server.id, &server.tools, tools),
+                catalog: build_catalog(&server.id, &server.tools, server.parallel_calls, tools),
                 lapse: None,
             }),
             Ok(Err(error)) => Err(error),
@@ -2224,7 +2240,7 @@ fn backoff(failures: u32) -> Duration {
 }
 
 /// Project a server's tools, dropping the ones the filter or name rules withhold.
-fn build_catalog(server: &str, filter: &ToolFilter, tools: Vec<Tool>) -> Catalog {
+fn build_catalog(server: &str, filter: &ToolFilter, parallel: bool, tools: Vec<Tool>) -> Catalog {
     let mut exposed = Vec::with_capacity(tools.len());
     let mut hidden = Vec::new();
     let mut app_only = Vec::new();
@@ -2236,7 +2252,9 @@ fn build_catalog(server: &str, filter: &ToolFilter, tools: Vec<Tool>) -> Catalog
             continue;
         }
         let (screen, model, app) = screen_meta(tool.meta.as_ref().map(|meta| &meta.0));
+        let marked = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
         let spec = McpToolSpec {
+            reads_only: parallel && marked == Some(true),
             name: qualify(server, &tool.name),
             description: truncate(tool.description.as_deref().unwrap_or(""), MAX_DESCRIPTION),
             schema: Value::Object(tool.input_schema.as_ref().clone()),
@@ -2772,12 +2790,32 @@ mod tests {
         let catalog = build_catalog(
             "srv",
             &filter,
+            false,
             vec![tool("visible"), tool("hidden"), tool("bad__name")],
         );
         assert_eq!(catalog.exposed.len(), 1);
         assert_eq!(catalog.exposed[0].name, "mcp__srv__visible");
         // Withheld names are kept so the tool browser can list them switched off.
         assert_eq!(catalog.hidden, vec!["bad__name", "hidden"]);
+    }
+
+    /// A server's own read-only mark is a claim: it counts only for a server the
+    /// user lets overlap, and a tool without the mark never counts.
+    #[test]
+    fn a_read_only_mark_counts_only_for_a_server_let_to_overlap() {
+        let marked = |name: &str, reads: bool| {
+            tool(name).with_annotations(rmcp::model::ToolAnnotations::new().read_only(reads))
+        };
+        let tools = || vec![marked("list", true), marked("delete", false), tool("plain")];
+        let reads = |parallel: bool| -> Vec<bool> {
+            let catalog = build_catalog("srv", &ToolFilter::default(), parallel, tools());
+            let mut exposed = catalog.exposed;
+            exposed.sort_by(|a, b| a.name.cmp(&b.name));
+            exposed.iter().map(|spec| spec.reads_only).collect()
+        };
+        // Sorted: delete, list, plain.
+        assert_eq!(reads(true), [false, true, false]);
+        assert_eq!(reads(false), [false, false, false]);
     }
 
     #[test]

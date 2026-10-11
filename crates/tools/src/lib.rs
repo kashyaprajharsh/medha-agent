@@ -10,6 +10,7 @@ use kernel::{BlastRadius, Executor, Observation, ToolCategory, ToolIntent, ToolS
 mod agents;
 mod browser;
 mod edit_match;
+mod lanes;
 mod model_view;
 pub mod outputs;
 mod shell_hints;
@@ -73,6 +74,16 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn blast_radius(&self) -> BlastRadius;
+
+    /// Risk of this one call; a tool whose verb is an argument answers per call.
+    fn call_radius(&self, _args: &Value) -> BlastRadius {
+        self.blast_radius()
+    }
+
+    /// The lowest risk any call of this tool has.
+    fn least_radius(&self) -> BlastRadius {
+        self.blast_radius()
+    }
 
     /// Stable identity of state this call changes, or `None` if side-effect free.
     /// Independent of blast radius, so a `Read` tool that mutates replayable
@@ -1107,6 +1118,20 @@ impl Executor for ToolRegistry {
         self.tools.get(tool).map(|t| t.blast_radius())
     }
 
+    fn call_radius(&self, intent: &ToolIntent) -> Option<BlastRadius> {
+        match self.tools.get(&intent.tool) {
+            Some(tool) => Some(tool.call_radius(&intent.args)),
+            None => self.blast_radius(&intent.tool),
+        }
+    }
+
+    fn least_radius(&self, tool: &str) -> Option<BlastRadius> {
+        match self.tools.get(tool) {
+            Some(found) => Some(found.least_radius()),
+            None => self.blast_radius(tool),
+        }
+    }
+
     fn category(&self, tool: &str) -> Option<ToolCategory> {
         if mcp::McpManager::is_mcp_tool(tool) {
             return Some(ToolCategory::Other);
@@ -1117,8 +1142,13 @@ impl Executor for ToolRegistry {
     fn mutation_key(&self, intent: &ToolIntent) -> Option<String> {
         if mcp::McpManager::is_mcp_tool(&intent.tool) {
             // MCP calls cross a process/trust boundary and may mutate state even
-            // when a remote server's schema does not say so.
-            return Some("state:*".to_string());
+            // when a remote server's schema does not say so: only a tool marked
+            // read-only, on a server the user lets overlap, runs beside others.
+            let reads = self
+                .mcp
+                .as_ref()
+                .is_some_and(|mcp| mcp.reads_only(&intent.tool));
+            return (!reads).then(|| kernel::write_lanes::WHOLE.to_string());
         }
         self.tools
             .get(&intent.tool)
@@ -1323,8 +1353,8 @@ impl Tool for Read {
             concat!(
                 read_text!(),
                 " An image path or stored image hash returns the picture itself, so use this \
-                 rather than a shell command to look at a screenshot or diagram: oversized \
-                 images are scaled, and rotated photos made upright, first. Pass \
+                 rather than a shell command to look at a screenshot or diagram (large ones \
+                 are scaled first). Pass \
                  `render: true` with an HTML file or http(s) URL to see the page as a \
                  screenshot; never launch a browser from the shell. A URL asks for network."
             )
@@ -1650,6 +1680,10 @@ impl Tool for Edit {
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::ReversibleLocal
     }
+    fn mutation_key(&self, args: &Value) -> Option<String> {
+        let path = args.get("path").and_then(Value::as_str);
+        Some(lanes::file(self.replace.sbx.root(), path))
+    }
     fn icon(&self) -> &'static str {
         "✎"
     }
@@ -1764,6 +1798,10 @@ impl Tool for FsWrite {
     }
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::ReversibleLocal
+    }
+    fn mutation_key(&self, args: &Value) -> Option<String> {
+        let path = args.get("path").and_then(Value::as_str);
+        Some(lanes::file(self.sbx.root(), path))
     }
     fn schema(&self) -> Value {
         json!({
@@ -5438,6 +5476,17 @@ impl Tool for ShellExec {
     fn blast_radius(&self) -> BlastRadius {
         BlastRadius::IrreversibleLocal
     }
+    // A reader waits for no one; a command allowed past the workspace runs alone.
+    fn mutation_key(&self, args: &Value) -> Option<String> {
+        let whole = Some(kernel::write_lanes::WHOLE.to_string());
+        let Ok(plan) = ShellPlan::parse(args, &self.sbx) else {
+            return whole;
+        };
+        if plan.access.outside_sandbox || !plan.access.write_paths.is_empty() {
+            return whole;
+        }
+        (!lanes::shell_only_reads(&plan.command)).then(|| lanes::tree(self.sbx.root()))
+    }
     fn timeout(&self, _args: &Value) -> Option<std::time::Duration> {
         // Self-managed: `execute` owns a bounded foreground wait and does not
         // return from its timeout path until the killed process has settled.
@@ -5494,6 +5543,9 @@ impl Tool for ShellExec {
         let workdir = plan.workdir;
         let deadline = std::time::Duration::from_secs(timeout_s);
         let mut env = shell_env();
+        if lanes::shell_only_reads(&command) {
+            env.push(lanes::git_read_env());
+        }
         // An approved unsandboxed run acts as the user, so it may reach their key agent.
         if plan.access.outside_sandbox
             && let Ok(agent) = std::env::var("SSH_AUTH_SOCK")
@@ -6005,6 +6057,14 @@ struct Git {
     sbx: Arc<WorkspaceSandbox>,
 }
 
+impl Git {
+    /// Whether this call only inspects the repository.
+    fn reads(&self, args: &Value) -> bool {
+        let sub = args.get("subcommand").and_then(Value::as_str);
+        sub.is_some_and(|sub| lanes::GIT_READS.contains(&sub))
+    }
+}
+
 /// Reject an argument that could be mistaken for a git flag (leading `-`).
 /// User-supplied revs/paths are passed as plain argv (no shell), and paths go
 /// after `--`, so this closes the only remaining flag-injection gap.
@@ -6036,6 +6096,18 @@ impl Tool for Git {
         // Mixed: reads are READ, commit/add stage/record changes. Report the max
         // (a commit is reversible via git). Policy gates the mutating subcommands.
         BlastRadius::ReversibleLocal
+    }
+    fn call_radius(&self, args: &Value) -> BlastRadius {
+        match self.reads(args) {
+            true => BlastRadius::Read,
+            false => self.blast_radius(),
+        }
+    }
+    fn least_radius(&self) -> BlastRadius {
+        BlastRadius::Read
+    }
+    fn mutation_key(&self, args: &Value) -> Option<String> {
+        (!self.reads(args)).then(|| lanes::tree(self.sbx.root()))
     }
     fn schema(&self) -> Value {
         json!({
@@ -6114,9 +6186,13 @@ impl Tool for Git {
         }
         // Fixed git subcommand, run through the sandbox backend (inherits env —
         // git needs $HOME/$PATH; it's not an arbitrary-command surface).
+        let env = match self.reads(args) {
+            true => vec![lanes::git_read_env()],
+            false => vec![],
+        };
         let output = self
             .sbx
-            .exec("git", &ga, vec![], false)
+            .exec("git", &ga, env, false)
             .await
             .map_err(|e| ToolError::Failed(format!("failed to run git: {e}")))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -6593,6 +6669,9 @@ impl Tool for Diagnostics {
         // code and write caches/artifacts. Treating this as Read would bypass the
         // human gate and let an untrusted checkout exfiltrate secrets.
         BlastRadius::IrreversibleLocal
+    }
+    fn mutation_key(&self, _args: &Value) -> Option<String> {
+        Some(lanes::tree(self.sbx.root()))
     }
     fn timeout(&self, _args: &Value) -> Option<std::time::Duration> {
         // A cold `cargo check`/`tsc`/`mvn` on a large workspace easily exceeds 60s.
@@ -9823,3 +9902,7 @@ mod image_view_tests;
 #[cfg(test)]
 #[path = "mcp_status_tests.rs"]
 mod mcp_status_tests;
+
+#[cfg(test)]
+#[path = "lane_keys_tests.rs"]
+mod lane_keys_tests;

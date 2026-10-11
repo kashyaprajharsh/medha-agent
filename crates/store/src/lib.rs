@@ -1311,6 +1311,10 @@ impl EventLog for SqliteLog {
         .map_err(|e| KernelError::Log(e.to_string()))
     }
 
+    fn mutation_lease_scope(&self, mutation_key: &str) -> String {
+        self.mutation_lock_for(mutation_key).display().to_string()
+    }
+
     async fn acquire_mutation_lease(
         &self,
         mutation_key: &str,
@@ -2626,6 +2630,46 @@ mod tests {
             .expect("second connection should enter after release")
             .expect("waiter should report acquisition");
         drop(waiter.await.unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two writers in one process hold the workspace lock together, where two
+    /// leases would wait on each other; another process waits for both.
+    #[tokio::test]
+    async fn writers_in_one_process_share_the_lease_another_process_waits_for() {
+        let dir = std::env::temp_dir().join(format!("medha-shared-lease-{}", Ulid::new()));
+        let db = dir.join("events.db");
+        let here = SqliteLog::open(&db).unwrap();
+        let elsewhere = std::sync::Arc::new(SqliteLog::open(&db).unwrap());
+        let leases = std::sync::Arc::new(kernel::write_lanes::SharedLeases::default());
+
+        let share = |key: &'static str| {
+            tokio::time::timeout(Duration::from_secs(2), leases.share(&here, key))
+        };
+        let first = share("path:/repo/a.rs")
+            .await
+            .expect("the first writer enters");
+        let second = share("path:/repo/b.rs").await.expect("the second joins it");
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let other = tokio::spawn(async move {
+            let lease = elsewhere.acquire_mutation_lease("state:*").await.unwrap();
+            let _ = entered_tx.send(());
+            lease
+        });
+
+        drop(first.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut entered_rx)
+                .await
+                .is_err(),
+            "another process entered while a writer here still held the lock"
+        );
+        drop(second.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), &mut entered_rx)
+            .await
+            .expect("the other process enters once both are done")
+            .unwrap();
+        drop(other.await.unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

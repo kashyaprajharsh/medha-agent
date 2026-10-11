@@ -488,10 +488,10 @@ pub struct Kernel<P: Provider, L: EventLog> {
     /// tree of agents would each hold their own lane and race the single surface
     /// they all prompt through.
     gate_serial: Arc<futures::lock::Mutex<()>>,
-    /// Orders state-changing turns across concurrent root/child sessions. The
-    /// guard spans execution through durable observation logging, so another
-    /// mutation cannot commit in the gap before replay learns about this one.
-    mutation_serial: Arc<tokio::sync::Mutex<()>>,
+    /// Orders overlapping changes across root and child sessions. A place is held
+    /// from the change through its saved result, so replay sees them in order.
+    lanes: Arc<crate::write_lanes::WriteLanes>,
+    leases: Arc<crate::write_lanes::SharedLeases>,
     settle_grace: std::time::Duration,
     /// Sessions whose start hooks already ran in this process, shared with
     /// derived kernels so a resumed tree fires them once.
@@ -580,6 +580,15 @@ const RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30
 /// rewrite the same turn indefinitely.
 const MAX_COMPACTION_PASSES: u32 = 3;
 
+/// One change's place among writers: taken once it is approved, kept until its
+/// result is saved, so nothing waits on a person's answer.
+struct Lane {
+    key: String,
+    cancel: tokio_util::sync::CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+    held: std::sync::Mutex<Option<(crate::write_lanes::Held, crate::write_lanes::LeaseShare)>>,
+}
+
 /// After a cancel, how long an in-flight tool gets to settle before its future
 /// is dropped and an `[interrupted]` observation is synthesized. Dropping is
 /// safe here: process trees die with the future (group reaper), and the
@@ -646,7 +655,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             secrets: Arc::default(),
             pricing: None,
             gate_serial: Arc::new(futures::lock::Mutex::new(())),
-            mutation_serial: Arc::new(tokio::sync::Mutex::new(())),
+            lanes: Arc::default(),
+            leases: Arc::default(),
             settle_grace: TOOL_SETTLE_GRACE,
             started_sessions: Arc::default(),
             sub_agent: false,
@@ -684,7 +694,8 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // Shared, not rebuilt: see the field's own note. A fresh lane here
             // is what let three children pop three cards at one surface.
             gate_serial: Arc::clone(&self.gate_serial),
-            mutation_serial: Arc::clone(&self.mutation_serial),
+            lanes: Arc::clone(&self.lanes),
+            leases: Arc::clone(&self.leases),
             settle_grace: self.settle_grace,
             started_sessions: Arc::clone(&self.started_sessions),
             sub_agent: true,
@@ -1005,6 +1016,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         cancel: tokio_util::sync::CancellationToken,
         wall_deadline: Option<tokio::time::Instant>,
         settle_deadline: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+        lane: Option<&Lane>,
         sink: &dyn StreamSink,
     ) -> (
         String,
@@ -1029,7 +1041,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             // tool gets TOOL_SETTLE_GRACE to finish and keep its real
             // observation. Only after the grace is it dropped and replaced by
             // a synthetic result, preserving intent → observation.
-            let fut = self.dispatch_one(session, &intent, web_tainted, &cancel, sink);
+            let fut = self.dispatch_one(session, &intent, web_tainted, &cancel, lane, sink);
             tokio::pin!(fut);
             tokio::select! {
                 biased;
@@ -1123,6 +1135,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                                 cancel,
                                 wall_deadline,
                                 settle_deadline,
+                                None,
                                 sink,
                             )
                             .await
@@ -1366,7 +1379,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             .specs()
             .into_iter()
             .filter(|spec| {
-                !planning || self.executor.blast_radius(&spec.name) == Some(BlastRadius::Read)
+                !planning || self.executor.least_radius(&spec.name) == Some(BlastRadius::Read)
             })
             .collect();
         // Tool definitions are sent every turn and count toward the request.
@@ -2224,12 +2237,9 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     )
             });
 
-            // Reads run concurrently; every mutation gets a hard barrier. If two
-            // writes commit B→A while the log records A→B, replay disagrees with
-            // live state. Mutation keys come from the executor, not tool names.
-            //
-            // Scoped to one mutation's execution and durable observation. Holding
-            // it across a later `agent.wait` would deadlock on a child's own write.
+            // Reads run together; this turn's changes run one by one, in order. If
+            // two commit B→A while the log records A→B, replay disagrees with live
+            // state. What a change must not overlap comes from the executor.
             let dispatch_cancel = cancel.clone();
             let dispatch_wall_deadline = gov.deadline();
             let dispatch_settle_deadline = Arc::new(std::sync::OnceLock::new());
@@ -2274,97 +2284,26 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             .await?;
                         }
                     }
-                    // Shared by every kernel derived from this one. Do not let a
-                    // competing mutation commit until this one's observation
-                    // (and MemoryWrite projection event, where applicable) is
-                    // durable. Release before any following read/wait call.
-                    let mutation_guard = tokio::select! {
-                        biased;
-                        _ = wait_for_deadline(dispatch_wall_deadline) => None,
-                        _ = dispatch_cancel.cancelled() => None,
-                        guard = self.mutation_serial.lock() => Some(guard),
+                    // The change takes its lane once approved, inside, and keeps it
+                    // until its result is saved below; a later read never waits on it.
+                    let lane = Lane {
+                        key: mutation_key,
+                        cancel: dispatch_cancel.clone(),
+                        deadline: dispatch_wall_deadline,
+                        held: Default::default(),
                     };
-                    let Some(mutation_guard) = mutation_guard else {
-                        let id = intent.id;
-                        let tool = intent.tool;
-                        let reason = if dispatch_wall_deadline
-                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                        {
-                            "[interrupted] task wall-clock deadline elapsed while waiting for the mutation lane"
-                        } else {
-                            "[interrupted] cancelled before the mutation lane became available"
-                        };
-                        self.persist_admitted(
+                    let (id, tool, obs, discovered) = self
+                        .execute_admitted(
                             session,
-                            id.clone(),
-                            tool,
-                            Observation::error(&id, reason),
-                            None,
-                            &adjusted,
-                            &mut room,
-                            &mut window_events,
-                            &mut window_taint,
-                            &mut web_tainted,
-                            &mut ordered_messages,
-                            &mut messages,
+                            intent,
+                            dispatch_web_tainted,
+                            dispatch_cancel.clone(),
+                            dispatch_wall_deadline,
+                            Arc::clone(&dispatch_settle_deadline),
+                            Some(&lane),
                             sink,
                         )
-                        .await?;
-                        continue;
-                    };
-                    // A second process has its own in-memory mutex, so the durable
-                    // writer lane comes from the log backend. Lease failure is a
-                    // settled tool error — every admitted intent gets an observation.
-                    let lease = tokio::select! {
-                        biased;
-                        _ = wait_for_deadline(dispatch_wall_deadline) => None,
-                        _ = dispatch_cancel.cancelled() => None,
-                        result = self.log.acquire_mutation_lease(&mutation_key) => Some(result),
-                    };
-                    let (durable_lease, executed) = match lease {
-                        None => {
-                            let id = intent.id;
-                            let tool = intent.tool;
-                            let reason = if dispatch_wall_deadline
-                                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                            {
-                                "[interrupted] task wall-clock deadline elapsed before the mutation lease became available"
-                            } else {
-                                "[interrupted] cancelled before the mutation lease became available"
-                            };
-                            (
-                                None,
-                                (id.clone(), tool, Observation::error(&id, reason), None),
-                            )
-                        }
-                        Some(Ok(lease)) => {
-                            let result = self
-                                .execute_admitted(
-                                    session,
-                                    intent,
-                                    dispatch_web_tainted,
-                                    dispatch_cancel.clone(),
-                                    dispatch_wall_deadline,
-                                    Arc::clone(&dispatch_settle_deadline),
-                                    sink,
-                                )
-                                .await;
-                            (Some(lease), result)
-                        }
-                        Some(Err(error)) => {
-                            let id = intent.id;
-                            let tool = intent.tool;
-                            let obs = Observation::error(
-                                &id,
-                                format!(
-                                    "state change was not started because its mutation lease \
-                                         could not be acquired: {error}"
-                                ),
-                            );
-                            (None, (id, tool, obs, None))
-                        }
-                    };
-                    let (id, tool, obs, discovered) = executed;
+                        .await;
                     self.persist_admitted(
                         session,
                         id,
@@ -2381,8 +2320,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         sink,
                     )
                     .await?;
-                    drop(durable_lease);
-                    drop(mutation_guard);
+                    drop(lane);
                 } else {
                     read_batch.push(intent);
                 }
@@ -3079,11 +3017,47 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         Ok((text, reasoning, intents, canonical, usage, false))
     }
 
+    /// Take `lane` unless this call holds it already; an error is for the model.
+    async fn enter_lane(&self, lane: &Lane) -> Result<(), String> {
+        if lane.held.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let entering = async {
+            let held = self.lanes.enter(&lane.key).await;
+            let lease = self.leases.share(self.log.as_ref(), &lane.key).await;
+            lease.map(|lease| (held, lease))
+        };
+        let entered = tokio::select! {
+            biased;
+            _ = wait_for_deadline(lane.deadline) => return Err(
+                "[interrupted] task wall-clock deadline elapsed while waiting for the mutation lane".into(),
+            ),
+            _ = lane.cancel.cancelled() => return Err(
+                "[interrupted] cancelled before the mutation lane became available".into(),
+            ),
+            entered = entering => entered,
+        };
+        let held = entered.map_err(|error| {
+            format!(
+                "state change was not started because its mutation lease could not be \
+                 acquired: {error}"
+            )
+        })?;
+        *lane.held.lock().unwrap() = Some(held);
+        Ok(())
+    }
+
     async fn execute_with_effect_outbox(
         &self,
         session: &Session,
         intent: &ToolIntent,
+        lane: Option<&Lane>,
     ) -> Observation {
+        if let Some(lane) = lane
+            && let Err(reason) = self.enter_lane(lane).await
+        {
+            return Observation::error(&intent.id, reason);
+        }
         if let Some(mutation_key) = self.executor.mutation_key(intent)
             && let Err(error) = self
                 .log
@@ -3235,9 +3209,10 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         intent: &ToolIntent,
         web_tainted: bool,
         cancel: &tokio_util::sync::CancellationToken,
+        lane: Option<&Lane>,
         sink: &dyn StreamSink,
     ) -> Observation {
-        let radius = self.executor.blast_radius(&intent.tool);
+        let radius = self.executor.call_radius(intent);
         // Enforce before policy/human approval so custom AllowAll policies and
         // remembered approvals cannot turn Plan into an editing session.
         let raw = if session.autonomy == crate::types::AutonomyLevel::Plan
@@ -3407,7 +3382,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         self.running_tool(intent, sink);
                         let observation = crate::execution_access_scope(
                             access,
-                            self.execute_with_effect_outbox(session, intent),
+                            self.execute_with_effect_outbox(session, intent, lane),
                         )
                         .await;
                         return self
@@ -3464,7 +3439,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                 if approved {
                     self.running_tool(intent, sink);
                     let observation = self
-                        .execute_with_net_retry(session, intent, web_tainted, radius)
+                        .execute_with_net_retry(session, intent, web_tainted, radius, lane)
                         .await;
                     self.apply_post_tool_hook(
                         session,
@@ -3482,7 +3457,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             crate::types::Decision::Allow => {
                 self.running_tool(intent, sink);
                 let observation = self
-                    .execute_with_net_retry(session, intent, web_tainted, radius)
+                    .execute_with_net_retry(session, intent, web_tainted, radius, lane)
                     .await;
                 self.apply_post_tool_hook(session, intent, observation, web_tainted, cancel, sink)
                     .await
@@ -3513,10 +3488,15 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         intent: &ToolIntent,
         web_tainted: bool,
         radius: Option<BlastRadius>,
+        lane: Option<&Lane>,
     ) -> Observation {
-        let obs = self.execute_with_effect_outbox(session, intent).await;
+        let obs = self.execute_with_effect_outbox(session, intent, lane).await;
         if !obs.net_denied || !self.executor.allows_network_retry(intent) {
             return obs;
+        }
+        // The first run is over; other changes need not wait on this answer.
+        if let Some(lane) = lane {
+            lane.held.lock().unwrap().take();
         }
         // Trust-flow escalation only, not the policy engine: argv is unchanged, so
         // policy would repeat the verdict that already admitted this intent. Given
@@ -3549,12 +3529,13 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
         match decision {
             crate::NetworkDecision::Deny => obs,
             crate::NetworkDecision::Once => {
-                crate::network_once_scope(self.execute_with_effect_outbox(session, intent)).await
+                crate::network_once_scope(self.execute_with_effect_outbox(session, intent, lane))
+                    .await
             }
             crate::NetworkDecision::Session | crate::NetworkDecision::Persistent => {
                 // The grant already flipped the shared network flag; the retry
                 // and every later command now reach the network.
-                self.execute_with_effect_outbox(session, intent).await
+                self.execute_with_effect_outbox(session, intent, lane).await
             }
         }
     }

@@ -89,6 +89,20 @@ impl Executor for NarrowedExecutor {
         self.inner.blast_radius(tool)
     }
 
+    fn call_radius(&self, intent: &ToolIntent) -> Option<BlastRadius> {
+        if !self.allows(&intent.tool) {
+            return None;
+        }
+        self.inner.call_radius(intent)
+    }
+
+    fn least_radius(&self, tool: &str) -> Option<BlastRadius> {
+        if !self.allows(tool) {
+            return None;
+        }
+        self.inner.least_radius(tool)
+    }
+
     fn category(&self, tool: &str) -> Option<ToolCategory> {
         if !self.allows(tool) {
             return None;

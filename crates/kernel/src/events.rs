@@ -668,8 +668,8 @@ trait MutationLeaseGuard: Send {}
 impl<T: Send> MutationLeaseGuard for T {}
 
 impl MutationLease {
-    /// A lease for an ephemeral log. The kernel's shared in-process mutex still
-    /// provides ordering between kernels derived from the same root.
+    /// A lease for an ephemeral log. The kernel's own write lanes still order
+    /// overlapping changes between kernels derived from the same root.
     pub fn in_process() -> Self {
         Self { _guard: None }
     }
@@ -775,6 +775,11 @@ pub trait EventLog: Send + Sync {
         _mutation_key: &str,
     ) -> Result<MutationLease, KernelError> {
         Ok(MutationLease::in_process())
+    }
+
+    /// Names the lock a key's lease takes, so one process takes each only once.
+    fn mutation_lease_scope(&self, _mutation_key: &str) -> String {
+        String::new()
     }
 
     /// The tool calls that ran, as each tool's name and when, in sessions used

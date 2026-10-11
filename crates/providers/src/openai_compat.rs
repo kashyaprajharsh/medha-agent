@@ -32,6 +32,7 @@ pub struct ProviderClient {
     streaming: std::sync::atomic::AtomicBool,
     /// What servers showed about their models, per protocol/endpoint/model.
     learned: crate::learned::Learned,
+    stable_system: Mutex<Option<String>>,
 }
 
 /// Compatibility name retained while callers migrate to the protocol/profile
@@ -195,7 +196,14 @@ impl ProviderClient {
             reasoning: Mutex::new(ReasoningConfig::default()),
             streaming: std::sync::atomic::AtomicBool::new(true),
             learned: crate::learned::Learned::default(),
+            stable_system: Mutex::new(None),
         }
+    }
+
+    /// The start of the system prompt that every chat shares; a caching server
+    /// can then keep it apart from the part that changes per chat or per day.
+    pub fn stable_system_start(&self, start: &str) {
+        *self.stable_system.lock().unwrap() = Some(start.to_owned());
     }
 
     /// Keep what servers show about their models in `path`, and start from
@@ -446,12 +454,12 @@ impl ProviderClient {
         );
         http::debug_json_request("POST", &url, &request.body);
 
-        let outgoing = http::with_profile(
-            self.http.post(&url),
-            &connection.profile,
-            &connection.credential,
-        )?
-        .json(&request.body);
+        let mut post = self.http.post(&url);
+        for (name, value) in &request.headers {
+            post = post.header(name, value);
+        }
+        let outgoing = http::with_profile(post, &connection.profile, &connection.credential)?
+            .json(&request.body);
         let resp = http::send_model_request(outgoing).await?;
         let resp = http::require_success(resp).await?;
 
@@ -1021,6 +1029,14 @@ impl Provider for ProviderClient {
         &self,
         ctx: &CompiledContext,
     ) -> Result<PreparedModelRequest, ProviderError> {
+        self.prepare_request_in(ctx, &kernel::RequestScope::default())
+    }
+
+    fn prepare_request_in(
+        &self,
+        ctx: &CompiledContext,
+        scope: &kernel::RequestScope,
+    ) -> Result<PreparedModelRequest, ProviderError> {
         let connection = self.connection.lock().unwrap().clone();
         let model = if ctx.model.is_empty() {
             connection.profile.model.clone()
@@ -1048,6 +1064,7 @@ impl Provider for ProviderClient {
             ));
         }
         let streaming = self.streaming();
+        let mut headers = Vec::new();
         let body = match connection.profile.protocol {
             Protocol::OpenAiChat => {
                 let mut body = openai_chat::prepare_body(
@@ -1062,6 +1079,14 @@ impl Provider for ProviderClient {
                 {
                     body["max_completion_tokens"] = cap;
                 }
+                // Last, so the marks sit on the request exactly as it is sent.
+                headers = crate::prompt_cache::apply(
+                    &mut body,
+                    crate::prompt_cache::route(&connection.profile, &model),
+                    connection.profile.cache_ttl,
+                    scope,
+                    self.stable_system.lock().unwrap().as_deref(),
+                );
                 body
             }
             Protocol::GeminiInteractions => {
@@ -1081,12 +1106,10 @@ impl Provider for ProviderClient {
                 )));
             }
         };
-        Ok(PreparedModelRequest::new(
-            connection.profile.protocol,
-            model,
-            body,
-            ctx.clone(),
-        ))
+        let mut prepared =
+            PreparedModelRequest::new(connection.profile.protocol, model, body, ctx.clone());
+        prepared.headers = headers;
+        Ok(prepared)
     }
 
     async fn count_input_tokens(
@@ -1233,12 +1256,12 @@ impl Provider for ProviderClient {
         // exact prepared JSON for every call.
         http::debug_json_request("POST", &url, &request.body);
 
-        let outgoing = http::with_profile(
-            self.http.post(&url),
-            &connection.profile,
-            &connection.credential,
-        )?
-        .json(&request.body);
+        let mut post = self.http.post(&url);
+        for (name, value) in &request.headers {
+            post = post.header(name, value);
+        }
+        let outgoing = http::with_profile(post, &connection.profile, &connection.credential)?
+            .json(&request.body);
         let resp = http::send_model_request(outgoing).await?;
         let resp = http::require_success(resp).await?;
 

@@ -1365,6 +1365,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
     ) -> Result<(Vec<Message>, StopReason), KernelError> {
         // `None` (headless) → a token that never trips; every cancel path is dead.
         let cancel = interrupts.as_ref().map(|q| q.token()).unwrap_or_default();
+        // A sub-agent or a headless run has nobody pausing between its turns.
+        let request_owner = crate::RequestScope {
+            conversation: session.id.to_string(),
+            unattended: self.sub_agent || interrupts.is_none(),
+        };
         let started = crate::events::now_ts();
         let mut images_left_out_said = false;
         let (mut retired_said, mut unreadable_said) = (0, false);
@@ -1703,7 +1708,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                     }
                     let prepared = self
                         .provider
-                        .prepare_request(&candidate)
+                        .prepare_request_in(&candidate, &request_owner)
                         .map_err(|error| KernelError::Provider(error.to_string()))?;
 
                     let request_scope = format!(
@@ -1721,8 +1726,11 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         restored_usage = true;
                         self.context.restore_usage(&candidate, 0);
                         if let Some(anchor) = &usage_anchor
-                            && let Some(prefix) =
-                                anchor.matching_context(self.provider.as_ref(), &candidate)
+                            && let Some(prefix) = anchor.matching_context(
+                                self.provider.as_ref(),
+                                &candidate,
+                                &request_owner,
+                            )
                         {
                             self.context.restore_usage(&prefix, anchor.prompt_tokens);
                         }

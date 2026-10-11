@@ -6,6 +6,7 @@ pub mod model_test;
 pub mod models_dev;
 pub mod openai_compat;
 pub mod profile;
+pub mod prompt_cache;
 pub(crate) mod protocol;
 #[cfg(test)]
 mod test_http;

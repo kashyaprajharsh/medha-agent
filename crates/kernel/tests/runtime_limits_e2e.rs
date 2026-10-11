@@ -1596,6 +1596,7 @@ async fn each_model_call_records_its_tokens_and_cost_in_the_log() {
         completion_tokens: 500_000,
         total_tokens: 1_500_000,
         cached_prompt_tokens: Some(400_000),
+        cache_write_tokens: None,
     };
     let provider = Arc::new(LimitProvider::new(vec![Turn::Blocks(vec![
         Block::Text("done".into()),

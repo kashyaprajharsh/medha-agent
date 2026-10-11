@@ -150,6 +150,17 @@ pub struct PreparedModelRequest {
     pub body: serde_json::Value,
     pub context: CompiledContext,
     pub request_fingerprint: String,
+    /// Headers this one request carries beyond the profile's own.
+    pub headers: Vec<(String, String)>,
+}
+
+/// Which conversation a request belongs to, for servers that cache per conversation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestScope {
+    /// One chat or one sub-agent; never shared between two.
+    pub conversation: String,
+    /// No person is typing: a sub-agent or a headless run.
+    pub unattended: bool,
 }
 
 impl PreparedModelRequest {
@@ -167,18 +178,21 @@ impl PreparedModelRequest {
             body,
             context,
             request_fingerprint,
+            headers: Vec::new(),
         }
     }
 
     /// Provider adapters use this when applying a bounded retry adjustment,
     /// such as lowering an output cap. A changed body always gets a new hash.
     pub fn with_body(&self, body: serde_json::Value) -> Self {
-        Self::new(
+        let mut changed = Self::new(
             self.protocol,
             self.model.clone(),
             body,
             self.context.clone(),
-        )
+        );
+        changed.headers = self.headers.clone();
+        changed
     }
 }
 
@@ -1012,6 +1026,16 @@ pub trait Provider: Send + Sync {
             body,
             ctx.clone(),
         ))
+    }
+
+    /// Prepare a request as part of one conversation, so a server that caches
+    /// per conversation can be told which. Without an override, the scope is unused.
+    fn prepare_request_in(
+        &self,
+        ctx: &CompiledContext,
+        _scope: &RequestScope,
+    ) -> Result<PreparedModelRequest, ProviderError> {
+        self.prepare_request(ctx)
     }
 
     /// Stream canonical blocks for one model call.

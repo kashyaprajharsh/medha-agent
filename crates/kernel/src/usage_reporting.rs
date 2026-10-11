@@ -45,6 +45,7 @@ impl UsageAnchor {
         &self,
         provider: &P,
         candidate: &crate::CompiledContext,
+        scope: &crate::RequestScope,
     ) -> Option<crate::CompiledContext> {
         if self.prompt_tokens == 0
             || self.message_count == 0
@@ -60,7 +61,7 @@ impl UsageAnchor {
             (None, None) => {}
             _ => return None,
         }
-        let prepared = provider.prepare_request(&prefix).ok()?;
+        let prepared = provider.prepare_request_in(&prefix, scope).ok()?;
         (prepared.request_fingerprint == self.fingerprint).then_some(prefix)
     }
 }

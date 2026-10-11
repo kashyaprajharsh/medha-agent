@@ -459,12 +459,25 @@ struct UsageRaw {
     /// DeepSeek's own spelling of the same number.
     #[serde(default)]
     prompt_cache_hit_tokens: Option<u32>,
+    /// The spellings proxies that route Claude or Kimi pass through unchanged.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_write_tokens: Option<u32>,
 }
 
 #[derive(Default, Clone, Copy, Deserialize)]
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: Option<u32>,
+    #[serde(default)]
+    cache_write_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
 }
 
 impl UsageRaw {
@@ -474,10 +487,23 @@ impl UsageRaw {
     fn cached_prompt_tokens(&self) -> Option<u32> {
         self.prompt_tokens_details
             .and_then(|details| details.cached_tokens)
+            .or(self.cache_read_input_tokens)
             .or(self.prompt_cache_hit_tokens)
+            .or(self.cached_tokens)
             // A gateway reporting more hits than prompt tokens is reporting
             // something else; keep the count inside the prompt it belongs to.
             .map(|cached| cached.min(self.prompt_tokens))
+    }
+
+    /// What the server stored for later re-reading, under any of its spellings.
+    fn cache_write_tokens(&self) -> Option<u32> {
+        let details = self.prompt_tokens_details.unwrap_or_default();
+        details
+            .cache_write_tokens
+            .or(details.cache_creation_input_tokens)
+            .or(self.cache_creation_input_tokens)
+            .or(self.cache_write_tokens)
+            .map(|written| written.min(self.prompt_tokens))
     }
 }
 
@@ -716,6 +742,7 @@ fn usage_block(usage: UsageRaw) -> Block {
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens(),
+        cache_write_tokens: usage.cache_write_tokens(),
     })
 }
 
@@ -1069,6 +1096,31 @@ mod tests {
             "prompt_cache_miss_tokens": 400,
         }));
         assert_eq!(deepseek.cached_prompt_tokens, Some(9_600));
+    }
+
+    /// A proxy routing Claude or Kimi reports re-reads and cache writes under
+    /// its own names. Missing them reads as "no caching" on a route that caches.
+    #[test]
+    fn cache_reads_and_writes_are_read_under_every_spelling() {
+        let counts = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({ "prompt_tokens": 10_000, "total_tokens": 10_200 });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let usage = usage_of(body);
+            (usage.cached_prompt_tokens, usage.cache_write_tokens)
+        };
+        let nested = serde_json::json!({
+            "prompt_tokens_details": { "cached_tokens": 9_000, "cache_write_tokens": 800 },
+        });
+        assert_eq!(counts(nested), (Some(9_000), Some(800)));
+        let passed_through = serde_json::json!({
+            "cache_read_input_tokens": 9_000, "cache_creation_input_tokens": 800,
+        });
+        assert_eq!(counts(passed_through), (Some(9_000), Some(800)));
+        let flat = serde_json::json!({ "cached_tokens": 9_000, "cache_write_tokens": 800 });
+        assert_eq!(counts(flat), (Some(9_000), Some(800)));
+        assert_eq!(counts(serde_json::json!({})), (None, None));
     }
 
     /// Silence is not a miss. Every endpoint that reports no bucket would

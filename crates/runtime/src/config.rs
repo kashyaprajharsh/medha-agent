@@ -1003,6 +1003,8 @@ fn resolve_inner(
         image_input,
         chat_token_limit: configured.map(|p| p.chat_token_limit).unwrap_or_default(),
         stream_idle_seconds: configured.and_then(|p| p.stream_idle_seconds),
+        prompt_cache: configured.and_then(|p| p.prompt_cache),
+        cache_ttl: configured.map(|p| p.cache_ttl).unwrap_or_default(),
     };
     provider.validate().map_err(anyhow::Error::msg)?;
     if provider.auth.requires_credential() && api_key.is_empty() {
@@ -2278,6 +2280,8 @@ mod tests {
             image_input: kernel::ImageInputMode::Auto,
             chat_token_limit: Default::default(),
             stream_idle_seconds: None,
+            prompt_cache: None,
+            cache_ttl: Default::default(),
         }
     }
 

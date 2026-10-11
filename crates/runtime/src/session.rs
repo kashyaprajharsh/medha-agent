@@ -849,6 +849,8 @@ pub async fn start(
         notices.say(&file.content);
     }
     let mut system = context::identity::system_prompt_for_tools(persona, &known_tools);
+    // What follows changes per chat or per day; this start is the same for all.
+    kernel.provider.stable_system_start(&system);
     // Give time-sensitive requests an explicit clock and workspace.
     let today = chrono::Local::now().format("%A, %-d %B %Y").to_string();
     let scratch_line = scratch.as_ref().map_or_else(String::new, |scratch| {

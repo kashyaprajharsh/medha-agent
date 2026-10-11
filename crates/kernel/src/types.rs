@@ -848,6 +848,7 @@ mod usage_tests {
             completion_tokens: 100,
             total_tokens: prompt + 100,
             cached_prompt_tokens: cached,
+            cache_write_tokens: None,
         }
     }
 
@@ -1065,6 +1066,10 @@ pub struct Usage {
     /// conversation each time and paying for what was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_prompt_tokens: Option<u32>,
+    /// The part of `prompt_tokens` the provider stored in its cache this time,
+    /// to be re-read later. `None` when the route does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
 }
 
 impl Usage {

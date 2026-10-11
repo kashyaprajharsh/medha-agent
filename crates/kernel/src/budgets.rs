@@ -473,6 +473,7 @@ mod tests {
             completion_tokens: 20_000,
             total_tokens: 120_000,
             cached_prompt_tokens: None,
+            cache_write_tokens: None,
         }); // 0.3 + 0.3 = $0.60
         assert!((per_turn - 0.6).abs() < 1e-9);
         let mut g = Governor::new(Budget {
@@ -584,6 +585,7 @@ mod tests {
                     completion_tokens: 0,
                     total_tokens: 0,
                     cached_prompt_tokens: None,
+                    cache_write_tokens: None,
                 }),
                 Some(pricing),
             )
@@ -626,6 +628,7 @@ mod tests {
                 completion_tokens: 20,
                 total_tokens: 60,
                 cached_prompt_tokens: None,
+                cache_write_tokens: None,
             }),
             None,
         );

@@ -111,6 +111,12 @@ pub struct ProviderProfile {
     /// a slow local server, may need longer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_idle_seconds: Option<u64>,
+    /// Force cache marks on or off for this deployment. Missing means Medha
+    /// decides from the server and model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub cache_ttl: crate::prompt_cache::CacheTtl,
 }
 
 /// Bounds on a configured stream wait: long enough for a model to think,
@@ -144,6 +150,8 @@ impl ProviderProfile {
             image_input: ImageInputMode::Auto,
             chat_token_limit: ChatTokenLimit::Auto,
             stream_idle_seconds: None,
+            prompt_cache: None,
+            cache_ttl: Default::default(),
         }
     }
 
@@ -306,6 +314,10 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             chat_token_limit: ChatTokenLimit,
             #[serde(default)]
             stream_idle_seconds: Option<u64>,
+            #[serde(default)]
+            prompt_cache: Option<bool>,
+            #[serde(default)]
+            cache_ttl: crate::prompt_cache::CacheTtl,
         }
 
         let raw = RawProfile::deserialize(deserializer)?;
@@ -330,6 +342,8 @@ impl<'de> Deserialize<'de> for ProviderProfile {
             image_input: raw.image_input,
             chat_token_limit: raw.chat_token_limit,
             stream_idle_seconds: raw.stream_idle_seconds,
+            prompt_cache: raw.prompt_cache,
+            cache_ttl: raw.cache_ttl,
         })
     }
 }

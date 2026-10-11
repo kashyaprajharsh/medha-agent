@@ -461,6 +461,7 @@ fn usage_block(usage: UsageRaw) -> Block {
         // Cached tokens are a subset of total_input_tokens, not extra input.
         // Missing remains unknown; a reported zero is a measured cache miss.
         cached_prompt_tokens: usage.cached.map(|cached| cached.min(prompt_tokens)),
+        cache_write_tokens: None,
     })
 }
 

@@ -59,7 +59,8 @@ pub use progress::{Phase, Progress, ProgressHandle, ProgressWatch};
 pub use provider::{
     ImageInputMode, ImageSupport, InputTokenCount, ModelLimits, PreparedModelRequest, Protocol,
     Provider, ProviderCaps, ProviderError, ProviderFailure, ReasoningConfig, ReasoningEffort,
-    ReasoningSupport, TokenAccountingMode, TokenCountError, TokenCountQuality, ToolCallStrategy,
+    ReasoningSupport, RequestScope, TokenAccountingMode, TokenCountError, TokenCountQuality,
+    ToolCallStrategy,
 };
 pub use request_images::ImageShrinker;
 pub use sink::{NullSink, StreamSink};

@@ -1172,6 +1172,7 @@ fn restore_snapshot(model: &mut Model, snapshot: protocol::PresentationSnapshot)
         completion_tokens: usage.completion_tokens.unwrap_or(0),
         total_tokens: usage.total_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
+        cache_write_tokens: None,
     });
     model.cost_usd = metrics.cost_usd.map(|usd| (usd, metrics.cost_indicative));
     model.context_pressure = metrics
@@ -1402,6 +1403,7 @@ fn turn_event(model: &mut Model, event: protocol::TurnEvent) {
                 total_tokens,
                 completion_tokens: completion_tokens.unwrap_or(0),
                 cached_prompt_tokens,
+                cache_write_tokens: None,
             });
             if let Some(cached) = cached_prompt_tokens {
                 let (hits, prompt) = model.cache.unwrap_or_default();

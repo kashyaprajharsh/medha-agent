@@ -1227,6 +1227,8 @@ fn image_message(text: &str) -> Message {
     images_message(text, &["hash"])
 }
 
+/// Stored images as Medha records them, with their size in pixels; the one
+/// named `tall` is 3000 pixels high.
 fn images_message(text: &str, hashes: &[&str]) -> Message {
     let mut message = Message::user(text);
     message.attachments = hashes
@@ -1235,13 +1237,25 @@ fn images_message(text: &str, hashes: &[&str]) -> Message {
             mime_type: "image/png".into(),
             source: MediaSource::Artifact((*hash).into()),
             label: Some("screen.png".into()),
-            width: None,
-            height: None,
+            width: Some(64),
+            height: Some(if *hash == "tall" { 3_000 } else { 64 }),
             byte_size: None,
             provider_state: Vec::new(),
         })
         .collect();
     message
+}
+
+/// Media type of every image a request carries.
+fn image_kinds(request: &PreparedModelRequest) -> Vec<String> {
+    let messages = request.context.ordered_messages();
+    let parts = messages.iter().flat_map(|message| &message.parts);
+    parts
+        .filter_map(|part| match part {
+            ContentPart::Media(media) => Some(media.mime_type.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 struct TestVision;
@@ -1277,7 +1291,7 @@ impl kernel::ArtifactStore for ImageArtifacts {
     fn size(&self, hash: &str) -> Result<usize, String> {
         match hash.strip_prefix("bytes:") {
             Some(size) => size.parse().map_err(|_| "missing artifact".into()),
-            None if hash == "hash" => Ok(6),
+            None if matches!(hash, "hash" | "tall") => Ok(6),
             None => Err("missing artifact".into()),
         }
     }
@@ -1286,8 +1300,14 @@ impl kernel::ArtifactStore for ImageArtifacts {
 struct ToBudget;
 
 impl kernel::ImageShrinker for ToBudget {
-    fn shrink(&self, _: &[u8], budget: usize) -> Result<(Vec<u8>, String), String> {
-        Ok((vec![b'p'; budget], "image/jpeg".into()))
+    fn shrink(
+        &self,
+        bytes: &[u8],
+        budget: usize,
+        max_side: u32,
+    ) -> Result<kernel::request_images::Fitted, String> {
+        let fitted = vec![b'p'; bytes.len().min(budget)];
+        Ok((fitted, "image/jpeg".into(), max_side))
     }
 }
 
@@ -1376,41 +1396,50 @@ async fn a_vision_server_refusing_some_images_is_not_taken_for_a_text_one() {
             .await
             .unwrap();
         assert_eq!(stop, StopReason::Finished);
-        let sent: Vec<_> = provider
-            .sent
-            .lock()
-            .unwrap()
-            .iter()
-            .map(image_sizes)
-            .collect();
-        (sent, *provider.observed.lock().unwrap())
+        let requests = provider.sent.lock().unwrap();
+        let sent: Vec<_> = requests.iter().map(image_sizes).collect();
+        let kinds: Vec<_> = requests.iter().map(image_kinds).collect();
+        (sent, kinds, *provider.observed.lock().unwrap())
     };
 
-    // Too large, said in words no list has: sent smaller, and again after the tool.
-    let (sent, learned) = run(
+    // Too large, said in words no list has: sent smaller, and again after the
+    // tool. The server's 4 MiB is of the image as sent, so 3 MiB on disk.
+    let (sent, _, learned) = run(
         "invalid request body",
-        |request| image_sizes(request).iter().any(|size| *size > 4 * MIB),
+        |request| image_sizes(request).iter().any(|size| *size > 3 * MIB),
         &["bytes:5000000", "hash"],
     )
     .await;
     assert_eq!(
         sent,
-        [vec![5_000_000, 6], vec![4 * MIB, 6], vec![4 * MIB, 6]]
+        [vec![5_000_000, 6], vec![3 * MIB, 6], vec![3 * MIB, 6]]
     );
     assert_eq!(learned, ImageSupport::Supported);
 
+    // Too tall, and the server says how tall it takes: resized, never left out.
+    let (sent, kinds, learned) = run(
+        "At least one of the image dimensions exceed max allowed size: 2000 pixels",
+        |request| image_kinds(request).iter().any(|kind| kind == "image/png"),
+        &["tall"],
+    )
+    .await;
+    assert_eq!(sent, [vec![6], vec![6], vec![6]], "sent every time");
+    assert_eq!(kinds[1..], [["image/jpeg"], ["image/jpeg"]], "and resized");
+    assert_eq!(learned, ImageSupport::Supported);
+
     // Too many: only the newest goes, and no request walks back up to try all.
-    let (sent, learned) = run(
+    let (sent, _, learned) = run(
         "invalid request body",
         |request| image_sizes(request).len() > 1,
         &["hash", "bytes:300000"],
     )
     .await;
-    assert_eq!(sent, [vec![6, 300_000], vec![256 * 1024], vec![256 * 1024]]);
+    let small = 256 * 1024 / 4 * 3;
+    assert_eq!(sent, [vec![6, 300_000], vec![small], vec![small]]);
     assert_eq!(learned, ImageSupport::Supported);
 
     // Named as too large, then accepted without it: that teaches nothing of sight.
-    let (sent, learned) = run("image too large", carries_image, &["hash"]).await;
+    let (sent, _, learned) = run("image too large", carries_image, &["hash"]).await;
     assert_eq!(sent, [vec![6], vec![], vec![]]);
     assert_eq!(learned, ImageSupport::Unknown);
 }

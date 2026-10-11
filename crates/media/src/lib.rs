@@ -179,10 +179,16 @@ pub fn normalize_for_transport(raw: Vec<u8>, budget: usize) -> Result<Image> {
 /// A message thumbnail also limits decoded pixels. A compressed blank image
 /// can fit the byte budget while still occupying hundreds of MB in a viewer.
 pub fn thumbnail(raw: Vec<u8>, budget: usize) -> Result<Image> {
+    fit(raw, budget, 512)
+}
+
+/// Bring an image within both a byte budget and a longest side, in pixels.
+pub fn fit(raw: Vec<u8>, budget: usize, max_side: u32) -> Result<Image> {
     ensure!(raw.len() <= MAX_SOURCE_BYTES, "image source exceeds 64 MiB");
     ensure!(budget > 0, "image transport budget must be positive");
     let limits = ImageLimits::from_env()?;
-    image_within(raw, budget.min(limits.max_encoded_bytes), limits, Some(512))
+    let budget = budget.min(limits.max_encoded_bytes);
+    image_within(raw, budget, limits, Some(max_side))
 }
 
 #[cfg(test)]

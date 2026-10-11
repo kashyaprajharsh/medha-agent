@@ -472,6 +472,8 @@ pub struct Kernel<P: Provider, L: EventLog> {
     shrinker: Option<Arc<dyn crate::ImageShrinker>>,
     /// This server took images only once they were smaller; later turns start there.
     shrinks_images: AtomicBool,
+    /// The longest image side, in pixels, this server is known to take.
+    image_side: std::sync::atomic::AtomicU32,
     progressive_context: Option<Arc<dyn crate::context::ProgressiveContext>>,
     max_parallel_tools: usize,
     /// (per result, per round) limits set in config; each one unset is worked
@@ -649,6 +651,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             vision: None,
             shrinker: None,
             shrinks_images: Default::default(),
+            image_side: crate::request_images::SIDE.into(),
             progressive_context: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             result_limits: (None, None),
@@ -686,6 +689,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
             vision: self.vision.clone(),
             shrinker: self.shrinker.clone(),
             shrinks_images: Default::default(),
+            image_side: crate::request_images::SIDE.into(),
             progressive_context: self.progressive_context.clone(),
             max_parallel_tools: self.max_parallel_tools,
             result_limits: self.result_limits,
@@ -1641,6 +1645,7 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                             Arc::clone(&self.artifacts),
                             sending,
                             self.shrinker.as_ref(),
+                            self.image_side.load(Ordering::Relaxed),
                         )
                         .await;
                         if sending != Sending::OneSmall && sent.retired > retired_said {
@@ -2050,10 +2055,14 @@ impl<P: Provider, L: EventLog> Kernel<P, L> {
                         if sending != Sending::AsText =>
                     {
                         unfit_named |= matches!(e, KernelError::ImageUnfit(_));
-                        small_refused |=
-                            sent.images == 1 && sent.largest <= crate::request_images::SMALL;
-                        sending = sending.after_refusal(sent, self.shrinker.is_some());
-                        image_refusal.get_or_insert(e.to_string());
+                        small_refused |= sent.one_small();
+                        let refusal = e.to_string();
+                        // A side the server names holds for every later request to it.
+                        let named = crate::request_images::side_limit(&refusal);
+                        let side = self.image_side.fetch_min(named, Ordering::Relaxed);
+                        sending =
+                            sending.after_refusal(sent, self.shrinker.is_some(), side.min(named));
+                        image_refusal.get_or_insert(refusal);
                         continue 'model_call;
                     }
                     Err(KernelError::ContextOverflow { reported_limit }) if !overflow_retried => {

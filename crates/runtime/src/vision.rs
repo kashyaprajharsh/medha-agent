@@ -120,10 +120,16 @@ pub fn connect(
 pub struct Shrinker;
 
 impl kernel::ImageShrinker for Shrinker {
-    fn shrink(&self, bytes: &[u8], budget: usize) -> Result<(Vec<u8>, String), String> {
-        let image = media::normalize_for_transport(bytes.to_vec(), budget)
-            .map_err(|error| format!("{error:#}"))?;
-        Ok((image.bytes, image.mime.into()))
+    fn shrink(
+        &self,
+        bytes: &[u8],
+        budget: usize,
+        max_side: u32,
+    ) -> Result<kernel::request_images::Fitted, String> {
+        let image =
+            media::fit(bytes.to_vec(), budget, max_side).map_err(|error| format!("{error:#}"))?;
+        let side = image.width.max(image.height);
+        Ok((image.bytes, image.mime.into(), side))
     }
 }
 

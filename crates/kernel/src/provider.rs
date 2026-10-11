@@ -482,11 +482,16 @@ fn classify_rejection(code: Option<u16>, message: &str) -> ProviderFailure {
         "image size exceeds",
         "image dimensions exceed",
         "dimensions exceed max allowed size",
+        "max allowed size: 8000",
+        "patches after processing",
         "media exceeds",
         "media too large",
+        "make sure your payload is below",
+        "streamreadconstraints.getmaxstringlength",
         "invalid png image",
         "invalid jpeg image",
         "provided image cannot be decoded",
+        "does not contain a valid jpg, png, webp, or ico image",
     ]
     .iter()
     .any(|said| lower.contains(said));

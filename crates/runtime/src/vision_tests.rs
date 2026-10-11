@@ -122,13 +122,27 @@ fn a_picture_refused_for_its_size_is_made_to_fit() {
     let budget = kernel::request_images::SMALL;
     assert!(picture.len() > budget * 4);
 
-    let (bytes, kind) = Shrinker.shrink(&picture, budget).unwrap();
+    let (bytes, kind, _) = Shrinker.shrink(&picture, budget, 8_000).unwrap();
     assert!(bytes.len() <= budget, "{} bytes", bytes.len());
     assert!(media::has_supported_image_header(&bytes));
     assert!(
         matches!(kind.as_str(), "image/png" | "image/jpeg"),
         "{kind}"
     );
+}
+
+/// A tall, flat screenshot is tiny in bytes and far too tall: it comes back
+/// within the side asked for, and the side reported is the real one.
+#[test]
+fn a_picture_refused_for_its_height_is_made_to_fit() {
+    use kernel::ImageShrinker as _;
+    let picture = media::from_rgba(200, 9_000, &vec![255; 200 * 9_000 * 4]).unwrap();
+    assert!(picture.len() < 100_000, "{} bytes", picture.len());
+
+    let (bytes, _, side) = Shrinker.shrink(&picture, 3 * 1024 * 1024, 2_000).unwrap();
+    let resized = media::normalize(bytes).unwrap();
+    assert_eq!(side, resized.width.max(resized.height));
+    assert!(side <= 2_000, "{side} pixels");
 }
 
 #[tokio::test]
